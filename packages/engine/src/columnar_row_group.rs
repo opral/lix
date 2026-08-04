@@ -483,6 +483,20 @@ pub(crate) async fn load_row_group_manifest(
     decode_manifest(&bytes).map(Some)
 }
 
+/// Loads an immutable manifest through the transaction-local write overlay.
+/// Row-group publication and current-state publication share one atomic write
+/// set, so a serving descriptor must validate the exact bytes being staged
+/// without requiring an intermediate storage commit.
+pub(crate) fn load_staged_row_group_manifest(
+    writes: &StorageWriteSet,
+    id: RowGroupSetId,
+) -> Result<Option<RowGroupManifest>, LixError> {
+    if let Some(bytes) = writes.staged_value(ROW_GROUP_MANIFEST_SPACE, id.as_bytes().as_slice()) {
+        return decode_manifest(&bytes).map(Some);
+    }
+    Ok(None)
+}
+
 /// Stages deletion of one immutable set and every addressed column. The
 /// owning commit remains the lifecycle authority; repository GC invokes this
 /// only after that commit leaves the reachable history graph.
@@ -666,6 +680,57 @@ pub(crate) async fn load_row_group_page(
                     "row-group {group_index} page {page_index} column {column_index} is missing"
                 ))
             })?;
+        arrays.push(decode_verified_column(
+            &bytes,
+            group.column_page_digests[column_index][page_index],
+            manifest.fields[column_index].data_type,
+            page_rows,
+        )?);
+    }
+    RecordBatch::try_new(projected_schema(manifest, projection), arrays)
+        .map_err(|error| row_group_error(error.to_string()))
+}
+
+/// Loads one page through ordinary storage plus the current atomic write set.
+/// Only columns absent from the overlay are issued as physical point reads.
+pub(crate) fn load_staged_row_group_page(
+    writes: &StorageWriteSet,
+    id: RowGroupSetId,
+    manifest: &RowGroupManifest,
+    group_index: usize,
+    page_index: usize,
+    projection: &[usize],
+) -> Result<RecordBatch, LixError> {
+    validate_projection(manifest, projection)?;
+    let group = manifest.groups.get(group_index).ok_or_else(|| {
+        row_group_error(format!(
+            "row-group index {group_index} is outside the manifest"
+        ))
+    })?;
+    let page_count = (group.row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
+    if page_index >= page_count {
+        return Err(row_group_error(format!(
+            "row-group page index {page_index} is outside {page_count} pages"
+        )));
+    }
+    let page_rows = ROW_GROUP_PAGE_ROWS
+        .min(group.row_count as usize - page_index.saturating_mul(ROW_GROUP_PAGE_ROWS));
+    let keys = projection
+        .iter()
+        .map(|&column_index| id.column_key(group_index, page_index, column_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = keys
+        .iter()
+        .map(|key| writes.staged_value(ROW_GROUP_COLUMN_SPACE, key.0.as_ref()))
+        .collect::<Vec<_>>();
+    let mut arrays = Vec::with_capacity(projection.len());
+    for ((&column_index, bytes), key) in projection.iter().zip(values).zip(keys) {
+        let bytes = bytes.ok_or_else(|| {
+            row_group_error(format!(
+                "row-group {group_index} page {page_index} column {column_index} is missing at {:?}",
+                key.0
+            ))
+        })?;
         arrays.push(decode_verified_column(
             &bytes,
             group.column_page_digests[column_index][page_index],

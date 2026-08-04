@@ -328,7 +328,6 @@ pub(crate) struct ScopedRangeCoveredPointRoute {
     pub(crate) covered_part: Option<ScopedRangePart>,
 }
 
-#[cfg(any(test, feature = "storage-benches"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedRangeInterval {
     pub(crate) coverage: Option<ScopedRangeCoverageMarker>,
@@ -1583,7 +1582,6 @@ pub(crate) async fn scan_scoped_range_interval(
 
 /// Returns every part in one exact scope without inventing a sentinel entity
 /// key. The synthetic route kind sorts after all part starts in that scope.
-#[cfg(feature = "storage-benches")]
 pub(crate) async fn scan_scoped_range_scope(
     store: &(impl StorageAdapterRead + ?Sized),
     root: &ScopedRangeRoot,
@@ -1989,7 +1987,6 @@ async fn load_routed_leaf(
     }
 }
 
-#[cfg(any(test, feature = "storage-benches"))]
 async fn collect_route_interval(
     store: &(impl StorageAdapterRead + ?Sized),
     root: &ScopedRangeRoot,

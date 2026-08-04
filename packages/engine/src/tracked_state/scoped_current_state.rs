@@ -7,7 +7,8 @@ use crate::changelog::CommitId;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor;
 use crate::tracked_state::scoped_range::{
-    ScopedRangeCoverageMarker, ScopedRangeRoot, stage_replace_scoped_range, stage_scoped_range_tree,
+    ScopedRangeCoverageMarker, ScopedRangeRoot, scan_scoped_range_scope,
+    stage_replace_scoped_range, stage_scoped_range_tree,
 };
 use crate::tracked_state::types::{
     CommitDeltaReplacementScope, CommitStateManifest, CommitStateMutationInventory,
@@ -16,6 +17,262 @@ use crate::tracked_state::types::{
 use crate::{LixError, storage_codec};
 
 const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v1";
+
+/// Publishes canonical column pages directly when their closed key envelopes
+/// are disjoint from every inherited post-image part. Interleaved parent rows
+/// require an ordinal-preserving range merge and deliberately fail closed for
+/// now; mutation/history authority remains complete either way.
+async fn stage_disjoint_columnar_current_state_pages(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent_manifest: Option<&CommitStateManifest>,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Option<CurrentStateScopedRangeRoot>, LixError> {
+    use datafusion::arrow::array::{Array, StringArray};
+
+    let parent =
+        parent_manifest.and_then(|manifest| manifest.current_state_scoped_ranges.as_deref());
+    let parts = inventory
+        .columnar_parts
+        .as_ref()
+        .ok_or_else(|| scoped_state_error("columnar publication omitted its part authority"))?;
+    if parts.owner_commit_id != *commit_id.as_uuid().as_bytes()
+        || inventory.single_partition.as_ref()
+            != Some(&CommitDeltaReplacementScope {
+                schema_key: parts.schema_key.clone(),
+                file_id: None,
+            })
+    {
+        return Err(scoped_state_error(
+            "columnar publication disagrees with its commit scope",
+        ));
+    }
+    let set_id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_staged_row_group_manifest(writes, set_id)?
+        .ok_or_else(|| scoped_state_error("columnar publication manifest is missing"))?;
+    crate::tracked_state::storage::validate_columnar_mutation_manifest(&manifest, parts)?;
+    let identity_column = manifest
+        .fields
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| scoped_state_error("columnar publication has no identity column"))?;
+    let mut descriptors = Vec::with_capacity(parts.page_first_keys.len());
+    let mut fence_index = 0usize;
+    let mut global_ordinal = 0u64;
+    for (group_index, group) in manifest.groups.iter().enumerate() {
+        let page_count =
+            (group.row_count as usize).div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS);
+        for page_index in 0..page_count {
+            let batch = crate::columnar_row_group::load_staged_row_group_page(
+                writes,
+                set_id,
+                &manifest,
+                group_index,
+                page_index,
+                &[identity_column],
+            )?;
+            let identities = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| scoped_state_error("columnar identity page is not UTF-8"))?;
+            if identities.is_empty() || identities.null_count() != 0 {
+                return Err(scoped_state_error(
+                    "columnar identity page is empty or contains nulls",
+                ));
+            }
+            let encoded_keys = (0..identities.len())
+                .map(|row_index| {
+                    let entity_pk = crate::entity_pk::EntityPk::from_json_array_text(
+                        identities.value(row_index),
+                    )
+                    .map_err(|error| scoped_state_error(error.to_string()))?;
+                    Ok(crate::tracked_state::codec::encode_key_ref(
+                        crate::tracked_state::types::TrackedStateKeyRef {
+                            schema_key: &parts.schema_key,
+                            file_id: None,
+                            entity_pk: &entity_pk,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            if encoded_keys.windows(2).any(|pair| pair[0] >= pair[1])
+                || parts.page_first_keys.get(fence_index) != encoded_keys.first()
+                || parts.page_last_keys.get(fence_index) != encoded_keys.last()
+            {
+                return Err(scoped_state_error(
+                    "columnar identity page disagrees with authenticated key fences",
+                ));
+            }
+            let row_count = u16::try_from(identities.len())
+                .map_err(|_| scoped_state_error("columnar page row count exceeds u16"))?;
+            descriptors.push(CurrentStatePartDescriptor {
+                first_key: encoded_keys.first().expect("non-empty page").clone(),
+                last_key: encoded_keys.last().expect("non-empty page").clone(),
+                content_digest: parts.manifest_digest,
+                payload_refs_digest: [0; 32],
+                source_kind: 2,
+                source_id: parts.row_group_set_id,
+                owner_commit_id: parts.owner_commit_id,
+                part_index: u32::try_from(group_index)
+                    .map_err(|_| scoped_state_error("columnar group index exceeds u32"))?,
+                source_page_index: u16::try_from(page_index)
+                    .map_err(|_| scoped_state_error("columnar page index exceeds u16"))?,
+                source_row_offset: 0,
+                row_count,
+                fragmented: false,
+                uniform_created_at: parts.uniform_created_at,
+                uniform_updated_at: parts.uniform_updated_at,
+            });
+            global_ordinal = global_ordinal
+                .checked_add(identities.len() as u64)
+                .ok_or_else(|| scoped_state_error("columnar row count overflows"))?;
+            fence_index += 1;
+        }
+    }
+    if fence_index != parts.page_first_keys.len() || global_ordinal != u64::from(parts.row_count) {
+        return Err(scoped_state_error(
+            "columnar page topology disagrees with mutation authority",
+        ));
+    }
+
+    let scope = CommitDeltaReplacementScope {
+        schema_key: parts.schema_key.clone(),
+        file_id: None,
+    };
+    let prefix = crate::tracked_state::current_state_envelope::current_state_scope_prefix(&scope)?;
+    let mut scoped_parts = descriptors
+        .iter()
+        .map(|descriptor| scoped_range_part_from_current_state_descriptor(&scope, descriptor))
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let tree = match parent {
+        None => {
+            if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
+                return Ok(None);
+            }
+            let marker = ScopedRangeCoverageMarker {
+                scope: prefix,
+                row_count: global_ordinal,
+                part_count: u32::try_from(scoped_parts.len())
+                    .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
+            };
+            stage_scoped_range_tree(writes, [(marker, scoped_parts)])?
+        }
+        Some(parent) => {
+            let inherited = scan_scoped_range_scope(store, &parent.tree, &prefix).await?;
+            let coverage = match inherited.coverage {
+                Some(coverage) => coverage,
+                None => {
+                    if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
+                        return Ok(None);
+                    }
+                    let marker = ScopedRangeCoverageMarker {
+                        scope: prefix,
+                        row_count: global_ordinal,
+                        part_count: u32::try_from(scoped_parts.len())
+                            .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
+                    };
+                    let tree = stage_replace_scoped_range(
+                        store,
+                        writes,
+                        &parent.tree,
+                        marker,
+                        scoped_parts,
+                    )
+                    .await?
+                    .root;
+                    return Ok(Some(attest_scoped_range_root(
+                        commit_id,
+                        Some(parent),
+                        inventory,
+                        tree,
+                    )?));
+                }
+            };
+            scoped_parts.extend(inherited.parts);
+            scoped_parts.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+            if scoped_parts
+                .windows(2)
+                .any(|pair| pair[0].last_key >= pair[1].first_key)
+            {
+                return Ok(None);
+            }
+            let marker =
+                ScopedRangeCoverageMarker {
+                    scope: prefix,
+                    row_count: coverage
+                        .row_count
+                        .checked_add(global_ordinal)
+                        .ok_or_else(|| scoped_state_error("columnar scope row count overflows"))?,
+                    part_count: coverage
+                        .part_count
+                        .checked_add(u32::try_from(descriptors.len()).map_err(|_| {
+                            scoped_state_error("columnar scope part count exceeds u32")
+                        })?)
+                        .ok_or_else(|| scoped_state_error("columnar scope part count overflows"))?,
+                };
+            stage_replace_scoped_range(store, writes, &parent.tree, marker, scoped_parts)
+                .await?
+                .root
+        }
+    };
+    Ok(Some(attest_scoped_range_root(
+        commit_id, parent, inventory, tree,
+    )?))
+}
+
+/// Proves that no commit in the first-parent state lineage could have authored
+/// the requested collection. Unknown/cascading scope information fails closed.
+async fn parent_scope_is_proven_empty(
+    store: &(impl StorageAdapterRead + ?Sized),
+    parent: Option<&CommitStateManifest>,
+    scope: &CommitDeltaReplacementScope,
+) -> Result<bool, LixError> {
+    let Some(parent) = parent else {
+        return Ok(true);
+    };
+    let mut next = Some(parent.clone());
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(manifest) = next {
+        if !visited.insert(manifest.commit_id) {
+            return Err(scoped_state_error(
+                "parent scope emptiness proof encountered a commit cycle",
+            ));
+        }
+        if manifest.mutations.member_count != 0 {
+            if manifest
+                .mutations
+                .columnar_parts
+                .as_ref()
+                .is_some_and(|parts| {
+                    parts.schema_key == scope.schema_key && scope.file_id.is_none()
+                })
+            {
+                return Ok(false);
+            }
+            let Some(touched) =
+                crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
+                    manifest.commit_id,
+                    &manifest.mutations,
+                )?
+            else {
+                return Ok(false);
+            };
+            if touched.contains(scope) {
+                return Ok(false);
+            }
+        }
+        let Some(parent_id) = manifest.parent_commit_ids.first().copied() else {
+            return Ok(true);
+        };
+        next = crate::tracked_state::storage::load_commit_state_manifest(store, parent_id).await?;
+        if next.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
 
 /// Opaque proof that the serving root was produced in this write set from the
 /// exact graph parent and sealed mutation inventory.
@@ -133,9 +390,11 @@ pub(crate) async fn stage_complete_replacement_scoped_range_root(
                 content_digest: part.content_digest,
                 payload_refs_digest: [0; 32],
                 source_kind: 0,
+                source_id: [0; 16],
                 owner_commit_id: part.owner_commit_id,
                 part_index: u32::try_from(part_index)
                     .map_err(|_| scoped_state_error("replacement part index overflows"))?,
+                source_page_index: 0,
                 source_row_offset: 0,
                 row_count,
                 fragmented: false,
@@ -194,6 +453,17 @@ pub(crate) async fn stage_current_state_scoped_ranges(
 ) -> Result<CertifiedCurrentStateScopedRangePublication, LixError> {
     let parent_commit_id = parent.map(|parent| parent.commit_id);
     let parent_root = parent.and_then(|parent| parent.current_state_scoped_ranges.as_deref());
+    if inventory.columnar_parts.is_some() {
+        let root = stage_disjoint_columnar_current_state_pages(
+            store, writes, parent, commit_id, inventory,
+        )
+        .await?;
+        return Ok(CertifiedCurrentStateScopedRangePublication {
+            write_set_id: writes.identity(),
+            parent_commit_id,
+            root,
+        });
+    }
     let touched = crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
         commit_id, inventory,
     )?;

@@ -751,6 +751,39 @@ where
                     ));
                 }
             }
+            2 => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+                if !packed.commits.contains_key(&owner) {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("live scoped range references missing columnar owner '{owner}'"),
+                    ));
+                }
+                let authority = crate::tracked_state::load_commit_state_manifest(store, owner)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("live scoped range columnar owner '{owner}' has no authority"),
+                        )
+                    })?;
+                let Some(parts) = authority.mutations.columnar_parts.as_ref() else {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "live columnar scoped range owner has no columnar mutation authority",
+                    ));
+                };
+                if parts.owner_commit_id != descriptor.owner_commit_id
+                    || parts.row_group_set_id != descriptor.source_id
+                    || parts.manifest_digest != descriptor.content_digest
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "live columnar scoped range descriptor disagrees with owner authority",
+                    ));
+                }
+                retained_authority_commits.insert(owner);
+            }
             _ => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,

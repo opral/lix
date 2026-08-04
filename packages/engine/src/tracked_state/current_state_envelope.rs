@@ -7,7 +7,7 @@ use crate::tracked_state::scoped_range::{
 use crate::tracked_state::types::{CommitDeltaReplacementScope, CurrentStatePartDescriptor};
 use crate::{LixError, storage_codec};
 
-const LOCATOR_PAYLOAD_VERSION: u16 = 2;
+const LOCATOR_PAYLOAD_VERSION: u16 = 3;
 
 #[derive(musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -15,8 +15,10 @@ struct CurrentStatePartLocatorPayload {
     content_digest: [u8; 32],
     payload_refs_digest: [u8; 32],
     source_kind: u8,
+    source_id: [u8; 16],
     owner_commit_id: [u8; 16],
     part_index: u32,
+    source_page_index: u16,
     source_row_offset: u16,
     fragmented: bool,
     uniform_created_at: crate::common::LixTimestamp,
@@ -58,8 +60,10 @@ pub(crate) fn scoped_range_part_from_current_state_descriptor(
                     content_digest: descriptor.content_digest,
                     payload_refs_digest: descriptor.payload_refs_digest,
                     source_kind: descriptor.source_kind,
+                    source_id: descriptor.source_id,
                     owner_commit_id: descriptor.owner_commit_id,
                     part_index: descriptor.part_index,
+                    source_page_index: descriptor.source_page_index,
                     source_row_offset: descriptor.source_row_offset,
                     fragmented: descriptor.fragmented,
                     uniform_created_at: descriptor.uniform_created_at,
@@ -86,8 +90,10 @@ pub(crate) fn current_state_descriptor_from_scoped_range_part(
         content_digest: payload.content_digest,
         payload_refs_digest: payload.payload_refs_digest,
         source_kind: payload.source_kind,
+        source_id: payload.source_id,
         owner_commit_id: payload.owner_commit_id,
         part_index: payload.part_index,
+        source_page_index: payload.source_page_index,
         source_row_offset: payload.source_row_offset,
         row_count: u16::try_from(part.row_count)
             .map_err(|_| envelope_error("part row count exceeds its locator codec"))?,
@@ -110,17 +116,32 @@ fn validate_current_state_descriptor(
         || descriptor.first_key > descriptor.last_key
         || descriptor.row_count == 0
         || slice_end
-            > crate::tracked_state::current_state_data_part::CURRENT_STATE_DATA_PART_MAX_ROWS as u32
+            > match descriptor.source_kind {
+                2 => crate::columnar_row_group::ROW_GROUP_PAGE_ROWS as u32,
+                _ => {
+                    crate::tracked_state::current_state_data_part::CURRENT_STATE_DATA_PART_MAX_ROWS
+                        as u32
+                }
+            }
         || descriptor.content_digest == [0; 32]
-        || descriptor.source_kind > 1
+        || descriptor.source_kind > 2
         || (descriptor.source_kind == 0
-            && (descriptor.owner_commit_id == [0; 16] || descriptor.payload_refs_digest != [0; 32]))
+            && (descriptor.source_id != [0; 16]
+                || descriptor.source_page_index != 0
+                || descriptor.owner_commit_id == [0; 16]
+                || descriptor.payload_refs_digest != [0; 32]))
         || (descriptor.source_kind == 1
-            && (descriptor.owner_commit_id != [0; 16]
+            && (descriptor.source_id != [0; 16]
+                || descriptor.source_page_index != 0
+                || descriptor.owner_commit_id != [0; 16]
                 || descriptor.part_index != 0
                 || descriptor.payload_refs_digest == [0; 32]
                 || descriptor.uniform_created_at.packed() != 0
                 || descriptor.uniform_updated_at.packed() != 0))
+        || (descriptor.source_kind == 2
+            && (descriptor.source_id == [0; 16]
+                || descriptor.owner_commit_id == [0; 16]
+                || descriptor.payload_refs_digest != [0; 32]))
     {
         return Err(envelope_error("part locator invariants are invalid"));
     }
