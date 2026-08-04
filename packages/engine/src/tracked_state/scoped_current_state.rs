@@ -12,11 +12,14 @@ use crate::tracked_state::scoped_range::{
 };
 use crate::tracked_state::types::{
     CommitDeltaReplacementScope, CommitStateManifest, CommitStateMutationInventory,
-    CurrentStatePartDescriptor, CurrentStateScopedRangeRoot,
+    CommitStateTouchedScopeFilter, CurrentStatePartDescriptor, CurrentStateScopedRangeRoot,
 };
 use crate::{LixError, storage_codec};
 
 const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v1";
+const TOUCHED_SCOPE_FILTER_BYTES: usize = 128;
+const TOUCHED_SCOPE_FILTER_HASHES: usize = 4;
+const TOUCHED_SCOPE_FILTER_CONTEXT: &str = "lix cumulative touched collection scope v1";
 
 /// Publishes canonical column pages directly when their closed key envelopes
 /// are disjoint from every inherited post-image part. Interleaved parent rows
@@ -156,7 +159,7 @@ async fn stage_disjoint_columnar_current_state_pages(
         {
             return Ok(None);
         }
-        if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
+        if !parent_scope_is_proven_empty(parent_manifest, &scope)? {
             return Ok(None);
         }
         let marker = ScopedRangeCoverageMarker {
@@ -179,63 +182,101 @@ async fn stage_disjoint_columnar_current_state_pages(
     )?))
 }
 
-/// Proves one collection has never been authored in the linear state lineage.
-/// This is a correctness fallback for first publication; existing covered
-/// scopes never use it. A cumulative scoped-authority summary will replace
-/// this one-time walk in the next manifest hard cut.
-async fn parent_scope_is_proven_empty(
-    store: &(impl StorageAdapterRead + ?Sized),
+/// Proves one collection has never been authored in the certified linear
+/// lineage. Bloom false positives only disable publication; a negative is an
+/// exact absence proof because every exactly bounded mutation contributes its
+/// scope and unknown/broad mutations make the certificate incomplete.
+fn parent_scope_is_proven_empty(
     parent: Option<&CommitStateManifest>,
     scope: &CommitDeltaReplacementScope,
 ) -> Result<bool, LixError> {
     let Some(parent) = parent else {
         return Ok(true);
     };
-    let mut next = Some(parent.clone());
-    let mut visited = std::collections::BTreeSet::new();
-    while let Some(manifest) = next {
-        if !visited.insert(manifest.commit_id) {
-            return Err(scoped_state_error(
-                "parent scope emptiness proof encountered a commit cycle",
-            ));
-        }
-        if manifest.parent_commit_ids.len() > 1
-            || manifest.mutations.selected_source_commit_id().is_some()
-        {
-            return Ok(false);
-        }
-        if manifest.mutations.member_count != 0 {
-            if manifest
-                .mutations
-                .columnar_parts
-                .as_ref()
-                .is_some_and(|parts| {
-                    parts.schema_key == scope.schema_key && scope.file_id.is_none()
-                })
-            {
-                return Ok(false);
+    touched_scope_filter_proves_absent(&parent.touched_scope_filter, scope)
+}
+
+fn empty_complete_touched_scope_filter() -> CommitStateTouchedScopeFilter {
+    CommitStateTouchedScopeFilter {
+        complete: true,
+        bits: vec![0; TOUCHED_SCOPE_FILTER_BYTES],
+    }
+}
+
+pub(crate) fn incomplete_touched_scope_filter() -> CommitStateTouchedScopeFilter {
+    CommitStateTouchedScopeFilter::default()
+}
+
+fn advance_touched_scope_filter(
+    parent: Option<&CommitStateManifest>,
+    touched: Option<&[CommitDeltaReplacementScope]>,
+) -> Result<CommitStateTouchedScopeFilter, LixError> {
+    let Some(touched) = touched else {
+        return Ok(incomplete_touched_scope_filter());
+    };
+    let mut filter = match parent {
+        None => empty_complete_touched_scope_filter(),
+        Some(parent) => {
+            validate_touched_scope_filter(&parent.touched_scope_filter)?;
+            if !parent.touched_scope_filter.complete {
+                return Ok(incomplete_touched_scope_filter());
             }
-            let Some(touched) =
-                crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
-                    manifest.commit_id,
-                    &manifest.mutations,
-                )?
-            else {
-                return Ok(false);
-            };
-            if touched.contains(scope) {
-                return Ok(false);
-            }
+            parent.touched_scope_filter.clone()
         }
-        let Some(parent_id) = manifest.parent_commit_ids.first().copied() else {
-            return Ok(true);
-        };
-        next = crate::tracked_state::storage::load_commit_state_manifest(store, parent_id).await?;
-        if next.is_none() {
-            return Ok(false);
+    };
+    for scope in touched {
+        for bit in touched_scope_filter_bits(scope.schema_key.as_bytes()) {
+            filter.bits[bit / 8] |= 1 << (bit % 8);
         }
     }
-    Ok(false)
+    Ok(filter)
+}
+
+fn touched_scope_filter_proves_absent(
+    filter: &CommitStateTouchedScopeFilter,
+    scope: &CommitDeltaReplacementScope,
+) -> Result<bool, LixError> {
+    validate_touched_scope_filter(filter)?;
+    if !filter.complete {
+        return Ok(false);
+    }
+    Ok(touched_scope_filter_bits(scope.schema_key.as_bytes())
+        .into_iter()
+        .any(|bit| filter.bits[bit / 8] & (1 << (bit % 8)) == 0))
+}
+
+fn touched_scope_filter_bits(scope: &[u8]) -> [usize; TOUCHED_SCOPE_FILTER_HASHES] {
+    let digest = blake3::Hasher::new_derive_key(TOUCHED_SCOPE_FILTER_CONTEXT)
+        .update(&(scope.len() as u64).to_be_bytes())
+        .update(scope)
+        .finalize();
+    let bytes = digest.as_bytes();
+    std::array::from_fn(|index| {
+        let offset = index * 8;
+        let hash = u64::from_be_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("BLAKE3 supplies four u64 filter hashes"),
+        );
+        hash as usize % (TOUCHED_SCOPE_FILTER_BYTES * 8)
+    })
+}
+
+pub(crate) fn validate_touched_scope_filter(
+    filter: &CommitStateTouchedScopeFilter,
+) -> Result<(), LixError> {
+    if filter.complete {
+        if filter.bits.len() != TOUCHED_SCOPE_FILTER_BYTES {
+            return Err(scoped_state_error(
+                "complete touched-scope filter has the wrong length",
+            ));
+        }
+    } else if !filter.bits.is_empty() {
+        return Err(scoped_state_error(
+            "incomplete touched-scope filter carries unauthoritative bits",
+        ));
+    }
+    Ok(())
 }
 
 /// Opaque proof that the serving root was produced in this write set from the
@@ -244,6 +285,7 @@ pub(crate) struct CertifiedCurrentStateScopedRangePublication {
     write_set_id: u64,
     parent_commit_id: Option<CommitId>,
     root: Option<CurrentStateScopedRangeRoot>,
+    touched_scope_filter: CommitStateTouchedScopeFilter,
 }
 
 impl CertifiedCurrentStateScopedRangePublication {
@@ -257,6 +299,10 @@ impl CertifiedCurrentStateScopedRangePublication {
 
     pub(crate) fn write_set_id(&self) -> u64 {
         self.write_set_id
+    }
+
+    pub(crate) fn touched_scope_filter(&self) -> &CommitStateTouchedScopeFilter {
+        &self.touched_scope_filter
     }
 }
 
@@ -417,6 +463,24 @@ pub(crate) async fn stage_current_state_scoped_ranges(
 ) -> Result<CertifiedCurrentStateScopedRangePublication, LixError> {
     let parent_commit_id = parent.map(|parent| parent.commit_id);
     let parent_root = parent.and_then(|parent| parent.current_state_scoped_ranges.as_deref());
+    let touched = crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
+        commit_id,
+        inventory,
+        parent.is_none(),
+    )?;
+    // Descriptor cascades make exact per-file serving scopes unknown, but
+    // they cannot introduce a schema family that was absent from the parent:
+    // every cascaded row had to be authored earlier. Preserve the cumulative
+    // negative certificate by adding only the current commit's authored schema
+    // families, using empty-base scope extraction to ignore that cascade.
+    let filter_touched = if touched.is_some() || parent.is_none() {
+        touched.clone()
+    } else {
+        crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
+            commit_id, inventory, true,
+        )?
+    };
+    let touched_scope_filter = advance_touched_scope_filter(parent, filter_touched.as_deref())?;
     if inventory.columnar_parts.is_some() {
         let root = stage_disjoint_columnar_current_state_pages(
             store, writes, parent, commit_id, inventory,
@@ -426,11 +490,9 @@ pub(crate) async fn stage_current_state_scoped_ranges(
             write_set_id: writes.identity(),
             parent_commit_id,
             root,
+            touched_scope_filter,
         });
     }
-    let touched = crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
-        commit_id, inventory,
-    )?;
 
     if inventory.replacement_generation.is_some() {
         let root = stage_complete_replacement_scoped_range_root(
@@ -445,6 +507,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
             write_set_id: writes.identity(),
             parent_commit_id,
             root,
+            touched_scope_filter,
         });
     }
 
@@ -453,6 +516,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
             write_set_id: writes.identity(),
             parent_commit_id,
             root: None,
+            touched_scope_filter,
         });
     };
     let Some(parent_root) = parent_root else {
@@ -460,6 +524,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
             write_set_id: writes.identity(),
             parent_commit_id,
             root: None,
+            touched_scope_filter,
         });
     };
     touched.sort();
@@ -509,6 +574,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
                 write_set_id: writes.identity(),
                 parent_commit_id,
                 root: None,
+                touched_scope_filter,
             });
         };
         tree = rewritten;
@@ -527,6 +593,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
             inventory,
             tree,
         )?),
+        touched_scope_filter,
     })
 }
 
@@ -554,6 +621,10 @@ fn scoped_state_error(message: impl std::fmt::Display) -> LixError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use bytes::Bytes;
 
     use crate::changelog::{ChangeId, CommitId};
@@ -569,10 +640,10 @@ mod tests {
         stage_scoped_range_tree, validate_scoped_range_tree,
     };
     use crate::tracked_state::storage::{
-        CommitDeltaReplacementGeneration, PublishedCommitStateManifest,
+        CommitDeltaReplacementGeneration, PublishedCommitStateManifest, load_commit_state_manifest,
         load_complete_current_state_values_from_scoped_root, load_published_commit_state_manifest,
         sparse_current_state_materialization_count_for_test, stage_certified_commit_state_manifest,
-        stage_certified_commit_state_manifest_with_handle,
+        stage_certified_commit_state_manifest_with_handle, stage_commit_state_manifest,
         stage_current_state_scoped_ranges_from_published_parent,
         stage_current_state_scoped_ranges_from_staged_parent,
         stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
@@ -581,14 +652,55 @@ mod tests {
     use crate::tracked_state::types::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementScope, CommitStateManifest,
         CommitStateMutationInventory, CommitStateMutationPart, CommitStateReplayDebt,
-        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, TrackedStateKeyRef,
-        TrackedStateSingleStringReplacementRef,
+        CommitStateTouchedScopeFilter, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
+        TrackedStateKeyRef, TrackedStateSingleStringReplacementRef,
     };
 
     use super::{
-        attest_scoped_range_root, parent_scope_is_proven_empty, stage_current_state_scoped_ranges,
-        validate_scoped_range_attestation,
+        TOUCHED_SCOPE_FILTER_BYTES, advance_touched_scope_filter, attest_scoped_range_root,
+        parent_scope_is_proven_empty, stage_current_state_scoped_ranges,
+        touched_scope_filter_proves_absent, validate_scoped_range_attestation,
+        validate_touched_scope_filter,
     };
+
+    struct ManifestCountingRead<R> {
+        inner: R,
+        manifest_calls: Arc<AtomicUsize>,
+    }
+
+    impl<R> crate::storage_adapter::StorageAdapterRead for ManifestCountingRead<R>
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> impl Future<
+            Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
+        > + Send {
+            for request in requests {
+                if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                {
+                    self.manifest_calls.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.inner.get_many(requests)
+        }
+
+        fn scan(
+            &self,
+            space: crate::storage_adapter::StorageSpace,
+            range: crate::storage::KeyRange,
+            opts: crate::storage::ScanOptions,
+        ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
+        {
+            self.inner.scan(space, range, opts)
+        }
+    }
 
     fn scope(schema_key: &str) -> CommitDeltaReplacementScope {
         CommitDeltaReplacementScope {
@@ -615,6 +727,7 @@ mod tests {
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
         }
@@ -681,6 +794,7 @@ mod tests {
         .expect("replacement scope should publish");
         let mut authority = manifest(commit_id, parent.map(|parent| parent.commit_id), inventory);
         authority.current_state_scoped_ranges = publication.root();
+        authority.touched_scope_filter = publication.touched_scope_filter().clone();
         stage_certified_commit_state_manifest(&mut writes, &authority, &publication)
             .expect("replacement authority should stage");
         drop(read);
@@ -760,6 +874,7 @@ mod tests {
         .expect("complete replacement should publish");
         let mut parent_manifest = manifest(parent_id, None, replacement_inventory);
         parent_manifest.current_state_scoped_ranges = parent_publication.root();
+        parent_manifest.touched_scope_filter = parent_publication.touched_scope_filter().clone();
         stage_certified_commit_state_manifest(
             &mut parent_writes,
             &parent_manifest,
@@ -861,6 +976,7 @@ mod tests {
             child_stage.mutation_inventory().clone(),
         );
         child_manifest.current_state_scoped_ranges = child_publication.root();
+        child_manifest.touched_scope_filter = child_publication.touched_scope_filter().clone();
         stage_certified_commit_state_manifest(
             &mut child_writes,
             &child_manifest,
@@ -1006,6 +1122,7 @@ mod tests {
         );
         let mut child = manifest(child_id, Some(beta_id), staged.mutation_inventory().clone());
         child.current_state_scoped_ranges = publication.root();
+        child.touched_scope_filter = publication.touched_scope_filter().clone();
         stage_certified_commit_state_manifest(&mut writes, &child, &publication)
             .expect("multi-scope authority should stage");
         drop(read);
@@ -1117,6 +1234,7 @@ mod tests {
             first_stage.mutation_inventory().clone(),
         );
         first.current_state_scoped_ranges = first_publication.root();
+        first.touched_scope_filter = first_publication.touched_scope_filter().clone();
         let first = stage_certified_commit_state_manifest_with_handle(
             &mut writes,
             &first,
@@ -1148,6 +1266,7 @@ mod tests {
             second_stage.mutation_inventory().clone(),
         );
         second.current_state_scoped_ranges = second_publication.root();
+        second.touched_scope_filter = second_publication.touched_scope_filter().clone();
         stage_certified_commit_state_manifest(&mut writes, &second, &second_publication)
             .expect("second child authority should stage");
         drop(read);
@@ -1375,11 +1494,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_scope_proof_rejects_merge_and_selected_source_ancestry() {
-        let storage = StorageAdapter::new(Memory::new());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
         let parent_id = CommitId::for_test_label("empty-proof-parent");
         let requested = scope("not-authored-here");
 
@@ -1391,11 +1505,7 @@ mod tests {
         merge
             .parent_commit_ids
             .push(CommitId::for_test_label("second-parent"));
-        assert!(
-            !parent_scope_is_proven_empty(&read, Some(&merge), &requested)
-                .await
-                .unwrap()
-        );
+        assert!(!parent_scope_is_proven_empty(Some(&merge), &requested).unwrap());
 
         let mut selected = manifest(parent_id, None, CommitStateMutationInventory::default());
         selected.mutations.selected_source_commit_id = Some(
@@ -1403,10 +1513,157 @@ mod tests {
                 .as_uuid()
                 .as_bytes(),
         );
+        assert!(!parent_scope_is_proven_empty(Some(&selected), &requested).unwrap());
+    }
+
+    #[test]
+    fn cumulative_touched_scope_filter_proves_only_exact_negatives() {
+        let authored = scope("authored");
+        let child_authored = scope("child-authored");
+        let absent = scope("never-authored");
+        let root_filter = advance_touched_scope_filter(None, Some(&[authored.clone()])).unwrap();
+        assert!(root_filter.complete);
+        assert!(!touched_scope_filter_proves_absent(&root_filter, &authored).unwrap());
+        assert!(touched_scope_filter_proves_absent(&root_filter, &absent).unwrap());
+
+        let mut parent = manifest(
+            CommitId::for_test_label("scope-filter-parent"),
+            None,
+            CommitStateMutationInventory::default(),
+        );
+        let incomplete_manifest_bytes =
+            crate::storage_codec::encode("scope-filter size baseline", &parent)
+                .unwrap()
+                .len();
+        parent.touched_scope_filter = root_filter;
+        let complete_manifest_bytes =
+            crate::storage_codec::encode("scope-filter size candidate", &parent)
+                .unwrap()
+                .len();
+        assert_eq!(complete_manifest_bytes - incomplete_manifest_bytes, 129);
+        let child_filter = advance_touched_scope_filter(
+            Some(&parent),
+            Some(std::slice::from_ref(&child_authored)),
+        )
+        .unwrap();
+        assert!(!touched_scope_filter_proves_absent(&child_filter, &authored).unwrap());
+        assert!(!touched_scope_filter_proves_absent(&child_filter, &child_authored).unwrap());
+        assert!(touched_scope_filter_proves_absent(&child_filter, &absent).unwrap());
+
+        let incomplete = advance_touched_scope_filter(Some(&parent), None).unwrap();
+        assert!(!incomplete.complete);
+        assert!(incomplete.bits.is_empty());
+        assert!(!touched_scope_filter_proves_absent(&incomplete, &absent).unwrap());
+    }
+
+    #[test]
+    fn touched_scope_filter_rejects_noncanonical_incomplete_or_truncated_state() {
         assert!(
-            !parent_scope_is_proven_empty(&read, Some(&selected), &requested)
+            validate_touched_scope_filter(&CommitStateTouchedScopeFilter {
+                complete: false,
+                bits: vec![1],
+            })
+            .is_err()
+        );
+        assert!(
+            validate_touched_scope_filter(&CommitStateTouchedScopeFilter {
+                complete: true,
+                bits: vec![0; TOUCHED_SCOPE_FILTER_BYTES - 1],
+            })
+            .is_err()
+        );
+    }
+
+    async fn legacy_lineage_scope_absence_proof(
+        store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+        parent: &CommitStateManifest,
+        scope: &CommitDeltaReplacementScope,
+    ) -> Result<bool, crate::LixError> {
+        let mut next = Some(parent.clone());
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(manifest) = next {
+            if !visited.insert(manifest.commit_id) {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "legacy scope proof encountered a commit cycle",
+                ));
+            }
+            if manifest.parent_commit_ids.len() > 1
+                || manifest.mutations.selected_source_commit_id().is_some()
+            {
+                return Ok(false);
+            }
+            if manifest.mutations.member_count != 0 {
+                let Some(touched) =
+                    crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
+                        manifest.commit_id,
+                        &manifest.mutations,
+                        false,
+                    )?
+                else {
+                    return Ok(false);
+                };
+                if touched.contains(scope) {
+                    return Ok(false);
+                }
+            }
+            let Some(parent_id) = manifest.parent_commit_ids.first().copied() else {
+                return Ok(true);
+            };
+            next = load_commit_state_manifest(store, parent_id).await?;
+            if next.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+
+    #[tokio::test]
+    async fn cumulative_filter_removes_lineage_manifest_reads_from_absence_proof() {
+        const DEPTH: usize = 128;
+        let storage = StorageAdapter::new(Memory::new());
+        let mut parent_id = None;
+        let mut tip = None;
+        for index in 0..DEPTH {
+            let commit_id = CommitId::for_test_label(&format!("scope-proof-{index}"));
+            let authority = manifest(
+                commit_id,
+                parent_id,
+                CommitStateMutationInventory::default(),
+            );
+            let mut writes = storage.new_write_set();
+            stage_commit_state_manifest(&mut writes, &authority).unwrap();
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+            parent_id = Some(commit_id);
+            tip = Some(authority);
+        }
+        let mut tip = tip.expect("lineage has a tip");
+        tip.touched_scope_filter = advance_touched_scope_filter(None, Some(&[])).unwrap();
+        let requested = scope("first-columnar-publication");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let counted = ManifestCountingRead {
+            inner: read,
+            manifest_calls: calls.clone(),
+        };
+        assert!(
+            legacy_lineage_scope_absence_proof(&counted, &tip, &requested)
                 .await
                 .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), DEPTH - 1);
+
+        assert!(parent_scope_is_proven_empty(Some(&tip), &requested).unwrap());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            DEPTH - 1,
+            "the certified proof must not issue another manifest read"
         );
     }
 }

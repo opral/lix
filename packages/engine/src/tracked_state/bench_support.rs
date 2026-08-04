@@ -39,6 +39,7 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
         },
@@ -448,6 +449,7 @@ async fn publish_bench_current_state_commit<StorageImpl: Storage>(
         parent.map(|parent| parent.commit_id),
         replay_depth,
         mutations,
+        publication.touched_scope_filter().clone(),
         publication.root(),
     );
     super::storage::stage_certified_commit_state_manifest(&mut writes, &manifest, &publication)
@@ -641,6 +643,7 @@ fn bench_current_state_manifest(
     parent_commit_id: Option<CommitId>,
     replay_depth: u16,
     mutations: super::types::CommitStateMutationInventory,
+    touched_scope_filter: super::types::CommitStateTouchedScopeFilter,
     current_state_scoped_ranges: Option<Box<super::types::CurrentStateScopedRangeRoot>>,
 ) -> CommitStateManifest {
     CommitStateManifest {
@@ -656,6 +659,7 @@ fn bench_current_state_manifest(
             bytes: u64::from(mutations.member_count),
         },
         mutations,
+        touched_scope_filter,
         current_state_scoped_ranges,
         snapshot_root: None,
     }

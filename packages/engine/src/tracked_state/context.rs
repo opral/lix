@@ -4985,6 +4985,7 @@ mod tests {
                 ),
                 replay_debt: Default::default(),
                 mutations: Default::default(),
+                touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
                 snapshot_root: Some(snapshot_root),
             },

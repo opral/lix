@@ -559,6 +559,7 @@ fn stage_test_commit_state_manifest(
             created_at: record.created_at,
             replay_debt,
             mutations,
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root,
         },

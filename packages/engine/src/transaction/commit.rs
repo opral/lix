@@ -5369,6 +5369,10 @@ where
             let current_state_scoped_ranges = catalog_publication
                 .as_ref()
                 .and_then(|publication| publication.root());
+            let touched_scope_filter = catalog_publication.as_ref().map_or_else(
+                crate::tracked_state::incomplete_touched_scope_filter,
+                |publication| publication.touched_scope_filter().clone(),
+            );
             if mutations.replacement_generation.is_some() {
                 mutations.parts.clear();
             }
@@ -5389,6 +5393,7 @@ where
                     CommitStateReplayDebt::default()
                 },
                 mutations,
+                touched_scope_filter,
                 current_state_scoped_ranges,
                 snapshot_root,
             };
@@ -6597,6 +6602,7 @@ mod tests {
                     .get(&commit_id)
                     .cloned()
                     .expect("mixed certified inventory should stage"),
+                touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
                 snapshot_root: None,
             },

@@ -37,6 +37,7 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
         },
