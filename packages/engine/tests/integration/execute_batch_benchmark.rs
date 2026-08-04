@@ -120,6 +120,66 @@ impl CounterSnapshot {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn staged_untracked_writes_reuse_the_transaction_opening_read() {
+    let storage = CountingStorage::new();
+    Engine::initialize(storage.clone()).await.unwrap();
+    let engine = Engine::new(storage.clone()).await.unwrap();
+    let session = engine.open_workspace_session().await.unwrap();
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"opening_read_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+             false,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO opening_read_note (id, text, lixcol_untracked) \
+             VALUES ('note-1', 'before-1', true), ('note-2', 'before-2', true)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut transaction = session.begin_transaction().await.unwrap();
+    let before = storage.snapshot();
+    for (id, text) in [("note-1", "after-1"), ("note-2", "after-2")] {
+        let result = transaction
+            .execute(
+                "UPDATE opening_read_note SET text = $1 \
+                 WHERE id = $2 AND lixcol_untracked = true",
+                &[Value::Text(text.to_string()), Value::Text(id.to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected(), 1);
+    }
+    let staged = storage.snapshot().delta(before);
+
+    assert_eq!(
+        staged.begin_reads, 0,
+        "staging against a transaction must not open per-statement storage snapshots"
+    );
+    transaction.commit().await.unwrap();
+
+    let rows = session
+        .execute("SELECT id, text FROM opening_read_note ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "note-1");
+    assert_eq!(rows.rows()[0].get::<String>("text").unwrap(), "after-1");
+    assert_eq!(rows.rows()[1].get::<String>("id").unwrap(), "note-2");
+    assert_eq!(rows.rows()[1].get::<String>("text").unwrap(), "after-2");
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "manual performance probe; run with --ignored --nocapture"]
 async fn execute_batch_benchmark_probe() {
     let file_count = parse_usize_env(FILE_COUNT_ENV, 10_000);

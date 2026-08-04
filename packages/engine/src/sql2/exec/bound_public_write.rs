@@ -58,6 +58,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_UNTRACKED_REPLACEMENT_BATCH_EXECUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -88,6 +90,11 @@ pub(crate) fn take_certified_generation_identity_replacements() -> usize {
 #[cfg(test)]
 pub(crate) fn take_certified_single_path_value_replacements() -> usize {
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_untracked_replacement_batch_executions() -> usize {
+    CERTIFIED_UNTRACKED_REPLACEMENT_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -590,6 +597,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         &spec,
         scan_entity_pks,
         direct_replacement.is_some(),
+        None,
     )
     .await?;
     if direct_replacement.is_some()
@@ -838,6 +846,12 @@ async fn try_execute_direct_path_value_replacement_batch(
     }
     let parameter_identity_digest = *parameter_identity_hasher.finalize().as_bytes();
     let active_branch_id = ctx.active_branch_id().to_owned();
+    // A literal retention fence gives this certificate an exact physical
+    // scope. Parameterized or unconstrained retention stays on the generic
+    // route because different statements could otherwise address different
+    // physical planes.
+    let explicitly_untracked =
+        bound_untracked_from_predicate(&plan.bound.predicate, &[]) == Some(true);
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,
         file_id: None,
@@ -845,10 +859,15 @@ async fn try_execute_direct_path_value_replacement_batch(
     // Generation controls describe committed HOT state. Any staged member can
     // change the effective identity set, so it must force the overlay-aware
     // candidate scan instead of certifying the committed digest.
-    let has_staged_collection_rows = ctx.has_staged_collection_rows(&active_branch_id, scope)?;
-    let collection_generation = ctx
-        .load_collection_generation(&active_branch_id, scope)
-        .await?;
+    let (has_staged_collection_rows, collection_generation) = if explicitly_untracked {
+        (false, None)
+    } else {
+        (
+            ctx.has_staged_collection_rows(&active_branch_id, scope)?,
+            ctx.load_collection_generation(&active_branch_id, scope)
+                .await?,
+        )
+    };
     let certified_ordered_generation = primary_keys_strictly_ordered
         && !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
@@ -997,20 +1016,26 @@ async fn try_execute_direct_path_value_replacement_batch(
     let candidates = if certified_generation_identity {
         MaterializedLiveStateBatch::default()
     } else {
-        let candidates =
-            scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.entity_update_value_batch.candidate_scan",
-                    row_count,
-                    unique_row_count
-                ))
-                .await?;
+        let candidates = scan_entity_candidates_for_pks(
+            ctx,
+            plan,
+            &spec,
+            unique_entity_pks.to_vec(),
+            true,
+            explicitly_untracked.then_some(true),
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.entity_update_value_batch.candidate_scan",
+            row_count,
+            unique_row_count
+        ))
+        .await?;
         if candidates.iter().any(|candidate| {
-            candidate.untracked()
+            candidate.untracked() != explicitly_untracked
                 || candidate.global()
                 || candidate.file_id().is_some()
-                || candidate.metadata().is_some()
+                || (!explicitly_untracked && candidate.metadata().is_some())
         }) {
             return Ok(None);
         }
@@ -1094,6 +1119,8 @@ async fn try_execute_direct_path_value_replacement_batch(
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
+    let mut replacement_candidate_indices =
+        explicitly_untracked.then(|| Vec::with_capacity(replacement_capacity));
     let mut affected_by_statement =
         (!certified_generation_identity).then(|| vec![0_u64; row_count]);
     let mut candidate_index = 0;
@@ -1149,6 +1176,9 @@ async fn try_execute_direct_path_value_replacement_batch(
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
         replacement_entity_pks.push(entity_pk.clone());
+        if let Some(candidate_indices) = &mut replacement_candidate_indices {
+            candidate_indices.push(candidate_index);
+        }
         if let Some(ordinals) = &sorted_statement_ordinals {
             for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
                 if let Some(affected_by_statement) = &mut affected_by_statement {
@@ -1166,38 +1196,62 @@ async fn try_execute_direct_path_value_replacement_batch(
         let normalized_len = normalized.len();
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-        let rows = CertifiedParameterReplacementBatch::new(
-            replacement_entity_pks,
-            snapshots,
-            spec.schema_key.as_str().into(),
-            active_branch_id.into(),
-            CertifiedRawWriteBatchPreparation {
-                schema_plan_id,
-                facts: PreparedRowFacts {
-                    row_content_validated: true,
-                    requires_transaction_validation: false,
-                },
-                tracked_keys_strictly_ordered: true,
-                complete_collection_replacement: replaces_complete_collection
-                    .then(|| {
-                        Some(CompleteCollectionReplacementProof {
-                            ordered_identity_digest: ordered_identity_digest?,
-                            replay_bytes: u64::try_from(
-                                replacement_identity_replay_bytes.checked_add(normalized_len)?,
-                            )
-                            .ok()?,
+        if let Some(candidate_indices) = replacement_candidate_indices {
+            let mut rows = RawWriteBatch::with_capacity(candidate_indices.len());
+            for (candidate_index, snapshot) in candidate_indices.into_iter().zip(snapshots) {
+                append_direct_path_value_replacement_prepared_row(
+                    &mut rows,
+                    &spec,
+                    EntityLiveRowRef::from(candidates.row(candidate_index)),
+                    snapshot,
+                )?;
+            }
+            stage_rows(ctx, TransactionWriteMode::Replace, rows)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_update_value_batch.stage_untracked_rows",
+                    row_count
+                ))
+                .await?;
+            #[cfg(test)]
+            CERTIFIED_UNTRACKED_REPLACEMENT_BATCH_EXECUTIONS.with(|executions| {
+                executions.set(executions.get().saturating_add(1));
+            });
+        } else {
+            let rows = CertifiedParameterReplacementBatch::new(
+                replacement_entity_pks,
+                snapshots,
+                spec.schema_key.as_str().into(),
+                active_branch_id.into(),
+                CertifiedRawWriteBatchPreparation {
+                    schema_plan_id,
+                    facts: PreparedRowFacts {
+                        row_content_validated: true,
+                        requires_transaction_validation: false,
+                    },
+                    tracked_keys_strictly_ordered: true,
+                    complete_collection_replacement: replaces_complete_collection
+                        .then(|| {
+                            Some(CompleteCollectionReplacementProof {
+                                ordered_identity_digest: ordered_identity_digest?,
+                                replay_bytes: u64::try_from(
+                                    replacement_identity_replay_bytes
+                                        .checked_add(normalized_len)?,
+                                )
+                                .ok()?,
+                            })
                         })
-                    })
-                    .flatten(),
-            },
-        )?;
-        ctx.stage_certified_parameter_batch_replace(rows)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.entity_update_value_batch.stage_rows",
-                row_count
-            ))
-            .await?;
+                        .flatten(),
+                },
+            )?;
+            ctx.stage_certified_parameter_batch_replace(rows)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_update_value_batch.stage_rows",
+                    row_count
+                ))
+                .await?;
+        }
     }
 
     #[cfg(test)]
@@ -1908,13 +1962,40 @@ fn bound_single_text_primary_key_param(
     };
     spec.visible_column(primary_key_column)
         .filter(|column| column.column_type == EntityColumnType::String)?;
+    if let BoundPredicate::And(predicates) = predicate {
+        let [first, second] = predicates.as_slice() else {
+            return None;
+        };
+        let first_primary_key = bound_text_primary_key_eq_param(primary_key_column, first);
+        let second_primary_key = bound_text_primary_key_eq_param(primary_key_column, second);
+        return match (first_primary_key, second_primary_key) {
+            (Some(param), None) if bound_literal_untracked_eq(second).is_some() => Some(param),
+            (None, Some(param)) if bound_literal_untracked_eq(first).is_some() => Some(param),
+            _ => None,
+        };
+    }
+    bound_text_primary_key_eq_param(primary_key_column, predicate)
+}
+
+fn bound_literal_untracked_eq(predicate: &BoundPredicate) -> Option<bool> {
+    let BoundPredicate::Eq(left, right) = predicate else {
+        return None;
+    };
+    bound_untracked_column_value(left, right, &[])
+        .or_else(|| bound_untracked_column_value(right, left, &[]))
+}
+
+fn bound_text_primary_key_eq_param(
+    primary_key_column: &str,
+    predicate: &BoundPredicate,
+) -> Option<usize> {
     let BoundPredicate::Eq(left, right) = predicate else {
         return None;
     };
     match (left, right) {
         (BoundExpr::Column(column), BoundExpr::Param(param))
         | (BoundExpr::Param(param), BoundExpr::Column(column))
-            if column.name == *primary_key_column =>
+            if column.name == primary_key_column =>
         {
             param.index.checked_sub(1)
         }
@@ -2980,7 +3061,8 @@ pub(crate) fn prepare_path_value_replacement_program(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
 ) -> Option<PreparedPathValueReplacementProgram> {
-    if spec.has_inter_row_constraints
+    if bound_untracked_from_predicate(&plan.bound.predicate, &[]) == Some(true)
+        || spec.has_inter_row_constraints
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
         || plan.bound.returning.is_some()
@@ -3986,12 +4068,14 @@ async fn scan_entity_candidates_for_pks(
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
+    untracked: Option<bool>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     ctx.scan_live_state_batch(&LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks,
             branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
+            untracked,
             include_tombstones: false,
             ..LiveStateFilter::default()
         },

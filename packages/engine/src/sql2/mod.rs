@@ -79,7 +79,9 @@ pub(crate) use exec::{
     take_certified_entity_insert_parameter_batch_executions,
     take_certified_generation_identity_replacements,
     take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_entity_update_parameter_batch_executions,
+    take_certified_single_path_value_replacements,
+    take_certified_untracked_replacement_batch_executions,
+    take_entity_update_parameter_batch_executions,
 };
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,

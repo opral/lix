@@ -1259,29 +1259,27 @@ async fn update_untracked_json_pointer_rows<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session
-        .begin_transaction()
-        .await
-        .expect("begin untracked update transaction");
-    for row in rows {
-        let affected = transaction
-            .execute(
+    let parameter_rows = rows
+        .iter()
+        .map(|row| {
+            Arc::<[Value]>::from([
+                Value::Text(row.updated_value_json.clone()),
+                Value::Text(row.path.clone()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let results = session
+        .execute_homogeneous_write_batch(
+            Arc::from(
                 "UPDATE json_pointer SET value = lix_json($1) \
                  WHERE path = $2 AND lixcol_untracked = true",
-                &[
-                    Value::Text(row.updated_value_json.clone()),
-                    Value::Text(row.path.clone()),
-                ],
-            )
-            .await
-            .expect("update untracked json_pointer rows")
-            .rows_affected();
-        assert_eq!(affected, 1);
-    }
-    transaction
-        .commit()
+            ),
+            Arc::from(parameter_rows),
+        )
         .await
-        .expect("commit untracked update transaction");
+        .expect("update untracked json_pointer parameter page");
+    assert_eq!(results.len(), rows.len());
+    assert!(results.iter().all(|result| result.rows_affected() == 1));
 }
 
 impl ProfileStorage {
