@@ -14,6 +14,20 @@ use crate::tracked_state::{
     TrackedStateScanRequest,
 };
 
+pub use super::mutation_directory::MutationDirectoryReadAccounting;
+
+/// Resets the feature-gated authenticated mutation-directory counters for one
+/// benchmark phase. Production builds do not compile this module.
+pub fn reset_mutation_directory_read_accounting() {
+    super::mutation_directory::reset_mutation_directory_read_accounting();
+}
+
+/// Stops and snapshots the feature-gated authenticated mutation-directory
+/// counters for the completed benchmark phase.
+pub fn snapshot_mutation_directory_read_accounting() -> MutationDirectoryReadAccounting {
+    super::mutation_directory::snapshot_mutation_directory_read_accounting()
+}
+
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
@@ -28,11 +42,7 @@ fn stage_bench_commit_deltas(
         writes,
         &CommitStateManifest {
             commit_id,
-            generation: 0,
-            parent_commit_ids: Vec::new(),
-            commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-commit")),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
                 depth: 1,
                 rows: u64::from(mutations.member_count),
@@ -523,11 +533,7 @@ where
         .expect("stage benchmark merge serving root");
         let merged = CommitStateManifest {
             commit_id: merge_id,
-            generation: self.current_manifest.generation.saturating_add(1),
-            parent_commit_ids: vec![self.current_manifest.commit_id, other_id],
-            commit_change_id: ChangeId::for_test_label("scoped-range-empty-merge-change"),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(33),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
                 depth: self
                     .current_manifest
@@ -704,12 +710,19 @@ where
     }
 
     async fn read_point_by_replay(&self, read: &(impl StorageAdapterRead + ?Sized)) -> usize {
+        let point_cache = super::storage::CommitDeltaPointReadCache::default();
         for commit_id in self.commits.iter().rev() {
-            let values = super::storage::load_commit_delta_values_encoded_with_cache(
+            let Some(state) = super::storage::load_point_replay_commit_state(read, *commit_id)
+                .await
+                .expect("load benchmark replay authority")
+            else {
+                continue;
+            };
+            let values = super::storage::load_commit_delta_values_encoded_from_replay_manifest(
                 read,
-                *commit_id,
+                &state,
                 std::slice::from_ref(&self.encoded_key),
-                None,
+                &point_cache,
             )
             .await
             .expect("replay benchmark commit point");
@@ -734,7 +747,7 @@ fn bench_addressable_commit_id(label: &str) -> CommitId {
 
 fn bench_current_state_manifest(
     commit_id: CommitId,
-    parent_commit_id: Option<CommitId>,
+    _parent_commit_id: Option<CommitId>,
     replay_depth: u16,
     mutations: super::types::CommitStateMutationInventory,
     touched_scope_filter: super::types::CommitStateTouchedScopeFilter,
@@ -742,11 +755,7 @@ fn bench_current_state_manifest(
 ) -> CommitStateManifest {
     CommitStateManifest {
         commit_id,
-        generation: 0,
-        parent_commit_ids: parent_commit_id.into_iter().collect(),
-        commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-state")),
-        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-        created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+        change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         replay_debt: CommitStateReplayDebt {
             depth: replay_depth,
             rows: u64::from(mutations.member_count),

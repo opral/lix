@@ -25,7 +25,9 @@ use lix_sdk::{
     CreateBranchOptions, Lix, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
     Storage, SwitchBranchOptions, Value, open_lix_with_storage,
 };
+use lix_slatedb_storage::SlateDB;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tracing::Subscriber;
 use tracing::span::{Attributes, Id};
 use tracing::subscriber::Interest;
@@ -33,7 +35,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 const SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-00000000b001";
 const INSERT_BATCH: usize = 250;
 
@@ -360,22 +362,41 @@ fn worker(cfg: Config) {
             .build()
             .expect("benchmark runtime")
             .block_on(async move {
-                match cfg.layer.as_str() {
-                    "rows" => {
-                        assert!(
-                            cfg.changes * 2 <= cfg.rows,
-                            "row fixture needs two disjoint change ranges"
-                        );
-                        run_row_case(cfg, collector).await;
+                let storage = benchmark_storage_name();
+                match storage.as_str() {
+                    "rocksdb" => run_worker::<RocksDB>(cfg, collector).await,
+                    "slatedb" => run_worker::<SlateDB>(cfg, collector).await,
+                    storage => {
+                        panic!(
+                            "unknown LIX_BRANCH_MERGE_BENCH_STORAGE {storage:?}; expected rocksdb or slatedb"
+                        )
                     }
-                    "files" => run_file_case(cfg, collector).await,
-                    other => panic!("unknown benchmark layer {other:?}"),
                 }
             });
     });
 }
 
-async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
+async fn run_worker<StorageImpl>(cfg: Config, collector: PerfSpanCollector)
+where
+    StorageImpl: BenchmarkStorage,
+{
+    match cfg.layer.as_str() {
+        "rows" => {
+            assert!(
+                cfg.changes * 2 <= cfg.rows,
+                "row fixture needs two disjoint change ranges"
+            );
+            run_row_case::<StorageImpl>(cfg, collector).await;
+        }
+        "files" => run_file_case::<StorageImpl>(cfg, collector).await,
+        other => panic!("unknown benchmark layer {other:?}"),
+    }
+}
+
+async fn run_file_case<StorageImpl>(cfg: Config, collector: PerfSpanCollector)
+where
+    StorageImpl: BenchmarkStorage,
+{
     assert!(matches!(
         cfg.scenario.as_str(),
         "all_plugins_resolvable" | "all_plugins_cold_reopen"
@@ -385,12 +406,13 @@ async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
         "file benchmark requires the five primary affected files"
     );
     let cold_reopen = cfg.scenario == "all_plugins_cold_reopen";
+    let provenance = benchmark_provenance();
     let total_started = Instant::now();
     let root = benchmark_tempdir();
     let db_path = root.path().join(".lix");
     let process_baseline_rss = current_rss_bytes();
     let open_started = Instant::now();
-    let mut lix = open_rocks(&db_path).await;
+    let mut lix = open_benchmark::<StorageImpl>(&db_path).await;
     let open_ms = elapsed_ms(open_started);
 
     let plugins_started = Instant::now();
@@ -444,7 +466,7 @@ async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
             .expect("close target before cold measurement");
         drop(source);
         drop(lix);
-        lix = open_rocks(&db_path).await;
+        lix = open_benchmark::<StorageImpl>(&db_path).await;
         source = lix
             .open_session(SOURCE_BRANCH_ID)
             .await
@@ -563,7 +585,7 @@ async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
     drop(source);
     drop(lix);
     let reopen_started = Instant::now();
-    let reopened = open_rocks(&db_path).await;
+    let reopened = open_benchmark::<StorageImpl>(&db_path).await;
     let reopen_ms = elapsed_ms(reopen_started);
     assert_eq!(
         read_all_files(&reopened, fixture_files.keys()).await,
@@ -578,7 +600,9 @@ async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
 
     println!("{}", serde_json::to_string(&json!({
         "schema_version": SCHEMA_VERSION,
+        "provenance": provenance,
         "status": "ok",
+        "storage_backend": StorageImpl::NAME,
         "layer": "files",
         "scenario": cfg.scenario,
         "sample": benchmark_sample(),
@@ -611,12 +635,13 @@ async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
             "merge_retained": signed_delta(merge_measure.after.rss_bytes, merge_measure.before.rss_bytes),
         },
         "io_bytes": {
+            "measurement": io_measurement_metadata(),
             "preview_read": preview_measure.after.read_bytes.saturating_sub(preview_measure.before.read_bytes),
             "preview_write": preview_measure.after.write_bytes.saturating_sub(preview_measure.before.write_bytes),
             "merge_read": merge_measure.after.read_bytes.saturating_sub(merge_measure.before.read_bytes),
             "merge_write": merge_measure.after.write_bytes.saturating_sub(merge_measure.before.write_bytes),
-            "storage_before": storage_bytes_before, "storage_after": storage_bytes_after,
-            "storage_growth": signed_delta(storage_bytes_after, storage_bytes_before),
+            "storage_before": storage_bytes_before, "storage_after_merge": storage_bytes_after,
+            "storage_growth_after_merge": signed_delta(storage_bytes_after, storage_bytes_before),
         },
         "phase_ms": { "preview": preview_phases, "merge": merge_phases },
         "plugin_counters": {
@@ -644,12 +669,16 @@ async fn run_file_case(cfg: Config, collector: PerfSpanCollector) {
     })).expect("serialize plugin result"));
 }
 
-async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
+async fn run_row_case<StorageImpl>(cfg: Config, collector: PerfSpanCollector)
+where
+    StorageImpl: BenchmarkStorage,
+{
+    let provenance = benchmark_provenance();
     let total_started = Instant::now();
     let root = benchmark_tempdir();
     let db_path = root.path().join(".lix");
     let open_started = Instant::now();
-    let mut lix = open_rocks(&db_path).await;
+    let mut lix = open_benchmark::<StorageImpl>(&db_path).await;
     let open_ms = elapsed_ms(open_started);
     register_row_schema(&lix).await;
     seed_rows(&lix, &cfg).await;
@@ -658,7 +687,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
     lix.close().await.expect("close row setup fixture");
     drop(lix);
     let setup_reopen_started = Instant::now();
-    lix = open_rocks(&db_path).await;
+    lix = open_benchmark::<StorageImpl>(&db_path).await;
     let setup_reopen_ms = elapsed_ms(setup_reopen_started);
     let main_branch_id = lix.active_branch_id().await.expect("main branch id");
 
@@ -932,23 +961,56 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
 
     let final_rows = read_rows(&lix).await;
     let storage_bytes_after = directory_bytes(&db_path);
+    let fanout_branch_ids = (0..cfg.branches.saturating_sub(1))
+        .map(|index| format!("01920000-0000-7000-8000-{:012x}", 0xc000 + index))
+        .collect::<Vec<_>>();
+    let delete_branches_measure = measure_async(|| async {
+        for branch_id in &fanout_branch_ids {
+            let result = lix
+                .execute(
+                    "DELETE FROM lix_branch WHERE id = $1",
+                    &[Value::Text(branch_id.clone())],
+                )
+                .await
+                .expect("delete fanout branch");
+            assert_eq!(result.rows_affected(), 1);
+        }
+    })
+    .await;
+    for branch_id in &fanout_branch_ids {
+        assert!(
+            !branch_exists(&lix, branch_id).await,
+            "deleted branch remained visible"
+        );
+    }
+    let storage_bytes_after_branch_deletion = directory_bytes(&db_path);
     source.close().await.expect("close source session");
     lix.close().await.expect("close target session");
     drop(source);
     drop(lix);
     let reopen_started = Instant::now();
-    let reopened = open_rocks(&db_path).await;
+    let reopened = open_benchmark::<StorageImpl>(&db_path).await;
     let reopen_ms = elapsed_ms(reopen_started);
     assert_eq!(
         read_rows(&reopened).await,
         final_rows,
         "rows changed across close/reopen"
     );
+    for branch_id in &fanout_branch_ids {
+        assert!(
+            !branch_exists(&reopened, branch_id).await,
+            "deleted branch reappeared after reopen"
+        );
+    }
+    let delete_branch_mean_ms = (!fanout_branch_ids.is_empty())
+        .then_some(delete_branches_measure.wall_ms / fanout_branch_ids.len().max(1) as f64);
     reopened.close().await.expect("close reopened session");
 
     let result = json!({
         "schema_version": SCHEMA_VERSION,
+        "provenance": provenance,
         "status": "ok",
+        "storage_backend": StorageImpl::NAME,
         "layer": cfg.layer,
         "scenario": cfg.scenario,
         "sample": benchmark_sample(),
@@ -958,6 +1020,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
             "divergent_commits_per_side": cfg.divergent_commits,
             "common_history_commits": cfg.history,
             "live_branches": cfg.branches,
+            "deleted_fanout_branches": fanout_branch_ids.len(),
             "payload_bytes": cfg.payload_bytes,
         },
         "latency_ms": {
@@ -970,6 +1033,8 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
             "create_branch_median": branch_median_ms,
             "create_branch_last": branch_last_ms,
             "create_branch_max": branch_max_ms,
+            "delete_branches_total": delete_branches_measure.wall_ms,
+            "delete_branch_mean": delete_branch_mean_ms,
             "switch_roundtrip": switch_roundtrip_ms,
             "preview": preview_measure.wall_ms,
             "merge": merge_measure.wall_ms,
@@ -978,11 +1043,13 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
         },
         "cpu_ms": {
             "create_branches": branch_measure.cpu_ms, "switch_roundtrip": switch_measure.cpu_ms,
+            "delete_branches": delete_branches_measure.cpu_ms,
             "preview": preview_measure.cpu_ms, "merge": merge_measure.cpu_ms,
             "diff": diff_measure.cpu_ms
         },
         "allocated_bytes": {
             "create_branches": branch_measure.allocated_bytes,
+            "delete_branches": delete_branches_measure.allocated_bytes,
             "switch_roundtrip": switch_measure.allocated_bytes,
             "preview": preview_measure.allocated_bytes,
             "merge": merge_measure.allocated_bytes,
@@ -999,20 +1066,30 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
             "merge_retained": signed_delta(merge_measure.after.rss_bytes, merge_measure.before.rss_bytes),
             "create_branches_incremental_peak": branch_measure.peak_rss_bytes.saturating_sub(branch_measure.before.rss_bytes),
             "create_branches_retained": signed_delta(branch_measure.after.rss_bytes, branch_measure.before.rss_bytes),
+            "delete_branches_baseline": delete_branches_measure.before.rss_bytes,
+            "delete_branches_peak": delete_branches_measure.peak_rss_bytes,
+            "delete_branches_incremental_peak": delete_branches_measure.peak_rss_bytes.saturating_sub(delete_branches_measure.before.rss_bytes),
+            "delete_branches_retained": signed_delta(delete_branches_measure.after.rss_bytes, delete_branches_measure.before.rss_bytes),
             "switch_incremental_peak": switch_measure.peak_rss_bytes.saturating_sub(switch_measure.before.rss_bytes),
             "switch_retained": signed_delta(switch_measure.after.rss_bytes, switch_measure.before.rss_bytes),
             "diff_incremental_peak": diff_measure.peak_rss_bytes.saturating_sub(diff_measure.before.rss_bytes),
             "diff_retained": signed_delta(diff_measure.after.rss_bytes, diff_measure.before.rss_bytes),
         },
         "io_bytes": {
+            "measurement": io_measurement_metadata(),
             "preview_read": preview_measure.after.read_bytes.saturating_sub(preview_measure.before.read_bytes),
             "preview_write": preview_measure.after.write_bytes.saturating_sub(preview_measure.before.write_bytes),
             "merge_read": merge_measure.after.read_bytes.saturating_sub(merge_measure.before.read_bytes),
             "merge_write": merge_measure.after.write_bytes.saturating_sub(merge_measure.before.write_bytes),
             "diff_read": diff_measure.after.read_bytes.saturating_sub(diff_measure.before.read_bytes),
             "diff_write": diff_measure.after.write_bytes.saturating_sub(diff_measure.before.write_bytes),
-            "storage_before": storage_bytes_before, "storage_after": storage_bytes_after,
-            "storage_growth": signed_delta(storage_bytes_after, storage_bytes_before),
+            "delete_branches_read": delete_branches_measure.after.read_bytes.saturating_sub(delete_branches_measure.before.read_bytes),
+            "delete_branches_write": delete_branches_measure.after.write_bytes.saturating_sub(delete_branches_measure.before.write_bytes),
+            "storage_before": storage_bytes_before,
+            "storage_after_merge": storage_bytes_after,
+            "storage_growth_after_merge": signed_delta(storage_bytes_after, storage_bytes_before),
+            "storage_after_branch_deletion": storage_bytes_after_branch_deletion,
+            "storage_growth_after_branch_deletion": signed_delta(storage_bytes_after_branch_deletion, storage_bytes_before),
         },
         "phase_ms": {
             "setup": setup_phases,
@@ -1027,6 +1104,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
             "failed_merge_atomic": (!expected_clean).then_some(true),
             "source_branch_unchanged": true,
             "branch_isolation": true,
+            "branch_deletion_durable": true,
             "merge_parent_count": merge_parents,
             "close_reopen_stable": true,
             "heads_and_merge_base": true,
@@ -1077,8 +1155,58 @@ where
     }
 }
 
-async fn open_rocks(path: &Path) -> Lix<RocksDB> {
-    let storage = RocksDB::open(path).expect("open benchmark RocksDB");
+trait BenchmarkStorage: Storage + Clone + Send + Sync + 'static {
+    const NAME: &'static str;
+
+    fn open_for_benchmark(path: &Path) -> Self;
+}
+
+impl BenchmarkStorage for RocksDB {
+    const NAME: &'static str = "rocksdb";
+
+    fn open_for_benchmark(path: &Path) -> Self {
+        Self::open(path).expect("open benchmark RocksDB")
+    }
+}
+
+impl BenchmarkStorage for SlateDB {
+    const NAME: &'static str = "slatedb";
+
+    fn open_for_benchmark(path: &Path) -> Self {
+        Self::open(path).expect("open benchmark SlateDB")
+    }
+}
+
+fn benchmark_storage_name() -> String {
+    std::env::var("LIX_BRANCH_MERGE_BENCH_STORAGE").unwrap_or_else(|_| "rocksdb".to_owned())
+}
+
+fn benchmark_provenance() -> serde_json::Value {
+    let executable = std::env::current_exe().expect("resolve benchmark executable");
+    let executable_bytes = fs::read(&executable).expect("read benchmark executable for hashing");
+    json!({
+        "commit_sha": option_env!("LIX_BENCH_COMMIT_SHA").unwrap_or("unrecorded"),
+        "binary_sha256": format!("{:x}", Sha256::digest(&executable_bytes)),
+        "rustc_version": option_env!("LIX_BENCH_RUSTC_VERSION").unwrap_or("unrecorded"),
+        "cargo_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "target_arch": std::env::consts::ARCH,
+        "target_os": std::env::consts::OS,
+    })
+}
+
+fn io_measurement_metadata() -> serde_json::Value {
+    json!({
+        "source": if cfg!(target_os = "linux") { "/proc/self/io" } else { "unavailable" },
+        "os_page_cache_controlled": false,
+        "interpretation": "process physical I/O lower bound; zero does not prove zero logical reads",
+    })
+}
+
+async fn open_benchmark<StorageImpl>(path: &Path) -> Lix<StorageImpl>
+where
+    StorageImpl: BenchmarkStorage,
+{
+    let storage = StorageImpl::open_for_benchmark(path);
     open_lix_with_storage(storage)
         .await
         .expect("open benchmark Lix")
@@ -1450,6 +1578,20 @@ where
     .rows()[0]
         .get::<String>("commit_id")
         .expect("branch head commit id")
+}
+
+async fn branch_exists<StorageImpl>(lix: &Lix<StorageImpl>, branch_id: &str) -> bool
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    !lix.execute(
+        "SELECT id FROM lix_branch WHERE id = $1",
+        &[Value::Text(branch_id.to_owned())],
+    )
+    .await
+    .expect("query branch existence")
+    .rows()
+    .is_empty()
 }
 
 async fn install_all_plugins<StorageImpl>(lix: &Lix<StorageImpl>)

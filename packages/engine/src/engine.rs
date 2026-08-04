@@ -309,9 +309,10 @@ where
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
     /// state. The current branch head is read from the live-state facade so
-    /// rebuild uses the same moving-ref visibility as normal execution. The
-    /// rebuilt root receives the full changelog coverage audit against its
-    /// staged chunks before the replacement root is published.
+    /// rebuild uses the same moving-ref visibility as normal execution. Rooted
+    /// heads restore content-addressed chunks only after their immutable root
+    /// metadata passes a full changelog coverage audit. Rootless heads receive
+    /// the same audit transiently and remain bounded-replay layouts.
     pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
@@ -330,7 +331,7 @@ where
             &head_commit_id,
             "tracked-state branch rebuild authority",
         )?;
-        crate::tracked_state::load_commit_state_manifest(
+        let manifest = crate::tracked_state::load_commit_state_manifest(
             &read,
             typed_head_commit_id,
         )
@@ -350,10 +351,15 @@ where
             .rebuild_commit_root_at(&head_commit_id)
             .await;
         rebuild_result?;
-        // A healthy rebuild is content-equivalent, but this API also repairs a
-        // stale or damaged serving root. Conservatively invalidate transaction
-        // opening catalogs so repaired registered-schema facts are never hidden
-        // behind a pre-rebuild cache entry.
+        if manifest.snapshot_root.is_none() {
+            // Rootless heads are audited transiently and remain replay-only;
+            // there is no serving-root publication or cache state to commit.
+            return Ok(());
+        }
+        // A healthy rebuild is content-equivalent, but this API also repairs
+        // missing or damaged serving chunks. Conservatively invalidate
+        // transaction opening catalogs so restored registered-schema facts are
+        // never hidden behind a pre-rebuild cache entry.
         crate::catalog::stage_catalog_revision(&mut writes);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

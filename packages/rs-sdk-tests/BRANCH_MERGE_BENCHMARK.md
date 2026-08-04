@@ -1,19 +1,31 @@
 # Branch and merge qualification benchmark
 
 `branch_merge_benchmark` is a correctness-gated benchmark for branch creation,
-branch switching, historical diff, merge preview, and merge commit. The controller launches one
+branch switching and deletion, historical diff, merge preview, and merge commit. The controller launches one
 fresh process per scenario so allocator retention, RocksDB caches, and WASM
 instances cannot leak between samples. Each worker emits exactly one JSON
 object on stdout; concatenate stdout to retain JSONL suitable for comparison.
 
+RocksDB is the default backend. Set
+`LIX_BRANCH_MERGE_BENCH_STORAGE=slatedb` to run the same qualification or
+worker against SlateDB.
+
 ## Commands
 
-Build and run qualification cases:
+Build and run qualification cases. Publishable artifacts must embed the exact
+source revision and compiler identity; each worker also hashes its executable
+before starting the process timer:
 
 ```sh
-cargo build --release -p lix_sdk_tests --example branch_merge_benchmark
+LIX_BENCH_COMMIT_SHA="$(git rev-parse HEAD)" \
+LIX_BENCH_RUSTC_VERSION="$(rustc --version)" \
+  cargo build --release -p lix_sdk_tests --example branch_merge_benchmark
 target/release/examples/branch_merge_benchmark qualification > branch-merge.jsonl
 ```
+
+Each schema-v2 record includes those values, the executable SHA-256, Cargo
+profile, target architecture, and target OS. A record containing `unrecorded`
+provenance is useful for local diagnosis but is not publishable evidence.
 
 Set `LIX_BRANCH_MERGE_BENCH_SAMPLES=11` to run every configuration in eleven
 separate child processes. Each JSON object includes its zero-based `sample`, so
@@ -50,7 +62,9 @@ the often size-limited system temporary filesystem. Set
 
 Workers report wall and CPU time, exact Rust allocation traffic, operation-local
 baseline/sampled-peak/retained RSS, process physical I/O deltas, merge tracing
-phases, parameters, merge outcome, and plugin transition counters. The 1 ms RSS
+phases, parameters, merge outcome, and plugin transition counters. Row workers
+report storage size separately after merge and after durable fanout-branch
+deletion, and include deletion-local process I/O. The 1 ms RSS
 sampler begins immediately before each operation and stops immediately afterward;
 incremental peak is the sampled peak minus the pre-operation RSS. Because a
 sub-millisecond RSS spike can fall between samples, use allocation traffic and
@@ -58,6 +72,12 @@ retained RSS as the gates for short operations; sampled peak RSS is a hard gate
 only when the measured operation lasts at least 5 ms. Native RocksDB allocations
 remain visible to RSS but not the Rust allocator counter. Use a release binary on
 an otherwise idle host for publishable results.
+
+Linux process-I/O counters come from `/proc/self/io`. The harness does not evict
+or otherwise control the OS page cache, so these counters are a lower bound on
+physical device traffic: a zero read delta does not prove zero logical reads or
+absence of read amplification. Use isolated cold-cache runs or backend-native
+logical counters when making cold-read amplification claims.
 
 Normalized-row cases compare Lix with a separate entity-level three-way model and
 compare `lix_diff` row counts with an independent map diff. Branch fanout reports

@@ -16,6 +16,7 @@ lix_sdk = { path = "../rs-sdk", version = "0.10.0", default-features = false, fe
 lix_collaboration_test_support = { path = "../collaboration-test-support" }
 lix_engine = { path = "../engine", version = "0.10.0", features = ["storage-benches"] }
 lix_rocksdb_storage = { path = "../rocksdb-storage", version = "0.10.0" }
+lix_slatedb_storage = { path = "../slatedb-storage", version = "0.10.0" }
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }

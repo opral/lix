@@ -8,6 +8,7 @@ pub(crate) mod current_state_envelope;
 mod diff;
 mod diff_id;
 mod merge;
+pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
 mod row_materialization;
 mod scoped_current_state;
@@ -37,6 +38,9 @@ pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,
 };
+pub(crate) use mutation_directory::{
+    MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
+};
 pub(crate) use replacement_part::{
     EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
     ReplacementPartRowRef, encode_replacement_part_with_compressor,
@@ -55,19 +59,21 @@ pub(crate) use storage::stage_commit_state_manifest;
 pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
-    CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateManifest,
+    CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology,
     StagedCommitStateManifest, commit_delta_contains_schema, direct_change_locator,
     load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
+    load_commit_mutation_directory_roots, load_commit_state_authority_ids,
     load_commit_state_manifest, load_commit_state_manifests, load_owned_commit_delta_entries,
-    load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_manifest,
+    load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
     scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
     selected_change_selection_fingerprint, stage_addressable_commit_deltas,
-    stage_addressable_commit_deltas_with_selected_source, stage_certified_commit_state_manifest,
+    stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_published_parent,
+    stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
@@ -79,8 +85,8 @@ pub(crate) use storage::{
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-    TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE,
-    decode_change_locator,
+    TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+    TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator,
 };
 #[cfg(all(test, not(feature = "storage-benches")))]
 pub(crate) use storage::{
@@ -88,11 +94,12 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{
-    TRACKED_STATE_COMMIT_STATE_SEAL_SPACE, change_id_from_packed_address,
-    load_authoritative_commit_root, load_commit_delta_change_ids,
-    load_complete_current_state_values_from_scoped_root, scan_commit_delta_members,
-    stage_resealed_commit_state_manifest_for_test,
+    change_id_from_packed_address, load_commit_delta_change_ids,
+    load_complete_current_state_values_from_scoped_root, load_snapshot_commit_root,
+    scan_commit_delta_members, stage_resealed_commit_state_manifest_for_test,
 };
+#[cfg(test)]
+pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,

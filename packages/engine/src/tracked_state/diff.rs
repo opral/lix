@@ -1239,21 +1239,20 @@ mod tests {
         writes: &mut StorageWriteSet,
         snapshot_root: &TrackedStateCommitRoot,
     ) -> Result<(), LixError> {
-        let mut manifest =
-            crate::tracked_state::storage::load_unchecked_commit_state_manifest_for_test(
-                read,
-                snapshot_root.commit_id,
+        let manifest = crate::tracked_state::storage::load_published_commit_state_manifest(
+            read,
+            snapshot_root.commit_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "corrupt-root fixture has no commit-state manifest",
             )
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "corrupt-root fixture has no commit-state manifest",
-                )
-            })?;
-        manifest.snapshot_root = Some(snapshot_root.clone());
-        manifest.replay_debt = Default::default();
-        crate::tracked_state::storage::stage_unchecked_commit_state_manifest_for_test(
+        })?;
+        let mut manifest = (*manifest).clone();
+        manifest.snapshot_root = Some(Box::new(snapshot_root.clone()));
+        crate::tracked_state::storage::stage_resealed_commit_state_manifest_for_test(
             writes, &manifest,
         )
     }
@@ -3445,6 +3444,8 @@ mod tests {
                 .contains("does not match changelog first-parent winners")
             || error.message.contains("contains non-winner identity")
             || error.message.contains("but changelog first parent is")
+            || error.message.contains("but its first parent is")
+            || error.message.contains("more than one first-parent root")
             || error
                 .message
                 .contains("nearest available first-parent root")

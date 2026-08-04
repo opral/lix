@@ -2749,14 +2749,10 @@ mod tests {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let commit_change_id = format!("{commit_id_text}:commit");
             let record = crate::changelog::CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
@@ -2792,16 +2788,12 @@ mod tests {
                 &mut writes,
                 &CommitStateManifest {
                     commit_id: record.commit_id,
-                    generation: record.generation,
-                    parent_commit_ids: record.parent_commit_ids.clone(),
-                    commit_change_id: record.change_id,
-                    account_id: record.account_id.clone(),
-                    created_at: record.created_at,
+                    change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
-                    snapshot_root: Some(snapshot_root),
+                    snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )
             .expect("empty commit-state authority should stage");
@@ -2990,15 +2982,10 @@ mod tests {
         for (commit_id, generation, parents) in [(parent, 0, Vec::new()), (child, 1, vec![parent])]
         {
             append.commits.push(crate::changelog::CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: u16::try_from(generation + 1)
-                    .expect("fixture generation should fit replay depth"),
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
@@ -3016,15 +3003,12 @@ mod tests {
                 &mut writes,
                 &CommitStateManifest {
                     commit_id: record.commit_id,
-                    generation: record.generation,
-                    parent_commit_ids: record.parent_commit_ids,
-                    commit_change_id: record.change_id,
-                    account_id: record.account_id,
-                    created_at: record.created_at,
+                    change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt {
-                        depth: record.tracked_state_rootless_depth,
-                        rows: record.tracked_state_rootless_rows,
-                        bytes: record.tracked_state_rootless_bytes,
+                        depth: u16::try_from(record.generation + 1)
+                            .expect("fixture generation should fit replay depth"),
+                        rows: 0,
+                        bytes: 0,
                     },
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
@@ -3176,14 +3160,10 @@ mod tests {
                 .map(|id| CommitId::for_test_label(id))
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
                 parent_commit_ids: typed_parent_ids,
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: commit_created_at,
@@ -3238,16 +3218,12 @@ mod tests {
                 writes,
                 &CommitStateManifest {
                     commit_id: record.commit_id,
-                    generation: record.generation,
-                    parent_commit_ids: record.parent_commit_ids,
-                    commit_change_id: record.change_id,
-                    account_id: record.account_id,
-                    created_at: record.created_at,
+                    change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: mutation_inventory,
                     touched_scope_filter: Default::default(),
                     current_state_scoped_ranges: None,
-                    snapshot_root: Some(snapshot_root),
+                    snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )?;
         }

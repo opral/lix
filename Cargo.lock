@@ -3557,6 +3557,7 @@ dependencies = [
  "lix_engine",
  "lix_rocksdb_storage",
  "lix_sdk",
+ "lix_slatedb_storage",
  "mimalloc",
  "plugin_csv",
  "plugin_excalidraw",
