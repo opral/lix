@@ -1725,12 +1725,11 @@ mod tests {
             .expect("repeat repository gc plan");
 
         assert_eq!(first.swept_commits, 10);
-        // Each unreachable commit removes its changelog projection and the
-        // unified commit-state authority. The hard cut retired the separate
-        // tracked-root record.
-        assert_eq!(first.staged_deletes, 20);
-        assert_eq!(first.key_shared_buffers, 2);
-        assert_eq!(first.key_shared_bytes, 20 * 16);
+        // Each unreachable commit removes its changelog projection, immutable
+        // commit-state authority, and rebuildable snapshot-root projection.
+        assert_eq!(first.staged_deletes, 30);
+        assert_eq!(first.key_shared_buffers, 3);
+        assert_eq!(first.key_shared_bytes, 30 * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.staged_deletes, first.staged_deletes);
     }
