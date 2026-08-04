@@ -1138,7 +1138,6 @@ where
     assert_eq!(affected, 1);
 }
 
-#[expect(clippy::cast_possible_truncation)]
 async fn insert_untracked_json_pointer_rows<StorageImpl>(
     session: &SessionContext<StorageImpl>,
     rows: &[PointerRow],
