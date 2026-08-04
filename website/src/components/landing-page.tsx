@@ -28,7 +28,7 @@ function CopyInstallButton({
   return (
     <button
       onClick={copy}
-      className={`flex h-12 cursor-pointer items-center gap-3.5 rounded-lg border border-[#DDDBD3] px-4 font-mono text-[14.5px] text-ink transition-colors hover:border-cyan-bright ${
+      className={`flex h-10 cursor-pointer items-center gap-3 rounded-lg border border-[#DDDBD3] px-3.5 font-mono text-[13.5px] text-ink transition-colors hover:border-cyan-bright ${
         background === "white"
           ? "bg-white shadow-[0_1px_2px_rgba(20,23,26,0.04)]"
           : "bg-paper"
@@ -49,7 +49,7 @@ const whatYouGet = [
     description:
       "Existing tools and agents can keep reading and writing files on disk.",
     icon: (
-      <svg viewBox="0 0 80 56" className="block h-14 w-20" aria-hidden="true">
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
           x="28"
           y="6"
@@ -115,7 +115,7 @@ const whatYouGet = [
     description:
       "Query file content, app data, and change history without rereading whole files.",
     icon: (
-      <svg viewBox="0 0 80 56" className="block h-14 w-20" aria-hidden="true">
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
           x="16"
           y="10"
@@ -214,7 +214,7 @@ const whatYouGet = [
     description:
       "Review the paragraph, CSV record, property, or app row that changed.",
     icon: (
-      <svg viewBox="0 0 80 56" className="block h-14 w-20" aria-hidden="true">
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <line
           x1="16"
           y1="14"
@@ -277,7 +277,7 @@ const whatYouGet = [
     description:
       "Give every user or agent an isolated repository, then review and merge its work.",
     icon: (
-      <svg viewBox="0 0 80 56" className="block h-14 w-20" aria-hidden="true">
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <path
           d="M14 40 H66"
           fill="none"
@@ -303,7 +303,7 @@ const whatYouGet = [
     description:
       "Update files and rows together while Lix records their history.",
     icon: (
-      <svg viewBox="0 0 80 56" className="block h-14 w-20" aria-hidden="true">
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
           x="12"
           y="10"
@@ -352,7 +352,7 @@ const whatYouGet = [
     description:
       "Embed Lix in an app or connect to a shared repository through the server protocol.",
     icon: (
-      <svg viewBox="0 0 80 56" className="block h-14 w-20" aria-hidden="true">
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
           x="12"
           y="20"
@@ -403,28 +403,28 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
       <Header width="narrow" />
       <main className="mx-auto w-full max-w-[1100px] px-8">
         {/* Hero */}
-        <section className="max-w-[820px] pt-[104px]">
-          <p className="mb-[26px] font-mono text-[12.5px] uppercase tracking-[0.08em] text-ink-faint">
+        <section className="max-w-[720px] pt-16">
+          <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
             Open source · MIT
           </p>
-          <h1 className="text-balance text-[40px] font-bold leading-[1.04] tracking-[-0.035em] sm:text-[60px]">
+          <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
             Database, filesystem and version control in one system
           </h1>
-          <div className="mt-[30px] flex max-w-[660px] flex-col gap-[18px]">
-            <p className="text-xl leading-[1.55] text-ink-secondary">
+          <div className="mt-4 flex max-w-[620px] flex-col gap-3">
+            <p className="text-base leading-[1.6] text-ink-secondary">
               Agents and tools work with files. Applications need a database.
               Teams need version control.
             </p>
-            <p className="text-xl leading-[1.55] text-ink-secondary">
+            <p className="text-base leading-[1.6] text-ink-secondary">
               Lix combines all three: normal files for tools, SQL rows for apps,
               and version control for every change.
             </p>
           </div>
-          <div className="mt-10 flex flex-wrap items-center gap-3.5">
+          <div className="mt-6 flex flex-wrap items-center gap-3">
             <CopyInstallButton background="white" />
             <a
               href="/docs/what-is-lix"
-              className="flex h-12 items-center rounded-lg bg-ink px-5 text-[14.5px] font-semibold text-paper transition-colors hover:text-paper"
+              className="flex h-10 items-center rounded-lg bg-ink px-4 text-[13.5px] font-semibold text-paper transition-colors hover:text-paper"
             >
               Read the docs
             </a>
@@ -432,24 +432,24 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         </section>
 
         {/* Stats */}
-        <section className="mt-[84px] flex flex-wrap gap-14 border-y border-line py-7">
-          <div className="flex flex-col gap-1.5">
-            <span className="text-3xl font-bold leading-none tracking-[-0.02em]">
+        <section className="mt-12 flex flex-wrap gap-10 border-y border-line py-5">
+          <div className="flex flex-col gap-1">
+            <span className="text-[22px] font-bold leading-none tracking-[-0.02em]">
               {coarseWeeklyDownloads()}
             </span>
-            <span className="text-sm text-ink-muted">weekly downloads</span>
+            <span className="text-[13px] text-ink-muted">weekly downloads</span>
           </div>
           {githubStars !== null && (
             <a
               href="https://github.com/opral/lix"
               target="_blank"
               rel="noopener noreferrer"
-              className="group flex flex-col gap-1.5"
+              className="group flex flex-col gap-1"
             >
-              <span className="text-3xl font-bold leading-none tracking-[-0.02em] transition-colors group-hover:text-cyan-deep">
+              <span className="text-[22px] font-bold leading-none tracking-[-0.02em] transition-colors group-hover:text-cyan-deep">
                 {githubStars.toLocaleString("en-US")}
               </span>
-              <span className="text-sm text-ink-muted">GitHub stars</span>
+              <span className="text-[13px] text-ink-muted">GitHub stars</span>
             </a>
           )}
         </section>
@@ -458,23 +458,23 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         <DownloadsChart />
 
         {/* What you get */}
-        <section className="pt-24">
-          <h2 className="mb-1 text-[34px] font-bold tracking-[-0.028em]">
+        <section className="pt-14">
+          <h2 className="mb-1 text-[22px] font-bold tracking-[-0.02em]">
             What you get
           </h2>
-          <div className="mt-9">
+          <div className="mt-5">
             {whatYouGet.map((item, index) => (
               <div
                 key={item.title}
-                className={`grid grid-cols-1 items-center gap-4 border-t border-line py-5 sm:grid-cols-[104px_224px_1fr] sm:gap-8 ${
+                className={`grid grid-cols-1 items-center gap-3 border-t border-line py-3 sm:grid-cols-[84px_210px_1fr] sm:gap-7 ${
                   index === whatYouGet.length - 1 ? "border-b" : ""
                 }`}
               >
                 {item.icon}
-                <span className="text-[17px] font-semibold tracking-[-0.01em]">
+                <span className="text-[15px] font-semibold tracking-[-0.01em]">
                   {item.title}
                 </span>
-                <span className="text-[17px] leading-[1.6] text-ink-secondary">
+                <span className="text-[15px] leading-[1.6] text-ink-secondary">
                   {item.description}
                 </span>
               </div>
@@ -484,22 +484,22 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
 
         {/* README */}
         {readmeHtml && (
-          <section className="pt-[88px]">
+          <section className="pt-14">
             <div className="overflow-hidden rounded-xl border border-line bg-white">
-              <div className="flex flex-wrap items-center justify-between gap-5 border-b border-line-soft bg-[#FDFCFA] px-7 py-3.5">
-                <span className="font-mono text-[12.5px] text-ink-faint">
+              <div className="flex flex-wrap items-center justify-between gap-5 border-b border-line-soft bg-[#FDFCFA] px-7 py-2.5">
+                <span className="font-mono text-xs text-ink-faint">
                   README.md · opral/lix
                 </span>
                 <a
                   href="https://github.com/opral/lix"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="font-mono text-[12.5px] text-ink-muted transition-colors hover:text-cyan-deep"
+                  className="font-mono text-xs text-ink-muted transition-colors hover:text-cyan-deep"
                 >
                   view on GitHub →
                 </a>
               </div>
-              <div className="px-6 pb-12 pt-10 sm:px-12">
+              <div className="px-6 pb-10 pt-8 sm:px-10">
                 <article
                   className="markdown-wc-body"
                   dangerouslySetInnerHTML={{ __html: readmeHtml }}
@@ -510,13 +510,13 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         )}
 
         {/* CTA */}
-        <section className="pb-[104px] pt-24">
-          <div className="flex flex-wrap items-center justify-between gap-10 rounded-xl border border-line bg-white px-6 py-11 sm:px-12">
-            <div className="flex flex-col gap-2.5">
-              <h2 className="text-[26px] font-bold tracking-[-0.025em]">
+        <section className="pb-16 pt-14">
+          <div className="flex flex-wrap items-center justify-between gap-8 rounded-xl border border-line bg-white px-6 py-7 sm:px-10">
+            <div className="flex flex-col gap-1.5">
+              <h2 className="text-[19px] font-bold tracking-[-0.02em]">
                 Start with the SDK
               </h2>
-              <p className="text-base text-ink-muted">
+              <p className="text-[14.5px] text-ink-muted">
                 MIT licensed. Runs in the browser and on the server.
               </p>
             </div>
