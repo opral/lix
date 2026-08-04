@@ -434,7 +434,12 @@ where
         .reader(store.clone())
         .scan()
         .await?;
-    let mut roots = crate::live_state::untracked_json_refs(&store)
+    let mut controlled_branches = controls
+        .iter()
+        .map(|(branch_id, _)| branch_id.clone())
+        .collect::<BTreeSet<_>>();
+    controlled_branches.insert(crate::GLOBAL_BRANCH_ID.to_owned());
+    let mut roots = crate::live_state::untracked_json_refs(&store, &controlled_branches)
         .await?
         .into_iter()
         .map(GcRoot::CurrentPayload)
@@ -462,10 +467,10 @@ where
     // maintenance work, but delta rows have no shared ownership and must be
     // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    // Old serving generations are derived data. Removing them in the same
-    // atomic sweep as their untracked payload-root withdrawal prevents stale
-    // branch generations from accumulating indefinitely.
-    let stale_untracked_refs = TrackedHeadContext::new()
+    // Old tracked serving generations are derived data. Untracked payload
+    // ownership is branch-stable and is discovered only from its authoritative
+    // row plane above.
+    TrackedHeadContext::new()
         .stage_collect_stale_current_state_generations(&store, writes, &controls)
         .await?;
     // The changelog plan contains every payload reachable from tracked
@@ -480,19 +485,13 @@ where
         .map(|json_ref| *json_ref.as_hash_array())
         .collect::<BTreeSet<_>>();
     // `collect_garbage` already staged deletes for dead changelog payloads.
-    // Avoid emitting a second mutation for a content hash shared with a stale
-    // untracked generation; `StorageWriteSet` deliberately rejects duplicate
-    // final mutations, even when both are deletes.
     let changelog_swept_payloads = changelog_plan
         .sweep
         .json_payloads
         .iter()
         .map(|json_ref| *json_ref.as_hash_array())
         .collect::<BTreeSet<_>>();
-    let mut reclaimable_untracked_refs = stale_untracked_refs
-        .into_iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
+    let mut reclaimable_untracked_refs = BTreeSet::new();
     let mut consumed_candidate_keys = Vec::new();
     for candidate in JsonStoreContext::new()
         .scan_untracked_reclaim_candidates(&store)

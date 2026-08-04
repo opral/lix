@@ -2661,7 +2661,6 @@ mod tests {
                     &std::collections::BTreeSet::new(),
                     Some(parent_rows),
                     None,
-                    None,
                     &mut working_diff_coverage,
                 )
                 .await
@@ -2728,22 +2727,15 @@ mod tests {
                     columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
-            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
-            TrackedHeadContext::new()
-                .writer(&read, &mut writes)
-                .stage_current_state_with_working_diff(
-                    &branch_id,
-                    Some(control.generation),
-                    control.head_commit_id,
-                    &deltas,
-                    &std::collections::BTreeSet::new(),
-                    None,
-                    None,
-                    None,
-                    &mut working_diff_coverage,
-                )
-                .await
-                .expect("test untracked current state should stage");
+            crate::live_state::stage_untracked_deltas(
+                &read,
+                &mut writes,
+                &branch_id,
+                &deltas,
+                &vec![false; deltas.len()],
+            )
+            .await
+            .expect("test untracked current state should stage");
             crate::branch::stage_branch_head_control(
                 &mut writes,
                 &branch_id,

@@ -433,7 +433,7 @@ fn entity_columnar_mask_error(message: &str) -> LixError {
 fn direct_entity_snapshot_request(request: &LiveStateScanRequest) -> bool {
     matches!(request.filter.rows, LiveStateRowFilter::All)
         && !request.filter.include_tombstones
-        && request.filter.untracked.is_none()
+        && request.filter.untracked == Some(false)
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
 }

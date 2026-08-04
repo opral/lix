@@ -3353,6 +3353,41 @@ async fn stage_tracked_head(
         "lix.perf.materialization.tracked_head.lifecycle"
     ))
     .await?;
+    // Validate the complete tracked/untracked final lane before the first
+    // untracked write is staged.  The read is the transaction opening
+    // snapshot; pending rows are overlaid in their final order so an atomic
+    // tracked<->untracked replacement is legal while a live/live collision is
+    // rejected in either direction.
+    let collision_branches = state_rows
+        .iter()
+        .map(|row| row.branch_id.as_str())
+        .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
+        .chain(
+            tracked_roots
+                .iter()
+                .filter(|root| root.publish_head)
+                .map(|root| root.branch_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    for branch_id in collision_branches {
+        let selected_change_batches = tracked_roots
+            .iter()
+            .find(|root| root.publish_head && root.branch_id == branch_id)
+            .and_then(|root| staged_commits.get(&root.commit_id))
+            .map(|staged| staged.selected_change_batches.as_slice())
+            .unwrap_or_default();
+        reject_final_lane_tracked_untracked_collisions(
+            read,
+            branch_id,
+            observations
+                .get(branch_id)
+                .and_then(|observation| observation.control),
+            selected_change_batches,
+            state_rows,
+            engine_rows,
+        )
+        .await?;
+    }
     // History-free rows have one branch-stable physical owner. Stage them
     // before tracked publication so no commit/generation path can absorb or
     // copy them into HOT state.
@@ -3574,7 +3609,6 @@ async fn stage_tracked_head(
                     certified_fresh_plugin_file_id,
                 )
             };
-        reject_untracked_absence_guard_collisions(read, &root.branch_id, &absence_guards).await?;
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (_, Some(control)) if is_checkpoint_publication => Some(control.generation),
             (Some(parent_commit_id), Some(control))
@@ -3584,18 +3618,6 @@ async fn stage_tracked_head(
             }
             _ => None,
         };
-
-        if !staged.selected_change_batches.is_empty() {
-            reject_selected_tracked_refs_with_untracked_rows(
-                read,
-                &root.branch_id,
-                parent_control,
-                &staged.selected_change_batches,
-                state_rows,
-                engine_rows,
-            )
-            .await?;
-        }
 
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
             let generation =
@@ -3965,7 +3987,6 @@ async fn stage_tracked_head(
                     }),
             );
         }
-        reject_untracked_delta_collisions(read, &root.branch_id, &tracked_deltas).await?;
         let mut durable_predecessors = state_row_indices
             .iter()
             .filter_map(|&row_index| {
@@ -4107,7 +4128,6 @@ async fn stage_tracked_head(
                     &deltas,
                     &absence_guards,
                     None,
-                    None,
                     working_diff_capture_checkpoint_commit_id,
                     &mut coverage,
                     certified_fresh_plugin_file_id,
@@ -4126,7 +4146,6 @@ async fn stage_tracked_head(
                 &deltas,
                 &durable_predecessors,
                 &owned_absence_guards,
-                None,
                 None,
                 working_diff_capture_checkpoint_commit_id,
                 &mut coverage,
@@ -4294,69 +4313,15 @@ fn packed_current_base_guards_match(
     delta_identities == guard_identities
 }
 
-async fn reject_untracked_absence_guard_collisions(
-    read: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    guards: &[TrackedStateKeyRef<'_>],
-) -> Result<(), LixError> {
-    if guards.is_empty() {
-        return Ok(());
-    }
-    let request = crate::live_state::LiveStateExactBatchRequest {
-        rows: guards
-            .iter()
-            .map(|guard| crate::live_state::LiveStateExactRowRequest {
-                schema_key: guard.schema_key.to_owned(),
-                branch_id: branch_id.to_owned(),
-                entity_pk: guard.entity_pk.clone(),
-                file_id: guard.file_id.map(str::to_owned),
-            })
-            .collect(),
-        untracked: Some(true),
-        ..crate::live_state::LiveStateExactBatchRequest::default()
-    };
-    let visible = [branch_id.to_owned()].into_iter().collect();
-    let existing = crate::live_state::load_untracked_exact_batch(read, &request, &visible).await?;
-    if let Some((guard, _)) = guards
-        .iter()
-        .zip(existing.into_rows())
-        .find(|(_, row)| row.is_some())
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNIQUE,
-            format!(
-                "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
-                guard.schema_key, guard.entity_pk,
-            ),
-        ));
-    }
-    Ok(())
-}
-
-async fn reject_untracked_delta_collisions(
-    read: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    deltas: &[crate::live_state::CurrentStateDeltaRef<'_>],
-) -> Result<(), LixError> {
-    let guards = deltas
-        .iter()
-        .map(|delta| TrackedStateKeyRef {
-            schema_key: delta.schema_key,
-            entity_pk: delta.entity_pk,
-            file_id: delta.file_id,
-        })
-        .collect::<Vec<_>>();
-    reject_untracked_absence_guard_collisions(read, branch_id, &guards).await
-}
-
-/// A selected historical change becomes visible through a newly materialized
-/// hot generation while branch-stable untracked state remains independently
-/// visible. The two retention modes must never own the same logical identity.
+/// Validates the final tracked/untracked identity ownership for one branch
+/// before any current-state write is staged.
 ///
-/// This is a merge/checkpoint lifecycle fence, not a normal CRUD-path check.
-/// Point-loading only the selected identities keeps large untracked workspaces
-/// out of the publication cost.
-async fn reject_selected_tracked_refs_with_untracked_rows(
+/// Both planes are checked against the same opening read. Pending rows are
+/// applied as final values, so a same-batch tombstone can make an atomic
+/// ownership transition legal, while two live owners fail closed. Exact-owner
+/// reads intentionally do not project the global branch into a local branch:
+/// local shadowing of global state is a supported identity.
+async fn reject_final_lane_tracked_untracked_collisions(
     read: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     control: Option<BranchHeadControl>,
@@ -4364,64 +4329,141 @@ async fn reject_selected_tracked_refs_with_untracked_rows(
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
 ) -> Result<(), LixError> {
-    let selected_identities = selected_changes(selected_change_batches)
-        .map(|change_ref| TrackedStateKey {
-            schema_key: change_ref.schema_key().to_owned(),
-            file_id: change_ref.file_id().map(str::to_owned),
-            entity_pk: change_ref.entity_pk().clone(),
-        })
-        .collect::<BTreeSet<_>>();
-    if selected_identities.is_empty() {
-        return Ok(());
+    let mut tracked_pending = BTreeMap::<TrackedStateKey, bool>::new();
+    let mut untracked_pending = BTreeMap::<TrackedStateKey, bool>::new();
+    for row in state_rows
+        .iter()
+        .filter(|row| row.branch_id == branch_id && row.schema_key != BRANCH_REF_SCHEMA_KEY)
+    {
+        let identity = TrackedStateKey {
+            schema_key: row.schema_key.to_string(),
+            file_id: row.file_id.map(ToString::to_string),
+            entity_pk: row.entity_pk.clone(),
+        };
+        if row.untracked {
+            untracked_pending.insert(identity, row.snapshot.is_some());
+        } else {
+            tracked_pending.insert(identity, row.snapshot.is_some());
+        }
+    }
+    for row in engine_rows.iter().filter(|row| row.branch_id == branch_id) {
+        let identity = TrackedStateKey {
+            schema_key: row.change.schema_key.clone(),
+            file_id: row.change.file_id.clone(),
+            entity_pk: row.change.entity_pk.clone(),
+        };
+        untracked_pending.insert(
+            identity,
+            row.change.snapshot != crate::json_store::JsonSlot::None,
+        );
+    }
+    for change_ref in selected_changes(selected_change_batches) {
+        tracked_pending.insert(
+            TrackedStateKey {
+                schema_key: change_ref.schema_key().to_owned(),
+                file_id: change_ref.file_id().map(str::to_owned),
+                entity_pk: change_ref.entity_pk().clone(),
+            },
+            !change_ref.deleted,
+        );
     }
 
-    let selected_keys = selected_identities.iter().cloned().collect::<Vec<_>>();
-    let mut untracked_identities = if control.is_some() {
+    for (identity, tracked_live) in &tracked_pending {
+        if *tracked_live && untracked_pending.get(identity) == Some(&true) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "tracked/untracked identity collision in one batch on branch '{branch_id}' for schema '{}' entity_pk {:?}",
+                    identity.schema_key, identity.entity_pk,
+                ),
+            ));
+        }
+    }
+
+    // Forward proof: every pending tracked live identity must either have a
+    // pending untracked delete or be absent from the exact branch owner.
+    let persisted_untracked_keys = tracked_pending
+        .iter()
+        .filter(|(_, live)| **live)
+        .filter(|(identity, _)| !untracked_pending.contains_key(*identity))
+        .map(|(identity, _)| identity.clone())
+        .collect::<Vec<_>>();
+    if !persisted_untracked_keys.is_empty() {
         let request = crate::live_state::LiveStateExactBatchRequest {
-            rows: selected_keys
+            rows: persisted_untracked_keys
                 .iter()
-                .map(|key| crate::live_state::LiveStateExactRowRequest {
-                    schema_key: key.schema_key.clone(),
+                .map(|identity| crate::live_state::LiveStateExactRowRequest {
+                    schema_key: identity.schema_key.clone(),
                     branch_id: branch_id.to_owned(),
-                    entity_pk: key.entity_pk.clone(),
-                    file_id: key.file_id.clone(),
+                    entity_pk: identity.entity_pk.clone(),
+                    file_id: identity.file_id.clone(),
                 })
                 .collect(),
             untracked: Some(true),
             ..crate::live_state::LiveStateExactBatchRequest::default()
         };
         let visible = [branch_id.to_owned()].into_iter().collect();
-        crate::live_state::load_untracked_exact_batch(read, &request, &visible)
-            .await?
-            .into_rows()
-            .into_iter()
-            .flatten()
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key,
-                file_id: row.file_id,
-                entity_pk: row.entity_pk,
-            })
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
+        let existing =
+            crate::live_state::load_untracked_exact_owner_batch(read, &request, &visible)
+                .await?
+                .into_rows();
+        if let Some((identity, _)) = persisted_untracked_keys
+            .iter()
+            .zip(existing)
+            .find(|(_, row)| row.is_some())
+        {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "tracked/untracked identity collision on branch '{branch_id}' for schema '{}' entity_pk {:?}; delete the untracked row first",
+                    identity.schema_key, identity.entity_pk,
+                ),
+            ));
+        }
+    }
 
-    apply_pending_untracked_identities(
-        &mut untracked_identities,
-        branch_id,
-        state_rows,
-        engine_rows,
-    );
-
-    let Some(identity) = selected_identities
+    // Reverse proof: every pending untracked live identity must either have a
+    // pending tracked tombstone or be absent from the exact tracked owner.
+    let tracked_read_keys = untracked_pending
         .iter()
-        .find(|identity| untracked_identities.contains(*identity))
-    else {
+        .filter(|(_, live)| **live)
+        .filter(|(identity, _)| !tracked_pending.contains_key(*identity))
+        .map(|(identity, _)| identity.clone())
+        .collect::<Vec<_>>();
+    let Some(control) = control else {
         return Ok(());
     };
-    Err(selected_tracked_ref_untracked_collision_error(
-        branch_id, identity,
-    ))
+    if tracked_read_keys.is_empty() {
+        return Ok(());
+    }
+    let tracked_refs = tracked_read_keys
+        .iter()
+        .map(|identity| TrackedStateKeyRef {
+            schema_key: identity.schema_key.as_str(),
+            file_id: identity.file_id.as_deref(),
+            entity_pk: &identity.entity_pk,
+        })
+        .collect::<Vec<_>>();
+    let projection = ChangeRecordProjection::full();
+    let tracked = TrackedHeadContext::new()
+        .reader(read)
+        .load_projected_live_batch_refs(branch_id, control, &tracked_refs, &projection)
+        .await?
+        .into_rows();
+    if let Some((identity, _)) = tracked_read_keys
+        .iter()
+        .zip(tracked)
+        .find(|(_, row)| row.as_ref().is_some_and(|row| !row.deleted))
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "tracked/untracked identity collision on branch '{branch_id}' for schema '{}' entity_pk {:?}; delete the tracked row first",
+                identity.schema_key, identity.entity_pk,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Applies the transaction's history-free mutations to an identity set.
@@ -4461,27 +4503,6 @@ fn apply_pending_untracked_identities(
             identities.insert(identity);
         }
     }
-}
-
-fn selected_tracked_ref_untracked_collision_error(
-    branch_id: &str,
-    identity: &TrackedStateKey,
-) -> LixError {
-    LixError::new(
-        LixError::CODE_MERGE_CONFLICT,
-        format!(
-            "cannot publish selected tracked change on branch '{branch_id}': it conflicts with an untracked current row for schema '{}' entity_pk {:?}",
-            identity.schema_key, identity.entity_pk
-        ),
-    )
-    .with_hint("Resolve the tracked and untracked identity conflict before retrying.")
-    .with_details(serde_json::json!({
-        "kind": "trackedUntrackedIdentityCollision",
-        "branchId": branch_id,
-        "schemaKey": &identity.schema_key,
-        "entityPk": &identity.entity_pk,
-        "fileId": &identity.file_id,
-    }))
 }
 
 /// A checkpoint cleans exactly its selected interval changes in the current

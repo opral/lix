@@ -494,7 +494,6 @@ where
                     &tracked_head_deltas,
                     &absence_guards,
                     None,
-                    None,
                     Some(plan.commit.id),
                     &mut working_diff_coverage,
                 )

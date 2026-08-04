@@ -50,8 +50,8 @@ pub(crate) use types::{
 };
 #[allow(unused_imports)]
 pub(crate) use untracked_state::{
-    UNTRACKED_ROW_SPACE, load_untracked_exact_batch, scan_untracked_batch, stage_untracked_deltas,
-    untracked_json_refs,
+    UNTRACKED_ROW_SPACE, load_untracked_exact_batch, load_untracked_exact_owner_batch,
+    scan_untracked_batch, stage_untracked_deltas, untracked_json_refs,
 };
 #[cfg(any(test, feature = "storage-benches"))]
 #[allow(unused_imports)]

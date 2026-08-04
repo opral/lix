@@ -32,13 +32,10 @@ use crate::storage_adapter::{
 };
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
-// Provisional replay IDs. Final allocation is deferred until the frozen
-// one-layout storage catalog is available for collision review.
 pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0033), "live_state.untracked_row.v1");
 
-const VALUE_VERSION: u8 = 1;
-const FLAG_GLOBAL: u8 = 1;
+const VALUE_VERSION: u8 = 2;
 const SLOT_NONE: u8 = 0;
 const SLOT_REF: u8 = 1;
 const SLOT_INLINE: u8 = 2;
@@ -148,6 +145,20 @@ pub(crate) async fn stage_untracked_deltas(
             "untracked known-absent flags do not align with deltas",
         ));
     }
+    let mut physical_identities = BTreeSet::new();
+    for delta in deltas.iter().filter(|delta| delta.untracked) {
+        let key = StorageKey(Bytes::from(encode_key(
+            branch_id,
+            delta.schema_key,
+            delta.file_id,
+            delta.entity_pk,
+        )?));
+        if !physical_identities.insert(key) {
+            return Err(codec_error(
+                "untracked batch contains a duplicate physical identity without a certified canonical last-write-wins reduction",
+            ));
+        }
+    }
     let mut mutations = BTreeMap::<StorageKey, Option<StorageValue>>::new();
     let mut retired_refs = BTreeSet::new();
     let untracked = deltas
@@ -206,7 +217,7 @@ pub(crate) async fn stage_untracked_deltas(
             mutations.insert(
                 key,
                 Some(StorageValue {
-                    bytes: Bytes::from(encode_value(branch_id, *delta, created_at)?),
+                    bytes: Bytes::from(encode_value(*delta, created_at)?),
                 }),
             );
         }
@@ -266,10 +277,11 @@ async fn stage_file_cascade_from_pages(
 ) -> Result<(), LixError> {
     #[cfg(any(test, feature = "storage-benches"))]
     record_authoritative_branch_scan();
+    let prefix = branch_prefix(branch_id)?;
     let plan = ScanPlan::prefix(
         UNTRACKED_ROW_SPACE,
         StoragePrefix {
-            bytes: Bytes::from(branch_prefix(branch_id)?),
+            bytes: Bytes::copy_from_slice(&prefix),
         },
     );
     let mut resume_after = None;
@@ -286,6 +298,7 @@ async fn stage_file_cascade_from_pages(
         #[cfg(any(test, feature = "storage-benches"))]
         record_authoritative_page();
         let next_cursor = validate_scan_page_progress(
+            &prefix,
             resume_after.as_ref(),
             page.value.entries.iter().map(|entry| &entry.key),
             page.value.has_more,
@@ -330,6 +343,7 @@ async fn stage_file_cascade_from_pages(
 }
 
 fn validate_scan_page_progress<'a>(
+    prefix: &[u8],
     resume_after: Option<&StorageKey>,
     keys: impl IntoIterator<Item = &'a StorageKey>,
     has_more: bool,
@@ -343,11 +357,17 @@ fn validate_scan_page_progress<'a>(
         }
         return Ok(None);
     };
+    if !first.0.starts_with(prefix) {
+        return Err(codec_error("untracked scan escaped its requested prefix"));
+    }
     if resume_after.is_some_and(|cursor| first <= cursor) {
         return Err(codec_error("untracked cascade scan cursor did not advance"));
     }
     let mut last = first;
     for key in keys {
+        if !key.0.starts_with(prefix) {
+            return Err(codec_error("untracked scan escaped its requested prefix"));
+        }
         if key <= last {
             return Err(codec_error(
                 "untracked cascade scan keys are not strictly increasing",
@@ -356,42 +376,6 @@ fn validate_scan_page_progress<'a>(
         last = key;
     }
     Ok(Some(last.clone()))
-}
-
-async fn scan_raw_prefix(
-    store: &(impl StorageAdapterRead + ?Sized),
-    prefix: &[u8],
-) -> Result<Vec<(StorageKey, Bytes)>, LixError> {
-    let plan = ScanPlan::prefix(
-        UNTRACKED_ROW_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(prefix),
-        },
-    );
-    let mut rows = Vec::new();
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let StorageProjectedValue::FullValue(value) = entry.value else {
-                return Err(codec_error("untracked scan omitted its row value"));
-            };
-            rows.push((entry.key, value));
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(rows)
 }
 
 pub(crate) async fn scan_untracked_batch(
@@ -445,17 +429,27 @@ async fn load_untracked_entities(
     branch_ids: &[String],
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     let mut decoded = Vec::new();
+    let requested = request.filter.entity_pks.iter().collect::<BTreeSet<_>>();
     for branch_id in branch_ids {
         for schema_key in &request.filter.schema_keys {
-            for entity_pk in &request.filter.entity_pks {
-                scan_prefix(
-                    store,
-                    &entity_prefix(branch_id, schema_key, entity_pk)?,
-                    request,
-                    &mut decoded,
-                )
-                .await?;
-            }
+            // The entity component is not the leading physical key. One
+            // schema-prefix scan is therefore the bounded generic candidate
+            // route for a homogeneous batch; filter the requested identities
+            // from that one ordered stream instead of issuing one scan per
+            // entity. The authoritative row space remains the sole source.
+            let mut schema_rows = Vec::new();
+            scan_prefix(
+                store,
+                &schema_prefix(branch_id, schema_key)?,
+                request,
+                &mut schema_rows,
+            )
+            .await?;
+            decoded.extend(
+                schema_rows
+                    .into_iter()
+                    .filter(|row| requested.contains(&row.entity_pk)),
+            );
         }
     }
     materialize_rows(store, decoded).await
@@ -509,8 +503,12 @@ async fn load_untracked_points(
         .value;
     let mut decoded = Vec::new();
     for (key, value) in keys.into_iter().zip(values) {
-        let Some(StorageProjectedValue::FullValue(value)) = value else {
-            continue;
+        let value = match value {
+            None => continue,
+            Some(StorageProjectedValue::FullValue(value)) => value,
+            Some(StorageProjectedValue::KeyOnly) => {
+                return Err(codec_error("untracked point read omitted its row value"));
+            }
         };
         let identity = decode_key(&key.0)?;
         if matches_filter(&identity, request) {
@@ -531,7 +529,29 @@ pub(crate) async fn load_untracked_exact_batch(
     request: &LiveStateExactBatchRequest,
     visible_branch_ids: &BTreeSet<String>,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-    let mut keys = Vec::with_capacity(request.rows.len().saturating_mul(2));
+    load_untracked_exact_batch_inner(store, request, visible_branch_ids, true).await
+}
+
+pub(crate) async fn load_untracked_exact_owner_batch(
+    store: &(impl StorageAdapterRead + ?Sized),
+    request: &LiveStateExactBatchRequest,
+    visible_branch_ids: &BTreeSet<String>,
+) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    load_untracked_exact_batch_inner(store, request, visible_branch_ids, false).await
+}
+
+async fn load_untracked_exact_batch_inner(
+    store: &(impl StorageAdapterRead + ?Sized),
+    request: &LiveStateExactBatchRequest,
+    visible_branch_ids: &BTreeSet<String>,
+    include_global_fallback: bool,
+) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    let mut keys = Vec::with_capacity(
+        request
+            .rows
+            .len()
+            .saturating_mul(if include_global_fallback { 2 } else { 1 }),
+    );
     let mut requested_key_pairs = Vec::with_capacity(request.rows.len());
     for row in &request.rows {
         if !visible_branch_ids.contains(&row.branch_id) {
@@ -546,9 +566,7 @@ pub(crate) async fn load_untracked_exact_batch(
         )?));
         let branch_index = keys.len();
         keys.push(branch);
-        let global_index = if row.branch_id == GLOBAL_BRANCH_ID {
-            branch_index
-        } else {
+        let global_index = if include_global_fallback && row.branch_id != GLOBAL_BRANCH_ID {
             let index = keys.len();
             keys.push(StorageKey(Bytes::from(encode_key(
                 GLOBAL_BRANCH_ID,
@@ -556,14 +574,26 @@ pub(crate) async fn load_untracked_exact_batch(
                 row.file_id.as_deref(),
                 &row.entity_pk,
             )?)));
-            index
+            Some(index)
+        } else {
+            None
         };
         requested_key_pairs.push(Some((branch_index, global_index)));
     }
     let values = PointReadPlan::new(UNTRACKED_ROW_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
-        .value;
+        .value
+        .into_iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some(StorageProjectedValue::FullValue(value)) => decode_value(value).map(Some),
+            Some(StorageProjectedValue::KeyOnly) => {
+                Err(codec_error("untracked exact read omitted its row value"))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = values;
     let mut decoded = Vec::new();
     let mut selected = Vec::with_capacity(request.rows.len());
     for (requested, pair) in request.rows.iter().zip(requested_key_pairs) {
@@ -571,20 +601,22 @@ pub(crate) async fn load_untracked_exact_batch(
             selected.push(None);
             continue;
         };
-        let chosen = values[branch_index]
-            .as_ref()
-            .or_else(|| values[global_index].as_ref());
-        let Some(StorageProjectedValue::FullValue(value)) = chosen else {
+        let branch_value = values[branch_index].take();
+        let chosen_global = branch_value.is_none()
+            && global_index.is_some_and(|global_index| values[global_index].is_some());
+        let chosen = branch_value
+            .or_else(|| global_index.and_then(|global_index| values[global_index].take()));
+        let Some(value) = chosen else {
             selected.push(None);
             continue;
         };
-        let (branch_id, branch_override) = if values[branch_index].is_some() {
-            (requested.branch_id.clone(), None)
-        } else {
+        let (branch_id, branch_override) = if chosen_global {
             (
                 GLOBAL_BRANCH_ID.to_owned(),
                 Some(requested.branch_id.clone()),
             )
+        } else {
+            (requested.branch_id.clone(), None)
         };
         let index = decoded.len();
         decoded.push(DecodedRow {
@@ -592,7 +624,7 @@ pub(crate) async fn load_untracked_exact_batch(
             schema_key: requested.schema_key.clone(),
             file_id: requested.file_id.clone(),
             entity_pk: requested.entity_pk.clone(),
-            value: decode_value(value.clone())?,
+            value,
         });
         selected.push(Some((index, branch_override)));
     }
@@ -611,10 +643,51 @@ pub(crate) async fn load_untracked_exact_batch(
 
 pub(crate) async fn untracked_json_refs(
     store: &(impl StorageAdapterRead + ?Sized),
+    controlled_branches: &BTreeSet<String>,
 ) -> Result<Vec<JsonRef>, LixError> {
     let mut refs = BTreeSet::new();
-    for (_, value) in scan_raw_prefix(store, &[]).await? {
-        collect_value_refs(&decode_value(value)?, &mut refs);
+    let plan = ScanPlan::prefix(
+        UNTRACKED_ROW_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        let next_cursor = validate_scan_page_progress(
+            &[],
+            resume_after.as_ref(),
+            page.value.entries.iter().map(|entry| &entry.key),
+            page.value.has_more,
+        )?;
+        for entry in page.value.entries {
+            let identity = decode_key(&entry.key.0)?;
+            if identity.branch_id != GLOBAL_BRANCH_ID
+                && !controlled_branches.contains(&identity.branch_id)
+            {
+                return Err(codec_error(format!(
+                    "untracked row belongs to orphan branch '{}'",
+                    identity.branch_id
+                )));
+            }
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(codec_error("untracked GC scan omitted its row value"));
+            };
+            collect_value_refs(&decode_value(value)?, &mut refs);
+        }
+        if !page.value.has_more {
+            break;
+        }
+        resume_after = next_cursor;
     }
     Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
 }
@@ -642,26 +715,33 @@ async fn scan_prefix(
                 },
             )
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        let next_cursor = validate_scan_page_progress(
+            prefix,
+            resume_after.as_ref(),
+            page.value.entries.iter().map(|entry| &entry.key),
+            page.value.has_more,
+        )?;
         for entry in page.value.entries {
             let identity = decode_key(&entry.key.0)?;
-            if !matches_filter(&identity, request) {
-                continue;
-            }
             let StorageProjectedValue::FullValue(value) = entry.value else {
                 return Err(codec_error("untracked scan omitted its row value"));
             };
+            let value = decode_value(value)?;
+            if !matches_filter(&identity, request) {
+                continue;
+            }
             decoded.push(DecodedRow {
                 branch_id: identity.branch_id,
                 schema_key: identity.schema_key,
                 file_id: identity.file_id,
                 entity_pk: identity.entity_pk,
-                value: decode_value(value)?,
+                value,
             });
         }
         if !page.value.has_more {
             break;
         }
+        resume_after = next_cursor;
     }
     Ok(())
 }
@@ -717,7 +797,7 @@ async fn materialize_rows(
             deleted: false,
             created_at: row.value.created_at,
             updated_at: row.value.updated_at,
-            global: row.value.global,
+            global: row.branch_id == GLOBAL_BRANCH_ID,
             change_id: None,
             commit_id: None,
             untracked: true,
@@ -764,7 +844,6 @@ struct DecodedRow {
 struct DecodedValue {
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    global: bool,
     snapshot: DecodedSlot,
     metadata: DecodedSlot,
 }
@@ -812,17 +891,6 @@ fn branch_prefix(branch_id: &str) -> Result<Vec<u8>, LixError> {
 fn schema_prefix(branch_id: &str, schema_key: &str) -> Result<Vec<u8>, LixError> {
     let mut out = branch_prefix(branch_id)?;
     push_text(&mut out, schema_key)?;
-    Ok(out)
-}
-
-fn entity_prefix(
-    branch_id: &str,
-    schema_key: &str,
-    entity_pk: &EntityPk,
-) -> Result<Vec<u8>, LixError> {
-    let mut out = schema_prefix(branch_id, schema_key)?;
-    let entity_pk = crate::storage_codec::encode("untracked entity key", entity_pk)?;
-    push_bytes(&mut out, &entity_pk)?;
     Ok(out)
 }
 
@@ -879,17 +947,11 @@ fn read_text(bytes: &[u8], offset: &mut usize, field: &str) -> Result<String, Li
 }
 
 fn encode_value(
-    branch_id: &str,
     delta: CurrentStateDeltaRef<'_>,
     created_at: LixTimestamp,
 ) -> Result<Vec<u8>, LixError> {
-    let mut out = Vec::with_capacity(18 + slot_len(delta.snapshot) + slot_len(delta.metadata));
+    let mut out = Vec::with_capacity(17 + slot_len(delta.snapshot) + slot_len(delta.metadata));
     out.push(VALUE_VERSION);
-    out.push(if branch_id == GLOBAL_BRANCH_ID {
-        FLAG_GLOBAL
-    } else {
-        0
-    });
     out.extend_from_slice(&created_at.packed().to_le_bytes());
     out.extend_from_slice(&delta.updated_at.packed().to_le_bytes());
     encode_slot(&mut out, delta.snapshot)?;
@@ -930,7 +992,6 @@ fn decode_value(bytes: Bytes) -> Result<DecodedValue, LixError> {
             "untracked row has an unsupported value version",
         ));
     }
-    let flags = take(&bytes, &mut offset, 1, "value flags")?[0];
     let created_at = LixTimestamp::from_packed(u64::from_le_bytes(
         take(&bytes, &mut offset, 8, "created_at")?
             .try_into()
@@ -951,7 +1012,6 @@ fn decode_value(bytes: Bytes) -> Result<DecodedValue, LixError> {
     Ok(DecodedValue {
         created_at,
         updated_at,
-        global: flags & FLAG_GLOBAL != 0,
         snapshot,
         metadata,
     })
@@ -1168,6 +1228,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_physical_identity_is_rejected_before_staging() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let entity_pk = EntityPk::single("duplicate");
+        let first = untracked(
+            "schema-duplicate",
+            Some("file"),
+            &entity_pk,
+            "{\"v\":1}",
+            timestamp(),
+        );
+        let second = untracked(
+            "schema-duplicate",
+            Some("file"),
+            &entity_pk,
+            "{\"v\":2}",
+            timestamp(),
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let error = stage_untracked_deltas(
+            &read,
+            &mut writes,
+            "branch-duplicate",
+            &[first, second],
+            &[false, false],
+        )
+        .await
+        .expect_err("duplicate physical identities require an explicit upstream LWW proof");
+        assert!(error.message.contains("duplicate physical identity"));
+        assert!(
+            writes.is_empty(),
+            "duplicate rejection must stage no writes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_root_discovery_rejects_orphan_branch_rows() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let entity_pk = EntityPk::single("orphan");
+        let row = untracked("schema-orphan", None, &entity_pk, "{\"v\":1}", timestamp());
+        let key = StorageKey(Bytes::from(encode_key(
+            "branch-orphan",
+            row.schema_key,
+            row.file_id,
+            row.entity_pk,
+        )?));
+        let value = StorageValue {
+            bytes: Bytes::from(encode_value(row, row.created_at)?),
+        };
+        commit_raw_rows(&storage, vec![(key, value)]).await?;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let error = untracked_json_refs(&read, &BTreeSet::new())
+            .await
+            .expect_err("GC must reject rows whose branch has no durable control");
+        assert!(error.message.contains("orphan branch"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn file_cascade_deletes_multiple_members_and_same_batch_replacements()
     -> Result<(), LixError> {
         let storage = StorageAdapter::new(Memory::new());
@@ -1291,7 +1417,7 @@ mod tests {
         let mut malformed_key = branch_prefix(branch_id)?;
         malformed_key.extend_from_slice(&u32::MAX.to_be_bytes());
         let raw_value = StorageValue {
-            bytes: Bytes::from(encode_value(branch_id, value_delta, now)?),
+            bytes: Bytes::from(encode_value(value_delta, now)?),
         };
         let raw_key = StorageKey(Bytes::from(malformed_key));
         let expected_bytes =
@@ -1353,7 +1479,7 @@ mod tests {
                 (
                     valid_key.clone(),
                     StorageValue {
-                        bytes: Bytes::from(encode_value(branch_id, valid_delta, now)?),
+                        bytes: Bytes::from(encode_value(valid_delta, now)?),
                     },
                 ),
                 (
@@ -1424,7 +1550,6 @@ mod tests {
             )?));
             let value = StorageValue {
                 bytes: Bytes::from(encode_value(
-                    branch_id,
                     untracked(
                         &schema_key,
                         Some(file_id),
@@ -1481,7 +1606,6 @@ mod tests {
         let sample_pk = EntityPk::single("sample");
         let valid_value = StorageValue {
             bytes: Bytes::from(encode_value(
-                branch_id,
                 untracked(
                     "schema-sample",
                     Some("file-other"),
@@ -1562,18 +1686,18 @@ mod tests {
         let c = StorageKey(Bytes::from_static(b"c"));
 
         assert_eq!(
-            validate_scan_page_progress(Some(&a), [&b, &c], true)?,
+            validate_scan_page_progress(b"", Some(&a), [&b, &c], true)?,
             Some(c.clone())
         );
-        assert!(validate_scan_page_progress(Some(&a), [&a], true).is_err());
-        assert!(validate_scan_page_progress(Some(&b), [&a], true).is_err());
-        assert!(validate_scan_page_progress(None, [&a, &a], false).is_err());
-        assert!(validate_scan_page_progress(None, [&b, &a], false).is_err());
+        assert!(validate_scan_page_progress(b"", Some(&a), [&a], true).is_err());
+        assert!(validate_scan_page_progress(b"", Some(&b), [&a], true).is_err());
+        assert!(validate_scan_page_progress(b"", None, [&a, &a], false).is_err());
+        assert!(validate_scan_page_progress(b"", None, [&b, &a], false).is_err());
         assert_eq!(
-            validate_scan_page_progress(None, std::iter::empty(), false)?,
+            validate_scan_page_progress(b"", None, std::iter::empty(), false)?,
             None
         );
-        assert!(validate_scan_page_progress(None, std::iter::empty(), true).is_err());
+        assert!(validate_scan_page_progress(b"", None, std::iter::empty(), true).is_err());
         Ok(())
     }
 
@@ -1592,7 +1716,6 @@ mod tests {
             &row_pk,
         )?));
         let value = Bytes::from(encode_value(
-            branch_id,
             untracked("schema", Some(file_id), &row_pk, r#"{"row":true}"#, now),
             now,
         )?);
