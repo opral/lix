@@ -41,14 +41,15 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V50 is the Arrow-native state-tree hard cut. Commits publish one
+/// V53 is the Arrow-native state-tree hard cut on top of account-attributed
+/// commits. Commits publish one
 /// content-addressed catalog of canonical Arrow leaves; compact event storage
 /// carries authored identity and coordinates only. Older repositories fail
 /// closed instead of invoking a legacy reader, replay, or migration path.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"sparse-current-state-parts.v50";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"arrow-native-state-tree.v53";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -214,12 +215,28 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         checkpoint_marker_snapshot(&main_branch_id)?,
         timestamp,
     );
+    let system_account_change = canonical_change(
+        functions.call_uuid_v7(),
+        EntityPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
+            .expect("system account ID is a canonical UUID"),
+        "lix_account",
+        account_snapshot(crate::SYSTEM_ACCOUNT_ID, "System", "system")?,
+        timestamp,
+    );
+    let anonymous_account_change = canonical_change(
+        functions.call_uuid_v7(),
+        EntityPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
+            .expect("anonymous account ID is a canonical UUID"),
+        "lix_account",
+        account_snapshot(crate::ANONYMOUS_ACCOUNT_ID, "Anonymous", "anonymous")?,
+        timestamp,
+    );
 
     let initial_commit = InitSeedCommit {
         id: initial_commit_id,
         change_id: ChangeId::from(functions.call_uuid_v7()),
         parent_ids: Vec::new(),
-        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
         created_at: timestamp,
     };
     // Keep one distinct public ref change id per initial branch, matching the
@@ -282,6 +299,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
                 main_branch_descriptor_change,
                 kv_lix_id_change,
                 initial_checkpoint_change,
+                system_account_change,
+                anonymous_account_change,
             ])
             .collect(),
         branch_controls: vec![global_branch_control, main_branch_control],
@@ -560,7 +579,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
     ChangeRecord {
         format_version: 1,
         change_id: change.id,
-        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
         entity_pk: change.entity_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
@@ -575,7 +594,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
     ChangeRecord {
         format_version: 2,
         change_id: row.id,
-        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
@@ -718,6 +737,15 @@ fn key_value_snapshot(key: &str, value: &str) -> Result<String, LixError> {
     }))
 }
 
+fn account_snapshot(id: &str, name: &str, kind: &str) -> Result<String, LixError> {
+    encode_snapshot(json!({
+        "id": id,
+        "name": name,
+        "kind": kind,
+        "status": "active",
+    }))
+}
+
 fn checkpoint_marker_snapshot(branch_id: &str) -> Result<String, LixError> {
     encode_snapshot(json!({
         "branch_id": branch_id,
@@ -754,7 +782,7 @@ mod tests {
     fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 4);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 6);
         assert_eq!(plan.untracked_rows.len(), 1);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
@@ -769,10 +797,10 @@ mod tests {
         assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
         assert_eq!(
             plan.commit.change_id.to_string(),
-            test_uuid(seed_schema_definitions().len() + 8)
+            test_uuid(seed_schema_definitions().len() + 10)
         );
         assert!(plan.commit.parent_ids.is_empty());
-        assert_eq!(plan.commit.account_id, crate::ANONYMOUS_ACCOUNT_ID);
+        assert_eq!(plan.commit.account_id, crate::SYSTEM_ACCOUNT_ID);
         assert_eq!(
             plan.commit.created_at.to_string(),
             "2026-01-01T00:00:00.001Z"
@@ -783,7 +811,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 4);
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
         let first_seed_change_id = test_uuid(4);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
@@ -916,7 +944,7 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 4);
+        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
         assert!(
             !change_refs.contains(&record.change_id),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"

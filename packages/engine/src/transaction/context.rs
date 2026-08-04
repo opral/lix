@@ -12761,7 +12761,7 @@ mod tests {
             schema_key: "lix_account".into(),
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(
-                json!({ "name": name }),
+                json!({ "name": name, "kind": "human", "status": "active" }),
             )),
             metadata: None,
             origin: None,
@@ -13083,6 +13083,8 @@ mod tests {
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(json!({
                 "name": "Ada",
+                "kind": "human",
+                "status": "active",
             }))),
             metadata: None,
             origin: None,
