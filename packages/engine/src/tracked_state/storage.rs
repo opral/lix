@@ -89,8 +89,8 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // replacements authoritative through their immutable part manifest. The
 // payload-less certified-reference encoding is intentionally rejected.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA3";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.semantic-authority.v3";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA4";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.semantic-authority.v4";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -99,7 +99,9 @@ const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.sem
 // intentionally rejected rather than interpreted with mixed root semantics.
 // Version 6 binds the scope-run v3 node protocol and shared runtime scope
 // identities. LXCS5 roots cannot be reinterpreted under its content hashes.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS6";
+// Version 7 authenticates the cumulative touched-schema negative certificate.
+// LXCS6 manifests and LXSA3 semantic seals are deliberately incompatible.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS7";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -642,9 +644,12 @@ fn commit_delta_manifest_from_commit_state(manifest: &CommitStateManifest) -> Co
 /// Returns the exact collection scopes touched by a sealed mutation inventory.
 /// `None` means bounds or implicit cascades may affect another scope, in which
 /// case an inherited serving catalog must be discarded fail-closed.
+/// At an empty base, descriptor cascades cannot reach inherited rows, so their
+/// own authored scope remains exact and can seed the cumulative certificate.
 pub(crate) fn commit_state_inventory_exact_touched_scopes(
     commit_id: CommitId,
     inventory: &CommitStateMutationInventory,
+    empty_base: bool,
 ) -> Result<Option<Vec<CommitDeltaReplacementScope>>, LixError> {
     if inventory.selected_source_commit_id.is_some() {
         return Ok(None);
@@ -673,7 +678,7 @@ pub(crate) fn commit_state_inventory_exact_touched_scopes(
         if first.schema_key != last.schema_key || first.file_id != last.file_id {
             return Ok(None);
         }
-        if first.schema_key == "lix_file_descriptor" {
+        if first.schema_key == "lix_file_descriptor" && !empty_base {
             return Ok(None);
         }
         scopes.insert(CommitDeltaReplacementScope {
@@ -686,7 +691,7 @@ pub(crate) fn commit_state_inventory_exact_touched_scopes(
         let mut has_cascade = false;
         visit_commit_delta_leaf(&leaf, commit_id, |_, encoded_key, _| {
             let key = decode_key(encoded_key)?;
-            if key.schema_key == "lix_file_descriptor" {
+            if key.schema_key == "lix_file_descriptor" && !empty_base {
                 has_cascade = true;
             } else {
                 scopes.insert(CommitDeltaReplacementScope {
@@ -739,7 +744,7 @@ async fn load_complete_current_state_values_encoded_inner(
         return Ok(None);
     }
     let Some(_touched_scopes) =
-        commit_state_inventory_exact_touched_scopes(state.commit_id, &state.mutations)?
+        commit_state_inventory_exact_touched_scopes(state.commit_id, &state.mutations, false)?
     else {
         return Ok(None);
     };
@@ -3393,6 +3398,11 @@ pub(crate) fn stage_commit_state_manifest(
             "current-state scoped ranges require canonical publication certification",
         ));
     }
+    if manifest.touched_scope_filter.complete {
+        return Err(replacement_payload_error(
+            "complete touched-scope filters require canonical publication certification",
+        ));
+    }
     stage_commit_state_manifest_bytes(writes, manifest)
 }
 
@@ -3436,6 +3446,11 @@ pub(crate) fn stage_certified_commit_state_manifest(
     if manifest.current_state_scoped_ranges != publication.root() {
         return Err(replacement_payload_error(
             "commit manifest disagrees with its canonical scoped-range publication proof",
+        ));
+    }
+    if &manifest.touched_scope_filter != publication.touched_scope_filter() {
+        return Err(replacement_payload_error(
+            "commit manifest disagrees with its certified touched-scope filter",
         ));
     }
     stage_commit_state_manifest_bytes(writes, manifest)
@@ -10030,6 +10045,7 @@ fn validate_commit_state_manifest_inner(
     }
 
     validate_commit_state_mutation_inventory(manifest.commit_id, &manifest.mutations)?;
+    super::scoped_current_state::validate_touched_scope_filter(&manifest.touched_scope_filter)?;
     validate_current_state_scoped_ranges(manifest, validate_scoped_range_attestation)
 }
 
@@ -10639,6 +10655,7 @@ mod tests {
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
         }
@@ -13673,6 +13690,7 @@ mod tests {
                 inline_part: encode_commit_delta_segment(&[entry]),
                 parts: Vec::new(),
             },
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
         }
@@ -13732,32 +13750,40 @@ mod tests {
         let manifest = commit_state_manifest_fixture();
         let payload = storage_codec::encode("tracked_state commit_state_manifest", &manifest)
             .expect("fixture should encode");
-        for magic in [b"LXCS3".as_slice(), b"LXCS5".as_slice()] {
+        for magic in [
+            b"LXCS3".as_slice(),
+            b"LXCS5".as_slice(),
+            b"LXCS6".as_slice(),
+        ] {
             let mut legacy = magic.to_vec();
             legacy.extend_from_slice(&payload);
             let error = decode_commit_state_manifest(&legacy)
-                .expect_err("the hard cut must reject pre-v6 manifest formats");
+                .expect_err("the hard cut must reject pre-v7 manifest formats");
             assert!(error.message.contains("unsupported format"));
         }
 
-        for magic in [b"LXSA1".as_slice(), b"LXSA2".as_slice()] {
+        for magic in [
+            b"LXSA1".as_slice(),
+            b"LXSA2".as_slice(),
+            b"LXSA3".as_slice(),
+        ] {
             let mut legacy_seal = magic.to_vec();
             legacy_seal.extend_from_slice(&[0; TRACKED_STATE_HASH_BYTES]);
             legacy_seal.extend_from_slice(&payload);
             let error = super::decode_commit_state_semantic_authority(&legacy_seal)
-                .expect_err("the hard cut must reject pre-v3 semantic seals");
+                .expect_err("the hard cut must reject pre-v4 semantic seals");
             assert!(error.message.contains("unsupported format"));
         }
 
         let legacy_digest =
-            blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v2")
+            blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v3")
                 .update(&payload)
                 .finalize();
-        let mut retagged_v2 = super::COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.to_vec();
-        retagged_v2.extend_from_slice(legacy_digest.as_bytes());
-        retagged_v2.extend_from_slice(&payload);
-        let error = super::decode_commit_state_semantic_authority(&retagged_v2)
-            .expect_err("an LXSA2 digest must not become valid under an LXSA3 prefix");
+        let mut retagged_v3 = super::COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.to_vec();
+        retagged_v3.extend_from_slice(legacy_digest.as_bytes());
+        retagged_v3.extend_from_slice(&payload);
+        let error = super::decode_commit_state_semantic_authority(&retagged_v3)
+            .expect_err("an LXSA3 digest must not become valid under an LXSA4 prefix");
         assert!(error.message.contains("digest is invalid"));
     }
 

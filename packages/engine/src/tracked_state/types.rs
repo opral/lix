@@ -324,6 +324,21 @@ pub(crate) struct CurrentStateScopedRangeRoot {
     pub(crate) transition_digest: [u8; 32],
 }
 
+/// Cumulative negative-membership certificate for collection scopes.
+///
+/// A complete filter may have false positives, but never false negatives: a
+/// missing schema-family bit therefore proves that no commit in the certified
+/// linear lineage authored any scope for that schema. Coarsening file-scoped
+/// collections to their schema avoids cardinality-driven saturation while
+/// remaining conservative. Incomplete filters fail closed and carry no bits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitStateTouchedScopeFilter {
+    pub(crate) complete: bool,
+    #[musli(bytes)]
+    pub(crate) bits: Vec<u8>,
+}
+
 /// Point-addressable immutable mutation inventory owned by one commit.
 ///
 /// The fields intentionally mirror the existing commit-delta directory. This
@@ -403,6 +418,7 @@ pub(crate) struct CommitStateManifest {
     pub(crate) created_at: LixTimestamp,
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
+    pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
     #[musli(with = crate::storage_codec::option)]

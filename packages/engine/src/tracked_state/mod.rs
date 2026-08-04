@@ -42,7 +42,10 @@ pub(crate) use row_materialization::{
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
     materialize_batch_from_index_entry_refs,
 };
+pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use storage::stage_commit_state_manifest;
 pub(crate) use storage::{
     CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor, CommitDeltaMember,
     CommitDeltaPointReadCache, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
@@ -54,10 +57,9 @@ pub(crate) use storage::{
     load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_manifest,
     scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
     selected_change_selection_fingerprint, stage_addressable_commit_deltas,
-    stage_addressable_commit_deltas_with_selected_source,
+    stage_addressable_commit_deltas_with_selected_source, stage_certified_commit_state_manifest,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
-    stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
-    stage_commit_state_manifest_with_handle,
+    stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_staged_parent, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,

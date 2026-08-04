@@ -1700,6 +1700,7 @@ mod tests {
                 bytes: live.tracked_state_rootless_bytes,
             },
             mutations: CommitStateMutationInventory::default(),
+            touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
         };
@@ -2454,6 +2455,7 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations,
+                touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
                 snapshot_root: None,
             },

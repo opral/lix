@@ -30,7 +30,7 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
+    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -49,7 +49,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"columnar-current-state-pages.v54";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"certified-touched-scope-filter.v55";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -400,7 +400,18 @@ where
                     "repository initialization did not stage its snapshot root",
                 )
             })?;
-        stage_commit_state_manifest(
+        let initial_mutations = staged_delta.mutation_inventory().clone();
+        let physical_publication =
+            crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
+                &read,
+                &mut writes,
+                None,
+                plan.commit.id,
+                &plan.commit.account_id,
+                &initial_mutations,
+            )
+            .await?;
+        crate::tracked_state::stage_certified_commit_state_manifest(
             &mut writes,
             &CommitStateManifest {
                 commit_id: plan.commit.id,
@@ -410,10 +421,12 @@ where
                 account_id: plan.commit.account_id.clone(),
                 created_at: plan.commit.created_at,
                 replay_debt: CommitStateReplayDebt::default(),
-                mutations: staged_delta.mutation_inventory().clone(),
-                current_state_scoped_ranges: None,
+                mutations: initial_mutations,
+                touched_scope_filter: physical_publication.touched_scope_filter().clone(),
+                current_state_scoped_ranges: physical_publication.root(),
                 snapshot_root: Some(snapshot_root),
             },
+            &physical_publication,
         )?;
 
         // Seed both visible branches with a complete hot current-state generation.
