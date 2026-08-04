@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import npmDownloads from "../npm-downloads.gen.json";
 
 const VW = 1000;
-const VH = 220;
+const VH = 150;
 const PAD = 6;
 
 const ranges = [
@@ -132,15 +132,15 @@ export function DownloadsChart() {
   const hoveredPoint = hoverIdx !== null ? points[hoverIdx] : null;
 
   return (
-    <section className="pt-14">
-      <div className="mb-7 flex flex-wrap items-end justify-between gap-6">
-        <div className="flex flex-col gap-2">
-          <h2 className="text-[17px] font-semibold tracking-[-0.01em]">
+    <section className="pt-10">
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-6">
+        <div className="flex flex-col gap-1.5">
+          <h2 className="text-[15px] font-semibold tracking-[-0.01em]">
             Adoption
           </h2>
-          <p className="text-[14.5px] text-ink-muted">
+          <p className="text-[13.5px] text-ink-muted">
             Weekly npm downloads of{" "}
-            <span className="font-mono text-[13.5px] text-ink-secondary">
+            <span className="font-mono text-[12.5px] text-ink-secondary">
               @lix-js/sdk
             </span>
           </p>
@@ -153,7 +153,7 @@ export function DownloadsChart() {
                 setRange(r.key);
                 setHoverIdx(null);
               }}
-              className={`cursor-pointer px-[15px] py-[9px] font-mono text-xs leading-none transition-colors ${
+              className={`cursor-pointer px-3 py-[7px] font-mono text-[11px] leading-none transition-colors ${
                 range === r.key
                   ? "bg-ink text-paper"
                   : "bg-transparent text-ink-faint"
@@ -258,7 +258,7 @@ export function DownloadsChart() {
         )}
       </div>
 
-      <div className="mt-3.5 flex items-baseline justify-between border-t border-line pt-3">
+      <div className="mt-2.5 flex items-baseline justify-between border-t border-line pt-2.5">
         <span className="font-mono text-xs text-ink-faint">{startLabel}</span>
         <span className="font-mono text-xs text-ink-faint">
           through {throughLabel}
