@@ -89,8 +89,8 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // replacements authoritative through their immutable part manifest. The
 // payload-less certified-reference encoding is intentionally rejected.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA4";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.semantic-authority.v4";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA5";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.semantic-authority.v5";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -101,7 +101,9 @@ const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.sem
 // identities. LXCS5 roots cannot be reinterpreted under its content hashes.
 // Version 7 authenticates the cumulative touched-schema negative certificate.
 // LXCS6 manifests and LXSA3 semantic seals are deliberately incompatible.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS7";
+// Version 8 binds current-state serving roots to an explicit physical base
+// commit independently from semantic graph ancestry.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS8";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -1183,19 +1185,22 @@ fn current_inventory_may_contain_any_key(
     }))
 }
 
-pub(crate) fn validate_current_state_scoped_range_parent_manifest(
+pub(crate) fn validate_current_state_scoped_range_serving_base_manifest(
     state: &CommitStateManifest,
-    parent: Option<&CommitStateManifest>,
+    serving_base: Option<&CommitStateManifest>,
 ) -> Result<(), LixError> {
     let Some(root) = state.current_state_scoped_ranges.as_ref() else {
         return Ok(());
     };
-    let expected_parent_root = parent
-        .and_then(|parent| parent.current_state_scoped_ranges.as_ref())
-        .map(|parent| parent.tree.root_id);
-    if root.parent_root_id != expected_parent_root {
+    let expected_base_commit_id = serving_base.map(|base| base.commit_id);
+    let expected_base_root = serving_base
+        .and_then(|base| base.current_state_scoped_ranges.as_ref())
+        .map(|base| base.tree.root_id);
+    if root.serving_base_commit_id != expected_base_commit_id
+        || root.serving_base_root_id != expected_base_root
+    {
         return Err(replacement_payload_error(
-            "current-state scoped-range transition disagrees with its graph parent",
+            "current-state scoped-range transition disagrees with its serving base",
         ));
     }
     Ok(())
@@ -2281,11 +2286,13 @@ impl Deref for StagedCommitStateManifest {
     }
 }
 
-pub(crate) fn certify_topology_touched_scope_filter(
-    writes: &StorageWriteSet,
+pub(crate) async fn stage_current_state_scoped_ranges_from_topology(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
     parents: &[CertifiedCommitStateTopologyParent<'_>],
     selected_source: Option<CertifiedCommitStateTopologyParent<'_>>,
     commit_id: CommitId,
+    account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
     let parents = parents
@@ -2296,13 +2303,18 @@ pub(crate) fn certify_topology_touched_scope_filter(
     let selected_source = selected_source
         .map(|source| source.manifest(writes))
         .transpose()?;
-    super::scoped_current_state::certify_topology_touched_scope_filter_from_manifests(
+    let serving_base = selected_source.or_else(|| parents.first().copied());
+    super::scoped_current_state::stage_current_state_scoped_ranges(
+        store,
         writes,
         &parents,
         selected_source,
+        serving_base,
         commit_id,
+        account_id,
         inventory,
     )
+    .await
 }
 
 pub(crate) async fn stage_current_state_scoped_ranges_from_published_parent(
@@ -2316,6 +2328,8 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_published_parent(
     super::scoped_current_state::stage_current_state_scoped_ranges(
         store,
         writes,
+        parent.map(|parent| &parent.manifest).as_slice(),
+        None,
         parent.map(|parent| &parent.manifest),
         commit_id,
         account_id,
@@ -2340,6 +2354,8 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_staged_parent(
     super::scoped_current_state::stage_current_state_scoped_ranges(
         store,
         writes,
+        &[&parent.manifest],
+        None,
         Some(&parent.manifest),
         commit_id,
         account_id,
@@ -10210,8 +10226,7 @@ fn validate_current_state_scoped_ranges(
                 || root.tree.tree_height == 0
                 || root.tree.marker_count == 0
                 || root.transition_digest == [0; 32]
-                || manifest.parent_commit_ids.len() > 1
-                || manifest.mutations.selected_source_commit_id.is_some()
+                || root.serving_base_commit_id.is_some() != root.serving_base_root_id.is_some()
         })
     {
         return Err(LixError::new(
@@ -10220,10 +10235,16 @@ fn validate_current_state_scoped_ranges(
         ));
     }
     if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-        if manifest.parent_commit_ids.is_empty() && root.parent_root_id.is_some() {
+        let expected_serving_base = manifest
+            .mutations
+            .selected_source_commit_id()
+            .or_else(|| manifest.parent_commit_ids.first().copied());
+        if root.serving_base_commit_id.is_some()
+            && root.serving_base_commit_id != expected_serving_base
+        {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "tracked_state current-state scoped-range ancestry disagrees with commit topology",
+                "tracked_state current-state serving base disagrees with commit authority",
             ));
         }
         if validate_attestation {
@@ -13865,10 +13886,12 @@ mod tests {
             row_count: 17,
             tree_height: 1,
         };
-        let parent_root_id = Some([9; 32]);
+        let serving_base_commit_id = manifest.parent_commit_ids.first().copied();
+        let serving_base_root_id = Some([9; 32]);
         let transition_digest = super::super::scoped_current_state::scoped_range_transition_digest(
             manifest.commit_id,
-            parent_root_id,
+            serving_base_commit_id,
+            serving_base_root_id,
             &manifest.mutations,
             &tree,
         )
@@ -13876,7 +13899,8 @@ mod tests {
         manifest.current_state_scoped_ranges =
             Some(Box::new(super::super::types::CurrentStateScopedRangeRoot {
                 tree,
-                parent_root_id,
+                serving_base_commit_id,
+                serving_base_root_id,
                 transition_digest,
             }));
 
@@ -13894,6 +13918,40 @@ mod tests {
     }
 
     #[test]
+    fn commit_state_manifest_codec_rejects_wrong_serving_base() {
+        let mut manifest = commit_state_manifest_fixture();
+        let tree = super::super::scoped_range::ScopedRangeRoot {
+            root_id: [7; 32],
+            root_digest: [8; 32],
+            marker_count: 1,
+            part_count: 2,
+            row_count: 17,
+            tree_height: 1,
+        };
+        let wrong_base = CommitId::for_test_label("wrong-serving-base");
+        let serving_base_root_id = Some([9; 32]);
+        let transition_digest = super::super::scoped_current_state::scoped_range_transition_digest(
+            manifest.commit_id,
+            Some(wrong_base),
+            serving_base_root_id,
+            &manifest.mutations,
+            &tree,
+        )
+        .expect("transition should hash");
+        manifest.current_state_scoped_ranges =
+            Some(Box::new(super::super::types::CurrentStateScopedRangeRoot {
+                tree,
+                serving_base_commit_id: Some(wrong_base),
+                serving_base_root_id,
+                transition_digest,
+            }));
+
+        let error = encode_commit_state_manifest(&manifest)
+            .expect_err("serving base outside commit authority must fail closed");
+        assert!(error.message.contains("serving base"));
+    }
+
+    #[test]
     fn commit_state_manifest_codec_rejects_pre_cut_formats() {
         let manifest = commit_state_manifest_fixture();
         let payload = storage_codec::encode("tracked_state commit_state_manifest", &manifest)
@@ -13902,6 +13960,7 @@ mod tests {
             b"LXCS3".as_slice(),
             b"LXCS5".as_slice(),
             b"LXCS6".as_slice(),
+            b"LXCS7".as_slice(),
         ] {
             let mut legacy = magic.to_vec();
             legacy.extend_from_slice(&payload);
@@ -13914,6 +13973,7 @@ mod tests {
             b"LXSA1".as_slice(),
             b"LXSA2".as_slice(),
             b"LXSA3".as_slice(),
+            b"LXSA4".as_slice(),
         ] {
             let mut legacy_seal = magic.to_vec();
             legacy_seal.extend_from_slice(&[0; TRACKED_STATE_HASH_BYTES]);
@@ -13924,14 +13984,14 @@ mod tests {
         }
 
         let legacy_digest =
-            blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v3")
+            blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v4")
                 .update(&payload)
                 .finalize();
-        let mut retagged_v3 = super::COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.to_vec();
-        retagged_v3.extend_from_slice(legacy_digest.as_bytes());
-        retagged_v3.extend_from_slice(&payload);
-        let error = super::decode_commit_state_semantic_authority(&retagged_v3)
-            .expect_err("an LXSA3 digest must not become valid under an LXSA4 prefix");
+        let mut retagged_v4 = super::COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.to_vec();
+        retagged_v4.extend_from_slice(legacy_digest.as_bytes());
+        retagged_v4.extend_from_slice(&payload);
+        let error = super::decode_commit_state_semantic_authority(&retagged_v4)
+            .expect_err("an LXSA4 digest must not become valid under an LXSA5 prefix");
         assert!(error.message.contains("digest is invalid"));
     }
 

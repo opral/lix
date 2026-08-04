@@ -42,14 +42,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V53 makes structural fragmentation explicit in current-state range
-/// locators. Sparse rewrites may retain immutable source slices, while
-/// compaction clears the fragment bit on canonical output. Older repositories
-/// must fail closed rather than infer this serving invariant from row density.
+/// V56 separates semantic graph ancestry from physical current-state ancestry.
+/// A serving root authenticates the exact commit/root it structurally reuses,
+/// including merge targets and selected sources. Older repositories must fail
+/// closed rather than reinterpret a first-parent root as this stronger proof.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"certified-touched-scope-filter.v55";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"authenticated-serving-base-lineage.v56";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_protocol_rejects_pre_columnar_policy_cut_marker() {
+    async fn repository_protocol_rejects_pre_serving_base_lineage_marker() {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = StorageWriteSet::new();
         writes.put(

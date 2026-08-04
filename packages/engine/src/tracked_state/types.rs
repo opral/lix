@@ -313,14 +313,17 @@ pub(crate) struct CurrentStatePartDescriptor {
 /// Manifest-attested root of the unified scope/part serving tree.
 ///
 /// The generic tree owns only authenticated physical routing. These fields
-/// bind one result root to the graph parent and sealed mutation authority that
-/// produced it, without exposing mutation payload semantics to the tree.
+/// bind one result root to the physical serving base and sealed mutation
+/// authority that produced it. Graph ancestry remains an independent semantic
+/// relationship and is not exposed to the tree.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CurrentStateScopedRangeRoot {
     pub(crate) tree: super::scoped_range::ScopedRangeRoot,
     #[musli(with = crate::storage_codec::option)]
-    pub(crate) parent_root_id: Option<[u8; 32]>,
+    pub(crate) serving_base_commit_id: Option<CommitId>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) serving_base_root_id: Option<[u8; 32]>,
     pub(crate) transition_digest: [u8; 32],
 }
 

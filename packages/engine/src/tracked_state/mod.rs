@@ -46,6 +46,8 @@ pub(crate) use row_materialization::{
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
     materialize_batch_from_index_entry_refs,
 };
+#[cfg(test)]
+pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
 #[cfg(any(test, feature = "storage-benches"))]
@@ -54,8 +56,8 @@ pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
     CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateManifest,
-    StagedCommitStateManifest, certify_topology_touched_scope_filter, commit_delta_contains_schema,
-    direct_change_locator, load_change_record_by_id, load_commit_delta_change_records,
+    StagedCommitStateManifest, commit_delta_contains_schema, direct_change_locator,
+    load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_commit_state_manifest, load_commit_state_manifests, load_owned_commit_delta_entries,
@@ -66,12 +68,13 @@ pub(crate) use storage::{
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_published_parent,
-    stage_current_state_scoped_ranges_from_staged_parent, stage_delete_change_locators,
+    stage_current_state_scoped_ranges_from_staged_parent,
+    stage_current_state_scoped_ranges_from_topology, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
     stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
     stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
-    validate_current_state_scoped_range_parent_manifest,
+    validate_current_state_scoped_range_serving_base_manifest,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{

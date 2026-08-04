@@ -87,7 +87,7 @@ async fn run_backend<S>(
     S: lix_engine::storage::Storage,
 {
     let setup = Instant::now();
-    let fixture = seed_current_state_point_fixture(
+    let mut fixture = seed_current_state_point_fixture(
         storage,
         rows,
         sparse_commits,
@@ -96,6 +96,12 @@ async fn run_backend<S>(
         point_target,
     )
     .await;
+    let topology = std::env::var("LIX_CURRENT_STATE_TOPOLOGY").unwrap_or_default();
+    if topology == "merge" {
+        fixture = fixture.append_empty_merge().await;
+    } else if !topology.is_empty() && topology != "linear" {
+        panic!("unknown LIX_CURRENT_STATE_TOPOLOGY '{topology}'; expected linear or merge");
+    }
     let setup = setup.elapsed();
     let mode = std::env::var("LIX_CURRENT_STATE_MODE").unwrap_or_default();
     if mode == "scope-scan" {
@@ -118,7 +124,7 @@ async fn run_backend<S>(
         };
         let measured = measure(&fixture, selected, warmups, samples).await;
         println!(
-            "current_state_scope_sharing,backend={backend},mode={mode},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},final_parts={},setup_ms={:.3},scoped_range_staged_puts={},scoped_range_staged_bytes={},sparse_scoped_range_staged_puts={},sparse_scoped_range_staged_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},scoped_manifest_bytes={},replay_manifest_bytes={},p50_us={:.3},p95_us={:.3}",
+            "current_state_scope_sharing,backend={backend},mode={mode},topology={topology},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},final_parts={},setup_ms={:.3},scoped_range_staged_puts={},scoped_range_staged_bytes={},sparse_scoped_range_staged_puts={},sparse_scoped_range_staged_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},scoped_manifest_bytes={},replay_manifest_bytes={},p50_us={:.3},p95_us={:.3}",
             fixture.scope_count(),
             fixture.current_state_part_count(),
             millis(setup),
@@ -155,7 +161,7 @@ async fn run_backend<S>(
     )
     .await;
     println!(
-        "current_state_scope_sharing,backend={backend},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},final_parts={},setup_ms={:.3},scoped_range_staged_puts={},scoped_range_staged_bytes={},sparse_scoped_range_staged_puts={},sparse_scoped_range_staged_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},scoped_manifest_bytes={},replay_manifest_bytes={},serving_p50_us={:.3},serving_p95_us={:.3},replay_p50_us={:.3},replay_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
+        "current_state_scope_sharing,backend={backend},topology={topology},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},final_parts={},setup_ms={:.3},scoped_range_staged_puts={},scoped_range_staged_bytes={},sparse_scoped_range_staged_puts={},sparse_scoped_range_staged_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},scoped_manifest_bytes={},replay_manifest_bytes={},serving_p50_us={:.3},serving_p95_us={:.3},replay_p50_us={:.3},replay_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
         fixture.scope_count(),
         fixture.current_state_part_count(),
         millis(setup),

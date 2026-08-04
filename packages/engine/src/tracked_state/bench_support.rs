@@ -466,6 +466,100 @@ impl<StorageImpl> BenchCurrentStatePointFixture<StorageImpl>
 where
     StorageImpl: Storage,
 {
+    /// Appends one production-shaped empty graph merge whose first parent is
+    /// the fixture's current state. Before serving-base lineage this topology
+    /// edge discarded the physical root and forced replay; the v56 path
+    /// re-attests the unchanged tree against the merge authority.
+    pub async fn append_empty_merge(mut self) -> Self {
+        let other_id = bench_addressable_commit_id("scoped-range-merge-other");
+        let other = bench_current_state_manifest(
+            other_id,
+            None,
+            1,
+            super::types::CommitStateMutationInventory::default(),
+            Default::default(),
+            None,
+        );
+        let mut other_writes = self.storage.new_write_set();
+        super::storage::stage_commit_state_manifest(&mut other_writes, &other)
+            .expect("stage benchmark merge parent authority");
+        self.storage
+            .commit_write_set(other_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark merge parent authority");
+
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark merge publication read");
+        let current = super::storage::load_published_commit_state_manifest(
+            &read,
+            self.current_manifest.commit_id,
+        )
+        .await
+        .expect("load benchmark merge target")
+        .expect("benchmark merge target exists");
+        let other = super::storage::load_published_commit_state_manifest(&read, other_id)
+            .await
+            .expect("load benchmark second merge parent")
+            .expect("benchmark second merge parent exists");
+        let merge_id = bench_addressable_commit_id("scoped-range-empty-merge");
+        let mutations = super::types::CommitStateMutationInventory::default();
+        let mut writes = self.storage.new_write_set();
+        let publication = super::storage::stage_current_state_scoped_ranges_from_topology(
+            &read,
+            &mut writes,
+            &[
+                super::storage::CertifiedCommitStateTopologyParent::Published(&current),
+                super::storage::CertifiedCommitStateTopologyParent::Published(&other),
+            ],
+            None,
+            merge_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &mutations,
+        )
+        .await
+        .expect("stage benchmark merge serving root");
+        let merged = CommitStateManifest {
+            commit_id: merge_id,
+            generation: self.current_manifest.generation.saturating_add(1),
+            parent_commit_ids: vec![self.current_manifest.commit_id, other_id],
+            commit_change_id: ChangeId::for_test_label("scoped-range-empty-merge-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(33),
+            replay_debt: CommitStateReplayDebt {
+                depth: self
+                    .current_manifest
+                    .replay_debt
+                    .depth
+                    .saturating_add(1)
+                    .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
+                rows: self.current_manifest.replay_debt.rows,
+                bytes: self.current_manifest.replay_debt.bytes,
+            },
+            mutations,
+            touched_scope_filter: publication.touched_scope_filter().clone(),
+            current_state_scoped_ranges: publication.root(),
+            snapshot_root: None,
+        };
+        super::storage::stage_certified_commit_state_manifest(&mut writes, &merged, &publication)
+            .expect("stage certified benchmark merge manifest");
+        drop(read);
+        self.storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark merge serving root");
+        self.current_manifest = merged;
+        self.commits.push(merge_id);
+        self.current_state_part_count = self
+            .current_manifest
+            .current_state_scoped_ranges
+            .as_ref()
+            .map_or(0, |root| u64::from(root.tree.part_count));
+        self
+    }
+
     pub fn scope_count(&self) -> usize {
         self.scope_count
     }
