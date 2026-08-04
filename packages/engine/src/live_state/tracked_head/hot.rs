@@ -5473,6 +5473,49 @@ where
         .await
     }
 
+    /// Publishes an already authenticated lossless columnar mutation set as
+    /// the immutable current-state base. The mutation inventory has already
+    /// walked the strictly ordered identities and sealed their digest, so
+    /// repeating that O(rows) work here would create a second physical-layout
+    /// authority and a large transient pointer index.
+    pub(crate) async fn stage_certified_columnar_insert_current_base(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        parts: &crate::tracked_state::ColumnarMutationPartSet,
+        lifecycle: &crate::tracked_state::CommitDeltaLifecycleSummary,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        if parts.owner_commit_id != *new_head.as_uuid().as_bytes()
+            || parts.row_count == 0
+            || lifecycle.scope.schema_key != parts.schema_key
+            || lifecycle.scope.file_id.is_some()
+            || lifecycle.uniform_created_at != parts.uniform_created_at
+        {
+            return Err(head_value_error(
+                "certified columnar current base disagrees with mutation authority",
+            ));
+        }
+        let schema_increments = BTreeMap::from([(
+            parts.schema_key.as_str(),
+            PackedCollectionIncrement {
+                live_count: u64::from(parts.row_count),
+                ordered_identity_digest: Some(lifecycle.ordered_identity_digest),
+            },
+        )]);
+        self.stage_packed_insert_current_base_manifest(
+            branch_id,
+            generation,
+            new_head,
+            schema_increments,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+        )
+        .await
+    }
+
     /// Publishes a commit whose ordered deltas replace every live member of
     /// one tracked, unfiled collection as a new packed base segment.
     ///

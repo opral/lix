@@ -95,11 +95,11 @@ pub(crate) use storage::{
 };
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
-    ColumnarMutationPartSet, CommitStateManifest, CommitStateMutationInventory,
-    CommitStateReplayDebt, MaterializedTrackedStateRow, TrackedStateBaseCoordinate,
-    TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateIndexValue, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
+    ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
+    CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
+    TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 #[cfg(feature = "storage-benches")]
