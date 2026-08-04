@@ -14,6 +14,20 @@ use crate::tracked_state::{
     TrackedStateScanRequest,
 };
 
+pub use super::mutation_directory::MutationDirectoryReadAccounting;
+
+/// Resets the feature-gated authenticated mutation-directory counters for one
+/// benchmark phase. Production builds do not compile this module.
+pub fn reset_mutation_directory_read_accounting() {
+    super::mutation_directory::reset_mutation_directory_read_accounting();
+}
+
+/// Stops and snapshots the feature-gated authenticated mutation-directory
+/// counters for the completed benchmark phase.
+pub fn snapshot_mutation_directory_read_accounting() -> MutationDirectoryReadAccounting {
+    super::mutation_directory::snapshot_mutation_directory_read_accounting()
+}
+
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],

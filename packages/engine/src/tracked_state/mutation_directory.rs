@@ -29,6 +29,254 @@ const ROOT_HASH_CONTEXT: &str = "lix commit mutation directory root v1";
 const FANOUT: usize = 128;
 const MAX_NODE_BYTES: usize = 16 * 1024 * 1024;
 
+#[cfg(any(test, feature = "storage-benches"))]
+mod read_accounting {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    pub(super) const DIRECT_ROUTE_CALLS: usize = 0;
+    pub(super) const SELECTOR_ALL_ROOTS: usize = 1;
+    pub(super) const SELECTOR_RANGE_CALLS: usize = 2;
+    pub(super) const SELECTOR_POINT_CALLS: usize = 3;
+    pub(super) const SELECTOR_DIRECT_CALLS: usize = 4;
+    pub(super) const TRAVERSAL_LEVELS: usize = 5;
+    pub(super) const NODE_BATCHES: usize = 6;
+    pub(super) const UNIQUE_NODE_IDS: usize = 7;
+    pub(super) const NODE_GETS: usize = 8;
+    pub(super) const VISITED_NODES: usize = 9;
+    pub(super) const EMITTED_RUNS: usize = 10;
+    pub(super) const BULK_MANIFEST_ROOTS: usize = 11;
+    pub(super) const COMPACT_MEMBER_ROOTS: usize = 12;
+    pub(super) const EMPTY_SCHEMA_MEMBER_ROOTS: usize = 13;
+    pub(super) const COMPACT_VALUE_ROOTS: usize = 14;
+    pub(super) const EMPTY_SCHEMA_VALUE_ROOTS: usize = 15;
+    pub(super) const REPOSITORY_INVENTORY_ROOTS: usize = 16;
+    pub(super) const FULL_MANIFEST_ROOTS: usize = 17;
+    pub(super) const GC_REACHABILITY_ROOTS: usize = 18;
+    pub(super) const EXTERNAL_PARTS_LOADED: usize = 19;
+    pub(super) const PARTS_DECODED: usize = 20;
+    pub(super) const DECODED_ROWS: usize = 21;
+    pub(super) const RAW_BYTES: usize = 22;
+    pub(super) const RESIDENT_BYTES: usize = 23;
+    pub(super) const REQUESTED_ROWS: usize = 24;
+    pub(super) const UNIQUE_REQUESTED_ROWS: usize = 25;
+    pub(super) const CLAIMED_UNIQUE_ROWS: usize = 26;
+    pub(super) const SCATTERED_ROWS: usize = 27;
+    pub(super) const EXPLICIT_FALLBACK_ROWS: usize = 28;
+    pub(super) const NOT_OWNED_MISSING_COMMIT: usize = 29;
+    pub(super) const NOT_OWNED_UNSUPPORTED_LAYOUT: usize = 30;
+    pub(super) const NOT_OWNED_ABSENT_INLINE: usize = 31;
+    pub(super) const NOT_OWNED_PART_INDEX: usize = 32;
+    pub(super) const NOT_OWNED_LOCAL_ROW: usize = 33;
+    pub(super) const CORRUPTION_OUTCOMES: usize = 34;
+    const COUNTER_COUNT: usize = 35;
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
+
+    pub(super) fn reset() {
+        ACTIVE.store(false, Ordering::Release);
+        for counter in &COUNTERS {
+            counter.store(0, Ordering::Relaxed);
+        }
+        ACTIVE.store(true, Ordering::Release);
+    }
+
+    pub(super) fn stop() {
+        ACTIVE.store(false, Ordering::Release);
+    }
+
+    pub(super) fn add(counter: usize, value: usize) {
+        if ACTIVE.load(Ordering::Relaxed) {
+            COUNTERS[counter].fetch_add(value as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn get(counter: usize) -> u64 {
+        COUNTERS[counter].load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MutationDirectoryReadAccounting {
+    pub direct_route_calls: u64,
+    pub selector_all_roots: u64,
+    pub selector_range_calls: u64,
+    pub selector_point_calls: u64,
+    pub selector_direct_calls: u64,
+    pub traversal_levels: u64,
+    pub node_batches: u64,
+    pub unique_node_ids: u64,
+    pub node_gets: u64,
+    pub visited_nodes: u64,
+    pub emitted_runs: u64,
+    pub bulk_manifest_roots: u64,
+    pub compact_member_roots: u64,
+    pub empty_schema_member_roots: u64,
+    pub compact_value_roots: u64,
+    pub empty_schema_value_roots: u64,
+    pub repository_inventory_roots: u64,
+    pub full_manifest_roots: u64,
+    pub gc_reachability_roots: u64,
+    pub external_parts_loaded: u64,
+    pub parts_decoded: u64,
+    pub decoded_rows: u64,
+    pub raw_bytes: u64,
+    pub resident_bytes: u64,
+    pub requested_rows: u64,
+    pub unique_requested_rows: u64,
+    pub claimed_unique_rows: u64,
+    pub scattered_rows: u64,
+    pub explicit_fallback_rows: u64,
+    pub not_owned_missing_commit: u64,
+    pub not_owned_unsupported_layout: u64,
+    pub not_owned_absent_inline: u64,
+    pub not_owned_part_index: u64,
+    pub not_owned_local_row: u64,
+    pub corruption_outcomes: u64,
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn reset_mutation_directory_read_accounting() {
+    read_accounting::reset();
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn snapshot_mutation_directory_read_accounting() -> MutationDirectoryReadAccounting {
+    use read_accounting as counters;
+    counters::stop();
+    MutationDirectoryReadAccounting {
+        direct_route_calls: counters::get(counters::DIRECT_ROUTE_CALLS),
+        selector_all_roots: counters::get(counters::SELECTOR_ALL_ROOTS),
+        selector_range_calls: counters::get(counters::SELECTOR_RANGE_CALLS),
+        selector_point_calls: counters::get(counters::SELECTOR_POINT_CALLS),
+        selector_direct_calls: counters::get(counters::SELECTOR_DIRECT_CALLS),
+        traversal_levels: counters::get(counters::TRAVERSAL_LEVELS),
+        node_batches: counters::get(counters::NODE_BATCHES),
+        unique_node_ids: counters::get(counters::UNIQUE_NODE_IDS),
+        node_gets: counters::get(counters::NODE_GETS),
+        visited_nodes: counters::get(counters::VISITED_NODES),
+        emitted_runs: counters::get(counters::EMITTED_RUNS),
+        bulk_manifest_roots: counters::get(counters::BULK_MANIFEST_ROOTS),
+        compact_member_roots: counters::get(counters::COMPACT_MEMBER_ROOTS),
+        empty_schema_member_roots: counters::get(counters::EMPTY_SCHEMA_MEMBER_ROOTS),
+        compact_value_roots: counters::get(counters::COMPACT_VALUE_ROOTS),
+        empty_schema_value_roots: counters::get(counters::EMPTY_SCHEMA_VALUE_ROOTS),
+        repository_inventory_roots: counters::get(counters::REPOSITORY_INVENTORY_ROOTS),
+        full_manifest_roots: counters::get(counters::FULL_MANIFEST_ROOTS),
+        gc_reachability_roots: counters::get(counters::GC_REACHABILITY_ROOTS),
+        external_parts_loaded: counters::get(counters::EXTERNAL_PARTS_LOADED),
+        parts_decoded: counters::get(counters::PARTS_DECODED),
+        decoded_rows: counters::get(counters::DECODED_ROWS),
+        raw_bytes: counters::get(counters::RAW_BYTES),
+        resident_bytes: counters::get(counters::RESIDENT_BYTES),
+        requested_rows: counters::get(counters::REQUESTED_ROWS),
+        unique_requested_rows: counters::get(counters::UNIQUE_REQUESTED_ROWS),
+        claimed_unique_rows: counters::get(counters::CLAIMED_UNIQUE_ROWS),
+        scattered_rows: counters::get(counters::SCATTERED_ROWS),
+        explicit_fallback_rows: counters::get(counters::EXPLICIT_FALLBACK_ROWS),
+        not_owned_missing_commit: counters::get(counters::NOT_OWNED_MISSING_COMMIT),
+        not_owned_unsupported_layout: counters::get(counters::NOT_OWNED_UNSUPPORTED_LAYOUT),
+        not_owned_absent_inline: counters::get(counters::NOT_OWNED_ABSENT_INLINE),
+        not_owned_part_index: counters::get(counters::NOT_OWNED_PART_INDEX),
+        not_owned_local_row: counters::get(counters::NOT_OWNED_LOCAL_ROW),
+        corruption_outcomes: counters::get(counters::CORRUPTION_OUTCOMES),
+    }
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_start(requested_rows: usize) {
+    read_accounting::add(read_accounting::DIRECT_ROUTE_CALLS, 1);
+    read_accounting::add(read_accounting::REQUESTED_ROWS, requested_rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_unique_rows(unique_rows: usize) {
+    read_accounting::add(read_accounting::UNIQUE_REQUESTED_ROWS, unique_rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_claimed_rows(claimed_rows: usize) {
+    read_accounting::add(read_accounting::CLAIMED_UNIQUE_ROWS, claimed_rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_scattered_rows(scattered_rows: usize) {
+    read_accounting::add(read_accounting::SCATTERED_ROWS, scattered_rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_explicit_fallback(rows: usize) {
+    read_accounting::add(read_accounting::EXPLICIT_FALLBACK_ROWS, rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_not_owned(reason: MutationDirectoryNotOwnedReason, rows: usize) {
+    let counter = match reason {
+        MutationDirectoryNotOwnedReason::UnsupportedLayout => {
+            read_accounting::NOT_OWNED_UNSUPPORTED_LAYOUT
+        }
+        MutationDirectoryNotOwnedReason::PartIndexOutOfRange => {
+            read_accounting::NOT_OWNED_PART_INDEX
+        }
+        MutationDirectoryNotOwnedReason::LocalRowOutOfRange => read_accounting::NOT_OWNED_LOCAL_ROW,
+    };
+    read_accounting::add(counter, rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_missing_commit(rows: usize) {
+    read_accounting::add(read_accounting::NOT_OWNED_MISSING_COMMIT, rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_absent_inline(rows: usize) {
+    read_accounting::add(read_accounting::NOT_OWNED_ABSENT_INLINE, rows);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_route_corruption() {
+    read_accounting::add(read_accounting::CORRUPTION_OUTCOMES, 1);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_external_parts_loaded(parts: usize) {
+    read_accounting::add(read_accounting::EXTERNAL_PARTS_LOADED, parts);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_direct_part_decoded(rows: usize, raw_bytes: usize, resident_bytes: usize) {
+    read_accounting::add(read_accounting::PARTS_DECODED, 1);
+    read_accounting::add(read_accounting::DECODED_ROWS, rows);
+    read_accounting::add(read_accounting::RAW_BYTES, raw_bytes);
+    read_accounting::add(read_accounting::RESIDENT_BYTES, resident_bytes);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) struct DirectRouteAccountingGuard {
+    complete: bool,
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+impl DirectRouteAccountingGuard {
+    pub(crate) fn new() -> Self {
+        Self { complete: false }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.complete = true;
+    }
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+impl Drop for DirectRouteAccountingGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            record_direct_route_corruption();
+        }
+    }
+}
+
 pub(crate) const LAYOUT_BOUNDED_INDIRECT: u8 = 1;
 pub(crate) const LAYOUT_BOUNDED_DIRECT: u8 = 2;
 pub(crate) const LAYOUT_COMPACT_REPLACEMENT: u8 = 3;
@@ -106,10 +354,81 @@ pub(crate) struct MutationDirectoryDirectCoordinate {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MutationDirectoryReadSelection<'a> {
-    All,
+    All(MutationDirectoryFullTraversalContext),
     SortedRanges(&'a [MutationDirectoryKeyRange]),
     SortedUniquePoints(&'a [Bytes]),
     SortedUniqueDirectCoordinates(&'a [MutationDirectoryDirectCoordinate]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationDirectoryFullTraversalContext {
+    BulkCommitStateManifests,
+    CompactMemberScan,
+    EmptySchemaMemberScan,
+    CompactValueScan,
+    EmptySchemaValueScan,
+    RepositoryInventory,
+    FullManifestExpansion,
+    #[cfg(test)]
+    Test,
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+fn record_full_traversal(context: MutationDirectoryFullTraversalContext, roots: usize) {
+    use read_accounting as counters;
+    counters::add(counters::SELECTOR_ALL_ROOTS, roots);
+    let counter = match context {
+        MutationDirectoryFullTraversalContext::BulkCommitStateManifests => {
+            counters::BULK_MANIFEST_ROOTS
+        }
+        MutationDirectoryFullTraversalContext::CompactMemberScan => counters::COMPACT_MEMBER_ROOTS,
+        MutationDirectoryFullTraversalContext::EmptySchemaMemberScan => {
+            counters::EMPTY_SCHEMA_MEMBER_ROOTS
+        }
+        MutationDirectoryFullTraversalContext::CompactValueScan => counters::COMPACT_VALUE_ROOTS,
+        MutationDirectoryFullTraversalContext::EmptySchemaValueScan => {
+            counters::EMPTY_SCHEMA_VALUE_ROOTS
+        }
+        MutationDirectoryFullTraversalContext::RepositoryInventory => {
+            counters::REPOSITORY_INVENTORY_ROOTS
+        }
+        MutationDirectoryFullTraversalContext::FullManifestExpansion => {
+            counters::FULL_MANIFEST_ROOTS
+        }
+        #[cfg(test)]
+        MutationDirectoryFullTraversalContext::Test => return,
+    };
+    counters::add(counter, roots);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+fn record_selector(selection: MutationDirectoryReadSelection<'_>) {
+    use read_accounting as counters;
+    match selection {
+        MutationDirectoryReadSelection::All(context) => record_full_traversal(context, 1),
+        MutationDirectoryReadSelection::SortedRanges(_) => {
+            counters::add(counters::SELECTOR_RANGE_CALLS, 1);
+        }
+        MutationDirectoryReadSelection::SortedUniquePoints(_) => {
+            counters::add(counters::SELECTOR_POINT_CALLS, 1);
+        }
+        MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(_) => {
+            counters::add(counters::SELECTOR_DIRECT_CALLS, 1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationDirectoryNotOwnedReason {
+    UnsupportedLayout,
+    PartIndexOutOfRange,
+    LocalRowOutOfRange,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MutationDirectoryNotOwnedSpan {
+    pub(crate) selector_span: Range<usize>,
+    pub(crate) reason: MutationDirectoryNotOwnedReason,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -122,6 +441,7 @@ pub(crate) struct MutationDirectoryPartRun {
 #[derive(Debug)]
 pub(crate) struct AuthenticatedMutationPartReadPlan {
     runs: Vec<MutationDirectoryPartRun>,
+    direct_not_owned: Vec<MutationDirectoryNotOwnedSpan>,
     #[cfg(test)]
     visited_node_count: usize,
     #[cfg(test)]
@@ -144,7 +464,17 @@ impl AuthenticatedMutationPartReadPlan {
     }
 
     pub(crate) fn into_runs(self) -> Vec<MutationDirectoryPartRun> {
+        debug_assert!(self.direct_not_owned.is_empty());
         self.runs
+    }
+
+    pub(crate) fn into_direct_routes(
+        self,
+    ) -> (
+        Vec<MutationDirectoryPartRun>,
+        Vec<MutationDirectoryNotOwnedSpan>,
+    ) {
+        (self.runs, self.direct_not_owned)
     }
 
     #[cfg(test)]
@@ -454,10 +784,26 @@ where
 pub(crate) async fn load_all_mutation_part_read_plans(
     store: &(impl StorageAdapterRead + ?Sized),
     roots: &[MutationDirectoryRoot],
+    context: MutationDirectoryFullTraversalContext,
 ) -> Result<Vec<AuthenticatedMutationPartReadPlan>, LixError> {
+    let valid_context = matches!(
+        context,
+        MutationDirectoryFullTraversalContext::BulkCommitStateManifests
+            | MutationDirectoryFullTraversalContext::RepositoryInventory
+    );
+    #[cfg(test)]
+    let valid_context =
+        valid_context || matches!(context, MutationDirectoryFullTraversalContext::Test);
+    if !valid_context {
+        return Err(directory_error(
+            "batched full traversal received a single-root context",
+        ));
+    }
     for root in roots {
         validate_root(root)?;
     }
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_full_traversal(context, roots.len());
     let mut frontiers = roots
         .iter()
         .map(|root| vec![(root.root_id, 0u32, None::<NodeSummary>)])
@@ -475,6 +821,8 @@ pub(crate) async fn load_all_mutation_part_read_plans(
     #[cfg(test)]
     let mut part_clone_counts = vec![0usize; roots.len()];
     while frontiers.iter().any(|frontier| !frontier.is_empty()) {
+        #[cfg(any(test, feature = "storage-benches"))]
+        read_accounting::add(read_accounting::TRAVERSAL_LEVELS, 1);
         let mut node_ids = Vec::new();
         let mut use_counts = HashMap::<[u8; 32], usize>::new();
         for (node_id, _, _) in frontiers.iter().flatten() {
@@ -589,6 +937,11 @@ pub(crate) async fn load_all_mutation_part_read_plans(
             return Err(directory_error("directory closure disagrees with its root"));
         }
     }
+    #[cfg(any(test, feature = "storage-benches"))]
+    read_accounting::add(
+        read_accounting::EMITTED_RUNS,
+        outputs.iter().map(Vec::len).sum(),
+    );
     Ok(outputs
         .into_iter()
         .enumerate()
@@ -597,6 +950,7 @@ pub(crate) async fn load_all_mutation_part_read_plans(
             let _ = root_index;
             AuthenticatedMutationPartReadPlan {
                 runs,
+                direct_not_owned: Vec::new(),
                 #[cfg(test)]
                 visited_node_count: visited_node_counts[root_index],
                 #[cfg(test)]
@@ -622,12 +976,26 @@ pub(crate) async fn load_mutation_part_read_plan(
     root: &MutationDirectoryRoot,
     selection: MutationDirectoryReadSelection<'_>,
 ) -> Result<AuthenticatedMutationPartReadPlan, LixError> {
+    if matches!(
+        selection,
+        MutationDirectoryReadSelection::All(
+            MutationDirectoryFullTraversalContext::BulkCommitStateManifests
+                | MutationDirectoryFullTraversalContext::RepositoryInventory
+        )
+    ) {
+        return Err(directory_error(
+            "single-root full traversal received a batched context",
+        ));
+    }
     validate_root(root)?;
     validate_selection(root, selection)?;
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_selector(selection);
     let selector_count = selection.len();
-    if !matches!(selection, MutationDirectoryReadSelection::All) && selector_count == 0 {
+    if !matches!(selection, MutationDirectoryReadSelection::All(_)) && selector_count == 0 {
         return Ok(AuthenticatedMutationPartReadPlan {
             runs: Vec::new(),
+            direct_not_owned: Vec::new(),
             #[cfg(test)]
             visited_node_count: 0,
             #[cfg(test)]
@@ -646,10 +1014,36 @@ pub(crate) async fn load_mutation_part_read_plan(
         expected: Option<NodeSummary>,
     }
 
+    let mut direct_not_owned = Vec::new();
+    let mut direct_coverage = Vec::<Range<usize>>::new();
+    let mut routed_selector_count = selector_count;
+    if let MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(coordinates) = selection {
+        if root.layout == LAYOUT_BOUNDED_INDIRECT {
+            let selector_span = 0..selector_count;
+            return Ok(AuthenticatedMutationPartReadPlan {
+                runs: Vec::new(),
+                direct_not_owned: vec![MutationDirectoryNotOwnedSpan {
+                    selector_span,
+                    reason: MutationDirectoryNotOwnedReason::UnsupportedLayout,
+                }],
+                #[cfg(test)]
+                visited_node_count: 0,
+                #[cfg(test)]
+                node_summary_owner_count: 0,
+                #[cfg(test)]
+                node_summary_clone_count: 0,
+                #[cfg(test)]
+                part_clone_count: 0,
+            });
+        }
+        routed_selector_count =
+            coordinates.partition_point(|coordinate| coordinate.part_index < root.entry_count);
+    }
+
     let mut frontier = vec![PendingNode {
         node_id: root.root_id,
         base_index: 0,
-        selector_span: 0..selector_count,
+        selector_span: 0..routed_selector_count,
         expected: None,
     }];
     let mut runs = Vec::new();
@@ -659,6 +1053,8 @@ pub(crate) async fn load_mutation_part_read_plan(
     let mut node_summary_owner_count = 0usize;
 
     while !frontier.is_empty() {
+        #[cfg(any(test, feature = "storage-benches"))]
+        read_accounting::add(read_accounting::TRAVERSAL_LEVELS, 1);
         let node_ids = frontier
             .iter()
             .map(|pending| pending.node_id)
@@ -701,9 +1097,38 @@ pub(crate) async fn load_mutation_part_read_plan(
                             entry_end,
                             Some(stored_entry_direct_rows(&entry)),
                         )?;
-                        let Some(selector_span) = selector_span else {
+                        let Some(mut selector_span) = selector_span else {
                             continue;
                         };
+                        if let MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(
+                            coordinates,
+                        ) = selection
+                        {
+                            let owned_end = selector_span.start
+                                + coordinates[selector_span.clone()].partition_point(
+                                    |coordinate| {
+                                        coordinate.local_row < stored_entry_direct_rows(&entry)
+                                    },
+                                );
+                            if selector_span.start < owned_end {
+                                let owned_span = selector_span.start..owned_end;
+                                direct_coverage.push(owned_span.clone());
+                                runs.push(MutationDirectoryPartRun {
+                                    entry_index,
+                                    selector_span: owned_span,
+                                    entry: runtime_entry(entry)?,
+                                });
+                            }
+                            if owned_end < selector_span.end {
+                                selector_span.start = owned_end;
+                                direct_coverage.push(selector_span.clone());
+                                direct_not_owned.push(MutationDirectoryNotOwnedSpan {
+                                    selector_span,
+                                    reason: MutationDirectoryNotOwnedReason::LocalRowOutOfRange,
+                                });
+                            }
+                            continue;
+                        }
                         runs.push(MutationDirectoryPartRun {
                             entry_index,
                             selector_span,
@@ -755,6 +1180,14 @@ pub(crate) async fn load_mutation_part_read_plan(
         }
         frontier = next;
     }
+    if routed_selector_count < selector_count {
+        let selector_span = routed_selector_count..selector_count;
+        direct_coverage.push(selector_span.clone());
+        direct_not_owned.push(MutationDirectoryNotOwnedSpan {
+            selector_span,
+            reason: MutationDirectoryNotOwnedReason::PartIndexOutOfRange,
+        });
+    }
     if runs.windows(2).any(|pair| {
         pair[0].entry_index >= pair[1].entry_index
             || pair[0].selector_span.start > pair[1].selector_span.start
@@ -766,20 +1199,25 @@ pub(crate) async fn load_mutation_part_read_plan(
     if matches!(
         selection,
         MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(_)
-    ) && (runs.first().is_none_or(|run| run.selector_span.start != 0)
-        || runs
+    ) && (direct_coverage
+        .first()
+        .is_none_or(|selector_span| selector_span.start != 0)
+        || direct_coverage
             .windows(2)
-            .any(|pair| pair[0].selector_span.end != pair[1].selector_span.start)
-        || runs
+            .any(|pair| pair[0].end != pair[1].start)
+        || direct_coverage
             .last()
-            .is_none_or(|run| run.selector_span.end != selector_count))
+            .is_none_or(|selector_span| selector_span.end != selector_count))
     {
         return Err(directory_error(
             "direct-coordinate read-plan output does not cover every selector",
         ));
     }
+    #[cfg(any(test, feature = "storage-benches"))]
+    read_accounting::add(read_accounting::EMITTED_RUNS, runs.len());
     Ok(AuthenticatedMutationPartReadPlan {
         runs,
+        direct_not_owned,
         #[cfg(test)]
         visited_node_count,
         #[cfg(test)]
@@ -794,7 +1232,7 @@ pub(crate) async fn load_mutation_part_read_plan(
 impl MutationDirectoryReadSelection<'_> {
     fn len(self) -> usize {
         match self {
-            Self::All => 0,
+            Self::All(_) => 0,
             Self::SortedRanges(ranges) => ranges.len(),
             Self::SortedUniquePoints(points) => points.len(),
             Self::SortedUniqueDirectCoordinates(coordinates) => coordinates.len(),
@@ -807,7 +1245,7 @@ fn validate_selection(
     selection: MutationDirectoryReadSelection<'_>,
 ) -> Result<(), LixError> {
     match selection {
-        MutationDirectoryReadSelection::All => Ok(()),
+        MutationDirectoryReadSelection::All(_) => Ok(()),
         MutationDirectoryReadSelection::SortedUniquePoints(points) => {
             if !is_bounded(root.layout) {
                 return Err(directory_error(
@@ -858,22 +1296,9 @@ fn validate_selection(
             if coordinates.is_empty() {
                 return Ok(());
             }
-            if root.direct_row_count == 0 {
-                return Err(directory_error(
-                    "direct-coordinate selection requires direct-row authority",
-                ));
-            }
             if coordinates.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(directory_error(
                     "direct-coordinate selection must be strictly sorted and unique",
-                ));
-            }
-            if coordinates
-                .last()
-                .is_some_and(|coordinate| coordinate.part_index >= root.entry_count)
-            {
-                return Err(directory_error(
-                    "direct-coordinate selection exceeds part authority",
                 ));
             }
             Ok(())
@@ -892,7 +1317,7 @@ fn selection_span_for_entry(
     direct_row_count: Option<u16>,
 ) -> Result<Option<Range<usize>>, LixError> {
     match selection {
-        MutationDirectoryReadSelection::All => Ok(Some(0..0)),
+        MutationDirectoryReadSelection::All(_) => Ok(Some(0..0)),
         MutationDirectoryReadSelection::SortedUniquePoints(points) => {
             while *cursor < selector_end && points[*cursor].as_ref() < first_key {
                 *cursor += 1;
@@ -927,15 +1352,7 @@ fn selection_span_for_entry(
             while *cursor < selector_end && coordinates[*cursor].part_index < entry_end {
                 *cursor += 1;
             }
-            if let Some(direct_row_count) = direct_row_count
-                && coordinates[start..*cursor]
-                    .iter()
-                    .any(|coordinate| coordinate.local_row >= direct_row_count)
-            {
-                return Err(directory_error(
-                    "direct coordinate exceeds authenticated part row count",
-                ));
-            }
+            let _ = direct_row_count;
             Ok((start < *cursor).then_some(start..*cursor))
         }
     }
@@ -946,6 +1363,8 @@ pub(crate) async fn collect_mutation_directory_node_ids(
     root: &MutationDirectoryRoot,
 ) -> Result<BTreeSet<[u8; 32]>, LixError> {
     validate_root(root)?;
+    #[cfg(any(test, feature = "storage-benches"))]
+    read_accounting::add(read_accounting::GC_REACHABILITY_ROOTS, 1);
     let mut reachable = BTreeSet::new();
     let mut frontier = vec![(root.root_id, None::<NodeSummary>)];
     while !frontier.is_empty() {
@@ -1034,11 +1453,20 @@ async fn load_nodes(
     } else {
         PointReadPlan::new(MUTATION_DIRECTORY_NODE_SPACE, &keys)
     };
+    #[cfg(any(test, feature = "storage-benches"))]
+    {
+        read_accounting::add(read_accounting::NODE_BATCHES, 1);
+        read_accounting::add(
+            read_accounting::UNIQUE_NODE_IDS,
+            plan.logical_unique_keys.len(),
+        );
+        read_accounting::add(read_accounting::NODE_GETS, plan.logical_unique_keys.len());
+    }
     let values = plan
         .materialize(store, StorageGetOptions::default())
         .await?
         .value;
-    node_ids
+    let nodes = node_ids
         .iter()
         .zip(values)
         .map(|(node_id, value)| {
@@ -1051,7 +1479,10 @@ async fn load_nodes(
             }
             decode_node(&bytes)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(any(test, feature = "storage-benches"))]
+    read_accounting::add(read_accounting::VISITED_NODES, nodes.len());
+    Ok(nodes)
 }
 
 fn stage_encoded_node(
@@ -1623,10 +2054,13 @@ mod tests {
         assert!(built.node_bytes().len() > 1);
         let (_storage, read) = stored_directory(&built).await;
 
-        let all =
-            load_mutation_part_read_plan(&read, &built.root, MutationDirectoryReadSelection::All)
-                .await
-                .unwrap();
+        let all = load_mutation_part_read_plan(
+            &read,
+            &built.root,
+            MutationDirectoryReadSelection::All(MutationDirectoryFullTraversalContext::Test),
+        )
+        .await
+        .unwrap();
         assert_eq!(all.len(), entries.len());
         assert_eq!(all.visited_node_count(), built.node_bytes().len());
         assert_eq!(all.node_summary_owner_count() + 1, all.visited_node_count());
@@ -1812,10 +2246,13 @@ mod tests {
             vec![(0, 0..1), (1, 0..1), (2, 0..1)]
         );
 
-        let batched =
-            load_all_mutation_part_read_plans(&read, &[built.root.clone(), built.root.clone()])
-                .await
-                .unwrap();
+        let batched = load_all_mutation_part_read_plans(
+            &read,
+            &[built.root.clone(), built.root.clone()],
+            MutationDirectoryFullTraversalContext::Test,
+        )
+        .await
+        .unwrap();
         assert_eq!(batched.len(), 2);
         assert!(batched.iter().all(|plan| plan.len() == entries.len()));
         assert!(batched.iter().all(|plan| {
@@ -1865,7 +2302,7 @@ mod tests {
             runs.iter().map(|run| run.entry_index).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        let error = load_mutation_part_read_plan(
+        let (_runs, not_owned) = load_mutation_part_read_plan(
             &read,
             &built.root,
             MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(&[
@@ -1876,8 +2313,15 @@ mod tests {
             ]),
         )
         .await
-        .expect_err("a physical hole must not become a dense ordinal");
-        assert!(error.to_string().contains("part row count"));
+        .expect("a physical hole is an authenticated unowned slot")
+        .into_direct_routes();
+        assert_eq!(
+            not_owned,
+            vec![MutationDirectoryNotOwnedSpan {
+                selector_span: 0..1,
+                reason: MutationDirectoryNotOwnedReason::LocalRowOutOfRange,
+            }]
+        );
 
         let entries = (0..(FANOUT * FANOUT + 1))
             .map(|_| MutationDirectoryEntry::DirectAddress {
@@ -2018,7 +2462,7 @@ mod tests {
             .expect_err("noncanonical direct coordinates must fail");
             assert!(error.to_string().contains("strictly sorted and unique"));
         }
-        let error = load_mutation_part_read_plan(
+        let (_runs, not_owned) = load_mutation_part_read_plan(
             &read,
             &built.root,
             MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(&[
@@ -2029,9 +2473,16 @@ mod tests {
             ]),
         )
         .await
-        .expect_err("out-of-range part coordinates must fail");
-        assert!(error.to_string().contains("exceeds part authority"));
-        let error = load_mutation_part_read_plan(
+        .expect("out-of-range part coordinates are authenticated unowned slots")
+        .into_direct_routes();
+        assert_eq!(
+            not_owned,
+            vec![MutationDirectoryNotOwnedSpan {
+                selector_span: 0..1,
+                reason: MutationDirectoryNotOwnedReason::PartIndexOutOfRange,
+            }]
+        );
+        let (_runs, not_owned) = load_mutation_part_read_plan(
             &read,
             &built.root,
             MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(&[
@@ -2042,8 +2493,15 @@ mod tests {
             ]),
         )
         .await
-        .expect_err("out-of-range local rows must fail");
-        assert!(error.to_string().contains("part row count"));
+        .expect("out-of-range local rows are authenticated unowned slots")
+        .into_direct_routes();
+        assert_eq!(
+            not_owned,
+            vec![MutationDirectoryNotOwnedSpan {
+                selector_span: 0..1,
+                reason: MutationDirectoryNotOwnedReason::LocalRowOutOfRange,
+            }]
+        );
         let empty_coordinates = load_mutation_part_read_plan(
             &read,
             &built.root,
@@ -2115,7 +2573,7 @@ mod tests {
             local_row: 0,
         }];
         for selection in [
-            MutationDirectoryReadSelection::All,
+            MutationDirectoryReadSelection::All(MutationDirectoryFullTraversalContext::Test),
             MutationDirectoryReadSelection::SortedRanges(&ranges),
             MutationDirectoryReadSelection::SortedUniquePoints(std::slice::from_ref(&point)),
             MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(&coordinate),
@@ -2135,10 +2593,13 @@ mod tests {
             bad_count.tree_height,
             bad_count.layout,
         );
-        let error =
-            load_mutation_part_read_plan(&read, &bad_count, MutationDirectoryReadSelection::All)
-                .await
-                .expect_err("root counts must agree with authenticated nodes");
+        let error = load_mutation_part_read_plan(
+            &read,
+            &bad_count,
+            MutationDirectoryReadSelection::All(MutationDirectoryFullTraversalContext::Test),
+        )
+        .await
+        .expect_err("root counts must agree with authenticated nodes");
         assert!(error.to_string().contains("root summary mismatch"));
     }
 
@@ -2155,7 +2616,7 @@ mod tests {
         let error = load_mutation_part_read_plan(
             &missing_read,
             &built.root,
-            MutationDirectoryReadSelection::All,
+            MutationDirectoryReadSelection::All(MutationDirectoryFullTraversalContext::Test),
         )
         .await
         .expect_err("a missing authenticated node must fail");
@@ -2183,7 +2644,7 @@ mod tests {
         let error = load_mutation_part_read_plan(
             &digest_read,
             &built.root,
-            MutationDirectoryReadSelection::All,
+            MutationDirectoryReadSelection::All(MutationDirectoryFullTraversalContext::Test),
         )
         .await
         .expect_err("content bytes must match their immutable node id");

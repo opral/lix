@@ -3757,10 +3757,13 @@ pub(crate) async fn load_commit_state_manifests(
                 .and_then(|(_, inventory)| inventory.directory_root.clone())
         })
         .collect::<Vec<_>>();
-    let mut directories =
-        super::mutation_directory::load_all_mutation_part_read_plans(store, &roots)
-            .await?
-            .into_iter();
+    let mut directories = super::mutation_directory::load_all_mutation_part_read_plans(
+        store,
+        &roots,
+        super::mutation_directory::MutationDirectoryFullTraversalContext::BulkCommitStateManifests,
+    )
+    .await?
+    .into_iter();
     let mut output = Vec::with_capacity(authorities.len());
     for authority in authorities {
         let Some((stored, inventory)) = authority else {
@@ -5260,15 +5263,23 @@ pub(crate) async fn load_change_record_by_id(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
-    if let Some(locator) = direct_change_locator(change_id)
-        && let Some(authority) =
-            load_claimed_direct_change_authority(store, locator.commit_id).await?
-    {
-        let mut records =
-            load_owned_direct_change_records_for_state(store, &authority, &[locator]).await?;
-        return Ok(Some(
-            records.pop().expect("one direct locator returns one row"),
-        ));
+    if let Some(locator) = direct_change_locator(change_id) {
+        match load_direct_change_authority(store, locator.commit_id).await? {
+            DirectChangeAuthority::Candidate(authority) => {
+                let route = route_direct_change_records_for_state(store, &authority, &[locator])
+                    .await?
+                    .pop()
+                    .expect("one direct locator returns one route");
+                if let DirectChangeRecordRoute::Owned(record) = route {
+                    return Ok(Some(record));
+                }
+            }
+            DirectChangeAuthority::NotOwned(reason) => {
+                let _ = reason;
+            }
+        }
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_explicit_fallback(1);
     }
     if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
         return load_change_record_at_locator(store, locator)
@@ -5282,12 +5293,23 @@ async fn load_canonical_change_locator(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<CommitDeltaChangeLocator>, LixError> {
-    if let Some(locator) = direct_change_locator(change_id)
-        && let Some(authority) =
-            load_claimed_direct_change_authority(store, locator.commit_id).await?
-    {
-        load_owned_direct_change_records_for_state(store, &authority, &[locator]).await?;
-        return Ok(Some(locator));
+    if let Some(locator) = direct_change_locator(change_id) {
+        match load_direct_change_authority(store, locator.commit_id).await? {
+            DirectChangeAuthority::Candidate(authority) => {
+                let route = route_direct_change_records_for_state(store, &authority, &[locator])
+                    .await?
+                    .pop()
+                    .expect("one direct locator returns one route");
+                if matches!(route, DirectChangeRecordRoute::Owned(_)) {
+                    return Ok(Some(locator));
+                }
+            }
+            DirectChangeAuthority::NotOwned(reason) => {
+                let _ = reason;
+            }
+        }
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_explicit_fallback(1);
     }
     if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
         return Ok(Some(locator));
@@ -5338,14 +5360,55 @@ async fn load_change_locator_by_id(
     decode_change_locator(change_id, &locator).map(Some)
 }
 
-async fn load_claimed_direct_change_authority(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectNotOwnedReason {
+    MissingCommitAuthority,
+    UnsupportedLayout,
+    AbsentInlineAuthority,
+    PartIndexOutOfRange,
+    LocalRowOutOfRange,
+}
+
+#[derive(Clone)]
+enum DirectChangeAuthority {
+    Candidate(Arc<AuthenticatedReplayCommitStateManifest>),
+    NotOwned(DirectNotOwnedReason),
+}
+
+#[derive(Clone)]
+enum DirectChangeRecordRoute {
+    Owned(crate::changelog::ChangeRecord),
+    NotOwned(DirectNotOwnedReason),
+}
+
+impl From<super::mutation_directory::MutationDirectoryNotOwnedReason> for DirectNotOwnedReason {
+    fn from(reason: super::mutation_directory::MutationDirectoryNotOwnedReason) -> Self {
+        match reason {
+            super::mutation_directory::MutationDirectoryNotOwnedReason::UnsupportedLayout => {
+                Self::UnsupportedLayout
+            }
+            super::mutation_directory::MutationDirectoryNotOwnedReason::PartIndexOutOfRange => {
+                Self::PartIndexOutOfRange
+            }
+            super::mutation_directory::MutationDirectoryNotOwnedReason::LocalRowOutOfRange => {
+                Self::LocalRowOutOfRange
+            }
+        }
+    }
+}
+
+async fn load_direct_change_authority(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
-) -> Result<Option<Arc<AuthenticatedReplayCommitStateManifest>>, LixError> {
+) -> Result<DirectChangeAuthority, LixError> {
     let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
-        return Ok(None);
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_missing_commit(1);
+        return Ok(DirectChangeAuthority::NotOwned(
+            DirectNotOwnedReason::MissingCommitAuthority,
+        ));
     };
-    let claimed = match state
+    let candidate = match state
         .mutation_directory_root
         .as_ref()
         .map(|root| root.layout)
@@ -5363,21 +5426,44 @@ async fn load_claimed_direct_change_authority(
         }
         None => !state.mutations.direct_part_row_counts.is_empty(),
     };
-    if claimed && state.mutations.selected_source_commit_id().is_some() {
+    if candidate && state.mutations.selected_source_commit_id().is_some() {
         return Err(replacement_payload_error(
             "selected-source alias cannot claim direct change coordinates",
         ));
     }
-    Ok(claimed.then(|| Arc::new(state)))
+    if candidate {
+        Ok(DirectChangeAuthority::Candidate(Arc::new(state)))
+    } else if state.mutation_directory_root.is_some() {
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_not_owned(
+            super::mutation_directory::MutationDirectoryNotOwnedReason::UnsupportedLayout,
+            1,
+        );
+        Ok(DirectChangeAuthority::NotOwned(
+            DirectNotOwnedReason::UnsupportedLayout,
+        ))
+    } else {
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_absent_inline(1);
+        Ok(DirectChangeAuthority::NotOwned(
+            DirectNotOwnedReason::AbsentInlineAuthority,
+        ))
+    }
 }
 
-async fn load_owned_direct_change_records_for_state(
+async fn route_direct_change_records_for_state(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     locators: &[CommitDeltaChangeLocator],
-) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+) -> Result<Vec<DirectChangeRecordRoute>, LixError> {
     if locators.is_empty() {
         return Ok(Vec::new());
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    let mut accounting_guard = super::mutation_directory::DirectRouteAccountingGuard::new();
+    #[cfg(any(test, feature = "storage-benches"))]
+    {
+        super::mutation_directory::record_direct_route_start(locators.len());
     }
     if state.mutations.selected_source_commit_id().is_some() {
         return Err(replacement_payload_error(
@@ -5421,9 +5507,11 @@ async fn load_owned_direct_change_records_for_state(
             }
         })
         .collect::<Vec<_>>();
+    #[cfg(any(test, feature = "storage-benches"))]
+    super::mutation_directory::record_direct_route_unique_rows(coordinates.len());
 
     let unique = if let Some(root) = state.mutation_directory_root.as_ref() {
-        let runs = super::mutation_directory::load_mutation_part_read_plan(
+        let (runs, not_owned) = super::mutation_directory::load_mutation_part_read_plan(
             store,
             root,
             super::mutation_directory::MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(
@@ -5431,7 +5519,33 @@ async fn load_owned_direct_change_records_for_state(
             ),
         )
         .await?
-        .into_runs();
+        .into_direct_routes();
+        let mut unique = (0..coordinates.len()).map(|_| None).collect::<Vec<_>>();
+        for route in not_owned {
+            let reason = DirectNotOwnedReason::from(route.reason);
+            #[cfg(any(test, feature = "storage-benches"))]
+            super::mutation_directory::record_direct_route_not_owned(
+                match reason {
+                    DirectNotOwnedReason::UnsupportedLayout => {
+                        super::mutation_directory::MutationDirectoryNotOwnedReason::UnsupportedLayout
+                    }
+                    DirectNotOwnedReason::PartIndexOutOfRange => {
+                        super::mutation_directory::MutationDirectoryNotOwnedReason::PartIndexOutOfRange
+                    }
+                    DirectNotOwnedReason::LocalRowOutOfRange => {
+                        super::mutation_directory::MutationDirectoryNotOwnedReason::LocalRowOutOfRange
+                    }
+                    DirectNotOwnedReason::MissingCommitAuthority
+                    | DirectNotOwnedReason::AbsentInlineAuthority => {
+                        continue;
+                    }
+                },
+                route.selector_span.len(),
+            );
+            for selector_index in route.selector_span {
+                unique[selector_index] = Some(DirectChangeRecordRoute::NotOwned(reason));
+            }
+        }
         for run in &runs {
             for coordinate in &coordinates[run.selector_span.clone()] {
                 if coordinate.part_index != run.entry_index {
@@ -5460,18 +5574,31 @@ async fn load_owned_direct_change_records_for_state(
                     ));
                 }
             }
-            load_columnar_direct_change_records(
+            let owned_indices = runs
+                .iter()
+                .flat_map(|run| run.selector_span.clone())
+                .collect::<Vec<_>>();
+            #[cfg(any(test, feature = "storage-benches"))]
+            super::mutation_directory::record_direct_route_claimed_rows(owned_indices.len());
+            let records = load_columnar_direct_change_records(
                 store,
                 state,
                 parts,
-                &unique_locator_indices
+                &owned_indices
                     .iter()
-                    .map(|&index| locators[index])
+                    .map(|&index| locators[unique_locator_indices[index]])
                     .collect::<Vec<_>>(),
             )
-            .await?
+            .await?;
+            for (selector_index, record) in owned_indices.into_iter().zip(records) {
+                unique[selector_index] = Some(DirectChangeRecordRoute::Owned(record));
+            }
         } else {
-            load_physical_direct_change_records(
+            #[cfg(any(test, feature = "storage-benches"))]
+            super::mutation_directory::record_direct_route_claimed_rows(
+                runs.iter().map(|run| run.selector_span.len()).sum(),
+            );
+            for (selector_index, record) in load_physical_direct_change_records(
                 store,
                 state,
                 &coordinates,
@@ -5482,50 +5609,110 @@ async fn load_owned_direct_change_records_for_state(
                 runs,
             )
             .await?
+            {
+                unique[selector_index] = Some(DirectChangeRecordRoute::Owned(record));
+            }
         }
+        unique
+            .into_iter()
+            .map(|route| {
+                route.ok_or_else(|| {
+                    replacement_payload_error(
+                        "direct-coordinate plan lost a claimed or unclaimed selector",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?
     } else {
         if state.mutations.inline_part.is_empty()
             || state.mutations.direct_part_row_counts.len() != 1
-            || coordinates
-                .iter()
-                .any(|coordinate| coordinate.part_index != 0)
         {
             return Err(replacement_payload_error(
-                "direct change coordinate has no authenticated inline authority",
+                "direct change candidate has invalid authenticated inline authority",
             ));
         }
         let direct_row_count = state.mutations.direct_part_row_counts[0];
-        let (leaf, payloads) =
-            decode_commit_delta_with_payloads(&state.mutations.inline_part, None)?;
-        if leaf.len() != usize::from(direct_row_count)
-            || leaf.len() != state.mutations.member_count as usize
-        {
-            return Err(replacement_payload_error(
-                "inline direct payload row count disagrees with authenticated authority",
-            ));
-        }
-        unique_locator_indices
+        let owned_indices = coordinates
             .iter()
-            .map(|&index| {
-                decode_change_at_locator_from_decoded(
+            .enumerate()
+            .filter_map(|(index, coordinate)| {
+                (coordinate.part_index == 0 && coordinate.local_row < direct_row_count)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let mut unique = coordinates
+            .iter()
+            .map(|coordinate| {
+                if coordinate.part_index != 0 {
+                    Some(DirectChangeRecordRoute::NotOwned(
+                        DirectNotOwnedReason::PartIndexOutOfRange,
+                    ))
+                } else if coordinate.local_row >= direct_row_count {
+                    Some(DirectChangeRecordRoute::NotOwned(
+                        DirectNotOwnedReason::LocalRowOutOfRange,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if owned_indices.is_empty() {
+            unique
+                .into_iter()
+                .map(|route| {
+                    route.ok_or_else(|| {
+                        replacement_payload_error("inline direct route lost an unclaimed selector")
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?
+        } else {
+            #[cfg(any(test, feature = "storage-benches"))]
+            super::mutation_directory::record_direct_route_claimed_rows(owned_indices.len());
+            let (leaf, payloads) =
+                decode_commit_delta_with_payloads(&state.mutations.inline_part, None)?;
+            if leaf.len() != usize::from(direct_row_count)
+                || leaf.len() != state.mutations.member_count as usize
+            {
+                return Err(replacement_payload_error(
+                    "inline direct payload row count disagrees with authenticated authority",
+                ));
+            }
+            for selector_index in owned_indices {
+                let locator_index = unique_locator_indices[selector_index];
+                let record = decode_change_at_locator_from_decoded(
                     &leaf,
                     &payloads,
-                    locators[index],
+                    locators[locator_index],
                     &state.change_account_id,
                 )
-                .map(|entry| entry.change_record)
-            })
-            .collect::<Result<Vec<_>, LixError>>()?
+                .map(|entry| entry.change_record)?;
+                unique[selector_index] = Some(DirectChangeRecordRoute::Owned(record));
+            }
+            unique
+                .into_iter()
+                .map(|route| {
+                    route.ok_or_else(|| {
+                        replacement_payload_error(
+                            "inline direct route lost a claimed or unclaimed selector",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?
+        }
     };
 
     let mut output = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
     for (request_index, unique_index) in output_routes {
         output[request_index] = Some(unique[unique_index].clone());
     }
+    #[cfg(any(test, feature = "storage-benches"))]
+    super::mutation_directory::record_direct_route_scattered_rows(locators.len());
+    #[cfg(any(test, feature = "storage-benches"))]
+    accounting_guard.finish();
     output
         .into_iter()
-        .map(|record| {
-            record.ok_or_else(|| {
+        .map(|route| {
+            route.ok_or_else(|| {
                 replacement_payload_error("direct change record scatter lost a requested row")
             })
         })
@@ -5605,7 +5792,9 @@ async fn load_physical_direct_change_records(
     coordinates: &[super::mutation_directory::MutationDirectoryDirectCoordinate],
     locators: &[CommitDeltaChangeLocator],
     runs: Vec<super::mutation_directory::MutationDirectoryPartRun>,
-) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+) -> Result<Vec<(usize, crate::changelog::ChangeRecord)>, LixError> {
+    #[cfg(any(test, feature = "storage-benches"))]
+    super::mutation_directory::record_direct_external_parts_loaded(runs.len());
     let storage_keys = runs
         .iter()
         .map(|run| match &run.entry {
@@ -5639,7 +5828,7 @@ async fn load_physical_direct_change_records(
         PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
             .materialize(store, StorageGetOptions::default())
             .await?;
-    let mut output = (0..coordinates.len()).map(|_| None).collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(coordinates.len());
     for (run, value) in runs.into_iter().zip(values.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("direct coordinate references a missing immutable part")
@@ -5680,6 +5869,12 @@ async fn load_physical_direct_change_records(
                 "direct immutable part row count disagrees with directory authority",
             ));
         }
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_part_decoded(
+            leaf.len(),
+            bytes.len(),
+            leaf.resident_bytes() + payloads.resident_bytes(),
+        );
         for output_index in run.selector_span {
             let coordinate = coordinates[output_index];
             let locator = locators[output_index];
@@ -5688,7 +5883,8 @@ async fn load_physical_direct_change_records(
                     "direct-coordinate run disagrees with its physical locator",
                 ));
             }
-            output[output_index] = Some(
+            output.push((
+                output_index,
                 decode_change_at_locator_from_decoded(
                     &leaf,
                     &payloads,
@@ -5696,17 +5892,10 @@ async fn load_physical_direct_change_records(
                     &state.change_account_id,
                 )?
                 .change_record,
-            );
+            ));
         }
     }
-    output
-        .into_iter()
-        .map(|record| {
-            record.ok_or_else(|| {
-                replacement_payload_error("direct-coordinate plan lost a selected payload row")
-            })
-        })
-        .collect()
+    Ok(output)
 }
 
 fn compact_replacement_bounds_for_selected_part(
@@ -5765,8 +5954,7 @@ async fn load_change_records_by_ids(
     if change_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut authority_cache =
-        BTreeMap::<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>::new();
+    let mut authority_cache = BTreeMap::<CommitId, DirectChangeAuthority>::new();
     let mut direct_by_commit = BTreeMap::<
         CommitId,
         (
@@ -5783,15 +5971,18 @@ async fn load_change_records_by_ids(
         let authority = match authority_cache.get(&locator.commit_id) {
             Some(authority) => authority.clone(),
             None => {
-                let authority =
-                    load_claimed_direct_change_authority(store, locator.commit_id).await?;
+                let authority = load_direct_change_authority(store, locator.commit_id).await?;
                 authority_cache.insert(locator.commit_id, authority.clone());
                 authority
             }
         };
-        let Some(authority) = authority else {
-            explicit.push((output_index, change_id));
-            continue;
+        let authority = match authority {
+            DirectChangeAuthority::Candidate(authority) => authority,
+            DirectChangeAuthority::NotOwned(reason) => {
+                let _ = reason;
+                explicit.push((output_index, change_id));
+                continue;
+            }
         };
         direct_by_commit
             .entry(locator.commit_id)
@@ -5806,12 +5997,20 @@ async fn load_change_records_by_ids(
             .iter()
             .map(|(_, locator)| *locator)
             .collect::<Vec<_>>();
-        let records = Box::pin(load_owned_direct_change_records_for_state(
+        let routes = Box::pin(route_direct_change_records_for_state(
             store, &authority, &locators,
         ))
         .await?;
-        for ((output_index, _), record) in requests.into_iter().zip(records) {
-            output[output_index] = Some(record);
+        for ((output_index, locator), route) in requests.into_iter().zip(routes) {
+            match route {
+                DirectChangeRecordRoute::Owned(record) => output[output_index] = Some(record),
+                DirectChangeRecordRoute::NotOwned(reason) => {
+                    let _ = reason;
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    super::mutation_directory::record_direct_route_explicit_fallback(1);
+                    explicit.push((output_index, locator.change_id));
+                }
+            }
         }
     }
 
@@ -6147,13 +6346,23 @@ async fn load_change_record_at_locator(
     store: &(impl StorageAdapterRead + ?Sized),
     locator: CommitDeltaChangeLocator,
 ) -> Result<crate::changelog::ChangeRecord, LixError> {
-    if direct_change_locator(locator.change_id) == Some(locator)
-        && let Some(authority) =
-            load_claimed_direct_change_authority(store, locator.commit_id).await?
-    {
-        let mut records =
-            load_owned_direct_change_records_for_state(store, &authority, &[locator]).await?;
-        return Ok(records.pop().expect("one direct locator returns one row"));
+    if direct_change_locator(locator.change_id) == Some(locator) {
+        match load_direct_change_authority(store, locator.commit_id).await? {
+            DirectChangeAuthority::Candidate(authority) => {
+                let route = route_direct_change_records_for_state(store, &authority, &[locator])
+                    .await?
+                    .pop()
+                    .expect("one direct locator returns one route");
+                if let DirectChangeRecordRoute::Owned(record) = route {
+                    return Ok(record);
+                }
+            }
+            DirectChangeAuthority::NotOwned(reason) => {
+                let _ = reason;
+            }
+        }
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_explicit_fallback(1);
     }
     let change_id = locator.change_id;
     let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await? else {
@@ -7271,7 +7480,9 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     let runs = super::mutation_directory::load_mutation_part_read_plan(
         store,
         root,
-        super::mutation_directory::MutationDirectoryReadSelection::All,
+        super::mutation_directory::MutationDirectoryReadSelection::All(
+            super::mutation_directory::MutationDirectoryFullTraversalContext::CompactMemberScan,
+        ),
     )
     .await?
     .into_runs();
@@ -7335,7 +7546,9 @@ async fn load_bounded_commit_delta_members_for_schemas(
         store,
         root,
         if ranges.is_empty() {
-            super::mutation_directory::MutationDirectoryReadSelection::All
+            super::mutation_directory::MutationDirectoryReadSelection::All(
+                super::mutation_directory::MutationDirectoryFullTraversalContext::EmptySchemaMemberScan,
+            )
         } else {
             super::mutation_directory::MutationDirectoryReadSelection::SortedRanges(&ranges)
         },
@@ -8522,7 +8735,9 @@ async fn scan_authenticated_local_commit_delta_values(
     let entries = super::mutation_directory::load_mutation_part_read_plan(
         store,
         root,
-        super::mutation_directory::MutationDirectoryReadSelection::All,
+        super::mutation_directory::MutationDirectoryReadSelection::All(
+            super::mutation_directory::MutationDirectoryFullTraversalContext::CompactValueScan,
+        ),
     )
     .await?
     .into_runs();
@@ -8586,7 +8801,9 @@ async fn scan_bounded_commit_delta_values(
         store,
         root,
         if ranges.is_empty() {
-            super::mutation_directory::MutationDirectoryReadSelection::All
+            super::mutation_directory::MutationDirectoryReadSelection::All(
+                super::mutation_directory::MutationDirectoryFullTraversalContext::EmptySchemaValueScan,
+            )
         } else {
             super::mutation_directory::MutationDirectoryReadSelection::SortedRanges(&ranges)
         },
@@ -9402,10 +9619,13 @@ async fn scan_commit_delta_plane(
         .iter()
         .filter_map(|(_, _, inventory)| inventory.directory_root.clone())
         .collect::<Vec<_>>();
-    let mut directories =
-        super::mutation_directory::load_all_mutation_part_read_plans(store, &roots)
-            .await?
-            .into_iter();
+    let mut directories = super::mutation_directory::load_all_mutation_part_read_plans(
+        store,
+        &roots,
+        super::mutation_directory::MutationDirectoryFullTraversalContext::RepositoryInventory,
+    )
+    .await?
+    .into_iter();
     let mut manifests = BTreeMap::<CommitId, CommitDeltaManifest>::new();
     for (commit_id, stored, inventory) in authorities {
         let entries = if inventory.directory_root.is_some() {
@@ -11487,7 +11707,9 @@ async fn decode_commit_state_manifest_with_scoped_range_attestation(
         Some(root) => super::mutation_directory::load_mutation_part_read_plan(
             store,
             root,
-            super::mutation_directory::MutationDirectoryReadSelection::All,
+            super::mutation_directory::MutationDirectoryReadSelection::All(
+                super::mutation_directory::MutationDirectoryFullTraversalContext::FullManifestExpansion,
+            ),
         )
         .await?
         .into_runs()
@@ -13412,6 +13634,243 @@ mod tests {
         assert_eq!(canonical.commit_id, explicit_commit_id);
     }
 
+    #[tokio::test]
+    async fn direct_claimed_short_part_holes_and_out_of_range_slots_dispatch_explicitly() {
+        let storage = StorageAdapter::new(Memory::new());
+        let direct_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_5678_0000_0000,
+        ));
+        let fixtures = (0..513)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "direct-hole".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single(format!("entity-{index:04}")),
+                change_id: ChangeId::for_test_label(&format!("direct-hole-{index}")),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index.into()),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy((index + 1).into()),
+            })
+            .collect::<Vec<_>>();
+        let deltas = fixtures
+            .iter()
+            .map(|fixture| {
+                commit_delta_ref(
+                    direct_commit,
+                    fixture,
+                    crate::json_store::JsonSlotRef::Inline("{}"),
+                    crate::json_store::JsonSlotRef::None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        let direct_stage = stage_ordered_addressable_commit_deltas(
+            &mut writes,
+            deltas.iter().copied().map(Ok::<_, LixError>),
+            true,
+        )
+        .expect("direct hole fixture should stage")
+        .expect("ordered direct fixture should use the streaming route");
+        assert_eq!(
+            direct_stage.mutation_inventory().direct_part_row_counts,
+            vec![128, 128, 128, 128, 1]
+        );
+        let hole_change_id = super::addressable_change_id(direct_commit, 4, 1)
+            .expect("short-part hole should retain its direct-shaped id");
+        let out_of_range_change_id = super::addressable_change_id(direct_commit, 5, 0)
+            .expect("out-of-range part should retain its direct-shaped id");
+        let explicit_commit = CommitId::for_test_label("direct-hole-explicit");
+        let mut explicit_hole = fixtures[0].clone();
+        explicit_hole.change_id = hole_change_id;
+        let mut explicit_out_of_range = fixtures[1].clone();
+        explicit_out_of_range.change_id = out_of_range_change_id;
+        let explicit_fixtures = [explicit_hole, explicit_out_of_range];
+        let explicit_deltas = explicit_fixtures
+            .iter()
+            .map(|fixture| {
+                commit_delta_ref(
+                    explicit_commit,
+                    fixture,
+                    crate::json_store::JsonSlotRef::Inline("{}"),
+                    crate::json_store::JsonSlotRef::None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let explicit_stage =
+            stage_addressable_commit_deltas(&mut writes, &explicit_deltas, &[false, false])
+                .expect("explicit collision rows should stage");
+        assert_eq!(explicit_stage.locators.len(), 2);
+        stage_change_locators(&mut writes, &explicit_stage.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("direct and explicit collision authorities should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("direct collision read should open");
+        super::super::mutation_directory::reset_mutation_directory_read_accounting();
+        let direct_record = load_change_record_by_id(&read, direct_stage.change_id_at(0).unwrap())
+            .await
+            .expect("claimed direct row should read")
+            .expect("claimed direct row should exist");
+        assert_eq!(direct_record.entity_pk, fixtures[0].entity_pk);
+        for (change_id, fixture) in [
+            (hole_change_id, &explicit_fixtures[0]),
+            (out_of_range_change_id, &explicit_fixtures[1]),
+        ] {
+            let loaded = load_change_record_by_id(&read, change_id)
+                .await
+                .expect("unowned direct-shaped collision should dispatch")
+                .expect("explicit collision locator should resolve");
+            assert_eq!(loaded.entity_pk, fixture.entity_pk);
+            assert_eq!(
+                super::load_canonical_change_locator(&read, change_id)
+                    .await
+                    .expect("explicit collision locator should remain canonical")
+                    .expect("explicit collision should have a locator")
+                    .commit_id,
+                explicit_commit
+            );
+        }
+        let requested = vec![
+            hole_change_id,
+            direct_stage.change_id_at(0).unwrap(),
+            out_of_range_change_id,
+            hole_change_id,
+        ];
+        let batch = super::load_change_records_by_ids(&read, &requested)
+            .await
+            .expect("mixed owned and unowned direct-shaped batch should dispatch");
+        assert_eq!(
+            batch
+                .iter()
+                .map(|record| record.change_id)
+                .collect::<Vec<_>>(),
+            requested
+        );
+        let accounting =
+            super::super::mutation_directory::snapshot_mutation_directory_read_accounting();
+        assert!(accounting.direct_route_calls >= 3);
+        assert_eq!(accounting.selector_all_roots, 0);
+        assert!(accounting.selector_direct_calls > 0);
+        assert!(accounting.not_owned_part_index > 0);
+        assert!(accounting.not_owned_local_row > 0);
+        assert!(accounting.explicit_fallback_rows > 0);
+
+        // A claimed direct slot remains authoritative even when its immutable
+        // payload is missing: the explicit locator collision must not become a
+        // fallback authority for a corruption case.
+        drop(read);
+        let direct_part_key = super::commit_delta_segment_key_for_part(
+            direct_commit,
+            0,
+            &direct_stage.mutation_inventory().parts[0],
+        )
+        .expect("direct part key should encode");
+        let mut corrupt = storage.new_write_set();
+        corrupt.delete_batch(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, [direct_part_key]);
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("claimed direct payload deletion should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt collision read should open");
+        super::super::mutation_directory::reset_mutation_directory_read_accounting();
+        let error = load_change_record_by_id(&read, direct_stage.change_id_at(0).unwrap())
+            .await
+            .expect_err("claimed payload corruption must not fall back");
+        assert!(error.to_string().contains("missing immutable part"));
+        assert!(
+            super::super::mutation_directory::snapshot_mutation_directory_read_accounting()
+                .corruption_outcomes
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_replacement_direct_change_id_hydrates_through_authenticated_part() {
+        use crate::tracked_state::types::{
+            CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
+            TrackedStateSingleStringReplacementRef,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_5679_0000_0000,
+        ));
+        let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
+        let scope = CommitDeltaReplacementScope {
+            schema_key: "compact-direct".to_string(),
+            file_id: None,
+        };
+        let generation = super::CommitDeltaReplacementGeneration {
+            scope: scope.clone(),
+            fallback_commit_id: None,
+            lifecycle_summary: CommitDeltaLifecycleSummary {
+                scope,
+                ordered_identity_digest: [41; 32],
+                uniform_created_at: created_at,
+            },
+        };
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_ordered_addressable_replacement_parts(
+            &mut writes,
+            ["compact-000", "compact-001"].into_iter().map(|entity_pk| {
+                Ok(TrackedStateSingleStringReplacementRef {
+                    schema_key: "compact-direct",
+                    file_id: None,
+                    entity_pk,
+                    commit_id,
+                    created_at,
+                    updated_at: created_at,
+                    snapshot: crate::json_store::JsonSlotRef::Inline("{\"v\":1}"),
+                    metadata: crate::json_store::JsonSlotRef::None,
+                })
+            }),
+            &generation,
+        )
+        .expect("compact replacement should stage");
+        let mut inventory = staged.mutation_inventory().clone();
+        // Compact replacement authority stores bounds in the authenticated
+        // digest directory, not the generic bounded-part vector.
+        inventory.parts.clear();
+        stage_fixture_manifest(&mut writes, commit_id, &inventory)
+            .expect("compact replacement authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("compact replacement should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("compact replacement read should open");
+        super::super::mutation_directory::reset_mutation_directory_read_accounting();
+        let change_id = staged
+            .change_id_at(1)
+            .expect("replacement row should be addressed");
+        let loaded = load_change_record_by_id(&read, change_id)
+            .await
+            .expect("compact direct hydration should succeed")
+            .expect("compact direct row should exist");
+        assert_eq!(loaded.change_id, change_id);
+        assert_eq!(loaded.entity_pk, EntityPk::single("compact-001"));
+        let accounting =
+            super::super::mutation_directory::snapshot_mutation_directory_read_accounting();
+        assert_eq!(accounting.selector_all_roots, 0);
+        assert!(accounting.selector_direct_calls > 0);
+        assert_eq!(accounting.external_parts_loaded, 1);
+        assert_eq!(accounting.parts_decoded, 1);
+        assert_eq!(accounting.decoded_rows, 2);
+        assert!(accounting.raw_bytes > 0);
+        assert!(accounting.resident_bytes > 0);
+    }
+
     #[test]
     fn change_locator_codec_compacts_sequential_ids_and_round_trips_explicit_ids() {
         let sequential = CommitDeltaChangeLocator {
@@ -14088,6 +14547,80 @@ mod tests {
             .await
             .expect("alias history should retain one canonical source authority");
         assert_eq!(canonical.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn persisted_selected_source_chain_is_rejected_before_hydration() {
+        let storage = StorageAdapter::new(Memory::new());
+        let source_commit = CommitId::for_test_label("persisted-selected-source-root");
+        let first_alias = CommitId::for_test_label("persisted-selected-source-alias");
+        let chained_alias = CommitId::for_test_label("persisted-selected-source-chain");
+        let mut fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+        fixtures[0].change_id = ChangeId::for_test_label("persisted-source-row");
+        fixtures[1].change_id = ChangeId::for_test_label("persisted-alias-row");
+        fixtures[2].change_id = ChangeId::for_test_label("persisted-chain-row");
+
+        let mut writes = storage.new_write_set();
+        let source_delta = commit_delta_ref(
+            source_commit,
+            &fixtures[0],
+            crate::json_store::JsonSlotRef::Inline("{\"source\":true}"),
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        stage_commit_deltas(&mut writes, &[source_delta]).expect("source should stage");
+
+        let first_delta = commit_delta_ref(
+            first_alias,
+            &fixtures[1],
+            crate::json_store::JsonSlotRef::Inline("{\"alias\":true}"),
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        let first_stage = stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &[first_delta],
+            &[false],
+            source_commit,
+        )
+        .expect("first selected-source alias should stage");
+        stage_change_locators(&mut writes, &first_stage.locators);
+
+        let chained_delta = commit_delta_ref(
+            chained_alias,
+            &fixtures[2],
+            crate::json_store::JsonSlotRef::Inline("{\"chain\":true}"),
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        let chained_stage = stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &[chained_delta],
+            &[false],
+            first_alias,
+        )
+        .expect("chained selected-source alias should stage for corruption fixture");
+        stage_change_locators(&mut writes, &chained_stage.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected-source chain fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected-source chain read should open");
+        let error = scan_commit_delta_inventory(&read)
+            .await
+            .expect_err("persisted selected-source chains must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("selected-source commit delta chains are unsupported")
+        );
     }
 
     #[test]
