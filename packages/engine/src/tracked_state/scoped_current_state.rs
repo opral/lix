@@ -146,60 +146,88 @@ async fn stage_disjoint_columnar_current_state_pages(
         .iter()
         .map(|descriptor| scoped_range_part_from_current_state_descriptor(&scope, descriptor))
         .collect::<Result<Vec<_>, LixError>>()?;
-    let tree = match parent {
-        None => {
-            if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
-                return Ok(None);
-            }
-            let marker = ScopedRangeCoverageMarker {
-                scope: prefix,
-                row_count: global_ordinal,
-                part_count: u32::try_from(scoped_parts.len())
-                    .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
-            };
-            stage_scoped_range_tree(writes, [(marker, scoped_parts)])?
-        }
-        Some(parent) => {
-            let inherited = scan_scoped_range_scope(store, &parent.tree, &prefix).await?;
-            let coverage = match inherited.coverage {
-                Some(coverage) => coverage,
-                None => {
-                    if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
-                        return Ok(None);
-                    }
-                    let marker = ScopedRangeCoverageMarker {
-                        scope: prefix,
-                        row_count: global_ordinal,
-                        part_count: u32::try_from(scoped_parts.len())
-                            .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
-                    };
-                    let tree = stage_replace_scoped_range(
-                        store,
-                        writes,
-                        &parent.tree,
-                        marker,
-                        scoped_parts,
-                    )
+    let complete_replacement =
+        inventory
+            .replacement_generation
+            .as_ref()
+            .is_some_and(|generation| {
+                generation.scope == scope && generation.owner_commit_id == parts.owner_commit_id
+            });
+    if inventory.replacement_generation.is_some() && !complete_replacement {
+        return Err(scoped_state_error(
+            "columnar replacement generation disagrees with its scope or owner",
+        ));
+    }
+    let tree = if complete_replacement {
+        let marker = ScopedRangeCoverageMarker {
+            scope: prefix,
+            row_count: global_ordinal,
+            part_count: u32::try_from(scoped_parts.len())
+                .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
+        };
+        match parent {
+            Some(parent) => {
+                stage_replace_scoped_range(store, writes, &parent.tree, marker, scoped_parts)
                     .await?
-                    .root;
-                    return Ok(Some(attest_scoped_range_root(
-                        commit_id,
-                        Some(parent),
-                        inventory,
-                        tree,
-                    )?));
-                }
-            };
-            scoped_parts.extend(inherited.parts);
-            scoped_parts.sort_by(|left, right| left.first_key.cmp(&right.first_key));
-            if scoped_parts
-                .windows(2)
-                .any(|pair| pair[0].last_key >= pair[1].first_key)
-            {
-                return Ok(None);
+                    .root
             }
-            let marker =
-                ScopedRangeCoverageMarker {
+            None => stage_scoped_range_tree(writes, [(marker, scoped_parts)])?,
+        }
+    } else {
+        match parent {
+            None => {
+                if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
+                    return Ok(None);
+                }
+                let marker = ScopedRangeCoverageMarker {
+                    scope: prefix,
+                    row_count: global_ordinal,
+                    part_count: u32::try_from(scoped_parts.len())
+                        .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
+                };
+                stage_scoped_range_tree(writes, [(marker, scoped_parts)])?
+            }
+            Some(parent) => {
+                let inherited = scan_scoped_range_scope(store, &parent.tree, &prefix).await?;
+                let coverage = match inherited.coverage {
+                    Some(coverage) => coverage,
+                    None => {
+                        if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
+                            return Ok(None);
+                        }
+                        let marker = ScopedRangeCoverageMarker {
+                            scope: prefix,
+                            row_count: global_ordinal,
+                            part_count: u32::try_from(scoped_parts.len()).map_err(|_| {
+                                scoped_state_error("columnar part count exceeds u32")
+                            })?,
+                        };
+                        let tree = stage_replace_scoped_range(
+                            store,
+                            writes,
+                            &parent.tree,
+                            marker,
+                            scoped_parts,
+                        )
+                        .await?
+                        .root;
+                        return Ok(Some(attest_scoped_range_root(
+                            commit_id,
+                            Some(parent),
+                            inventory,
+                            tree,
+                        )?));
+                    }
+                };
+                scoped_parts.extend(inherited.parts);
+                scoped_parts.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+                if scoped_parts
+                    .windows(2)
+                    .any(|pair| pair[0].last_key >= pair[1].first_key)
+                {
+                    return Ok(None);
+                }
+                let marker = ScopedRangeCoverageMarker {
                     scope: prefix,
                     row_count: coverage
                         .row_count
@@ -212,9 +240,10 @@ async fn stage_disjoint_columnar_current_state_pages(
                         })?)
                         .ok_or_else(|| scoped_state_error("columnar scope part count overflows"))?,
                 };
-            stage_replace_scoped_range(store, writes, &parent.tree, marker, scoped_parts)
-                .await?
-                .root
+                stage_replace_scoped_range(store, writes, &parent.tree, marker, scoped_parts)
+                    .await?
+                    .root
+            }
         }
     };
     Ok(Some(attest_scoped_range_root(
