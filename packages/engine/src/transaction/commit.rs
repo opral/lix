@@ -85,6 +85,8 @@ fn compare_certified_predecessors(
 std::thread_local! {
     static ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_COLUMNAR_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS: std::cell::Cell<usize> =
@@ -101,6 +103,11 @@ static DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS: std::sync::LazyLock<
 #[cfg(test)]
 pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
     ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_columnar_current_base_publications() -> usize {
+    CERTIFIED_COLUMNAR_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
 }
 
 #[cfg(test)]
@@ -719,6 +726,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &explicit_branch_targets,
         &branch_control_observations,
         &checkpoint_epochs,
+        &staged_delta_index.inventories,
         &staged_delta_index.ordered_addressable_commits,
         &replacement_generation_commits,
         &ordered_replacements,
@@ -3318,6 +3326,7 @@ async fn stage_tracked_head(
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CommitId>,
+    mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_addressable_commits: &BTreeSet<CommitId>,
     replacement_generation_commits: &BTreeSet<CommitId>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
@@ -3351,6 +3360,7 @@ async fn stage_tracked_head(
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
     let mut deferred_fresh_hot_plans = Vec::new();
+    let mut exclusive_certified_columnar_publication = false;
 
     for root in tracked_roots_parent_first(tracked_roots)?
         .into_iter()
@@ -3381,6 +3391,9 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let certified_columnar_parts = mutation_inventories
+            .get(&root.commit_id)
+            .and_then(|inventory| inventory.columnar_parts.as_ref());
         let selected_materialization = if !staged.selected_change_batches.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
@@ -3417,15 +3430,19 @@ async fn stage_tracked_head(
         } else {
             None
         };
-        let mut untracked_deltas = state_rows
-            .iter()
-            .filter(|row| {
-                row.untracked
-                    && row.branch_id.as_str() == root.branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-            })
-            .map(current_state_delta_from_state_row)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut untracked_deltas = if certified_columnar_parts.is_some() {
+            Vec::new()
+        } else {
+            state_rows
+                .iter()
+                .filter(|row| {
+                    row.untracked
+                        && row.branch_id.as_str() == root.branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                })
+                .map(current_state_delta_from_state_row)
+                .collect::<Result<Vec<_>, _>>()?
+        };
         untracked_deltas.extend(
             engine_rows
                 .iter()
@@ -3447,21 +3464,22 @@ async fn stage_tracked_head(
             && explicit_branch_targets.is_empty()
             && state_row_indices.len() == state_rows.len()
             && insert_selection.len() == state_rows.len()
-            && state_row_indices.iter().all(|&row_index| {
-                let row = state_rows.row(row_index);
-                insert_selection.contains(row_index)
-                    && row.branch_id.as_str() == root.branch_id
-                    && !row.untracked
-                    && row.snapshot.is_some()
-                    && row.file_id.is_none()
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                    && row.schema_key
-                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                    && row.commit_id == Some(root.commit_id)
-                    && row
-                        .change_id
-                        .is_some_and(|change_id| change_id != ChangeId::default())
-            });
+            && (certified_columnar_parts.is_some()
+                || state_row_indices.iter().all(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    insert_selection.contains(row_index)
+                        && row.branch_id.as_str() == root.branch_id
+                        && !row.untracked
+                        && row.snapshot.is_some()
+                        && row.file_id.is_none()
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.schema_key
+                            != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                        && row.commit_id == Some(root.commit_id)
+                        && row
+                            .change_id
+                            .is_some_and(|change_id| change_id != ChangeId::default())
+                }));
         let complete_replacement_schema =
             (state_rows.complete_collection_replacement_proof().is_some()
                 && replacement_generation_commits.contains(&root.commit_id)
@@ -3672,25 +3690,56 @@ async fn stage_tracked_head(
             ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
             });
-            let generation = tracked_head
-                .writer(read, writes)
-                .stage_ordered_insert_current_base(
-                    &root.branch_id,
-                    parent_generation,
-                    root.commit_id,
-                    state_row_indices
-                        .iter()
-                        .map(|&row_index| state_rows.row(row_index))
-                        .map(|row| (row.schema_key.as_str(), row.entity_pk)),
-                    entity_columnar_write_sets,
-                    working_diff_capture_checkpoint_commit_id,
-                    &mut coverage,
+            let inventory = mutation_inventories.get(&root.commit_id).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "ordered current-base publication omitted its mutation inventory",
                 )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.materialization.tracked_head.stage_ordered_packed_current_base"
-                ))
-                .await?;
+            })?;
+            let mut writer = tracked_head.writer(read, writes);
+            let generation = if let (Some(parts), Some(lifecycle)) = (
+                certified_columnar_parts,
+                inventory.lifecycle_summary.as_ref(),
+            ) {
+                #[cfg(test)]
+                CERTIFIED_COLUMNAR_CURRENT_BASE_PUBLICATIONS.with(|publications| {
+                    publications.set(publications.get().saturating_add(1));
+                });
+                writer
+                    .stage_certified_columnar_insert_current_base(
+                        &root.branch_id,
+                        parent_generation,
+                        root.commit_id,
+                        parts,
+                        lifecycle,
+                        working_diff_capture_checkpoint_commit_id,
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_certified_columnar_current_base"
+                    ))
+                    .await?
+            } else {
+                writer
+                    .stage_ordered_insert_current_base(
+                        &root.branch_id,
+                        parent_generation,
+                        root.commit_id,
+                        state_row_indices
+                            .iter()
+                            .map(|&row_index| state_rows.row(row_index))
+                            .map(|row| (row.schema_key.as_str(), row.entity_pk)),
+                        entity_columnar_write_sets,
+                        working_diff_capture_checkpoint_commit_id,
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_ordered_packed_current_base"
+                    ))
+                    .await?
+            };
             if let Some(epoch) = working_diff_epoch {
                 let next_epoch = TrackedWorkingDiffEpoch {
                     checkpoint_commit_id: epoch.checkpoint_commit_id,
@@ -3707,11 +3756,25 @@ async fn stage_tracked_head(
                 generation,
                 working_diff_checkpoint_commit_id,
             )?;
-            control.note_schemas(
-                state_row_indices
-                    .iter()
-                    .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
-            );
+            if let Some(parts) = certified_columnar_parts {
+                control.note_schemas(std::iter::once(parts.schema_key.as_str()));
+                debug_assert!(
+                    state_row_indices.len() == state_rows.len()
+                        && insert_selection.len() == state_rows.len()
+                        && untracked_deltas.is_empty()
+                        && engine_rows.is_empty(),
+                    "exclusive columnar publication must cover the whole prepared state batch"
+                );
+                // The same exclusivity proof makes the later global scan for
+                // untracked-only branches redundant.
+                exclusive_certified_columnar_publication = true;
+            } else {
+                control.note_schemas(
+                    state_row_indices
+                        .iter()
+                        .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
+                );
+            }
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
         }
@@ -4073,15 +4136,19 @@ async fn stage_tracked_head(
         .iter()
         .map(|root| root.branch_id.as_str())
         .collect::<BTreeSet<_>>();
-    let current_only_branches = state_rows
-        .iter()
-        .filter(|row| row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY)
-        .map(|row| row.branch_id.as_str())
-        .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
-        .filter(|branch_id| {
-            !rooted_branches.contains(branch_id) && !explicit_branches.contains(*branch_id)
-        })
-        .collect::<BTreeSet<_>>();
+    let current_only_branches = if exclusive_certified_columnar_publication {
+        BTreeSet::new()
+    } else {
+        state_rows
+            .iter()
+            .filter(|row| row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY)
+            .map(|row| row.branch_id.as_str())
+            .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
+            .filter(|branch_id| {
+                !rooted_branches.contains(branch_id) && !explicit_branches.contains(*branch_id)
+            })
+            .collect::<BTreeSet<_>>()
+    };
     for branch_id in current_only_branches {
         let control = observations
             .get(branch_id)

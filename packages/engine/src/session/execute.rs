@@ -5069,7 +5069,6 @@ mod tests {
             1,
             "the certified ordered batch must publish its commit delta directly as current state"
         );
-
         let rows = session
             .execute(
                 "SELECT id, value FROM ordered_packed_insert_probe WHERE id IN ('0000', '1023') ORDER BY id",
@@ -5654,6 +5653,7 @@ mod tests {
             .expect("pre-insert head should exist");
 
         crate::transaction::take_ordered_packed_current_base_publications();
+        crate::transaction::take_certified_columnar_current_base_publications();
         let insert_sql = "INSERT INTO columnar_lifecycle_probe (id, value) VALUES ($1, $2)";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
@@ -5676,6 +5676,11 @@ mod tests {
             crate::transaction::take_ordered_packed_current_base_publications(),
             1,
             "fixture must activate packed current-state publication"
+        );
+        assert_eq!(
+            crate::transaction::take_certified_columnar_current_base_publications(),
+            1,
+            "lossless columnar INSERT must bypass the row-wise current-base publisher"
         );
         let inserted_head = engine
             .load_branch_head_commit_id(&main_branch_id)

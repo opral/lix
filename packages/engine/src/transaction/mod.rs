@@ -17,6 +17,8 @@ pub mod bench {
 }
 
 #[cfg(test)]
+pub(crate) use commit::take_certified_columnar_current_base_publications;
+#[cfg(test)]
 pub(crate) use commit::take_complete_replacement_packed_current_base_publications;
 #[cfg(test)]
 pub(crate) use commit::take_complete_replacement_packed_current_base_retirements;
