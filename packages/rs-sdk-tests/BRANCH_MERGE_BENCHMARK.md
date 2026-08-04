@@ -1,10 +1,14 @@
 # Branch and merge qualification benchmark
 
 `branch_merge_benchmark` is a correctness-gated benchmark for branch creation,
-branch switching, historical diff, merge preview, and merge commit. The controller launches one
+branch switching and deletion, historical diff, merge preview, and merge commit. The controller launches one
 fresh process per scenario so allocator retention, RocksDB caches, and WASM
 instances cannot leak between samples. Each worker emits exactly one JSON
 object on stdout; concatenate stdout to retain JSONL suitable for comparison.
+
+RocksDB is the default backend. Set
+`LIX_BRANCH_MERGE_BENCH_STORAGE=slatedb` to run the same qualification or
+worker against SlateDB.
 
 ## Commands
 
