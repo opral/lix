@@ -433,7 +433,7 @@ fn entity_columnar_mask_error(message: &str) -> LixError {
 fn direct_entity_snapshot_request(request: &LiveStateScanRequest) -> bool {
     matches!(request.filter.rows, LiveStateRowFilter::All)
         && !request.filter.include_tombstones
-        && request.filter.untracked.is_none()
+        && request.filter.untracked == Some(false)
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
 }
@@ -483,6 +483,7 @@ mod tests {
     #[test]
     fn exact_primary_key_and_limit_bypass_columnar_scan() {
         let mut request = LiveStateScanRequest::default();
+        request.filter.untracked = Some(false);
         assert!(direct_entity_columnar_request(&request));
 
         request

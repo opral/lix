@@ -1993,6 +1993,7 @@ mod tests {
                     schema_keys: vec![schema_key.to_string()],
                     entity_pks: entity_pks.to_vec(),
                     branch_ids: vec![branch_id.to_string()],
+                    untracked: Some(false),
                     ..LiveStateFilter::default()
                 },
                 ..LiveStateScanRequest::default()
@@ -2118,34 +2119,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_entity_snapshots_fall_back_for_retention_scoped_reads() {
+    async fn direct_entity_snapshots_fall_back_for_untracked_reads() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
-        for untracked in [false, true] {
-            let snapshots = live_state
-                .reader(
-                    storage
-                        .begin_read(StorageReadOptions::default())
-                        .await
-                        .expect("open retention-scoped entity read"),
-                )
-                .scan_direct_entity_snapshots(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec!["schema".to_string()],
-                        entity_pks: vec![EntityPk::single("row")],
-                        branch_ids: vec!["branch".to_string()],
-                        untracked: Some(untracked),
-                        ..LiveStateFilter::default()
-                    },
-                    ..LiveStateScanRequest::default()
-                })
-                .await
-                .expect("retention-scoped entity read should execute");
-            assert!(
-                snapshots.is_none(),
-                "raw snapshot serving must not bypass retention filtering"
-            );
-        }
+        let snapshots = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("open untracked entity read"),
+            )
+            .scan_direct_entity_snapshots(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["schema".to_string()],
+                    entity_pks: vec![EntityPk::single("row")],
+                    branch_ids: vec!["branch".to_string()],
+                    untracked: Some(true),
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await
+            .expect("untracked entity read should execute");
+        assert!(
+            snapshots.is_none(),
+            "tracked raw snapshot serving must not answer untracked reads"
+        );
     }
 
     #[tokio::test]
