@@ -654,6 +654,16 @@ pub(crate) fn commit_state_inventory_exact_touched_scopes(
     if inventory.selected_source_commit_id.is_some() {
         return Ok(None);
     }
+    commit_state_inventory_exact_local_touched_scopes(commit_id, inventory, empty_base)
+}
+
+/// Returns only scopes authored by this inventory, excluding the complete
+/// inherited state supplied by an optional selected source.
+pub(crate) fn commit_state_inventory_exact_local_touched_scopes(
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+    empty_base: bool,
+) -> Result<Option<Vec<CommitDeltaReplacementScope>>, LixError> {
     if inventory.member_count == 0 {
         return Ok(Some(Vec::new()));
     }
@@ -2222,6 +2232,31 @@ pub(crate) struct StagedCommitStateManifest {
     write_set_id: u64,
 }
 
+/// Authenticated topology input accepted by cumulative physical publication.
+/// The variants prevent freely constructed manifests from minting a complete
+/// touched-scope certificate.
+#[derive(Clone, Copy)]
+pub(crate) enum CertifiedCommitStateTopologyParent<'a> {
+    Published(&'a PublishedCommitStateManifest),
+    Staged(&'a StagedCommitStateManifest),
+}
+
+impl<'a> CertifiedCommitStateTopologyParent<'a> {
+    fn manifest(self, writes: &StorageWriteSet) -> Result<&'a CommitStateManifest, LixError> {
+        match self {
+            Self::Published(parent) => Ok(&parent.manifest),
+            Self::Staged(parent) => {
+                if parent.write_set_id != writes.identity() {
+                    return Err(replacement_payload_error(
+                        "staged topology parent belongs to a different storage write set",
+                    ));
+                }
+                Ok(&parent.manifest)
+            }
+        }
+    }
+}
+
 impl Deref for PublishedCommitStateManifest {
     type Target = CommitStateManifest;
 
@@ -2246,6 +2281,30 @@ impl Deref for StagedCommitStateManifest {
     }
 }
 
+pub(crate) fn certify_topology_touched_scope_filter(
+    writes: &StorageWriteSet,
+    parents: &[CertifiedCommitStateTopologyParent<'_>],
+    selected_source: Option<CertifiedCommitStateTopologyParent<'_>>,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
+    let parents = parents
+        .iter()
+        .copied()
+        .map(|parent| parent.manifest(writes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_source = selected_source
+        .map(|source| source.manifest(writes))
+        .transpose()?;
+    super::scoped_current_state::certify_topology_touched_scope_filter_from_manifests(
+        writes,
+        &parents,
+        selected_source,
+        commit_id,
+        inventory,
+    )
+}
+
 pub(crate) async fn stage_current_state_scoped_ranges_from_published_parent(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -2253,7 +2312,7 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_published_parent(
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
-) -> Result<super::scoped_current_state::CertifiedCurrentStateScopedRangePublication, LixError> {
+) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
     super::scoped_current_state::stage_current_state_scoped_ranges(
         store,
         writes,
@@ -2272,7 +2331,7 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_staged_parent(
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
-) -> Result<super::scoped_current_state::CertifiedCurrentStateScopedRangePublication, LixError> {
+) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
     if parent.write_set_id != writes.identity() {
         return Err(replacement_payload_error(
             "staged scoped-range parent belongs to a different storage write set",
@@ -3417,30 +3476,26 @@ pub(crate) fn stage_commit_state_manifest_with_handle(
     })
 }
 
-/// Publishes a scoped-range root only when the exact opaque proof from its
-/// canonical staging transition accompanies the manifest.
+/// Publishes physical serving authority only when the exact opaque proof from
+/// its canonical topology and range transition accompanies the manifest.
 pub(crate) fn stage_certified_commit_state_manifest(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
-    publication: &super::scoped_current_state::CertifiedCurrentStateScopedRangePublication,
+    publication: &super::scoped_current_state::CertifiedCommitStatePhysicalPublication,
 ) -> Result<(), LixError> {
     if writes.identity() != publication.write_set_id() {
         return Err(replacement_payload_error(
-            "scoped-range publication proof belongs to a different storage write set",
+            "physical publication proof belongs to a different storage write set",
         ));
     }
-    let declared_parent_id = match manifest.parent_commit_ids.as_slice() {
-        [] => None,
-        [parent_id] => Some(*parent_id),
-        _ => {
-            return Err(replacement_payload_error(
-                "certified current-state scoped ranges cannot have multiple graph parents",
-            ));
-        }
-    };
-    if declared_parent_id != publication.parent_commit_id() {
+    if manifest.parent_commit_ids != publication.parent_commit_ids() {
         return Err(replacement_payload_error(
-            "commit manifest graph parent disagrees with its scoped-range publication proof",
+            "commit manifest graph-parent topology disagrees with its physical publication proof",
+        ));
+    }
+    if manifest.mutations.selected_source_commit_id() != publication.selected_source_commit_id() {
+        return Err(replacement_payload_error(
+            "commit manifest selected source disagrees with its physical publication proof",
         ));
     }
     if manifest.current_state_scoped_ranges != publication.root() {
@@ -3459,7 +3514,7 @@ pub(crate) fn stage_certified_commit_state_manifest(
 pub(crate) fn stage_certified_commit_state_manifest_with_handle(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
-    publication: &super::scoped_current_state::CertifiedCurrentStateScopedRangePublication,
+    publication: &super::scoped_current_state::CertifiedCommitStatePhysicalPublication,
 ) -> Result<StagedCommitStateManifest, LixError> {
     stage_certified_commit_state_manifest(writes, manifest, publication)?;
     Ok(StagedCommitStateManifest {

@@ -327,10 +327,11 @@ pub(crate) struct CurrentStateScopedRangeRoot {
 /// Cumulative negative-membership certificate for collection scopes.
 ///
 /// A complete filter may have false positives, but never false negatives: a
-/// missing schema-family bit therefore proves that no commit in the certified
-/// linear lineage authored any scope for that schema. Coarsening file-scoped
-/// collections to their schema avoids cardinality-driven saturation while
-/// remaining conservative. Incomplete filters fail closed and carry no bits.
+/// missing schema-family bit therefore proves that no effective graph-parent
+/// or selected-source lineage authored any scope for that schema. Coarsening
+/// file-scoped collections to their schema avoids cardinality-driven
+/// saturation while remaining conservative. Incomplete filters fail closed
+/// and carry no bits.
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateTouchedScopeFilter {
