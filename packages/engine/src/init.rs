@@ -42,14 +42,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V56 separates semantic graph ancestry from physical current-state ancestry.
-/// A serving root authenticates the exact commit/root it structurally reuses,
-/// including merge targets and selected sources. Older repositories must fail
-/// closed rather than reinterpret a first-parent root as this stronger proof.
+/// V57 makes commit-state manifests immutable physical authority. Semantic
+/// commit facts remain owned exclusively by `changelog.commit`; canonical
+/// snapshot metadata stays inside the immutable physical manifest while its
+/// content-addressed tree chunks remain rebuildable.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"authenticated-serving-base-lineage.v56";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v57";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -411,23 +411,20 @@ where
                 &initial_mutations,
             )
             .await?;
-        crate::tracked_state::stage_certified_commit_state_manifest(
-            &mut writes,
-            &CommitStateManifest {
-                commit_id: plan.commit.id,
-                generation: 0,
-                parent_commit_ids: plan.commit.parent_ids.clone(),
-                commit_change_id: plan.commit.change_id,
-                account_id: plan.commit.account_id.clone(),
-                created_at: plan.commit.created_at,
-                replay_debt: CommitStateReplayDebt::default(),
-                mutations: initial_mutations,
-                touched_scope_filter: physical_publication.touched_scope_filter().clone(),
-                current_state_scoped_ranges: physical_publication.root(),
-                snapshot_root: Some(snapshot_root),
-            },
-            &physical_publication,
-        )?;
+        let _initial_state =
+            crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+                &mut writes,
+                &CommitStateManifest {
+                    commit_id: plan.commit.id,
+                    change_account_id: plan.commit.account_id.clone(),
+                    replay_debt: CommitStateReplayDebt::default(),
+                    mutations: initial_mutations,
+                    touched_scope_filter: physical_publication.touched_scope_filter().clone(),
+                    current_state_scoped_ranges: physical_publication.root(),
+                    snapshot_root: Some(Box::new(snapshot_root)),
+                },
+                &physical_publication,
+            )?;
 
         // Seed both visible branches with a complete hot current-state generation.
         // The initial commit is shared, but the branch-scoped marker and
@@ -606,14 +603,10 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 1,
+        format_version: 2,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
-        tracked_state_rootless: false,
-        tracked_state_rootless_depth: 0,
-        tracked_state_rootless_rows: 0,
-        tracked_state_rootless_bytes: 0,
         change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,

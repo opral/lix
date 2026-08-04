@@ -229,14 +229,10 @@ pub fn append_ordered_commits(
             .checked_add(offset)
             .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
         append.commits.push(CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: CommitId::new(ordered_bench_uuid(commit_index, 0)),
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: false,
-            tracked_state_rootless_depth: 0,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -256,14 +252,10 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     for commit_index in 0..commit_count {
         let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id,
             generation: u64::try_from(commit_index).expect("benchmark commit index fits u64"),
             parent_commit_ids: parent_commit_id.into_iter().collect(),
-            tracked_state_rootless: false,
-            tracked_state_rootless_depth: 0,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -622,14 +614,10 @@ fn direct_append_with_shape(
             next_change += 1;
         }
         append.commits.push(CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: typed_commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: false,
-            tracked_state_rootless_depth: 0,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&commit_change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(

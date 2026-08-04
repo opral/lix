@@ -158,6 +158,23 @@ pub(crate) struct TrackedStateCommitRoot {
     pub(crate) primary_chunk_bytes: u64,
 }
 
+impl TrackedStateCommitRoot {
+    /// Compares immutable serving identity and shape.
+    ///
+    /// Primary chunk counts and bytes describe the publication path's staged
+    /// writes. A rebuild can reach the same content-addressed root through a
+    /// different sequence of intermediate chunks, so those original metrics
+    /// remain manifest-owned accounting rather than rebuilt root identity.
+    pub(crate) fn has_same_authoritative_layout(&self, other: &Self) -> bool {
+        self.commit_id == other.commit_id
+            && self.root_id == other.root_id
+            && self.parent_roots == other.parent_roots
+            && self.changed_key_count == other.changed_key_count
+            && self.row_count_estimate == other.row_count_estimate
+            && self.tree_height == other.tree_height
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedStateCommitRootParent {
@@ -168,10 +185,9 @@ pub(crate) struct TrackedStateCommitRootParent {
 /// Bounded first-parent replay work carried by a commit's canonical mutation
 /// interval.
 ///
-/// Zero debt means the snapshot root is the canonical serving layout. Nonzero
-/// debt means readers can reconstruct the state from the bounded interval;
-/// [`CommitStateManifest::snapshot_root`] may still contain an equivalent,
-/// rebuildable snapshot accelerator without changing that policy.
+/// Zero debt means the manifest's snapshot root is the canonical serving
+/// layout. Nonzero debt means readers reconstruct state from the bounded
+/// interval and the manifest must not publish a snapshot root.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateReplayDebt {
@@ -313,7 +329,7 @@ pub(crate) struct CurrentStatePartDescriptor {
 /// Manifest-attested root of the unified scope/part serving tree.
 ///
 /// The generic tree owns only authenticated physical routing. These fields
-/// bind one result root to the physical serving base and sealed mutation
+/// bind one result root to the physical serving base and certified mutation
 /// authority that produced it. Graph ancestry remains an independent semantic
 /// relationship and is not exposed to the tree.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -406,27 +422,29 @@ impl CommitStateMutationInventory {
     }
 }
 
-/// Single semantic authority for one tracked commit.
+/// Immutable physical authority for one tracked commit.
 ///
 /// Compact topology projections, point locators, current-state HOT rows, and
 /// snapshot tree chunks remain rebuildable serving indexes. None may carry
-/// commit semantics absent from this manifest.
+/// semantic commit facts, which belong exclusively to `changelog.commit`.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateManifest {
     pub(crate) commit_id: CommitId,
-    pub(crate) generation: u64,
-    pub(crate) parent_commit_ids: Vec<CommitId>,
-    pub(crate) commit_change_id: ChangeId,
-    pub(crate) account_id: String,
-    pub(crate) created_at: LixTimestamp,
+    /// Physical decode dictionary for authored mutation rows. This is not
+    /// commit-account authority: it remains with retained immutable payloads
+    /// even if GC removes the semantic commit projection.
+    pub(crate) change_account_id: String,
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    /// Canonical snapshot metadata when this commit was published as a root
+    /// fence. The tree chunks are rebuildable by content hash; this immutable
+    /// pointer is the authority that permits readers to serve them.
     #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
+    pub(crate) snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }
 
 /// Materialized tracked-state commit-root row.
@@ -629,4 +647,35 @@ pub(crate) struct TrackedStateTreeDiffEntry {
     pub(crate) key: TrackedStateKey,
     pub(crate) before: Option<TrackedStateIndexValue>,
     pub(crate) after: Option<TrackedStateIndexValue>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit_root() -> TrackedStateCommitRoot {
+        TrackedStateCommitRoot {
+            commit_id: CommitId::parse_lix("01920000-0000-7000-8000-000000000001", "test commit")
+                .expect("test commit id should parse"),
+            root_id: TrackedStateRootId::new([1; 32]),
+            parent_roots: Vec::new(),
+            changed_key_count: 3,
+            row_count_estimate: 7,
+            tree_height: 1,
+            primary_chunk_count: 2,
+            primary_chunk_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn authoritative_layout_excludes_publication_write_accounting() {
+        let expected = commit_root();
+        let mut rebuilt = expected.clone();
+        rebuilt.primary_chunk_count = 5;
+        rebuilt.primary_chunk_bytes = 512;
+        assert!(expected.has_same_authoritative_layout(&rebuilt));
+
+        rebuilt.root_id = TrackedStateRootId::new([2; 32]);
+        assert!(!expected.has_same_authoritative_layout(&rebuilt));
+    }
 }

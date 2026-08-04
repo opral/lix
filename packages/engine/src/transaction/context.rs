@@ -29,8 +29,8 @@ use crate::catalog::{
     stage_catalog_revision,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
-    materialize_known_change_payloads,
+    ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId,
+    CommitLoadRequest, load_change_records, materialize_known_change_payloads,
 };
 use crate::checkpoint::{
     CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head, checkpoint_marker_stage_row,
@@ -154,13 +154,17 @@ where
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let accounts_by_commit = commit_ids
-            .iter()
-            .copied()
-            .zip(crate::tracked_state::load_commit_state_manifests(&self.store, &commit_ids).await?)
-            .map(|(commit_id, manifest)| {
-                manifest
-                    .map(|manifest| (commit_id, manifest.account_id))
+        let records = ChangelogContext::new()
+            .reader(&self.store)
+            .load_commits(CommitLoadRequest {
+                commit_ids: &commit_ids,
+            })
+            .await?;
+        let accounts_by_commit = records
+            .into_iter()
+            .map(|(commit_id, record)| {
+                record
+                    .map(|record| (*commit_id, record.account_id))
                     .ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,

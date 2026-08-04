@@ -313,25 +313,13 @@ pub(crate) struct ChangelogAppend {
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitRecord {
+    /// Version 2 removes physical replay policy from the semantic commit row.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
     /// smaller generation, enabling bounded priority graph walks.
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
-    /// Normal serial tracked commits carry all required state in the
-    /// changelog/delta index and intentionally omit an immutable root. Root
-    /// fences remain the topology and checkpoint fallback.
-    pub(crate) tracked_state_rootless: bool,
-    /// First-parent distance from the nearest rooted commit. Zero means this
-    /// commit is rooted; rootless intervals use this to schedule bounded
-    /// automatic root fences without graph walks on the write path.
-    pub(crate) tracked_state_rootless_depth: u16,
-    /// Cumulative delta rows since the nearest rooted first-parent ancestor.
-    /// This bounds foreground replay work independently of commit depth.
-    pub(crate) tracked_state_rootless_rows: u64,
-    /// Conservative encoded/payload work estimate for the same interval.
-    pub(crate) tracked_state_rootless_bytes: u64,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,

@@ -42,7 +42,7 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     let typed_commit_id = CommitId::parse_lix(commit_id, "commit-root rebuild authority")?;
-    storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
+    let manifest = storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
         .await?
         .ok_or_else(|| {
             LixError::new(
@@ -52,6 +52,27 @@ where
                 ),
             )
         })?;
+    if manifest.snapshot_root.is_none() {
+        // Rootless commits are intentionally bounded-replay layouts. Build and
+        // audit the canonical state transiently, but do not persist chunks that
+        // immutable authority cannot address.
+        let mut scratch_writes = StorageWriteSet::new();
+        let mut scratch_rebuilder = TrackedStateRootRebuilder {
+            store: rebuilder.store,
+            writes: &mut scratch_writes,
+        };
+        return rebuild_commit_root_at_inner(&mut scratch_rebuilder, commit_id).await;
+    }
+    rebuild_commit_root_at_inner(rebuilder, commit_id).await
+}
+
+async fn rebuild_commit_root_at_inner<S>(
+    rebuilder: &mut TrackedStateRootRebuilder<'_, S>,
+    commit_id: &str,
+) -> Result<TrackedStateWriteReport, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
     let plans =
         load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
     let mut report = None;
@@ -85,14 +106,19 @@ where
                     ),
                 )
             })?;
-        // The rebuilt tree is an optional immutable accelerator. Preserve
-        // replay debt: it remains the physical-policy authority projected by
-        // the changelog, while readers may serve through this equivalent root.
-        storage::stage_commit_state_snapshot_root_update(
-            rebuilder.writes,
-            &manifest,
-            Some(snapshot_root),
-        )?;
+        if let Some(expected) = manifest.snapshot_root.as_ref()
+            && !expected.has_same_authoritative_layout(&snapshot_root)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "rebuilt tracked_state root for commit '{}' disagrees with immutable commit authority: expected {expected:?}, rebuilt {snapshot_root:?}",
+                    snapshot_root.commit_id,
+                ),
+            ));
+        }
+        // Root metadata is immutable authority. Rebuilds restore its
+        // content-addressed chunks; rootless commits remain replay-only.
     }
     Ok(report)
 }
@@ -149,8 +175,7 @@ where
         if !seen.insert(commit_id.to_string()) {
             return Ok(None);
         }
-        let Some(metadata) = storage::load_authoritative_commit_root(store, commit_id).await?
-        else {
+        let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
             seen.remove(commit_id);
             return Ok(None);
         };

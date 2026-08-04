@@ -11,7 +11,7 @@ use std::ops::{Bound, Deref, Range};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::changelog::CommitId;
+use crate::changelog::{ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest};
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
@@ -48,8 +48,6 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
     "tracked_state.commit_state_manifest.v6";
-pub(crate) const TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE: &str =
-    "tracked_state.commit_state_semantic_authority.v3";
 const MIN_CURRENT_STATE_SCOPED_RANGE_POINT_READS: u16 = 4;
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0001),
@@ -72,13 +70,9 @@ pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace
 /// Current repositories publish this one manifest per commit, including
 /// commits with no tracked mutations. The former topology, delta-directory,
 /// and root authority spaces are not part of the current protocol.
-pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_002b),
     TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
-);
-pub(crate) const TRACKED_STATE_COMMIT_STATE_SEAL_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_002e),
-    TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
 );
 
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
@@ -89,8 +83,6 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // replacements authoritative through their immutable part manifest. The
 // payload-less certified-reference encoding is intentionally rejected.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA5";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.semantic-authority.v5";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -100,10 +92,10 @@ const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.sem
 // Version 6 binds the scope-run v3 node protocol and shared runtime scope
 // identities. LXCS5 roots cannot be reinterpreted under its content hashes.
 // Version 7 authenticates the cumulative touched-schema negative certificate.
-// LXCS6 manifests and LXSA3 semantic seals are deliberately incompatible.
+// Pre-cut manifests are deliberately incompatible with this physical-only format.
 // Version 8 binds current-state serving roots to an explicit physical base
 // commit independently from semantic graph ancestry.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS8";
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS9";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -503,17 +495,6 @@ pub(crate) struct CommitDeltaInventoryEntry {
     pub(crate) segment_count: usize,
     physical_segment_keys: Vec<Vec<u8>>,
     pub(crate) selected_source_commit_id: Option<CommitId>,
-    pub(crate) authority: CommitStateTopologyProjection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitStateTopologyProjection {
-    pub(crate) generation: u64,
-    pub(crate) parent_commit_ids: Vec<CommitId>,
-    pub(crate) commit_change_id: crate::changelog::ChangeId,
-    pub(crate) account_id: String,
-    pub(crate) created_at: crate::common::LixTimestamp,
-    pub(crate) replay_debt: crate::tracked_state::types::CommitStateReplayDebt,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -523,7 +504,6 @@ pub(crate) struct CommitDeltaInventory {
 
 struct CommitDeltaPlane {
     manifests: BTreeMap<CommitId, CommitDeltaManifest>,
-    authorities: BTreeMap<CommitId, CommitStateTopologyProjection>,
     segments: BTreeMap<CommitId, BTreeMap<usize, Bytes>>,
     segment_keys: BTreeMap<CommitId, BTreeMap<usize, Bytes>>,
 }
@@ -639,11 +619,11 @@ fn commit_state_inventory_from_delta_manifest(
 
 fn commit_delta_manifest_from_commit_state(manifest: &CommitStateManifest) -> CommitDeltaManifest {
     let mut delta = commit_delta_manifest_from_inventory(&manifest.mutations);
-    delta.account_id.clone_from(&manifest.account_id);
+    delta.account_id = manifest.change_account_id.clone();
     delta
 }
 
-/// Returns the exact collection scopes touched by a sealed mutation inventory.
+/// Returns the exact collection scopes touched by a certified mutation inventory.
 /// `None` means bounds or implicit cascades may affect another scope, in which
 /// case an inherited serving catalog must be discarded fail-closed.
 /// At an empty base, descriptor cascades cannot reach inherited rows, so their
@@ -1124,9 +1104,8 @@ pub(crate) async fn load_complete_current_state_values_from_scoped_root(
 }
 
 /// Uses a manifest returned by [`load_commit_state_manifest`] or
-/// [`load_commit_state_manifests`]. The opaque handle proves that the mutable
-/// manifest matched its immutable semantic authority in the caller's coherent
-/// read.
+/// [`load_commit_state_manifests`]. The opaque handle proves that the manifest
+/// came from the immutable physical authority in the caller's coherent read.
 #[cfg(feature = "storage-benches")]
 pub(crate) async fn load_complete_current_state_values_from_published_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
@@ -1152,8 +1131,8 @@ pub(crate) async fn load_complete_current_state_values_from_replay_manifest(
     encoded_keys: &[Bytes],
 ) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
     // `load_point_replay_commit_state` decoded this exact manifest from the
-    // immutable semantic-authority seal, including its certified scoped root.
-    // Re-reading the mutable manifest would add point I/O without
+    // immutable physical manifest, including its certified scoped root.
+    // Re-reading the immutable manifest would add point I/O without
     // strengthening that authority.
     load_complete_current_state_values_encoded_inner(store, state, encoded_keys, false, true).await
 }
@@ -2118,23 +2097,49 @@ pub(crate) async fn load_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    Ok(load_authoritative_commit_root(store, commit_id)
+    Ok(load_snapshot_commit_root(store, commit_id)
         .await?
         .map(|metadata| metadata.root_id))
 }
 
-/// Resolves snapshot metadata only through the hard-cut commit authority.
+/// Resolves canonical snapshot metadata from immutable physical authority.
 ///
-/// Tree chunks are content addressed; the commit-state manifest is the only
-/// durable mapping from a commit to a snapshot root.
-pub(crate) async fn load_authoritative_commit_root(
+/// Tree chunks are rebuildable by content hash, but the manifest-owned root
+/// pointer is the authority that permits readers to serve them.
+pub(crate) async fn load_snapshot_commit_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateCommitRoot>, LixError> {
-    let commit_id = CommitId::parse_lix(commit_id, "tracked-state authoritative root lookup")?;
+    let commit_id = CommitId::parse_lix(commit_id, "tracked-state snapshot root lookup")?;
+    let commit_ids = [commit_id];
+    let mut changelog = ChangelogContext::new().reader(store);
+    let semantic_commit_exists = changelog
+        .load_commits(CommitLoadRequest {
+            commit_ids: &commit_ids,
+        })
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record)
+        .is_some();
+    if !semantic_commit_exists {
+        return Ok(None);
+    }
+    load_manifest_snapshot_commit_root(store, commit_id).await
+}
+
+/// Loads the physical pointer without granting semantic commit liveness.
+///
+/// Only code that has already proved semantic liveness and integrity tests may
+/// use this helper; all commit-addressed read APIs must use
+/// [`load_snapshot_commit_root`].
+pub(super) async fn load_manifest_snapshot_commit_root(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<TrackedStateCommitRoot>, LixError> {
     Ok(load_commit_state_manifest(store, commit_id)
         .await?
-        .and_then(|manifest| manifest.snapshot_root))
+        .and_then(|manifest| manifest.snapshot_root.map(|root| *root)))
 }
 
 fn commit_delta_manifest_key(commit_id: CommitId) -> Vec<u8> {
@@ -2145,93 +2150,23 @@ fn commit_state_manifest_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
 }
 
-fn commit_state_semantic_seal(manifest: &CommitStateManifest) -> Result<Vec<u8>, LixError> {
-    // Retain the root published with the commit so one-read point replay can
-    // stop at its original baseline. A later rebuilt root may change only the
-    // mutable manifest; semantic comparison intentionally ignores that field.
-    let payload = storage_codec::encode("commit-state semantic authority", manifest)?;
-    let digest = blake3::Hasher::new_derive_key(COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT)
-        .update(&payload)
-        .finalize();
-    let mut encoded = Vec::with_capacity(
-        COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.len() + TRACKED_STATE_HASH_BYTES + payload.len(),
-    );
-    encoded.extend_from_slice(COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC);
-    encoded.extend_from_slice(digest.as_bytes());
-    encoded.extend_from_slice(&payload);
-    Ok(encoded)
-}
-
-fn decode_commit_state_semantic_authority(bytes: &[u8]) -> Result<CommitStateManifest, LixError> {
-    let payload = bytes
-        .strip_prefix(COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC)
-        .ok_or_else(|| {
-            replacement_payload_error("commit-state semantic authority has an unsupported format")
-        })?;
-    let (expected_digest, payload) = payload
-        .split_at_checked(TRACKED_STATE_HASH_BYTES)
-        .ok_or_else(|| replacement_payload_error("commit-state semantic authority is truncated"))?;
-    let actual_digest =
-        blake3::Hasher::new_derive_key(COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT)
-            .update(payload)
-            .finalize();
-    if expected_digest != actual_digest.as_bytes() {
-        return Err(replacement_payload_error(
-            "commit-state semantic authority digest is invalid",
-        ));
-    }
-    let manifest = storage_codec::decode("commit-state semantic authority", payload)?;
-    // The immutable seal authenticates bytes, while local validation proves
-    // that those bytes describe a structurally valid serving authority. This
-    // is what lets one-read point replay trust a catalog leaf without loading
-    // the historical complete-replacement manifest that first created it.
-    validate_commit_state_manifest(&manifest)?;
-    Ok(manifest)
-}
-
-fn validate_commit_state_semantic_seal(
-    manifest: &CommitStateManifest,
-    seal: &[u8],
-) -> Result<(), LixError> {
-    let authority = decode_commit_state_semantic_authority(seal)?;
-    validate_commit_state_semantic_projection(manifest, &authority)
-}
-
-fn validate_commit_state_semantic_projection(
-    manifest: &CommitStateManifest,
-    authority: &CommitStateManifest,
-) -> Result<(), LixError> {
-    let mut manifest_semantics = manifest.clone();
-    manifest_semantics.snapshot_root = None;
-    let mut authority_semantics = authority.clone();
-    authority_semantics.snapshot_root = None;
-    if authority_semantics != manifest_semantics {
-        return Err(replacement_payload_error(
-            "commit-state manifest disagrees with its immutable semantic authority",
-        ));
-    }
-    Ok(())
-}
-
-/// Commit authority loaded from the mutable manifest plane after its
-/// immutable semantic authority was verified. Only this opaque handle may bypass
-/// publication-time catalog re-derivation.
+/// Commit authority loaded from the immutable manifest plane. Only this
+/// opaque handle may bypass publication-time catalog re-derivation.
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedCommitStateManifest {
     manifest: CommitStateManifest,
 }
 
-/// One-read immutable semantic authority used by point replay. The wrapper
-/// prevents a freely constructed manifest from claiming authoritative catalog
-/// coverage without passing seal and structural validation.
+/// One-read immutable authority used by point replay. The wrapper prevents a
+/// freely constructed manifest from claiming authoritative catalog coverage.
 #[derive(Clone, Debug)]
 pub(crate) struct AuthenticatedReplayCommitStateManifest {
     manifest: CommitStateManifest,
 }
 
-/// Same-write-set authority produced only after semantic publication. This lets a
-/// later commit in one atomic transaction consume its parent catalog without
-/// treating a freely constructible manifest as provenance.
+/// Same-write-set authority produced only after immutable physical publication.
+/// This lets a later commit in one atomic transaction consume its parent catalog
+/// without treating a freely constructible manifest as provenance.
 pub(crate) struct StagedCommitStateManifest {
     manifest: CommitStateManifest,
     write_set_id: u64,
@@ -2365,7 +2300,7 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_staged_parent(
 }
 
 /// Rewrites one exactly scoped current-state partition from its certified
-/// parent post-image and the current commit's sealed mutation parts. Untouched
+/// parent post-image and the current commit's certified mutation parts. Untouched
 /// parent descriptors are reused byte-for-byte; only intersecting bounded
 /// parts and insertion gaps become native current-state data parts.
 /// Rewrites one covered scope in the unified current-state serving tree.
@@ -3232,40 +3167,22 @@ fn commit_delta_segment_key_for_bounds(
     Ok(encoded)
 }
 
-/// Loads the hard-cut semantic authority for one tracked commit.
+/// Loads the immutable physical authority for one tracked commit.
 pub(crate) async fn load_commit_state_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<CommitStateManifest>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_sealed_manifest_load();
-    let key = StorageKey(Bytes::from(commit_state_manifest_key(commit_id)));
-    let requests = [
-        StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-            keys: std::slice::from_ref(&key),
-            opts: StorageGetOptions::default(),
-        },
-        StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-            keys: std::slice::from_ref(&key),
-            opts: StorageGetOptions::default(),
-        },
-    ];
-    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
-    let manifest_bytes = values.next().flatten().and_then(full_value_bytes);
-    let seal = values.next().flatten().and_then(full_value_bytes);
-    let Some(bytes) = manifest_bytes else {
-        if seal.is_some() {
-            return Err(replacement_payload_error(
-                "commit-state semantic authority has no mutable manifest",
-            ));
-        }
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        commit_state_manifest_key(commit_id),
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    let seal = seal.ok_or_else(|| {
-        replacement_payload_error("commit-state manifest omitted its immutable semantic authority")
-    })?;
     let manifest = decode_commit_state_manifest(&bytes)?;
     if manifest.commit_id != commit_id {
         return Err(LixError::new(
@@ -3276,7 +3193,6 @@ pub(crate) async fn load_commit_state_manifest(
             ),
         ));
     }
-    validate_commit_state_semantic_seal(&manifest, &seal)?;
     Ok(Some(manifest))
 }
 
@@ -3289,7 +3205,7 @@ pub(crate) async fn load_published_commit_state_manifest(
         .map(|manifest| PublishedCommitStateManifest { manifest }))
 }
 
-/// Loads the replay projection after verifying immutable semantic authority.
+/// Loads the replay projection from immutable physical authority.
 pub(crate) async fn load_replay_commit_state_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
@@ -3307,19 +3223,19 @@ pub(crate) async fn load_point_replay_commit_state(
     crate::storage_bench::record_crud_replay_manifest_load();
     let Some(authority) = get_one(
         store,
-        TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         commit_state_manifest_key(commit_id),
     )
     .await?
     else {
         return Ok(None);
     };
-    let state = decode_commit_state_semantic_authority(&authority)?;
+    let state = decode_commit_state_manifest(&authority)?;
     if state.commit_id != commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "tracked_state semantic authority key for commit '{commit_id}' contains authority for commit '{}'",
+                "tracked_state manifest key for commit '{commit_id}' contains authority for commit '{}'",
                 state.commit_id
             ),
         ));
@@ -3338,41 +3254,21 @@ pub(crate) async fn load_commit_state_manifests(
         .iter()
         .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
         .collect::<Vec<_>>();
-    let requests = [
-        StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-            keys: &keys,
-            opts: StorageGetOptions::default(),
-        },
-        StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-            keys: &keys,
-            opts: StorageGetOptions::default(),
-        },
-    ];
-    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
-    let manifests = values.by_ref().take(keys.len()).collect::<Vec<_>>();
-    let seals = values.collect::<Vec<_>>();
+    let request = [StorageGetManyRequest {
+        space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        keys: &keys,
+        opts: StorageGetOptions::default(),
+    }];
+    let manifests = exact_get_many(store, &request).await?.values;
     commit_ids
         .iter()
         .copied()
-        .zip(manifests.into_iter().zip(seals))
-        .map(|(commit_id, (manifest_value, seal_value))| {
+        .zip(manifests)
+        .map(|(commit_id, manifest_value)| {
             let manifest_bytes = manifest_value.and_then(full_value_bytes);
-            let seal = seal_value.and_then(full_value_bytes);
             let Some(bytes) = manifest_bytes else {
-                if seal.is_some() {
-                    return Err(replacement_payload_error(
-                        "commit-state semantic authority has no mutable manifest",
-                    ));
-                }
                 return Ok(None);
             };
-            let seal = seal.ok_or_else(|| {
-                replacement_payload_error(
-                    "commit-state manifest omitted its immutable semantic authority",
-                )
-            })?;
             let manifest = decode_commit_state_manifest(&bytes)?;
             if manifest.commit_id != commit_id {
                 return Err(LixError::new(
@@ -3383,38 +3279,9 @@ pub(crate) async fn load_commit_state_manifests(
                     ),
                 ));
             }
-            validate_commit_state_semantic_seal(&manifest, &seal)?;
             Ok(Some(manifest))
         })
         .collect()
-}
-
-/// Loads deliberately malformed authority without semantic validation so a
-/// corruption test can replace one forged record with another.
-#[cfg(test)]
-pub(crate) async fn load_unchecked_commit_state_manifest_for_test(
-    store: &(impl StorageAdapterRead + ?Sized),
-    commit_id: CommitId,
-) -> Result<Option<CommitStateManifest>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        commit_state_manifest_key(commit_id),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let payload = bytes
-        .strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state corrupt-test commit_state_manifest has an unsupported format",
-            )
-        })?;
-    let manifest = storage_codec::decode("tracked_state commit_state_manifest", payload)?;
-    Ok(Some(manifest))
 }
 
 async fn load_commit_delta_manifests(
@@ -3434,29 +3301,18 @@ async fn load_commit_delta_manifests(
     Ok(manifests)
 }
 
-/// Stages one complete commit authority record.
-///
-/// Callers must invoke this only after the immutable mutation inventory and
-/// optional snapshot metadata are final. Publishing a partially populated
-/// manifest and patching it later would make an intermediate representation
-/// authoritative to read-your-writes consumers.
+/// Stages one complete immutable physical commit authority record.
 fn stage_commit_state_manifest_bytes(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
 ) -> Result<(), LixError> {
     let encoded = encode_commit_state_manifest(manifest)?;
-    let seal = commit_state_semantic_seal(manifest)?;
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_commit_state_manifest_bytes(encoded.len());
     writes.put(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         key(commit_state_manifest_key(manifest.commit_id)),
         value(encoded),
-    );
-    writes.put(
-        TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-        key(commit_state_manifest_key(manifest.commit_id)),
-        value(seal.to_vec()),
     );
     Ok(())
 }
@@ -3504,9 +3360,9 @@ pub(crate) fn stage_certified_commit_state_manifest(
             "physical publication proof belongs to a different storage write set",
         ));
     }
-    if manifest.parent_commit_ids != publication.parent_commit_ids() {
+    if manifest.commit_id != publication.commit_id() {
         return Err(replacement_payload_error(
-            "commit manifest graph-parent topology disagrees with its physical publication proof",
+            "commit manifest identity disagrees with its physical publication proof",
         ));
     }
     if manifest.mutations.selected_source_commit_id() != publication.selected_source_commit_id() {
@@ -3539,66 +3395,20 @@ pub(crate) fn stage_certified_commit_state_manifest_with_handle(
     })
 }
 
-/// Updates only the rebuildable snapshot accelerator of an already sealed
-/// authority. All semantic fields come from the opaque published handle and
-/// therefore retain the exact same immutable authority.
-pub(crate) fn stage_commit_state_snapshot_root_update(
-    writes: &mut StorageWriteSet,
-    published: &PublishedCommitStateManifest,
-    snapshot_root: Option<TrackedStateCommitRoot>,
-) -> Result<(), LixError> {
-    let mut manifest = published.manifest.clone();
-    manifest.snapshot_root = snapshot_root;
-    let encoded = encode_commit_state_manifest(&manifest)?;
-    writes.put(
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        key(commit_state_manifest_key(manifest.commit_id)),
-        value(encoded),
-    );
-    Ok(())
-}
-
-/// Stages deliberately malformed authority for corruption tests. Production
-/// publication must always use [`stage_commit_state_manifest`].
-#[cfg(test)]
-pub(crate) fn stage_unchecked_commit_state_manifest_for_test(
-    writes: &mut StorageWriteSet,
-    manifest: &CommitStateManifest,
-) -> Result<(), LixError> {
-    let payload = storage_codec::encode("tracked_state commit_state_manifest", manifest)?;
-    let mut encoded = Vec::with_capacity(COMMIT_STATE_MANIFEST_FORMAT_MAGIC.len() + payload.len());
-    encoded.extend_from_slice(COMMIT_STATE_MANIFEST_FORMAT_MAGIC);
-    encoded.extend_from_slice(&payload);
-    writes.put(
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        key(commit_state_manifest_key(manifest.commit_id)),
-        value(encoded),
-    );
-    Ok(())
-}
-
-/// Replaces both mutable manifest bytes and the normally immutable seal for a
-/// corruption/test-fixture scenario. Production code cannot compile a call to
-/// this bypass.
+/// Replaces immutable manifest bytes through a mutable test-only declaration.
 #[cfg(test)]
 pub(crate) fn stage_resealed_commit_state_manifest_for_test(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
 ) -> Result<(), LixError> {
     let encoded = encode_commit_state_manifest(manifest)?;
-    let seal = commit_state_semantic_seal(manifest)?;
-    writes.put(
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        key(commit_state_manifest_key(manifest.commit_id)),
-        value(encoded),
-    );
     writes.put(
         StorageSpace::mutable(
-            TRACKED_STATE_COMMIT_STATE_SEAL_SPACE.id,
-            TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
         ),
         key(commit_state_manifest_key(manifest.commit_id)),
-        value(seal.to_vec()),
+        value(encoded),
     );
     Ok(())
 }
@@ -5856,10 +5666,8 @@ pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
         .await;
     }
     if point_cache.manifest(state.commit_id)?.is_none() {
-        point_cache.remember_manifest(
-            state.commit_id,
-            Arc::new(commit_delta_manifest_from_commit_state(state)),
-        )?;
+        let manifest = expanded_commit_delta_manifest_from_commit_state(store, state).await?;
+        point_cache.remember_manifest(state.commit_id, Arc::new(manifest))?;
     }
     load_commit_delta_values_encoded_with_cache(
         store,
@@ -6895,7 +6703,7 @@ async fn load_inventory_part_entries_one_ordered(
                 &payloads,
                 &encoded_keys[encoded],
                 commit_id,
-                &state.account_id,
+                &state.change_account_id,
             )?;
         }
     }
@@ -7739,19 +7547,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 },
             )
             .await?;
-        let seal_keys = page
-            .value
-            .entries
-            .iter()
-            .map(|entry| entry.key.clone())
-            .collect::<Vec<_>>();
-        let seal_request = [StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-            keys: &seal_keys,
-            opts: StorageGetOptions::default(),
-        }];
-        let seals = exact_get_many(store, &seal_request).await?.values;
-        for (entry, seal) in page.value.entries.iter().zip(seals) {
+        for entry in &page.value.entries {
             if entry.key.0.len() != 16 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -7769,12 +7565,6 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     "tracked_state commit-state scan key and manifest commit disagree",
                 ));
             }
-            let seal = seal.and_then(full_value_bytes).ok_or_else(|| {
-                replacement_payload_error(
-                    "commit-state scan found a manifest without its immutable semantic authority",
-                )
-            })?;
-            validate_commit_state_semantic_seal(&state, &seal)?;
             let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
             if let Some(parts) = manifest.columnar_parts.as_ref() {
                 emitted = emitted.saturating_add(
@@ -7988,7 +7778,6 @@ pub(crate) async fn scan_commit_delta_inventory(
 ) -> Result<CommitDeltaInventory, LixError> {
     let CommitDeltaPlane {
         manifests,
-        mut authorities,
         mut segments,
         mut segment_keys,
     } = scan_commit_delta_plane(store).await?;
@@ -8059,9 +7848,6 @@ pub(crate) async fn scan_commit_delta_inventory(
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 selected_source_commit_id: manifest.selected_source_commit_id(),
-                authority: authorities
-                    .remove(&commit_id)
-                    .expect("every decoded mutation manifest has topology authority"),
             },
         );
     }
@@ -8133,7 +7919,6 @@ pub(crate) async fn scan_commit_delta_inventory(
     }
     debug_assert!(segments.is_empty());
     debug_assert!(segment_keys.is_empty());
-    debug_assert!(authorities.is_empty());
     Ok(inventory)
 }
 
@@ -8142,23 +7927,10 @@ async fn scan_commit_delta_plane(
 ) -> Result<CommitDeltaPlane, LixError> {
     let commit_state_rows =
         scan_full_space(store, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE).await?;
-    let commit_state_seals = scan_full_space(store, TRACKED_STATE_COMMIT_STATE_SEAL_SPACE).await?;
     let segment_rows = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE).await?;
 
-    if commit_state_rows.len() != commit_state_seals.len()
-        || commit_state_rows
-            .iter()
-            .zip(&commit_state_seals)
-            .any(|((manifest_key, _), (seal_key, _))| manifest_key != seal_key)
-    {
-        return Err(replacement_payload_error(
-            "commit-state inventory found an orphan manifest or semantic authority",
-        ));
-    }
-
     let mut manifests = BTreeMap::<CommitId, CommitDeltaManifest>::new();
-    let mut authorities = BTreeMap::<CommitId, CommitStateTopologyProjection>::new();
-    for ((key, bytes), (_, seal)) in commit_state_rows.into_iter().zip(commit_state_seals) {
+    for (key, bytes) in commit_state_rows {
         if key.0.len() != 16 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -8175,18 +7947,6 @@ async fn scan_commit_delta_plane(
                 ),
             ));
         }
-        validate_commit_state_semantic_seal(&manifest, &seal)?;
-        authorities.insert(
-            commit_id,
-            CommitStateTopologyProjection {
-                generation: manifest.generation,
-                parent_commit_ids: manifest.parent_commit_ids.clone(),
-                commit_change_id: manifest.commit_change_id,
-                account_id: manifest.account_id.clone(),
-                created_at: manifest.created_at,
-                replay_debt: manifest.replay_debt,
-            },
-        );
         manifests.insert(
             commit_id,
             expanded_commit_delta_manifest_from_commit_state(store, &manifest).await?,
@@ -8242,7 +8002,6 @@ async fn scan_commit_delta_plane(
 
     Ok(CommitDeltaPlane {
         manifests,
-        authorities,
         segments,
         segment_keys,
     })
@@ -8297,10 +8056,6 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
 ) -> Result<(), LixError> {
     writes.delete(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        key(commit_state_manifest_key(commit_id)),
-    );
-    writes.delete(
-        TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
         key(commit_state_manifest_key(commit_id)),
     );
     for segment_key in &entry.physical_segment_keys {
@@ -8565,8 +8320,7 @@ pub(crate) async fn load_commit_delta_replay_metadata_with_cache(
         .map(|manifest| commit_delta_replay_metadata_from_inventory(&manifest.mutations)))
 }
 
-/// Seeds the snapshot-local delta cache from the seal-verified replay manifest
-/// already read by point traversal, avoiding a second authority read.
+/// Returns replay metadata from an already authenticated physical manifest.
 pub(crate) fn seed_commit_delta_point_cache_from_replay_manifest(
     state: &CommitStateManifest,
     point_cache: &CommitDeltaPointReadCache,
@@ -9996,7 +9750,6 @@ pub(crate) struct TrackedStateStagedRead<'a, S: ?Sized> {
     store: &'a S,
     chunks: &'a TrackedStateChunkOverlay,
     commit_states: HashMap<Vec<u8>, Bytes>,
-    commit_state_seals: HashMap<Vec<u8>, Bytes>,
 }
 
 impl<'a, S> TrackedStateStagedRead<'a, S>
@@ -10008,39 +9761,36 @@ where
             store,
             chunks,
             commit_states: HashMap::new(),
-            commit_state_seals: HashMap::new(),
         }
     }
 
-    pub(crate) fn with_commit_state_manifests(
+    pub(crate) fn with_commit_state_roots(
         store: &'a S,
         chunks: &'a TrackedStateChunkOverlay,
-        manifests: impl IntoIterator<Item = CommitStateManifest>,
+        commit_states: impl IntoIterator<Item = (CommitStateManifest, TrackedStateCommitRoot)>,
     ) -> Result<Self, LixError> {
-        let manifests = manifests.into_iter().collect::<Vec<_>>();
-        let commit_states = manifests
-            .iter()
-            .map(|manifest| {
+        let manifests = commit_states
+            .into_iter()
+            .map(|(mut manifest, root)| {
+                if manifest.commit_id != root.commit_id {
+                    return Err(replacement_payload_error(
+                        "staged snapshot root belongs to a different commit manifest",
+                    ));
+                }
+                // This overlay exists only to audit the staged canonical root;
+                // it is never published as immutable commit authority.
+                manifest.replay_debt = Default::default();
+                manifest.snapshot_root = Some(Box::new(root));
                 Ok((
                     commit_state_manifest_key(manifest.commit_id),
-                    Bytes::from(encode_commit_state_manifest(manifest)?),
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, LixError>>()?;
-        let commit_state_seals = manifests
-            .iter()
-            .map(|manifest| {
-                Ok((
-                    commit_state_manifest_key(manifest.commit_id),
-                    Bytes::copy_from_slice(&commit_state_semantic_seal(manifest)?),
+                    Bytes::from(encode_commit_state_manifest(&manifest)?),
                 ))
             })
             .collect::<Result<HashMap<_, _>, LixError>>()?;
         Ok(Self {
             store,
             chunks,
-            commit_states,
-            commit_state_seals,
+            commit_states: manifests,
         })
     }
 
@@ -10051,9 +9801,6 @@ where
         }
         if space == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id {
             return self.commit_states.get(key.0.as_ref()).cloned();
-        }
-        if space == TRACKED_STATE_COMMIT_STATE_SEAL_SPACE.id {
-            return self.commit_state_seals.get(key.0.as_ref()).cloned();
         }
         None
     }
@@ -10152,45 +9899,6 @@ fn validate_commit_state_manifest_inner(
     manifest: &CommitStateManifest,
     validate_scoped_range_attestation: bool,
 ) -> Result<(), LixError> {
-    let mut parents = BTreeSet::new();
-    for parent in &manifest.parent_commit_ids {
-        if *parent == manifest.commit_id || !parents.insert(*parent) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_state_manifest has a self or duplicate parent",
-            ));
-        }
-    }
-
-    match &manifest.snapshot_root {
-        Some(root) => {
-            if root.commit_id != manifest.commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_state_manifest snapshot belongs to another commit",
-                ));
-            }
-            if root.parent_roots.first().map(|parent| parent.commit_id)
-                != manifest.parent_commit_ids.first().copied()
-                || root
-                    .parent_roots
-                    .iter()
-                    .any(|parent| !parents.contains(&parent.commit_id))
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_state_manifest snapshot ancestry disagrees with commit topology",
-                ));
-            }
-        }
-        None if manifest.replay_debt.depth == 0 => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state rootless commit_state_manifest has zero replay depth",
-            ));
-        }
-        None => {}
-    }
     if manifest.replay_debt.depth == 0
         && (manifest.replay_debt.rows != 0 || manifest.replay_debt.bytes != 0)
     {
@@ -10206,6 +9914,26 @@ fn validate_commit_state_manifest_inner(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state commit_state_manifest replay debt exceeds the protocol bound",
         ));
+    }
+    if manifest.replay_debt.depth == 0 && manifest.snapshot_root.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state rooted commit_state_manifest is missing its snapshot root",
+        ));
+    }
+    if let Some(root) = manifest.snapshot_root.as_ref() {
+        if root.commit_id != manifest.commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_state_manifest snapshot root belongs to a different commit",
+            ));
+        }
+        if manifest.replay_debt.depth != 0 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state rootless commit_state_manifest cannot publish a snapshot root",
+            ));
+        }
     }
 
     validate_commit_state_mutation_inventory(manifest.commit_id, &manifest.mutations)?;
@@ -10235,13 +9963,8 @@ fn validate_current_state_scoped_ranges(
         ));
     }
     if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-        let expected_serving_base = manifest
-            .mutations
-            .selected_source_commit_id()
-            .or_else(|| manifest.parent_commit_ids.first().copied());
-        if root.serving_base_commit_id.is_some()
-            && root.serving_base_commit_id != expected_serving_base
-        {
+        let selected_source = manifest.mutations.selected_source_commit_id();
+        if selected_source.is_some() && root.serving_base_commit_id != selected_source {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state current-state serving base disagrees with commit authority",
@@ -10475,7 +10198,7 @@ mod tests {
     };
     use crate::branch::BRANCH_HEAD_CONTROL_SPACE;
     use crate::changelog::{
-        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, CommitId,
+        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, CommitId, CommitRecord,
     };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
@@ -10496,10 +10219,9 @@ mod tests {
     };
     use crate::tracked_state::types::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-        CurrentStatePartDescriptor, TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate,
-        TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateDeltaRef,
-        TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-        TrackedStateRootId,
+        CurrentStatePartDescriptor, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
+        TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
+        TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
     };
 
     use super::{
@@ -10765,13 +10487,12 @@ mod tests {
         );
     }
 
-    struct SealCountingRead<R> {
+    struct ManifestCountingRead<R> {
         inner: R,
         manifest_requests: std::sync::Arc<AtomicUsize>,
-        seal_requests: std::sync::Arc<AtomicUsize>,
     }
 
-    impl<R> crate::storage_adapter::StorageAdapterRead for SealCountingRead<R>
+    impl<R> crate::storage_adapter::StorageAdapterRead for ManifestCountingRead<R>
     where
         R: crate::storage_adapter::StorageAdapterRead,
     {
@@ -10788,9 +10509,6 @@ mod tests {
             for request in requests {
                 if request.space == super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE {
                     self.manifest_requests.fetch_add(1, Ordering::Relaxed);
-                }
-                if request.space == super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE {
-                    self.seal_requests.fetch_add(1, Ordering::Relaxed);
                 }
             }
             self.inner.get_many(requests)
@@ -10813,11 +10531,7 @@ mod tests {
     ) -> CommitStateManifest {
         CommitStateManifest {
             commit_id,
-            generation: 0,
-            parent_commit_ids: Vec::new(),
-            commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:commit")),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
                 depth: 1,
                 rows: u64::from(mutations.member_count),
@@ -10835,6 +10549,20 @@ mod tests {
         commit_id: CommitId,
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
+        let record = CommitRecord {
+            format_version: 2,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            change_id: ChangeId::for_test_label(&format!("{commit_id}:fixture-commit")),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+        };
+        writes.put(
+            COMMIT_SPACE,
+            key(commit_id.as_uuid().as_bytes().to_vec()),
+            value(crate::changelog::encode_commit_record(&record)?),
+        );
         stage_commit_state_manifest(
             writes,
             &fixture_commit_state_manifest(commit_id, mutations.clone()),
@@ -12370,7 +12098,7 @@ mod tests {
         assert_eq!(
             writes.stats().staged_puts,
             5,
-            "generic history keeps 300 compact rows in three read-friendly segments plus its commit-state authority and immutable seal"
+            "generic history keeps 300 compact rows in three read-friendly segments plus its physical authority and semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -12566,7 +12294,7 @@ mod tests {
         assert_eq!(
             writes.stats().staged_puts,
             4,
-            "the oversized four-row candidate should become two segments plus its commit-state authority and immutable seal"
+            "the oversized four-row candidate should become two segments plus its physical authority and semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -13361,7 +13089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shallow_point_replay_reads_one_immutable_semantic_authority() {
+    async fn shallow_point_replay_reads_one_immutable_physical_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("one-read-shallow-point-replay");
         let fixture = packed_commit_delta_fixtures()
@@ -13383,14 +13111,12 @@ mod tests {
             .expect("ordinary delta should commit");
 
         let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
-        let seal_requests = std::sync::Arc::new(AtomicUsize::new(0));
-        let read = SealCountingRead {
+        let read = ManifestCountingRead {
             inner: storage
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("point read should open"),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
-            seal_requests: std::sync::Arc::clone(&seal_requests),
         };
         let state = super::load_replay_commit_state_manifest(&read, commit_id)
             .await
@@ -13413,8 +13139,7 @@ mod tests {
         .await
         .expect("cached shallow point replay should load");
         assert_eq!(values, vec![Some(fixture.value(commit_id))]);
-        assert_eq!(manifest_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(seal_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -13437,7 +13162,7 @@ mod tests {
         assert_eq!(
             writes.stats().staged_puts,
             2,
-            "a one-segment commit should remain inline in its commit-state authority plus immutable seal"
+            "a one-segment commit should remain inline in its physical authority plus semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -13478,8 +13203,8 @@ mod tests {
         .expect("inline delta should stage for deletion");
         assert_eq!(
             deletes.stats().staged_deletes,
-            2,
-            "GC should delete the inline commit-state authority and immutable seal"
+            1,
+            "physical inventory deletion should remove its single manifest authority"
         );
     }
 
@@ -13620,7 +13345,7 @@ mod tests {
                 .get(&commit_id)
                 .expect("packed commit should be inventoried")
                 .segment_count
-                + 2,
+                + 1,
         )
         .expect("test segment count fits u64");
         assert_eq!(deletes.stats().staged_deletes, expected_deletes);
@@ -13832,11 +13557,7 @@ mod tests {
         };
         CommitStateManifest {
             commit_id,
-            generation: 7,
-            parent_commit_ids: vec![CommitId::for_test_label("manifest-parent")],
-            commit_change_id: ChangeId::for_test_label("manifest-commit-change"),
-            account_id: "account-a".to_string(),
-            created_at: timestamp,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
                 depth: 2,
                 rows: 1,
@@ -13878,6 +13599,7 @@ mod tests {
     #[test]
     fn commit_state_manifest_codec_authenticates_scoped_range_root() {
         let mut manifest = commit_state_manifest_fixture();
+        let serving_base_commit_id = None;
         let tree = super::super::scoped_range::ScopedRangeRoot {
             root_id: [7; 32],
             root_digest: [8; 32],
@@ -13886,8 +13608,7 @@ mod tests {
             row_count: 17,
             tree_height: 1,
         };
-        let serving_base_commit_id = manifest.parent_commit_ids.first().copied();
-        let serving_base_root_id = Some([9; 32]);
+        let serving_base_root_id = None;
         let transition_digest = super::super::scoped_current_state::scoped_range_transition_digest(
             manifest.commit_id,
             serving_base_commit_id,
@@ -13918,40 +13639,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_state_manifest_codec_rejects_wrong_serving_base() {
-        let mut manifest = commit_state_manifest_fixture();
-        let tree = super::super::scoped_range::ScopedRangeRoot {
-            root_id: [7; 32],
-            root_digest: [8; 32],
-            marker_count: 1,
-            part_count: 2,
-            row_count: 17,
-            tree_height: 1,
-        };
-        let wrong_base = CommitId::for_test_label("wrong-serving-base");
-        let serving_base_root_id = Some([9; 32]);
-        let transition_digest = super::super::scoped_current_state::scoped_range_transition_digest(
-            manifest.commit_id,
-            Some(wrong_base),
-            serving_base_root_id,
-            &manifest.mutations,
-            &tree,
-        )
-        .expect("transition should hash");
-        manifest.current_state_scoped_ranges =
-            Some(Box::new(super::super::types::CurrentStateScopedRangeRoot {
-                tree,
-                serving_base_commit_id: Some(wrong_base),
-                serving_base_root_id,
-                transition_digest,
-            }));
-
-        let error = encode_commit_state_manifest(&manifest)
-            .expect_err("serving base outside commit authority must fail closed");
-        assert!(error.message.contains("serving base"));
-    }
-
-    #[test]
     fn commit_state_manifest_codec_rejects_pre_cut_formats() {
         let manifest = commit_state_manifest_fixture();
         let payload = storage_codec::encode("tracked_state commit_state_manifest", &manifest)
@@ -13968,31 +13655,6 @@ mod tests {
                 .expect_err("the hard cut must reject pre-v7 manifest formats");
             assert!(error.message.contains("unsupported format"));
         }
-
-        for magic in [
-            b"LXSA1".as_slice(),
-            b"LXSA2".as_slice(),
-            b"LXSA3".as_slice(),
-            b"LXSA4".as_slice(),
-        ] {
-            let mut legacy_seal = magic.to_vec();
-            legacy_seal.extend_from_slice(&[0; TRACKED_STATE_HASH_BYTES]);
-            legacy_seal.extend_from_slice(&payload);
-            let error = super::decode_commit_state_semantic_authority(&legacy_seal)
-                .expect_err("the hard cut must reject pre-v4 semantic seals");
-            assert!(error.message.contains("unsupported format"));
-        }
-
-        let legacy_digest =
-            blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v4")
-                .update(&payload)
-                .finalize();
-        let mut retagged_v4 = super::COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.to_vec();
-        retagged_v4.extend_from_slice(legacy_digest.as_bytes());
-        retagged_v4.extend_from_slice(&payload);
-        let error = super::decode_commit_state_semantic_authority(&retagged_v4)
-            .expect_err("an LXSA4 digest must not become valid under an LXSA5 prefix");
-        assert!(error.message.contains("digest is invalid"));
     }
 
     #[tokio::test]
@@ -14019,135 +13681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_authority_is_the_point_source_and_guards_manifest_scans() {
-        let storage = StorageAdapter::new(Memory::new());
-        let manifest = commit_state_manifest_fixture();
-        let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest).expect("authority should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("authority should commit");
-
-        let mut forged = manifest.clone();
-        forged.generation += 1;
-        let mut writes = storage.new_write_set();
-        super::stage_unchecked_commit_state_manifest_for_test(&mut writes, &forged)
-            .expect("mutable manifest corruption should stage without replacing authority");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("mutable manifest corruption should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corrupt read should open");
-        let point_state = super::load_point_replay_commit_state(&read, manifest.commit_id)
-            .await
-            .expect("point replay should load immutable semantic authority")
-            .expect("semantic authority should exist");
-        assert_eq!(&*point_state, &manifest);
-        let change_error = scan_change_records_from_commit_deltas(&read)
-            .await
-            .expect_err("packed change scans must verify semantic authority");
-        assert!(change_error.message.contains("semantic authority"));
-        let inventory_error = scan_commit_delta_inventory(&read)
-            .await
-            .expect_err("GC inventory must verify semantic authority");
-        assert!(inventory_error.message.contains("semantic authority"));
-
-        let mut corrupted_authority =
-            super::commit_state_semantic_seal(&manifest).expect("semantic authority should encode");
-        *corrupted_authority
-            .last_mut()
-            .expect("semantic authority should not be empty") ^= 0xff;
-        let mut writes = storage.new_write_set();
-        writes.put(
-            StorageSpace::mutable(
-                super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE.id,
-                super::TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
-            ),
-            key(super::commit_state_manifest_key(manifest.commit_id)),
-            value(corrupted_authority),
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("authority corruption should commit through the test-only mutable alias");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corrupt authority read should open");
-        let error = super::load_point_replay_commit_state(&read, manifest.commit_id)
-            .await
-            .expect_err("point replay must reject corrupt immutable authority bytes");
-        assert!(error.message.contains("authority digest"));
-    }
-
-    #[tokio::test]
-    async fn gc_inventory_rejects_missing_and_orphan_semantic_authority() {
-        let missing_storage = StorageAdapter::new(Memory::new());
-        let manifest = commit_state_manifest_fixture();
-        let mut writes = missing_storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest).expect("authority should stage");
-        missing_storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("authority should commit");
-        let mut deletes = missing_storage.new_write_set();
-        deletes.delete(
-            super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-            key(super::commit_state_manifest_key(manifest.commit_id)),
-        );
-        missing_storage
-            .commit_write_set(deletes, StorageWriteOptions::default())
-            .await
-            .expect("seal deletion should commit");
-        let read = missing_storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("missing-seal read should open");
-        let error = scan_commit_delta_inventory(&read)
-            .await
-            .expect_err("GC inventory must reject a missing seal");
-        assert!(
-            error
-                .message
-                .contains("orphan manifest or semantic authority")
-        );
-
-        let orphan_storage = StorageAdapter::new(Memory::new());
-        let mut writes = orphan_storage.new_write_set();
-        writes.put(
-            super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-            key(super::commit_state_manifest_key(manifest.commit_id)),
-            value(
-                super::commit_state_semantic_seal(&manifest)
-                    .unwrap()
-                    .to_vec(),
-            ),
-        );
-        orphan_storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("orphan seal should commit");
-        let read = orphan_storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan-seal read should open");
-        let error = scan_commit_delta_inventory(&read)
-            .await
-            .expect_err("GC inventory must reject an orphan seal");
-        assert!(
-            error
-                .message
-                .contains("orphan manifest or semantic authority")
-        );
-    }
-
-    #[tokio::test]
-    async fn authoritative_root_is_visible_only_through_commit_state() {
+    async fn manifest_root_does_not_grant_semantic_commit_liveness() {
         let storage = StorageAdapter::new(Memory::new());
         let mut manifest = commit_state_manifest_fixture();
         manifest.replay_debt = CommitStateReplayDebt::default();
@@ -14155,7 +13689,7 @@ mod tests {
             commit_id: manifest.commit_id,
             root_id: TrackedStateRootId::new([1; 32]),
             parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
-                commit_id: manifest.parent_commit_ids[0],
+                commit_id: CommitId::for_test_label("snapshot-parent"),
                 root_id: TrackedStateRootId::new([3; 32]),
             }],
             changed_key_count: 1,
@@ -14164,8 +13698,8 @@ mod tests {
             primary_chunk_count: 1,
             primary_chunk_bytes: 64,
         };
-        manifest.snapshot_root = Some(authoritative.clone());
         let mut writes = storage.new_write_set();
+        manifest.snapshot_root = Some(Box::new(authoritative.clone()));
         stage_commit_state_manifest(&mut writes, &manifest).expect("authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -14176,71 +13710,40 @@ mod tests {
             .await
             .expect("read should open");
 
-        assert_eq!(
-            super::load_authoritative_commit_root(&read, &manifest.commit_id.to_string())
+        assert!(
+            super::load_snapshot_commit_root(&read, &manifest.commit_id.to_string())
                 .await
-                .expect("authority should load"),
+                .expect("authorized root lookup should succeed")
+                .is_none(),
+            "physical retention alone must not make a missing semantic commit readable"
+        );
+        assert_eq!(
+            super::load_manifest_snapshot_commit_root(&read, manifest.commit_id)
+                .await
+                .expect("physical root should load"),
             Some(authoritative)
         );
-        drop(read);
-
-        manifest.snapshot_root = None;
-        manifest.replay_debt = CommitStateReplayDebt {
-            depth: 1,
-            rows: 1,
-            bytes: 64,
-        };
-        let mut writes = storage.new_write_set();
-        super::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
-            .expect("rootless authority should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("rootless authority should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("rootless read should open");
-        assert!(
-            super::load_authoritative_commit_root(&read, &manifest.commit_id.to_string())
+        assert_eq!(
+            load_commit_state_manifest(&read, manifest.commit_id)
                 .await
-                .expect("rootless authority should load")
-                .is_none(),
-            "a stale derived root must not override rootless authority"
+                .expect("manifest should load"),
+            Some(manifest)
         );
     }
 
     #[tokio::test]
-    async fn rootless_rebuild_updates_only_the_mutable_snapshot_accelerator() {
-        let storage = StorageAdapter::new(Memory::new());
+    async fn rootless_manifest_rejects_snapshot_authority() {
         let mut original = commit_state_manifest_fixture();
-        original.snapshot_root = None;
         original.replay_debt = CommitStateReplayDebt {
             depth: 1,
             rows: 1,
             bytes: 64,
         };
-        let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &original)
-            .expect("rootless authority should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("rootless authority should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("published authority read should open");
-        let published = super::load_published_commit_state_manifest(&read, original.commit_id)
-            .await
-            .expect("published authority should load")
-            .expect("published authority should exist");
         let rebuilt = TrackedStateCommitRoot {
             commit_id: original.commit_id,
             root_id: TrackedStateRootId::new([9; 32]),
             parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
-                commit_id: original.parent_commit_ids[0],
+                commit_id: CommitId::for_test_label("rebuild-parent"),
                 root_id: TrackedStateRootId::new([8; 32]),
             }],
             changed_key_count: 1,
@@ -14249,33 +13752,20 @@ mod tests {
             primary_chunk_count: 1,
             primary_chunk_bytes: 64,
         };
-        let mut writes = storage.new_write_set();
-        super::stage_commit_state_snapshot_root_update(
-            &mut writes,
-            &published,
-            Some(rebuilt.clone()),
-        )
-        .expect("snapshot accelerator update should stage");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("snapshot rebuild must not rewrite immutable authority");
+        original.snapshot_root = Some(Box::new(rebuilt));
+        let error = encode_commit_state_manifest(&original)
+            .expect_err("rootless immutable authority must not accept a snapshot root");
+        assert!(error.message.contains("rootless"));
+    }
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("rebuilt authority read should open");
-        let loaded = load_commit_state_manifest(&read, original.commit_id)
-            .await
-            .expect("rebuilt manifest should load")
-            .expect("rebuilt manifest should exist");
-        assert_eq!(loaded.snapshot_root, Some(rebuilt));
-        let point = super::load_point_replay_commit_state(&read, original.commit_id)
-            .await
-            .expect("immutable point authority should load")
-            .expect("immutable point authority should exist");
-        assert_eq!(&*point, &original);
+    #[test]
+    fn rooted_manifest_requires_immutable_snapshot_authority() {
+        let mut manifest = commit_state_manifest_fixture();
+        manifest.replay_debt = CommitStateReplayDebt::default();
+
+        let error = encode_commit_state_manifest(&manifest)
+            .expect_err("zero replay debt must carry canonical snapshot authority");
+        assert!(error.message.contains("missing its snapshot root"));
     }
 
     #[test]
@@ -14299,7 +13789,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_state_manifest_allows_accelerators_and_rejects_replay_drift() {
+    fn commit_state_manifest_rejects_replay_drift() {
         let mut mixed = commit_state_manifest_fixture();
         mixed.mutations.parts.push(super::CommitStateMutationPart {
             first_key: vec![1],
@@ -14313,28 +13803,7 @@ mod tests {
                 .contains("mixes inline and external")
         );
 
-        let mut rooted_with_debt = commit_state_manifest_fixture();
-        rooted_with_debt.snapshot_root = Some(TrackedStateCommitRoot {
-            commit_id: rooted_with_debt.commit_id,
-            root_id: TrackedStateRootId::new([4; 32]),
-            parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
-                commit_id: rooted_with_debt.parent_commit_ids[0],
-                root_id: TrackedStateRootId::new([5; 32]),
-            }],
-            changed_key_count: 1,
-            row_count_estimate: 1,
-            tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: 64,
-        });
-        let encoded = encode_commit_state_manifest(&rooted_with_debt)
-            .expect("an immutable snapshot accelerator may coexist with replay debt");
-        assert_eq!(
-            decode_commit_state_manifest(&encoded).expect("accelerated manifest should decode"),
-            rooted_with_debt
-        );
-
-        let mut invalid_debt = rooted_with_debt.clone();
+        let mut invalid_debt = commit_state_manifest_fixture();
         invalid_debt.replay_debt.depth = 0;
         assert!(
             encode_commit_state_manifest(&invalid_debt)
@@ -14348,7 +13817,7 @@ mod tests {
         forged_empty_authority.mutations.replacement_parts =
             Some(super::StoredReplacementPartsAuthority {
                 directory_digest: [7; 32],
-                uniform_updated_at: forged_empty_authority.created_at,
+                uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(1234),
             });
         assert!(
             encode_commit_state_manifest(&forged_empty_authority)

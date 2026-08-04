@@ -362,7 +362,7 @@ where
             parameter + 3
         )
         .expect("write insert parameter placeholders");
-        params.push(Value::Text(format!("benchmark-file-{file_index:05}")));
+        params.push(Value::Text(benchmark_file_id(file_index)));
         params.push(Value::Text(format!("/files/{file_index:05}.bin")));
         params.push(Value::Blob(payload(0, file_index, FILE_BYTES).into()));
     }
@@ -540,7 +540,7 @@ async fn run_workload<S>(
                 let file_index =
                     benchmark_file_index(file_count, checkpoint_index, auto_commit_index, offset);
                 expected_payloads.insert(
-                    format!("benchmark-file-{file_index:05}"),
+                    benchmark_file_id(file_index),
                     payload(checkpoint_index, file_index, FILE_BYTES),
                 );
             }
@@ -652,7 +652,7 @@ async fn update_file_group<S>(
             sql: "UPDATE lix_file SET content = $1 WHERE id = $2".to_string(),
             params: vec![
                 Value::Blob(payload(checkpoint_index, file_index, FILE_BYTES).into()),
-                Value::Text(format!("benchmark-file-{file_index:05}")),
+                Value::Text(benchmark_file_id(file_index)),
             ],
         });
     }
@@ -669,6 +669,10 @@ fn benchmark_file_index(
     offset: usize,
 ) -> usize {
     (checkpoint_index * 97 + auto_commit_index * 17 + offset * 31) % file_count
+}
+
+fn benchmark_file_id(file_index: usize) -> String {
+    format!("00000000-0000-0000-0000-{file_index:012x}")
 }
 
 #[inline(never)]

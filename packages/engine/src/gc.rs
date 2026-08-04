@@ -593,37 +593,17 @@ where
         pending.extend(commits.parent_commit_ids(commit).iter().copied());
     }
 
-    // GC is destructive, so the hard-cut commit-state manifest must be
-    // present and agree with every live changelog topology projection before
-    // payload reachability or sweep mutations are derived. Missing authority
-    // must not silently turn a live commit into an empty mutation owner.
+    // GC is destructive, so every live semantic commit must have an immutable
+    // physical manifest before payload reachability or sweep mutations are
+    // derived. Missing physical authority must not silently turn a live commit
+    // into an empty mutation owner.
     for commit_id in &live_commits {
-        let commit = commits
-            .get(*commit_id)
-            .expect("live commit existence was checked during graph walk");
-        let authority = packed.commits.get(commit_id).ok_or_else(|| {
+        packed.commits.get(commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("live commit '{commit_id}' has no commit-state authority"),
             )
         })?;
-        let topology = &authority.authority;
-        let manifest_rootless = topology.replay_debt.depth > 0;
-        if topology.generation != commit.generation
-            || topology.parent_commit_ids != commits.parent_commit_ids(commit)
-            || topology.commit_change_id != commit.change_id
-            || topology.account_id != commit.account_id
-            || topology.created_at != commit.created_at
-            || manifest_rootless != commit.tracked_state_rootless
-            || topology.replay_debt.depth != commit.tracked_state_rootless_depth
-            || topology.replay_debt.rows != commit.tracked_state_rootless_rows
-            || topology.replay_debt.bytes != commit.tracked_state_rootless_bytes
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("live commit '{commit_id}' disagrees with its commit-state authority"),
-            ));
-        }
     }
 
     // Mutation parts are immutable: direct ChangeIds encode their physical
@@ -1116,14 +1096,7 @@ where
 #[derive(Clone, Debug)]
 struct GcCommitInventoryEntry {
     commit_id: CommitId,
-    generation: u64,
-    tracked_state_rootless: bool,
-    tracked_state_rootless_depth: u16,
-    tracked_state_rootless_rows: u64,
-    tracked_state_rootless_bytes: u64,
     change_id: ChangeId,
-    account_id: String,
-    created_at: crate::common::LixTimestamp,
     parent_start: usize,
     parent_len: usize,
 }
@@ -1186,14 +1159,7 @@ where
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
-                generation: commit.generation,
-                tracked_state_rootless: commit.tracked_state_rootless,
-                tracked_state_rootless_depth: commit.tracked_state_rootless_depth,
-                tracked_state_rootless_rows: commit.tracked_state_rootless_rows,
-                tracked_state_rootless_bytes: commit.tracked_state_rootless_bytes,
                 change_id: commit.change_id,
-                account_id: commit.account_id,
-                created_at: commit.created_at,
                 parent_start,
                 parent_len,
             });
@@ -1711,73 +1677,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_gc_rejects_live_topology_drift_before_staging_deletes() {
-        let storage = StorageAdapter::new(Memory::new());
-        let live = gc_authority_record("gc-live-authority-drift");
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("authority-drift fixture read should open");
-        let mut writes = storage.new_write_set();
-        ChangelogContext::new()
-            .writer(&mut read, &mut writes)
-            .stage_append(ChangelogAppend {
-                commits: vec![live.clone()],
-                changes: Vec::new(),
-            })
-            .await
-            .expect("authority-drift commit should stage");
-        let mut drifted = CommitStateManifest {
-            commit_id: live.commit_id,
-            generation: live.generation,
-            parent_commit_ids: live.parent_commit_ids.clone(),
-            commit_change_id: live.change_id,
-            account_id: live.account_id.clone(),
-            created_at: live.created_at,
-            replay_debt: CommitStateReplayDebt {
-                depth: live.tracked_state_rootless_depth,
-                rows: live.tracked_state_rootless_rows,
-                bytes: live.tracked_state_rootless_bytes,
-            },
-            mutations: CommitStateMutationInventory::default(),
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
-        };
-        drifted.generation += 1;
-        stage_commit_state_manifest(&mut writes, &drifted)
-            .expect("internally valid but projection-drifted authority should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("authority-drift fixture should commit");
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("authority-drift GC read should open"),
-        );
-        let mut gc_writes = storage.new_write_set();
-        let error = super::plan_and_stage_authority_gc(
-            &read,
-            &mut gc_writes,
-            &[GcRoot::BranchHead(live.commit_id)],
-        )
-        .await
-        .expect_err("GC must reject topology projection drift");
-        assert!(
-            error
-                .message
-                .contains("disagrees with its commit-state authority")
-        );
-        assert!(
-            gc_writes.is_empty(),
-            "authority validation must precede every destructive GC mutation"
-        );
-    }
-
-    #[tokio::test]
     async fn authority_gc_retains_tombstone_only_checkpoint_alias_source() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage);
@@ -1799,53 +1698,37 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 2,
-                tracked_state_rootless_rows: 2,
-                tracked_state_rootless_bytes: 2,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -2058,40 +1941,28 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 2,
-                tracked_state_rootless_rows: 2,
-                tracked_state_rootless_bytes: 2,
                 change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("authority-gc-dead-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -2128,14 +1999,15 @@ mod tests {
             (dead_commit, dead_stage.mutation_inventory().clone()),
         ]);
         for record in &commits {
-            stage_test_commit_state_manifest(
-                &mut writes,
-                record,
-                inventories
-                    .get(&record.commit_id)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            let mutations = inventories
+                .get(&record.commit_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut manifest = test_commit_state_manifest(record, mutations);
+            manifest.replay_debt = CommitStateReplayDebt::default();
+            manifest.snapshot_root = Some(Box::new(test_snapshot_root(record.commit_id)));
+            stage_commit_state_manifest(&mut writes, &manifest)
+                .expect("rooted GC fixture commit-state manifest should stage");
         }
         let sidecar_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -2264,6 +2136,27 @@ mod tests {
             .expect("post-GC packed inventory should scan");
         assert!(inventory.commits.contains_key(&live_parent));
         assert!(inventory.commits.contains_key(&dead_commit));
+        assert!(
+            crate::tracked_state::load_snapshot_commit_root(&read, &live_parent.to_string())
+                .await
+                .expect("live snapshot lookup should succeed")
+                .is_some(),
+            "a retained semantic commit keeps its immutable snapshot authority"
+        );
+        assert!(
+            crate::tracked_state::load_snapshot_commit_root(&read, &dead_commit.to_string())
+                .await
+                .expect("dead snapshot lookup should succeed")
+                .is_none(),
+            "retained selected-source bytes must not authorize a swept semantic commit"
+        );
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, dead_commit)
+                .await
+                .expect("retained physical source lookup should succeed")
+                .is_some(),
+            "the test must retain dead mutation authority for the live selected source"
+        );
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
@@ -2484,14 +2377,10 @@ mod tests {
 
     fn gc_authority_record(label: &str) -> CommitRecord {
         CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: CommitId::for_test_label(label),
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: true,
-            tracked_state_rootless_depth: 1,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
@@ -2527,35 +2416,37 @@ mod tests {
             .collect()
     }
 
-    fn stage_test_commit_state_manifest(
-        writes: &mut crate::storage_adapter::StorageWriteSet,
-        record: &CommitRecord,
-        mutations: CommitStateMutationInventory,
-    ) {
-        stage_commit_state_manifest(writes, &test_commit_state_manifest(record, mutations))
-            .expect("GC fixture commit-state manifest should stage");
-    }
-
     fn test_commit_state_manifest(
         record: &CommitRecord,
         mutations: CommitStateMutationInventory,
     ) -> CommitStateManifest {
         CommitStateManifest {
             commit_id: record.commit_id,
-            generation: record.generation,
-            parent_commit_ids: record.parent_commit_ids.clone(),
-            commit_change_id: record.change_id,
-            account_id: record.account_id.clone(),
-            created_at: record.created_at,
+            change_account_id: record.account_id.clone(),
             replay_debt: CommitStateReplayDebt {
-                depth: record.tracked_state_rootless_depth,
-                rows: record.tracked_state_rootless_rows,
-                bytes: record.tracked_state_rootless_bytes,
+                depth: 1,
+                rows: u64::from(mutations.member_count),
+                bytes: u64::from(mutations.member_count),
             },
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
+        }
+    }
+
+    fn test_snapshot_root(commit_id: CommitId) -> crate::tracked_state::TrackedStateCommitRoot {
+        crate::tracked_state::TrackedStateCommitRoot {
+            commit_id,
+            root_id: crate::tracked_state::TrackedStateRootId::new(
+                *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
+            ),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: 64,
         }
     }
 
