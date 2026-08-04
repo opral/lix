@@ -980,7 +980,7 @@ simulation_test!(
         assert!(
             error
                 .message
-                .contains("a canonical untracked row already exists; delete it first"),
+                .contains("cannot change retention for an existing untracked row"),
             "durability collision should have a targeted error: {error:?}"
         );
 

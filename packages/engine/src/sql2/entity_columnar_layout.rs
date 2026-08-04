@@ -31,12 +31,11 @@ pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
 pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.entity_columnar.base_coordinates.v1";
 pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
-pub(crate) const ENTITY_ARROW_STATE_NAMESPACE: &str = "lix.tracked_state.arrow_leaf.v1";
-pub(crate) const ENTITY_ARROW_STATE_LAYOUT: &str = "arrow-native-state-leaf-v2";
-pub(crate) const ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA: &str = "lix.state.schema_key";
-pub(crate) const ENTITY_ARROW_STATE_COMMIT_ID_METADATA: &str = "lix.state.commit_id";
-pub(crate) const ENTITY_ARROW_STATE_CREATED_AT_METADATA: &str = "lix.state.created_at";
-pub(crate) const ENTITY_ARROW_STATE_UPDATED_AT_METADATA: &str = "lix.state.updated_at";
+pub(crate) use crate::tracked_state::{
+    ENTITY_ARROW_STATE_COMMIT_ID_METADATA, ENTITY_ARROW_STATE_CREATED_AT_METADATA,
+    ENTITY_ARROW_STATE_LAYOUT, ENTITY_ARROW_STATE_NAMESPACE,
+    ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA, ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
+};
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
 const ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;

@@ -20,6 +20,9 @@ pub(crate) use context::{
 };
 pub(crate) use current_state_data_part::{
     ArrowStateInputRowRef, CURRENT_STATE_DATA_PART_REFS_SPACE, CurrentStateDataRow,
+    ENTITY_ARROW_STATE_COMMIT_ID_METADATA, ENTITY_ARROW_STATE_CREATED_AT_METADATA,
+    ENTITY_ARROW_STATE_LAYOUT, ENTITY_ARROW_STATE_NAMESPACE,
+    ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA, ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
     HydratedArrowStatePayload, decode_current_state_data_part, decode_current_state_data_part_refs,
     encode_authoritative_arrow_state_rows, stage_current_state_ref_summary,
 };
@@ -50,7 +53,7 @@ pub(crate) use storage::{
     CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
     OrderedAddressableCommitDeltaStage, addressable_change_id, direct_change_locator,
     finalize_commit_delta_event_coordinates, load_change_origin_keys_by_ids,
-    load_change_record_by_id, load_commit_delta_members_with_payloads_for_schemas,
+    load_change_record_by_id, load_commit_delta_members_with_payloads_for_history,
     load_commit_delta_selection_certificate, load_commit_state_manifest,
     load_commit_state_manifests, load_complete_current_state_coordinates_encoded,
     load_current_state_payloads_at_coordinates, load_current_state_scope_descriptors,

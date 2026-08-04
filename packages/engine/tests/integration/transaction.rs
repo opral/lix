@@ -500,7 +500,7 @@ async fn validate_tracked_state_does_not_commit_on_read_failure() {
         .await
         .expect("initialized storage should create an engine");
 
-    storage.fail_read_namespace("changelog.commit");
+    storage.fail_read_namespace("tracked_state.commit_state_manifest.v1");
     let before = storage.stats();
     let error = engine
         .validate_tracked_state_for_branch(&receipt.main_branch_id)
@@ -1524,6 +1524,7 @@ fn namespace_space(namespace: &str) -> Option<SpaceId> {
     match namespace {
         "changelog.commit" => Some(SpaceId(0x0006_0001)),
         "changelog.change" => Some(SpaceId(0x0006_0002)),
+        "tracked_state.commit_state_manifest.v1" => Some(SpaceId(0x0004_002b)),
         _ => None,
     }
 }

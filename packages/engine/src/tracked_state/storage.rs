@@ -290,6 +290,8 @@ fn decode_optional_base_coordinate(
 
 pub(crate) struct LoadedCommitDeltaEntry {
     pub(crate) change_record: crate::changelog::ChangeRecord,
+    base_coordinate: Option<TrackedStateBaseCoordinate>,
+    commit_id: CommitId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -850,6 +852,55 @@ pub(crate) async fn scan_complete_current_state_rows(
     state: &CommitStateManifest,
     request: &TrackedStatePhysicalScanRequest,
 ) -> Result<Vec<crate::tracked_state::CurrentStateDataRow>, LixError> {
+    let exact_key_count = request
+        .schema_keys
+        .len()
+        .checked_mul(request.entity_pks.len())
+        .and_then(|count| count.checked_mul(request.file_ids.len()));
+    if !request.schema_keys.is_empty()
+        && !request.entity_pks.is_empty()
+        && !request.file_ids.is_empty()
+        && request
+            .file_ids
+            .iter()
+            .all(|file_id| !matches!(file_id, crate::NullableKeyFilter::Any))
+        && exact_key_count.is_some_and(|count| count <= 4096)
+    {
+        let mut encoded_keys = Vec::with_capacity(exact_key_count.unwrap_or_default());
+        for schema_key in &request.schema_keys {
+            for file_id in &request.file_ids {
+                let file_id = match file_id {
+                    crate::NullableKeyFilter::Null => None,
+                    crate::NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
+                    crate::NullableKeyFilter::Any => unreachable!("exact route rejected Any"),
+                };
+                for entity_pk in &request.entity_pks {
+                    encoded_keys.push(Bytes::from(encode_key_ref(TrackedStateKeyRef {
+                        schema_key,
+                        file_id,
+                        entity_pk,
+                    })));
+                }
+            }
+        }
+        encoded_keys.sort_unstable();
+        encoded_keys.dedup();
+        let exact_rows =
+            load_complete_current_state_rows_with_coordinates_encoded(store, state, &encoded_keys)
+                .await?;
+        let mut rows = Vec::with_capacity(exact_rows.len());
+        for (row, _) in exact_rows.into_iter().flatten() {
+            let key = decode_key_shared(Bytes::copy_from_slice(&row.encoded_key))?;
+            if request.matches_ref(key.as_ref(), &row.value) {
+                rows.push(row);
+            }
+        }
+        rows.sort_unstable_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        return Ok(rows);
+    }
     let catalog = super::current_state_part::load_current_state_catalog_entries(
         store,
         &state.current_state_catalog,
@@ -1713,7 +1764,7 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
         if encoded_mutations
             .manifest
             .metadata
-            .get(crate::sql2::ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA)
+            .get(crate::tracked_state::ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA)
             .is_none_or(|schema_key| schema_key != &scope.schema_key)
             || encoded_mutations.manifest.metadata.get(
                 crate::tracked_state::current_state_data_part::ENTITY_ARROW_STATE_FILE_ID_METADATA,
@@ -4093,8 +4144,8 @@ where
         ));
     }
     let key = decode_key(entry.key)?;
-    let origin_key = match payloads.decode(ordinal)? {
-        CommitDeltaPayload::AuthoredEvent(payload) => payload.origin_key,
+    let (origin_key, base_coordinate) = match payloads.decode(ordinal)? {
+        CommitDeltaPayload::AuthoredEvent(payload) => (payload.origin_key, payload.base_coordinate),
         CommitDeltaPayload::SelectedRef(_) | CommitDeltaPayload::SelectedTombstone(_) => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -4118,7 +4169,64 @@ where
             created_at: updated_at,
             origin_key,
         },
+        base_coordinate: (!value.deleted).then_some(base_coordinate).flatten(),
+        commit_id: locator.commit_id,
     })
+}
+
+async fn hydrate_change_entry_at_arrow_coordinate(
+    store: &(impl StorageAdapterRead + ?Sized),
+    mut entry: LoadedCommitDeltaEntry,
+) -> Result<crate::changelog::ChangeRecord, LixError> {
+    let Some(coordinate) = entry.base_coordinate else {
+        return Ok(entry.change_record);
+    };
+    let manifest =
+        crate::columnar_row_group::load_row_group_manifest(store, coordinate.state_set_id)
+            .await?
+            .ok_or_else(|| {
+                replacement_payload_error("change Arrow coordinate is missing its leaf")
+            })?;
+    let projection =
+        crate::tracked_state::current_state_data_part::current_state_data_projection(&manifest)?;
+    let batch = crate::columnar_row_group::load_row_group_batch(
+        store,
+        coordinate.state_set_id,
+        &manifest,
+        usize::try_from(coordinate.group_index).expect("u32 group index fits usize"),
+        &projection,
+    )
+    .await?;
+    let loaded = crate::columnar_row_group::LoadedRowGroupSet {
+        manifest,
+        batches: vec![batch],
+    };
+    let mut rows =
+        crate::tracked_state::current_state_data_part::hydrate_current_state_payload_rows(
+            &loaded,
+            &[coordinate.row_index],
+        )?;
+    let row = rows
+        .pop()
+        .ok_or_else(|| replacement_payload_error("change Arrow coordinate is out of bounds"))?;
+    let expected_key = encode_key_ref(TrackedStateKeyRef {
+        schema_key: &entry.change_record.schema_key,
+        file_id: entry.change_record.file_id.as_deref(),
+        entity_pk: &entry.change_record.entity_pk,
+    });
+    if row.encoded_key != expected_key
+        || row.value.change_id != entry.change_record.change_id
+        || row.value.commit_id != entry.commit_id
+        || row.value.deleted
+        || row.value.updated_at != entry.change_record.created_at
+    {
+        return Err(replacement_payload_error(
+            "change Arrow coordinate points to a different state row",
+        ));
+    }
+    entry.change_record.snapshot = row.snapshot;
+    entry.change_record.metadata = row.metadata;
+    Ok(entry.change_record)
 }
 
 async fn load_change_record_at_locator(
@@ -4209,9 +4317,10 @@ async fn try_load_change_record_at_locator_in_manifest(
         })?;
         (segment, Some(bounds))
     };
-    Ok(Some(
-        decode_change_at_locator(&segment, bounds, locator, &manifest.account_id)?.change_record,
-    ))
+    let entry = decode_change_at_locator(&segment, bounds, locator, &manifest.account_id)?;
+    hydrate_change_entry_at_arrow_coordinate(store, entry)
+        .await
+        .map(Some)
 }
 
 pub(crate) fn decode_change_locator(
@@ -4369,10 +4478,49 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
 /// Segment bounds route around unrelated schema ranges before payload-sidecar
 /// decoding. An empty schema list retains the full inventory behavior used by
 /// history, rebuild, and lifecycle callers.
-pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
+#[cfg(any(test, feature = "storage-benches"))]
+async fn load_commit_delta_members_with_payloads_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     schema_keys: &[String],
+    max_segment_count: usize,
+) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    load_commit_delta_members_with_payloads_filtered(
+        store,
+        commit_id,
+        schema_keys,
+        &[],
+        &[],
+        max_segment_count,
+    )
+    .await
+}
+
+pub(crate) async fn load_commit_delta_members_with_payloads_for_history(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    entity_pks: &[crate::entity_pk::EntityPk],
+    file_ids: &[String],
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    Ok(load_commit_delta_members_with_payloads_filtered(
+        store,
+        commit_id,
+        schema_keys,
+        entity_pks,
+        file_ids,
+        usize::MAX,
+    )
+    .await?
+    .expect("unbounded history member load cannot exceed its segment limit"))
+}
+
+async fn load_commit_delta_members_with_payloads_filtered(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    entity_pks: &[crate::entity_pk::EntityPk],
+    file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
@@ -4422,8 +4570,15 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     } else {
         None
     };
-    let mut local =
-        load_commit_delta_members_from_manifest(store, commit_id, &manifest, schema_keys).await?;
+    let mut local = load_commit_delta_members_from_manifest_filtered(
+        store,
+        commit_id,
+        &manifest,
+        schema_keys,
+        entity_pks,
+        file_ids,
+    )
+    .await?;
     let Some((source_commit_id, source_manifest)) = source else {
         return Ok(Some(local));
     };
@@ -4433,11 +4588,13 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             "selected-source commit delta chains are unsupported",
         ));
     }
-    let mut members = load_commit_delta_members_from_manifest(
+    let mut members = load_commit_delta_members_from_manifest_filtered(
         store,
         source_commit_id,
         &source_manifest,
         schema_keys,
+        entity_pks,
+        file_ids,
     )
     .await?;
     for member in &mut members {
@@ -4461,6 +4618,25 @@ async fn load_commit_delta_members_from_manifest(
     commit_id: CommitId,
     manifest: &CommitDeltaManifest,
     schema_keys: &[String],
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    load_commit_delta_members_from_manifest_filtered(
+        store,
+        commit_id,
+        manifest,
+        schema_keys,
+        &[],
+        &[],
+    )
+    .await
+}
+
+async fn load_commit_delta_members_from_manifest_filtered(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    manifest: &CommitDeltaManifest,
+    schema_keys: &[String],
+    entity_pks: &[crate::entity_pk::EntityPk],
+    file_ids: &[String],
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     let requested_schemas = schema_keys
         .iter()
@@ -4513,6 +4689,18 @@ async fn load_commit_delta_members_from_manifest(
     }
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
+    }
+    if !entity_pks.is_empty() {
+        members.retain(|member| entity_pks.contains(&member.key.entity_pk));
+    }
+    if !file_ids.is_empty() {
+        members.retain(|member| {
+            member
+                .key
+                .file_id
+                .as_ref()
+                .is_some_and(|file_id| file_ids.contains(file_id))
+        });
     }
     hydrate_selected_members(store, &mut members).await?;
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
@@ -7526,17 +7714,6 @@ mod tests {
                 updated_at,
             })
             .collect::<Vec<_>>();
-        let mut deltas = commit_delta_refs(commit_id, &fixtures);
-        for (index, delta) in deltas.iter_mut().enumerate() {
-            delta.snapshot = crate::json_store::JsonSlotRef::Inline("{}");
-            delta.base_coordinate = Some(TrackedStateBaseCoordinate {
-                state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([13; 32]),
-                group_index: u32::try_from(index / super::COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                    .expect("fixture group fits u32"),
-                row_index: u32::try_from(index % super::COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                    .expect("fixture row fits u32"),
-            });
-        }
         let generation = super::CommitDeltaReplacementGeneration {
             scope: super::CommitDeltaReplacementScope {
                 schema_key: "alpha".to_string(),
@@ -7552,6 +7729,52 @@ mod tests {
             },
         };
         let mut writes = storage.new_write_set();
+        let encoded_keys = fixtures
+            .iter()
+            .map(|fixture| crate::tracked_state::encode_key(&fixture.key()))
+            .collect::<Vec<_>>();
+        let state_rows = fixtures
+            .iter()
+            .zip(&encoded_keys)
+            .enumerate()
+            .map(|(index, (_, encoded_key))| {
+                Ok(crate::tracked_state::ArrowStateInputRowRef {
+                    encoded_key,
+                    value: TrackedStateIndexValueRef {
+                        change_id: super::addressable_change_id(
+                            commit_id,
+                            index / super::COMMIT_DELTA_SEGMENT_MAX_ROWS,
+                            index % super::COMMIT_DELTA_SEGMENT_MAX_ROWS,
+                        )?,
+                        commit_id,
+                        deleted: false,
+                        created_at,
+                        updated_at,
+                    },
+                    snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
+                    metadata: crate::json_store::JsonSlotRef::None,
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()
+            .expect("replacement change addresses should construct");
+        let (encoded_state, state_locations) =
+            crate::tracked_state::encode_authoritative_arrow_state_rows(
+                &generation.scope,
+                &state_rows,
+            )
+            .expect("replacement Arrow state should encode");
+        let state_set_id =
+            crate::columnar_row_group::stage_row_group_set(&mut writes, &encoded_state)
+                .expect("replacement Arrow state should stage");
+        let mut deltas = commit_delta_refs(commit_id, &fixtures);
+        for (delta, location) in deltas.iter_mut().zip(state_locations.iter().copied()) {
+            delta.snapshot = crate::json_store::JsonSlotRef::Inline("{}");
+            delta.base_coordinate = Some(TrackedStateBaseCoordinate {
+                state_set_id,
+                group_index: location.group_index,
+                row_index: location.row_index,
+            });
+        }
         let staged = super::stage_ordered_addressable_replacement_parts(
             &mut writes,
             deltas.iter().copied().map(Ok),
@@ -7559,6 +7782,11 @@ mod tests {
         )
         .expect("replacement parts should stage");
         let mut borrowed_writes = storage.new_write_set();
+        assert_eq!(
+            crate::columnar_row_group::stage_row_group_set(&mut borrowed_writes, &encoded_state,)
+                .expect("borrowed replacement Arrow state should stage"),
+            state_set_id,
+        );
         let borrowed_staged = super::stage_ordered_addressable_replacement_parts(
             &mut borrowed_writes,
             fixtures.iter().enumerate().map(|(index, fixture)| {
@@ -7576,15 +7804,9 @@ mod tests {
                         snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
                         metadata: crate::json_store::JsonSlotRef::None,
                         base_coordinate: Some(TrackedStateBaseCoordinate {
-                            state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest(
-                                [13; 32],
-                            ),
-                            group_index: u32::try_from(
-                                index / super::COMMIT_DELTA_SEGMENT_MAX_ROWS,
-                            )
-                            .expect("fixture group fits u32"),
-                            row_index: u32::try_from(index % super::COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                                .expect("fixture row fits u32"),
+                            state_set_id,
+                            group_index: state_locations[index].group_index,
+                            row_index: state_locations[index].row_index,
                         }),
                     },
                 )

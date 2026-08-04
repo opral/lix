@@ -311,7 +311,7 @@ where
                 continue;
             }
             for change in self
-                .load_member_changes(node.commit_id, &member_schema_keys)
+                .load_member_changes(node.commit_id, &member_schema_keys, request)
                 .await?
             {
                 if !seen_changes.insert(history_change_identity(&change)) {
@@ -338,31 +338,37 @@ where
         &mut self,
         commit_id: CommitId,
         schema_keys: &[String],
+        request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChange>, LixError> {
-        if let Some(changes) = self
-            .member_changes_cache
-            .get(schema_keys)
-            .and_then(|by_commit| by_commit.get(&commit_id))
-        {
-            return Ok(changes.clone());
+        let unfiltered = request.entity_pks.is_empty() && request.file_ids.is_empty();
+        if unfiltered {
+            if let Some(changes) = self
+                .member_changes_cache
+                .get(schema_keys)
+                .and_then(|by_commit| by_commit.get(&commit_id))
+            {
+                return Ok(changes.clone());
+            }
         }
-        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_history(
             &self.store,
             commit_id,
             schema_keys,
-            usize::MAX,
+            &request.entity_pks,
+            &request.file_ids,
         )
-        .await?
-        .expect("unbounded commit member load cannot exceed its segment limit");
+        .await?;
         let mut changes = members
             .into_iter()
             .map(|member| commit_graph_change_from_change_record(member.change))
             .collect::<Vec<_>>();
         changes.sort_by_key(|change| change.id);
-        self.member_changes_cache
-            .entry(schema_keys.to_vec())
-            .or_default()
-            .insert(commit_id, changes.clone());
+        if unfiltered {
+            self.member_changes_cache
+                .entry(schema_keys.to_vec())
+                .or_default()
+                .insert(commit_id, changes.clone());
+        }
         Ok(changes)
     }
 }

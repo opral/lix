@@ -36,6 +36,12 @@ pub(crate) const CURRENT_STATE_DATA_PART_TARGET_BYTES: usize = 64 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 const REFS_DIGEST_CONTEXT: &str = "lix arrow state leaf refs v1";
 const LEAF_NAMESPACE: &str = "lix.tracked_state.arrow_leaf.v1";
+pub(crate) const ENTITY_ARROW_STATE_NAMESPACE: &str = LEAF_NAMESPACE;
+pub(crate) const ENTITY_ARROW_STATE_LAYOUT: &str = "arrow-native-state-leaf-v2";
+pub(crate) const ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA: &str = "lix.state.schema_key";
+pub(crate) const ENTITY_ARROW_STATE_COMMIT_ID_METADATA: &str = "lix.state.commit_id";
+pub(crate) const ENTITY_ARROW_STATE_CREATED_AT_METADATA: &str = "lix.state.created_at";
+pub(crate) const ENTITY_ARROW_STATE_UPDATED_AT_METADATA: &str = "lix.state.updated_at";
 pub(crate) const ENTITY_ARROW_STATE_FILE_ID_METADATA: &str = "lix.state.file_id";
 
 pub(crate) fn current_state_data_projection(
@@ -44,7 +50,7 @@ pub(crate) fn current_state_data_projection(
     if !manifest
         .metadata
         .get("lix.layout")
-        .is_some_and(|layout| layout == crate::sql2::ENTITY_ARROW_STATE_LAYOUT)
+        .is_some_and(|layout| layout == ENTITY_ARROW_STATE_LAYOUT)
     {
         return Err(part_error(
             "unsupported Arrow state leaf layout; recreate the repository",
@@ -60,18 +66,9 @@ pub(crate) fn current_state_data_projection(
         "metadata_payload",
     ];
     for (metadata_key, column_name) in [
-        (
-            crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA,
-            "commit_id",
-        ),
-        (
-            crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA,
-            "created_at",
-        ),
-        (
-            crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
-            "updated_at",
-        ),
+        (ENTITY_ARROW_STATE_COMMIT_ID_METADATA, "commit_id"),
+        (ENTITY_ARROW_STATE_CREATED_AT_METADATA, "created_at"),
+        (ENTITY_ARROW_STATE_UPDATED_AT_METADATA, "updated_at"),
     ] {
         if !manifest.metadata.contains_key(metadata_key) {
             names.push(column_name);
@@ -157,11 +154,11 @@ pub(crate) fn encode_authoritative_arrow_state_rows(
     let mut schema_metadata = HashMap::from([
         (
             "lix.layout".to_owned(),
-            crate::sql2::ENTITY_ARROW_STATE_LAYOUT.to_owned(),
+            ENTITY_ARROW_STATE_LAYOUT.to_owned(),
         ),
         ("lix.order".to_owned(), "physical_key-ascending".to_owned()),
         (
-            crate::sql2::ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA.to_owned(),
             scope.schema_key.clone(),
         ),
     ]);
@@ -173,19 +170,19 @@ pub(crate) fn encode_authoritative_arrow_state_rows(
     }
     if uniform_commit_id {
         schema_metadata.insert(
-            crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
             first.commit_id.to_string(),
         );
     }
     if uniform_created_at {
         schema_metadata.insert(
-            crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
             first.created_at.packed().to_string(),
         );
     }
     if uniform_updated_at {
         schema_metadata.insert(
-            crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
             first.updated_at.packed().to_string(),
         );
     }
@@ -402,7 +399,7 @@ fn encode_selected_current_state_data_part(
     let mut schema_metadata = HashMap::from([
         (
             "lix.layout".to_owned(),
-            crate::sql2::ENTITY_ARROW_STATE_LAYOUT.to_owned(),
+            ENTITY_ARROW_STATE_LAYOUT.to_owned(),
         ),
         ("lix.order".to_owned(), "physical_key-ascending".to_owned()),
     ]);
@@ -411,9 +408,9 @@ fn encode_selected_current_state_data_part(
             if matches!(key.as_str(), "lix.layout" | "lix.order")
                 || matches!(
                     key.as_str(),
-                    crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA
-                        | crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA
-                        | crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA
+                    ENTITY_ARROW_STATE_COMMIT_ID_METADATA
+                        | ENTITY_ARROW_STATE_CREATED_AT_METADATA
+                        | ENTITY_ARROW_STATE_UPDATED_AT_METADATA
                 )
             {
                 continue;
@@ -431,7 +428,7 @@ fn encode_selected_current_state_data_part(
     }
     if uniform_commit_id {
         schema_metadata.insert(
-            crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
             first.commit_id.to_string(),
         );
     } else {
@@ -443,7 +440,7 @@ fn encode_selected_current_state_data_part(
     }
     if uniform_created_at {
         schema_metadata.insert(
-            crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
             first.created_at.packed().to_string(),
         );
     } else {
@@ -454,7 +451,7 @@ fn encode_selected_current_state_data_part(
     }
     if uniform_updated_at {
         schema_metadata.insert(
-            crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
+            ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
             first.updated_at.packed().to_string(),
         );
     } else {
@@ -637,7 +634,7 @@ pub(crate) fn decode_current_state_data_part(
             .manifest
             .metadata
             .get("lix.layout")
-            .is_some_and(|layout| layout == crate::sql2::ENTITY_ARROW_STATE_LAYOUT)
+            .is_some_and(|layout| layout == ENTITY_ARROW_STATE_LAYOUT)
     {
         return Err(part_error(
             "unsupported Arrow state leaf layout; recreate the repository",
@@ -645,7 +642,7 @@ pub(crate) fn decode_current_state_data_part(
     }
     let metadata = &loaded.manifest.metadata;
     let uniform_commit_id = metadata
-        .get(crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA)
+        .get(ENTITY_ARROW_STATE_COMMIT_ID_METADATA)
         .map(|value| {
             value
                 .parse::<crate::changelog::CommitId>()
@@ -667,14 +664,8 @@ pub(crate) fn decode_current_state_data_part(
             })
             .transpose()
     };
-    let uniform_created_at = timestamp(
-        crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA,
-        "created_at",
-    )?;
-    let uniform_updated_at = timestamp(
-        crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
-        "updated_at",
-    )?;
+    let uniform_created_at = timestamp(ENTITY_ARROW_STATE_CREATED_AT_METADATA, "created_at")?;
+    let uniform_updated_at = timestamp(ENTITY_ARROW_STATE_UPDATED_AT_METADATA, "updated_at")?;
     let mut rows = Vec::with_capacity(loaded.batches.iter().map(RecordBatch::num_rows).sum());
     for batch in &loaded.batches {
         let column_index = |name: &str| {
@@ -797,7 +788,7 @@ pub(crate) fn decode_current_state_authority_rows(
             .manifest
             .metadata
             .get("lix.layout")
-            .is_some_and(|layout| layout == crate::sql2::ENTITY_ARROW_STATE_LAYOUT)
+            .is_some_and(|layout| layout == ENTITY_ARROW_STATE_LAYOUT)
     {
         return Err(part_error(
             "unsupported Arrow state leaf layout; recreate the repository",
@@ -805,7 +796,7 @@ pub(crate) fn decode_current_state_authority_rows(
     }
     let metadata = &loaded.manifest.metadata;
     let uniform_commit_id = metadata
-        .get(crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA)
+        .get(ENTITY_ARROW_STATE_COMMIT_ID_METADATA)
         .map(|value| {
             value
                 .parse::<crate::changelog::CommitId>()
@@ -827,14 +818,8 @@ pub(crate) fn decode_current_state_authority_rows(
             })
             .transpose()
     };
-    let uniform_created_at = timestamp(
-        crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA,
-        "created_at",
-    )?;
-    let uniform_updated_at = timestamp(
-        crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
-        "updated_at",
-    )?;
+    let uniform_created_at = timestamp(ENTITY_ARROW_STATE_CREATED_AT_METADATA, "created_at")?;
+    let uniform_updated_at = timestamp(ENTITY_ARROW_STATE_UPDATED_AT_METADATA, "updated_at")?;
     let mut rows = Vec::with_capacity(loaded.batches.iter().map(RecordBatch::num_rows).sum());
     for (batch_index, batch) in loaded.batches.iter().enumerate() {
         let column_index = |name: &str| {
@@ -1259,23 +1244,23 @@ mod tests {
             let metadata = HashMap::from([
                 (
                     "lix.layout".to_owned(),
-                    crate::sql2::ENTITY_ARROW_STATE_LAYOUT.to_owned(),
+                    ENTITY_ARROW_STATE_LAYOUT.to_owned(),
                 ),
                 ("lix.order".to_owned(), "physical_key-ascending".to_owned()),
                 (
-                    crate::sql2::ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA.to_owned(),
+                    ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA.to_owned(),
                     "typed_splice".to_owned(),
                 ),
                 (
-                    crate::sql2::ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
+                    ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
                     commit_id.to_string(),
                 ),
                 (
-                    crate::sql2::ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
+                    ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
                     "1".to_owned(),
                 ),
                 (
-                    crate::sql2::ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
+                    ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
                     "2".to_owned(),
                 ),
             ]);

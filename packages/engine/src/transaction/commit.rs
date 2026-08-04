@@ -1824,7 +1824,7 @@ fn stage_certified_native_state_parts(
     let Some(encoded) = entity_columnar_write_sets.get_unfiled(commit_id, first.schema_key) else {
         return Ok(None);
     };
-    if encoded.manifest.namespace != crate::sql2::ENTITY_ARROW_STATE_NAMESPACE {
+    if encoded.manifest.namespace != crate::tracked_state::ENTITY_ARROW_STATE_NAMESPACE {
         return Ok(None);
     }
     // The persistent state root owns publication. HOT may reference the same

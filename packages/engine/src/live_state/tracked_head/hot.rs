@@ -2227,7 +2227,7 @@ where
                 })?;
                 if manifest.namespace != "lix.tracked_state.arrow_leaf.v1"
                     || manifest.metadata.get("lix.layout").map(String::as_str)
-                        != Some(crate::sql2::ENTITY_ARROW_STATE_LAYOUT)
+                        != Some(crate::tracked_state::ENTITY_ARROW_STATE_LAYOUT)
                 {
                     return Err(head_value_error(
                         "current-state descriptor does not reference the canonical Arrow leaf layout",

@@ -50,9 +50,6 @@ pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader}
 #[cfg(test)]
 pub(crate) use entity_columnar_layout::encode_registered_entity_row_groups;
 pub(crate) use entity_columnar_layout::{
-    ENTITY_ARROW_STATE_COMMIT_ID_METADATA, ENTITY_ARROW_STATE_CREATED_AT_METADATA,
-    ENTITY_ARROW_STATE_LAYOUT, ENTITY_ARROW_STATE_NAMESPACE,
-    ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA, ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
     ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
     ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY, EncodedEntityRowGroups,
     EntityColumnarAuthorityRef, EntityColumnarRowRef, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
