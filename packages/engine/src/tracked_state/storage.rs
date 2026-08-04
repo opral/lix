@@ -8111,6 +8111,24 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
     Ok(())
 }
 
+/// Removes rebuildable snapshot projections owned by collected semantic commits.
+///
+/// Snapshot roots are mutable accelerators rather than immutable mutation
+/// authority. A selected-source manifest may therefore remain live after its
+/// semantic commit is swept, but its commit-addressed snapshot root must not:
+/// otherwise historical reads can continue to resolve the collected commit.
+pub(crate) fn stage_delete_snapshot_commit_roots(
+    writes: &mut StorageWriteSet,
+    commit_ids: impl IntoIterator<Item = CommitId>,
+) {
+    writes.delete_batch(
+        TRACKED_STATE_SNAPSHOT_ROOT_SPACE,
+        commit_ids
+            .into_iter()
+            .map(|commit_id| key(commit_state_manifest_key(commit_id))),
+    );
+}
+
 async fn scan_full_space(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,

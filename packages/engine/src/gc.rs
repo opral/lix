@@ -1017,6 +1017,10 @@ where
         COMMIT_SPACE,
         sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
     );
+    // Snapshot roots are rebuildable commit-addressed projections. Delete
+    // them with their semantic commit even when a selected-source relationship
+    // keeps the immutable mutation manifest alive for another commit.
+    crate::tracked_state::stage_delete_snapshot_commit_roots(writes, sweep_commits.iter().copied());
     stage_sweep_unreachable_content_nodes(
         store,
         writes,
@@ -2007,6 +2011,7 @@ mod tests {
                     .cloned()
                     .unwrap_or_default(),
             );
+            stage_test_snapshot_root(&mut writes, record.commit_id);
         }
         let sidecar_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -2135,6 +2140,20 @@ mod tests {
             .expect("post-GC packed inventory should scan");
         assert!(inventory.commits.contains_key(&live_parent));
         assert!(inventory.commits.contains_key(&dead_commit));
+        assert!(
+            crate::tracked_state::load_snapshot_commit_root(&read, &live_parent.to_string())
+                .await
+                .expect("live snapshot-root lookup should succeed")
+                .is_some(),
+            "the live commit keeps its snapshot projection"
+        );
+        assert!(
+            crate::tracked_state::load_snapshot_commit_root(&read, &dead_commit.to_string())
+                .await
+                .expect("dead snapshot-root lookup should succeed")
+                .is_none(),
+            "a swept semantic commit must not remain readable through an orphan snapshot root"
+        );
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
@@ -2401,6 +2420,34 @@ mod tests {
     ) {
         stage_commit_state_manifest(writes, &test_commit_state_manifest(record, mutations))
             .expect("GC fixture commit-state manifest should stage");
+    }
+
+    fn stage_test_snapshot_root(
+        writes: &mut crate::storage_adapter::StorageWriteSet,
+        commit_id: CommitId,
+    ) {
+        let root = crate::tracked_state::TrackedStateCommitRoot {
+            commit_id,
+            root_id: crate::tracked_state::TrackedStateRootId::new(
+                *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
+            ),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: 64,
+        };
+        writes.put(
+            crate::tracked_state::TRACKED_STATE_SNAPSHOT_ROOT_SPACE,
+            StorageKey(Bytes::copy_from_slice(commit_id.as_uuid().as_bytes())),
+            StorageValue {
+                bytes: Bytes::from(
+                    crate::storage_codec::encode("tracked-state snapshot root", &root)
+                        .expect("GC fixture snapshot root should encode"),
+                ),
+            },
+        );
     }
 
     fn test_commit_state_manifest(

@@ -70,9 +70,9 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_delete_change_locators,
-    stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
-    stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
-    stage_preencoded_ordered_addressable_replacement_parts,
+    stage_delete_commit_delta_inventory_entry, stage_delete_snapshot_commit_roots,
+    stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
+    stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts, stage_staged_commit_state_snapshot_root,
     validate_current_state_scoped_range_serving_base_manifest,
 };
@@ -88,10 +88,12 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{
-    change_id_from_packed_address, load_commit_delta_change_ids,
+    TRACKED_STATE_SNAPSHOT_ROOT_SPACE, change_id_from_packed_address, load_commit_delta_change_ids,
     load_complete_current_state_values_from_scoped_root, load_snapshot_commit_root,
     scan_commit_delta_members, stage_resealed_commit_state_manifest_for_test,
 };
+#[cfg(test)]
+pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
