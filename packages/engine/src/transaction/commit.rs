@@ -60,10 +60,12 @@ use tracing::Instrument as _;
 type RowIndex = usize;
 
 // Below this size, per-row HOT writes are cheaper and keep repeated ordinary
-// INSERT transactions at one point-addressable current-state lookup. Packed
-// bases are reserved for bulk publication where avoiding row write
-// amplification dominates the cost of retaining one immutable manifest.
-const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
+// INSERT transactions at one point-addressable current-state lookup. At 1K,
+// measured HOT publication still emitted one backend put per row, while the
+// immutable packed base removes that amplification without entering the
+// single-row path. Keep the crossover at a power-of-two boundary below that
+// representative bulk size while leaving ordinary point writes unchanged.
+const PACKED_CURRENT_BASE_MIN_ROWS: usize = 512;
 
 // Complete replacements retain an authoritative partition generation.
 // Ordinary non-empty ordered commits start bounded rootless intervals
@@ -3965,13 +3967,12 @@ async fn stage_tracked_head(
             .iter()
             .map(|delta| delta.schema_key)
             .collect::<BTreeSet<_>>();
-        let packed_guards_match = tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
-            && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
-        let can_publish_packed_current_base = !is_checkpoint_publication
+        let packed_guards_match =
+            packed_current_base_guards_match(&tracked_deltas, &absence_guards);
+        let packed_current_base_candidate = !is_checkpoint_publication
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
             && staged.selected_change_batches.is_empty()
-            && packed_guards_match
             && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
             && tracked_deltas.iter().all(|delta| {
                 !delta.untracked
@@ -3985,9 +3986,102 @@ async fn stage_tracked_head(
             && untracked_deltas
                 .iter()
                 .all(|delta| !packed_schema_keys.contains(delta.schema_key));
+        let mut deltas = tracked_deltas.clone();
+        deltas.extend_from_slice(&untracked_deltas);
+        // Every absence guard above is derived from one of these exact
+        // transaction deltas. The fresh-file certificate likewise proves its
+        // complete file-scoped namespace absent. The branch-control CAS
+        // protects both proofs through publication.
+        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
+            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
+        let mut writer = tracked_head.writer(read, writes);
+        let exact_delete_candidate = !is_checkpoint_publication
+            && certified_fresh_plugin_file_id.is_none()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
+            && staged.selected_change_batches.is_empty()
+            && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && untracked_deltas.is_empty()
+            && tracked_deltas.iter().all(|delta| {
+                !delta.untracked
+                    && delta.deleted
+                    && delta.file_id.is_none()
+                    && delta.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && delta.commit_id == Some(root.commit_id)
+                    && delta.change_id.is_some()
+            });
+        let delete_generation = if exact_delete_candidate {
+            writer
+                .try_stage_exact_collection_delete_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &tracked_deltas,
+                    working_diff_capture_checkpoint_commit_id,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_exact_collection_delete"
+                ))
+                .await?
+        } else {
+            None
+        };
+        let replacement_generation = if delete_generation.is_none()
+            && packed_current_base_candidate
+            && absence_guards.is_empty()
+            && untracked_deltas.is_empty()
+        {
+            writer
+                .try_stage_exact_collection_replacement_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &tracked_deltas,
+                    entity_columnar_write_sets,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_exact_collection_replacement"
+                ))
+                .await?
+        } else {
+            None
+        };
+        let packed_generation = if delete_generation.is_none()
+            && replacement_generation.is_none()
+            && packed_current_base_candidate
+            && (packed_guards_match || absence_guards.is_empty())
+        {
+            writer
+                .try_stage_packed_insert_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &tracked_deltas,
+                    &absence_guards,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_packed_current_base"
+                ))
+                .await?
+        } else {
+            None
+        };
+        let packed_generation = delete_generation
+            .or(replacement_generation)
+            .or(packed_generation);
+        let can_publish_packed_current_base = packed_generation.is_some();
         tracing::debug!(
             target: "lix_perf",
             can_publish_packed_current_base,
+            packed_current_base_candidate,
+            exact_delete_candidate,
             tracked_delta_count = tracked_deltas.len(),
             packed_min_rows = PACKED_CURRENT_BASE_MIN_ROWS,
             untracked_delta_count = untracked_deltas.len(),
@@ -4000,15 +4094,6 @@ async fn stage_tracked_head(
             durable_predecessor_count = durable_predecessors.len(),
             "packed current-base route decision"
         );
-        let mut deltas = tracked_deltas.clone();
-        deltas.extend_from_slice(&untracked_deltas);
-        // Every absence guard above is derived from one of these exact
-        // transaction deltas. The fresh-file certificate likewise proves its
-        // complete file-scoped namespace absent. The branch-control CAS
-        // protects both proofs through publication.
-        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
-            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
-        let mut writer = tracked_head.writer(read, writes);
         let generation = if is_checkpoint_publication {
             let checkpoint_commit_id =
                 checkpoint_commit_id.expect("checkpoint publication has an epoch commit id");
@@ -4028,22 +4113,7 @@ async fn stage_tracked_head(
                     "lix.perf.materialization.tracked_head.stage_checkpoint"
                 ))
                 .await?
-        } else if can_publish_packed_current_base {
-            let generation = writer
-                .stage_packed_insert_current_base(
-                    &root.branch_id,
-                    parent_generation,
-                    root.commit_id,
-                    &tracked_deltas,
-                    &absence_guards,
-                    working_diff_capture_checkpoint_commit_id,
-                    &mut coverage,
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.materialization.tracked_head.stage_packed_current_base"
-                ))
-                .await?;
+        } else if let Some(generation) = packed_generation {
             if !untracked_deltas.is_empty() {
                 writer
                     .stage_current_state_with_working_diff(

@@ -5677,6 +5677,199 @@ where
         Ok((generation, !replaced.is_empty()))
     }
 
+    /// Attempts to prove that an ordinary Replace/upsert batch covers one
+    /// complete packed collection, then publishes it through the replacement
+    /// lane. The persisted count alone is insufficient: equality of the
+    /// ordered identity digest proves that no current member is omitted and
+    /// no unrelated identity is introduced.
+    pub(crate) async fn try_stage_exact_collection_replacement_current_base(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<Option<CommitId>, LixError> {
+        let Some(first) = deltas.first() else {
+            return Ok(None);
+        };
+        let schema_key = first.schema_key;
+        if deltas.iter().any(|delta| {
+            delta.schema_key != schema_key
+                || delta.file_id.is_some()
+                || delta.untracked
+                || delta.deleted
+                || delta.commit_id != Some(new_head)
+                || delta.change_id.is_none()
+        }) {
+            return Ok(None);
+        }
+        let mut entity_pks = deltas
+            .iter()
+            .map(|delta| delta.entity_pk)
+            .collect::<Vec<_>>();
+        entity_pks.sort_unstable();
+        if entity_pks.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(head_value_error(
+                "packed collection replacement contains duplicate identities",
+            ));
+        }
+        let Some(identity_digest) =
+            crate::collection_generation::ordered_single_string_identity_digest(
+                entity_pks.iter().copied(),
+            )
+        else {
+            return Ok(None);
+        };
+        let control = load_hot_collection_control(
+            self.store,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if control.active_generation != generation
+            || control.live_count != u64::try_from(entity_pks.len()).unwrap_or(u64::MAX)
+            || control.ordered_identity_digest != Some(identity_digest)
+        {
+            return Ok(None);
+        }
+        self.stage_complete_collection_replacement_current_base(
+            branch_id,
+            generation,
+            new_head,
+            schema_key,
+            entity_pks.len(),
+            entity_columnar_write_sets,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+        )
+        .await
+        .map(|(generation, _)| Some(generation))
+    }
+
+    /// Attempts to collapse an exact row-wise deletion of one untouched
+    /// packed collection into its collection-generation control. Historical
+    /// tombstones remain authoritative in the commit delta; current state
+    /// needs only the new empty-generation fence and retirement of the old
+    /// exclusive packed base.
+    pub(crate) async fn try_stage_exact_collection_delete_current_base(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+    ) -> Result<Option<CommitId>, LixError> {
+        if working_diff_capture_checkpoint_commit_id.is_some() {
+            return Ok(None);
+        }
+        let Some(first) = deltas.first() else {
+            return Ok(None);
+        };
+        let schema_key = first.schema_key;
+        if deltas.iter().any(|delta| {
+            delta.schema_key != schema_key
+                || delta.file_id.is_some()
+                || delta.untracked
+                || !delta.deleted
+                || delta.commit_id != Some(new_head)
+                || delta.change_id.is_none()
+        }) {
+            return Ok(None);
+        }
+        let mut entity_pks = deltas
+            .iter()
+            .map(|delta| delta.entity_pk)
+            .collect::<Vec<_>>();
+        entity_pks.sort_unstable();
+        if entity_pks.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(head_value_error(
+                "packed collection deletion contains duplicate identities",
+            ));
+        }
+        let Some(identity_digest) =
+            crate::collection_generation::ordered_single_string_identity_digest(
+                entity_pks.iter().copied(),
+            )
+        else {
+            return Ok(None);
+        };
+        let control = load_hot_collection_control(
+            self.store,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if control.active_generation != generation
+            || control.live_count != u64::try_from(entity_pks.len()).unwrap_or(u64::MAX)
+            || control.ordered_identity_digest != Some(identity_digest)
+        {
+            return Ok(None);
+        }
+
+        let replaced =
+            packed_exclusive_schema_base_refs(self.store, branch_id, generation, schema_key)
+                .await?;
+        if replaced.is_empty() {
+            return Ok(None);
+        }
+        let base_keys = replaced
+            .iter()
+            .map(|base_ref| {
+                let mut key = hot_scope_prefix(branch_id, generation);
+                key.reserve(16);
+                key.extend_from_slice(base_ref.commit_id.as_uuid().as_bytes());
+                StorageKey(Bytes::from(key))
+            })
+            .collect::<Vec<_>>();
+        let base_values = PointReadPlan::new(PACKED_CURRENT_BASE_SPACE, &base_keys)
+            .materialize(self.store, StorageGetOptions::default())
+            .await?
+            .value;
+        for value in base_values {
+            let value = value.ok_or_else(|| {
+                head_value_error(
+                    "exclusive-schema index references an inactive packed current base",
+                )
+            })?;
+            if full_value_bytes(value)?.as_ref() != [0; 16] {
+                return Ok(None);
+            }
+        }
+        for (base_ref, base_key) in replaced.iter().zip(base_keys) {
+            self.writes.delete(PACKED_CURRENT_BASE_SPACE, base_key);
+            self.writes.delete(
+                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+                StorageKey(base_ref.index_key.clone()),
+            );
+        }
+        stage_hot_collection_control(
+            self.writes,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: new_head,
+                live_count: 0,
+                ordered_identity_digest: None,
+            },
+        )?;
+        Ok(Some(generation))
+    }
+
     /// Publishes validated, tracked, unfiled creates as an immutable base.
     ///
     /// The commit-delta plane already owns the sorted identities and payloads,
@@ -5684,7 +5877,7 @@ where
     /// row is pure write amplification. This path retains only collection
     /// counts plus one generation-to-commit reference. Ordinary mutations
     /// continue to shadow the base through HOT rows.
-    pub(crate) async fn stage_packed_insert_current_base(
+    pub(crate) async fn try_stage_packed_insert_current_base(
         &mut self,
         branch_id: &str,
         generation: CommitId,
@@ -5693,10 +5886,10 @@ where
         absence_guards: &[TrackedStateKeyRef<'_>],
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        if deltas.is_empty() || deltas.len() != absence_guards.len() {
+    ) -> Result<Option<CommitId>, LixError> {
+        if deltas.is_empty() {
             return Err(head_value_error(
-                "packed current base requires one absence proof per inserted row",
+                "packed current base requires at least one inserted row",
             ));
         }
         let mut sorted = deltas.iter().collect::<Vec<_>>();
@@ -5720,21 +5913,6 @@ where
         {
             return Err(current_state_duplicate_delta_error(sorted[1]));
         }
-        let mut guarded = absence_guards
-            .iter()
-            .map(|guard| (guard.schema_key, guard.entity_pk, guard.file_id))
-            .collect::<Vec<_>>();
-        guarded.sort_unstable();
-        if sorted
-            .iter()
-            .map(|delta| (delta.schema_key, delta.entity_pk, delta.file_id))
-            .ne(guarded)
-        {
-            return Err(head_value_error(
-                "packed current base rows do not exactly match their validated absence proofs",
-            ));
-        }
-
         let mut schema_rows = BTreeMap::<&str, Vec<&EntityPk>>::new();
         for delta in &sorted {
             schema_rows
@@ -5742,6 +5920,44 @@ where
                 .or_default()
                 .push(delta.entity_pk);
         }
+        if absence_guards.is_empty() {
+            // Generic Replace/upsert batches do not carry INSERT-shaped
+            // per-row guards. An exact empty collection control is a stronger,
+            // constant-size proof that every identity in that scope is absent.
+            // The caller's branch-head CAS keeps this snapshot valid through
+            // publication. Root-backed deferred counts deliberately fail this
+            // certificate and remain on the ordinary row-addressable path.
+            let scopes = schema_rows
+                .keys()
+                .map(
+                    |schema_key| crate::collection_generation::CollectionScopeRef {
+                        schema_key,
+                        file_id: None,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let controls =
+                load_hot_collection_controls(self.store, branch_id, generation, &scopes).await?;
+            if controls.iter().any(|control| control.live_count != 0) {
+                return Ok(None);
+            }
+        } else {
+            let mut guarded = absence_guards
+                .iter()
+                .map(|guard| (guard.schema_key, guard.entity_pk, guard.file_id))
+                .collect::<Vec<_>>();
+            guarded.sort_unstable();
+            if sorted
+                .iter()
+                .map(|delta| (delta.schema_key, delta.entity_pk, delta.file_id))
+                .ne(guarded)
+            {
+                return Err(head_value_error(
+                    "packed current base rows do not exactly match their validated absence proofs",
+                ));
+            }
+        }
+
         let schema_increments = schema_rows
             .into_iter()
             .map(|(schema_key, entity_pks)| {
@@ -5768,6 +5984,7 @@ where
             coverage,
         )
         .await
+        .map(Some)
     }
 
     async fn stage_packed_insert_current_base_manifest(

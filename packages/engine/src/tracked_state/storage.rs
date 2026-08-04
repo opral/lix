@@ -75,7 +75,14 @@ pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = Stora
     TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
 );
 
+// The durable direct-ChangeId address stride. Physical ordered parts may be
+// smaller, but their logical slots must remain stable at this width.
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
+// Bound newly authored ordered parts tightly enough that point and small-batch
+// reads do not decompress an entire 512-row payload neighborhood. A 1K commit
+// still publishes only sixteen parts, keeping mutation counts near the 35-put
+// reference while the same history authority serves bounded current points.
+const ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 64;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
@@ -3520,7 +3527,7 @@ where
     };
     let mut compressor = None;
     let mut source = deltas;
-    let mut pending = VecDeque::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut pending = VecDeque::with_capacity(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
     let mut manifest = CommitDeltaManifest {
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
@@ -3533,7 +3540,7 @@ where
         })?,
         selection_fingerprint: [0; 32],
         direct_segment_row_counts: Vec::with_capacity(
-            row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+            row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS),
         ),
         single_partition: None,
         lifecycle_summary,
@@ -3541,11 +3548,11 @@ where
         replacement_parts: None,
         columnar_parts: None,
         inline_segment: Vec::new(),
-        segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
+        segments: Vec::with_capacity(row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
     let mut segment_row_counts = Vec::with_capacity(manifest.segments.capacity());
     while !pending.is_empty() || source.len() > 0 {
-        while pending.len() < COMMIT_DELTA_SEGMENT_MAX_ROWS {
+        while pending.len() < ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS {
             let Some(delta) = source.next() else {
                 break;
             };
@@ -3591,7 +3598,7 @@ where
         if segment_index == 1 {
             writes.reserve_space(
                 TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-                row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+                row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS),
                 0,
             );
             let (first_bounds, first_encoded) = first_segment
@@ -3870,9 +3877,9 @@ where
         .as_ref()
         .and_then(|prefix| prefix.3.last())
         .map_or_else(Vec::new, |part| part.last_key().to_vec());
-    let mut pending = Vec::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut pending = Vec::with_capacity(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut parts = prefix.map_or_else(Vec::new, |prefix| prefix.3);
-    parts.reserve(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
+    parts.reserve(row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS));
     let mut compressor = None;
     for delta in deltas {
         let delta = delta?.into_replacement_part_input()?;
@@ -3914,7 +3921,7 @@ where
             snapshot: delta.snapshot,
             metadata: delta.metadata,
         });
-        if pending.len() == COMMIT_DELTA_SEGMENT_MAX_ROWS {
+        if pending.len() == ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS {
             encode_replacement_part_prefix(&mut pending, &mut parts, &mut compressor)?;
         }
     }
@@ -3931,7 +3938,7 @@ where
         parts: &mut Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
         compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
     ) -> Result<(), LixError> {
-        let mut candidate_len = pending.len().min(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+        let mut candidate_len = pending.len().min(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
         let encoded = loop {
             let refs = pending[..candidate_len]
                 .iter()

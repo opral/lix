@@ -174,6 +174,12 @@ where
     }
 
     pub async fn read_all(&self) -> usize {
+        let count = self.scan_count().await;
+        assert_eq!(count, self.rows.len());
+        count
+    }
+
+    async fn scan_count(&self) -> usize {
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -196,7 +202,6 @@ where
             })
             .await
             .expect("scan transaction bench rows");
-        assert_eq!(rows.len(), self.rows.len());
         rows.len()
     }
 
@@ -553,6 +558,26 @@ async fn seed_visible_schema_rows<StorageImpl>(
     let tracked_head = TrackedHeadContext::new();
     let absence_guards = BTreeSet::new();
     for (branch_id, _, _, _) in &branch_refs {
+        #[cfg(test)]
+        {
+            let mut coverage = WorkingDiffIndexCoverage::default();
+            tracked_head
+                .writer(&read, &mut writes)
+                .stage_current_state_with_working_diff(
+                    branch_id,
+                    None,
+                    commit_id,
+                    &[],
+                    &absence_guards,
+                    Some(rows.clone()),
+                    None,
+                    None,
+                    &mut coverage,
+                )
+                .await
+                .expect("schema fixture tracked head should stage");
+        }
+        #[cfg(not(test))]
         tracked_head
             .writer(&read, &mut writes)
             .stage_commit(
@@ -605,4 +630,63 @@ fn json_pointer_schema() -> JsonValue {
         "required": ["path", "value"],
         "additionalProperties": false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage_adapter::Memory;
+
+    const BULK_ROWS: usize = 1_000;
+
+    fn bulk_rows(count: usize) -> Vec<BenchTransactionRow> {
+        (0..count)
+            .map(|index| BenchTransactionRow {
+                schema_key: "json_pointer".to_owned(),
+                file_id: None,
+                entity_pk: format!("/bulk/{index:04}"),
+                value: Arc::new(json!({
+                    "path": format!("/bulk/{index:04}"),
+                    "value": format!("before-{index:04}"),
+                })),
+                updated_value: Arc::new(json!({
+                    "path": format!("/bulk/{index:04}"),
+                    "value": format!("after-{index:04}"),
+                })),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bulk_current_state_uses_compact_certificates_without_changing_point_writes() {
+        let mut fixture =
+            BenchTransactionFixture::new(StorageAdapter::new(Memory::new()), bulk_rows(BULK_ROWS))
+                .await;
+
+        let inserted = fixture.insert_all_accounting().await;
+        assert_eq!(inserted.logical_rows, BULK_ROWS);
+        assert!(inserted.staged_puts < 30, "{inserted:?}");
+        assert_eq!(fixture.read_all().await, BULK_ROWS);
+
+        let point_update = fixture.update_one_by_pk_accounting().await;
+        assert_eq!(point_update.logical_rows, 1);
+        assert_eq!(point_update.staged_puts, 8, "{point_update:?}");
+
+        // A sparse overlay deliberately invalidates the complete-generation
+        // digest, so use a fresh fixture to exercise exact bulk replacement
+        // and deletion certificates.
+        let mut bulk_fixture =
+            BenchTransactionFixture::new(StorageAdapter::new(Memory::new()), bulk_rows(BULK_ROWS))
+                .await;
+        bulk_fixture.insert_all().await;
+        let updated = bulk_fixture.update_all_accounting().await;
+        assert_eq!(updated.logical_rows, BULK_ROWS);
+        assert!(updated.staged_puts < 30, "{updated:?}");
+        assert_eq!(bulk_fixture.read_all().await, BULK_ROWS);
+
+        let deleted = bulk_fixture.delete_all_accounting().await;
+        assert_eq!(deleted.logical_rows, BULK_ROWS);
+        assert!(deleted.staged_puts < 40, "{deleted:?}");
+        assert_eq!(bulk_fixture.scan_count().await, 0);
+    }
 }
