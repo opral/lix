@@ -2058,23 +2058,56 @@ async fn stage_tracked_commit_delta_index(
                         "immutable replacement journal has no lifecycle generation",
                     )
                 })?;
+            let (sealed_rows, parts) = journal.sealed_replacement_prefix();
             let created_at = generation.lifecycle_summary.uniform_created_at;
-            let stage = crate::tracked_state::stage_ordered_addressable_replacement_parts(
-                writes,
-                journal.iter().map(|row| {
-                    Ok(TrackedStateSingleStringReplacementRef {
-                        schema_key: journal.schema_key(),
-                        file_id: None,
-                        entity_pk: row.identity(),
-                        commit_id: root.commit_id,
-                        created_at,
-                        updated_at: journal.timestamp(),
-                        snapshot: row.snapshot_slot(),
-                        metadata: crate::json_store::JsonSlotRef::None,
-                    })
-                }),
-                generation,
-            )?;
+            let stage = if sealed_rows == journal.row_count() {
+                crate::tracked_state::stage_preencoded_ordered_addressable_replacement_parts(
+                    writes,
+                    root.commit_id,
+                    journal.timestamp(),
+                    journal.row_count(),
+                    parts,
+                    generation,
+                )?
+            } else if sealed_rows > 0 {
+                crate::tracked_state::stage_prefixed_ordered_addressable_replacement_parts(
+                    writes,
+                    root.commit_id,
+                    journal.timestamp(),
+                    sealed_rows,
+                    parts,
+                    journal.iter().skip(sealed_rows).map(|row| {
+                        Ok(TrackedStateSingleStringReplacementRef {
+                            schema_key: journal.schema_key(),
+                            file_id: None,
+                            entity_pk: row.identity(),
+                            commit_id: root.commit_id,
+                            created_at,
+                            updated_at: journal.timestamp(),
+                            snapshot: row.snapshot_slot(),
+                            metadata: crate::json_store::JsonSlotRef::None,
+                        })
+                    }),
+                    generation,
+                )?
+            } else {
+                crate::tracked_state::stage_ordered_addressable_replacement_parts(
+                    writes,
+                    journal.iter().map(|row| {
+                        Ok(TrackedStateSingleStringReplacementRef {
+                            schema_key: journal.schema_key(),
+                            file_id: None,
+                            entity_pk: row.identity(),
+                            commit_id: root.commit_id,
+                            created_at,
+                            updated_at: journal.timestamp(),
+                            snapshot: row.snapshot_slot(),
+                            metadata: crate::json_store::JsonSlotRef::None,
+                        })
+                    }),
+                    generation,
+                )?
+            };
             inventories.insert(root.commit_id, stage.mutation_inventory().clone());
             ordered_addressable_commits.insert(root.commit_id);
             continue;
