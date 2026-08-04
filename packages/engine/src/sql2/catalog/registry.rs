@@ -21,7 +21,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_SOURCE_CHANGES,
 };
 #[cfg(test)]
-use crate::sql2::providers::filesystem_working_change_schema;
+use crate::sql2::providers::filesystem_working_diff_schema;
 use crate::sql2::result_metadata::json_field;
 
 #[derive(Clone, Debug, Default)]
@@ -105,8 +105,8 @@ impl PublicCatalog {
             ])),
             PublicSurfaceKind::Checkpoint => checkpoint_schema(false),
             PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
-            PublicSurfaceKind::WorkingDiff => working_change_schema(false),
-            PublicSurfaceKind::WorkingDiffByBranch => working_change_schema(true),
+            PublicSurfaceKind::WorkingDiff => working_diff_schema(false),
+            PublicSurfaceKind::WorkingDiffByBranch => working_diff_schema(true),
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
@@ -114,12 +114,12 @@ impl PublicCatalog {
                 DataType::Utf8,
                 false,
             )])),
-            PublicSurfaceKind::FileWorkingChange | PublicSurfaceKind::DirectoryWorkingChange => {
-                filesystem_working_change_schema(false)
+            PublicSurfaceKind::FileWorkingDiff | PublicSurfaceKind::DirectoryWorkingDiff => {
+                filesystem_working_diff_schema(false)
             }
-            PublicSurfaceKind::FileWorkingChangeByBranch
-            | PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
-                filesystem_working_change_schema(true)
+            PublicSurfaceKind::FileWorkingDiffByBranch
+            | PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
+                filesystem_working_diff_schema(true)
             }
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -295,23 +295,23 @@ impl PublicCatalog {
         }
         for (name, kind, by_branch) in [
             (
-                "lix_file_working_change",
-                PublicSurfaceKind::FileWorkingChange,
+                "lix_file_working_diff",
+                PublicSurfaceKind::FileWorkingDiff,
                 false,
             ),
             (
-                "lix_file_working_change_by_branch",
-                PublicSurfaceKind::FileWorkingChangeByBranch,
+                "lix_file_working_diff_by_branch",
+                PublicSurfaceKind::FileWorkingDiffByBranch,
                 true,
             ),
             (
-                "lix_directory_working_change",
-                PublicSurfaceKind::DirectoryWorkingChange,
+                "lix_directory_working_diff",
+                PublicSurfaceKind::DirectoryWorkingDiff,
                 false,
             ),
             (
-                "lix_directory_working_change_by_branch",
-                PublicSurfaceKind::DirectoryWorkingChangeByBranch,
+                "lix_directory_working_diff_by_branch",
+                PublicSurfaceKind::DirectoryWorkingDiffByBranch,
                 true,
             ),
         ] {
@@ -446,7 +446,7 @@ fn checkpoint_schema(by_branch: bool) -> SchemaRef {
 }
 
 #[cfg(test)]
-fn working_change_schema(by_branch: bool) -> SchemaRef {
+fn working_diff_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
         json_field("entity_pk", false),

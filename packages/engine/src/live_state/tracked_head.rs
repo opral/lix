@@ -128,7 +128,7 @@ impl WorkingDiffIndexCoverage {
 
 /// A checkpoint-relative direct diff assembled from the current-state
 /// generation.
-/// This is internal plumbing for SQL working-change and checkpoint compaction;
+/// This is internal plumbing for SQL working-diff and checkpoint compaction;
 /// the public API remains the existing tracked-state diff representation.
 pub(crate) struct TrackedWorkingDiff {
     pub(crate) checkpoint_commit_id: CommitId,

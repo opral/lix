@@ -32,14 +32,14 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-pub(super) async fn register_filesystem_working_change_provider<S>(
+pub(super) async fn register_filesystem_working_diff_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlChangelogQuerySource<S>,
-    kind: FilesystemWorkingChangeKind,
+    kind: FilesystemWorkingDiffKind,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -47,7 +47,7 @@ where
     register_spec_table(
         session,
         surface_name,
-        Arc::new(FilesystemWorkingChangeSpec {
+        Arc::new(FilesystemWorkingDiffSpec {
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
@@ -60,38 +60,36 @@ where
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum FilesystemWorkingChangeKind {
+pub(super) enum FilesystemWorkingDiffKind {
     File,
     Directory,
 }
 
-struct FilesystemWorkingChangeSpec<S> {
+struct FilesystemWorkingDiffSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     store: S,
-    kind: FilesystemWorkingChangeKind,
+    kind: FilesystemWorkingDiffKind,
 }
 
 #[async_trait]
-impl<S> TableSpec for FilesystemWorkingChangeSpec<S>
+impl<S> TableSpec for FilesystemWorkingDiffSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn table_name(&self) -> &str {
         match (self.kind, self.by_branch) {
-            (FilesystemWorkingChangeKind::File, false) => "lix_file_working_change",
-            (FilesystemWorkingChangeKind::File, true) => "lix_file_working_change_by_branch",
-            (FilesystemWorkingChangeKind::Directory, false) => "lix_directory_working_change",
-            (FilesystemWorkingChangeKind::Directory, true) => {
-                "lix_directory_working_change_by_branch"
-            }
+            (FilesystemWorkingDiffKind::File, false) => "lix_file_working_diff",
+            (FilesystemWorkingDiffKind::File, true) => "lix_file_working_diff_by_branch",
+            (FilesystemWorkingDiffKind::Directory, false) => "lix_directory_working_diff",
+            (FilesystemWorkingDiffKind::Directory, true) => "lix_directory_working_diff_by_branch",
         }
     }
 
     fn schema(&self) -> SchemaRef {
-        filesystem_working_change_schema(self.by_branch)
+        filesystem_working_diff_schema(self.by_branch)
     }
 
     fn table_type(&self) -> TableType {
@@ -118,7 +116,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
-        let route = FilesystemWorkingChangeRoute::from_filters(filters)?;
+        let route = FilesystemWorkingDiffRoute::from_filters(filters)?;
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -135,7 +133,7 @@ where
                 ),
                 move |(active_branch_id, branch_ref, commit_graph, store, schema, route, kind)| async move {
                     if route.contradictory {
-                        return FILESYSTEM_WORKING_CHANGE_COLS
+                        return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
                             .map_err(batch_error);
                     }
@@ -182,7 +180,7 @@ where
                             break;
                         }
                     }
-                    FILESYSTEM_WORKING_CHANGE_COLS
+                    FILESYSTEM_WORKING_DIFF_COLS
                         .build(schema, &rows)
                         .map_err(batch_error)
                 },
@@ -192,13 +190,13 @@ where
 }
 
 #[derive(Clone)]
-struct FilesystemWorkingChangeRoute {
+struct FilesystemWorkingDiffRoute {
     branch_ids: FileIdConstraint,
     ids: FileIdConstraint,
     contradictory: bool,
 }
 
-impl FilesystemWorkingChangeRoute {
+impl FilesystemWorkingDiffRoute {
     fn from_filters(filters: &[Expr]) -> Result<Self> {
         let conjuncts = filter_conjuncts(filters);
         let branch_ids =
@@ -239,8 +237,8 @@ async fn load_rows<S>(
     checkpoint_id: &str,
     head_id: &str,
     branch_id: &str,
-    kind: FilesystemWorkingChangeKind,
-) -> Result<Vec<FilesystemWorkingChangeSqlRow>, LixError>
+    kind: FilesystemWorkingDiffKind,
+) -> Result<Vec<FilesystemWorkingDiffSqlRow>, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -280,7 +278,7 @@ where
     if diff.entries.is_empty() {
         return Ok(Vec::new());
     }
-    if matches!(kind, FilesystemWorkingChangeKind::Directory) && directory_ids.is_empty() {
+    if matches!(kind, FilesystemWorkingDiffKind::Directory) && directory_ids.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -288,8 +286,8 @@ where
     let before = load_logical_snapshot(tracked, checkpoint_id, &file_ids, load_all_files).await?;
     let after = load_logical_snapshot(tracked, head_id, &file_ids, load_all_files).await?;
     let (before_entries, after_entries) = match kind {
-        FilesystemWorkingChangeKind::File => (&before.files, &after.files),
-        FilesystemWorkingChangeKind::Directory => (&before.directories, &after.directories),
+        FilesystemWorkingDiffKind::File => (&before.files, &after.files),
+        FilesystemWorkingDiffKind::Directory => (&before.directories, &after.directories),
     };
     let ids = before_entries
         .keys()
@@ -301,8 +299,8 @@ where
         let previous_path = before_entries.get(&id).cloned();
         let path = after_entries.get(&id).cloned();
         let directly_changed = match kind {
-            FilesystemWorkingChangeKind::File => file_ids.contains(&id),
-            FilesystemWorkingChangeKind::Directory => directory_ids.contains(&id),
+            FilesystemWorkingDiffKind::File => file_ids.contains(&id),
+            FilesystemWorkingDiffKind::Directory => directory_ids.contains(&id),
         };
         if previous_path == path && !directly_changed {
             continue;
@@ -315,7 +313,7 @@ where
             (true, false) => "removed",
             _ => "modified",
         };
-        rows.push(FilesystemWorkingChangeSqlRow {
+        rows.push(FilesystemWorkingDiffSqlRow {
             id,
             path,
             previous_path,
@@ -532,7 +530,7 @@ fn resolve_directory_path(
 }
 
 #[derive(Debug)]
-struct FilesystemWorkingChangeSqlRow {
+struct FilesystemWorkingDiffSqlRow {
     id: String,
     path: Option<String>,
     previous_path: Option<String>,
@@ -540,7 +538,7 @@ struct FilesystemWorkingChangeSqlRow {
     branch_id: String,
 }
 
-static FILESYSTEM_WORKING_CHANGE_COLS: ColumnTable<FilesystemWorkingChangeSqlRow> = ColumnTable {
+static FILESYSTEM_WORKING_DIFF_COLS: ColumnTable<FilesystemWorkingDiffSqlRow> = ColumnTable {
     columns: &[
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("path", Col::Utf8(|row| row.path.as_deref())),
@@ -556,7 +554,7 @@ static FILESYSTEM_WORKING_CHANGE_COLS: ColumnTable<FilesystemWorkingChangeSqlRow
     ],
 };
 
-pub(crate) fn filesystem_working_change_schema(by_branch: bool) -> SchemaRef {
+pub(crate) fn filesystem_working_diff_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, true),
@@ -573,7 +571,7 @@ fn batch_error(error: ColumnTableError) -> datafusion::common::DataFusionError {
     match error {
         ColumnTableError::UnsupportedColumn(column) => {
             datafusion::common::DataFusionError::Execution(format!(
-                "unsupported filesystem working-change column '{column}'"
+                "unsupported filesystem working-diff column '{column}'"
             ))
         }
         ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => {

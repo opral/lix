@@ -122,7 +122,7 @@ where
                                 LixError::new(
                                     LixError::CODE_INTERNAL_ERROR,
                                     format!(
-                                        "working change for schema '{}' entity {:?} has no target row",
+                                        "working diff for schema '{}' entity {:?} has no target row",
                                         entry.identity.schema_key(),
                                         entry.identity.entity_pk()
                                     ),

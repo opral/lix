@@ -23,14 +23,14 @@ mod entity_history;
 mod file;
 mod file_history;
 mod filesystem_history_path;
-mod filesystem_working_change;
+mod filesystem_working_diff;
 mod history_table_function;
 mod history_util;
 mod spec;
 pub(crate) use spec::{SpecScanExec, StatementScanKey};
 mod upsert;
 mod values;
-mod working_change;
+mod working_diff;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -50,7 +50,7 @@ pub(crate) use file::{
     execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
 };
 #[cfg(test)]
-pub(crate) use filesystem_working_change::filesystem_working_change_schema;
+pub(crate) use filesystem_working_diff::filesystem_working_diff_schema;
 pub(crate) use spec::DmlReturning;
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
@@ -440,7 +440,7 @@ where
                 .await?;
             }
             PublicSurfaceKind::WorkingDiff => {
-                working_change::register_working_change_provider(
+                working_diff::register_working_diff_provider(
                     session,
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
@@ -451,7 +451,7 @@ where
                 .await?;
             }
             PublicSurfaceKind::WorkingDiffByBranch => {
-                working_change::register_working_change_provider(
+                working_diff::register_working_diff_provider(
                     session,
                     &surface.name,
                     None,
@@ -461,51 +461,51 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileWorkingChange => {
-                filesystem_working_change::register_filesystem_working_change_provider(
+            PublicSurfaceKind::FileWorkingDiff => {
+                filesystem_working_diff::register_filesystem_working_diff_provider(
                     session,
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
-                    filesystem_working_change::FilesystemWorkingChangeKind::File,
+                    filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileWorkingChangeByBranch => {
-                filesystem_working_change::register_filesystem_working_change_provider(
+            PublicSurfaceKind::FileWorkingDiffByBranch => {
+                filesystem_working_diff::register_filesystem_working_diff_provider(
                     session,
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
-                    filesystem_working_change::FilesystemWorkingChangeKind::File,
+                    filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
             }
-            PublicSurfaceKind::DirectoryWorkingChange => {
-                filesystem_working_change::register_filesystem_working_change_provider(
+            PublicSurfaceKind::DirectoryWorkingDiff => {
+                filesystem_working_diff::register_filesystem_working_diff_provider(
                     session,
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
-                    filesystem_working_change::FilesystemWorkingChangeKind::Directory,
+                    filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
             }
-            PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
-                filesystem_working_change::register_filesystem_working_change_provider(
+            PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
+                filesystem_working_diff::register_filesystem_working_diff_provider(
                     session,
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
                     ctx.commit_graph(),
                     ctx.changelog_query_source(),
-                    filesystem_working_change::FilesystemWorkingChangeKind::Directory,
+                    filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
             }
@@ -767,10 +767,10 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::CheckpointByBranch
             | PublicSurfaceKind::WorkingDiff
             | PublicSurfaceKind::WorkingDiffByBranch
-            | PublicSurfaceKind::FileWorkingChange
-            | PublicSurfaceKind::FileWorkingChangeByBranch
-            | PublicSurfaceKind::DirectoryWorkingChange
-            | PublicSurfaceKind::DirectoryWorkingChangeByBranch
+            | PublicSurfaceKind::FileWorkingDiff
+            | PublicSurfaceKind::FileWorkingDiffByBranch
+            | PublicSurfaceKind::DirectoryWorkingDiff
+            | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
             PublicSurfaceKind::EntityBase { .. }
@@ -813,8 +813,8 @@ mod tests {
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
-        directory_history, entity, file, file_history, filesystem_working_change, is_write_surface,
-        read_provider_selection, working_change,
+        directory_history, entity, file, file_history, filesystem_working_diff, is_write_surface,
+        read_provider_selection, working_diff,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -975,11 +975,11 @@ mod tests {
                 "lix_checkpoint",
                 "lix_checkpoint_by_branch",
                 "lix_directory_history",
-                "lix_directory_working_change",
-                "lix_directory_working_change_by_branch",
+                "lix_directory_working_diff",
+                "lix_directory_working_diff_by_branch",
                 "lix_file_history",
-                "lix_file_working_change",
-                "lix_file_working_change_by_branch",
+                "lix_file_working_diff",
+                "lix_file_working_diff_by_branch",
                 "lix_working_diff",
                 "lix_working_diff_by_branch",
                 "phase8_entity_history",
@@ -1038,23 +1038,23 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_file_working_change",
-            filesystem_working_change::filesystem_working_change_schema(false),
+            "lix_file_working_diff",
+            filesystem_working_diff::filesystem_working_diff_schema(false),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_file_working_change_by_branch",
-            filesystem_working_change::filesystem_working_change_schema(true),
+            "lix_file_working_diff_by_branch",
+            filesystem_working_diff::filesystem_working_diff_schema(true),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_directory_working_change",
-            filesystem_working_change::filesystem_working_change_schema(false),
+            "lix_directory_working_diff",
+            filesystem_working_diff::filesystem_working_diff_schema(false),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_directory_working_change_by_branch",
-            filesystem_working_change::filesystem_working_change_schema(true),
+            "lix_directory_working_diff_by_branch",
+            filesystem_working_diff::filesystem_working_diff_schema(true),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -1094,12 +1094,12 @@ mod tests {
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_working_diff",
-            working_change::working_change_schema(false),
+            working_diff::working_diff_schema(false),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
             "lix_working_diff_by_branch",
-            working_change::working_change_schema(true),
+            working_diff::working_diff_schema(true),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,

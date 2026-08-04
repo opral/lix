@@ -217,8 +217,8 @@ simulation_test!(
             "UPDATE lix_checkpoint SET created_at = 'fake'",
             "DELETE FROM lix_working_diff",
             "UPDATE lix_working_diff_by_branch SET diff_type = 'fake'",
-            "DELETE FROM lix_file_working_change",
-            "UPDATE lix_directory_working_change_by_branch SET change_kind = 'fake'",
+            "DELETE FROM lix_file_working_diff",
+            "UPDATE lix_directory_working_diff_by_branch SET change_kind = 'fake'",
         ] {
             let error = session
                 .execute(sql, &[])
@@ -230,7 +230,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    working_change_reports_net_tracked_adds_and_removals_after_a_revert,
+    working_diff_reports_net_tracked_adds_and_removals_after_a_revert,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -264,7 +264,7 @@ simulation_test!(
             session
                 .execute(sql, &[])
                 .await
-                .expect("tracked working change should succeed");
+                .expect("tracked working diff should succeed");
         }
 
         assert_eq!(
@@ -304,7 +304,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_working_change_reports_root_file_changes_without_directory_changes,
+    file_working_diff_reports_root_file_changes_without_directory_changes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -332,7 +332,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT id, path, previous_path, change_kind \
-                 FROM lix_file_working_change",
+                 FROM lix_file_working_diff",
             )
             .await,
             vec![vec![
@@ -374,7 +374,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT id, path, previous_path, change_kind \
-                 FROM lix_file_working_change ORDER BY id",
+                 FROM lix_file_working_diff ORDER BY id",
             )
             .await,
             vec![
@@ -416,7 +416,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT id, path, previous_path, change_kind \
-                 FROM lix_file_working_change ORDER BY id",
+                 FROM lix_file_working_diff ORDER BY id",
             )
             .await,
             vec![
@@ -439,7 +439,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    filesystem_working_change_surfaces_compose_paths_and_directory_moves,
+    filesystem_working_diff_surfaces_compose_paths_and_directory_moves,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -463,7 +463,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT id, path, previous_path, change_kind \
-                 FROM lix_file_working_change ORDER BY id",
+                 FROM lix_file_working_diff ORDER BY id",
             )
             .await,
             vec![vec![
@@ -477,7 +477,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT path, previous_path, change_kind \
-                 FROM lix_directory_working_change",
+                 FROM lix_directory_working_diff",
             )
             .await,
             vec![vec![
@@ -492,7 +492,7 @@ simulation_test!(
             .await
             .expect("checkpoint should succeed");
         assert_eq!(
-            select_rows(&session, "SELECT COUNT(*) FROM lix_file_working_change",).await,
+            select_rows(&session, "SELECT COUNT(*) FROM lix_file_working_diff",).await,
             vec![vec![Value::Integer(0)]]
         );
 
@@ -507,7 +507,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT id, path, previous_path, change_kind \
-                 FROM lix_file_working_change",
+                 FROM lix_file_working_diff",
             )
             .await,
             vec![vec![
@@ -521,7 +521,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT path, previous_path FROM lix_directory_working_change",
+                "SELECT path, previous_path FROM lix_directory_working_diff",
             )
             .await,
             vec![vec![

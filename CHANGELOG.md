@@ -9,7 +9,10 @@
   Non-root paths must not end with `/`; the typed file or directory surface determines the entity kind. Applications must remove trailing slashes from directory path values.
 - Turn automatic edit history into deliberate checkpoints.
 
-  The SDK can create milestones, SQL can query checkpoint history and working changes, and Lix automatically cleans up superseded automatic commits after a recovery window.
+  The SDK can create milestones, SQL can query checkpoint history and working diffs, and Lix automatically cleans up superseded automatic commits after a recovery window.
+- Rename the filesystem working-diff SQL surfaces for consistent terminology.
+
+  `lix_file_working_diff`, `lix_file_working_diff_by_branch`, `lix_directory_working_diff`, and `lix_directory_working_diff_by_branch` replace their `*_working_change*` predecessors. The old names are not retained as aliases.
 - Lix is substantially faster and more storage-efficient for large files and workspaces.
 
   v0.9 adds indexed and batched file operations, faster SQL reads and writes, compressed native storage, lower-copy blob handling, and more efficient tracked-state merges. Remote clients also transfer localized file and query changes instead of repeatedly sending complete payloads.
