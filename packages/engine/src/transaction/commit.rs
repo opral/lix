@@ -1133,7 +1133,7 @@ async fn stage_changelog_commits(
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     external_parent_manifests: &mut BTreeMap<
         CommitId,
-        crate::tracked_state::PublishedCommitStateManifest,
+        crate::tracked_state::PublishedCommitStateTopology,
     >,
     active_account_id: &str,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
@@ -1173,7 +1173,7 @@ async fn stage_changelog_commits(
             )
         })?;
         let published =
-            crate::tracked_state::load_published_commit_state_manifest(read, *commit_id)
+            crate::tracked_state::load_published_commit_state_topology(read, *commit_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
@@ -1181,11 +1181,10 @@ async fn stage_changelog_commits(
                         format!("commit '{commit_id}' has no commit-state authority"),
                     )
                 })?;
-        let manifest = &*published;
         // Replay debt is physical layout policy. Rootless commits remain
         // bounded-replay layouts; rooted commits publish their canonical
         // snapshot metadata inside immutable physical authority.
-        if manifest.commit_id != record.commit_id {
+        if published.commit_id() != record.commit_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -1194,9 +1193,10 @@ async fn stage_changelog_commits(
             ));
         }
         generations.insert(*commit_id, record.generation);
-        rootless_depths.insert(*commit_id, manifest.replay_debt.depth);
-        rootless_rows.insert(*commit_id, manifest.replay_debt.rows);
-        rootless_bytes.insert(*commit_id, manifest.replay_debt.bytes);
+        let replay_debt = published.replay_debt();
+        rootless_depths.insert(*commit_id, replay_debt.depth);
+        rootless_rows.insert(*commit_id, replay_debt.rows);
+        rootless_bytes.insert(*commit_id, replay_debt.bytes);
         external_parent_manifests.insert(*commit_id, published);
     }
     let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
@@ -2620,7 +2620,7 @@ async fn certify_complete_replacement_generations(
                         ),
                     )
                 })?;
-            let manifest = crate::tracked_state::load_published_commit_state_manifest(
+            let manifest = crate::tracked_state::load_published_commit_state_topology(
                 read, commit_id,
             )
             .await?
@@ -2632,7 +2632,7 @@ async fn certify_complete_replacement_generations(
                     ),
                 )
             })?;
-            if manifest.replay_debt.depth == 0 {
+            if manifest.replay_debt().depth == 0 {
                 break Some(commit_id);
             }
             let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
@@ -2744,7 +2744,7 @@ async fn certify_ordered_journal_replacement_generations(
                         ),
                     )
                 })?;
-            let manifest = crate::tracked_state::load_published_commit_state_manifest(
+            let manifest = crate::tracked_state::load_published_commit_state_topology(
                 read, commit_id,
             )
             .await?
@@ -2754,7 +2754,7 @@ async fn certify_ordered_journal_replacement_generations(
                     format!("immutable replacement parent '{commit_id}' has no physical authority"),
                 )
             })?;
-            if manifest.replay_debt.depth == 0 {
+            if manifest.replay_debt().depth == 0 {
                 break Some(commit_id);
             }
             let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
@@ -5476,7 +5476,7 @@ fn stage_commit_state_manifests<'a, S>(
     snapshot_roots: &'a BTreeMap<CommitId, TrackedStateCommitRoot>,
     external_parent_manifests: &'a BTreeMap<
         CommitId,
-        crate::tracked_state::PublishedCommitStateManifest,
+        crate::tracked_state::PublishedCommitStateTopology,
     >,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
@@ -5551,7 +5551,7 @@ where
                     )
                     .await?
                 } else {
-                    crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
+                    crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
                         read,
                         writes,
                         external_parent,
@@ -5571,7 +5571,7 @@ where
                             .map(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged)
                             .or_else(|| {
                                 external_parent_manifests.get(parent_id).map(
-                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology,
                                 )
                             })
                             .ok_or_else(|| {
@@ -5591,7 +5591,7 @@ where
                     && !external_parent_manifests.contains_key(&source_id)
                 {
                     Some(
-                        crate::tracked_state::load_published_commit_state_manifest(read, source_id)
+                        crate::tracked_state::load_published_commit_state_topology(read, source_id)
                             .await?
                             .ok_or_else(|| {
                                 LixError::new(
@@ -5613,12 +5613,12 @@ where
                             .map(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged)
                             .or_else(|| {
                                 external_parent_manifests.get(&source_id).map(
-                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology,
                                 )
                             })
                             .or_else(|| {
                                 loaded_selected_source.as_ref().map(
-                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology,
                                 )
                             })
                             .ok_or_else(|| {
@@ -6500,7 +6500,7 @@ mod tests {
     );
     const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
-        "tracked_state.commit_state_manifest.v4",
+        "tracked_state.commit_state_manifest.v7",
     );
     // V11 has no tracked-head marker space. Keep the retired v10 ID here only
     // as a negative test sentinel: normal serving and staging must never read

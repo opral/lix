@@ -741,6 +741,7 @@ where
         std::collections::BTreeMap::<crate::changelog::CommitId, (u64, u64)>::new();
     for space in [
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     ] {
         for entry in scan_layout_entries(read, space).await {
@@ -1471,6 +1472,8 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,

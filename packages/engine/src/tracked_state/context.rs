@@ -1838,7 +1838,7 @@ where
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
             )));
         };
-        let manifest = storage::load_commit_state_manifest(&self.store, commit_id_typed)
+        let topology = storage::load_published_commit_state_topology(&self.store, commit_id_typed)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -1848,7 +1848,7 @@ where
                     ),
                 )
             })?;
-        if manifest.mutations.member_count == 0 {
+        if topology.mutation_member_count() == 0 {
             cache
                 .commit_delta_winners
                 .insert(commit_id.to_string(), HashMap::new());
@@ -1913,7 +1913,7 @@ where
             CommitId::parse_lix(commit_id, "tracked-state optional snapshot root lookup")?;
         self.load_cached_changelog_first_parent(commit_id, cache)
             .await?;
-        let manifest = storage::load_commit_state_manifest(&self.store, typed_commit_id)
+        let topology = storage::load_published_commit_state_topology(&self.store, typed_commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -1923,10 +1923,7 @@ where
                     ),
                 )
             })?;
-        let root_id = manifest
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.root_id.clone());
+        let root_id = topology.snapshot_root_id();
         cache
             .commit_roots
             .insert(commit_id.to_string(), root_id.clone());
@@ -2008,9 +2005,14 @@ where
             }
         } else {
             let typed_commit_id = CommitId::parse_lix(commit_id, "diff row owner commit_id")?;
-            storage::load_commit_state_manifest(&self.store, typed_commit_id)
-                .await?
-                .ok_or_else(|| missing_commit_root_error(commit_id))?;
+            let authority_ids = storage::load_commit_state_authority_ids(
+                &self.store,
+                std::slice::from_ref(&typed_commit_id),
+            )
+            .await?;
+            if authority_ids.into_iter().next().flatten().is_none() {
+                return Err(missing_commit_root_error(commit_id));
+            }
             if let Some(parent_commit_id) = self
                 .load_cached_changelog_first_parent(
                     commit_id,
@@ -2660,19 +2662,19 @@ where
             "tracked-state current-state diff right commit_id",
         )?;
         let Some(left_state) =
-            storage::load_published_commit_state_manifest(&self.store, left_commit_id).await?
+            storage::load_published_commit_state_topology(&self.store, left_commit_id).await?
         else {
             return Ok(None);
         };
         let Some(right_state) =
-            storage::load_published_commit_state_manifest(&self.store, right_commit_id).await?
+            storage::load_published_commit_state_topology(&self.store, right_commit_id).await?
         else {
             return Ok(None);
         };
-        let Some(left_root) = left_state.current_state_scoped_ranges.as_ref() else {
+        let Some(left_root) = left_state.current_state_scoped_ranges() else {
             return Ok(None);
         };
-        let Some(right_root) = right_state.current_state_scoped_ranges.as_ref() else {
+        let Some(right_root) = right_state.current_state_scoped_ranges() else {
             return Ok(None);
         };
         let prefix = super::current_state_envelope::current_state_scope_prefix(&scope)?;
@@ -6888,6 +6890,10 @@ mod tests {
             for commit_id in ["middle", "child"] {
                 writes.delete(
                     storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+                    commit_root_key(commit_id),
+                );
+                writes.delete(
+                    storage::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
                     commit_root_key(commit_id),
                 );
             }

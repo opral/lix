@@ -106,11 +106,11 @@ where
                     commit_ids: &uncached_ids,
                 })
                 .await?;
-            let manifests =
-                crate::tracked_state::load_commit_state_manifests(&self.store, &uncached_ids)
+            let authority_ids =
+                crate::tracked_state::load_commit_state_authority_ids(&self.store, &uncached_ids)
                     .await?;
-            for ((commit_id, record), manifest) in batch.into_iter().zip(manifests) {
-                let node = commit_graph_node_from_authority(*commit_id, record, manifest)?;
+            for ((commit_id, record), authority_id) in batch.into_iter().zip(authority_ids) {
+                let node = commit_graph_node_from_authority(*commit_id, record, authority_id)?;
                 self.node_cache.insert(*commit_id, node);
             }
         }
@@ -141,11 +141,12 @@ where
                 .iter()
                 .map(|record| record.commit_id)
                 .collect::<Vec<_>>();
-            let manifests =
-                crate::tracked_state::load_commit_state_manifests(&self.store, &commit_ids).await?;
-            for (record, manifest) in scan.entries.into_iter().zip(manifests) {
+            let authority_ids =
+                crate::tracked_state::load_commit_state_authority_ids(&self.store, &commit_ids)
+                    .await?;
+            for (record, authority_id) in scan.entries.into_iter().zip(authority_ids) {
                 let commit_id = record.commit_id;
-                let node = commit_graph_node_from_authority(commit_id, Some(record), manifest)?
+                let node = commit_graph_node_from_authority(commit_id, Some(record), authority_id)?
                     .expect("scanned commit projection produces a graph node");
                 self.node_cache.insert(node.commit_id, Some(node.clone()));
                 commits.push(node);
@@ -384,7 +385,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
 fn commit_graph_node_from_authority(
     commit_id: CommitId,
     record: Option<CommitRecord>,
-    manifest: Option<crate::tracked_state::CommitStateManifest>,
+    authority_id: Option<CommitId>,
 ) -> Result<Option<CommitGraphNode>, LixError> {
     // Public graph membership belongs to the compact changelog projection.
     // GC may retain an immutable manifest after removing that projection so
@@ -392,7 +393,7 @@ fn commit_graph_node_from_authority(
     let Some(record) = record else {
         return Ok(None);
     };
-    let Some(manifest) = manifest else {
+    let Some(authority_id) = authority_id else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -400,7 +401,7 @@ fn commit_graph_node_from_authority(
             ),
         ));
     };
-    if record.commit_id != manifest.commit_id {
+    if record.commit_id != authority_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(

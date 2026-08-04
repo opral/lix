@@ -47,7 +47,9 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
     "tracked_state.commit_delta_segment.v6";
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
-    "tracked_state.commit_state_manifest.v6";
+    "tracked_state.commit_state_manifest.v7";
+pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE: &str =
+    "tracked_state.commit_mutation_catalog.v1";
 const MIN_CURRENT_STATE_SCOPED_RANGE_POINT_READS: u16 = 4;
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0001),
@@ -67,13 +69,20 @@ pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace
 );
 /// Hard-cut tracked commit authority.
 ///
-/// Current repositories publish this one manifest per commit, including
-/// commits with no tracked mutations. The former topology, delta-directory,
-/// and root authority spaces are not part of the current protocol.
+/// Current repositories publish one compact authority header per commit,
+/// including commits with no tracked mutations. The header authenticates a
+/// separately keyed mutation catalog and its optional hierarchical directory.
+/// The former topology, flat delta-directory, and root authority spaces are
+/// not part of the current protocol.
 pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_002b),
     TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
 );
+pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
+    StorageSpace::immutable(
+        StorageSpaceId(0x0004_002c),
+        TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+    );
 
 // The durable direct-ChangeId address stride. Physical ordered parts may be
 // smaller, but their logical slots must remain stable at this width.
@@ -102,7 +111,10 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
 // Pre-cut manifests are deliberately incompatible with this physical-only format.
 // Version 8 binds current-state serving roots to an explicit physical base
 // commit independently from semantic graph ancestry.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS9";
+// Version 10 splits the authority header from a separately keyed mutation
+// catalog and authenticates a content-addressed hierarchical part directory.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
+const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -418,8 +430,9 @@ impl AddressableCommitDeltaStage {
 /// Compact assignment map for an already ordered, fully addressable commit.
 ///
 /// Full 512-row segments derive their direct addresses from the row ordinal.
-/// Byte-limited irregular segments retain one packed u32 address per row. Both
-/// shapes avoid retaining one UUID per row while the prepared batch and backend
+/// Smaller physical segments retain only one cumulative row end per segment;
+/// their `(segment, ordinal)` address is derived on demand. Both shapes avoid
+/// retaining per-row UUIDs or addresses while the prepared batch and backend
 /// write batch are simultaneously live.
 #[derive(Debug, Clone)]
 pub(crate) struct OrderedAddressableCommitDeltaStage {
@@ -432,7 +445,7 @@ pub(crate) struct OrderedAddressableCommitDeltaStage {
 #[derive(Debug, Clone)]
 enum OrderedChangeAddresses {
     Dense,
-    Packed(Vec<u32>),
+    Segmented(Vec<u32>),
 }
 
 impl OrderedAddressableCommitDeltaStage {
@@ -461,7 +474,26 @@ impl OrderedAddressableCommitDeltaStage {
                 .expect("ordered commit-delta row index fits direct address space")
                 .checked_add(1)
                 .expect("ordered commit-delta address fits direct address space"),
-            OrderedChangeAddresses::Packed(addresses) => addresses[row_index],
+            OrderedChangeAddresses::Segmented(row_ends) => {
+                let row_index = u32::try_from(row_index)
+                    .expect("ordered commit-delta row index fits direct address space");
+                let segment_index = row_ends.partition_point(|&end| end <= row_index);
+                let segment_start = segment_index
+                    .checked_sub(1)
+                    .map_or(0, |previous| row_ends[previous]);
+                let ordinal = row_index
+                    .checked_sub(segment_start)
+                    .expect("ordered row follows its segment start");
+                u32::try_from(segment_index)
+                    .expect("ordered commit-delta segment index fits u32")
+                    .checked_mul(
+                        u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                            .expect("segment row limit fits u32"),
+                    )
+                    .and_then(|base| base.checked_add(ordinal))
+                    .and_then(|address| address.checked_add(1))
+                    .expect("ordered commit-delta address fits direct address space")
+            }
         };
         Some(change_id_from_packed_address(self.commit_id, packed))
     }
@@ -553,6 +585,56 @@ struct CommitDeltaManifest {
     #[musli(bytes)]
     inline_segment: Vec<u8>,
     segments: Vec<CommitDeltaSegmentBounds>,
+}
+
+/// Small immutable authority header for one tracked commit.
+///
+/// Large mutation-part bounds live exactly once in the separately keyed
+/// mutation inventory. This header owns its digest and selected-source fact,
+/// so the inventory cannot be substituted and does not duplicate topology.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCommitStateManifest {
+    commit_id: CommitId,
+    change_account_id: String,
+    replay_debt: crate::tracked_state::CommitStateReplayDebt,
+    #[musli(with = storage_codec::option)]
+    selected_source_commit_id: Option<[u8; 16]>,
+    mutation_inventory_digest: [u8; 32],
+    mutation_transition_digest: [u8; 32],
+    mutation_member_count: u32,
+    mutation_part_count: u32,
+    #[musli(with = storage_codec::option)]
+    mutation_directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
+    touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
+    #[musli(with = storage_codec::option)]
+    current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    snapshot_root: Option<Box<TrackedStateCommitRoot>>,
+}
+
+/// Small separately keyed mutation catalog. Large ordered part metadata lives
+/// only in the authenticated directory leaves referenced by `directory_root`.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCommitMutationInventory {
+    member_count: u32,
+    selection_fingerprint: [u8; 32],
+    #[musli(with = storage_codec::option)]
+    single_partition: Option<CommitDeltaReplacementScope>,
+    #[musli(with = storage_codec::option)]
+    lifecycle_summary: Option<CommitDeltaLifecycleSummary>,
+    #[musli(with = storage_codec::option)]
+    replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
+    #[musli(with = storage_codec::option)]
+    replacement_parts: Option<StoredReplacementPartsAuthority>,
+    #[musli(with = storage_codec::option)]
+    columnar_parts: Option<crate::tracked_state::types::ColumnarMutationPartSet>,
+    #[musli(bytes)]
+    inline_part: Vec<u8>,
+    inline_direct: bool,
+    #[musli(with = storage_codec::option)]
+    directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2151,9 +2233,26 @@ pub(super) async fn load_manifest_snapshot_commit_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<TrackedStateCommitRoot>, LixError> {
-    Ok(load_commit_state_manifest(store, commit_id)
-        .await?
-        .and_then(|manifest| manifest.snapshot_root.map(|root| *root)))
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        commit_state_manifest_key(commit_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let stored = decode_stored_commit_state_manifest(&bytes)?;
+    if stored.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state commit_state_manifest key for commit '{commit_id}' contains manifest for commit '{}'",
+                stored.commit_id
+            ),
+        ));
+    }
+    Ok(stored.snapshot_root.map(|root| *root))
 }
 
 fn commit_delta_manifest_key(commit_id: CommitId) -> Vec<u8> {
@@ -2164,6 +2263,10 @@ fn commit_state_manifest_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
 }
 
+fn commit_mutation_inventory_key(commit_id: CommitId) -> Vec<u8> {
+    commit_id.as_uuid().as_bytes().to_vec()
+}
+
 /// Commit authority loaded from the immutable manifest plane. Only this
 /// opaque handle may bypass publication-time catalog re-derivation.
 #[derive(Clone, Debug)]
@@ -2171,11 +2274,53 @@ pub(crate) struct PublishedCommitStateManifest {
     manifest: CommitStateManifest,
 }
 
+/// Header-only immutable authority for topology and lifecycle work.
+/// Scoped-range transition metadata is authenticated directly by the compact
+/// header, so consumers do not need the mutation catalog or directory.
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedCommitStateTopology {
+    header: StoredCommitStateManifest,
+}
+
+impl PublishedCommitStateTopology {
+    pub(crate) fn commit_id(&self) -> CommitId {
+        self.header.commit_id
+    }
+
+    pub(crate) fn replay_debt(&self) -> crate::tracked_state::CommitStateReplayDebt {
+        self.header.replay_debt
+    }
+
+    pub(crate) fn mutation_member_count(&self) -> u32 {
+        self.header.mutation_member_count
+    }
+
+    pub(crate) fn current_state_scoped_ranges(&self) -> Option<&CurrentStateScopedRangeRoot> {
+        self.header.current_state_scoped_ranges.as_deref()
+    }
+
+    pub(crate) fn snapshot_root_id(&self) -> Option<TrackedStateRootId> {
+        self.header
+            .snapshot_root
+            .as_ref()
+            .map(|root| root.root_id.clone())
+    }
+
+    fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
+        super::scoped_current_state::CommitStateTopologyRef {
+            commit_id: self.header.commit_id,
+            touched_scope_filter: &self.header.touched_scope_filter,
+            current_state_scoped_ranges: self.header.current_state_scoped_ranges.as_deref(),
+        }
+    }
+}
+
 /// One-read immutable authority used by point replay. The wrapper prevents a
 /// freely constructed manifest from claiming authoritative catalog coverage.
 #[derive(Clone, Debug)]
 pub(crate) struct AuthenticatedReplayCommitStateManifest {
     manifest: CommitStateManifest,
+    mutation_directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
 }
 
 /// Same-write-set authority produced only after immutable physical publication.
@@ -2191,21 +2336,28 @@ pub(crate) struct StagedCommitStateManifest {
 /// touched-scope certificate.
 #[derive(Clone, Copy)]
 pub(crate) enum CertifiedCommitStateTopologyParent<'a> {
+    #[cfg(any(test, feature = "storage-benches"))]
     Published(&'a PublishedCommitStateManifest),
+    PublishedTopology(&'a PublishedCommitStateTopology),
     Staged(&'a StagedCommitStateManifest),
 }
 
 impl<'a> CertifiedCommitStateTopologyParent<'a> {
-    fn manifest(self, writes: &StorageWriteSet) -> Result<&'a CommitStateManifest, LixError> {
+    fn topology(
+        self,
+        writes: &StorageWriteSet,
+    ) -> Result<super::scoped_current_state::CommitStateTopologyRef<'a>, LixError> {
         match self {
-            Self::Published(parent) => Ok(&parent.manifest),
+            #[cfg(any(test, feature = "storage-benches"))]
+            Self::Published(parent) => Ok((&parent.manifest).into()),
+            Self::PublishedTopology(parent) => Ok(parent.topology_ref()),
             Self::Staged(parent) => {
                 if parent.write_set_id != writes.identity() {
                     return Err(replacement_payload_error(
                         "staged topology parent belongs to a different storage write set",
                     ));
                 }
-                Ok(&parent.manifest)
+                Ok((&parent.manifest).into())
             }
         }
     }
@@ -2247,13 +2399,13 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_topology(
     let parents = parents
         .iter()
         .copied()
-        .map(|parent| parent.manifest(writes))
+        .map(|parent| parent.topology(writes))
         .collect::<Result<Vec<_>, _>>()?;
     let selected_source = selected_source
-        .map(|source| source.manifest(writes))
+        .map(|source| source.topology(writes))
         .transpose()?;
     let serving_base = selected_source.or_else(|| parents.first().copied());
-    super::scoped_current_state::stage_current_state_scoped_ranges(
+    super::scoped_current_state::stage_current_state_scoped_ranges_from_topology_refs(
         store,
         writes,
         &parents,
@@ -2274,12 +2426,35 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_published_parent(
     account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
-    super::scoped_current_state::stage_current_state_scoped_ranges(
+    super::scoped_current_state::stage_current_state_scoped_ranges_from_topology_refs(
         store,
         writes,
-        parent.map(|parent| &parent.manifest).as_slice(),
+        parent.map(|parent| (&parent.manifest).into()).as_slice(),
         None,
-        parent.map(|parent| &parent.manifest),
+        parent.map(|parent| (&parent.manifest).into()),
+        commit_id,
+        account_id,
+        inventory,
+    )
+    .await
+}
+
+pub(crate) async fn stage_current_state_scoped_ranges_from_published_topology_parent(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent: Option<&PublishedCommitStateTopology>,
+    commit_id: CommitId,
+    account_id: &str,
+    inventory: &CommitStateMutationInventory,
+) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
+    super::scoped_current_state::stage_current_state_scoped_ranges_from_topology_refs(
+        store,
+        writes,
+        parent
+            .map(PublishedCommitStateTopology::topology_ref)
+            .as_slice(),
+        None,
+        parent.map(PublishedCommitStateTopology::topology_ref),
         commit_id,
         account_id,
         inventory,
@@ -2300,12 +2475,12 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_staged_parent(
             "staged scoped-range parent belongs to a different storage write set",
         ));
     }
-    super::scoped_current_state::stage_current_state_scoped_ranges(
+    super::scoped_current_state::stage_current_state_scoped_ranges_from_topology_refs(
         store,
         writes,
-        &[&parent.manifest],
+        &[(&parent.manifest).into()],
         None,
-        Some(&parent.manifest),
+        Some((&parent.manifest).into()),
         commit_id,
         account_id,
         inventory,
@@ -3188,16 +3363,40 @@ pub(crate) async fn load_commit_state_manifest(
 ) -> Result<Option<CommitStateManifest>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_sealed_manifest_load();
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        commit_state_manifest_key(commit_id),
-    )
-    .await?
-    else {
-        return Ok(None);
+    let header_keys = [StorageKey(Bytes::from(commit_state_manifest_key(
+        commit_id,
+    )))];
+    let inventory_keys = [StorageKey(Bytes::from(commit_mutation_inventory_key(
+        commit_id,
+    )))];
+    let requests = [
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &header_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            keys: &inventory_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let header = values.next().flatten().and_then(full_value_bytes);
+    let inventory = values.next().flatten().and_then(full_value_bytes);
+    let (header, inventory) = match (header, inventory) {
+        (None, None) => return Ok(None),
+        (Some(header), Some(inventory)) => (header, inventory),
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                ),
+            ));
+        }
     };
-    let manifest = decode_commit_state_manifest(&bytes)?;
+    let manifest = decode_commit_state_manifest(store, &header, &inventory).await?;
     if manifest.commit_id != commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3219,14 +3418,49 @@ pub(crate) async fn load_published_commit_state_manifest(
         .map(|manifest| PublishedCommitStateManifest { manifest }))
 }
 
+/// Loads only the authenticated immutable authority header needed by commit
+/// topology, branch lifecycle, and scoped-root inheritance.
+pub(crate) async fn load_published_commit_state_topology(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<PublishedCommitStateTopology>, LixError> {
+    let keys = [StorageKey(Bytes::from(commit_state_manifest_key(
+        commit_id,
+    )))];
+    let request = [StorageGetManyRequest {
+        space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        keys: &keys,
+        opts: StorageGetOptions::default(),
+    }];
+    let Some(bytes) = exact_get_many(store, &request)
+        .await?
+        .values
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(full_value_bytes)
+    else {
+        return Ok(None);
+    };
+    let header = decode_stored_commit_state_manifest(&bytes)?;
+    if header.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state topology-header key for commit '{commit_id}' contains '{}'",
+                header.commit_id
+            ),
+        ));
+    }
+    Ok(Some(PublishedCommitStateTopology { header }))
+}
+
 /// Loads the replay projection from immutable physical authority.
 pub(crate) async fn load_replay_commit_state_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<CommitStateManifest>, LixError> {
-    Ok(load_point_replay_commit_state(store, commit_id)
-        .await?
-        .map(|state| state.manifest))
+    load_commit_state_manifest(store, commit_id).await
 }
 
 pub(crate) async fn load_point_replay_commit_state(
@@ -3235,16 +3469,42 @@ pub(crate) async fn load_point_replay_commit_state(
 ) -> Result<Option<AuthenticatedReplayCommitStateManifest>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_replay_manifest_load();
-    let Some(authority) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        commit_state_manifest_key(commit_id),
-    )
-    .await?
-    else {
-        return Ok(None);
+    let header_keys = [StorageKey(Bytes::from(commit_state_manifest_key(
+        commit_id,
+    )))];
+    let inventory_keys = [StorageKey(Bytes::from(commit_mutation_inventory_key(
+        commit_id,
+    )))];
+    let requests = [
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &header_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            keys: &inventory_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let header = values.next().flatten().and_then(full_value_bytes);
+    let inventory = values.next().flatten().and_then(full_value_bytes);
+    let (header, inventory) = match (header, inventory) {
+        (None, None) => return Ok(None),
+        (Some(header), Some(inventory)) => (header, inventory),
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                ),
+            ));
+        }
     };
-    let state = decode_commit_state_manifest(&authority)?;
+    let (stored, stored_inventory) = decode_stored_commit_state_authority(&header, &inventory)?;
+    let mutation_directory_root = stored_inventory.directory_root.clone();
+    let state = assemble_shallow_commit_state_manifest(stored, stored_inventory)?;
     if state.commit_id != commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3256,6 +3516,7 @@ pub(crate) async fn load_point_replay_commit_state(
     }
     Ok(Some(AuthenticatedReplayCommitStateManifest {
         manifest: state,
+        mutation_directory_root,
     }))
 }
 
@@ -3264,6 +3525,107 @@ pub(crate) async fn load_commit_state_manifests(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_ids: &[CommitId],
 ) -> Result<Vec<Option<CommitStateManifest>>, LixError> {
+    let header_keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let inventory_keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_mutation_inventory_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let requests = [
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &header_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            keys: &inventory_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values;
+    let inventories = values.split_off(commit_ids.len());
+    let headers = values;
+    let mut authorities = Vec::with_capacity(commit_ids.len());
+    for (commit_id, (header_value, inventory_value)) in commit_ids
+        .iter()
+        .copied()
+        .zip(headers.into_iter().zip(inventories))
+    {
+        let header = header_value.and_then(full_value_bytes);
+        let inventory = inventory_value.and_then(full_value_bytes);
+        let (header, inventory) = match (header, inventory) {
+            (None, None) => {
+                authorities.push(None);
+                continue;
+            }
+            (Some(header), Some(inventory)) => (header, inventory),
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                    ),
+                ));
+            }
+        };
+        let (stored, stored_inventory) = decode_stored_commit_state_authority(&header, &inventory)?;
+        if stored.commit_id != commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit-state batch key for commit '{commit_id}' contains manifest for commit '{}'",
+                    stored.commit_id
+                ),
+            ));
+        }
+        authorities.push(Some((stored, stored_inventory)));
+    }
+    let roots = authorities
+        .iter()
+        .filter_map(|authority| {
+            authority
+                .as_ref()
+                .and_then(|(_, inventory)| inventory.directory_root.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut directories = super::mutation_directory::load_mutation_directories(store, &roots)
+        .await?
+        .into_iter();
+    let mut output = Vec::with_capacity(authorities.len());
+    for authority in authorities {
+        let Some((stored, inventory)) = authority else {
+            output.push(None);
+            continue;
+        };
+        let entries = if inventory.directory_root.is_some() {
+            directories
+                .next()
+                .expect("each authenticated root returns one directory")
+        } else {
+            Vec::new()
+        };
+        output.push(Some(assemble_commit_state_manifest(
+            stored, inventory, entries, true,
+        )?));
+    }
+    debug_assert!(directories.next().is_none());
+    Ok(output)
+}
+
+/// Loads only the small immutable authority headers in request order.
+///
+/// Topology membership and commit identity do not require mutation-directory
+/// bytes. Each returned header has already passed format, replay, root, scoped
+/// metadata, and directory-digest-shape validation; replay/history consumers
+/// must use [`load_commit_state_manifests`] to authenticate and decode the
+/// separately keyed directory itself.
+pub(crate) async fn load_commit_state_authority_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_ids: &[CommitId],
+) -> Result<Vec<Option<CommitId>>, LixError> {
     let keys = commit_ids
         .iter()
         .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
@@ -3273,27 +3635,64 @@ pub(crate) async fn load_commit_state_manifests(
         keys: &keys,
         opts: StorageGetOptions::default(),
     }];
-    let manifests = exact_get_many(store, &request).await?.values;
     commit_ids
         .iter()
         .copied()
-        .zip(manifests)
-        .map(|(commit_id, manifest_value)| {
-            let manifest_bytes = manifest_value.and_then(full_value_bytes);
-            let Some(bytes) = manifest_bytes else {
+        .zip(exact_get_many(store, &request).await?.values)
+        .map(|(commit_id, value)| {
+            let Some(bytes) = value.and_then(full_value_bytes) else {
                 return Ok(None);
             };
-            let manifest = decode_commit_state_manifest(&bytes)?;
-            if manifest.commit_id != commit_id {
+            let stored = decode_stored_commit_state_manifest(&bytes)?;
+            if stored.commit_id != commit_id {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "tracked_state commit-state batch key for commit '{commit_id}' contains manifest for commit '{}'",
-                        manifest.commit_id
+                        "tracked_state authority-header key for commit '{commit_id}' contains '{}'",
+                        stored.commit_id
                     ),
                 ));
             }
-            Ok(Some(manifest))
+            Ok(Some(stored.commit_id))
+        })
+        .collect()
+}
+
+/// Loads authenticated mutation-directory roots without reading catalogs or
+/// directory nodes. GC uses this projection to mark shared content-addressed
+/// nodes from retained commit authorities.
+pub(crate) async fn load_commit_mutation_directory_roots(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_ids: &[CommitId],
+) -> Result<Vec<Option<super::mutation_directory::MutationDirectoryRoot>>, LixError> {
+    let keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let request = [StorageGetManyRequest {
+        space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        keys: &keys,
+        opts: StorageGetOptions::default(),
+    }];
+    commit_ids
+        .iter()
+        .copied()
+        .zip(exact_get_many(store, &request).await?.values)
+        .map(|(commit_id, value)| {
+            let Some(bytes) = value.and_then(full_value_bytes) else {
+                return Ok(None);
+            };
+            let stored = decode_stored_commit_state_manifest(&bytes)?;
+            if stored.commit_id != commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state mutation-root key for commit '{commit_id}' contains '{}'",
+                        stored.commit_id
+                    ),
+                ));
+            }
+            Ok(stored.mutation_directory_root)
         })
         .collect()
 }
@@ -3322,11 +3721,29 @@ fn stage_commit_state_manifest_bytes(
 ) -> Result<(), LixError> {
     let encoded = encode_commit_state_manifest(manifest)?;
     #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_crud_commit_state_manifest_bytes(encoded.len());
+    crate::storage_bench::record_crud_commit_state_manifest_bytes(
+        encoded.header.len()
+            + encoded.mutation_inventory.len()
+            + encoded.mutation_directory.as_ref().map_or(0, |directory| {
+                directory
+                    .node_bytes()
+                    .values()
+                    .map(Bytes::len)
+                    .sum::<usize>()
+            }),
+    );
+    if let Some(directory) = encoded.mutation_directory.as_ref() {
+        directory.stage(writes)?;
+    }
     writes.put(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         key(commit_state_manifest_key(manifest.commit_id)),
-        value(encoded),
+        value(encoded.header),
+    );
+    writes.put(
+        TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        key(commit_mutation_inventory_key(manifest.commit_id)),
+        value(encoded.mutation_inventory),
     );
     Ok(())
 }
@@ -3416,13 +3833,24 @@ pub(crate) fn stage_resealed_commit_state_manifest_for_test(
     manifest: &CommitStateManifest,
 ) -> Result<(), LixError> {
     let encoded = encode_commit_state_manifest(manifest)?;
+    if let Some(directory) = encoded.mutation_directory.as_ref() {
+        directory.stage(writes)?;
+    }
     writes.put(
         StorageSpace::mutable(
             TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
             TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
         ),
         key(commit_state_manifest_key(manifest.commit_id)),
-        value(encoded),
+        value(encoded.header),
+    );
+    writes.put(
+        StorageSpace::mutable(
+            TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+            TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+        ),
+        key(commit_mutation_inventory_key(manifest.commit_id)),
+        value(encoded.mutation_inventory),
     );
     Ok(())
 }
@@ -3655,24 +4083,18 @@ where
     let change_addresses = if dense_addresses {
         OrderedChangeAddresses::Dense
     } else {
-        let mut packed = Vec::with_capacity(row_count);
-        for (segment_index, &segment_rows) in segment_row_counts.iter().enumerate() {
-            let segment_base = u32::try_from(segment_index)
-                .expect("ordered commit-delta segment index fits u32")
-                .checked_mul(
-                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                        .expect("segment row limit fits u32"),
-                )
-                .expect("ordered commit-delta segment base fits direct address space");
-            packed.extend((0..segment_rows).map(|ordinal| {
-                segment_base
-                    .checked_add(u32::from(ordinal))
-                    .and_then(|address| address.checked_add(1))
-                    .expect("ordered commit-delta address fits u32")
-            }));
-        }
-        debug_assert_eq!(packed.len(), row_count);
-        OrderedChangeAddresses::Packed(packed)
+        let mut cumulative_rows = 0u32;
+        let row_ends = segment_row_counts
+            .iter()
+            .map(|&segment_rows| {
+                cumulative_rows = cumulative_rows
+                    .checked_add(u32::from(segment_rows))
+                    .expect("ordered commit-delta row count fits u32");
+                cumulative_rows
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(usize::try_from(cumulative_rows).ok(), Some(row_count));
+        OrderedChangeAddresses::Segmented(row_ends)
     };
     Ok(Some(OrderedAddressableCommitDeltaStage {
         commit_id,
@@ -4093,17 +4515,19 @@ pub(crate) fn stage_preencoded_ordered_addressable_replacement_parts(
     let change_addresses = if dense {
         OrderedChangeAddresses::Dense
     } else {
-        let mut packed = Vec::with_capacity(row_count);
-        for (segment_index, &rows) in manifest.direct_segment_row_counts.iter().enumerate() {
-            let base = u32::try_from(segment_index)
-                .expect("replacement segment index fits u32")
-                .checked_mul(
-                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("row limit fits u32"),
-                )
-                .expect("replacement direct address fits u32");
-            packed.extend((0..rows).map(|ordinal| base + u32::from(ordinal) + 1));
-        }
-        OrderedChangeAddresses::Packed(packed)
+        let mut cumulative_rows = 0u32;
+        let row_ends = manifest
+            .direct_segment_row_counts
+            .iter()
+            .map(|&rows| {
+                cumulative_rows = cumulative_rows
+                    .checked_add(u32::from(rows))
+                    .expect("replacement row count fits u32");
+                cumulative_rows
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(usize::try_from(cumulative_rows).ok(), Some(row_count));
+        OrderedChangeAddresses::Segmented(row_ends)
     };
     Ok(OrderedAddressableCommitDeltaStage {
         commit_id,
@@ -5666,16 +6090,42 @@ pub(crate) async fn load_commit_delta_values_encoded_with_cache(
 /// immutable parts; ordinary manifests seed and reuse the point cache.
 pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
-    state: &CommitStateManifest,
+    state: &AuthenticatedReplayCommitStateManifest,
     encoded_keys: &[Bytes],
     point_cache: &CommitDeltaPointReadCache,
 ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-    if !state.mutations.replacement_part_digests.is_empty() {
+    if state.mutations.selected_source_commit_id.is_none()
+        && state.mutation_directory_root.as_ref().is_some_and(|root| {
+            root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+                || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
+        })
+    {
+        return load_bounded_directory_values_encoded(store, state, encoded_keys).await;
+    }
+    if state
+        .mutation_directory_root
+        .as_ref()
+        .is_some_and(|root| root.layout == super::mutation_directory::LAYOUT_COMPACT_REPLACEMENT)
+    {
+        if let Some(root) = state.current_state_scoped_ranges.as_ref()
+            && let Some(values) =
+                load_complete_current_state_values_from_scoped_root(store, root, encoded_keys)
+                    .await?
+        {
+            return Ok(values);
+        }
+        let full_state = load_commit_state_manifest(store, state.commit_id)
+            .await?
+            .ok_or_else(|| {
+                replacement_payload_error(
+                    "compact point replay lost its mutation-directory authority",
+                )
+            })?;
         return load_compact_replacement_values_encoded(
             store,
             state.commit_id,
             encoded_keys,
-            state,
+            &full_state,
         )
         .await;
     }
@@ -5690,6 +6140,80 @@ pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
         Some(point_cache),
     )
     .await
+}
+
+async fn load_bounded_directory_values_encoded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
+    encoded_keys: &[Bytes],
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
+        replacement_payload_error("bounded point replay omitted its mutation-directory root")
+    })?;
+    let key_refs = encoded_keys.iter().map(Bytes::as_ref).collect::<Vec<_>>();
+    let routes =
+        super::mutation_directory::route_mutation_directory_points(store, root, &key_refs).await?;
+    let mut grouped = BTreeMap::<u32, (CommitStateMutationPart, Vec<usize>)>::new();
+    for (output_index, route) in routes.into_iter().enumerate() {
+        let Some(route) = route else {
+            continue;
+        };
+        match grouped.entry(route.entry_index) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((route.part, vec![output_index]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != route.part {
+                    return Err(replacement_payload_error(
+                        "bounded point replay returned conflicting part routes",
+                    ));
+                }
+                entry.get_mut().1.push(output_index);
+            }
+        }
+    }
+    let storage_keys = grouped
+        .iter()
+        .map(|(&part_index, (part, _))| {
+            commit_delta_segment_key_for_bounds(
+                state.commit_id,
+                usize::try_from(part_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                &CommitDeltaSegmentBounds {
+                    first_key: part.first_key.clone(),
+                    last_key: part.last_key.clone(),
+                    replacement_part: part.replacement_part.clone(),
+                },
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut output = vec![None; encoded_keys.len()];
+    for ((_, (part, requests)), value) in grouped.into_iter().zip(loaded.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("bounded mutation directory references a missing part")
+        })?;
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: part.first_key,
+            last_key: part.last_key,
+            replacement_part: part.replacement_part,
+        };
+        let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(&bounds))?;
+        for output_index in requests {
+            output[output_index] = find_loaded_commit_delta_entry(
+                &leaf,
+                &payloads,
+                &encoded_keys[output_index],
+                state.commit_id,
+                &state.change_account_id,
+            )?
+            .map(|entry| entry.value);
+        }
+    }
+    Ok(output)
 }
 
 async fn load_compact_replacement_values_encoded(
@@ -6647,46 +7171,48 @@ async fn load_inventory_part_entries_one_ordered(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
-    state: &CommitStateManifest,
+    state: &AuthenticatedReplayCommitStateManifest,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
-    let inventory = &state.mutations;
-    if !inventory_parts_support_direct_route(inventory) {
-        return Err(replacement_payload_error(
-            "ordered mutation inventory has invalid part bounds",
-        ));
-    }
+    let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
+        replacement_payload_error("ordered mutation inventory omitted its directory root")
+    })?;
     let mut encoded_keys = Vec::new();
-    let mut grouped = BTreeMap::<usize, Vec<(usize, Range<usize>)>>::new();
-    for (output_index, &key) in keys.iter().enumerate() {
-        let encoded = encode_key_ref_into(&mut encoded_keys, key);
-        let key_bytes = &encoded_keys[encoded.clone()];
-        let mut lower = 0usize;
-        let mut upper = inventory.parts.len();
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            if inventory.parts[middle].first_key.as_slice() <= key_bytes {
-                lower = middle + 1;
-            } else {
-                upper = middle;
-            }
-        }
-        let Some(part_index) = lower.checked_sub(1) else {
+    let ranges = keys
+        .iter()
+        .map(|&key| encode_key_ref_into(&mut encoded_keys, key))
+        .collect::<Vec<_>>();
+    let key_bytes = ranges
+        .iter()
+        .map(|range| &encoded_keys[range.clone()])
+        .collect::<Vec<_>>();
+    let routes =
+        super::mutation_directory::route_mutation_directory_points(store, root, &key_bytes).await?;
+    let mut grouped = BTreeMap::<u32, (CommitStateMutationPart, Vec<(usize, Range<usize>)>)>::new();
+    for (output_index, (encoded, route)) in ranges.into_iter().zip(routes).enumerate() {
+        let Some(route) = route else {
             continue;
         };
-        if key_bytes <= inventory.parts[part_index].last_key.as_slice() {
-            grouped
-                .entry(part_index)
-                .or_default()
-                .push((output_index, encoded));
+        match grouped.entry(route.entry_index) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((route.part, vec![(output_index, encoded)]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != route.part {
+                    return Err(replacement_payload_error(
+                        "mutation directory returned conflicting routes for one part",
+                    ));
+                }
+                entry.get_mut().1.push((output_index, encoded));
+            }
         }
     }
     let storage_keys = grouped
-        .keys()
-        .map(|&part_index| {
-            let bounds = &inventory.parts[part_index];
+        .iter()
+        .map(|(&part_index, (bounds, _))| {
             commit_delta_segment_key_for_bounds(
                 commit_id,
-                part_index,
+                usize::try_from(part_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
                 &CommitDeltaSegmentBounds {
                     first_key: bounds.first_key.clone(),
                     last_key: bounds.last_key.clone(),
@@ -6700,11 +7226,10 @@ async fn load_inventory_part_entries_one_ordered(
         .materialize(store, StorageGetOptions::default())
         .await?;
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-    for ((part_index, requests), value) in grouped.into_iter().zip(loaded.value) {
+    for ((_, (part, requests)), value) in grouped.into_iter().zip(loaded.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("mutation inventory references a missing immutable part")
         })?;
-        let part = &inventory.parts[part_index];
         let bounds = CommitDeltaSegmentBounds {
             first_key: part.first_key.clone(),
             last_key: part.last_key.clone(),
@@ -6722,20 +7247,6 @@ async fn load_inventory_part_entries_one_ordered(
         }
     }
     Ok(output)
-}
-
-fn inventory_parts_support_direct_route(inventory: &CommitStateMutationInventory) -> bool {
-    !(inventory.selected_source_commit_id.is_some()
-        || !inventory.inline_part.is_empty()
-        || inventory.parts.is_empty()
-        || inventory.parts.len() != inventory.direct_part_row_counts.len()
-        || inventory.parts.iter().any(|part| {
-            part.first_key.is_empty() || part.last_key.is_empty() || part.first_key > part.last_key
-        })
-        || inventory
-            .parts
-            .windows(2)
-            .any(|pair| pair[0].last_key >= pair[1].first_key))
 }
 
 /// Fast path for one physical owner and an already ordered exact-key batch.
@@ -6760,14 +7271,29 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                 return Ok((0..keys.len()).map(|_| None).collect());
             };
             if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS
-                && inventory_parts_support_direct_route(&state.mutations)
+                && state.mutations.selected_source_commit_id.is_none()
+                && state.mutations.inline_part.is_empty()
+                && state.mutation_directory_root.as_ref().is_some_and(|root| {
+                    root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+                })
             {
                 let output =
                     load_inventory_part_entries_one_ordered(store, commit_id, keys, &state).await?;
-                remember_expanded_point_manifest(store, &state, point_cache).await?;
                 return Ok(output);
             }
-            let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
+            let full_state = if state.mutation_directory_root.is_some() {
+                load_commit_state_manifest(store, commit_id)
+                    .await?
+                    .ok_or_else(|| {
+                        replacement_payload_error(
+                            "point replay lost its full mutation-directory authority",
+                        )
+                    })?
+            } else {
+                state.manifest.clone()
+            };
+            let manifest =
+                expanded_commit_delta_manifest_from_commit_state(store, &full_state).await?;
             validate_commit_delta_manifest(&manifest)?;
             if manifest
                 .replacement_generation
@@ -7118,19 +7644,6 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     }
     hydrate_selected_loaded_entries(store, &mut output).await?;
     Ok(output)
-}
-
-async fn remember_expanded_point_manifest(
-    store: &(impl StorageAdapterRead + ?Sized),
-    state: &CommitStateManifest,
-    point_cache: Option<&CommitDeltaPointReadCache>,
-) -> Result<(), LixError> {
-    let Some(point_cache) = point_cache else {
-        return Ok(());
-    };
-    let manifest = expanded_commit_delta_manifest_from_commit_state(store, state).await?;
-    validate_commit_delta_manifest(&manifest)?;
-    point_cache.remember_manifest(state.commit_id, Arc::new(manifest))
 }
 
 async fn hydrate_selected_loaded_entries(
@@ -7568,11 +8081,18 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     "tracked_state commit_delta manifest key is not a 16-byte commit id",
                 ));
             }
-            let StorageProjectedValue::FullValue(bytes) = &entry.value else {
+            let StorageProjectedValue::FullValue(_) = &entry.value else {
                 unreachable!("full commit-delta scan returned a key-only row");
             };
             let commit_id = commit_id_from_delta_key(&entry.key)?;
-            let state = decode_commit_state_manifest(bytes)?;
+            let state = load_commit_state_manifest(store, commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit-state scan lost its split authority",
+                    )
+                })?;
             if state.commit_id != commit_id {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -7941,10 +8461,30 @@ async fn scan_commit_delta_plane(
 ) -> Result<CommitDeltaPlane, LixError> {
     let commit_state_rows =
         scan_full_space(store, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE).await?;
+    let mutation_inventory_rows =
+        scan_full_space(store, TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE).await?;
     let segment_rows = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE).await?;
 
-    let mut manifests = BTreeMap::<CommitId, CommitDeltaManifest>::new();
-    for (key, bytes) in commit_state_rows {
+    let header_keys = commit_state_rows
+        .iter()
+        .map(|(key, _)| key)
+        .collect::<BTreeSet<_>>();
+    let inventory_keys = mutation_inventory_rows
+        .iter()
+        .map(|(key, _)| key)
+        .collect::<BTreeSet<_>>();
+    if header_keys != inventory_keys {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state split commit authority has orphaned headers or mutation inventories",
+        ));
+    }
+
+    let mut inventory_rows = mutation_inventory_rows
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let mut authorities = Vec::with_capacity(commit_state_rows.len());
+    for (key, header) in commit_state_rows {
         if key.0.len() != 16 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -7952,12 +8492,46 @@ async fn scan_commit_delta_plane(
             ));
         }
         let commit_id = commit_id_from_delta_key(&key)?;
-        let manifest = decode_commit_state_manifest(&bytes)?;
-        if manifest.commit_id != commit_id || manifests.contains_key(&commit_id) {
+        let inventory = inventory_rows.remove(&key).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit-state inventory lost its split authority",
+            )
+        })?;
+        let (stored, stored_inventory) = decode_stored_commit_state_authority(&header, &inventory)?;
+        if stored.commit_id != commit_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
                     "tracked_state commit-state inventory found duplicate or mismatched manifest for commit '{commit_id}'"
+                ),
+            ));
+        }
+        authorities.push((commit_id, stored, stored_inventory));
+    }
+    debug_assert!(inventory_rows.is_empty());
+    let roots = authorities
+        .iter()
+        .filter_map(|(_, _, inventory)| inventory.directory_root.clone())
+        .collect::<Vec<_>>();
+    let mut directories = super::mutation_directory::load_mutation_directories(store, &roots)
+        .await?
+        .into_iter();
+    let mut manifests = BTreeMap::<CommitId, CommitDeltaManifest>::new();
+    for (commit_id, stored, inventory) in authorities {
+        let entries = if inventory.directory_root.is_some() {
+            directories
+                .next()
+                .expect("each scanned mutation root returns one directory")
+        } else {
+            Vec::new()
+        };
+        let manifest = assemble_commit_state_manifest(stored, inventory, entries, true)?;
+        if manifests.contains_key(&commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit-state inventory found duplicate manifest for commit '{commit_id}'"
                 ),
             ));
         }
@@ -7966,6 +8540,7 @@ async fn scan_commit_delta_plane(
             expanded_commit_delta_manifest_from_commit_state(store, &manifest).await?,
         );
     }
+    debug_assert!(directories.next().is_none());
 
     let mut segments = BTreeMap::<CommitId, BTreeMap<usize, Bytes>>::new();
     let mut segment_keys = BTreeMap::<CommitId, BTreeMap<usize, Bytes>>::new();
@@ -8071,6 +8646,10 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
     writes.delete(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         key(commit_state_manifest_key(commit_id)),
+    );
+    writes.delete(
+        TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        key(commit_mutation_inventory_key(commit_id)),
     );
     for segment_key in &entry.physical_segment_keys {
         writes.delete(
@@ -8329,21 +8908,21 @@ pub(crate) async fn load_commit_delta_replay_metadata_with_cache(
     {
         return Ok(Some(commit_delta_replay_metadata(&manifest)));
     }
-    Ok(load_replay_commit_state_manifest(store, commit_id)
+    Ok(load_point_replay_commit_state(store, commit_id)
         .await?
         .map(|manifest| commit_delta_replay_metadata_from_inventory(&manifest.mutations)))
 }
 
 /// Returns replay metadata from an already authenticated physical manifest.
 pub(crate) fn seed_commit_delta_point_cache_from_replay_manifest(
-    state: &CommitStateManifest,
+    state: &AuthenticatedReplayCommitStateManifest,
     point_cache: &CommitDeltaPointReadCache,
 ) -> Result<CommitDeltaReplayMetadata, LixError> {
     if let Some(manifest) = point_cache.manifest(state.commit_id)? {
         return Ok(commit_delta_replay_metadata(&manifest));
     }
     let metadata = commit_delta_replay_metadata_from_inventory(&state.mutations);
-    if state.mutations.replacement_part_digests.is_empty() {
+    if state.mutation_directory_root.is_none() {
         point_cache.remember_manifest(
             state.commit_id,
             Arc::new(commit_delta_manifest_from_commit_state(state)),
@@ -8398,10 +8977,10 @@ async fn load_commit_delta_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<CommitDeltaManifest>, LixError> {
-    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+    let Some(full_state) = load_commit_state_manifest(store, commit_id).await? else {
         return Ok(None);
     };
-    let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
+    let manifest = expanded_commit_delta_manifest_from_commit_state(store, &full_state).await?;
     validate_commit_delta_manifest(&manifest)?;
     if manifest
         .replacement_generation
@@ -9791,6 +10370,8 @@ pub(crate) struct TrackedStateStagedRead<'a, S: ?Sized> {
     store: &'a S,
     chunks: &'a TrackedStateChunkOverlay,
     commit_states: HashMap<Vec<u8>, Bytes>,
+    mutation_inventories: HashMap<Vec<u8>, Bytes>,
+    mutation_directory_nodes: HashMap<Vec<u8>, Bytes>,
 }
 
 impl<'a, S> TrackedStateStagedRead<'a, S>
@@ -9802,6 +10383,8 @@ where
             store,
             chunks,
             commit_states: HashMap::new(),
+            mutation_inventories: HashMap::new(),
+            mutation_directory_nodes: HashMap::new(),
         }
     }
 
@@ -9810,7 +10393,7 @@ where
         chunks: &'a TrackedStateChunkOverlay,
         commit_states: impl IntoIterator<Item = (CommitStateManifest, TrackedStateCommitRoot)>,
     ) -> Result<Self, LixError> {
-        let manifests = commit_states
+        let encoded = commit_states
             .into_iter()
             .map(|(mut manifest, root)| {
                 if manifest.commit_id != root.commit_id {
@@ -9822,16 +10405,36 @@ where
                 // it is never published as immutable commit authority.
                 manifest.replay_debt = Default::default();
                 manifest.snapshot_root = Some(Box::new(root));
-                Ok((
-                    commit_state_manifest_key(manifest.commit_id),
-                    Bytes::from(encode_commit_state_manifest(&manifest)?),
-                ))
+                let key = commit_state_manifest_key(manifest.commit_id);
+                let encoded = encode_commit_state_manifest(&manifest)?;
+                Ok((key, encoded))
             })
-            .collect::<Result<HashMap<_, _>, LixError>>()?;
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let commit_states = encoded
+            .iter()
+            .map(|(key, encoded)| (key.clone(), Bytes::copy_from_slice(&encoded.header)))
+            .collect();
+        let mutation_inventories = encoded
+            .iter()
+            .map(|(key, encoded)| {
+                (
+                    key.clone(),
+                    Bytes::copy_from_slice(&encoded.mutation_inventory),
+                )
+            })
+            .collect();
+        let mutation_directory_nodes = encoded
+            .iter()
+            .flat_map(|(_, encoded)| encoded.mutation_directory.iter())
+            .flat_map(|directory| directory.node_bytes())
+            .map(|(node_id, bytes)| (node_id.to_vec(), bytes.clone()))
+            .collect();
         Ok(Self {
             store,
             chunks,
-            commit_states: manifests,
+            commit_states,
+            mutation_inventories,
+            mutation_directory_nodes,
         })
     }
 
@@ -9842,6 +10445,12 @@ where
         }
         if space == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id {
             return self.commit_states.get(key.0.as_ref()).cloned();
+        }
+        if space == TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id {
+            return self.mutation_inventories.get(key.0.as_ref()).cloned();
+        }
+        if space == super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id {
+            return self.mutation_directory_nodes.get(key.0.as_ref()).cloned();
         }
         None
     }
@@ -9904,32 +10513,497 @@ fn full_value_bytes(value: StorageProjectedValue) -> Option<Bytes> {
     }
 }
 
-fn encode_commit_state_manifest(manifest: &CommitStateManifest) -> Result<Vec<u8>, LixError> {
+#[derive(Debug)]
+struct EncodedCommitStateManifest {
+    header: Vec<u8>,
+    mutation_inventory: Vec<u8>,
+    mutation_directory: Option<super::mutation_directory::BuiltMutationDirectory>,
+}
+
+fn encode_commit_state_manifest(
+    manifest: &CommitStateManifest,
+) -> Result<EncodedCommitStateManifest, LixError> {
     validate_commit_state_manifest(manifest)?;
-    let payload = storage_codec::encode("tracked_state commit_state_manifest", manifest)?;
-    let mut encoded = Vec::with_capacity(COMMIT_STATE_MANIFEST_FORMAT_MAGIC.len() + payload.len());
-    encoded.extend_from_slice(COMMIT_STATE_MANIFEST_FORMAT_MAGIC);
-    encoded.extend_from_slice(&payload);
-    Ok(encoded)
+    let selected_source_commit_id = manifest.mutations.selected_source_commit_id;
+    let (stored_inventory, mutation_directory) =
+        stored_commit_mutation_inventory(&manifest.mutations)?;
+    let inventory_payload =
+        storage_codec::encode("tracked_state commit mutation inventory", &stored_inventory)?;
+    let mut mutation_inventory = Vec::with_capacity(
+        COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC.len() + inventory_payload.len(),
+    );
+    mutation_inventory.extend_from_slice(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC);
+    mutation_inventory.extend_from_slice(&inventory_payload);
+    let header = StoredCommitStateManifest {
+        commit_id: manifest.commit_id,
+        change_account_id: manifest.change_account_id.clone(),
+        replay_debt: manifest.replay_debt,
+        selected_source_commit_id,
+        mutation_inventory_digest: *blake3::hash(&mutation_inventory).as_bytes(),
+        mutation_transition_digest:
+            super::scoped_current_state::current_state_mutation_authority_digest(
+                &manifest.mutations,
+            )?,
+        mutation_member_count: manifest.mutations.member_count,
+        mutation_part_count: u32::try_from(manifest.mutations.part_count()).map_err(|_| {
+            replacement_payload_error("mutation part count exceeds the authority-header bound")
+        })?,
+        mutation_directory_root: stored_inventory.directory_root.clone(),
+        touched_scope_filter: manifest.touched_scope_filter.clone(),
+        current_state_scoped_ranges: manifest.current_state_scoped_ranges.clone(),
+        snapshot_root: manifest.snapshot_root.clone(),
+    };
+    let header_payload = storage_codec::encode("tracked_state commit_state_manifest", &header)?;
+    let mut encoded_header =
+        Vec::with_capacity(COMMIT_STATE_MANIFEST_FORMAT_MAGIC.len() + header_payload.len());
+    encoded_header.extend_from_slice(COMMIT_STATE_MANIFEST_FORMAT_MAGIC);
+    encoded_header.extend_from_slice(&header_payload);
+    Ok(EncodedCommitStateManifest {
+        header: encoded_header,
+        mutation_inventory,
+        mutation_directory,
+    })
 }
 
-fn decode_commit_state_manifest(bytes: &[u8]) -> Result<CommitStateManifest, LixError> {
-    decode_commit_state_manifest_with_scoped_range_attestation(bytes, true)
+fn stored_commit_mutation_inventory(
+    inventory: &CommitStateMutationInventory,
+) -> Result<
+    (
+        StoredCommitMutationInventory,
+        Option<super::mutation_directory::BuiltMutationDirectory>,
+    ),
+    LixError,
+> {
+    let mutation_directory = if !inventory.parts.is_empty() {
+        let direct_rows = if inventory.direct_part_row_counts.is_empty() {
+            None
+        } else {
+            Some(inventory.direct_part_row_counts.as_slice())
+        };
+        Some(super::mutation_directory::build_bounded_mutation_directory(
+            &inventory.parts,
+            direct_rows,
+        )?)
+    } else if !inventory.replacement_part_digests.is_empty() {
+        Some(
+            super::mutation_directory::build_compact_replacement_mutation_directory(
+                &inventory.replacement_part_digests,
+                &inventory.direct_part_row_counts,
+            )?,
+        )
+    } else if inventory.columnar_parts.is_some() && !inventory.direct_part_row_counts.is_empty() {
+        Some(
+            super::mutation_directory::build_direct_rows_mutation_directory(
+                &inventory.direct_part_row_counts,
+            )?,
+        )
+    } else {
+        None
+    };
+    let stored = StoredCommitMutationInventory {
+        member_count: inventory.member_count,
+        selection_fingerprint: inventory.selection_fingerprint,
+        single_partition: inventory.single_partition.clone(),
+        lifecycle_summary: inventory.lifecycle_summary.clone(),
+        replacement_generation: inventory.replacement_generation.clone(),
+        replacement_parts: inventory.replacement_parts.clone(),
+        columnar_parts: inventory.columnar_parts.clone(),
+        inline_part: inventory.inline_part.clone(),
+        inline_direct: !inventory.inline_part.is_empty()
+            && !inventory.direct_part_row_counts.is_empty(),
+        directory_root: mutation_directory
+            .as_ref()
+            .map(|directory| directory.root.clone()),
+    };
+    Ok((stored, mutation_directory))
 }
 
-fn decode_commit_state_manifest_with_scoped_range_attestation(
-    bytes: &[u8],
+async fn decode_commit_state_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    header: &[u8],
+    mutation_inventory: &[u8],
+) -> Result<CommitStateManifest, LixError> {
+    decode_commit_state_manifest_with_scoped_range_attestation(
+        store,
+        header,
+        mutation_inventory,
+        true,
+    )
+    .await
+}
+
+async fn decode_commit_state_manifest_with_scoped_range_attestation(
+    store: &(impl StorageAdapterRead + ?Sized),
+    header: &[u8],
+    mutation_inventory: &[u8],
     validate_scoped_range_attestation: bool,
 ) -> Result<CommitStateManifest, LixError> {
+    let (stored, stored_inventory) =
+        decode_stored_commit_state_authority(header, mutation_inventory)?;
+    let entries = match stored_inventory.directory_root.as_ref() {
+        Some(root) => super::mutation_directory::load_mutation_directory(store, root).await?,
+        None => Vec::new(),
+    };
+    assemble_commit_state_manifest(
+        stored,
+        stored_inventory,
+        entries,
+        validate_scoped_range_attestation,
+    )
+}
+
+fn decode_stored_commit_state_authority(
+    header: &[u8],
+    mutation_inventory: &[u8],
+) -> Result<(StoredCommitStateManifest, StoredCommitMutationInventory), LixError> {
+    let stored = decode_stored_commit_state_manifest(header)?;
+    if stored.mutation_inventory_digest != *blake3::hash(mutation_inventory).as_bytes() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit mutation inventory disagrees with its authority digest",
+        ));
+    }
+    let Some(inventory_payload) =
+        mutation_inventory.strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC)
+    else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit mutation inventory has an unsupported format; recreate the repository",
+        ));
+    };
+    let stored_inventory: StoredCommitMutationInventory =
+        storage_codec::decode("tracked_state commit mutation inventory", inventory_payload)?;
+    if stored.mutation_member_count != stored_inventory.member_count
+        || stored.mutation_directory_root != stored_inventory.directory_root
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit mutation inventory disagrees with its authority header",
+        ));
+    }
+    Ok((stored, stored_inventory))
+}
+
+fn assemble_commit_state_manifest(
+    stored: StoredCommitStateManifest,
+    stored_inventory: StoredCommitMutationInventory,
+    entries: Vec<super::mutation_directory::MutationDirectoryEntry>,
+    validate_scoped_range_attestation: bool,
+) -> Result<CommitStateManifest, LixError> {
+    use super::mutation_directory::{
+        LAYOUT_BOUNDED_DIRECT, LAYOUT_BOUNDED_INDIRECT, LAYOUT_COMPACT_REPLACEMENT,
+        LAYOUT_DIRECT_ROWS_ONLY, MutationDirectoryEntry,
+    };
+    let mut parts = Vec::new();
+    let mut direct_part_row_counts = Vec::new();
+    let mut replacement_part_digests = Vec::new();
+    match stored_inventory
+        .directory_root
+        .as_ref()
+        .map(|root| root.layout)
+    {
+        Some(LAYOUT_BOUNDED_INDIRECT | LAYOUT_BOUNDED_DIRECT) => {
+            let direct = stored_inventory
+                .directory_root
+                .as_ref()
+                .is_some_and(|root| root.layout == LAYOUT_BOUNDED_DIRECT);
+            for entry in entries {
+                let MutationDirectoryEntry::Bounded {
+                    part,
+                    direct_row_count,
+                } = entry
+                else {
+                    return Err(replacement_payload_error(
+                        "bounded mutation directory contains a compact entry",
+                    ));
+                };
+                parts.push(part);
+                if direct {
+                    direct_part_row_counts.push(direct_row_count);
+                }
+            }
+        }
+        Some(LAYOUT_COMPACT_REPLACEMENT) => {
+            for entry in entries {
+                let MutationDirectoryEntry::CompactReplacement {
+                    content_digest,
+                    direct_row_count,
+                } = entry
+                else {
+                    return Err(replacement_payload_error(
+                        "compact mutation directory contains a bounded entry",
+                    ));
+                };
+                replacement_part_digests.push(content_digest);
+                direct_part_row_counts.push(direct_row_count);
+            }
+        }
+        Some(LAYOUT_DIRECT_ROWS_ONLY) => {
+            for entry in entries {
+                let MutationDirectoryEntry::DirectAddress { direct_row_count } = entry else {
+                    return Err(replacement_payload_error(
+                        "direct-address directory contains a physical part entry",
+                    ));
+                };
+                direct_part_row_counts.push(direct_row_count);
+            }
+        }
+        None if entries.is_empty() => {}
+        _ => {
+            return Err(replacement_payload_error(
+                "mutation directory has an unsupported authority layout",
+            ));
+        }
+    }
+    if stored_inventory.inline_direct {
+        let inline_rows = u16::try_from(stored_inventory.member_count).map_err(|_| {
+            replacement_payload_error("inline mutation row count exceeds direct-address bound")
+        })?;
+        if inline_rows == 0 || !direct_part_row_counts.is_empty() {
+            return Err(replacement_payload_error(
+                "inline direct-address authority has an invalid directory",
+            ));
+        }
+        direct_part_row_counts.push(inline_rows);
+    }
+    let mutations = CommitStateMutationInventory {
+        selected_source_commit_id: stored.selected_source_commit_id,
+        member_count: stored_inventory.member_count,
+        selection_fingerprint: stored_inventory.selection_fingerprint,
+        direct_part_row_counts,
+        replacement_part_digests,
+        single_partition: stored_inventory.single_partition,
+        lifecycle_summary: stored_inventory.lifecycle_summary,
+        replacement_generation: stored_inventory.replacement_generation,
+        replacement_parts: stored_inventory.replacement_parts,
+        columnar_parts: stored_inventory.columnar_parts,
+        inline_part: stored_inventory.inline_part,
+        parts,
+    };
+    if super::scoped_current_state::current_state_mutation_authority_digest(&mutations)?
+        != stored.mutation_transition_digest
+    {
+        return Err(replacement_payload_error(
+            "mutation catalog disagrees with its transition authority digest",
+        ));
+    }
+    let manifest = CommitStateManifest {
+        commit_id: stored.commit_id,
+        change_account_id: stored.change_account_id,
+        replay_debt: stored.replay_debt,
+        mutations,
+        touched_scope_filter: stored.touched_scope_filter,
+        current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        snapshot_root: stored.snapshot_root,
+    };
+    if u32::try_from(manifest.mutations.part_count()).ok() != Some(stored.mutation_part_count) {
+        return Err(replacement_payload_error(
+            "mutation part closure disagrees with its authority header",
+        ));
+    }
+    validate_commit_state_manifest_inner(&manifest, validate_scoped_range_attestation)?;
+    Ok(manifest)
+}
+
+fn assemble_shallow_commit_state_manifest(
+    stored: StoredCommitStateManifest,
+    stored_inventory: StoredCommitMutationInventory,
+) -> Result<CommitStateManifest, LixError> {
+    use super::mutation_directory::{
+        LAYOUT_BOUNDED_DIRECT, LAYOUT_BOUNDED_INDIRECT, LAYOUT_COMPACT_REPLACEMENT,
+        LAYOUT_DIRECT_ROWS_ONLY,
+    };
+
+    let root = stored_inventory.directory_root.as_ref();
+    let has_inline = !stored_inventory.inline_part.is_empty();
+    let has_columnar = stored_inventory.columnar_parts.is_some();
+    let invalid_shape = has_inline && (has_columnar || root.is_some())
+        || has_columnar && root.is_none_or(|root| root.layout != LAYOUT_DIRECT_ROWS_ONLY)
+        || root.is_some_and(|root| {
+            matches!(
+                root.layout,
+                LAYOUT_BOUNDED_DIRECT | LAYOUT_BOUNDED_INDIRECT | LAYOUT_COMPACT_REPLACEMENT
+            ) && (has_inline || has_columnar)
+        })
+        || (stored_inventory.member_count > 0 && !has_inline && !has_columnar && root.is_none())
+        || stored_inventory.inline_direct && !has_inline
+        || has_inline && stored_inventory.member_count > COMMIT_DELTA_SEGMENT_MAX_ROWS as u32
+        || root.is_some_and(|root| {
+            (root.layout == LAYOUT_BOUNDED_DIRECT
+                || root.layout == LAYOUT_COMPACT_REPLACEMENT
+                || root.layout == LAYOUT_DIRECT_ROWS_ONLY)
+                && root.direct_row_count != u64::from(stored_inventory.member_count)
+        });
+    if invalid_shape {
+        return Err(replacement_payload_error(
+            "shallow mutation catalog has an invalid directory shape",
+        ));
+    }
+    let mutation_part_count = if let Some(columnar) = stored_inventory.columnar_parts.as_ref() {
+        u32::try_from(columnar.group_row_counts.len())
+            .map_err(|_| replacement_payload_error("columnar part count overflows"))?
+    } else if has_inline {
+        1
+    } else {
+        root.map_or(0, |root| root.entry_count)
+    };
+    if mutation_part_count != stored.mutation_part_count {
+        return Err(replacement_payload_error(
+            "shallow mutation part closure disagrees with its authority header",
+        ));
+    }
+    let direct_part_row_counts = if stored_inventory.inline_direct {
+        vec![u16::try_from(stored_inventory.member_count).map_err(|_| {
+            replacement_payload_error("inline mutation row count exceeds direct-address bound")
+        })?]
+    } else {
+        Vec::new()
+    };
+    let mutations = CommitStateMutationInventory {
+        selected_source_commit_id: stored.selected_source_commit_id,
+        member_count: stored_inventory.member_count,
+        selection_fingerprint: stored_inventory.selection_fingerprint,
+        direct_part_row_counts,
+        replacement_part_digests: Vec::new(),
+        single_partition: stored_inventory.single_partition,
+        lifecycle_summary: stored_inventory.lifecycle_summary,
+        replacement_generation: stored_inventory.replacement_generation,
+        replacement_parts: stored_inventory.replacement_parts,
+        columnar_parts: stored_inventory.columnar_parts,
+        inline_part: stored_inventory.inline_part,
+        parts: Vec::new(),
+    };
+    Ok(CommitStateManifest {
+        commit_id: stored.commit_id,
+        change_account_id: stored.change_account_id,
+        replay_debt: stored.replay_debt,
+        mutations,
+        touched_scope_filter: stored.touched_scope_filter,
+        current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        snapshot_root: stored.snapshot_root,
+    })
+}
+
+#[cfg(test)]
+fn decode_encoded_commit_state_manifest(
+    encoded: &EncodedCommitStateManifest,
+) -> Result<CommitStateManifest, LixError> {
+    let (stored, stored_inventory) =
+        decode_stored_commit_state_authority(&encoded.header, &encoded.mutation_inventory)?;
+    let entries = match encoded.mutation_directory.as_ref() {
+        Some(directory) => super::mutation_directory::decode_built_mutation_directory(directory)?,
+        None => Vec::new(),
+    };
+    assemble_commit_state_manifest(stored, stored_inventory, entries, true)
+}
+
+fn decode_stored_commit_state_manifest(
+    bytes: &[u8],
+) -> Result<StoredCommitStateManifest, LixError> {
     let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC) else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state commit_state_manifest has an unsupported format; recreate the repository",
         ));
     };
-    let manifest = storage_codec::decode("tracked_state commit_state_manifest", payload)?;
-    validate_commit_state_manifest_inner(&manifest, validate_scoped_range_attestation)?;
-    Ok(manifest)
+    let stored: StoredCommitStateManifest =
+        storage_codec::decode("tracked_state commit_state_manifest", payload)?;
+    validate_commit_state_manifest_header(&stored)?;
+    Ok(stored)
+}
+
+fn validate_commit_state_manifest_header(
+    stored: &StoredCommitStateManifest,
+) -> Result<(), LixError> {
+    if stored.mutation_inventory_digest == [0; 32]
+        || stored.mutation_transition_digest == [0; 32]
+        || stored.selected_source_commit_id == Some(*stored.commit_id.as_uuid().as_bytes())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_state_manifest has invalid mutation authority",
+        ));
+    }
+    if let Some(root) = stored.mutation_directory_root.as_ref() {
+        super::mutation_directory::validate_mutation_directory_root(root)?;
+        if root.layout != super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY
+            && root.entry_count != stored.mutation_part_count
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_state_manifest mutation root count disagrees with its header",
+            ));
+        }
+    }
+    if stored.replay_debt.depth == 0
+        && (stored.replay_debt.rows != 0 || stored.replay_debt.bytes != 0)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_state_manifest has replay work at zero depth",
+        ));
+    }
+    if stored.replay_debt.depth > crate::tracked_state::COMMIT_STATE_MAX_REPLAY_DEPTH
+        || stored.replay_debt.bytes > crate::tracked_state::COMMIT_STATE_MAX_REPLAY_BYTES
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_state_manifest replay debt exceeds the protocol bound",
+        ));
+    }
+    if stored.replay_debt.depth == 0 && stored.snapshot_root.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state rooted commit_state_manifest is missing its snapshot root",
+        ));
+    }
+    if let Some(root) = stored.snapshot_root.as_ref()
+        && (root.commit_id != stored.commit_id || stored.replay_debt.depth != 0)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_state_manifest has an invalid snapshot root",
+        ));
+    }
+    super::scoped_current_state::validate_touched_scope_filter(&stored.touched_scope_filter)?;
+    if stored
+        .current_state_scoped_ranges
+        .as_ref()
+        .is_some_and(|root| {
+            root.tree.root_id == [0; 32]
+                || root.tree.root_digest == [0; 32]
+                || root.tree.tree_height == 0
+                || root.tree.marker_count == 0
+                || root.transition_digest == [0; 32]
+                || root.serving_base_commit_id.is_some() != root.serving_base_root_id.is_some()
+                || (stored.selected_source_commit_id.is_some()
+                    && root.serving_base_commit_id
+                        != stored
+                            .selected_source_commit_id
+                            .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes))))
+        })
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_state_manifest has an invalid current-state scoped-range root",
+        ));
+    }
+    if let Some(root) = stored.current_state_scoped_ranges.as_ref()
+        && root.transition_digest
+            != super::scoped_current_state::scoped_range_transition_digest_from_authority(
+                stored.commit_id,
+                root.serving_base_commit_id,
+                root.serving_base_root_id,
+                stored.mutation_transition_digest,
+                &root.tree,
+            )
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_state_manifest scoped-range transition disagrees with its header authority",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_commit_state_manifest(manifest: &CommitStateManifest) -> Result<(), LixError> {
@@ -10259,7 +11333,8 @@ mod tests {
         encode_key_ref, encode_value_ref, hash_bytes,
     };
     use crate::tracked_state::types::{
-        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+        CommitStateManifest, CommitStateMutationInventory,
+        CommitStateMutationPart as FixtureMutationPart, CommitStateReplayDebt,
         CurrentStatePartDescriptor, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
         TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
         TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
@@ -10271,16 +11346,16 @@ mod tests {
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, columnar_identity_row_map,
-        decode_commit_delta_with_payloads, decode_commit_state_manifest,
-        direct_change_locator_in_commit_state, encode_commit_delta_segment,
-        encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
-        encode_commit_state_manifest, key, load_change_record_by_id, load_commit_delta_change_ids,
-        load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-        load_commit_delta_values_encoded, load_commit_state_manifest,
-        load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
-        scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
-        stage_change_locators, stage_commit_state_manifest,
-        stage_delete_commit_delta_inventory_entry,
+        decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
+        decode_stored_commit_state_authority, direct_change_locator_in_commit_state,
+        encode_commit_delta_segment, encode_commit_delta_segment_with_payloads,
+        encode_commit_delta_segment_with_raw_sidecar, encode_commit_state_manifest, key,
+        load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
+        load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
+        load_commit_state_manifest, load_owned_commit_delta_entries,
+        scan_change_records_from_commit_deltas, scan_commit_delta_inventory,
+        scan_commit_delta_members, scan_commit_delta_values, stage_change_locators,
+        stage_commit_state_manifest, stage_delete_commit_delta_inventory_entry,
         stage_fragmented_scoped_current_state_descriptor, value,
     };
 
@@ -10531,6 +11606,8 @@ mod tests {
     struct ManifestCountingRead<R> {
         inner: R,
         manifest_requests: std::sync::Arc<AtomicUsize>,
+        inventory_requests: std::sync::Arc<AtomicUsize>,
+        directory_requests: std::sync::Arc<AtomicUsize>,
     }
 
     impl<R> crate::storage_adapter::StorageAdapterRead for ManifestCountingRead<R>
@@ -10550,6 +11627,12 @@ mod tests {
             for request in requests {
                 if request.space == super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE {
                     self.manifest_requests.fetch_add(1, Ordering::Relaxed);
+                } else if request.space == super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE {
+                    self.inventory_requests.fetch_add(1, Ordering::Relaxed);
+                } else if request.space
+                    == super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE
+                {
+                    self.directory_requests.fetch_add(1, Ordering::Relaxed);
                 }
             }
             self.inner.get_many(requests)
@@ -11218,6 +12301,45 @@ mod tests {
         let assigned = staged.assigned_change_ids().collect::<Vec<_>>();
         assert_eq!(assigned.len(), ROW_COUNT);
         assert_eq!(staged.change_id_at(ROW_COUNT), None);
+
+        let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inventory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let directory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let routed_read = ManifestCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("routed point read should open"),
+            manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            inventory_requests: std::sync::Arc::clone(&inventory_requests),
+            directory_requests: std::sync::Arc::clone(&directory_requests),
+        };
+        let routed_indices = [0usize, ROW_COUNT / 2, ROW_COUNT - 1];
+        let routed_keys = routed_indices
+            .iter()
+            .map(|&index| TrackedStateKeyRef {
+                schema_key: &fixtures[index].schema_key,
+                file_id: fixtures[index].file_id.as_deref(),
+                entity_pk: &fixtures[index].entity_pk,
+            })
+            .collect::<Vec<_>>();
+        let routed = super::load_owned_commit_delta_entries_one_ordered_ref(
+            &routed_read,
+            commit_id,
+            &routed_keys,
+            None,
+        )
+        .await
+        .expect("hierarchical point routes should load");
+        for (&index, entry) in routed_indices.iter().zip(routed) {
+            assert_eq!(
+                entry.expect("routed mutation should exist").value.change_id,
+                assigned[index]
+            );
+        }
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(directory_requests.load(Ordering::Relaxed), 1);
 
         let mut row_start = 0usize;
         for (segment_index, &segment_rows) in
@@ -12138,8 +13260,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &deltas).expect("packed deltas should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            5,
-            "generic history keeps 300 compact rows in three read-friendly segments plus its physical authority and semantic owner"
+            7,
+            "generic history keeps three read-friendly segments plus an atomic header, catalog, directory root, and semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -12334,8 +13456,8 @@ mod tests {
             .expect("individually valid rows should split below the sidecar limit");
         assert_eq!(
             writes.stats().staged_puts,
-            4,
-            "the oversized four-row candidate should become two segments plus its physical authority and semantic owner"
+            6,
+            "the oversized four-row candidate should become two segments plus an atomic header, catalog, directory root, and semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -13152,14 +14274,18 @@ mod tests {
             .expect("ordinary delta should commit");
 
         let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inventory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let directory_requests = std::sync::Arc::new(AtomicUsize::new(0));
         let read = ManifestCountingRead {
             inner: storage
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("point read should open"),
             manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            inventory_requests: std::sync::Arc::clone(&inventory_requests),
+            directory_requests: std::sync::Arc::clone(&directory_requests),
         };
-        let state = super::load_replay_commit_state_manifest(&read, commit_id)
+        let state = super::load_point_replay_commit_state(&read, commit_id)
             .await
             .expect("replay manifest should load")
             .expect("replay manifest should exist");
@@ -13181,6 +14307,8 @@ mod tests {
         .expect("cached shallow point replay should load");
         assert_eq!(values, vec![Some(fixture.value(commit_id))]);
         assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(directory_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -13202,8 +14330,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &[delta]).expect("inline delta should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            2,
-            "a one-segment commit should remain inline in its physical authority plus semantic owner"
+            3,
+            "a one-segment commit should remain inline in its atomic header/catalog authority plus semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -13244,8 +14372,8 @@ mod tests {
         .expect("inline delta should stage for deletion");
         assert_eq!(
             deletes.stats().staged_deletes,
-            1,
-            "physical inventory deletion should remove its single manifest authority"
+            2,
+            "physical inventory deletion should remove its header and catalog authority"
         );
     }
 
@@ -13386,7 +14514,7 @@ mod tests {
                 .get(&commit_id)
                 .expect("packed commit should be inventoried")
                 .segment_count
-                + 1,
+                + 2,
         )
         .expect("test segment count fits u64");
         assert_eq!(deletes.stats().staged_deletes, expected_deletes);
@@ -13439,7 +14567,7 @@ mod tests {
         let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..128]);
         stage_commit_deltas(&mut inline_writes, &inline_deltas)
             .expect("128 generic deltas should fit the history read boundary");
-        assert_eq!(inline_writes.stats().staged_puts, 2);
+        assert_eq!(inline_writes.stats().staged_puts, 3);
         storage
             .commit_write_set(inline_writes, StorageWriteOptions::default())
             .await
@@ -13449,7 +14577,7 @@ mod tests {
         let indexed_deltas = commit_delta_refs(indexed_commit_id, &fixtures);
         stage_commit_deltas(&mut indexed_writes, &indexed_deltas)
             .expect("129 generic deltas should use indexed segments");
-        assert_eq!(indexed_writes.stats().staged_puts, 4);
+        assert_eq!(indexed_writes.stats().staged_puts, 6);
         storage
             .commit_write_set(indexed_writes, StorageWriteOptions::default())
             .await
@@ -13627,13 +14755,79 @@ mod tests {
         }
     }
 
+    fn external_commit_state_manifest_fixture(
+        label: &str,
+        part_count: usize,
+    ) -> CommitStateManifest {
+        let commit_id = CommitId::for_test_label(label);
+        let schema_key = "external-directory".to_string();
+        let parts = (0..part_count)
+            .map(|index| {
+                let first = EntityPk::single(format!("entity-{:06}", index * 2));
+                let last = EntityPk::single(format!("entity-{:06}", index * 2 + 1));
+                FixtureMutationPart {
+                    first_key: encode_key_ref(TrackedStateKeyRef {
+                        schema_key: &schema_key,
+                        file_id: None,
+                        entity_pk: &first,
+                    }),
+                    last_key: encode_key_ref(TrackedStateKeyRef {
+                        schema_key: &schema_key,
+                        file_id: None,
+                        entity_pk: &last,
+                    }),
+                    replacement_part: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        CommitStateManifest {
+            commit_id,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            replay_debt: CommitStateReplayDebt {
+                depth: 1,
+                rows: part_count as u64,
+                bytes: part_count as u64,
+            },
+            mutations: CommitStateMutationInventory {
+                selected_source_commit_id: None,
+                member_count: part_count as u32,
+                selection_fingerprint: [4; 32],
+                direct_part_row_counts: vec![1; part_count],
+                replacement_part_digests: Vec::new(),
+                single_partition: Some(super::CommitDeltaReplacementScope {
+                    schema_key,
+                    file_id: None,
+                }),
+                lifecycle_summary: None,
+                replacement_generation: None,
+                replacement_parts: None,
+                columnar_parts: None,
+                inline_part: Vec::new(),
+                parts,
+            },
+            touched_scope_filter: Default::default(),
+            current_state_scoped_ranges: None,
+            snapshot_root: None,
+        }
+    }
+
     #[test]
     fn commit_state_manifest_codec_roundtrips_all_authority_planes() {
         let expected = commit_state_manifest_fixture();
         let encoded = encode_commit_state_manifest(&expected).expect("manifest should encode");
-        assert!(encoded.starts_with(COMMIT_STATE_MANIFEST_FORMAT_MAGIC));
+        assert!(
+            encoded
+                .header
+                .starts_with(COMMIT_STATE_MANIFEST_FORMAT_MAGIC)
+        );
+        assert!(
+            encoded
+                .mutation_inventory
+                .starts_with(super::COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC)
+        );
 
-        let decoded = decode_commit_state_manifest(&encoded).expect("manifest should round trip");
+        let decoded =
+            decode_encoded_commit_state_manifest(&encoded).expect("manifest should round trip");
         assert_eq!(decoded, expected);
     }
 
@@ -13667,7 +14861,31 @@ mod tests {
             }));
 
         let encoded = encode_commit_state_manifest(&manifest).expect("manifest should encode");
-        assert_eq!(decode_commit_state_manifest(&encoded).unwrap(), manifest);
+        assert_eq!(
+            decode_encoded_commit_state_manifest(&encoded).unwrap(),
+            manifest
+        );
+
+        let mut stored: super::StoredCommitStateManifest = storage_codec::decode(
+            "tracked_state commit_state_manifest",
+            encoded
+                .header
+                .strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC)
+                .expect("encoded header has current magic"),
+        )
+        .expect("stored header should decode");
+        stored
+            .current_state_scoped_ranges
+            .as_mut()
+            .expect("fixture has a scoped root")
+            .transition_digest[0] ^= 1;
+        let payload = storage_codec::encode("tracked_state commit_state_manifest", &stored)
+            .expect("tampered header fixture should encode");
+        let mut tampered_header = COMMIT_STATE_MANIFEST_FORMAT_MAGIC.to_vec();
+        tampered_header.extend_from_slice(&payload);
+        let error = super::decode_stored_commit_state_manifest(&tampered_header)
+            .expect_err("header-only scoped authority must fail closed");
+        assert!(error.message.contains("transition"));
 
         manifest
             .current_state_scoped_ranges
@@ -13677,6 +14895,45 @@ mod tests {
         let error = encode_commit_state_manifest(&manifest)
             .expect_err("forged scoped-range transition must fail closed");
         assert!(error.message.contains("transition"));
+    }
+
+    #[tokio::test]
+    async fn published_topology_loads_only_the_authenticated_header() {
+        let manifest = external_commit_state_manifest_fixture("header-only-topology", 700);
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &manifest).expect("fixture should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fixture should commit");
+
+        let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inventory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let directory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let read = ManifestCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("topology read should open"),
+            manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            inventory_requests: std::sync::Arc::clone(&inventory_requests),
+            directory_requests: std::sync::Arc::clone(&directory_requests),
+        };
+
+        let topology = super::load_published_commit_state_topology(&read, manifest.commit_id)
+            .await
+            .expect("topology should load")
+            .expect("topology should exist");
+        assert_eq!(topology.commit_id(), manifest.commit_id);
+        assert_eq!(topology.replay_debt(), manifest.replay_debt);
+        assert_eq!(
+            topology.mutation_member_count(),
+            manifest.mutations.member_count
+        );
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(directory_requests.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -13689,11 +14946,13 @@ mod tests {
             b"LXCS5".as_slice(),
             b"LXCS6".as_slice(),
             b"LXCS7".as_slice(),
+            b"LXCS8".as_slice(),
+            b"LXCS9".as_slice(),
         ] {
             let mut legacy = magic.to_vec();
             legacy.extend_from_slice(&payload);
-            let error = decode_commit_state_manifest(&legacy)
-                .expect_err("the hard cut must reject pre-v7 manifest formats");
+            let error = decode_stored_commit_state_authority(&legacy, &[])
+                .expect_err("the hard cut must reject pre-v10 manifest formats");
             assert!(error.message.contains("unsupported format"));
         }
     }
@@ -13722,6 +14981,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_mutation_authority_publishes_atomically_and_fails_closed() {
+        const PART_COUNT: usize = 260;
+        let manifest = external_commit_state_manifest_fixture(
+            "split-mutation-authority-corruption",
+            PART_COUNT,
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &manifest).expect("split authority should stage");
+        assert_eq!(
+            writes
+                .staged_values_in_space(super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE)
+                .len(),
+            1
+        );
+        assert_eq!(
+            writes
+                .staged_values_in_space(super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE)
+                .len(),
+            1
+        );
+        assert!(
+            writes
+                .staged_values_in_space(
+                    super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE,
+                )
+                .len()
+                > 1,
+            "a multi-level directory must publish all authenticated nodes in the same write set"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("split authority should commit atomically");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("split authority should open");
+        assert_eq!(
+            load_commit_state_manifest(&read, manifest.commit_id)
+                .await
+                .expect("complete hierarchy should load"),
+            Some(manifest.clone())
+        );
+        drop(read);
+
+        let mut corrupt = storage.new_write_set();
+        corrupt.delete(
+            StorageSpace::mutable(
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+            ),
+            key(super::commit_mutation_inventory_key(manifest.commit_id)),
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("test corruption should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt split authority should open");
+        let error = load_commit_state_manifest(&read, manifest.commit_id)
+            .await
+            .expect_err("a missing catalog must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete split physical authority")
+        );
+        let error = scan_commit_delta_inventory(&read)
+            .await
+            .expect_err("an orphan header must fail the global inventory");
+        assert!(error.to_string().contains("orphaned headers"));
+    }
+
+    #[tokio::test]
+    async fn mutation_catalog_and_directory_tampering_fail_digest_validation() {
+        let manifest =
+            external_commit_state_manifest_fixture("mutation-directory-digest-corruption", 260);
+        let encoded = encode_commit_state_manifest(&manifest).expect("fixture should encode");
+        let root_id = encoded
+            .mutation_directory
+            .as_ref()
+            .expect("external fixture has a directory")
+            .root
+            .root_id;
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &manifest).expect("fixture should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fixture should commit");
+
+        let mut tampered_catalog = encoded.mutation_inventory.clone();
+        let last = tampered_catalog
+            .last_mut()
+            .expect("encoded catalog is non-empty");
+        *last ^= 1;
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            StorageSpace::mutable(
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+            ),
+            key(super::commit_mutation_inventory_key(manifest.commit_id)),
+            value(tampered_catalog),
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("catalog corruption should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("catalog corruption should open");
+        let error = load_commit_state_manifest(&read, manifest.commit_id)
+            .await
+            .expect_err("tampered catalog must fail closed");
+        assert!(error.to_string().contains("authority digest"));
+        drop(read);
+
+        let mut repair = storage.new_write_set();
+        repair.put(
+            StorageSpace::mutable(
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+            ),
+            key(super::commit_mutation_inventory_key(manifest.commit_id)),
+            value(encoded.mutation_inventory),
+        );
+        repair.put(
+            StorageSpace::mutable(
+                super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id,
+                super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.name,
+            ),
+            key(root_id.to_vec()),
+            value(b"forged-directory-node".to_vec()),
+        );
+        storage
+            .commit_write_set(repair, StorageWriteOptions::default())
+            .await
+            .expect("node corruption should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("node corruption should open");
+        let error = load_commit_state_manifest(&read, manifest.commit_id)
+            .await
+            .expect_err("tampered directory node must fail closed");
+        assert!(error.to_string().contains("content digest mismatch"));
+    }
+
+    #[tokio::test]
     async fn manifest_root_does_not_grant_semantic_commit_liveness() {
         let storage = StorageAdapter::new(Memory::new());
         let mut manifest = commit_state_manifest_fixture();
@@ -13746,10 +15161,28 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("root fixtures should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
+        let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inventory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let directory_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let read = ManifestCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open"),
+            manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            inventory_requests: std::sync::Arc::clone(&inventory_requests),
+            directory_requests: std::sync::Arc::clone(&directory_requests),
+        };
+
+        assert_eq!(
+            super::load_manifest_snapshot_commit_root(&read, manifest.commit_id)
+                .await
+                .expect("physical root should load"),
+            Some(authoritative.clone())
+        );
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(directory_requests.load(Ordering::Relaxed), 0);
 
         assert!(
             super::load_snapshot_commit_root(&read, &manifest.commit_id.to_string())
@@ -13757,12 +15190,6 @@ mod tests {
                 .expect("authorized root lookup should succeed")
                 .is_none(),
             "physical retention alone must not make a missing semantic commit readable"
-        );
-        assert_eq!(
-            super::load_manifest_snapshot_commit_root(&read, manifest.commit_id)
-                .await
-                .expect("physical root should load"),
-            Some(authoritative)
         );
         assert_eq!(
             load_commit_state_manifest(&read, manifest.commit_id)
@@ -13870,7 +15297,7 @@ mod tests {
 
     #[test]
     fn commit_state_manifest_rejects_old_formats() {
-        let error = decode_commit_state_manifest(b"LXCS0old")
+        let error = decode_stored_commit_state_authority(b"LXCS0old", &[])
             .expect_err("old commit-state formats must fail closed");
         assert!(error.message.contains("recreate the repository"));
     }

@@ -887,6 +887,41 @@ where
             ),
         ));
     }
+    let retained_authority_ids = retained_authority_commits
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let retained_mutation_roots =
+        crate::tracked_state::load_commit_mutation_directory_roots(store, &retained_authority_ids)
+            .await?;
+    let mut unique_mutation_roots = BTreeMap::new();
+    for (commit_id, root) in retained_authority_ids
+        .into_iter()
+        .zip(retained_mutation_roots)
+    {
+        if !packed.commits.contains_key(&commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("retained mutation authority '{commit_id}' is missing"),
+            ));
+        }
+        let Some(root) = root else {
+            continue;
+        };
+        if let Some(previous) = unique_mutation_roots.insert(root.root_id, root.clone())
+            && previous != root
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "retained mutation authorities disagree about a shared directory root",
+            ));
+        }
+    }
+    let mut live_mutation_directory_nodes = BTreeSet::new();
+    for root in unique_mutation_roots.values() {
+        live_mutation_directory_nodes
+            .extend(crate::tracked_state::collect_mutation_directory_node_ids(store, root).await?);
+    }
     let sweep_authority_commits = packed
         .commits
         .keys()
@@ -1022,6 +1057,13 @@ where
         writes,
         crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
         &live_scoped_range_nodes,
+    )
+    .await?;
+    stage_sweep_unreachable_content_nodes(
+        store,
+        writes,
+        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+        &live_mutation_directory_nodes,
     )
     .await?;
     stage_sweep_unreachable_content_nodes(
@@ -1337,6 +1379,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         for space in [
             crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
@@ -1362,6 +1405,7 @@ mod tests {
         let live = BTreeSet::from([live_id]);
         for space in [
             crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
@@ -1384,6 +1428,7 @@ mod tests {
         ];
         for space in [
             crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {

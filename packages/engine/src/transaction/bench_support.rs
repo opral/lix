@@ -670,7 +670,7 @@ mod tests {
 
         let point_update = fixture.update_one_by_pk_accounting().await;
         assert_eq!(point_update.logical_rows, 1);
-        assert_eq!(point_update.staged_puts, 8, "{point_update:?}");
+        assert_eq!(point_update.staged_puts, 9, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement

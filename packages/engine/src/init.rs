@@ -42,14 +42,15 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V57 makes commit-state manifests immutable physical authority. Semantic
-/// commit facts remain owned exclusively by `changelog.commit`; canonical
-/// snapshot metadata stays inside the immutable physical manifest while its
-/// content-addressed tree chunks remain rebuildable.
+/// V58 splits immutable commit-state authority into a compact header and an
+/// authenticated, hierarchical mutation catalog. Semantic commit facts remain
+/// owned exclusively by `changelog.commit`; canonical snapshot metadata stays
+/// inside the immutable physical authority while its content-addressed tree
+/// chunks remain rebuildable.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v57";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v58";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -1009,6 +1010,35 @@ mod tests {
             )
             .await
             .expect("old protocol marker should stage");
+        let read = storage
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .expect("protocol read should open");
+
+        assert_eq!(
+            repository_protocol_status(&read)
+                .await
+                .expect("protocol status should load"),
+            RepositoryProtocolStatus::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_protocol_rejects_pre_split_commit_state_marker() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            REPOSITORY_PROTOCOL_SPACE,
+            REPOSITORY_PROTOCOL_KEY,
+            &b"immutable-physical-commit-state.v57"[..],
+        );
+        storage
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
+            .await
+            .expect("pre-split protocol marker should stage");
         let read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await

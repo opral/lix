@@ -7968,8 +7968,8 @@ async fn opening_parent_complete_lifecycle_created_at(
     let Some(parent_commit_id) = parent_commit_id else {
         return Ok(None);
     };
-    let Some(manifest) =
-        crate::tracked_state::load_commit_state_manifest(read, parent_commit_id).await?
+    let Some(metadata) =
+        crate::tracked_state::load_commit_delta_replay_metadata(read, parent_commit_id).await?
     else {
         return Ok(None);
     };
@@ -7977,13 +7977,12 @@ async fn opening_parent_complete_lifecycle_created_at(
         schema_key: schema_key.to_owned(),
         file_id: None,
     };
-    if manifest.mutations.member_count != u32::try_from(live_count).unwrap_or(u32::MAX)
-        || manifest.mutations.single_partition.as_ref() != Some(&expected_scope)
+    if metadata.member_count != u32::try_from(live_count).unwrap_or(u32::MAX)
+        || metadata.single_partition.as_ref() != Some(&expected_scope)
     {
         return Ok(None);
     }
-    Ok(manifest
-        .mutations
+    Ok(metadata
         .lifecycle_summary
         .as_ref()
         .filter(|summary| {
