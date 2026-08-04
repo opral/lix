@@ -28,11 +28,7 @@ fn stage_bench_commit_deltas(
         writes,
         &CommitStateManifest {
             commit_id,
-            generation: 0,
-            parent_commit_ids: Vec::new(),
-            commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-commit")),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
                 depth: 1,
                 rows: u64::from(mutations.member_count),
@@ -41,7 +37,6 @@ fn stage_bench_commit_deltas(
             mutations,
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
-            snapshot_root: None,
         },
     )?;
     Ok(staged.locators)
@@ -523,11 +518,7 @@ where
         .expect("stage benchmark merge serving root");
         let merged = CommitStateManifest {
             commit_id: merge_id,
-            generation: self.current_manifest.generation.saturating_add(1),
-            parent_commit_ids: vec![self.current_manifest.commit_id, other_id],
-            commit_change_id: ChangeId::for_test_label("scoped-range-empty-merge-change"),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(33),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
                 depth: self
                     .current_manifest
@@ -541,7 +532,6 @@ where
             mutations,
             touched_scope_filter: publication.touched_scope_filter().clone(),
             current_state_scoped_ranges: publication.root(),
-            snapshot_root: None,
         };
         super::storage::stage_certified_commit_state_manifest(&mut writes, &merged, &publication)
             .expect("stage certified benchmark merge manifest");
@@ -734,7 +724,7 @@ fn bench_addressable_commit_id(label: &str) -> CommitId {
 
 fn bench_current_state_manifest(
     commit_id: CommitId,
-    parent_commit_id: Option<CommitId>,
+    _parent_commit_id: Option<CommitId>,
     replay_depth: u16,
     mutations: super::types::CommitStateMutationInventory,
     touched_scope_filter: super::types::CommitStateTouchedScopeFilter,
@@ -742,11 +732,7 @@ fn bench_current_state_manifest(
 ) -> CommitStateManifest {
     CommitStateManifest {
         commit_id,
-        generation: 0,
-        parent_commit_ids: parent_commit_id.into_iter().collect(),
-        commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-state")),
-        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-        created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+        change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         replay_debt: CommitStateReplayDebt {
             depth: replay_depth,
             rows: u64::from(mutations.member_count),
@@ -755,7 +741,6 @@ fn bench_current_state_manifest(
         mutations,
         touched_scope_filter,
         current_state_scoped_ranges,
-        snapshot_root: None,
     }
 }
 

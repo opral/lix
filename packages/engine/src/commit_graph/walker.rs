@@ -355,14 +355,10 @@ mod tests {
             crate::changelog::COMMIT_SPACE,
             StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
             crate::changelog::encode_commit_record(&CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label("mismatched-key-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -398,14 +394,10 @@ mod tests {
         for (label, parent) in [("commit-a", "commit-b"), ("commit-b", "commit-a")] {
             let commit_id = commit_id(label);
             let record = CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id,
                 generation: 1,
                 parent_commit_ids: commit_ids([parent]),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{label}-change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -692,14 +684,10 @@ mod tests {
         let child = commit_id("commit-child");
         let mut writes = storage.new_write_set();
         let record = CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
-            tracked_state_rootless: true,
-            tracked_state_rootless_depth: 2,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label("commit-child-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -1021,15 +1009,10 @@ mod tests {
                 .map_or(0, |parent_generation| parent_generation + 1);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
             append.commits.push(CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: u16::try_from(generation + 1)
-                    .expect("test generation should fit replay depth"),
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
@@ -1059,20 +1042,16 @@ mod tests {
             writes,
             &CommitStateManifest {
                 commit_id: record.commit_id,
-                generation: record.generation,
-                parent_commit_ids: record.parent_commit_ids.clone(),
-                commit_change_id: record.change_id,
-                account_id: record.account_id.clone(),
-                created_at: record.created_at,
+                change_account_id: record.account_id.clone(),
                 replay_debt: CommitStateReplayDebt {
-                    depth: record.tracked_state_rootless_depth,
-                    rows: record.tracked_state_rootless_rows,
-                    bytes: record.tracked_state_rootless_bytes,
+                    depth: u16::try_from(record.generation + 1)
+                        .expect("test generation should fit replay depth"),
+                    rows: 0,
+                    bytes: 0,
                 },
                 mutations: CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
-                snapshot_root: None,
             },
         )
     }

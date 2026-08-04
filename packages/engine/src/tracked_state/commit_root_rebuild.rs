@@ -149,8 +149,7 @@ where
         if !seen.insert(commit_id.to_string()) {
             return Ok(None);
         }
-        let Some(metadata) = storage::load_authoritative_commit_root(store, commit_id).await?
-        else {
+        let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
             seen.remove(commit_id);
             return Ok(None);
         };

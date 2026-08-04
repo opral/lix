@@ -1022,6 +1022,7 @@ fn index_prepared_rows(rows: &PreparedStateBatch) -> Result<PreparedRowIndex, Li
 #[derive(Clone, Debug)]
 struct StagedChangelogCommit {
     record: CommitRecord,
+    replay_debt: CommitStateReplayDebt,
     change_count: usize,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
 }
@@ -1179,20 +1180,10 @@ async fn stage_changelog_commits(
                     )
                 })?;
         let manifest = &*published;
-        // Replay debt is the durable layout authority. A rootless commit may
-        // later gain an immutable snapshot accelerator without changing its
-        // changelog topology projection.
-        let manifest_rootless = manifest.replay_debt.depth > 0;
-        if manifest.generation != record.generation
-            || manifest.parent_commit_ids != record.parent_commit_ids
-            || manifest.commit_change_id != record.change_id
-            || manifest.account_id != record.account_id
-            || manifest.created_at != record.created_at
-            || manifest_rootless != record.tracked_state_rootless
-            || manifest.replay_debt.depth != record.tracked_state_rootless_depth
-            || manifest.replay_debt.rows != record.tracked_state_rootless_rows
-            || manifest.replay_debt.bytes != record.tracked_state_rootless_bytes
-        {
+        // Replay debt is physical layout policy. A rootless commit may later
+        // gain a rebuildable snapshot accelerator without changing its
+        // immutable physical manifest or semantic changelog record.
+        if manifest.commit_id != record.commit_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -1200,7 +1191,7 @@ async fn stage_changelog_commits(
                 ),
             ));
         }
-        generations.insert(*commit_id, manifest.generation);
+        generations.insert(*commit_id, record.generation);
         rootless_depths.insert(*commit_id, manifest.replay_debt.depth);
         rootless_rows.insert(*commit_id, manifest.replay_debt.rows);
         rootless_bytes.insert(*commit_id, manifest.replay_debt.bytes);
@@ -1423,14 +1414,10 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            tracked_state_rootless: rootless_commit_ids.contains(&commit_row.commit_id),
-            tracked_state_rootless_depth: rootless_depths[&commit_row.commit_id],
-            tracked_state_rootless_rows: rootless_rows[&commit_row.commit_id],
-            tracked_state_rootless_bytes: rootless_bytes[&commit_row.commit_id],
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
@@ -1448,6 +1435,11 @@ async fn stage_changelog_commits(
             commit_row.commit_id,
             StagedChangelogCommit {
                 record,
+                replay_debt: CommitStateReplayDebt {
+                    depth: rootless_depths[&commit_row.commit_id],
+                    rows: rootless_rows[&commit_row.commit_id],
+                    bytes: rootless_bytes[&commit_row.commit_id],
+                },
                 change_count,
                 selected_change_batches: commit_row.selected_change_batches.clone(),
             },
@@ -2626,7 +2618,19 @@ async fn certify_complete_replacement_generations(
                         ),
                     )
                 })?;
-            if !record.tracked_state_rootless {
+            let manifest = crate::tracked_state::load_published_commit_state_manifest(
+                read, commit_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "replacement generation parent '{commit_id}' has no physical authority"
+                    ),
+                )
+            })?;
+            if manifest.replay_debt.depth == 0 {
                 break Some(commit_id);
             }
             let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
@@ -2738,7 +2742,17 @@ async fn certify_ordered_journal_replacement_generations(
                         ),
                     )
                 })?;
-            if !record.tracked_state_rootless {
+            let manifest = crate::tracked_state::load_published_commit_state_manifest(
+                read, commit_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("immutable replacement parent '{commit_id}' has no physical authority"),
+                )
+            })?;
+            if manifest.replay_debt.depth == 0 {
                 break Some(commit_id);
             }
             let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
@@ -5554,24 +5568,15 @@ where
             }
             let manifest = CommitStateManifest {
                 commit_id: record.commit_id,
-                generation: record.generation,
-                parent_commit_ids: record.parent_commit_ids.clone(),
-                commit_change_id: record.change_id,
-                account_id: record.account_id.clone(),
-                created_at: record.created_at,
+                change_account_id: record.account_id.clone(),
                 replay_debt: if rootless {
-                    CommitStateReplayDebt {
-                        depth: record.tracked_state_rootless_depth,
-                        rows: record.tracked_state_rootless_rows,
-                        bytes: record.tracked_state_rootless_bytes,
-                    }
+                    staged.replay_debt
                 } else {
                     CommitStateReplayDebt::default()
                 },
                 mutations,
                 touched_scope_filter,
                 current_state_scoped_ranges,
-                snapshot_root,
             };
             let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
                 crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
@@ -5582,6 +5587,13 @@ where
             } else {
                 crate::tracked_state::stage_commit_state_manifest_with_handle(writes, &manifest)?
             };
+            if let Some(snapshot_root) = snapshot_root {
+                crate::tracked_state::stage_staged_commit_state_snapshot_root(
+                    writes,
+                    &staged_manifest,
+                    snapshot_root,
+                )?;
+            }
             published_manifests.insert(record.commit_id, staged_manifest);
         }
         Ok(())
@@ -6763,11 +6775,7 @@ mod tests {
             &mut writes,
             &CommitStateManifest {
                 commit_id,
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                commit_change_id: change_id("mixed-certified-commit"),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: timestamp,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
                     rows: 2,
@@ -6780,7 +6788,6 @@ mod tests {
                     .expect("mixed certified inventory should stage"),
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
-                snapshot_root: None,
             },
         )
         .expect("mixed certified authority should stage");
@@ -6902,11 +6909,16 @@ mod tests {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
-        assert!(!record.tracked_state_rootless);
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("membership read should open");
+        let physical_state =
+            crate::tracked_state::load_commit_state_manifest(&membership_read, record.commit_id)
+                .await
+                .expect("physical state should load")
+                .expect("physical state should exist");
+        assert_eq!(physical_state.replay_debt, CommitStateReplayDebt::default());
         let change_ids =
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
@@ -8724,23 +8736,30 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(commits[0].generation, 0);
         assert_eq!(commits[1].generation, 1);
-        assert!(
-            commits.iter().all(|record| record.tracked_state_rootless),
-            "a staged child must inherit its first parent's rootless interval"
-        );
+        let authority_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("physical authority read should open");
+        let states =
+            crate::tracked_state::load_commit_state_manifests(&authority_read, &commit_ids)
+                .await
+                .expect("physical states should load")
+                .into_iter()
+                .map(|state| state.expect("physical state"))
+                .collect::<Vec<_>>();
         assert_eq!(
-            commits
+            states
                 .iter()
-                .map(|record| record.tracked_state_rootless_depth)
+                .map(|state| state.replay_debt.depth)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(commits[0].tracked_state_rootless_bytes > 0);
-        assert!(commits[1].tracked_state_rootless_bytes > commits[0].tracked_state_rootless_bytes);
+        assert!(states[0].replay_debt.bytes > 0);
+        assert!(states[1].replay_debt.bytes > states[0].replay_debt.bytes);
         assert_eq!(
-            commits
+            states
                 .iter()
-                .map(|record| record.tracked_state_rootless_rows)
+                .map(|state| state.replay_debt.rows)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
@@ -8818,12 +8837,11 @@ mod tests {
         assert!(rootless_commit_ids.is_empty());
         assert!(durable_root_rebuild_parents.is_empty());
         assert_eq!(staged_root_rebuild_commits.len(), commit_count - 1);
-        assert!(staged.values().all(|commit| {
-            !commit.record.tracked_state_rootless
-                && commit.record.tracked_state_rootless_depth == 0
-                && commit.record.tracked_state_rootless_rows == 0
-                && commit.record.tracked_state_rootless_bytes == 0
-        }));
+        assert!(
+            staged
+                .values()
+                .all(|commit| commit.replay_debt == Default::default())
+        );
     }
 
     #[tokio::test]

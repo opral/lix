@@ -427,14 +427,10 @@ mod tests {
 
     fn commit_record(id: CommitId, generation: u64, parent: Option<CommitId>) -> CommitRecord {
         CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
-            tracked_state_rootless: false,
-            tracked_state_rootless_depth: 0,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&format!("{id}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: timestamp(),

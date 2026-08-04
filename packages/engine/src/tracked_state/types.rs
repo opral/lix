@@ -170,8 +170,8 @@ pub(crate) struct TrackedStateCommitRootParent {
 ///
 /// Zero debt means the snapshot root is the canonical serving layout. Nonzero
 /// debt means readers can reconstruct the state from the bounded interval;
-/// [`CommitStateManifest::snapshot_root`] may still contain an equivalent,
-/// rebuildable snapshot accelerator without changing that policy.
+/// The separate snapshot-root projection may still contain an equivalent,
+/// rebuildable accelerator without changing that policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateReplayDebt {
@@ -313,7 +313,7 @@ pub(crate) struct CurrentStatePartDescriptor {
 /// Manifest-attested root of the unified scope/part serving tree.
 ///
 /// The generic tree owns only authenticated physical routing. These fields
-/// bind one result root to the physical serving base and sealed mutation
+/// bind one result root to the physical serving base and certified mutation
 /// authority that produced it. Graph ancestry remains an independent semantic
 /// relationship and is not exposed to the tree.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -406,27 +406,24 @@ impl CommitStateMutationInventory {
     }
 }
 
-/// Single semantic authority for one tracked commit.
+/// Immutable physical authority for one tracked commit.
 ///
 /// Compact topology projections, point locators, current-state HOT rows, and
 /// snapshot tree chunks remain rebuildable serving indexes. None may carry
-/// commit semantics absent from this manifest.
+/// semantic commit facts, which belong exclusively to `changelog.commit`.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateManifest {
     pub(crate) commit_id: CommitId,
-    pub(crate) generation: u64,
-    pub(crate) parent_commit_ids: Vec<CommitId>,
-    pub(crate) commit_change_id: ChangeId,
-    pub(crate) account_id: String,
-    pub(crate) created_at: LixTimestamp,
+    /// Physical decode dictionary for authored mutation rows. This is not
+    /// commit-account authority: it remains with retained immutable payloads
+    /// even if GC removes the semantic commit projection.
+    pub(crate) change_account_id: String,
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
 }
 
 /// Materialized tracked-state commit-root row.

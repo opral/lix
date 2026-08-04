@@ -4124,6 +4124,7 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
     use crate::entity_pk::EntityPk;
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
@@ -5087,8 +5088,6 @@ mod tests {
 
     #[tokio::test]
     async fn large_certified_insert_publishes_rootless_history_and_reads_packed_head() {
-        use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
-
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -5176,25 +5175,16 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("history read should open");
-        let head_commit_ids = [head.commit_id];
-        let commits = ChangelogContext::new()
-            .reader(&history_read)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &head_commit_ids,
-            })
-            .await
-            .expect("head commit should load");
-        let record = commits
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .expect("head commit should exist");
-        assert!(record.tracked_state_rootless);
-        assert!(record.tracked_state_rootless_depth >= 1);
-        assert!(record.tracked_state_rootless_rows >= ROW_COUNT as u64);
-        assert!(record.tracked_state_rootless_bytes > record.tracked_state_rootless_rows);
+        let commit_state =
+            crate::tracked_state::load_commit_state_manifest(&history_read, head.commit_id)
+                .await
+                .expect("head physical state should load")
+                .expect("head physical state should exist");
+        assert!(commit_state.replay_debt.depth >= 1);
+        assert!(commit_state.replay_debt.rows >= ROW_COUNT as u64);
+        assert!(commit_state.replay_debt.bytes > commit_state.replay_debt.rows);
         assert!(
-            crate::tracked_state::load_authoritative_commit_root(
+            crate::tracked_state::load_snapshot_commit_root(
                 &history_read,
                 &head.commit_id.to_string(),
             )
@@ -5260,36 +5250,28 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("descendant history read should open");
-        let descendant_commit_ids = [descendant.commit_id];
-        let descendant_commits = ChangelogContext::new()
-            .reader(&descendant_history_read)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &descendant_commit_ids,
-            })
-            .await
-            .expect("descendant commit should load");
-        let descendant_record = descendant_commits
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .expect("descendant commit should exist");
+        let descendant_state = crate::tracked_state::load_commit_state_manifest(
+            &descendant_history_read,
+            descendant.commit_id,
+        )
+        .await
+        .expect("descendant physical state should load")
+        .expect("descendant physical state should exist");
         assert!(
-            descendant_record.tracked_state_rootless,
+            descendant_state.replay_debt.depth > 0,
             "a sparse descendant must extend the rootless first-parent interval"
         );
         assert_eq!(
-            descendant_record.tracked_state_rootless_depth,
-            record.tracked_state_rootless_depth + 1
+            descendant_state.replay_debt.depth,
+            commit_state.replay_debt.depth + 1
         );
         assert_eq!(
-            descendant_record.tracked_state_rootless_rows,
-            record.tracked_state_rootless_rows + 1
+            descendant_state.replay_debt.rows,
+            commit_state.replay_debt.rows + 1
         );
+        assert!(descendant_state.replay_debt.bytes > commit_state.replay_debt.bytes);
         assert!(
-            descendant_record.tracked_state_rootless_bytes > record.tracked_state_rootless_bytes
-        );
-        assert!(
-            crate::tracked_state::load_authoritative_commit_root(
+            crate::tracked_state::load_snapshot_commit_root(
                 &descendant_history_read,
                 &descendant.commit_id.to_string(),
             )
@@ -5405,21 +5387,12 @@ mod tests {
             .await
             .expect("reseed head should load")
             .expect("reseed head should exist");
-        let reseed_commit_ids = [reseed_head.commit_id];
-        let reseed_commits = ChangelogContext::new()
-            .reader(&reseed_read)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &reseed_commit_ids,
-            })
-            .await
-            .expect("reseed commit should load");
-        let reseed_record = reseed_commits
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .expect("reseed commit should exist");
-        assert!(reseed_record.tracked_state_rootless);
-        assert!(reseed_record.tracked_state_rootless_depth >= 1);
+        let reseed_state =
+            crate::tracked_state::load_commit_state_manifest(&reseed_read, reseed_head.commit_id)
+                .await
+                .expect("reseed physical state should load")
+                .expect("reseed physical state should exist");
+        assert!(reseed_state.replay_debt.depth >= 1);
 
         let mut rooted_fence = None;
         for generation_offset in 1..=32 {
@@ -5442,25 +5415,15 @@ mod tests {
                 .await
                 .expect("root-fence head should load")
                 .expect("root-fence head should exist");
-            let fence_commit_ids = [head.commit_id];
-            let commits = ChangelogContext::new()
-                .reader(&read)
-                .load_commits(CommitLoadRequest {
-                    commit_ids: &fence_commit_ids,
-                })
+            let state = crate::tracked_state::load_commit_state_manifest(&read, head.commit_id)
                 .await
-                .expect("root-fence commit should load");
-            let record = commits
-                .into_iter()
-                .next()
-                .and_then(|(_, record)| record)
-                .expect("root-fence commit should exist");
-            if !record.tracked_state_rootless {
-                assert_eq!(record.tracked_state_rootless_depth, 0);
-                assert_eq!(record.tracked_state_rootless_rows, 0);
-                assert_eq!(record.tracked_state_rootless_bytes, 0);
+                .expect("root-fence physical state should load")
+                .expect("root-fence physical state should exist");
+            if state.replay_debt.depth == 0 {
+                assert_eq!(state.replay_debt.rows, 0);
+                assert_eq!(state.replay_debt.bytes, 0);
                 assert!(
-                    crate::tracked_state::load_authoritative_commit_root(
+                    crate::tracked_state::load_snapshot_commit_root(
                         &read,
                         &head.commit_id.to_string(),
                     )
@@ -5727,7 +5690,20 @@ mod tests {
             .columnar_parts
             .as_ref()
             .expect("fixture must publish column pages as sole mutation authority");
-        assert_eq!(commit_state.account_id, crate::SYSTEM_ACCOUNT_ID);
+        let semantic_commit_ids = [commit_state.commit_id];
+        let commit_records = ChangelogContext::new()
+            .reader(&read)
+            .load_commits(CommitLoadRequest {
+                commit_ids: &semantic_commit_ids,
+            })
+            .await
+            .expect("typed lifecycle semantic owner should load");
+        let semantic_owner = commit_records
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .expect("typed lifecycle semantic owner should exist");
+        assert_eq!(semantic_owner.account_id, crate::SYSTEM_ACCOUNT_ID);
         assert!(commit_state.mutations.inline_part.is_empty());
         assert!(commit_state.mutations.parts.is_empty());
         assert_eq!(columnar_parts.page_first_keys.len(), 33);

@@ -969,7 +969,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
     /// in one snapshot, so resolving neighbouring observed revisions never
     /// reloads the same changelog records.
     point_replay_commits: HashMap<CommitId, PointReplayCommit>,
-    /// Shares decoded immutable manifests between rootless topology discovery
+    /// Shares decoded immutable manifests between rootless layout discovery
     /// and the later delta scan in this storage snapshot.
     commit_delta_point_cache: storage::CommitDeltaPointReadCache,
 }
@@ -1636,7 +1636,7 @@ where
             }
 
             let current_metadata =
-                storage::load_authoritative_commit_root(&self.store, &current_commit_id).await?;
+                storage::load_snapshot_commit_root(&self.store, &current_commit_id).await?;
             let (parent_commit_id, parent_value, current_is_rootless) = if let Some(metadata) =
                 current_metadata
             {
@@ -1867,7 +1867,7 @@ where
         if let Some(metadata) = cache.commit_root_metadata.get(commit_id) {
             return Ok(metadata.clone());
         }
-        let metadata = storage::load_authoritative_commit_root(&self.store, commit_id)
+        let metadata = storage::load_snapshot_commit_root(&self.store, commit_id)
             .await?
             .ok_or_else(|| missing_commit_root_error(commit_id))?;
         cache
@@ -1884,11 +1884,9 @@ where
         if let Some(root_id) = cache.commit_roots.get(commit_id) {
             return Ok(root_id.clone());
         }
-        let typed_commit_id = CommitId::parse_lix(
-            commit_id,
-            "tracked-state optional authoritative root lookup",
-        )?;
-        let manifest = storage::load_commit_state_manifest(&self.store, typed_commit_id)
+        let typed_commit_id =
+            CommitId::parse_lix(commit_id, "tracked-state optional snapshot root lookup")?;
+        storage::load_commit_state_manifest(&self.store, typed_commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -1898,7 +1896,9 @@ where
                     ),
                 )
             })?;
-        let root_id = manifest.snapshot_root.map(|root| root.root_id);
+        let root_id = storage::load_snapshot_commit_root(&self.store, commit_id)
+            .await?
+            .map(|root| root.root_id);
         cache
             .commit_roots
             .insert(commit_id.to_string(), root_id.clone());
@@ -1965,9 +1965,7 @@ where
         change_created_at: crate::common::LixTimestamp,
     ) -> Result<(), LixError> {
         let mut expected_created_at = change_created_at;
-        if let Some(metadata) =
-            storage::load_authoritative_commit_root(&self.store, commit_id).await?
-        {
+        if let Some(metadata) = storage::load_snapshot_commit_root(&self.store, commit_id).await? {
             if let Some(parent) = metadata.parent_roots.first() {
                 let parent_value = self
                     .tree
@@ -2074,7 +2072,7 @@ where
     ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
         let row_commit_id = row.commit_id.to_string();
         let Some(metadata) =
-            storage::load_authoritative_commit_root(&self.store, &row_commit_id).await?
+            storage::load_snapshot_commit_root(&self.store, &row_commit_id).await?
         else {
             return Ok(None);
         };
@@ -3467,36 +3465,10 @@ where
                     ),
                 )
             })?;
-        if manifest.generation != record.generation
-            || manifest.parent_commit_ids != record.parent_commit_ids
-            || manifest.commit_change_id != record.change_id
-            || manifest.account_id != record.account_id
-            || manifest.created_at != record.created_at
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state commit_state_manifest disagrees with the topology projection for commit '{commit_id}'"
-                ),
-            ));
-        }
-        let root_id = manifest
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.root_id.clone());
+        let root_id = storage::load_snapshot_commit_root(&self.store, &commit_id.to_string())
+            .await?
+            .map(|root| root.root_id);
         let rootless = manifest.replay_debt.depth > 0;
-        if rootless != record.tracked_state_rootless
-            || manifest.replay_debt.depth != record.tracked_state_rootless_depth
-            || manifest.replay_debt.rows != record.tracked_state_rootless_rows
-            || manifest.replay_debt.bytes != record.tracked_state_rootless_bytes
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state commit_state_manifest disagrees with the replay projection for commit '{commit_id}'"
-                ),
-            ));
-        }
         let replacement_generation = if rootless && manifest.mutations.member_count != 0 {
             storage::seed_commit_delta_point_cache_from_replay_manifest(
                 &manifest,
@@ -3507,7 +3479,7 @@ where
             None
         };
         let replay_commit = PointReplayCommit {
-            parent_commit_id: manifest.parent_commit_ids.first().copied(),
+            parent_commit_id: record.parent_commit_ids.first().copied(),
             root_id,
             rootless,
             replacement_generation,
@@ -3766,9 +3738,9 @@ where
                     format!("tracked-state staged root for commit '{commit_id}' is missing"),
                 )
             })?;
-        let mut staged_manifests = Vec::with_capacity(self.staged_roots.len());
+        let mut staged_commit_states = Vec::with_capacity(self.staged_roots.len());
         for metadata in self.staged_roots.values() {
-            let mut manifest = storage::load_commit_state_manifest(self.store, metadata.commit_id)
+            let manifest = storage::load_commit_state_manifest(self.store, metadata.commit_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
@@ -3779,13 +3751,12 @@ where
                         ),
                     )
                 })?;
-            manifest.snapshot_root = Some(metadata.clone());
-            staged_manifests.push(manifest);
+            staged_commit_states.push((manifest, metadata.clone()));
         }
-        let read = storage::TrackedStateStagedRead::with_commit_state_manifests(
+        let read = storage::TrackedStateStagedRead::with_commit_state_roots(
             self.store,
             &self.chunk_overlay,
-            staged_manifests,
+            staged_commit_states,
         )?;
         TrackedStateContext::new()
             .reader(read)
@@ -3834,8 +3805,7 @@ where
                 let metadata = match self.staged_roots.get(parent_commit_id) {
                     Some(metadata) => Some(metadata.clone()),
                     None => {
-                        storage::load_authoritative_commit_root(self.store, parent_commit_id)
-                            .await?
+                        storage::load_snapshot_commit_root(self.store, parent_commit_id).await?
                     }
                 };
                 let Some(metadata) = metadata else {
@@ -4231,7 +4201,7 @@ where
         let parent_metadata = match parent_commit_id {
             Some(parent_commit_id) => Some(match self.staged_roots.get(parent_commit_id) {
                 Some(metadata) => metadata.clone(),
-                None => storage::load_authoritative_commit_root(self.store, parent_commit_id)
+                None => storage::load_snapshot_commit_root(self.store, parent_commit_id)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(
@@ -4963,33 +4933,16 @@ mod tests {
         writes: &mut StorageWriteSet,
         snapshot_root: TrackedStateCommitRoot,
     ) -> Result<(), LixError> {
-        let parent_commit_ids = snapshot_root
-            .parent_roots
-            .iter()
-            .map(|parent| parent.commit_id)
-            .collect::<Vec<_>>();
-        storage::stage_commit_state_manifest(
-            writes,
-            &crate::tracked_state::CommitStateManifest {
-                commit_id: snapshot_root.commit_id,
-                generation: u64::from(!parent_commit_ids.is_empty()),
-                parent_commit_ids,
-                commit_change_id: ChangeId::for_test_label(&format!(
-                    "{}:snapshot-authority",
-                    snapshot_root.commit_id
-                )),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: crate::common::LixTimestamp::expect_parse(
-                    "snapshot authority created_at",
-                    "1970-01-01T00:00:00.000Z",
-                ),
-                replay_debt: Default::default(),
-                mutations: Default::default(),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: Some(snapshot_root),
-            },
-        )
+        let manifest = crate::tracked_state::CommitStateManifest {
+            commit_id: snapshot_root.commit_id,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            replay_debt: Default::default(),
+            mutations: Default::default(),
+            touched_scope_filter: Default::default(),
+            current_state_scoped_ranges: None,
+        };
+        let staged = storage::stage_commit_state_manifest_with_handle(writes, &manifest)?;
+        storage::stage_staged_commit_state_snapshot_root(writes, &staged, snapshot_root)
     }
 
     fn change_id(label: &str) -> String {
@@ -5023,6 +4976,10 @@ mod tests {
             let mut writes = storage.new_write_set();
             writes.delete(
                 storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+                commit_root_key("missing-parent"),
+            );
+            writes.delete(
+                storage::TRACKED_STATE_SNAPSHOT_ROOT_SPACE,
                 commit_root_key("missing-parent"),
             );
             storage
@@ -5080,7 +5037,7 @@ mod tests {
             .await
             .expect("child root should load")
             .expect("child root should exist");
-        let metadata = storage::load_authoritative_commit_root(&read, "child")
+        let metadata = storage::load_snapshot_commit_root(&read, "child")
             .await
             .expect("metadata should load")
             .expect("metadata should exist");
@@ -6456,7 +6413,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let parent_metadata = storage::load_authoritative_commit_root(&read, "parent")
+        let parent_metadata = storage::load_snapshot_commit_root(&read, "parent")
             .await
             .expect("parent metadata should load")
             .expect("parent metadata should exist");
@@ -6487,7 +6444,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should reopen");
-        let child_metadata = storage::load_authoritative_commit_root(&read, "empty-child")
+        let child_metadata = storage::load_snapshot_commit_root(&read, "empty-child")
             .await
             .expect("child metadata should load")
             .expect("child metadata should exist");
@@ -6809,10 +6766,6 @@ mod tests {
                     storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
                     commit_root_key(commit_id),
                 );
-                writes.delete(
-                    storage::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-                    commit_root_key(commit_id),
-                );
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -6873,39 +6826,37 @@ mod tests {
             let mut writes = storage.new_write_set();
             let commit_a = CommitId::for_test_label("commit-a");
             let commit_b = CommitId::for_test_label("commit-b");
-            let mut manifest = storage::load_commit_state_manifest(&read, commit_a)
+            let published = storage::load_published_commit_state_manifest(&read, commit_a)
                 .await
                 .expect("commit-a authority should load")
                 .expect("commit-a authority should exist");
-            manifest.generation = 2;
-            manifest.parent_commit_ids = vec![commit_b];
-            manifest
-                .snapshot_root
-                .as_mut()
-                .expect("commit-a should have a snapshot root")
-                .parent_roots = vec![TrackedStateCommitRootParent {
+            let mut snapshot_root = storage::load_snapshot_commit_root(&read, "commit-a")
+                .await
+                .expect("commit-a root should load")
+                .expect("commit-a root should exist");
+            snapshot_root.parent_roots = vec![TrackedStateCommitRootParent {
                 commit_id: commit_b,
                 root_id: storage::load_root(&read, "commit-b")
                     .await
                     .expect("commit-b root should load")
                     .expect("commit-b root should exist"),
             }];
-            storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
-                .expect("corrupt cycle authority should stage");
+            storage::stage_commit_state_snapshot_root_update(
+                &mut writes,
+                &published,
+                Some(snapshot_root),
+            )
+            .expect("corrupt cycle root should stage");
             writes.put(
                 crate::changelog::COMMIT_SPACE,
                 crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
-                    format_version: 1,
+                    format_version: 2,
                     commit_id: commit_a,
-                    generation: manifest.generation,
+                    generation: 2,
                     parent_commit_ids: vec![commit_b],
-                    tracked_state_rootless: false,
-                    tracked_state_rootless_depth: 0,
-                    tracked_state_rootless_rows: 0,
-                    tracked_state_rootless_bytes: 0,
                     change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
@@ -7121,11 +7072,11 @@ mod tests {
                 .await
                 .expect("repaired authority should load")
                 .expect("child authority should exist");
-        let repaired_root = storage::load_authoritative_commit_root(&authority_read, "child")
+        let repaired_root = storage::load_snapshot_commit_root(&authority_read, "child")
             .await
             .expect("repaired root should load")
             .expect("repaired root should exist");
-        assert_eq!(repaired_authority.snapshot_root, Some(repaired_root));
+        assert_eq!(repaired_root.commit_id, repaired_authority.commit_id);
         assert_eq!(repaired_authority.replay_debt, Default::default());
         drop(authority_read);
 
@@ -7723,7 +7674,7 @@ mod tests {
             .await
             .expect_err("materialization must reject missing packed authority");
         assert!(
-            error.message.contains("commit_state_manifest is missing"),
+            error.message.contains("missing from owning commit"),
             "unexpected error: {error}"
         );
     }
@@ -9070,11 +9021,12 @@ mod tests {
             .await
             .expect("commit-state authority should load")
             .expect("root fixture should publish commit-state authority");
-        stale_root.parent_roots = published
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.parent_roots.clone())
-            .unwrap_or_default();
+        stale_root.parent_roots =
+            storage::load_snapshot_commit_root(&read, &typed_commit_id.to_string())
+                .await
+                .expect("published root should load")
+                .map(|root| root.parent_roots)
+                .unwrap_or_default();
         storage::stage_commit_state_snapshot_root_update(&mut writes, &published, Some(stale_root))
             .expect("stale authority should encode");
         storage
