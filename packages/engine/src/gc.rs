@@ -671,11 +671,14 @@ where
         if !retained_authority_commits.insert(commit_id) {
             continue;
         }
-        if !packed.commits.contains_key(&commit_id) {
-            return Err(LixError::new(
+        let authority = packed.commits.get(&commit_id).ok_or_else(|| {
+            LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("canonical mutation authority '{commit_id}' is missing"),
-            ));
+            )
+        })?;
+        if let Some(source_commit_id) = authority.selected_source_commit_id {
+            authority_roots.push(source_commit_id);
         }
     }
     let mut live_scoped_range_nodes = BTreeSet::<[u8; 32]>::new();
@@ -683,7 +686,7 @@ where
     let mut live_current_state_ref_summaries = BTreeMap::<[u8; 32], [u8; 32]>::new();
     let mut live_current_state_payload_hashes = BTreeSet::<[u8; 32]>::new();
     let mut scoped_roots = BTreeMap::new();
-    let mut live_manifests = BTreeMap::new();
+    let mut authority_manifests = BTreeMap::new();
     let live_commit_ids = live_commits.iter().copied().collect::<Vec<_>>();
     let loaded_live_manifests =
         crate::tracked_state::load_commit_state_manifests(store, &live_commit_ids).await?;
@@ -694,7 +697,7 @@ where
                 format!("live commit '{commit_id}' has no commit-state authority"),
             )
         })?;
-        live_manifests.insert(commit_id, manifest.clone());
+        authority_manifests.insert(commit_id, manifest.clone());
         let Some(root) = manifest.current_state_scoped_ranges.as_ref() else {
             continue;
         };
@@ -710,13 +713,50 @@ where
             }
         }
     }
-    for manifest in live_manifests.values() {
-        let parent = manifest
-            .parent_commit_ids
-            .first()
-            .and_then(|parent_id| live_manifests.get(parent_id));
-        crate::tracked_state::validate_current_state_scoped_range_parent_manifest(
-            manifest, parent,
+    let serving_base_ids = authority_manifests
+        .values()
+        .filter_map(|manifest| {
+            manifest
+                .current_state_scoped_ranges
+                .as_ref()
+                .and_then(|root| root.serving_base_commit_id)
+        })
+        .filter(|base_id| !authority_manifests.contains_key(base_id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(base_id) = serving_base_ids
+        .iter()
+        .find(|base_id| !retained_authority_commits.contains(base_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("current-state serving base '{base_id}' is not retained authority"),
+        ));
+    }
+    let loaded_serving_bases =
+        crate::tracked_state::load_commit_state_manifests(store, &serving_base_ids).await?;
+    for (base_id, manifest) in serving_base_ids.into_iter().zip(loaded_serving_bases) {
+        let manifest = manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("current-state serving base '{base_id}' has no commit-state authority"),
+            )
+        })?;
+        authority_manifests.insert(base_id, manifest);
+    }
+    for commit_id in &live_commits {
+        let manifest = authority_manifests
+            .get(commit_id)
+            .expect("live commit authority was loaded");
+        let serving_base = manifest
+            .current_state_scoped_ranges
+            .as_ref()
+            .and_then(|root| root.serving_base_commit_id)
+            .and_then(|base_id| authority_manifests.get(&base_id));
+        crate::tracked_state::validate_current_state_scoped_range_serving_base_manifest(
+            manifest,
+            serving_base,
         )?;
     }
 
@@ -776,7 +816,7 @@ where
         }
     }
     for (owner, source_id, content_digest) in live_columnar_sources {
-        let authority = match live_manifests.get(&owner) {
+        let authority = match authority_manifests.get(&owner) {
             Some(authority) => authority.clone(),
             None => crate::tracked_state::load_commit_state_manifest(store, owner)
                 .await?
@@ -1856,15 +1896,67 @@ mod tests {
             ),
             (alias_commit, alias_stage.mutation_inventory().clone()),
         ]);
-        for record in &commits {
-            stage_test_commit_state_manifest(
-                &mut writes,
+        let scope = crate::tracked_state::scoped_range::ScopedRangePrefix::try_from_components([
+            b"gc-selected-source-empty".as_slice(),
+        ])
+        .expect("GC selected-source scope should encode");
+        let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
+            &mut writes,
+            [(
+                crate::tracked_state::scoped_range::ScopedRangeCoverageMarker {
+                    scope,
+                    row_count: 0,
+                    part_count: 0,
+                },
+                Vec::new(),
+            )],
+        )
+        .expect("GC selected-source empty serving tree should stage");
+        let source_inventory = inventories[&source_commit].clone();
+        let source_root = crate::tracked_state::attest_scoped_range_root(
+            source_commit,
+            None,
+            &source_inventory,
+            tree.clone(),
+        )
+        .expect("source serving root should attest");
+        let mut source_manifest = test_commit_state_manifest(&commits[0], source_inventory);
+        source_manifest.current_state_scoped_ranges = Some(Box::new(source_root.clone()));
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+            &mut writes,
+            &source_manifest,
+        )
+        .expect("source serving authority should stage");
+
+        let alias_inventory = inventories[&alias_commit].clone();
+        let alias_root = crate::tracked_state::attest_scoped_range_root(
+            alias_commit,
+            Some((source_commit, &source_root)),
+            &alias_inventory,
+            tree,
+        )
+        .expect("selected-source serving root should attest");
+        let mut alias_manifest = test_commit_state_manifest(&commits[1], alias_inventory);
+        alias_manifest.current_state_scoped_ranges = Some(Box::new(alias_root));
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+            &mut writes,
+            &alias_manifest,
+        )
+        .expect("selected-source serving authority should stage");
+
+        for record in &commits[2..] {
+            let manifest = test_commit_state_manifest(
                 record,
                 inventories
                     .get(&record.commit_id)
                     .cloned()
                     .unwrap_or_default(),
             );
+            crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+                &mut writes,
+                &manifest,
+            )
+            .expect("GC retained-authority fixture manifest should stage");
         }
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2440,27 +2532,31 @@ mod tests {
         record: &CommitRecord,
         mutations: CommitStateMutationInventory,
     ) {
-        stage_commit_state_manifest(
-            writes,
-            &CommitStateManifest {
-                commit_id: record.commit_id,
-                generation: record.generation,
-                parent_commit_ids: record.parent_commit_ids.clone(),
-                commit_change_id: record.change_id,
-                account_id: record.account_id.clone(),
-                created_at: record.created_at,
-                replay_debt: CommitStateReplayDebt {
-                    depth: record.tracked_state_rootless_depth,
-                    rows: record.tracked_state_rootless_rows,
-                    bytes: record.tracked_state_rootless_bytes,
-                },
-                mutations,
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
+        stage_commit_state_manifest(writes, &test_commit_state_manifest(record, mutations))
+            .expect("GC fixture commit-state manifest should stage");
+    }
+
+    fn test_commit_state_manifest(
+        record: &CommitRecord,
+        mutations: CommitStateMutationInventory,
+    ) -> CommitStateManifest {
+        CommitStateManifest {
+            commit_id: record.commit_id,
+            generation: record.generation,
+            parent_commit_ids: record.parent_commit_ids.clone(),
+            commit_change_id: record.change_id,
+            account_id: record.account_id.clone(),
+            created_at: record.created_at,
+            replay_debt: CommitStateReplayDebt {
+                depth: record.tracked_state_rootless_depth,
+                rows: record.tracked_state_rootless_rows,
+                bytes: record.tracked_state_rootless_bytes,
             },
-        )
-        .expect("GC fixture commit-state manifest should stage");
+            mutations,
+            touched_scope_filter: Default::default(),
+            current_state_scoped_ranges: None,
+            snapshot_root: None,
+        }
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {

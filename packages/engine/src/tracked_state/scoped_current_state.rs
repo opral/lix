@@ -16,7 +16,7 @@ use crate::tracked_state::types::{
 };
 use crate::{LixError, storage_codec};
 
-const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v1";
+const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v2";
 const TOUCHED_SCOPE_FILTER_BYTES: usize = 128;
 const TOUCHED_SCOPE_FILTER_HASHES: usize = 4;
 const TOUCHED_SCOPE_FILTER_CONTEXT: &str = "lix cumulative touched collection scope v1";
@@ -29,6 +29,7 @@ async fn stage_disjoint_columnar_current_state_pages(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     parent_manifest: Option<&CommitStateManifest>,
+    inherited_scope_filter: &CommitStateTouchedScopeFilter,
     commit_id: CommitId,
     inventory: &CommitStateMutationInventory,
 ) -> Result<Option<CurrentStateScopedRangeRoot>, LixError> {
@@ -159,7 +160,7 @@ async fn stage_disjoint_columnar_current_state_pages(
         {
             return Ok(None);
         }
-        if !parent_scope_is_proven_empty(parent_manifest, &scope)? {
+        if !touched_scope_filter_proves_absent(inherited_scope_filter, &scope)? {
             return Ok(None);
         }
         let marker = ScopedRangeCoverageMarker {
@@ -178,7 +179,12 @@ async fn stage_disjoint_columnar_current_state_pages(
         }
     };
     Ok(Some(attest_scoped_range_root(
-        commit_id, parent, inventory, tree,
+        commit_id,
+        parent_manifest
+            .zip(parent)
+            .map(|(manifest, root)| (manifest.commit_id, root)),
+        inventory,
+        tree,
     )?))
 }
 
@@ -186,6 +192,7 @@ async fn stage_disjoint_columnar_current_state_pages(
 /// lineage. Bloom false positives only disable publication; a negative is an
 /// exact absence proof because every exactly bounded mutation contributes its
 /// scope and unknown/broad mutations make the certificate incomplete.
+#[cfg(test)]
 fn parent_scope_is_proven_empty(
     parent: Option<&CommitStateManifest>,
     scope: &CommitDeltaReplacementScope,
@@ -212,10 +219,7 @@ fn advance_touched_scope_filter(
     selected_source: Option<&CommitStateManifest>,
     touched: Option<&[CommitDeltaReplacementScope]>,
 ) -> Result<CommitStateTouchedScopeFilter, LixError> {
-    let Some(touched) = touched else {
-        return Ok(incomplete_touched_scope_filter());
-    };
-    let mut filter = if let Some(source) = selected_source {
+    let filter = if let Some(source) = selected_source {
         validate_touched_scope_filter(&source.touched_scope_filter)?;
         if !source.touched_scope_filter.complete {
             return Ok(incomplete_touched_scope_filter());
@@ -245,6 +249,19 @@ fn advance_touched_scope_filter(
             }
         }
     };
+    extend_touched_scope_filter(filter, touched)
+}
+
+fn extend_touched_scope_filter(
+    mut filter: CommitStateTouchedScopeFilter,
+    touched: Option<&[CommitDeltaReplacementScope]>,
+) -> Result<CommitStateTouchedScopeFilter, LixError> {
+    let Some(touched) = touched else {
+        return Ok(incomplete_touched_scope_filter());
+    };
+    if !filter.complete {
+        return Ok(filter);
+    }
     for scope in touched {
         for bit in touched_scope_filter_bits(scope.schema_key.as_bytes()) {
             filter.bits[bit / 8] |= 1 << (bit % 8);
@@ -360,6 +377,7 @@ impl CertifiedCommitStatePhysicalPublication {
 /// root itself cannot cross a merge or selected-source topology edge. Graph
 /// parents are unioned conservatively. A selected source supplies the complete
 /// inherited state, so it supersedes graph parents for this proof.
+#[cfg(test)]
 pub(super) fn certify_topology_touched_scope_filter_from_manifests(
     writes: &StorageWriteSet,
     parents: &[&CommitStateManifest],
@@ -418,16 +436,21 @@ pub(crate) fn current_state_mutation_authority_digest(
 
 pub(crate) fn scoped_range_transition_digest(
     commit_id: CommitId,
-    parent_root_id: Option<[u8; 32]>,
+    serving_base_commit_id: Option<CommitId>,
+    serving_base_root_id: Option<[u8; 32]>,
     inventory: &CommitStateMutationInventory,
     tree: &ScopedRangeRoot,
 ) -> Result<[u8; 32], LixError> {
     let authority = current_state_mutation_authority_digest(inventory)?;
     let mut digest = blake3::Hasher::new_derive_key(TRANSITION_CONTEXT);
     digest.update(commit_id.as_uuid().as_bytes());
-    digest.update(&[u8::from(parent_root_id.is_some())]);
-    if let Some(parent_root_id) = parent_root_id {
-        digest.update(&parent_root_id);
+    digest.update(&[u8::from(serving_base_commit_id.is_some())]);
+    if let Some(serving_base_commit_id) = serving_base_commit_id {
+        digest.update(serving_base_commit_id.as_uuid().as_bytes());
+    }
+    digest.update(&[u8::from(serving_base_root_id.is_some())]);
+    if let Some(serving_base_root_id) = serving_base_root_id {
+        digest.update(&serving_base_root_id);
     }
     digest.update(&authority);
     digest.update(&tree.root_id);
@@ -441,16 +464,23 @@ pub(crate) fn scoped_range_transition_digest(
 
 pub(crate) fn attest_scoped_range_root(
     commit_id: CommitId,
-    parent: Option<&CurrentStateScopedRangeRoot>,
+    serving_base: Option<(CommitId, &CurrentStateScopedRangeRoot)>,
     inventory: &CommitStateMutationInventory,
     tree: ScopedRangeRoot,
 ) -> Result<CurrentStateScopedRangeRoot, LixError> {
-    let parent_root_id = parent.map(|parent| parent.tree.root_id);
-    let transition_digest =
-        scoped_range_transition_digest(commit_id, parent_root_id, inventory, &tree)?;
+    let serving_base_commit_id = serving_base.map(|(commit_id, _)| commit_id);
+    let serving_base_root_id = serving_base.map(|(_, root)| root.tree.root_id);
+    let transition_digest = scoped_range_transition_digest(
+        commit_id,
+        serving_base_commit_id,
+        serving_base_root_id,
+        inventory,
+        &tree,
+    )?;
     Ok(CurrentStateScopedRangeRoot {
         tree,
-        parent_root_id,
+        serving_base_commit_id,
+        serving_base_root_id,
         transition_digest,
     })
 }
@@ -458,6 +488,7 @@ pub(crate) fn attest_scoped_range_root(
 pub(crate) async fn stage_complete_replacement_scoped_range_root(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
+    serving_base_commit_id: Option<CommitId>,
     parent: Option<&CurrentStateScopedRangeRoot>,
     commit_id: CommitId,
     inventory: &CommitStateMutationInventory,
@@ -537,7 +568,10 @@ pub(crate) async fn stage_complete_replacement_scoped_range_root(
         None => stage_scoped_range_tree(writes, [(marker, parts)])?,
     };
     Ok(Some(attest_scoped_range_root(
-        commit_id, parent, inventory, tree,
+        commit_id,
+        serving_base_commit_id.zip(parent),
+        inventory,
+        tree,
     )?))
 }
 
@@ -547,50 +581,71 @@ pub(crate) async fn stage_complete_replacement_scoped_range_root(
 pub(crate) async fn stage_current_state_scoped_ranges(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
-    parent: Option<&CommitStateManifest>,
+    graph_parents: &[&CommitStateManifest],
+    selected_source: Option<&CommitStateManifest>,
+    serving_base: Option<&CommitStateManifest>,
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<CertifiedCommitStatePhysicalPublication, LixError> {
-    let parent_commit_ids = CertifiedGraphParents::from_manifests(parent.as_slice());
-    let parent_root = parent.and_then(|parent| parent.current_state_scoped_ranges.as_deref());
-    let touched = crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
+    let parent_commit_ids = CertifiedGraphParents::from_manifests(graph_parents);
+    let selected_source_commit_id = selected_source.map(|source| source.commit_id);
+    if selected_source_commit_id != inventory.selected_source_commit_id() {
+        return Err(scoped_state_error(
+            "selected-source manifest disagrees with mutation authority",
+        ));
+    }
+    let parent_root = serving_base.and_then(|parent| parent.current_state_scoped_ranges.as_deref());
+    let touched = crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
         commit_id,
         inventory,
-        parent.is_none(),
+        serving_base.is_none(),
     )?;
     // Descriptor cascades make exact per-file serving scopes unknown, but
     // they cannot introduce a schema family that was absent from the parent:
     // every cascaded row had to be authored earlier. Preserve the cumulative
     // negative certificate by adding only the current commit's authored schema
     // families, using empty-base scope extraction to ignore that cascade.
-    let filter_touched = if touched.is_some() || parent.is_none() {
+    let filter_touched = if touched.is_some() || serving_base.is_none() {
         touched.clone()
     } else {
-        crate::tracked_state::storage::commit_state_inventory_exact_touched_scopes(
+        crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
             commit_id, inventory, true,
         )?
     };
-    let touched_scope_filter =
-        advance_touched_scope_filter(parent.as_slice(), None, filter_touched.as_deref())?;
+    let inherited_scope_filter =
+        advance_touched_scope_filter(graph_parents, selected_source, Some(&[]))?;
     if inventory.columnar_parts.is_some() {
         let root = stage_disjoint_columnar_current_state_pages(
-            store, writes, parent, commit_id, inventory,
+            store,
+            writes,
+            serving_base,
+            &inherited_scope_filter,
+            commit_id,
+            inventory,
         )
         .await?;
+        let touched_scope_filter =
+            extend_touched_scope_filter(inherited_scope_filter, filter_touched.as_deref())?;
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             parent_commit_ids,
-            selected_source_commit_id: None,
+            selected_source_commit_id,
             root,
             touched_scope_filter,
         });
     }
+    let touched_scope_filter =
+        extend_touched_scope_filter(inherited_scope_filter, filter_touched.as_deref())?;
 
     if inventory.replacement_generation.is_some() {
         let root = stage_complete_replacement_scoped_range_root(
             store,
             writes,
+            touched
+                .as_ref()
+                .and(parent_root)
+                .and(serving_base.map(|parent| parent.commit_id)),
             touched.as_ref().and(parent_root),
             commit_id,
             inventory,
@@ -599,7 +654,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             parent_commit_ids,
-            selected_source_commit_id: None,
+            selected_source_commit_id,
             root,
             touched_scope_filter,
         });
@@ -609,7 +664,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             parent_commit_ids,
-            selected_source_commit_id: None,
+            selected_source_commit_id,
             root: None,
             touched_scope_filter,
         });
@@ -618,11 +673,25 @@ pub(crate) async fn stage_current_state_scoped_ranges(
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             parent_commit_ids,
-            selected_source_commit_id: None,
+            selected_source_commit_id,
             root: None,
             touched_scope_filter,
         });
     };
+    if touched.is_empty() {
+        return Ok(CertifiedCommitStatePhysicalPublication {
+            write_set_id: writes.identity(),
+            parent_commit_ids,
+            selected_source_commit_id,
+            root: Some(attest_scoped_range_root(
+                commit_id,
+                serving_base.map(|parent| (parent.commit_id, parent_root)),
+                inventory,
+                parent_root.tree.clone(),
+            )?),
+            touched_scope_filter,
+        });
+    }
     touched.sort();
     touched.dedup();
     let staged_segments = crate::tracked_state::storage::staged_commit_delta_segment_bytes(
@@ -653,7 +722,8 @@ pub(crate) async fn stage_current_state_scoped_ranges(
     for scope in touched {
         let transient = CurrentStateScopedRangeRoot {
             tree,
-            parent_root_id: parent_root.parent_root_id,
+            serving_base_commit_id: parent_root.serving_base_commit_id,
+            serving_base_root_id: parent_root.serving_base_root_id,
             transition_digest: parent_root.transition_digest,
         };
         let Some(rewritten) =
@@ -669,7 +739,7 @@ pub(crate) async fn stage_current_state_scoped_ranges(
             return Ok(CertifiedCommitStatePhysicalPublication {
                 write_set_id: writes.identity(),
                 parent_commit_ids,
-                selected_source_commit_id: None,
+                selected_source_commit_id,
                 root: None,
                 touched_scope_filter,
             });
@@ -684,10 +754,10 @@ pub(crate) async fn stage_current_state_scoped_ranges(
     Ok(CertifiedCommitStatePhysicalPublication {
         write_set_id: writes.identity(),
         parent_commit_ids,
-        selected_source_commit_id: None,
+        selected_source_commit_id,
         root: Some(attest_scoped_range_root(
             commit_id,
-            Some(parent_root),
+            serving_base.map(|parent| (parent.commit_id, parent_root)),
             inventory,
             tree,
         )?),
@@ -701,7 +771,13 @@ pub(crate) fn validate_scoped_range_attestation(
     root: &CurrentStateScopedRangeRoot,
 ) -> Result<(), LixError> {
     if root.transition_digest
-        != scoped_range_transition_digest(commit_id, root.parent_root_id, inventory, &root.tree)?
+        != scoped_range_transition_digest(
+            commit_id,
+            root.serving_base_commit_id,
+            root.serving_base_root_id,
+            inventory,
+            &root.tree,
+        )?
     {
         return Err(scoped_state_error(
             "root transition is not bound to commit mutation authority",
@@ -738,14 +814,16 @@ mod tests {
         stage_scoped_range_tree, validate_scoped_range_tree,
     };
     use crate::tracked_state::storage::{
-        CommitDeltaReplacementGeneration, PublishedCommitStateManifest, load_commit_state_manifest,
+        CertifiedCommitStateTopologyParent, CommitDeltaReplacementGeneration,
+        PublishedCommitStateManifest, load_commit_state_manifest,
         load_complete_current_state_values_from_scoped_root, load_published_commit_state_manifest,
         sparse_current_state_materialization_count_for_test, stage_certified_commit_state_manifest,
         stage_certified_commit_state_manifest_with_handle, stage_commit_state_manifest,
         stage_current_state_scoped_ranges_from_published_parent,
         stage_current_state_scoped_ranges_from_staged_parent,
-        stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
-        validate_current_state_scoped_range_parent_manifest,
+        stage_current_state_scoped_ranges_from_topology, stage_ordered_addressable_commit_deltas,
+        stage_ordered_addressable_replacement_parts,
+        validate_current_state_scoped_range_serving_base_manifest,
     };
     use crate::tracked_state::types::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementScope, CommitStateManifest,
@@ -963,6 +1041,8 @@ mod tests {
         let parent_publication = stage_current_state_scoped_ranges(
             &empty_read,
             &mut parent_writes,
+            &[],
+            None,
             None,
             parent_id,
             crate::ANONYMOUS_ACCOUNT_ID,
@@ -1095,7 +1175,7 @@ mod tests {
             .await
             .expect("child authority should load")
             .expect("child authority should exist");
-        validate_current_state_scoped_range_parent_manifest(&child, Some(&parent))
+        validate_current_state_scoped_range_serving_base_manifest(&child, Some(&parent))
             .expect("child must bind the exact parent root");
         let values = load_complete_current_state_values_from_scoped_root(
             &child_read,
@@ -1499,6 +1579,8 @@ mod tests {
         let publication = stage_current_state_scoped_ranges(
             &read,
             &mut writes,
+            &[],
+            None,
             None,
             commit_id,
             crate::ANONYMOUS_ACCOUNT_ID,
@@ -1549,13 +1631,16 @@ mod tests {
 
         let mut unknown = CommitStateMutationInventory::default();
         unknown.member_count = 1;
-        unknown.selected_source_commit_id =
-            Some(*CommitId::for_test_label("selected").as_uuid().as_bytes());
+        let selected_id = CommitId::for_test_label("selected");
+        unknown.selected_source_commit_id = Some(*selected_id.as_uuid().as_bytes());
+        let selected = manifest(selected_id, None, CommitStateMutationInventory::default());
         let mut writes = storage.new_write_set();
         let publication = stage_current_state_scoped_ranges(
             &read,
             &mut writes,
-            None,
+            &[],
+            Some(&selected),
+            Some(&selected),
             commit_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             &unknown,
@@ -1577,6 +1662,8 @@ mod tests {
         let publication = stage_current_state_scoped_ranges(
             &read,
             &mut writes,
+            &[],
+            None,
             None,
             commit_id,
             crate::ANONYMOUS_ACCOUNT_ID,
@@ -1729,6 +1816,81 @@ mod tests {
 
         merged.parent_commit_ids.swap(0, 1);
         assert!(stage_certified_commit_state_manifest(&mut writes, &merged, &publication).is_err());
+    }
+
+    #[tokio::test]
+    async fn topology_publication_binds_merge_and_selected_source_serving_bases() {
+        let storage = StorageAdapter::new(Memory::new());
+        let left_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_3300_0000_7000_8000_0001_0000_0000,
+        ));
+        let left = publish_replacement_scope(&storage, None, left_id, "left_schema").await;
+        let right_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_3300_0000_7000_8000_0002_0000_0000,
+        ));
+        let right = publish_replacement_scope(&storage, None, right_id, "right_schema").await;
+        let left_root = left
+            .current_state_scoped_ranges
+            .as_deref()
+            .expect("left parent has a serving root");
+        let right_root = right
+            .current_state_scoped_ranges
+            .as_deref()
+            .expect("right parent has a serving root");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+
+        let merge_commit = CommitId::for_test_label("serving-base-merge");
+        let merge_inventory = CommitStateMutationInventory::default();
+        let mut merge_writes = storage.new_write_set();
+        let merge_publication = stage_current_state_scoped_ranges_from_topology(
+            &read,
+            &mut merge_writes,
+            &[
+                CertifiedCommitStateTopologyParent::Published(&left),
+                CertifiedCommitStateTopologyParent::Published(&right),
+            ],
+            None,
+            merge_commit,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &merge_inventory,
+        )
+        .await
+        .unwrap();
+        let merge_root = merge_publication.root().expect("merge reuses target root");
+        assert_eq!(merge_root.serving_base_commit_id, Some(left.commit_id));
+        assert_eq!(
+            merge_root.serving_base_root_id,
+            Some(left_root.tree.root_id)
+        );
+        assert_eq!(merge_root.tree, left_root.tree);
+
+        let alias_commit = CommitId::for_test_label("serving-base-selected-source");
+        let mut alias_inventory = CommitStateMutationInventory::default();
+        alias_inventory.selected_source_commit_id = Some(*right.commit_id.as_uuid().as_bytes());
+        let mut alias_writes = storage.new_write_set();
+        let alias_publication = stage_current_state_scoped_ranges_from_topology(
+            &read,
+            &mut alias_writes,
+            &[CertifiedCommitStateTopologyParent::Published(&left)],
+            Some(CertifiedCommitStateTopologyParent::Published(&right)),
+            alias_commit,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &alias_inventory,
+        )
+        .await
+        .unwrap();
+        let alias_root = alias_publication
+            .root()
+            .expect("selected source supplies serving root");
+        assert_eq!(alias_root.serving_base_commit_id, Some(right.commit_id));
+        assert_eq!(
+            alias_root.serving_base_root_id,
+            Some(right_root.tree.root_id)
+        );
+        assert_eq!(alias_root.tree, right_root.tree);
     }
 
     #[test]

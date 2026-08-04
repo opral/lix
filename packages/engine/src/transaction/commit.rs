@@ -5462,13 +5462,18 @@ where
                             })
                     })
                     .transpose()?;
-                Some(crate::tracked_state::certify_topology_touched_scope_filter(
-                    writes,
-                    &topology_parents,
-                    selected_source,
-                    record.commit_id,
-                    &mutations,
-                )?)
+                Some(
+                    crate::tracked_state::stage_current_state_scoped_ranges_from_topology(
+                        read,
+                        writes,
+                        &topology_parents,
+                        selected_source,
+                        record.commit_id,
+                        &record.account_id,
+                        &mutations,
+                    )
+                    .await?,
+                )
             };
             let current_state_scoped_ranges = catalog_publication
                 .as_ref()
