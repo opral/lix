@@ -1581,22 +1581,30 @@ pub(crate) async fn scan_scoped_range_interval(
     })
 }
 
+/// Resolves only the authenticated coverage marker for one exact scope.
+pub(crate) async fn load_scoped_range_coverage(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &ScopedRangeRoot,
+    scope: &ScopedRangePrefix,
+) -> Result<Option<ScopedRangeCoverageMarker>, LixError> {
+    match find_exact(store, root, &marker_route(scope)).await? {
+        Some(ScopedRangeEntry::Marker(marker)) if marker.scope == *scope => Ok(Some(marker)),
+        Some(ScopedRangeEntry::Marker(_)) | None => Ok(None),
+        Some(ScopedRangeEntry::Part(_)) => {
+            Err(scoped_range_error("scope marker route resolved a part"))
+        }
+    }
+}
+
 /// Returns every part in one exact scope without inventing a sentinel entity
 /// key. The synthetic route kind sorts after all part starts in that scope.
-#[cfg(feature = "storage-benches")]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn scan_scoped_range_scope(
     store: &(impl StorageAdapterRead + ?Sized),
     root: &ScopedRangeRoot,
     scope: &ScopedRangePrefix,
 ) -> Result<ScopedRangeInterval, LixError> {
-    let marker = find_exact(store, root, &marker_route(scope)).await?;
-    let coverage = match marker {
-        Some(ScopedRangeEntry::Marker(marker)) if marker.scope == *scope => Some(marker),
-        Some(ScopedRangeEntry::Marker(_)) | None => None,
-        Some(ScopedRangeEntry::Part(_)) => {
-            return Err(scoped_range_error("scope marker route resolved a part"));
-        }
-    };
+    let coverage = load_scoped_range_coverage(store, root, scope).await?;
     let Some(coverage) = coverage else {
         return Ok(ScopedRangeInterval {
             coverage: None,

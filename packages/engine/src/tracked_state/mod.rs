@@ -76,8 +76,9 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{
-    TRACKED_STATE_COMMIT_STATE_SEAL_SPACE, load_authoritative_commit_root,
-    load_commit_delta_change_ids, scan_commit_delta_members,
+    TRACKED_STATE_COMMIT_STATE_SEAL_SPACE, change_id_from_packed_address,
+    load_authoritative_commit_root, load_commit_delta_change_ids,
+    load_complete_current_state_values_from_scoped_root, scan_commit_delta_members,
     stage_resealed_commit_state_manifest_for_test,
 };
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};

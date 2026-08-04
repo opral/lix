@@ -1,9 +1,26 @@
-//! Storage identities for derived entity columnar row groups.
+//! Entity-specific contract layered over generic immutable columnar row groups.
 
 use std::collections::BTreeMap;
 
 use crate::changelog::CommitId;
 use crate::columnar_row_group::{RowGroupRowLocation, RowGroupSetId};
+
+pub(crate) const ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
+    "lix.entity_columnar.lossless_snapshot.v1";
+pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
+
+pub(crate) fn entity_identity_column_index(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+) -> Option<usize> {
+    (manifest
+        .metadata
+        .get(ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
+        .map(String::as_str)
+        == Some("true"))
+    .then(|| manifest.fields.len().checked_sub(1))
+    .flatten()
+    .filter(|&index| manifest.fields[index].name == ENTITY_COLUMNAR_ENTITY_PK_FIELD)
+}
 
 pub(crate) struct EntityColumnarWriteSets {
     sets: BTreeMap<(CommitId, String), crate::columnar_row_group::EncodedRowGroupSet>,

@@ -5726,6 +5726,75 @@ mod tests {
         assert!(commit_state.mutations.inline_part.is_empty());
         assert!(commit_state.mutations.parts.is_empty());
         assert_eq!(columnar_parts.page_first_keys.len(), 33);
+        let serving_root = commit_state
+            .current_state_scoped_ranges
+            .as_deref()
+            .expect("new collection insert must publish canonical column pages");
+        let serving_scope =
+            crate::tracked_state::current_state_envelope::current_state_scope_prefix(
+                &crate::tracked_state::CommitDeltaReplacementScope {
+                    schema_key: "columnar_lifecycle_probe".to_owned(),
+                    file_id: None,
+                },
+            )
+            .expect("test scope should encode");
+        let serving = crate::tracked_state::scoped_range::scan_scoped_range_scope(
+            &read,
+            &serving_root.tree,
+            &serving_scope,
+        )
+        .await
+        .expect("columnar serving scope should scan");
+        assert_eq!(serving.parts.len(), 33);
+        assert_eq!(
+            serving
+                .parts
+                .iter()
+                .map(|part| {
+                    crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
+                        .expect("columnar locator should decode")
+                        .source_kind
+                })
+                .collect::<Vec<_>>(),
+            vec![2; 33]
+        );
+        let owner =
+            crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle serving owner")
+                .expect("insert head should be canonical");
+        let point_ids = ["02047", "02048", "65535", "65536", "70000"];
+        let point_keys = point_ids
+            .iter()
+            .map(|identity| {
+                let entity_pk = EntityPk::from_json_array_text(&format!("[\"{identity}\"]"))
+                    .expect("test identity should parse");
+                bytes::Bytes::from(crate::tracked_state::encode_key_ref(
+                    crate::tracked_state::TrackedStateKeyRef {
+                        schema_key: "columnar_lifecycle_probe",
+                        file_id: None,
+                        entity_pk: &entity_pk,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        let point_values =
+            crate::tracked_state::load_complete_current_state_values_from_scoped_root(
+                &read,
+                serving_root,
+                &point_keys,
+            )
+            .await
+            .expect("page-backed points should load")
+            .expect("the new collection scope should be covered");
+        for (index, ordinal) in [2047_u32, 2048, 65_535, 65_536].into_iter().enumerate() {
+            assert_eq!(
+                point_values[index]
+                    .as_ref()
+                    .expect("inserted page identity should resolve")
+                    .change_id,
+                crate::tracked_state::change_id_from_packed_address(owner, ordinal + 1,)
+            );
+        }
+        assert!(point_values[4].is_none());
         drop(read);
 
         assert_columnar_lifecycle_current(&main, ROW_COUNT, "base-0000", "base-1023").await;

@@ -32,6 +32,9 @@ use crate::storage_adapter::{
 pub(crate) const ROW_GROUP_MAX_ROWS: usize = 64 * 1024;
 /// Independently compressed point-read unit inside a scan-oriented row group.
 pub(crate) const ROW_GROUP_PAGE_ROWS: usize = 2 * 1024;
+/// Backpressure budget expressed in projected physical column pages. Wider
+/// projections therefore use smaller coordinate batches automatically.
+const ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RowGroupRowLocation {
@@ -483,6 +486,20 @@ pub(crate) async fn load_row_group_manifest(
     decode_manifest(&bytes).map(Some)
 }
 
+/// Loads an immutable manifest through the transaction-local write overlay.
+/// Row-group publication and current-state publication share one atomic write
+/// set, so a serving descriptor must validate the exact bytes being staged
+/// without requiring an intermediate storage commit.
+pub(crate) fn load_staged_row_group_manifest(
+    writes: &StorageWriteSet,
+    id: RowGroupSetId,
+) -> Result<Option<RowGroupManifest>, LixError> {
+    if let Some(bytes) = writes.staged_value(ROW_GROUP_MANIFEST_SPACE, id.as_bytes().as_slice()) {
+        return decode_manifest(&bytes).map(Some);
+    }
+    Ok(None)
+}
+
 /// Stages deletion of one immutable set and every addressed column. The
 /// owning commit remains the lifecycle authority; repository GC invokes this
 /// only after that commit leaves the reachable history graph.
@@ -633,6 +650,145 @@ pub(crate) async fn load_row_group_page(
     page_index: usize,
     projection: &[usize],
 ) -> Result<RecordBatch, LixError> {
+    load_row_group_pages(
+        store,
+        id,
+        manifest,
+        &[(group_index, page_index)],
+        projection,
+    )
+    .await?
+    .pop()
+    .ok_or_else(|| row_group_error("row-group page read returned no batch"))
+}
+
+/// Loads multiple pages from one immutable set in one backend point-read
+/// batch. Caller order and duplicate coordinates are preserved.
+pub(crate) async fn load_row_group_pages(
+    store: &(impl StorageAdapterRead + ?Sized),
+    id: RowGroupSetId,
+    manifest: &RowGroupManifest,
+    pages: &[(usize, usize)],
+    projection: &[usize],
+) -> Result<Vec<RecordBatch>, LixError> {
+    let mut batches = Vec::with_capacity(pages.len());
+    visit_row_group_pages(store, id, manifest, pages, projection, |_, batch| {
+        batches.push(batch);
+        Ok(())
+    })
+    .await?;
+    Ok(batches)
+}
+
+/// Visits requested pages in caller order while bounding compressed and
+/// decoded working state. A page batch is dropped before the next physical
+/// read unless the caller deliberately retains it. A projection wider than
+/// the budget still reads one indivisible coordinate at a time; the budget
+/// limits physical working state rather than imposing a query-size policy.
+pub(crate) async fn visit_row_group_pages(
+    store: &(impl StorageAdapterRead + ?Sized),
+    id: RowGroupSetId,
+    manifest: &RowGroupManifest,
+    pages: &[(usize, usize)],
+    projection: &[usize],
+    mut visit: impl FnMut((usize, usize), RecordBatch) -> Result<(), LixError>,
+) -> Result<crate::storage_adapter::StorageReadStats, LixError> {
+    validate_projection(manifest, projection)?;
+    let mut stats = crate::storage_adapter::StorageReadStats::default();
+    let coordinates_per_batch = if projection.is_empty() {
+        ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES
+    } else {
+        (ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES / projection.len()).max(1)
+    };
+    for coordinate_batch in pages.chunks(coordinates_per_batch) {
+        let mut page_row_counts = Vec::with_capacity(coordinate_batch.len());
+        let mut keys = Vec::with_capacity(coordinate_batch.len().saturating_mul(projection.len()));
+        for &(group_index, page_index) in coordinate_batch {
+            let group = manifest.groups.get(group_index).ok_or_else(|| {
+                row_group_error(format!(
+                    "row-group index {group_index} is outside the manifest"
+                ))
+            })?;
+            let page_count = (group.row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
+            if page_index >= page_count {
+                return Err(row_group_error(format!(
+                    "row-group page index {page_index} is outside {page_count} pages"
+                )));
+            }
+            page_row_counts
+                .push(ROW_GROUP_PAGE_ROWS.min(
+                    group.row_count as usize - page_index.saturating_mul(ROW_GROUP_PAGE_ROWS),
+                ));
+            for &column_index in projection {
+                keys.push(id.column_key(group_index, page_index, column_index)?);
+            }
+        }
+        let loaded = PointReadPlan::new(ROW_GROUP_COLUMN_SPACE, &keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+        stats.add(loaded.stats);
+        let mut values = loaded.value.into_iter();
+        for (&(group_index, page_index), page_rows) in coordinate_batch.iter().zip(page_row_counts)
+        {
+            if projection.is_empty() {
+                visit(
+                    (group_index, page_index),
+                    RecordBatch::try_new_with_options(
+                        projected_schema(manifest, projection),
+                        Vec::new(),
+                        &RecordBatchOptions::new().with_row_count(Some(page_rows)),
+                    )
+                    .map_err(|error| row_group_error(error.to_string()))?,
+                )?;
+                continue;
+            }
+            let group = &manifest.groups[group_index];
+            let mut arrays = Vec::with_capacity(projection.len());
+            for &column_index in projection {
+                let bytes = values
+                    .next()
+                    .flatten()
+                    .and_then(|value| match value {
+                        StorageProjectedValue::FullValue(bytes) => Some(bytes),
+                        StorageProjectedValue::KeyOnly => None,
+                    })
+                    .ok_or_else(|| {
+                        row_group_error(format!(
+                            "row-group {group_index} page {page_index} column {column_index} is missing"
+                        ))
+                    })?;
+                arrays.push(decode_verified_column(
+                    &bytes,
+                    group.column_page_digests[column_index][page_index],
+                    manifest.fields[column_index].data_type,
+                    page_rows,
+                )?);
+            }
+            visit(
+                (group_index, page_index),
+                RecordBatch::try_new(projected_schema(manifest, projection), arrays)
+                    .map_err(|error| row_group_error(error.to_string()))?,
+            )?;
+        }
+        if values.next().is_some() {
+            return Err(row_group_error(
+                "row-group page read returned excess column values",
+            ));
+        }
+    }
+    Ok(stats)
+}
+
+/// Loads one page through ordinary storage plus the current atomic write set.
+/// Only columns absent from the overlay are issued as physical point reads.
+pub(crate) fn load_staged_row_group_page(
+    writes: &StorageWriteSet,
+    id: RowGroupSetId,
+    manifest: &RowGroupManifest,
+    group_index: usize,
+    page_index: usize,
+    projection: &[usize],
+) -> Result<RecordBatch, LixError> {
     validate_projection(manifest, projection)?;
     let group = manifest.groups.get(group_index).ok_or_else(|| {
         row_group_error(format!(
@@ -651,21 +807,18 @@ pub(crate) async fn load_row_group_page(
         .iter()
         .map(|&column_index| id.column_key(group_index, page_index, column_index))
         .collect::<Result<Vec<_>, _>>()?;
-    let loaded = PointReadPlan::from_unique_keys(ROW_GROUP_COLUMN_SPACE, keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
+    let values = keys
+        .iter()
+        .map(|key| writes.staged_value(ROW_GROUP_COLUMN_SPACE, key.0.as_ref()))
+        .collect::<Vec<_>>();
     let mut arrays = Vec::with_capacity(projection.len());
-    for (&column_index, value) in projection.iter().zip(loaded.value) {
-        let bytes = value
-            .and_then(|value| match value {
-                StorageProjectedValue::FullValue(bytes) => Some(bytes),
-                StorageProjectedValue::KeyOnly => None,
-            })
-            .ok_or_else(|| {
-                row_group_error(format!(
-                    "row-group {group_index} page {page_index} column {column_index} is missing"
-                ))
-            })?;
+    for ((&column_index, bytes), key) in projection.iter().zip(values).zip(keys) {
+        let bytes = bytes.ok_or_else(|| {
+            row_group_error(format!(
+                "row-group {group_index} page {page_index} column {column_index} is missing at {:?}",
+                key.0
+            ))
+        })?;
         arrays.push(decode_verified_column(
             &bytes,
             group.column_page_digests[column_index][page_index],
@@ -1626,6 +1779,76 @@ mod tests {
         assert_eq!(last.num_rows(), 3);
         assert_eq!(last.num_columns(), 1);
         assert_eq!(last.schema().field(0).name(), "name");
+        let pages =
+            load_row_group_pages(&read, id, &loaded.manifest, &[(0, 0), (0, 1), (0, 0)], &[1])
+                .await
+                .expect("load projected pages in one batch");
+        assert_eq!(
+            pages.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![
+                ROW_GROUP_PAGE_ROWS,
+                ROW_GROUP_PAGE_ROWS,
+                ROW_GROUP_PAGE_ROWS
+            ]
+        );
+        assert_eq!(pages[0], pages[2], "duplicate coordinates preserve order");
+        let all_page_coordinates = (0..loaded.manifest.groups.len())
+            .flat_map(|group_index| {
+                let page_count = (loaded.manifest.groups[group_index].row_count as usize)
+                    .div_ceil(ROW_GROUP_PAGE_ROWS);
+                (0..page_count).map(move |page_index| (group_index, page_index))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            all_page_coordinates.len() > ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES,
+            "fixture must cross the physical page backpressure boundary"
+        );
+        let mut visited = Vec::new();
+        let visit_stats = visit_row_group_pages(
+            &read,
+            id,
+            &loaded.manifest,
+            &all_page_coordinates,
+            &[0],
+            |coordinate, batch| {
+                visited.push((coordinate, batch.num_rows()));
+                Ok(())
+            },
+        )
+        .await
+        .expect("visit pages across the backpressure boundary");
+        assert_eq!(
+            visited
+                .iter()
+                .map(|(coordinate, _)| *coordinate)
+                .collect::<Vec<_>>(),
+            all_page_coordinates
+        );
+        assert_eq!(
+            visit_stats.storage_calls, 2,
+            "33 projected pages must collapse from 33 calls to two bounded batches"
+        );
+        let full_projection = (0..loaded.manifest.fields.len()).collect::<Vec<_>>();
+        let full_stats = visit_row_group_pages(
+            &read,
+            id,
+            &loaded.manifest,
+            &all_page_coordinates,
+            &full_projection,
+            |_, _| Ok(()),
+        )
+        .await
+        .expect("visit fully projected pages with bounded batching");
+        let coordinates_per_batch =
+            (ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES / full_projection.len()).max(1);
+        assert_eq!(
+            full_stats.storage_calls,
+            all_page_coordinates.len().div_ceil(coordinates_per_batch) as u64
+        );
+        assert!(
+            full_stats.storage_calls < all_page_coordinates.len() as u64,
+            "full-page hydration must issue fewer calls than one request per page"
+        );
         assert!(
             load_row_group_manifest(&read, RowGroupSetId::new([9; 16]))
                 .await

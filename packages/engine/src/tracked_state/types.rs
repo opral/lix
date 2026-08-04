@@ -286,10 +286,18 @@ pub(crate) struct CurrentStatePartDescriptor {
     /// complete-replacement sources whose history authority owns reachability.
     pub(crate) payload_refs_digest: [u8; 32],
     /// 0 references an immutable complete-replacement mutation part; 1
-    /// references a native content-addressed current-state data part.
+    /// references a native content-addressed current-state data part; 2
+    /// references one authenticated page in a canonical entity row-group set.
     pub(crate) source_kind: u8,
+    /// Physical immutable source generation. Zero for replacement/native
+    /// sources; the exact row-group-set ID for columnar pages.
+    pub(crate) source_id: [u8; 16],
     pub(crate) owner_commit_id: [u8; 16],
+    /// Replacement segment index or columnar row-group index. Zero for native
+    /// current-state data parts.
     pub(crate) part_index: u32,
+    /// Columnar page index inside `part_index`. Zero for other source kinds.
+    pub(crate) source_page_index: u16,
     /// First physical row selected from the source part. Descriptor slicing
     /// allows sparse deletes and updates to retain untouched source bytes.
     pub(crate) source_row_offset: u16,

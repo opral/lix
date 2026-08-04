@@ -10,7 +10,10 @@ pub(crate) mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{BranchHeadControlCache, LiveStateContext, LiveStateStoreReader};
-pub(crate) use entity_columnar::{EntityColumnarWriteSets, entity_row_group_set_id};
+pub(crate) use entity_columnar::{
+    ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    EntityColumnarWriteSets, entity_identity_column_index, entity_row_group_set_id,
+};
 pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
 };

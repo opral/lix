@@ -667,6 +667,26 @@ fn profile_hot_sql_session_operations(
         repeats,
         elapsed / repeats_u32,
     );
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_READ_AFTER_HOT_UPDATES").is_some()
+        && matches!(operation, TransactionBenchOp::UpdateOneByPk)
+    {
+        let _ = runtime.block_on(fixture.read_many_by_pk());
+        let mut samples = Vec::with_capacity(profile_sample_count());
+        for _ in 0..profile_sample_count() {
+            let started = Instant::now();
+            black_box(runtime.block_on(fixture.read_many_by_pk()));
+            samples.push(started.elapsed());
+        }
+        print_profile_samples(
+            &format!(
+                "sql_session/{}/warm_after_{repeats}_updates",
+                profile.name()
+            ),
+            TransactionBenchOp::ReadManyByPk,
+            read_many_pk_count,
+            samples,
+        );
+    }
     if matches!(operation, TransactionBenchOp::ReadOneByPk) {
         let cache = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
         println!(
