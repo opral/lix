@@ -29,8 +29,6 @@ async fn stage_disjoint_columnar_current_state_pages(
     commit_id: CommitId,
     inventory: &CommitStateMutationInventory,
 ) -> Result<Option<CurrentStateScopedRangeRoot>, LixError> {
-    use datafusion::arrow::array::{Array, StringArray};
-
     let parent =
         parent_manifest.and_then(|manifest| manifest.current_state_scoped_ranges.as_deref());
     let parts = inventory
@@ -52,64 +50,38 @@ async fn stage_disjoint_columnar_current_state_pages(
     let manifest = crate::columnar_row_group::load_staged_row_group_manifest(writes, set_id)?
         .ok_or_else(|| scoped_state_error("columnar publication manifest is missing"))?;
     crate::tracked_state::storage::validate_columnar_mutation_manifest(&manifest, parts)?;
-    let identity_column = manifest
-        .fields
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| scoped_state_error("columnar publication has no identity column"))?;
-    let mut descriptors = Vec::with_capacity(parts.page_first_keys.len());
+    let mut descriptors =
+        Vec::<CurrentStatePartDescriptor>::with_capacity(parts.page_first_keys.len());
     let mut fence_index = 0usize;
     let mut global_ordinal = 0u64;
     for (group_index, group) in manifest.groups.iter().enumerate() {
         let page_count =
             (group.row_count as usize).div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS);
         for page_index in 0..page_count {
-            let batch = crate::columnar_row_group::load_staged_row_group_page(
-                writes,
-                set_id,
-                &manifest,
-                group_index,
-                page_index,
-                &[identity_column],
-            )?;
-            let identities = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| scoped_state_error("columnar identity page is not UTF-8"))?;
-            if identities.is_empty() || identities.null_count() != 0 {
-                return Err(scoped_state_error(
-                    "columnar identity page is empty or contains nulls",
-                ));
-            }
-            let encoded_keys = (0..identities.len())
-                .map(|row_index| {
-                    let entity_pk = crate::entity_pk::EntityPk::from_json_array_text(
-                        identities.value(row_index),
-                    )
-                    .map_err(|error| scoped_state_error(error.to_string()))?;
-                    Ok(crate::tracked_state::codec::encode_key_ref(
-                        crate::tracked_state::types::TrackedStateKeyRef {
-                            schema_key: &parts.schema_key,
-                            file_id: None,
-                            entity_pk: &entity_pk,
-                        },
-                    ))
-                })
-                .collect::<Result<Vec<_>, LixError>>()?;
-            if encoded_keys.windows(2).any(|pair| pair[0] >= pair[1])
-                || parts.page_first_keys.get(fence_index) != encoded_keys.first()
-                || parts.page_last_keys.get(fence_index) != encoded_keys.last()
+            let row_count = u16::try_from(
+                (group.row_count as usize
+                    - page_index * crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
+                    .min(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS),
+            )
+            .map_err(|_| scoped_state_error("columnar page row count exceeds u16"))?;
+            let first_key = parts.page_first_keys.get(fence_index).ok_or_else(|| {
+                scoped_state_error("columnar mutation authority omitted a page first-key fence")
+            })?;
+            let last_key = parts.page_last_keys.get(fence_index).ok_or_else(|| {
+                scoped_state_error("columnar mutation authority omitted a page last-key fence")
+            })?;
+            if first_key > last_key
+                || descriptors
+                    .last()
+                    .is_some_and(|previous| previous.last_key.as_slice() >= first_key.as_slice())
             {
                 return Err(scoped_state_error(
-                    "columnar identity page disagrees with authenticated key fences",
+                    "columnar mutation authority has unordered page key fences",
                 ));
             }
-            let row_count = u16::try_from(identities.len())
-                .map_err(|_| scoped_state_error("columnar page row count exceeds u16"))?;
             descriptors.push(CurrentStatePartDescriptor {
-                first_key: encoded_keys.first().expect("non-empty page").clone(),
-                last_key: encoded_keys.last().expect("non-empty page").clone(),
+                first_key: first_key.clone(),
+                last_key: last_key.clone(),
                 content_digest: parts.manifest_digest,
                 payload_refs_digest: [0; 32],
                 source_kind: 2,
@@ -126,7 +98,7 @@ async fn stage_disjoint_columnar_current_state_pages(
                 uniform_updated_at: parts.uniform_updated_at,
             });
             global_ordinal = global_ordinal
-                .checked_add(identities.len() as u64)
+                .checked_add(u64::from(row_count))
                 .ok_or_else(|| scoped_state_error("columnar row count overflows"))?;
             fence_index += 1;
         }
