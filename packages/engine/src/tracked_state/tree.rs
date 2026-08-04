@@ -7,7 +7,7 @@
 )]
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroUsize,
     ops::Range,
@@ -1816,6 +1816,27 @@ impl TrackedStateTree {
             current = next;
         }
         Ok(out)
+    }
+
+    pub(crate) async fn reachable_chunk_hashes_with_overlay(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
+        root_id: &TrackedStateRootId,
+    ) -> Result<HashSet<[u8; TRACKED_STATE_HASH_BYTES]>, LixError> {
+        let mut reachable = HashSet::new();
+        let mut pending = vec![*root_id.as_bytes()];
+        while let Some(hash) = pending.pop() {
+            if !reachable.insert(hash) {
+                continue;
+            }
+            if let DecodedNode::Internal(internal) =
+                self.load_node_with_overlay(store, overlay, &hash).await?
+            {
+                pending.extend(internal.children().iter().map(|child| child.child_hash));
+            }
+        }
+        Ok(reachable)
     }
 
     fn collect_root_diff_shared<'a, S>(

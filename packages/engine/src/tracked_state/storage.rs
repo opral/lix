@@ -79,10 +79,10 @@ pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = Stora
 // smaller, but their logical slots must remain stable at this width.
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 // Bound newly authored ordered parts tightly enough that point and small-batch
-// reads do not decompress an entire 512-row payload neighborhood. A 1K commit
-// still publishes only sixteen parts, keeping mutation counts near the 35-put
-// reference while the same history authority serves bounded current points.
-const ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 64;
+// reads do not decompress an entire 512-row payload neighborhood. The 128-row
+// bound halves 1K segment puts versus 64-row parts while controlled RocksDB
+// CRUD keeps every point and bulk operation within the 5% latency envelope.
+const ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
@@ -2118,6 +2118,13 @@ pub(crate) async fn load_snapshot_commit_root(
     commit_id: &str,
 ) -> Result<Option<TrackedStateCommitRoot>, LixError> {
     let commit_id = CommitId::parse_lix(commit_id, "tracked-state snapshot root lookup")?;
+    // Rootless commits are the common bounded-replay layout. Probe physical
+    // authority first so they do not pay a second semantic lookup merely to
+    // prove the absence of a root pointer. A present pointer still requires
+    // semantic liveness before it may authorize any chunk reads.
+    let Some(snapshot_root) = load_manifest_snapshot_commit_root(store, commit_id).await? else {
+        return Ok(None);
+    };
     let commit_ids = [commit_id];
     let mut changelog = ChangelogContext::new().reader(store);
     let semantic_commit_exists = changelog
@@ -2132,7 +2139,7 @@ pub(crate) async fn load_snapshot_commit_root(
     if !semantic_commit_exists {
         return Ok(None);
     }
-    load_manifest_snapshot_commit_root(store, commit_id).await
+    Ok(Some(snapshot_root))
 }
 
 /// Loads the physical pointer without granting semantic commit liveness.
@@ -9712,6 +9719,33 @@ impl TrackedStateChunkOverlay {
 
     pub(crate) fn staged_chunk(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<&[u8]> {
         self.chunks.get(hash).map(AsRef::as_ref)
+    }
+
+    pub(crate) fn chunk_hashes(&self) -> impl Iterator<Item = [u8; TRACKED_STATE_HASH_BYTES]> + '_ {
+        self.chunks.keys().copied()
+    }
+
+    pub(crate) fn stage_selected_chunks(
+        &self,
+        writes: &mut StorageWriteSet,
+        hashes: impl IntoIterator<Item = [u8; TRACKED_STATE_HASH_BYTES]>,
+    ) -> Result<(), LixError> {
+        for hash in hashes {
+            let bytes = self.chunks.get(&hash).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state transient chunk promotion lost its overlay bytes",
+                )
+            })?;
+            writes.put(
+                TRACKED_STATE_TREE_CHUNK_SPACE,
+                StorageKey(Bytes::copy_from_slice(&hash)),
+                StorageValue {
+                    bytes: bytes.clone(),
+                },
+            );
+        }
+        Ok(())
     }
 
     fn staged_chunk_bytes(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<Bytes> {

@@ -2085,17 +2085,11 @@ async fn load_hot_collection_control(
     {
         return Ok(control);
     }
-    if load_root_current_base_commit(store, branch_id, branch_generation)
-        .await?
-        .is_some()
+    if let Some(base_commit_id) =
+        load_root_current_base_commit(store, branch_id, branch_generation).await?
     {
-        Box::pin(load_root_collection_control(
-            store,
-            branch_id,
-            branch_generation,
-            scope,
-        ))
-        .await
+        load_root_collection_control_from_base(store, base_commit_id, branch_generation, scope)
+            .await
     } else {
         Ok(HotCollectionControl {
             active_generation: branch_generation,
@@ -2170,21 +2164,12 @@ async fn load_hot_collection_visibility_control(
     storage_codec::decode("hot collection control", &bytes)
 }
 
-async fn load_root_collection_control(
+async fn load_root_collection_control_from_base(
     store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
+    base_commit_id: CommitId,
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
 ) -> Result<HotCollectionControl, LixError> {
-    let Some(base_commit_id) =
-        load_root_current_base_commit(store, branch_id, branch_generation).await?
-    else {
-        return Ok(HotCollectionControl {
-            active_generation: branch_generation,
-            live_count: 0,
-            ordered_identity_digest: None,
-        });
-    };
     let active_generation = load_root_active_collection_generations(store, base_commit_id, [scope])
         .await?
         .get(&(
@@ -2211,31 +2196,49 @@ async fn load_hot_collection_controls(
     }
     let values =
         load_stored_hot_collection_controls(store, branch_id, branch_generation, scopes).await?;
+    let missing_scopes = scopes
+        .iter()
+        .copied()
+        .zip(&values)
+        .filter_map(|(scope, value)| value.is_none().then_some(scope))
+        .collect::<Vec<_>>();
+    let root_generations = if missing_scopes.is_empty() {
+        None
+    } else if let Some(base_commit_id) =
+        load_root_current_base_commit(store, branch_id, branch_generation).await?
+    {
+        Some(
+            load_root_active_collection_generations(
+                store,
+                base_commit_id,
+                missing_scopes.iter().copied(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let mut controls = Vec::with_capacity(scopes.len());
     for (scope, value) in scopes.iter().copied().zip(values) {
-        controls.push(match value {
-            Some(control) => Ok(control),
-            None => {
-                if load_root_current_base_commit(store, branch_id, branch_generation)
-                    .await?
-                    .is_some()
-                {
-                    Box::pin(load_root_collection_control(
-                        store,
-                        branch_id,
-                        branch_generation,
-                        scope,
+        controls.push(match (value, root_generations.as_ref()) {
+            (Some(control), _) => control,
+            (None, Some(generations)) => HotCollectionControl {
+                active_generation: generations
+                    .get(&(
+                        scope.schema_key.to_owned(),
+                        scope.file_id.map(str::to_owned),
                     ))
-                    .await
-                } else {
-                    Ok(HotCollectionControl {
-                        active_generation: branch_generation,
-                        live_count: 0,
-                        ordered_identity_digest: None,
-                    })
-                }
-            }
-        }?);
+                    .map(|generation| generation.commit_id)
+                    .unwrap_or(branch_generation),
+                live_count: DEFERRED_ROOT_LIVE_COUNT,
+                ordered_identity_digest: None,
+            },
+            (None, None) => HotCollectionControl {
+                active_generation: branch_generation,
+                live_count: 0,
+                ordered_identity_digest: None,
+            },
+        });
     }
     Ok(controls)
 }
@@ -5467,6 +5470,7 @@ where
             generation,
             new_head,
             schema_increments,
+            None,
             working_diff_capture_checkpoint_commit_id,
             coverage,
         )
@@ -5510,6 +5514,7 @@ where
             generation,
             new_head,
             schema_increments,
+            None,
             working_diff_capture_checkpoint_commit_id,
             coverage,
         )
@@ -5550,6 +5555,32 @@ where
             },
         )
         .await?;
+        self.stage_complete_collection_replacement_current_base_with_control(
+            branch_id,
+            generation,
+            new_head,
+            schema_key,
+            row_count,
+            control,
+            entity_columnar_write_sets,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+        )
+        .await
+    }
+
+    async fn stage_complete_collection_replacement_current_base_with_control(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        schema_key: &str,
+        row_count: u64,
+        control: HotCollectionControl,
+        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<(CommitId, bool), LixError> {
         let live_count = if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
             let reader = HotStateStoreReader {
                 store: &*self.store,
@@ -5686,6 +5717,7 @@ where
         &mut self,
         branch_id: &str,
         generation: CommitId,
+        parent_commit_id: CommitId,
         new_head: CommitId,
         deltas: &[CurrentStateDeltaRef<'_>],
         entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
@@ -5723,6 +5755,17 @@ where
         else {
             return Ok(None);
         };
+        if !self
+            .authoritative_collection_matches(
+                parent_commit_id,
+                schema_key,
+                &entity_pks,
+                identity_digest,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         let control = load_hot_collection_control(
             self.store,
             branch_id,
@@ -5739,12 +5782,13 @@ where
         {
             return Ok(None);
         }
-        self.stage_complete_collection_replacement_current_base(
+        self.stage_complete_collection_replacement_current_base_with_control(
             branch_id,
             generation,
             new_head,
             schema_key,
-            entity_pks.len(),
+            u64::try_from(entity_pks.len()).unwrap_or(u64::MAX),
+            control,
             entity_columnar_write_sets,
             working_diff_capture_checkpoint_commit_id,
             coverage,
@@ -5762,6 +5806,7 @@ where
         &mut self,
         branch_id: &str,
         generation: CommitId,
+        parent_commit_id: CommitId,
         new_head: CommitId,
         deltas: &[CurrentStateDeltaRef<'_>],
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
@@ -5800,6 +5845,17 @@ where
         else {
             return Ok(None);
         };
+        if !self
+            .authoritative_collection_matches(
+                parent_commit_id,
+                schema_key,
+                &entity_pks,
+                identity_digest,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         let control = load_hot_collection_control(
             self.store,
             branch_id,
@@ -5870,6 +5926,47 @@ where
         Ok(Some(generation))
     }
 
+    /// Recomputes a full-collection certificate from immutable tracked-state
+    /// authority before a derived HOT control is allowed to retire a base.
+    /// A corrupt or stale control can therefore disable the compact route,
+    /// but it can never make omitted identities disappear from current state.
+    async fn authoritative_collection_matches(
+        &self,
+        parent_commit_id: CommitId,
+        schema_key: &str,
+        expected_entity_pks: &[&EntityPk],
+        expected_identity_digest: [u8; 32],
+    ) -> Result<bool, LixError> {
+        let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&*self.store);
+        let rows = reader
+            .scan_batch_at_commit(
+                &parent_commit_id.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![schema_key.to_owned()],
+                        file_ids: vec![NullableKeyFilter::Null],
+                        ..TrackedStateFilter::default()
+                    },
+                    ..TrackedStateScanRequest::default()
+                },
+            )
+            .await?;
+        if rows.len() != expected_entity_pks.len() {
+            return Ok(false);
+        }
+        let mut authoritative_entity_pks =
+            rows.iter().map(|row| row.entity_pk()).collect::<Vec<_>>();
+        authoritative_entity_pks.sort_unstable();
+        if authoritative_entity_pks.as_slice() != expected_entity_pks {
+            return Ok(false);
+        }
+        Ok(
+            crate::collection_generation::ordered_single_string_identity_digest(
+                authoritative_entity_pks,
+            ) == Some(expected_identity_digest),
+        )
+    }
+
     /// Publishes validated, tracked, unfiled creates as an immutable base.
     ///
     /// The commit-delta plane already owns the sorted identities and payloads,
@@ -5920,7 +6017,7 @@ where
                 .or_default()
                 .push(delta.entity_pk);
         }
-        if absence_guards.is_empty() {
+        let preloaded_controls = if absence_guards.is_empty() {
             // Generic Replace/upsert batches do not carry INSERT-shaped
             // per-row guards. An exact empty collection control is a stronger,
             // constant-size proof that every identity in that scope is absent.
@@ -5941,6 +6038,7 @@ where
             if controls.iter().any(|control| control.live_count != 0) {
                 return Ok(None);
             }
+            Some(controls)
         } else {
             let mut guarded = absence_guards
                 .iter()
@@ -5956,7 +6054,8 @@ where
                     "packed current base rows do not exactly match their validated absence proofs",
                 ));
             }
-        }
+            None
+        };
 
         let schema_increments = schema_rows
             .into_iter()
@@ -5980,6 +6079,7 @@ where
             generation,
             new_head,
             schema_increments,
+            preloaded_controls,
             working_diff_capture_checkpoint_commit_id,
             coverage,
         )
@@ -5993,6 +6093,7 @@ where
         generation: CommitId,
         new_head: CommitId,
         schema_increments: BTreeMap<&str, PackedCollectionIncrement>,
+        preloaded_controls: Option<Vec<HotCollectionControl>>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
@@ -6020,8 +6121,17 @@ where
                 },
             )
             .collect::<Vec<_>>();
-        let controls =
-            load_hot_collection_controls(self.store, branch_id, generation, &scopes).await?;
+        let controls = match preloaded_controls {
+            Some(controls) if controls.len() == scopes.len() => controls,
+            Some(_) => {
+                return Err(head_value_error(
+                    "packed current-base control certificate has the wrong scope count",
+                ));
+            }
+            None => {
+                load_hot_collection_controls(self.store, branch_id, generation, &scopes).await?
+            }
+        };
         for ((schema_key, increment), mut control) in schema_increments.into_iter().zip(controls) {
             let was_empty = control.live_count == 0;
             if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
@@ -11337,6 +11447,143 @@ mod tests {
         );
         assert!(bases[1].is_none(), "the exclusive predecessor must retire");
         assert!(bases[2].is_some(), "the replacement base must publish");
+    }
+
+    #[tokio::test]
+    async fn corrupt_collection_control_cannot_certify_omitted_authoritative_members() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000ca";
+        const SCHEMA_KEY: &str = "corrupt_control_schema";
+        let storage = StorageAdapter::new(Memory::new());
+        let parent_commit_id = CommitId::for_test_label("corrupt-control-parent");
+        let entity_pks = [
+            EntityPk::single("entity-a"),
+            EntityPk::single("entity-b"),
+            EntityPk::single("entity-c"),
+        ];
+        let created_at = timestamp();
+        let rows = entity_pks
+            .iter()
+            .enumerate()
+            .map(|(index, entity_pk)| MaterializedTrackedStateRow {
+                entity_pk: entity_pk.clone(),
+                schema_key: SCHEMA_KEY.to_owned(),
+                file_id: None,
+                snapshot_content: Some(format!(r#"{{"index":{index}}}"#).into()),
+                metadata: None,
+                deleted: false,
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+                change_id: ChangeId::for_test_label(&format!("corrupt-control-{index}")),
+                commit_id: parent_commit_id,
+            })
+            .collect::<Vec<_>>();
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            BRANCH_ID,
+            "corrupt-control-parent",
+            &rows,
+        )
+        .await;
+
+        let forged_members = [&entity_pks[0], &entity_pks[1]];
+        let forged_digest =
+            crate::collection_generation::ordered_single_string_identity_digest(forged_members)
+                .expect("single-string fixture identities should hash");
+        let mut corrupt_writes = StorageWriteSet::new();
+        stage_hot_collection_control(
+            &mut corrupt_writes,
+            BRANCH_ID,
+            parent_commit_id,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: parent_commit_id,
+                live_count: 2,
+                ordered_identity_digest: Some(forged_digest),
+            },
+        )
+        .expect("forged derived control should encode");
+        storage
+            .commit_write_set(corrupt_writes, StorageWriteOptions::default())
+            .await
+            .expect("forged derived control should commit");
+
+        let new_head = CommitId::for_test_label("corrupt-control-child");
+        let change_ids = [
+            ChangeId::for_test_label("corrupt-control-child-a"),
+            ChangeId::for_test_label("corrupt-control-child-b"),
+        ];
+        let replacement_deltas = forged_members
+            .iter()
+            .zip(change_ids)
+            .map(|(entity_pk, change_id)| CurrentStateDeltaRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+                entity_pk,
+                change_id: Some(change_id),
+                commit_id: Some(new_head),
+                untracked: false,
+                deleted: false,
+                created_at,
+                updated_at: created_at,
+                snapshot: JsonSlotRef::Inline(r#"{"replacement":true}"#),
+                metadata: JsonSlotRef::None,
+                columnar_base_coordinate: None,
+            })
+            .collect::<Vec<_>>();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt-control read should open");
+        let mut replacement_writes = StorageWriteSet::new();
+        let replacement = HotStateWriter {
+            store: &read,
+            writes: &mut replacement_writes,
+        }
+        .try_stage_exact_collection_replacement_current_base(
+            BRANCH_ID,
+            parent_commit_id,
+            parent_commit_id,
+            new_head,
+            &replacement_deltas,
+            &crate::live_state::EntityColumnarWriteSets::new(),
+            None,
+            &mut WorkingDiffIndexCoverage::default(),
+        )
+        .await
+        .expect("authority mismatch should fail closed");
+        assert_eq!(replacement, None);
+        assert_eq!(replacement_writes.stats().staged_puts, 0);
+        assert_eq!(replacement_writes.stats().staged_deletes, 0);
+
+        let deletion_deltas = replacement_deltas
+            .iter()
+            .map(|delta| CurrentStateDeltaRef {
+                deleted: true,
+                snapshot: JsonSlotRef::None,
+                ..*delta
+            })
+            .collect::<Vec<_>>();
+        let mut deletion_writes = StorageWriteSet::new();
+        let deletion = HotStateWriter {
+            store: &read,
+            writes: &mut deletion_writes,
+        }
+        .try_stage_exact_collection_delete_current_base(
+            BRANCH_ID,
+            parent_commit_id,
+            parent_commit_id,
+            new_head,
+            &deletion_deltas,
+            None,
+        )
+        .await
+        .expect("delete authority mismatch should fail closed");
+        assert_eq!(deletion, None);
+        assert_eq!(deletion_writes.stats().staged_puts, 0);
+        assert_eq!(deletion_writes.stats().staged_deletes, 0);
     }
 
     #[tokio::test]

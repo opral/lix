@@ -929,6 +929,26 @@ impl TrackedStateContext {
         TrackedStateWriter {
             chunk_overlay: storage::TrackedStateChunkOverlay::new(),
             staged_roots: BTreeMap::new(),
+            transient_chunk_hashes: HashSet::new(),
+            tree: self.tree.clone(),
+            store,
+            writes,
+        }
+    }
+
+    pub(crate) fn writer_with_rebuild_state<'a, S>(
+        &'a self,
+        store: &'a S,
+        writes: &'a mut StorageWriteSet,
+        state: TrackedStateTransientRebuildState,
+    ) -> TrackedStateWriter<'a, S>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        TrackedStateWriter {
+            chunk_overlay: state.chunk_overlay,
+            staged_roots: state.staged_roots,
+            transient_chunk_hashes: state.transient_chunk_hashes,
             tree: self.tree.clone(),
             store,
             writes,
@@ -3699,9 +3719,36 @@ fn exact_current_state_scope(
 pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     chunk_overlay: storage::TrackedStateChunkOverlay,
     staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
+    transient_chunk_hashes: HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
     tree: TrackedStateTree,
     store: &'a S,
     writes: &'a mut StorageWriteSet,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TrackedStateTransientRebuildState {
+    chunk_overlay: storage::TrackedStateChunkOverlay,
+    staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
+    transient_chunk_hashes: HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
+}
+
+impl TrackedStateTransientRebuildState {
+    pub(crate) fn chunk_hashes(
+        &self,
+    ) -> HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]> {
+        self.chunk_overlay.chunk_hashes().collect()
+    }
+
+    pub(crate) fn mark_new_chunks_transient(
+        &mut self,
+        previously_known: &HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
+    ) {
+        self.transient_chunk_hashes.extend(
+            self.chunk_overlay
+                .chunk_hashes()
+                .filter(|hash| !previously_known.contains(hash)),
+        );
+    }
 }
 
 /// Explicit commit-root rebuilder created by `TrackedStateContext`.
@@ -3726,6 +3773,38 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    pub(crate) fn into_transient_rebuild_state(self) -> TrackedStateTransientRebuildState {
+        TrackedStateTransientRebuildState {
+            chunk_overlay: self.chunk_overlay,
+            staged_roots: self.staged_roots,
+            transient_chunk_hashes: self.transient_chunk_hashes,
+        }
+    }
+
+    pub(crate) async fn promote_reachable_transient_chunks(
+        &mut self,
+        root_id: &TrackedStateRootId,
+    ) -> Result<(), LixError> {
+        if self.transient_chunk_hashes.is_empty() {
+            return Ok(());
+        }
+        let reachable = self
+            .tree
+            .reachable_chunk_hashes_with_overlay(self.store, &self.chunk_overlay, root_id)
+            .await?;
+        let promoted = self
+            .transient_chunk_hashes
+            .intersection(&reachable)
+            .copied()
+            .collect::<Vec<_>>();
+        self.chunk_overlay
+            .stage_selected_chunks(self.writes, promoted.iter().copied())?;
+        for hash in promoted {
+            self.transient_chunk_hashes.remove(&hash);
+        }
+        Ok(())
+    }
+
     pub(crate) fn staged_commit_roots(&self) -> impl Iterator<Item = &TrackedStateCommitRoot> {
         self.staged_roots.values()
     }
@@ -4793,6 +4872,7 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
     use std::time::Instant;
 
     use super::*;
@@ -8091,6 +8171,207 @@ mod tests {
         assert_eq!(writes.stats().staged_puts, 0);
         assert_eq!(writes.stats().staged_deletes, 0);
         assert_eq!(writes.stats().written_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn rooted_rebuild_promotes_only_reachable_chunks_from_rootless_ancestor() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-base", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        let rootless_rows = (0..300)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:04}"),
+                    &format!("rootless-{index:04}"),
+                    "rootless",
+                    "rootless",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, "rootless", "base", &rootless_rows).await;
+        write_rootless_commit_for_test(
+            &storage,
+            "child",
+            "rootless",
+            &[row_with_value(
+                "entity-0150",
+                "child-0150",
+                "child",
+                "child",
+            )],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fixture rebuild read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            "child",
+            true,
+        )
+        .await
+        .expect("fixture plans should load");
+        let mut fixture_writes = storage.new_write_set();
+        let mut fixture_writer = tracked_state.writer(&read, &mut fixture_writes);
+        for plan in plans.iter().rev() {
+            crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                &mut fixture_writer,
+                plan,
+            )
+            .await
+            .expect("fixture root should stage");
+        }
+        let child_commit_id = CommitId::for_test_label("child");
+        let child_snapshot_root = fixture_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == child_commit_id)
+            .cloned()
+            .expect("fixture child root should exist");
+        drop(fixture_writer);
+        let mut child_manifest = storage::load_commit_state_manifest(&read, child_commit_id)
+            .await
+            .expect("child manifest should load")
+            .expect("child manifest should exist");
+        child_manifest.replay_debt = crate::tracked_state::CommitStateReplayDebt::default();
+        child_manifest.snapshot_root = Some(Box::new(child_snapshot_root));
+        storage::stage_resealed_commit_state_manifest_for_test(
+            &mut fixture_writes,
+            &child_manifest,
+        )
+        .expect("rooted child authority should reseal");
+        drop(read);
+        storage
+            .commit_write_set(fixture_writes, StorageWriteOptions::default())
+            .await
+            .expect("rooted child fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reachability read should open");
+        let base_root = storage::load_root(&read, "base")
+            .await
+            .expect("base root should load")
+            .expect("base root should exist");
+        let child_root = storage::load_root(&read, "child")
+            .await
+            .expect("child root should load")
+            .expect("child root should exist");
+        let empty_overlay = storage::TrackedStateChunkOverlay::new();
+        let tree = TrackedStateTree::new();
+        let base_reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &empty_overlay, &base_root)
+            .await
+            .expect("base reachability should load");
+        let child_reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &empty_overlay, &child_root)
+            .await
+            .expect("child reachability should load");
+        drop(read);
+
+        let all_chunks = stored_tree_chunk_hashes_for_test(&storage).await;
+        let mut deletes = storage.new_write_set();
+        for hash in all_chunks.difference(&base_reachable) {
+            deletes.delete(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash)),
+            );
+        }
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("child-only chunks should delete");
+        let before = stored_tree_chunk_hashes_for_test(&storage).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("child")
+            .await
+            .expect("rooted descendant should rebuild through rootless authority");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("reachable rebuilt chunks should commit");
+
+        let after = stored_tree_chunk_hashes_for_test(&storage).await;
+        let added = after.difference(&before).copied().collect::<HashSet<_>>();
+        let expected = child_reachable
+            .difference(&before)
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(added, expected);
+        let rows = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("verification read should open"),
+            )
+            .scan_batch_at_commit("child", &test_schema_scan_request())
+            .await
+            .expect("rebuilt child should scan");
+        assert_eq!(rows.len(), 301);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.entity_pk() == &EntityPk::single("entity-0150"))
+                .and_then(|row| row.snapshot_content())
+                .map(AsRef::as_ref),
+            Some("{\"value\":\"child\"}")
+        );
+    }
+
+    async fn stored_tree_chunk_hashes_for_test(
+        storage: &StorageAdapter,
+    ) -> HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("chunk inventory read should open");
+        let chunk = crate::storage_adapter::ScanPlan::range(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        )
+        .collect(
+            &read,
+            crate::storage_adapter::StorageScanOptions {
+                projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
+                limit_rows: usize::MAX,
+                resume_after: None,
+            },
+        )
+        .await
+        .expect("chunk inventory should scan")
+        .value;
+        assert!(!chunk.has_more, "test chunk inventory must fit one page");
+        chunk
+            .entries
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .key
+                    .0
+                    .as_ref()
+                    .try_into()
+                    .expect("tracked-state chunk keys are fixed hashes")
+            })
+            .collect()
     }
 
     #[tokio::test]

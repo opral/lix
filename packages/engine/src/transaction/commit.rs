@@ -3967,8 +3967,6 @@ async fn stage_tracked_head(
             .iter()
             .map(|delta| delta.schema_key)
             .collect::<BTreeSet<_>>();
-        let packed_guards_match =
-            packed_current_base_guards_match(&tracked_deltas, &absence_guards);
         let packed_current_base_candidate = !is_checkpoint_publication
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
@@ -3986,6 +3984,12 @@ async fn stage_tracked_head(
             && untracked_deltas
                 .iter()
                 .all(|delta| !packed_schema_keys.contains(delta.schema_key));
+        // Identity sorting is useful only for a route that can actually
+        // publish a packed base. Keep ordinary point/small-batch commits on
+        // their allocation-free short circuit.
+        let packed_guards_match = packed_current_base_candidate
+            && !absence_guards.is_empty()
+            && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
         let mut deltas = tracked_deltas.clone();
         deltas.extend_from_slice(&untracked_deltas);
         // Every absence guard above is derived from one of these exact
@@ -4015,6 +4019,12 @@ async fn stage_tracked_head(
                 .try_stage_exact_collection_delete_current_base(
                     &root.branch_id,
                     parent_generation,
+                    root.parent_commit_id.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "exact collection deletion lacks parent commit authority",
+                        )
+                    })?,
                     root.commit_id,
                     &tracked_deltas,
                     working_diff_capture_checkpoint_commit_id,
@@ -4036,6 +4046,12 @@ async fn stage_tracked_head(
                 .try_stage_exact_collection_replacement_current_base(
                     &root.branch_id,
                     parent_generation,
+                    root.parent_commit_id.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "exact collection replacement lacks parent commit authority",
+                        )
+                    })?,
                     root.commit_id,
                     &tracked_deltas,
                     entity_columnar_write_sets,
