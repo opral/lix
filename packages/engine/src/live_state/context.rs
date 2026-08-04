@@ -545,7 +545,7 @@ where
             || request.limit.is_some()
             || !matches!(request.filter.rows, LiveStateRowFilter::All)
             || request.filter.include_tombstones
-            || request.filter.untracked.is_some()
+            || request.filter.untracked != Some(false)
             || !request.filter.file_ids.is_empty()
             || !request.filter.constraints.is_empty()
         {
@@ -629,9 +629,10 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
-        // The hot index carries tracked and untracked rows in one serving
-        // plane, so this route never probes a separate retention index.
-        if request.filter.untracked.is_some() || request_may_include_derived(request) {
+        // Direct snapshots and columnar layouts cover only tracked HOT state.
+        // A retention-agnostic scan must also consult the dedicated untracked
+        // plane, so only an explicitly tracked request may take this route.
+        if request.filter.untracked != Some(false) || request_may_include_derived(request) {
             return Ok(None);
         }
         let [schema_key] = request.filter.schema_keys.as_slice() else {

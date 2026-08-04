@@ -76,6 +76,7 @@ pub(crate) async fn stage_untracked_deltas(
         .await?
         .value;
     let mut previous_keys = BTreeSet::new();
+    let mut previous_created_at = BTreeMap::new();
     for (key, value) in keys.into_iter().zip(previous) {
         let Some(StorageProjectedValue::FullValue(value)) = value else {
             if value.is_some() {
@@ -83,8 +84,10 @@ pub(crate) async fn stage_untracked_deltas(
             }
             continue;
         };
+        let decoded = decode_value(value)?;
+        collect_value_refs(&decoded, &mut retired_refs);
+        previous_created_at.insert(key.clone(), decoded.created_at);
         previous_keys.insert(key);
-        collect_value_refs(&decode_value(value)?, &mut retired_refs);
     }
     for delta in deltas {
         if !delta.untracked {
@@ -104,10 +107,14 @@ pub(crate) async fn stage_untracked_deltas(
         if delta.deleted {
             mutations.insert(key, None);
         } else {
+            let created_at = previous_created_at
+                .get(&key)
+                .copied()
+                .unwrap_or(delta.created_at);
             mutations.insert(
                 key,
                 Some(StorageValue {
-                    bytes: Bytes::from(encode_value(branch_id, *delta)?),
+                    bytes: Bytes::from(encode_value(branch_id, *delta, created_at)?),
                 }),
             );
         }
@@ -870,7 +877,11 @@ fn read_text(bytes: &[u8], offset: &mut usize, field: &str) -> Result<String, Li
         .map_err(|_| codec_error(format!("untracked {field} is not UTF-8")))
 }
 
-fn encode_value(branch_id: &str, delta: CurrentStateDeltaRef<'_>) -> Result<Vec<u8>, LixError> {
+fn encode_value(
+    branch_id: &str,
+    delta: CurrentStateDeltaRef<'_>,
+    created_at: LixTimestamp,
+) -> Result<Vec<u8>, LixError> {
     let mut out = Vec::with_capacity(18 + slot_len(delta.snapshot) + slot_len(delta.metadata));
     out.push(VALUE_VERSION);
     out.push(if branch_id == GLOBAL_BRANCH_ID {
@@ -878,7 +889,7 @@ fn encode_value(branch_id: &str, delta: CurrentStateDeltaRef<'_>) -> Result<Vec<
     } else {
         0
     });
-    out.extend_from_slice(&delta.created_at.packed().to_le_bytes());
+    out.extend_from_slice(&created_at.packed().to_le_bytes());
     out.extend_from_slice(&delta.updated_at.packed().to_le_bytes());
     encode_slot(&mut out, delta.snapshot)?;
     encode_slot(&mut out, delta.metadata)?;

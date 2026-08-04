@@ -4900,6 +4900,7 @@ where
         ))
     }
 
+    #[cfg(test)]
     pub(crate) async fn load_projected_live_rows(
         &self,
         branch_id: &str,
@@ -4912,6 +4913,7 @@ where
             .map(MaterializedLiveStateExactBatch::into_rows)
     }
 
+    #[cfg(test)]
     pub(crate) async fn load_projected_live_batch(
         &self,
         branch_id: &str,
