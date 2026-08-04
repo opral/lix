@@ -116,7 +116,7 @@ required-features = ["storage-benches"]
 name = "untracked_state_crud"
 path = "benches/untracked_state_crud/main.rs"
 harness = false
-required-features = ["storage-benches"]
+required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
 name = "tracked_state_crud"
