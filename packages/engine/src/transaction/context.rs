@@ -6062,11 +6062,7 @@ where
             return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let live_state = self.live_state.reader(&read);
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();

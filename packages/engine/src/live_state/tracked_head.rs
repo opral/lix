@@ -321,9 +321,9 @@ impl<'a> TrackedHeadDeltaRef<'a> {
 /// One mutation of the authoritative current serving state.
 ///
 /// `tracked` mutations have both IDs and may create tombstones. `untracked`
-/// mutations have neither ID; deletion removes the member physically. This
-/// is deliberately the single write representation for the hot state plane,
-/// so callers never stage a separate untracked overlay.
+/// mutations have neither ID; deletion removes the member physically. This is
+/// the common logical write representation lowered into separate tracked HOT
+/// and branch-stable untracked physical planes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) schema_key: &'a str,

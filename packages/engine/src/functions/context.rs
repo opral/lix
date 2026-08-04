@@ -122,8 +122,7 @@ mod tests {
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
-    use crate::live_state::LiveStateContext;
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::live_state::{CurrentStateDeltaRef, LiveStateContext};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -354,35 +353,28 @@ mod tests {
             .expect("global branch control should load")
             .expect("global branch control should exist");
         let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
-        let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
-        TrackedHeadContext::new()
-            .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
-                GLOBAL_BRANCH_ID,
-                Some(control.generation),
-                control.head_commit_id,
-                &[CurrentStateDeltaRef {
-                    schema_key: "lix_key_value",
-                    file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: false,
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                    snapshot: snapshot.as_ref_slot(),
-                    metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }],
-                &std::collections::BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut working_diff_coverage,
-            )
-            .await
-            .expect("test key-value current row should stage");
+        crate::live_state::stage_untracked_deltas(
+            &read,
+            &mut writes,
+            GLOBAL_BRANCH_ID,
+            &[CurrentStateDeltaRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk: &entity_pk,
+                change_id: None,
+                commit_id: None,
+                untracked: true,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                snapshot: snapshot.as_ref_slot(),
+                metadata: crate::json_store::JsonSlotRef::None,
+                columnar_base_coordinate: None,
+            }],
+            &[false],
+        )
+        .await
+        .expect("test key-value current row should stage");
         stage_branch_head_control(
             &mut writes,
             GLOBAL_BRANCH_ID,

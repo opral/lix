@@ -9448,6 +9448,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn homogeneous_untracked_json_pointer_updates_are_scoped_and_last_write_wins() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "physical_json_pointer",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("physical json pointer schema should register");
+        for (path, untracked) in [("/physical", true), ("/tracked", false)] {
+            session
+                .execute(
+                    "INSERT INTO physical_json_pointer (path, value, lixcol_untracked) \
+                     VALUES ($1, lix_json($2), $3)",
+                    &[
+                        Value::Text(path.to_string()),
+                        Value::Text("{\"step\":0}".to_string()),
+                        Value::Boolean(untracked),
+                    ],
+                )
+                .await
+                .expect("json pointer seed should commit");
+        }
+
+        let parameter_rows = vec![
+            Arc::<[Value]>::from([
+                Value::Text("{\"step\":1}".to_string()),
+                Value::Text("/physical".to_string()),
+            ]),
+            Arc::<[Value]>::from([
+                Value::Text("not valid JSON".to_string()),
+                Value::Text("/missing".to_string()),
+            ]),
+            Arc::<[Value]>::from([
+                Value::Text("{\"wrong_plane\":true}".to_string()),
+                Value::Text("/tracked".to_string()),
+            ]),
+            Arc::<[Value]>::from([
+                Value::Text("{\"step\":2}".to_string()),
+                Value::Text("/physical".to_string()),
+            ]),
+        ];
+        assert_eq!(
+            sql2::take_certified_untracked_replacement_batch_executions(),
+            0
+        );
+        let invalid = session
+            .execute_homogeneous_write_batch(
+                Arc::from(
+                    "UPDATE physical_json_pointer SET value = lix_json($1) \
+                     WHERE path = $2 AND lixcol_untracked = true",
+                ),
+                Arc::from(vec![
+                    Arc::<[Value]>::from([
+                        Value::Text("{\"step\":99}".to_string()),
+                        Value::Text("/physical".to_string()),
+                    ]),
+                    Arc::<[Value]>::from([
+                        Value::Text("not valid JSON".to_string()),
+                        Value::Text("/physical".to_string()),
+                    ]),
+                ]),
+            )
+            .await
+            .expect_err("a live invalid replacement must roll back the whole page");
+        assert_eq!(invalid.details.unwrap()["statementIndex"], 1);
+        let unchanged = session
+            .execute(
+                "SELECT value FROM physical_json_pointer \
+                 WHERE path = '/physical' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("rolled-back physical row should remain readable");
+        assert_eq!(
+            unchanged.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"step": 0})
+        );
+        assert_eq!(
+            sql2::take_certified_untracked_replacement_batch_executions(),
+            0,
+            "failed normalization must happen before physical staging"
+        );
+        let results = session
+            .execute_homogeneous_write_batch(
+                Arc::from(
+                    "UPDATE physical_json_pointer SET value = lix_json($1) \
+                     WHERE path = $2 AND lixcol_untracked = true",
+                ),
+                Arc::from(parameter_rows),
+            )
+            .await
+            .expect("physical replacement page should commit atomically");
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 0, 1]
+        );
+        assert_eq!(
+            sql2::take_certified_untracked_replacement_batch_executions(),
+            1,
+            "the parameter page must take the physical untracked certificate"
+        );
+
+        let rows = session
+            .execute(
+                "SELECT path, value, lixcol_untracked FROM physical_json_pointer ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("both physical planes should remain readable");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"step": 2})
+        );
+        assert!(rows.rows()[0].get::<bool>("lixcol_untracked").unwrap());
+        assert_eq!(
+            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"step": 0})
+        );
+        assert!(!rows.rows()[1].get::<bool>("lixcol_untracked").unwrap());
+    }
+
+    #[tokio::test]
     async fn packed_mutation_membership_defers_to_transaction_overlay() {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;

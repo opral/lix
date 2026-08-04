@@ -1461,6 +1461,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     &[
         crate::init::REPOSITORY_PROTOCOL_SPACE,
         crate::branch::BRANCH_HEAD_CONTROL_SPACE,
+        crate::live_state::UNTRACKED_ROW_SPACE,
         crate::live_state::HOT_ROW_SPACE,
         crate::live_state::HOT_FILE_SPACE,
         crate::live_state::HOT_DIFF_SPACE,

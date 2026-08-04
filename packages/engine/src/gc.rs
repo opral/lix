@@ -434,9 +434,7 @@ where
         .reader(store.clone())
         .scan()
         .await?;
-    let mut roots = TrackedHeadContext::new()
-        .reader(store.clone())
-        .untracked_json_refs(&controls)
+    let mut roots = crate::live_state::untracked_json_refs(&store)
         .await?
         .into_iter()
         .map(GcRoot::CurrentPayload)
@@ -1258,7 +1256,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
+    use crate::branch::BranchHeadControlContext;
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
@@ -1269,7 +1267,7 @@ mod tests {
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
     };
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::live_state::CurrentStateDeltaRef;
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
@@ -2358,54 +2356,33 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("current-state owner read should open");
-        let control = BranchHeadControlContext::new()
-            .reader(&read)
-            .load(GLOBAL_BRANCH_ID)
-            .await
-            .expect("global control should load")
-            .expect("global control should exist");
         let entity_pk = EntityPk::single(entity_pk_value);
         let snapshot_slot = snapshot.map_or(JsonSlot::None, JsonSlot::Ref);
         let timestamp =
             LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
         let mut writes = storage_adapter.new_write_set();
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        TrackedHeadContext::new()
-            .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
-                GLOBAL_BRANCH_ID,
-                Some(control.generation),
-                control.head_commit_id,
-                &[CurrentStateDeltaRef {
-                    schema_key: "gc_untracked_owner",
-                    file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: snapshot.is_none(),
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                    snapshot: snapshot_slot.as_ref_slot(),
-                    metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }],
-                &BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut coverage,
-            )
-            .await
-            .expect("untracked current-state owner should stage");
-        stage_branch_head_control(
+        crate::live_state::stage_untracked_deltas(
+            &read,
             &mut writes,
             GLOBAL_BRANCH_ID,
-            control
-                .next_current_state_revision()
-                .expect("current-state revision should advance"),
+            &[CurrentStateDeltaRef {
+                schema_key: "gc_untracked_owner",
+                file_id: None,
+                entity_pk: &entity_pk,
+                change_id: None,
+                commit_id: None,
+                untracked: true,
+                deleted: snapshot.is_none(),
+                created_at: timestamp,
+                updated_at: timestamp,
+                snapshot: snapshot_slot.as_ref_slot(),
+                metadata: crate::json_store::JsonSlotRef::None,
+                columnar_base_coordinate: None,
+            }],
+            &[false],
         )
-        .expect("current-state control should stage");
+        .await
+        .expect("untracked current-state owner should stage");
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

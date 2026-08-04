@@ -94,6 +94,70 @@ simulation_test!(
 );
 
 simulation_test!(
+    tracked_file_delete_cascades_file_scoped_untracked_entity,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_untracked_file_cascade_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 false, false)",
+                &[],
+            )
+            .await
+            .expect("register file-scoped entity schema");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('66696c65-2d63-8173-8363-616465000000', '/cascade.txt', X'31')",
+                &[],
+            )
+            .await
+            .expect("insert tracked file");
+        session
+            .execute(
+                "INSERT INTO engine_untracked_file_cascade_schema \
+                 (id, lixcol_file_id, lixcol_untracked) \
+                 VALUES ('owned-row', '66696c65-2d63-8173-8363-616465000000', true)",
+                &[],
+            )
+            .await
+            .expect("insert file-owned untracked row");
+
+        session
+            .execute(
+                "DELETE FROM lix_file \
+                 WHERE id = '66696c65-2d63-8173-8363-616465000000'",
+                &[],
+            )
+            .await
+            .expect("delete tracked file");
+
+        let rows = session
+            .execute(
+                "SELECT id FROM engine_untracked_file_cascade_schema \
+                 WHERE id = 'owned-row'",
+                &[],
+            )
+            .await
+            .expect("read cascaded untracked row");
+        assert!(
+            rows.is_empty(),
+            "file deletion must remove owned untracked rows"
+        );
+    }
+);
+
+simulation_test!(
     registered_schema_default_values_materializes_generated_and_literal_defaults,
     |sim| async move {
         let engine = sim.boot_engine().await;

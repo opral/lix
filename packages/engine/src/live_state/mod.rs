@@ -6,6 +6,7 @@ mod entity_decoded_column_cache;
 mod reader;
 mod tracked_head;
 mod types;
+mod untracked_state;
 pub(crate) mod visibility;
 
 #[allow(unused_imports)]
@@ -46,6 +47,16 @@ pub(crate) use types::{
     LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
     MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
     ScanConstraint, ScanField, ScanOperator,
+};
+#[allow(unused_imports)]
+pub(crate) use untracked_state::{
+    UNTRACKED_ROW_SPACE, load_untracked_exact_batch, scan_untracked_batch, stage_untracked_deltas,
+    untracked_json_refs,
+};
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(unused_imports)]
+pub(crate) use untracked_state::{
+    UntrackedFileCascadeReadProfile, take_untracked_file_cascade_read_profile,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{

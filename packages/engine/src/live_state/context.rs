@@ -545,7 +545,7 @@ where
             || request.limit.is_some()
             || !matches!(request.filter.rows, LiveStateRowFilter::All)
             || request.filter.include_tombstones
-            || request.filter.untracked.is_some()
+            || request.filter.untracked != Some(false)
             || !request.filter.file_ids.is_empty()
             || !request.filter.constraints.is_empty()
         {
@@ -629,9 +629,10 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
-        // The hot index carries tracked and untracked rows in one serving
-        // plane, so this route never probes a separate retention index.
-        if request.filter.untracked.is_some() || request_may_include_derived(request) {
+        // Direct snapshots and columnar layouts cover only tracked HOT state.
+        // Retention-agnostic scans must also consult the authoritative
+        // untracked plane, so only an explicitly tracked request may route.
+        if request.filter.untracked != Some(false) || request_may_include_derived(request) {
             return Ok(None);
         }
         let [schema_key] = request.filter.schema_keys.as_slice() else {
@@ -697,7 +698,9 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
-        if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
+        if request.filter.untracked == Some(false)
+            && let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await?
+        {
             return Ok(rows);
         }
         let derived_rows = MaterializedLiveStateBatch::from_rows(
@@ -711,15 +714,22 @@ where
             )
             .await?,
         );
-        let mut hot_branch_rows = if !is_derived_only_request(request) {
-            self.scan_hot_branch_rows(request, &scope).await?
+        let mut hot_branch_rows =
+            if !is_derived_only_request(request) && request.filter.untracked != Some(true) {
+                self.scan_hot_branch_rows(request, &scope).await?
+            } else {
+                Vec::new()
+            };
+        let untracked_rows = if !is_derived_only_request(request) {
+            crate::live_state::scan_untracked_batch(store, request, &scope.storage_branch_ids)
+                .await?
         } else {
-            Vec::new()
+            MaterializedLiveStateBatch::default()
         };
         // The ordered single-branch route bypasses the generic visibility
         // resolver, so apply the retention predicate before taking that fast
         // path. Otherwise `untracked = Some(..)` accidentally returned both
-        // member kinds from an already-unified group.
+        // member kinds from the tracked HOT lane.
         if request.filter.untracked.is_some() {
             for branch_rows in &mut hot_branch_rows {
                 branch_rows.rows = filter_current_row_retention(
@@ -729,6 +739,7 @@ where
             }
         }
         if derived_rows.is_empty()
+            && untracked_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
@@ -739,11 +750,13 @@ where
             ));
         }
         let rows = concat_live_state_batches(
-            std::iter::once(derived_rows).chain(
-                hot_branch_rows
-                    .into_iter()
-                    .map(|branch_rows| branch_rows.rows),
-            ),
+            std::iter::once(derived_rows)
+                .chain(std::iter::once(untracked_rows))
+                .chain(
+                    hot_branch_rows
+                        .into_iter()
+                        .map(|branch_rows| branch_rows.rows),
+                ),
         );
         Ok(resolve_visible_batch(
             rows,
@@ -873,13 +886,16 @@ where
         if request.rows.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
-        // Derived rows are synthesized rather than stored under the
-        // requested identity. Preserve their exact scan semantics without
-        // widening the optimized durable-state batch.
-        if request
-            .rows
-            .iter()
-            .any(|row| is_derived_schema(&row.schema_key))
+        // Derived rows are synthesized rather than stored under the requested
+        // identity. A retention-agnostic request also spans two deliberately
+        // separate physical planes, so preserve visibility/collision
+        // semantics through the common scan path. Retention-specific CRUD
+        // stays on the batched point-read paths below.
+        if request.untracked.is_none()
+            || request
+                .rows
+                .iter()
+                .any(|row| is_derived_schema(&row.schema_key))
         {
             let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
             let mut slots = Vec::with_capacity(request.rows.len());
@@ -915,11 +931,8 @@ where
             },
             ..Default::default()
         };
-        // The hot current-state rows are authoritative for both retention modes.
-        // Even an untracked-only exact batch therefore needs the branch
-        // controls that select the active generation; treating that request
-        // as "not tracked" used to skip the controls entirely and made the
-        // workspace selector (an untracked row) invisible after hot-index init.
+        // Branch controls still select visible branch identities, but the
+        // untracked values themselves are branch-stable and generation-free.
         let scope = scan_scope(
             &self.store,
             &scope_request,
@@ -932,6 +945,15 @@ where
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+
+        if request.untracked == Some(true) {
+            return crate::live_state::load_untracked_exact_batch(
+                &self.store,
+                request,
+                &visible_branch_ids,
+            )
+            .await;
+        }
 
         let mut storage_identities = Vec::with_capacity(request.rows.len().saturating_mul(2));
         for row in &request.rows {
