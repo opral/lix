@@ -19,7 +19,12 @@ mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
-    load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
+    is_missing_tree_chunk_error, load_rebuild_plans_skipping_root, stage_rebuild_plan_with_writer,
+};
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(unused_imports)]
+pub(crate) use commit_root_rebuild::{
+    record_missing_descendant_retry, reset_root_availability_counters, root_availability_counters,
 };
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,

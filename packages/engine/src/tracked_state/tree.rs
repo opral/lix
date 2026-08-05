@@ -107,6 +107,45 @@ impl TrackedStateTree {
         storage::load_root(store, commit_id).await
     }
 
+    /// Checks only the authenticated root chunk for a manifest-published
+    /// commit root. This deliberately does not walk descendants: immutable
+    /// manifest metadata is the authority for the root shape, while the
+    /// selected read/rebuild traversal remains responsible for discovering a
+    /// missing descendant.
+    pub(crate) async fn validate_root_chunk_availability(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        expected_row_count: u64,
+    ) -> Result<bool, LixError> {
+        if root_id.as_bytes() == &[0; TRACKED_STATE_HASH_BYTES] {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state commit-root metadata contains an empty root id",
+            ));
+        }
+        let Some(bytes) = storage::read_chunk(store, root_id.as_bytes()).await? else {
+            return Ok(false);
+        };
+        storage::verify_chunk_hash(root_id.as_bytes(), &bytes)?;
+        let node = decode_node(&bytes)?;
+        let actual_row_count = u64::try_from(decoded_node_row_count(&node)).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state commit-root row count exceeds u64",
+            )
+        })?;
+        if actual_row_count != expected_row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked-state commit-root root chunk row count {actual_row_count} disagrees with authenticated metadata {expected_row_count}"
+                ),
+            ));
+        }
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) async fn get(
         &self,
@@ -2157,7 +2196,10 @@ impl TrackedStateTree {
         }
 
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
-            LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
+            LixError::new(
+                "LIX_TRACKED_STATE_MISSING_CHUNK",
+                "tracked-state tree chunk is missing",
+            )
         })?;
         // Verify once on a durable-store miss before making the bytes reusable.
         storage::verify_chunk_hash(hash, &bytes)?;

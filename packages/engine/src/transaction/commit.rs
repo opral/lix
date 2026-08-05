@@ -5305,17 +5305,49 @@ async fn stage_tracked_roots(
     let mut tracked_writer = tracked_state.writer(read, writes);
     let mut staged_rebuild_plan_ids = BTreeSet::new();
     for parent_commit_id in durable_root_rebuild_parents {
-        let plans = crate::tracked_state::load_rebuild_plans_to_nearest_available_root(
-            read,
-            &parent_commit_id.to_string(),
-            true,
-        )
-        .await?;
-        for plan in plans.iter().rev() {
-            if staged_rebuild_plan_ids.insert(plan.commit_id) {
-                crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
-                    .await?;
+        let mut skipped_root = None;
+        let mut retried_missing_descendant = false;
+        loop {
+            let plans = crate::tracked_state::load_rebuild_plans_skipping_root(
+                read,
+                &parent_commit_id.to_string(),
+                true,
+                skipped_root.as_deref(),
+            )
+            .await?;
+            let mut retry_parent = None;
+            for plan in plans.iter().rev() {
+                if !staged_rebuild_plan_ids.insert(plan.commit_id) {
+                    continue;
+                }
+                match crate::tracked_state::stage_rebuild_plan_with_writer(
+                    &mut tracked_writer,
+                    plan,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if !retried_missing_descendant
+                            && crate::tracked_state::is_missing_tree_chunk_error(&error) =>
+                    {
+                        let Some(parent_commit_id) = plan.parent_commit_id else {
+                            return Err(error);
+                        };
+                        staged_rebuild_plan_ids.remove(&plan.commit_id);
+                        retry_parent = Some(parent_commit_id);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
+            let Some(retry_parent) = retry_parent else {
+                break;
+            };
+            retried_missing_descendant = true;
+            skipped_root = Some(retry_parent.to_string());
+            #[cfg(any(test, feature = "storage-benches"))]
+            crate::tracked_state::record_missing_descendant_retry();
         }
     }
     let empty_certified_replacement_markers = BTreeSet::new();

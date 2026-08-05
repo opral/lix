@@ -1,6 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
 use crate::changelog::{
@@ -15,9 +13,7 @@ use crate::tracked_state::context::{
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
-use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
-};
+use crate::tracked_state::types::TrackedStateRootId;
 use crate::tracked_state::{
     TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateRootMutationRef, encode_key_ref,
 };
@@ -33,6 +29,176 @@ pub(crate) struct CommitRootRebuildDelta {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RootAvailability {
+    Missing,
+    Corrupt(LixError),
+    Available(TrackedStateRootId),
+}
+
+const MISSING_TREE_CHUNK_CODE: &str = "LIX_TRACKED_STATE_MISSING_CHUNK";
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RootAvailabilityCounters {
+    pub(crate) probes: u64,
+    pub(crate) root_chunk_reads: u64,
+    pub(crate) available: u64,
+    pub(crate) missing: u64,
+    pub(crate) corrupt: u64,
+    pub(crate) missing_descendant_retries: u64,
+    pub(crate) full_tree_scans: u64,
+    pub(crate) canonical_rebuilds: u64,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod counters {
+    use std::cell::Cell;
+
+    use super::RootAvailabilityCounters;
+
+    thread_local! {
+        static STATE: Cell<RootAvailabilityCounters> = const {
+            Cell::new(RootAvailabilityCounters {
+                probes: 0,
+                root_chunk_reads: 0,
+                available: 0,
+                missing: 0,
+                corrupt: 0,
+                missing_descendant_retries: 0,
+                full_tree_scans: 0,
+                canonical_rebuilds: 0,
+            })
+        };
+    }
+
+    pub(super) fn reset() {
+        STATE.with(|state| state.set(RootAvailabilityCounters::default()));
+    }
+
+    pub(super) fn snapshot() -> RootAvailabilityCounters {
+        STATE.with(Cell::get)
+    }
+
+    fn update(update: impl FnOnce(&mut RootAvailabilityCounters)) {
+        STATE.with(|state| {
+            let mut counters = state.get();
+            update(&mut counters);
+            state.set(counters);
+        });
+    }
+
+    pub(super) fn probe() {
+        update(|counters| counters.probes += 1);
+    }
+
+    pub(super) fn root_chunk_read() {
+        update(|counters| counters.root_chunk_reads += 1);
+    }
+
+    pub(super) fn available() {
+        update(|counters| counters.available += 1);
+    }
+
+    pub(super) fn missing() {
+        update(|counters| counters.missing += 1);
+    }
+
+    pub(super) fn corrupt() {
+        update(|counters| counters.corrupt += 1);
+    }
+
+    pub(super) fn missing_descendant_retry() {
+        update(|counters| counters.missing_descendant_retries += 1);
+    }
+}
+
+#[cfg(all(not(test), feature = "storage-benches"))]
+#[allow(dead_code)]
+mod counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::RootAvailabilityCounters;
+
+    static PROBES: AtomicU64 = AtomicU64::new(0);
+    static ROOT_CHUNK_READS: AtomicU64 = AtomicU64::new(0);
+    static AVAILABLE: AtomicU64 = AtomicU64::new(0);
+    static MISSING: AtomicU64 = AtomicU64::new(0);
+    static CORRUPT: AtomicU64 = AtomicU64::new(0);
+    static MISSING_DESCENDANT_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn reset() {
+        for counter in [
+            &PROBES,
+            &ROOT_CHUNK_READS,
+            &AVAILABLE,
+            &MISSING,
+            &CORRUPT,
+            &MISSING_DESCENDANT_RETRIES,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn snapshot() -> RootAvailabilityCounters {
+        RootAvailabilityCounters {
+            probes: PROBES.load(Ordering::Relaxed),
+            root_chunk_reads: ROOT_CHUNK_READS.load(Ordering::Relaxed),
+            available: AVAILABLE.load(Ordering::Relaxed),
+            missing: MISSING.load(Ordering::Relaxed),
+            corrupt: CORRUPT.load(Ordering::Relaxed),
+            missing_descendant_retries: MISSING_DESCENDANT_RETRIES.load(Ordering::Relaxed),
+            // These paths were deleted by the hard cut. Keeping explicit
+            // zero-valued fields makes the test/benchmark proof auditable.
+            full_tree_scans: 0,
+            canonical_rebuilds: 0,
+        }
+    }
+
+    pub(super) fn probe() {
+        PROBES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn root_chunk_read() {
+        ROOT_CHUNK_READS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn available() {
+        AVAILABLE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn missing() {
+        MISSING.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn corrupt() {
+        CORRUPT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn missing_descendant_retry() {
+        MISSING_DESCENDANT_RETRIES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(dead_code)]
+pub(crate) fn reset_root_availability_counters() {
+    counters::reset();
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(dead_code)]
+pub(crate) fn root_availability_counters() -> RootAvailabilityCounters {
+    counters::snapshot()
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn record_missing_descendant_retry() {
+    counters::missing_descendant_retry();
 }
 
 pub(crate) async fn rebuild_commit_root_at<S>(
@@ -74,10 +240,79 @@ async fn rebuild_commit_root_at_inner<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plans =
-        load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
-    let mut report = None;
+    let mut skipped_root = None;
+    let mut retried_missing_descendant = false;
+    let (report, state) = loop {
+        let plans = load_rebuild_plans_skipping_root(
+            rebuilder.store,
+            commit_id,
+            true,
+            skipped_root.as_deref(),
+        )
+        .await?;
+        match stage_rebuild_plans_once(rebuilder, &plans).await {
+            Ok(result) => break result,
+            Err(error) if !retried_missing_descendant && is_missing_tree_chunk_error(&error) => {
+                let Some(missing_base_root) = plans
+                    .iter()
+                    .find(|plan| plan.parent_commit_id.is_some())
+                    .and_then(|plan| plan.parent_commit_id)
+                else {
+                    return Err(error);
+                };
+                retried_missing_descendant = true;
+                #[cfg(any(test, feature = "storage-benches"))]
+                counters::missing_descendant_retry();
+                skipped_root = Some(missing_base_root.to_string());
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let context = TrackedStateContext::new();
+    let writer = context.writer_with_rebuild_state(rebuilder.store, rebuilder.writes, state);
+    writer
+        .validate_staged_commit_root_against_changelog(commit_id)
+        .await?;
+    let staged_roots = writer.staged_commit_roots().cloned().collect::<Vec<_>>();
+    drop(writer);
+    for snapshot_root in staged_roots {
+        let manifest = storage::load_published_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot publish rebuilt tracked_state root for commit '{}' without its commit-state manifest",
+                        snapshot_root.commit_id
+                    ),
+                )
+            })?;
+        if let Some(expected) = manifest.snapshot_root.as_ref()
+            && !expected.has_same_authoritative_layout(&snapshot_root)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "rebuilt tracked_state root for commit '{}' disagrees with immutable commit authority: expected {expected:?}, rebuilt {snapshot_root:?}",
+                    snapshot_root.commit_id,
+                ),
+            ));
+        }
+        // Root metadata is immutable authority. Rebuilds restore its
+        // content-addressed chunks; rootless commits remain replay-only.
+    }
+    Ok(report)
+}
+
+async fn stage_rebuild_plans_once<S>(
+    rebuilder: &mut TrackedStateRootRebuilder<'_, S>,
+    plans: &[CommitRootRebuildPlan],
+) -> Result<(TrackedStateWriteReport, TrackedStateTransientRebuildState), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let context = TrackedStateContext::new();
+    let mut report = None;
     let mut state = TrackedStateTransientRebuildState::default();
     for plan in plans.iter().rev() {
         let manifest = storage::load_commit_state_manifest(rebuilder.store, plan.commit_id)
@@ -116,46 +351,18 @@ where
     let report = report.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked_state commit_root rebuild for commit '{commit_id}' did not stage a root"
-            ),
+            "tracked_state commit_root rebuild did not stage a root",
         )
     })?;
-    let writer = context.writer_with_rebuild_state(rebuilder.store, rebuilder.writes, state);
-    writer
-        .validate_staged_commit_root_against_changelog(commit_id)
-        .await?;
-    let staged_roots = writer.staged_commit_roots().cloned().collect::<Vec<_>>();
-    drop(writer);
-    for snapshot_root in staged_roots {
-        let manifest = storage::load_published_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "cannot publish rebuilt tracked_state root for commit '{}' without its commit-state manifest",
-                        snapshot_root.commit_id
-                    ),
-                )
-            })?;
-        if let Some(expected) = manifest.snapshot_root.as_ref()
-            && !expected.has_same_authoritative_layout(&snapshot_root)
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "rebuilt tracked_state root for commit '{}' disagrees with immutable commit authority: expected {expected:?}, rebuilt {snapshot_root:?}",
-                    snapshot_root.commit_id,
-                ),
-            ));
-        }
-        // Root metadata is immutable authority. Rebuilds restore its
-        // content-addressed chunks; rootless commits remain replay-only.
-    }
-    Ok(report)
+    Ok((report, state))
 }
 
+#[cfg_attr(not(any(test, feature = "storage-benches")), allow(dead_code))]
+pub(crate) fn is_missing_tree_chunk_error(error: &LixError) -> bool {
+    error.code == MISSING_TREE_CHUNK_CODE
+}
+
+#[allow(dead_code)]
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
     store: &S,
     commit_id: &str,
@@ -164,10 +371,22 @@ pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    load_rebuild_plans_skipping_root(store, commit_id, force_head, None).await
+}
+
+pub(crate) async fn load_rebuild_plans_skipping_root<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+    skipped_root: Option<&str>,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
     let mut plans = Vec::new();
     let mut current_commit_id = commit_id.to_string();
     let mut force_current = force_head;
-    let mut seen_commit_ids = HashSet::new();
+    let mut seen_commit_ids = BTreeSet::new();
     loop {
         if !seen_commit_ids.insert(current_commit_id.clone()) {
             return Err(LixError::new(
@@ -177,12 +396,12 @@ where
                 ),
             ));
         }
-        if !force_current
-            && load_available_root(store, &current_commit_id, &mut HashSet::new())
-                .await?
-                .is_some()
-        {
-            break;
+        if !force_current && skipped_root != Some(current_commit_id.as_str()) {
+            match load_available_root(store, &current_commit_id).await? {
+                RootAvailability::Available(_) => break,
+                RootAvailability::Missing => {}
+                RootAvailability::Corrupt(error) => return Err(error),
+            }
         }
         let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
         let parent_commit_id = plan.parent_commit_id;
@@ -196,84 +415,48 @@ where
     Ok(plans)
 }
 
-fn load_available_root<'a, S>(
-    store: &'a S,
-    commit_id: &'a str,
-    seen: &'a mut HashSet<String>,
-) -> Pin<Box<dyn Future<Output = Result<Option<TrackedStateRootId>, LixError>> + Send + 'a>>
-where
-    S: StorageAdapterRead + ?Sized + 'a,
-{
-    Box::pin(async move {
-        if !seen.insert(commit_id.to_string()) {
-            return Ok(None);
-        }
-        let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
-            seen.remove(commit_id);
-            return Ok(None);
-        };
-        if !commit_root_tree_is_readable(store, &metadata).await? {
-            seen.remove(commit_id);
-            return Ok(None);
-        }
-        if !commit_root_matches_canonical_rebuild(store, commit_id, &metadata, seen).await? {
-            seen.remove(commit_id);
-            return Ok(None);
-        }
-        seen.remove(commit_id);
-        Ok(Some(metadata.root_id))
-    })
-}
-
-async fn commit_root_tree_is_readable<S>(
-    store: &S,
-    metadata: &TrackedStateCommitRoot,
-) -> Result<bool, LixError>
+async fn load_available_root<S>(store: &S, commit_id: &str) -> Result<RootAvailability, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    match TrackedStateTree::new()
-        .scan(
-            store,
-            &metadata.root_id,
-            &TrackedStateTreeScanRequest::default(),
-        )
+    #[cfg(any(test, feature = "storage-benches"))]
+    counters::probe();
+    let metadata = match storage::load_snapshot_commit_root(store, commit_id).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            #[cfg(any(test, feature = "storage-benches"))]
+            counters::missing();
+            return Ok(RootAvailability::Missing);
+        }
+        Err(error) => {
+            #[cfg(any(test, feature = "storage-benches"))]
+            counters::corrupt();
+            return Ok(RootAvailability::Corrupt(error));
+        }
+    };
+    #[cfg(any(test, feature = "storage-benches"))]
+    counters::root_chunk_read();
+    let tree = TrackedStateTree::new();
+    match tree
+        .validate_root_chunk_availability(store, &metadata.root_id, metadata.row_count_estimate)
         .await
     {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-async fn commit_root_matches_canonical_rebuild<S>(
-    store: &S,
-    commit_id: &str,
-    metadata: &TrackedStateCommitRoot,
-    seen: &mut HashSet<String>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let plan = load_commit_root_rebuild_plan(store, commit_id).await?;
-    if let Some(parent_commit_id) = plan.parent_commit_id.as_ref() {
-        let parent_commit_id_text = parent_commit_id.to_string();
-        let Some(parent_root_id) = load_available_root(store, &parent_commit_id_text, seen).await?
-        else {
-            return Ok(false);
-        };
-        match metadata.parent_roots.first() {
-            Some(parent)
-                if parent.commit_id == *parent_commit_id && parent.root_id == parent_root_id => {}
-            _ => return Ok(false),
+        Ok(true) => {
+            #[cfg(any(test, feature = "storage-benches"))]
+            counters::available();
+            Ok(RootAvailability::Available(metadata.root_id))
         }
-    } else if !metadata.parent_roots.is_empty() {
-        return Ok(false);
+        Ok(false) => {
+            #[cfg(any(test, feature = "storage-benches"))]
+            counters::missing();
+            Ok(RootAvailability::Missing)
+        }
+        Err(error) => {
+            #[cfg(any(test, feature = "storage-benches"))]
+            counters::corrupt();
+            Ok(RootAvailability::Corrupt(error))
+        }
     }
-    let mut scratch_writes = StorageWriteSet::new();
-    let context = TrackedStateContext::new();
-    let mut writer = context.writer(store, &mut scratch_writes);
-    let report = stage_rebuild_plan_with_writer(&mut writer, &plan).await?;
-    Ok(report.root_id == metadata.root_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

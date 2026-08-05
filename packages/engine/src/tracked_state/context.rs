@@ -7094,6 +7094,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthy_root_availability_does_not_scan_or_rebuild_descendants() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+
+        crate::tracked_state::reset_root_availability_counters();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read, "base", false,
+        )
+        .await
+        .expect("available root should stop replay");
+        assert!(plans.is_empty());
+        let counters = crate::tracked_state::root_availability_counters();
+        assert_eq!(counters.probes, 1);
+        assert_eq!(counters.root_chunk_reads, 1);
+        assert_eq!(counters.available, 1);
+        assert_eq!(counters.missing, 0);
+        assert_eq!(counters.corrupt, 0);
+        assert_eq!(counters.missing_descendant_retries, 0);
+        assert_eq!(counters.full_tree_scans, 0);
+        assert_eq!(counters.canonical_rebuilds, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_descendant_rebuilds_once_from_authenticated_parent_metadata() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let base_rows = (0..300)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:04}"),
+                    &format!("change-base-{index:04}"),
+                    "base",
+                    &format!("base-{index:04}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked_state, "base", None, &base_rows)
+            .await
+            .expect("base root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("base"),
+            &[row_with_value(
+                "entity-0150",
+                "change-child",
+                "child",
+                "child",
+            )],
+        )
+        .await
+        .expect("child root should write");
+
+        // Preserve the authenticated base root header and root chunk, but
+        // remove one descendant. The first child replay attempt must discover
+        // this typed Missing condition; the bounded retry rebuilds the parent
+        // once and then replays the child.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let base_root = storage::load_root(&read, "base")
+            .await
+            .expect("base root metadata should load")
+            .expect("base root should exist");
+        let tree = TrackedStateTree::new();
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        let reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &overlay, &base_root)
+            .await
+            .expect("base reachability should load");
+        let descendant = reachable
+            .into_iter()
+            .find(|hash| hash != base_root.as_bytes())
+            .expect("large base tree should have a descendant chunk");
+        drop(read);
+        let mut deletes = storage.new_write_set();
+        deletes.delete(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&descendant)),
+        );
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("descendant deletion should commit");
+
+        crate::tracked_state::reset_root_availability_counters();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("child")
+            .await
+            .expect("missing descendant should trigger one bounded retry");
+        let counters = crate::tracked_state::root_availability_counters();
+        assert_eq!(counters.missing_descendant_retries, 1);
+        assert_eq!(counters.full_tree_scans, 0);
+        assert_eq!(counters.canonical_rebuilds, 0);
+        assert!(counters.available >= 1);
+        assert_eq!(counters.corrupt, 0);
+    }
+
+    #[tokio::test]
+    async fn corrupt_authenticated_parent_root_fails_closed_without_retry() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("base"),
+            &[row_with_value("entity-a", "change-child", "child", "child")],
+        )
+        .await
+        .expect("child root should write");
+        corrupt_root_chunk_for_test(&storage, "base").await;
+
+        crate::tracked_state::reset_root_availability_counters();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read, "child", true,
+        )
+        .await
+        .expect_err("corrupt parent root must fail closed");
+        assert_ne!(error.code, "LIX_TRACKED_STATE_MISSING_CHUNK");
+        let counters = crate::tracked_state::root_availability_counters();
+        assert_eq!(counters.corrupt, 1);
+        assert_eq!(counters.missing_descendant_retries, 0);
+        assert_eq!(counters.full_tree_scans, 0);
+        assert_eq!(counters.canonical_rebuilds, 0);
+    }
+
+    #[tokio::test]
     async fn explicit_rebuild_repairs_missing_head_root_chunk() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
@@ -7132,6 +7294,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        crate::tracked_state::reset_root_availability_counters();
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read, "child", false,
+        )
+        .await
+        .expect("missing root should be eligible for replay");
+        assert_eq!(plans.len(), 1);
+        let counters = crate::tracked_state::root_availability_counters();
+        assert_eq!(counters.missing, 1);
+        assert_eq!(counters.available, 1);
+        assert_eq!(counters.corrupt, 0);
+        assert_eq!(counters.full_tree_scans, 0);
+        assert_eq!(counters.canonical_rebuilds, 0);
         let mut writes = storage.new_write_set();
         tracked_state
             .root_rebuilder(&read, &mut writes)
