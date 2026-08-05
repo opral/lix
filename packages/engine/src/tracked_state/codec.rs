@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::ops::Range;
-use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
@@ -10,8 +9,6 @@ use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
     TrackedStateKeyRef, TrackedStateMutation, TrackedStateMutationBatch,
 };
-
-const WEIBULL_K: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -92,6 +89,7 @@ pub(crate) struct ChildSummary {
     pub(crate) last_key: Bytes,
     pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
     pub(crate) subtree_count: u64,
+    pub(crate) subtree_height: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +98,7 @@ pub(crate) struct ChildSummaryRef<'a> {
     pub(crate) last_key: &'a [u8],
     pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
     pub(crate) subtree_count: u64,
+    pub(crate) subtree_height: u32,
 }
 
 impl ChildSummary {
@@ -109,6 +108,7 @@ impl ChildSummary {
             last_key: &self.last_key,
             child_hash: self.child_hash,
             subtree_count: self.subtree_count,
+            subtree_height: self.subtree_height,
         }
     }
 }
@@ -231,8 +231,12 @@ impl DecodedInternalNode {
     }
 }
 
-const NODE_KIND_LEAF_V3: u8 = 3;
-const NODE_KIND_INTERNAL_V3: u8 = 4;
+// V4 is a deliberate hard cut: the authenticated internal summaries carry
+// subtree height so a frontier can rebuild only affected ancestors without
+// walking untouched descendants. V3 roots are rejected rather than silently
+// interpreted as a different authority shape.
+const NODE_KIND_LEAF_V4: u8 = 5;
+const NODE_KIND_INTERNAL_V4: u8 = 6;
 
 #[derive(Debug, Clone, Copy)]
 struct MutationSpan {
@@ -1417,10 +1421,10 @@ const VALUE_TAIL_DISTINCT_MIN: u8 = VALUE_TIMESTAMP_WIDTH_COUNT;
 const VALUE_TAIL_DISTINCT_MAX: u8 =
     VALUE_TAIL_DISTINCT_MIN + VALUE_TIMESTAMP_WIDTH_COUNT * VALUE_TIMESTAMP_WIDTH_COUNT - 1;
 
-/// Leaf node wire format (v3):
+/// Leaf node wire format (v4):
 ///
 /// ```text
-/// [NODE_KIND_LEAF_V3]
+/// [NODE_KIND_LEAF_V4]
 /// varint entry_count
 /// varint commit_dict_len ++ commit_dict_len x 16 commit-id bytes
 /// varint tail_dict_len ++ tail_dict_len x self-delimiting state tails
@@ -1470,7 +1474,7 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
     let tail_dictionary = repeated_tail_dictionary(entries);
 
     let mut out = Vec::with_capacity(64 + entries.len() * 24);
-    out.push(NODE_KIND_LEAF_V3);
+    out.push(NODE_KIND_LEAF_V4);
     write_varint(&mut out, entries.len() as u64);
     write_varint(&mut out, commit_dictionary.len() as u64);
     for commit_id in &commit_dictionary {
@@ -1578,7 +1582,7 @@ fn slice_dictionary_ref(dictionary: &[&[u8]], value: &[u8]) -> u64 {
         .map_or(0, |index| index as u64 + 1)
 }
 
-fn decode_leaf_v3(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1799,7 +1803,7 @@ pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec
     );
 
     let mut out = Vec::with_capacity(2 + children.len() * 40);
-    out.push(NODE_KIND_INTERNAL_V3);
+    out.push(NODE_KIND_INTERNAL_V4);
     write_varint(&mut out, children.len() as u64);
     let mut previous_last: &[u8] = &[];
     for child in children {
@@ -1807,6 +1811,7 @@ pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec
         write_front_coded(&mut out, child.first_key, child.last_key);
         out.extend_from_slice(&child.child_hash);
         write_varint(&mut out, child.subtree_count);
+        write_varint(&mut out, u64::from(child.subtree_height));
         previous_last = child.last_key;
     }
     out
@@ -1819,7 +1824,7 @@ fn write_front_coded(out: &mut Vec<u8>, base: &[u8], value: &[u8]) {
     out.extend_from_slice(&value[shared..]);
 }
 
-fn decode_internal_v3(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
+fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1879,6 +1884,7 @@ fn decode_internal_v3(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
         last_key: Range<usize>,
         child_hash: [u8; TRACKED_STATE_HASH_BYTES],
         subtree_count: u64,
+        subtree_height: u32,
     }
 
     let mut offset = 0usize;
@@ -1921,12 +1927,30 @@ fn decode_internal_v3(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
                 "tracked-state internal node child has an empty subtree",
             ));
         }
+        let subtree_height = u32::try_from(read_varint(
+            body,
+            &mut offset,
+            "tracked-state internal node",
+        )?)
+        .map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node subtree height overflows u32",
+            )
+        })?;
+        if subtree_height == 0 {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node child has zero height",
+            ));
+        }
         previous_last = Some(last_key.clone());
         child_spans.push(DecodedChildSpan {
             first_key,
             last_key,
             child_hash,
             subtree_count,
+            subtree_height,
         });
     }
     if offset != body.len() {
@@ -1944,6 +1968,7 @@ fn decode_internal_v3(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
                 last_key: boundary_arena.slice(child.last_key),
                 child_hash: child.child_hash,
                 subtree_count: child.subtree_count,
+                subtree_height: child.subtree_height,
             })
             .collect(),
     })
@@ -1961,52 +1986,13 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> 
         .split_first()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
     match kind {
-        NODE_KIND_LEAF_V3 => Ok(DecodedNodeRef::Leaf(decode_leaf_v3(body)?)),
-        NODE_KIND_INTERNAL_V3 => Ok(DecodedNodeRef::Internal(decode_internal_v3(body)?)),
+        NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v4(body)?)),
+        NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
         )),
     }
-}
-
-#[expect(clippy::cast_precision_loss)]
-pub(crate) fn boundary_trigger(
-    encoded_key: &[u8],
-    level: usize,
-    chunk_size: usize,
-    item_size: usize,
-    target_chunk_bytes: usize,
-) -> bool {
-    if item_size == 0 || target_chunk_bytes == 0 {
-        return false;
-    }
-
-    let start =
-        weibull_cdf(chunk_size.saturating_sub(item_size) as f64 / target_chunk_bytes as f64);
-    let end = weibull_cdf(chunk_size as f64 / target_chunk_bytes as f64);
-    let remaining = 1.0 - start;
-    if remaining <= 0.0 {
-        return true;
-    }
-
-    let split_probability = ((end - start) / remaining).clamp(0.0, 1.0);
-    let hash = xxh3_64_with_seed(encoded_key, level_salt(level));
-    (hash as f64) < split_probability * (u64::MAX as f64)
-}
-
-fn weibull_cdf(normalized_size: f64) -> f64 {
-    if normalized_size <= 0.0 {
-        return 0.0;
-    }
-    -f64::exp_m1(-normalized_size.powi(WEIBULL_K))
-}
-
-fn level_salt(level: usize) -> u64 {
-    let mut value = (level as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 #[cfg(test)]
@@ -2197,7 +2183,7 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = encode_leaf_refs_for_tests(&refs);
         let mut expected = vec![
-            3, // NODE_KIND_LEAF_V3
+            5, // NODE_KIND_LEAF_V4
             3, // entry count
             1, // commit dictionary length
         ];
@@ -2219,7 +2205,7 @@ mod tests {
         expected.extend_from_slice(&[0xFF; 16]);
         expected.push(0);
         expected.extend_from_slice(&[0x93, 0x11, 0x12]);
-        assert_eq!(encoded, expected, "v3 wire bytes must stay stable");
+        assert_eq!(encoded, expected, "v4 wire bytes must stay stable");
     }
 
     #[test]
@@ -3098,36 +3084,26 @@ mod tests {
     }
 
     #[test]
-    fn internal_v3_round_trips_and_pins_front_coded_boundaries() {
+    fn internal_v4_round_trips_and_pins_front_coded_boundaries() {
         let children = vec![
             ChildSummary {
                 first_key: Bytes::from_static(b"aa"),
                 last_key: Bytes::from_static(b"az"),
                 child_hash: [1; TRACKED_STATE_HASH_BYTES],
                 subtree_count: 3,
+                subtree_height: 1,
             },
             ChildSummary {
                 first_key: Bytes::from_static(b"ba"),
                 last_key: Bytes::from_static(b"bz"),
                 child_hash: [2; TRACKED_STATE_HASH_BYTES],
                 subtree_count: 4,
+                subtree_height: 2,
             },
         ];
         let encoded = encode_internal_node(&children);
-        let mut expected = vec![
-            4, 2, // kind, child count
-            0, 2, b'a', b'a', // first "aa" relative to empty
-            1, 1, b'z', // last "az" relative to "aa"
-        ];
-        expected.extend_from_slice(&[1; TRACKED_STATE_HASH_BYTES]);
-        expected.extend_from_slice(&[
-            3, // subtree count
-            0, 2, b'b', b'a', // first "ba" relative to previous last "az"
-            1, 1, b'z', // last "bz" relative to "ba"
-        ]);
-        expected.extend_from_slice(&[2; TRACKED_STATE_HASH_BYTES]);
-        expected.push(4);
-        assert_eq!(encoded, expected, "internal v3 wire bytes must stay stable");
+        assert_eq!(encoded.first(), Some(&NODE_KIND_INTERNAL_V4));
+        assert!(encoded.ends_with(&[4, 2]), "height fields must be encoded");
 
         let DecodedNode::Internal(decoded) = decode_node(&encoded).expect("internal node") else {
             panic!("expected internal node");
@@ -3136,16 +3112,17 @@ mod tests {
     }
 
     #[test]
-    fn internal_v3_rejects_empty_truncated_and_invalid_boundaries() {
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 0]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 1]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 1, 1, 0]).is_err());
+    fn internal_v4_rejects_empty_truncated_and_invalid_boundaries() {
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 0]).is_err());
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 1]).is_err());
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 1, 1, 0]).is_err());
 
         let child = ChildSummary {
             first_key: Bytes::from_static(b"a"),
             last_key: Bytes::from_static(b"z"),
             child_hash: [9; TRACKED_STATE_HASH_BYTES],
             subtree_count: 1,
+            subtree_height: 1,
         };
         let encoded = encode_internal_node(&[child]);
         let mut zero_subtree = encoded.clone();
@@ -3160,12 +3137,5 @@ mod tests {
     #[test]
     fn content_hash_is_blake3() {
         assert_eq!(hash_bytes(b"abc"), *blake3::hash(b"abc").as_bytes());
-    }
-
-    #[test]
-    fn boundary_decisions_are_xxh3_based_and_deterministic() {
-        let left = boundary_trigger(b"key", 0, 4096, 128, 4096);
-        let right = boundary_trigger(b"key", 0, 4096, 128, 4096);
-        assert_eq!(left, right);
     }
 }
