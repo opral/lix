@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 
 use crate::binary_cas::BlobId;
@@ -151,6 +153,7 @@ where
         },
     );
     let mut resume_after = None;
+    let mut reclaimed_branches = BTreeSet::<[u8; 16]>::new();
     loop {
         let page = plan
             .collect(
@@ -200,32 +203,34 @@ where
                 // than deleting the recreated branch's active files.
                 continue;
             }
-            let checkpoint_plan = ScanPlan::prefix(
-                PLUGIN_CHECKPOINT_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::copy_from_slice(branch_bytes),
-                },
-            );
-            let mut checkpoint_resume = None;
-            loop {
-                let chunk = checkpoint_plan
-                    .collect(
-                        read,
-                        StorageScanOptions {
-                            projection: StorageCoreProjection::KeyOnly,
-                            resume_after: checkpoint_resume.clone(),
-                            ..StorageScanOptions::default()
-                        },
-                    )
-                    .await?
-                    .value;
-                checkpoint_resume = chunk.entries.last().map(|item| item.key.clone());
-                writes.delete_batch(
+            if reclaimed_branches.insert(key.branch_id) {
+                let checkpoint_plan = ScanPlan::prefix(
                     PLUGIN_CHECKPOINT_SPACE,
-                    chunk.entries.into_iter().map(|item| item.key),
+                    StoragePrefix {
+                        bytes: Bytes::copy_from_slice(branch_bytes),
+                    },
                 );
-                if !chunk.has_more || checkpoint_resume.is_none() {
-                    break;
+                let mut checkpoint_resume = None;
+                loop {
+                    let chunk = checkpoint_plan
+                        .collect(
+                            read,
+                            StorageScanOptions {
+                                projection: StorageCoreProjection::KeyOnly,
+                                resume_after: checkpoint_resume.clone(),
+                                ..StorageScanOptions::default()
+                            },
+                        )
+                        .await?
+                        .value;
+                    checkpoint_resume = chunk.entries.last().map(|item| item.key.clone());
+                    writes.delete_batch(
+                        PLUGIN_CHECKPOINT_SPACE,
+                        chunk.entries.into_iter().map(|item| item.key),
+                    );
+                    if !chunk.has_more || checkpoint_resume.is_none() {
+                        break;
+                    }
                 }
             }
             writes.delete(PLUGIN_CHECKPOINT_RECLAMATION_SPACE, entry.key);
@@ -466,6 +471,8 @@ mod tests {
             generation.as_bytes()[..16].try_into().unwrap(),
         )
         .unwrap();
+        stage_enqueue_branch_plugin_checkpoint_reclamation(&mut writes, BRANCH_ID, [7; 16])
+            .unwrap();
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
