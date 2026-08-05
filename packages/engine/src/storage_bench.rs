@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
+use crate::changelog::ChangelogReader;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
@@ -586,11 +587,12 @@ where
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryGcBenchResult {
     pub live_commits: usize,
     pub swept_commits: usize,
     pub swept_standalone_changes: usize,
+    pub standalone_swept_ids: Vec<String>,
     pub swept_payloads: usize,
     pub staged_puts: u64,
     pub staged_deletes: u64,
@@ -629,8 +631,24 @@ where
     let arena = writes.arena_stats();
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
-        swept_commits: plan.changelog.sweep.commits.len(),
-        swept_standalone_changes: plan.changelog.sweep.changes.len(),
+        swept_commits: plan
+            .changelog
+            .sweep
+            .commits
+            .len()
+            .saturating_add(plan.sweep.tracked_commit_roots.len()),
+        swept_standalone_changes: plan
+            .changelog
+            .sweep
+            .changes
+            .len()
+            .saturating_add(plan.sweep.standalone_changes.len()),
+        standalone_swept_ids: plan
+            .sweep
+            .standalone_changes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         swept_payloads: plan.changelog.sweep.json_payloads.len(),
         staged_puts: stats.staged_puts,
         staged_deletes: stats.staged_deletes,
@@ -647,6 +665,21 @@ where
         tracked_root_stage_us: plan.profile.tracked_root_stage_us,
         total_us: plan.profile.total_us,
     })
+}
+
+/// Audits standalone semantic facts for the GC benchmark without adding the
+/// scan to the measured planner phase. The exact IDs and their authenticated
+/// control reason make the old-vs-frontier sweep discrepancy explicit.
+pub async fn audit_repository_gc_standalone_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<Vec<String>, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    crate::gc::audit_repository_gc_standalone_refs(&read).await
 }
 
 /// Scans public commit facts through the two checkpoint-history strategies.

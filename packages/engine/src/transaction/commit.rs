@@ -245,6 +245,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
+    #[cfg(test)]
+    let seeded_reachability_queue =
+        crate::gc::ensure_reachability_queue_for_test(&*read, &mut writes).await?;
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
@@ -759,6 +762,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
     let mut root_backed_branch_publications = BTreeSet::new();
+    let mut root_reachability_deltas = Vec::new();
     let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
@@ -772,6 +776,27 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
+        &mut root_reachability_deltas,
+    )
+    .await?;
+    #[cfg(test)]
+    if seeded_reachability_queue {
+        // The seed and first publication share this test-only bootstrap write
+        // set; the production initializer always commits the queue before any
+        // branch publication, so no delta can be lost in live repositories.
+        root_reachability_deltas.clear();
+    }
+    let checkpoint_roots = prepared_writes
+        .checkpoint_publications
+        .iter()
+        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
+        .collect::<Vec<_>>();
+    crate::gc::stage_reachability_delta_batch(
+        read,
+        &mut writes,
+        &root_reachability_deltas,
+        &checkpoint_roots,
+        &mut preconditions,
     )
     .await?;
     if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
@@ -4741,6 +4766,7 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
+    root_reachability_deltas: &mut Vec<crate::gc::RootReachabilityDelta>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     let mut publications = normal_controls
@@ -4909,6 +4935,21 @@ async fn stage_branch_head_control_publications(
             branch_id,
             observation.raw_token.clone(),
         )?);
+        let old_root = observation.control.map(|control| control.head_commit_id);
+        let new_root = desired.as_ref().map(|control| control.head_commit_id);
+        if old_root != new_root {
+            root_reachability_deltas.push(crate::gc::RootReachabilityDelta {
+                branch_id: branch_id.clone(),
+                old_root,
+                new_root,
+                old_control: observation.control,
+                new_control: *desired,
+                old_control_digest: crate::gc::root_control_digest_for_control(
+                    observation.control.as_ref(),
+                )?,
+                new_control_digest: crate::gc::root_control_digest_for_control(desired.as_ref())?,
+            });
+        }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
             None => stage_delete_branch_head_control(writes, branch_id)?,
