@@ -858,6 +858,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &staged_hot_heads.controls,
+        &staged_hot_heads.untracked_controls,
         &staged_hot_heads.tracked_snapshots,
         &state_rows,
         &explicit_branch_targets,
@@ -3005,6 +3006,11 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
+    /// Locator-bound controls produced while staging branch-local untracked
+    /// mutations. Explicit branch-ref publications are finalized separately,
+    /// so they must consume this exact updated binding instead of retaining
+    /// the pre-mutation root metadata.
+    untracked_controls: BTreeMap<String, BranchHeadControl>,
     tracked_snapshots: BTreeMap<CommitId, HotTrackedSnapshot>,
     deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
 }
@@ -4489,6 +4495,7 @@ async fn stage_tracked_head(
     }
     Ok(StagedHotHeads {
         controls,
+        untracked_controls,
         tracked_snapshots,
         deferred_fresh_hot_plans,
     })
@@ -5004,6 +5011,7 @@ async fn stage_branch_head_control_publications(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     normal_controls: &BTreeMap<String, BranchHeadControl>,
+    untracked_controls: &BTreeMap<String, BranchHeadControl>,
     tracked_snapshots: &BTreeMap<CommitId, HotTrackedSnapshot>,
     state_rows: &PreparedStateBatch,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
@@ -5096,6 +5104,7 @@ async fn stage_branch_head_control_publications(
                             &mut coverage,
                         )
                         .await?;
+                    let locator_control = untracked_controls.get(branch_id).copied().or(existing);
                     let mut control = BranchHeadControl {
                         head_commit_id,
                         generation,
@@ -5119,13 +5128,13 @@ async fn stage_branch_head_control_publications(
                         schema_presence_bloom: existing
                             .expect("existing lifecycle publication was handled above")
                             .schema_presence_bloom,
-                        untracked_locator_root: existing
+                        untracked_locator_root: locator_control
                             .expect("existing lifecycle publication was handled above")
                             .untracked_locator_root,
-                        untracked_locator_generation: existing
+                        untracked_locator_generation: locator_control
                             .expect("existing lifecycle publication was handled above")
                             .untracked_locator_generation,
-                        untracked_locator_count: existing
+                        untracked_locator_count: locator_control
                             .expect("existing lifecycle publication was handled above")
                             .untracked_locator_count,
                     };
