@@ -13944,9 +13944,13 @@ mod tests {
             out_of_range_change_id,
             hole_change_id,
         ];
-        let batch = super::load_change_records_by_ids(&read, &requested)
-            .await
-            .expect("mixed owned and unowned direct-shaped batch should dispatch");
+        let (batch_result, invocation_accounting) =
+            super::super::mutation_directory::test_read_accounting::scope(
+                super::load_change_records_by_ids(&read, &requested),
+            )
+            .await;
+        let batch =
+            batch_result.expect("mixed owned and unowned direct-shaped batch should dispatch");
         assert_eq!(
             batch
                 .iter()
@@ -13957,7 +13961,7 @@ mod tests {
         let accounting =
             super::super::mutation_directory::snapshot_mutation_directory_read_accounting();
         assert!(accounting.direct_route_calls >= 3);
-        assert_eq!(accounting.selector_all_roots, 0);
+        assert_eq!(invocation_accounting.selector_all_roots, 0);
         assert!(accounting.selector_direct_calls > 0);
         assert!(accounting.not_owned_part_index > 0);
         assert!(accounting.not_owned_local_row > 0);
@@ -14057,15 +14061,19 @@ mod tests {
         let change_id = staged
             .change_id_at(1)
             .expect("replacement row should be addressed");
-        let loaded = load_change_record_by_id(&read, change_id)
-            .await
+        let (loaded_result, invocation_accounting) =
+            super::super::mutation_directory::test_read_accounting::scope(
+                load_change_record_by_id(&read, change_id),
+            )
+            .await;
+        let loaded = loaded_result
             .expect("compact direct hydration should succeed")
             .expect("compact direct row should exist");
         assert_eq!(loaded.change_id, change_id);
         assert_eq!(loaded.entity_pk, EntityPk::single("compact-001"));
         let accounting =
             super::super::mutation_directory::snapshot_mutation_directory_read_accounting();
-        assert_eq!(accounting.selector_all_roots, 0);
+        assert_eq!(invocation_accounting.selector_all_roots, 0);
         assert!(accounting.selector_direct_calls > 0);
         assert_eq!(accounting.external_parts_loaded, 1);
         assert_eq!(accounting.parts_decoded, 1);

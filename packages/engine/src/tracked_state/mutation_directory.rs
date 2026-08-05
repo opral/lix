@@ -96,6 +96,45 @@ mod read_accounting {
     }
 }
 
+// The process-wide counters above are useful for benchmark phases, but their
+// absolute values are intentionally not suitable for assertions in a
+// parallel test suite.  Keep a task-local test observer for the narrow
+// per-invocation properties that must not be contaminated by other tests.
+#[cfg(test)]
+pub(crate) mod test_read_accounting {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::rc::Rc;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct ScopedMutationDirectoryReadAccounting {
+        pub(crate) selector_all_roots: u64,
+    }
+
+    tokio::task_local! {
+        static ACTIVE: Rc<RefCell<ScopedMutationDirectoryReadAccounting>>;
+    }
+
+    pub(crate) async fn scope<F>(future: F) -> (F::Output, ScopedMutationDirectoryReadAccounting)
+    where
+        F: Future,
+    {
+        let state = Rc::new(RefCell::new(
+            ScopedMutationDirectoryReadAccounting::default(),
+        ));
+        let output = ACTIVE.scope(state.clone(), future).await;
+        let accounting = *state.borrow();
+        (output, accounting)
+    }
+
+    pub(crate) fn record_selector_all_roots(roots: usize) {
+        let _ = ACTIVE.try_with(|state| {
+            let mut state = state.borrow_mut();
+            state.selector_all_roots = state.selector_all_roots.saturating_add(roots as u64);
+        });
+    }
+}
+
 #[cfg(any(test, feature = "storage-benches"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MutationDirectoryReadAccounting {
@@ -376,6 +415,8 @@ pub(crate) enum MutationDirectoryFullTraversalContext {
 #[cfg(any(test, feature = "storage-benches"))]
 fn record_full_traversal(context: MutationDirectoryFullTraversalContext, roots: usize) {
     use read_accounting as counters;
+    #[cfg(test)]
+    test_read_accounting::record_selector_all_roots(roots);
     counters::add(counters::SELECTOR_ALL_ROOTS, roots);
     let counter = match context {
         MutationDirectoryFullTraversalContext::BulkCommitStateManifests => {
