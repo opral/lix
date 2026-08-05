@@ -1975,6 +1975,12 @@ fn decode_internal_v5(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
         }
         let first_bytes = &boundary_arena[first_key.clone()];
         let last_bytes = &boundary_arena[last_key.clone()];
+        if first_bytes.is_empty() || last_bytes.is_empty() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node child has an empty key boundary",
+            ));
+        }
         if first_bytes > last_bytes {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
