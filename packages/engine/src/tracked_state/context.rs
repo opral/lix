@@ -7214,6 +7214,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_descendant_in_older_rootless_replay_plan_retries_the_failing_parent() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let grandparent_rows = (0..300)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:04}"),
+                    &format!("change-grandparent-{index:04}"),
+                    "grandparent",
+                    &format!("grandparent-{index:04}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "grandparent",
+            None,
+            &grandparent_rows,
+        )
+        .await
+        .expect("grandparent root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "parent",
+            "grandparent",
+            &[row_with_value(
+                "entity-0150",
+                "change-parent",
+                "parent",
+                "parent",
+            )],
+        )
+        .await;
+        write_rootless_commit_for_test(
+            &storage,
+            "target",
+            "parent",
+            &[row_with_value(
+                "entity-0151",
+                "change-target",
+                "target",
+                "target",
+            )],
+        )
+        .await;
+
+        // Keep the authenticated grandparent root header but remove its
+        // descendants. The first failing plan is the older rootless parent,
+        // whose parent is grandparent; retrying target.parent would skip the
+        // wrong commit and reproduce the same missing descendant.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let grandparent_root = storage::load_root(&read, "grandparent")
+            .await
+            .expect("grandparent root metadata should load")
+            .expect("grandparent root should exist");
+        let tree = TrackedStateTree::new();
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        let reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &overlay, &grandparent_root)
+            .await
+            .expect("grandparent reachability should load");
+        let descendants = reachable
+            .into_iter()
+            .filter(|hash| hash != grandparent_root.as_bytes())
+            .collect::<Vec<_>>();
+        assert!(
+            !descendants.is_empty(),
+            "large grandparent tree should have descendant chunks"
+        );
+        drop(read);
+        let mut deletes = storage.new_write_set();
+        for descendant in descendants {
+            deletes.delete(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&descendant)),
+            );
+        }
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("descendant deletion should commit");
+
+        crate::tracked_state::reset_root_availability_counters();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("target")
+            .await
+            .expect("older-plan missing descendant should trigger one bounded retry");
+        let counters = crate::tracked_state::root_availability_counters();
+        assert_eq!(counters.missing_descendant_retries, 1);
+        assert_eq!(counters.full_tree_scans, 0);
+        assert_eq!(counters.canonical_rebuilds, 0);
+    }
+
+    #[tokio::test]
     async fn corrupt_authenticated_parent_root_fails_closed_without_retry() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();

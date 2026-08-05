@@ -252,20 +252,19 @@ where
         .await?;
         match stage_rebuild_plans_once(rebuilder, &plans).await {
             Ok(result) => break result,
-            Err(error) if !retried_missing_descendant && is_missing_tree_chunk_error(&error) => {
-                let Some(missing_base_root) = plans
-                    .iter()
-                    .find(|plan| plan.parent_commit_id.is_some())
-                    .and_then(|plan| plan.parent_commit_id)
-                else {
-                    return Err(error);
+            Err(stage_error)
+                if !retried_missing_descendant
+                    && is_missing_tree_chunk_error(&stage_error.error) =>
+            {
+                let Some(missing_base_root) = stage_error.retry_parent else {
+                    return Err(stage_error.error);
                 };
                 retried_missing_descendant = true;
                 #[cfg(any(test, feature = "storage-benches"))]
                 counters::missing_descendant_retry();
                 skipped_root = Some(missing_base_root.to_string());
             }
-            Err(error) => return Err(error),
+            Err(stage_error) => return Err(stage_error.error),
         }
     };
     let context = TrackedStateContext::new();
@@ -307,7 +306,7 @@ where
 async fn stage_rebuild_plans_once<S>(
     rebuilder: &mut TrackedStateRootRebuilder<'_, S>,
     plans: &[CommitRootRebuildPlan],
-) -> Result<(TrackedStateWriteReport, TrackedStateTransientRebuildState), LixError>
+) -> Result<(TrackedStateWriteReport, TrackedStateTransientRebuildState), StageRebuildPlansError>
 where
     S: StorageAdapterRead + ?Sized,
 {
@@ -329,10 +328,19 @@ where
         if manifest.snapshot_root.is_some() {
             let mut writer =
                 context.writer_with_rebuild_state(rebuilder.store, rebuilder.writes, state);
-            let rooted_report = stage_rebuild_plan_with_writer(&mut writer, plan).await?;
+            let rooted_report = stage_rebuild_plan_with_writer(&mut writer, plan)
+                .await
+                .map_err(|error| StageRebuildPlansError {
+                    retry_parent: plan.parent_commit_id,
+                    error,
+                })?;
             writer
                 .promote_reachable_transient_chunks(&rooted_report.root_id)
-                .await?;
+                .await
+                .map_err(|error| StageRebuildPlansError {
+                    retry_parent: plan.parent_commit_id,
+                    error,
+                })?;
             report = Some(rooted_report);
             state = writer.into_transient_rebuild_state();
         } else {
@@ -343,7 +351,14 @@ where
             let mut scratch_writes = StorageWriteSet::new();
             let mut writer =
                 context.writer_with_rebuild_state(rebuilder.store, &mut scratch_writes, state);
-            report = Some(stage_rebuild_plan_with_writer(&mut writer, plan).await?);
+            report = Some(
+                stage_rebuild_plan_with_writer(&mut writer, plan)
+                    .await
+                    .map_err(|error| StageRebuildPlansError {
+                        retry_parent: plan.parent_commit_id,
+                        error,
+                    })?,
+            );
             state = writer.into_transient_rebuild_state();
             state.mark_new_chunks_transient(&previously_known);
         }
@@ -355,6 +370,21 @@ where
         )
     })?;
     Ok((report, state))
+}
+
+#[derive(Debug)]
+struct StageRebuildPlansError {
+    error: LixError,
+    retry_parent: Option<CommitId>,
+}
+
+impl From<LixError> for StageRebuildPlansError {
+    fn from(error: LixError) -> Self {
+        Self {
+            error,
+            retry_parent: None,
+        }
+    }
 }
 
 #[cfg_attr(not(any(test, feature = "storage-benches")), allow(dead_code))]
