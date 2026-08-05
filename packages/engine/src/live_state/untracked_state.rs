@@ -2,8 +2,9 @@
 //!
 //! Untracked rows do not participate in commit history, merge, diff, working
 //! diff, or generation rotation. Their canonical storage key is `(branch,
-//! schema, entity)` and its value bundles the complete set of file variants;
-//! deleting the final member removes that bundle key physically.
+//! schema, entity)` and its value is an authenticated root for the complete
+//! set of file variants. Variant payloads live in immutable content-addressed
+//! chunks; deleting the final member removes the root physically.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -40,12 +41,18 @@ pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0033),
     "live_state.untracked_bundle.v2",
 );
+/// Immutable payload chunks referenced by an authoritative bundle root. A
+/// chunk is content addressed and has no entity/file lookup semantics; the
+/// root is the sole owner of logical untracked facts.
+pub(crate) const UNTRACKED_BUNDLE_CHUNK_SPACE: StorageSpace = StorageSpace::immutable(
+    StorageSpaceId(0x0004_0034),
+    "live_state.untracked_bundle_chunk.v1",
+);
 const VALUE_VERSION: u8 = 2;
 // The physical key names one canonical entity, while this value contains the
-// complete set of file variants for that entity.  A bundle is the sole
-// untracked authority; file fan-out records are never consulted or written by
-// the bundle path.
-const BUNDLE_MAGIC: &[u8] = b"LXUB2";
+// complete, strictly ordered chunk descriptor set for that entity. A bundle
+// root is the sole untracked authority; chunks never supply logical identity.
+const BUNDLE_ROOT_MAGIC: &[u8] = b"LXUB3";
 const SLOT_NONE: u8 = 0;
 const SLOT_REF: u8 = 1;
 const SLOT_INLINE: u8 = 2;
@@ -214,10 +221,19 @@ async fn stage_untracked_deltas_inner(
     )
     .await
 }
+#[cfg(test)]
 async fn read_untracked_bundles(
     store: &(impl StorageAdapterRead + ?Sized),
     keys: &[StorageKey],
 ) -> Result<BTreeMap<StorageKey, DecodedBundle>, LixError> {
+    let roots = read_untracked_bundle_roots(store, keys).await?;
+    resolve_untracked_bundle_roots(store, roots).await
+}
+
+async fn read_untracked_bundle_roots(
+    store: &(impl StorageAdapterRead + ?Sized),
+    keys: &[StorageKey],
+) -> Result<BTreeMap<StorageKey, BundleRoot>, LixError> {
     if keys.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -227,24 +243,170 @@ async fn read_untracked_bundles(
         .materialize(store, StorageGetOptions::default())
         .await?
         .value;
-    let mut bundles = BTreeMap::new();
+    let mut roots = BTreeMap::new();
     for (key, value) in keys.iter().cloned().zip(values) {
         let Some(value) = value else { continue };
         let StorageProjectedValue::FullValue(value) = value else {
             return Err(codec_error("untracked bundle point read omitted its value"));
         };
-        let identity = decode_bundle_key(&key.0)?;
-        let bundle = decode_bundle(value)?;
+        decode_bundle_key(&key.0)?;
+        roots.insert(key.clone(), decode_bundle_root(&key.0, value)?);
+    }
+    Ok(roots)
+}
+
+async fn resolve_untracked_bundle_roots(
+    store: &(impl StorageAdapterRead + ?Sized),
+    roots: BTreeMap<StorageKey, BundleRoot>,
+) -> Result<BTreeMap<StorageKey, DecodedBundle>, LixError> {
+    if roots.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut chunk_keys = BTreeSet::new();
+    for root in roots.values() {
+        for descriptor in root.values() {
+            chunk_keys.insert(StorageKey(Bytes::copy_from_slice(&descriptor.hash)));
+        }
+    }
+    let chunk_keys = chunk_keys.into_iter().collect::<Vec<_>>();
+    let chunk_values = if chunk_keys.is_empty() {
+        Vec::new()
+    } else {
+        #[cfg(any(test, feature = "storage-benches"))]
+        record_previous_point_read_keys(chunk_keys.len());
+        let values =
+            PointReadPlan::from_unique_keys(UNTRACKED_BUNDLE_CHUNK_SPACE, chunk_keys.clone())
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value;
+        let mut decoded = Vec::with_capacity(values.len());
+        for (key, value) in chunk_keys.iter().zip(values) {
+            let Some(value) = value else {
+                return Err(codec_error(
+                    "untracked bundle root references a missing chunk",
+                ));
+            };
+            let StorageProjectedValue::FullValue(value) = value else {
+                return Err(codec_error("untracked bundle chunk read omitted its value"));
+            };
+            if value.len() > u32::MAX as usize || blake3::hash(&value).as_bytes() != key.0.as_ref()
+            {
+                return Err(codec_error("untracked bundle chunk hash validation failed"));
+            }
+            decoded.push(value);
+        }
+        decoded
+    };
+    let chunk_by_hash = chunk_keys
+        .into_iter()
+        .zip(chunk_values)
+        .map(|(key, value)| {
+            let hash: [u8; 32] = key.0.as_ref().try_into().expect("chunk key is a hash");
+            (hash, value)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut bundles = BTreeMap::new();
+    for (key, root) in roots {
+        let mut bundle = BTreeMap::new();
+        for (file_id, descriptor) in root {
+            let encoded = chunk_by_hash
+                .get(&descriptor.hash)
+                .ok_or_else(|| codec_error("untracked bundle root references an unknown chunk"))?;
+            if encoded.len() != descriptor.len as usize {
+                return Err(codec_error(
+                    "untracked bundle chunk length validation failed",
+                ));
+            }
+            let encoded = encoded.clone();
+            let value = decode_value(encoded.clone())?;
+            bundle.insert(file_id, BundleMember { encoded, value });
+        }
         bundles.insert(key, bundle);
-        let _ = identity;
     }
     Ok(bundles)
+}
+
+/// Resolve only the variants named by a mutation/cascade plan. The root
+/// remains complete, while payload reads are proportional to touched file
+/// identities rather than the number of variants already present.
+async fn resolve_selected_bundle_members(
+    store: &(impl StorageAdapterRead + ?Sized),
+    roots: &BTreeMap<StorageKey, BundleRoot>,
+    requested: &BTreeMap<StorageKey, BTreeSet<Option<String>>>,
+) -> Result<BTreeMap<(StorageKey, Option<String>), BundleMember>, LixError> {
+    let mut descriptors = BTreeMap::<[u8; 32], ChunkDescriptor>::new();
+    for (key, files) in requested {
+        let Some(root) = roots.get(key) else { continue };
+        for file_id in files {
+            let Some(descriptor) = root.get(file_id) else {
+                continue;
+            };
+            descriptors
+                .entry(descriptor.hash)
+                .or_insert_with(|| descriptor.clone());
+        }
+    }
+    if descriptors.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let chunk_keys = descriptors
+        .keys()
+        .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+        .collect::<Vec<_>>();
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_previous_point_read_keys(chunk_keys.len());
+    let values = PointReadPlan::from_unique_keys(UNTRACKED_BUNDLE_CHUNK_SPACE, chunk_keys.clone())
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
+    let mut chunks = BTreeMap::<[u8; 32], Bytes>::new();
+    for (key, value) in chunk_keys.into_iter().zip(values) {
+        let Some(value) = value else {
+            return Err(codec_error(
+                "untracked bundle root references a missing chunk",
+            ));
+        };
+        let StorageProjectedValue::FullValue(value) = value else {
+            return Err(codec_error("untracked bundle chunk read omitted its value"));
+        };
+        let hash: [u8; 32] = key.0.as_ref().try_into().expect("chunk key is a hash");
+        if value.len() != descriptors[&hash].len as usize
+            || *blake3::hash(&value).as_bytes() != hash
+        {
+            return Err(codec_error("untracked bundle chunk validation failed"));
+        }
+        chunks.insert(hash, value);
+    }
+    let mut members = BTreeMap::new();
+    for (key, files) in requested {
+        let Some(root) = roots.get(key) else { continue };
+        for file_id in files {
+            let Some(descriptor) = root.get(file_id) else {
+                continue;
+            };
+            let encoded = chunks
+                .get(&descriptor.hash)
+                .ok_or_else(|| codec_error("untracked bundle chunk was not loaded"))?
+                .clone();
+            if encoded.len() != descriptor.len as usize {
+                return Err(codec_error(
+                    "untracked bundle selected descriptor length validation failed",
+                ));
+            }
+            let value = decode_value(encoded.clone())?;
+            members.insert(
+                (key.clone(), file_id.clone()),
+                BundleMember { encoded, value },
+            );
+        }
+    }
+    Ok(members)
 }
 
 async fn scan_all_untracked_bundles(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
-) -> Result<BTreeMap<StorageKey, DecodedBundle>, LixError> {
+) -> Result<BTreeMap<StorageKey, BundleRoot>, LixError> {
     let prefix = branch_prefix(branch_id)?;
     let plan = ScanPlan::prefix(
         UNTRACKED_ROW_SPACE,
@@ -253,7 +415,7 @@ async fn scan_all_untracked_bundles(
         },
     );
     let mut resume_after = None;
-    let mut bundles = BTreeMap::new();
+    let mut roots = BTreeMap::new();
     loop {
         let page = plan
             .collect(
@@ -280,14 +442,14 @@ async fn scan_all_untracked_bundles(
             }
             #[cfg(any(test, feature = "storage-benches"))]
             record_previous_scan_row(entry.key.0.len().saturating_add(value.len()));
-            bundles.insert(entry.key, decode_bundle(value)?);
+            roots.insert(entry.key.clone(), decode_bundle_root(&entry.key.0, value)?);
         }
         if !page.value.has_more {
             break;
         }
         resume_after = next_cursor;
     }
-    Ok(bundles)
+    Ok(roots)
 }
 
 /// Validate every bundle in a branch cascade scan, retaining only bundles
@@ -298,7 +460,7 @@ async fn scan_untracked_bundles_for_file_cascade(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     deleted_file_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<StorageKey, DecodedBundle>, LixError> {
+) -> Result<BTreeMap<StorageKey, BundleRoot>, LixError> {
     let prefix = branch_prefix(branch_id)?;
     let plan = ScanPlan::prefix(
         UNTRACKED_ROW_SPACE,
@@ -307,7 +469,7 @@ async fn scan_untracked_bundles_for_file_cascade(
         },
     );
     let mut resume_after = None;
-    let mut affected = BTreeMap::new();
+    let mut affected_roots = BTreeMap::new();
     loop {
         let page = plan
             .collect(
@@ -338,13 +500,13 @@ async fn scan_untracked_bundles_for_file_cascade(
             }
             #[cfg(any(test, feature = "storage-benches"))]
             record_previous_scan_row(entry.key.0.len().saturating_add(value.len()));
-            let bundle = decode_bundle(value)?;
-            if bundle.keys().any(|file_id| {
+            let root = decode_bundle_root(&entry.key.0, value)?;
+            if root.keys().any(|file_id| {
                 file_id
                     .as_deref()
                     .is_some_and(|file_id| deleted_file_ids.contains(file_id))
             }) {
-                affected.insert(entry.key, bundle);
+                affected_roots.insert(entry.key, root);
             }
         }
         if !page.value.has_more {
@@ -352,7 +514,7 @@ async fn scan_untracked_bundles_for_file_cascade(
         }
         resume_after = next_cursor;
     }
-    Ok(affected)
+    Ok(affected_roots)
 }
 
 async fn load_untracked_bundle_points(
@@ -372,11 +534,34 @@ async fn load_untracked_bundle_points(
             }
         }
     }
-    let bundles = read_untracked_bundles(store, &keys.into_iter().collect::<Vec<_>>()).await?;
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let roots = read_untracked_bundle_roots(store, &keys).await?;
+    let mut requested_members = BTreeMap::new();
+    for (key, root) in &roots {
+        let files = if request.filter.file_ids.is_empty() {
+            root.keys().cloned().collect::<BTreeSet<_>>()
+        } else {
+            root.keys()
+                .filter(|file_id| {
+                    request.filter.file_ids.iter().any(|filter| match filter {
+                        NullableKeyFilter::Any => true,
+                        NullableKeyFilter::Null => file_id.is_none(),
+                        NullableKeyFilter::Value(value) => file_id.as_ref() == Some(value),
+                    })
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        requested_members.insert(key.clone(), files);
+    }
+    let members = resolve_selected_bundle_members(store, &roots, &requested_members).await?;
     let mut decoded = Vec::new();
-    for (key, bundle) in bundles {
+    for (key, files) in requested_members {
         let identity = decode_bundle_key(&key.0)?;
-        for (file_id, member) in bundle {
+        for file_id in files {
+            let Some(member) = members.get(&(key.clone(), file_id.clone())) else {
+                continue;
+            };
             let row_identity = DecodedIdentity {
                 branch_id: identity.branch_id.clone(),
                 schema_key: identity.schema_key.clone(),
@@ -389,7 +574,7 @@ async fn load_untracked_bundle_points(
                     schema_key: row_identity.schema_key,
                     file_id: row_identity.file_id,
                     entity_pk: row_identity.entity_pk,
-                    value: member.value,
+                    value: member.value.clone(),
                 });
             }
         }
@@ -433,8 +618,26 @@ async fn stage_untracked_bundles(
         keys.insert(key);
     }
     let key_vec = keys.iter().cloned().collect::<Vec<_>>();
-    let mut states = read_untracked_bundles(store, &key_vec).await?;
+    let root_states = read_untracked_bundle_roots(store, &key_vec).await?;
+    let mut existing_chunk_hashes = root_states
+        .values()
+        .flat_map(|root| root.values().map(|descriptor| descriptor.hash))
+        .collect::<BTreeSet<_>>();
+    let mut roots = root_states;
     let mut changed_keys = keys.clone();
+
+    let mut requested_members = BTreeMap::<StorageKey, BTreeSet<Option<String>>>::new();
+    for delta in deltas.iter().filter(|delta| delta.untracked) {
+        let key = StorageKey(Bytes::from(encode_bundle_key(
+            branch_id,
+            delta.schema_key,
+            delta.entity_pk,
+        )?));
+        requested_members
+            .entry(key)
+            .or_default()
+            .insert(delta.file_id.map(str::to_owned));
+    }
 
     // Validate the caller's absence proof against the exact bundle member.
     for (delta, absent) in deltas.iter().zip(known_absent).filter(|(d, _)| d.untracked) {
@@ -443,9 +646,9 @@ async fn stage_untracked_bundles(
             delta.schema_key,
             delta.entity_pk,
         )?));
-        let present = states
+        let present = roots
             .get(&key)
-            .and_then(|bundle| bundle.get(&delta.file_id.map(str::to_owned)))
+            .and_then(|root| root.get(&delta.file_id.map(str::to_owned)))
             .is_some();
         if *absent && present {
             return Err(codec_error(format!(
@@ -462,12 +665,23 @@ async fn stage_untracked_bundles(
         .collect::<Result<BTreeSet<_>, _>>()?;
     deleted_file_ids.extend(deleted_file_ids_from_lifecycle.iter().cloned());
     if !deleted_file_ids.is_empty() {
-        for (key, bundle) in
+        for (key, root) in
             scan_untracked_bundles_for_file_cascade(store, branch_id, &deleted_file_ids).await?
         {
-            states.entry(key).or_insert(bundle);
+            let files = deleted_file_ids
+                .iter()
+                .filter(|file_id| root.contains_key(&Some((*file_id).clone())))
+                .map(|file_id| Some(file_id.clone()))
+                .collect::<BTreeSet<_>>();
+            requested_members
+                .entry(key.clone())
+                .or_default()
+                .extend(files);
+            roots.entry(key).or_insert(root);
         }
     }
+
+    let mut members = resolve_selected_bundle_members(store, &roots, &requested_members).await?;
 
     let mut retired_refs = BTreeSet::new();
     for delta in deltas.iter().filter(|delta| delta.untracked) {
@@ -476,30 +690,36 @@ async fn stage_untracked_bundles(
             delta.schema_key,
             delta.entity_pk,
         )?));
-        let bundle = states.entry(key.clone()).or_default();
         let file_id = delta.file_id.map(str::to_owned);
-        if let Some(previous) = bundle.get(&file_id) {
-            if delta.deleted || !delta.deleted {
-                collect_value_refs(&previous.value, &mut retired_refs);
-            }
+        let previous = members.remove(&(key.clone(), file_id.clone()));
+        if let Some(previous) = &previous {
+            collect_value_refs(&previous.value, &mut retired_refs);
         }
         if delta.deleted {
-            bundle.remove(&file_id);
+            roots.entry(key).or_default().remove(&file_id);
         } else {
-            let created_at = bundle
-                .get(&file_id)
+            let created_at = previous
+                .as_ref()
                 .map(|member| member.value.created_at)
                 .unwrap_or(delta.created_at);
             let encoded = Bytes::from(encode_value(*delta, created_at)?);
             let value = decode_value(encoded.clone())?;
-            bundle.insert(file_id, BundleMember { encoded, value });
+            let descriptor = chunk_descriptor(&encoded)?;
+            roots
+                .entry(key.clone())
+                .or_default()
+                .insert(file_id.clone(), descriptor);
+            members.insert((key, file_id), BundleMember { encoded, value });
         }
     }
     let mut cascaded_keys = BTreeSet::new();
-    for (key, bundle) in states.iter_mut() {
+    for (key, root) in roots.iter_mut() {
         for file_id in deleted_file_ids.iter() {
-            if let Some(member) = bundle.remove(&Some(file_id.clone())) {
-                collect_value_refs(&member.value, &mut retired_refs);
+            let member_key = (key.clone(), Some(file_id.clone()));
+            if root.remove(&Some(file_id.clone())).is_some() {
+                if let Some(member) = members.remove(&member_key) {
+                    collect_value_refs(&member.value, &mut retired_refs);
+                }
                 cascaded_keys.insert(key.clone());
             }
         }
@@ -508,25 +728,42 @@ async fn stage_untracked_bundles(
 
     if drop_branch {
         let existing = scan_all_untracked_bundles(store, branch_id).await?;
+        // Branch deletion is a destructive lifecycle operation. Validate every
+        // referenced immutable chunk before staging any root delete so a
+        // missing/corrupt payload cannot be hidden by deleting its root.
+        let _validated = resolve_untracked_bundle_roots(store, existing.clone()).await?;
         for key in existing.keys() {
             writes.delete(UNTRACKED_ROW_SPACE, key.clone());
         }
     } else {
+        let mut new_chunks = BTreeMap::<[u8; 32], Bytes>::new();
         for key in changed_keys {
-            let Some(bundle) = states.remove(&key) else {
+            let Some(root) = roots.remove(&key) else {
                 continue;
             };
-            if bundle.is_empty() {
+            if root.is_empty() {
                 writes.delete(UNTRACKED_ROW_SPACE, key);
             } else {
-                writes.put(
-                    UNTRACKED_ROW_SPACE,
-                    key,
-                    StorageValue {
-                        bytes: encode_bundle(&bundle)?,
-                    },
-                );
+                if let Some(files) = requested_members.get(&key) {
+                    for file_id in files {
+                        if let Some(member) = members.get(&(key.clone(), file_id.clone())) {
+                            let descriptor = chunk_descriptor(&member.encoded)?;
+                            if existing_chunk_hashes.insert(descriptor.hash) {
+                                new_chunks.insert(descriptor.hash, member.encoded.clone());
+                            }
+                        }
+                    }
+                }
+                let root_bytes = encode_bundle_root(&key.0, &root)?;
+                writes.put(UNTRACKED_ROW_SPACE, key, StorageValue { bytes: root_bytes });
             }
+        }
+        for (hash, bytes) in new_chunks {
+            writes.put(
+                UNTRACKED_BUNDLE_CHUNK_SPACE,
+                StorageKey(Bytes::copy_from_slice(&hash)),
+                bytes.to_vec(),
+            );
         }
     }
     crate::json_store::JsonStoreWriter::stage_untracked_reclaim_candidates(
@@ -678,7 +915,23 @@ async fn load_untracked_exact_bundle_batch(
         requested_keys.push(Some((branch_key, global_key)));
     }
     let keys = keys.into_iter().collect::<Vec<_>>();
-    let bundles = read_untracked_bundles(store, &keys).await?;
+    let roots = read_untracked_bundle_roots(store, &keys).await?;
+    let mut requested_members = BTreeMap::<StorageKey, BTreeSet<Option<String>>>::new();
+    for (row, requested) in request.rows.iter().zip(&requested_keys) {
+        if let Some((branch_key, global_key)) = requested {
+            requested_members
+                .entry(branch_key.clone())
+                .or_default()
+                .insert(row.file_id.clone());
+            if let Some(global_key) = global_key {
+                requested_members
+                    .entry(global_key.clone())
+                    .or_default()
+                    .insert(row.file_id.clone());
+            }
+        }
+    }
+    let members = resolve_selected_bundle_members(store, &roots, &requested_members).await?;
     let mut decoded = Vec::new();
     let mut selections = Vec::with_capacity(request.rows.len());
     for (row, requested) in request.rows.iter().zip(requested_keys) {
@@ -687,19 +940,17 @@ async fn load_untracked_exact_bundle_batch(
             continue;
         };
         let file_id = row.file_id.clone();
-        let (chosen_key, branch_override, member) = if let Some(bundle) = bundles.get(&branch_key)
-            && let Some(member) = bundle.get(&file_id)
-        {
-            (branch_key, None, member)
-        } else if let Some(global_key) = global_key
-            && let Some(bundle) = bundles.get(&global_key)
-            && let Some(member) = bundle.get(&file_id)
-        {
-            (global_key, Some(row.branch_id.clone()), member)
-        } else {
-            selections.push(None);
-            continue;
-        };
+        let (chosen_key, branch_override, member) =
+            if let Some(member) = members.get(&(branch_key.clone(), file_id.clone())) {
+                (branch_key, None, member)
+            } else if let Some(global_key) = global_key
+                && let Some(member) = members.get(&(global_key.clone(), file_id.clone()))
+            {
+                (global_key, Some(row.branch_id.clone()), member)
+            } else {
+                selections.push(None);
+                continue;
+            };
         let identity = decode_bundle_key(&chosen_key.0)?;
         let index = decoded.len();
         decoded.push(DecodedRow {
@@ -759,7 +1010,16 @@ async fn untracked_bundle_json_refs(
             page.value.entries.iter().map(|entry| &entry.key),
             page.value.has_more,
         )?;
+        let mut page_roots = BTreeMap::new();
         for entry in page.value.entries {
+            #[cfg(any(test, feature = "storage-benches"))]
+            record_previous_scan_row(
+                entry.key.0.len()
+                    + match &entry.value {
+                        StorageProjectedValue::FullValue(value) => value.len(),
+                        StorageProjectedValue::KeyOnly => 0,
+                    },
+            );
             let identity = decode_bundle_key(&entry.key.0)?;
             if identity.branch_id != GLOBAL_BRANCH_ID
                 && !controlled_branches.contains(&identity.branch_id)
@@ -772,7 +1032,13 @@ async fn untracked_bundle_json_refs(
             let StorageProjectedValue::FullValue(value) = entry.value else {
                 return Err(codec_error("untracked bundle GC scan omitted its value"));
             };
-            for member in decode_bundle(value)?.values() {
+            page_roots.insert(entry.key.clone(), decode_bundle_root(&entry.key.0, value)?);
+        }
+        for bundle in resolve_untracked_bundle_roots(store, page_roots)
+            .await?
+            .values()
+        {
+            for member in bundle.values() {
                 collect_value_refs(&member.value, &mut refs);
             }
         }
@@ -782,6 +1048,137 @@ async fn untracked_bundle_json_refs(
         resume_after = next_cursor;
     }
     Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
+}
+
+/// Sweep immutable variant chunks against the pinned authoritative roots.
+/// Every root is checked for a controlled branch, every reachable chunk must
+/// exist and validate, and only then are orphan deletes staged. This is a
+/// derived-payload maintenance operation; roots remain the sole authority.
+pub(crate) async fn stage_untracked_chunk_gc(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    controlled_branches: &BTreeSet<String>,
+) -> Result<(), LixError> {
+    let root_plan = ScanPlan::prefix(
+        UNTRACKED_ROW_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut root_cursor = None;
+    let mut reachable = BTreeSet::<[u8; 32]>::new();
+    loop {
+        let page = root_plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: root_cursor.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        let next = validate_scan_page_progress(
+            &[],
+            root_cursor.as_ref(),
+            page.value.entries.iter().map(|entry| &entry.key),
+            page.value.has_more,
+        )?;
+        for entry in page.value.entries {
+            #[cfg(any(test, feature = "storage-benches"))]
+            record_previous_scan_row(
+                entry.key.0.len()
+                    + match &entry.value {
+                        StorageProjectedValue::FullValue(value) => value.len(),
+                        StorageProjectedValue::KeyOnly => 0,
+                    },
+            );
+            let identity = decode_bundle_key(&entry.key.0)?;
+            if !controlled_branches.contains(&identity.branch_id) {
+                return Err(codec_error(format!(
+                    "untracked chunk GC encountered orphan branch '{}'",
+                    identity.branch_id
+                )));
+            }
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(codec_error("untracked chunk GC root omitted its value"));
+            };
+            let root = decode_bundle_root(&entry.key.0, value)?;
+            reachable.extend(root.values().map(|descriptor| descriptor.hash));
+        }
+        if !page.value.has_more {
+            break;
+        }
+        root_cursor = next;
+    }
+
+    let chunk_plan = ScanPlan::prefix(
+        UNTRACKED_BUNDLE_CHUNK_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut chunk_cursor = None;
+    let mut seen = BTreeSet::<[u8; 32]>::new();
+    let mut orphaned = Vec::new();
+    loop {
+        let page = chunk_plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: chunk_cursor.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        let next = validate_scan_page_progress(
+            &[],
+            chunk_cursor.as_ref(),
+            page.value.entries.iter().map(|entry| &entry.key),
+            page.value.has_more,
+        )?;
+        for entry in page.value.entries {
+            #[cfg(any(test, feature = "storage-benches"))]
+            record_previous_scan_row(
+                entry.key.0.len()
+                    + match &entry.value {
+                        StorageProjectedValue::FullValue(value) => value.len(),
+                        StorageProjectedValue::KeyOnly => 0,
+                    },
+            );
+            if entry.key.0.len() != 32 {
+                return Err(codec_error("untracked bundle chunk key is not a hash"));
+            }
+            let hash: [u8; 32] = entry.key.0.as_ref().try_into().expect("32-byte chunk key");
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(codec_error("untracked bundle chunk GC omitted its value"));
+            };
+            if *blake3::hash(&value).as_bytes() != hash {
+                return Err(codec_error(
+                    "untracked bundle chunk GC hash validation failed",
+                ));
+            }
+            seen.insert(hash);
+            if !reachable.contains(&hash) {
+                orphaned.push(hash);
+            }
+        }
+        if !page.value.has_more {
+            break;
+        }
+        chunk_cursor = next;
+    }
+    if reachable.iter().any(|hash| !seen.contains(hash)) {
+        return Err(codec_error(
+            "untracked bundle GC found a root with a missing chunk",
+        ));
+    }
+    for hash in orphaned {
+        writes.delete(
+            UNTRACKED_BUNDLE_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(&hash)),
+        );
+    }
+    Ok(())
 }
 
 async fn scan_prefix(
@@ -822,12 +1219,26 @@ async fn scan_bundle_prefix(
             page.value.entries.iter().map(|entry| &entry.key),
             page.value.has_more,
         )?;
+        let mut page_roots = BTreeMap::new();
         for entry in page.value.entries {
             let StorageProjectedValue::FullValue(value) = entry.value else {
                 return Err(codec_error("untracked bundle scan omitted its value"));
             };
             let identity = decode_bundle_key(&entry.key.0)?;
-            let bundle = decode_bundle(value)?;
+            page_roots.insert(
+                entry.key.clone(),
+                (identity, decode_bundle_root(&entry.key.0, value)?),
+            );
+        }
+        let roots = page_roots
+            .iter()
+            .map(|(key, (_, root))| (key.clone(), root.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let bundles = resolve_untracked_bundle_roots(store, roots).await?;
+        for (key, (identity, _)) in page_roots {
+            let bundle = bundles
+                .get(&key)
+                .ok_or_else(|| codec_error("untracked bundle page root disappeared"))?;
             for (file_id, member) in bundle {
                 let row_identity = DecodedIdentity {
                     branch_id: identity.branch_id.clone(),
@@ -841,7 +1252,7 @@ async fn scan_bundle_prefix(
                         schema_key: row_identity.schema_key,
                         file_id: row_identity.file_id,
                         entity_pk: row_identity.entity_pk,
-                        value: member.value,
+                        value: member.value.clone(),
                     });
                 }
             }
@@ -963,6 +1374,14 @@ struct BundleMember {
     value: DecodedValue,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChunkDescriptor {
+    hash: [u8; 32],
+    len: u32,
+}
+
+type BundleRoot = BTreeMap<Option<String>, ChunkDescriptor>;
+
 type DecodedBundle = BTreeMap<Option<String>, BundleMember>;
 
 fn collect_value_refs(value: &DecodedValue, refs: &mut BTreeSet<[u8; 32]>) {
@@ -1040,14 +1459,14 @@ fn decode_bundle_key(bytes: &Bytes) -> Result<DecodedIdentity, LixError> {
     })
 }
 
-fn encode_bundle(bundle: &DecodedBundle) -> Result<Bytes, LixError> {
-    let count = u32::try_from(bundle.len())
+fn encode_bundle_root(binding: &[u8], root: &BundleRoot) -> Result<Bytes, LixError> {
+    let count = u32::try_from(root.len())
         .map_err(|_| codec_error("untracked bundle has too many file variants"))?;
     let mut out = Vec::new();
-    out.extend_from_slice(BUNDLE_MAGIC);
+    out.extend_from_slice(BUNDLE_ROOT_MAGIC);
     out.extend_from_slice(&count.to_be_bytes());
     let mut previous: Option<&str> = None;
-    for (file_id, member) in bundle {
+    for (file_id, descriptor) in root {
         match file_id {
             None => {
                 if previous.is_some() {
@@ -1069,67 +1488,111 @@ fn encode_bundle(bundle: &DecodedBundle) -> Result<Bytes, LixError> {
                 push_text(&mut out, file_id)?;
             }
         }
-        let len = u32::try_from(member.encoded.len())
-            .map_err(|_| codec_error("untracked bundle member is too large"))?;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&member.encoded);
+        out.extend_from_slice(&descriptor.hash);
+        out.extend_from_slice(&descriptor.len.to_be_bytes());
     }
+    let mut digest_input = Vec::with_capacity(binding.len() + out.len());
+    digest_input.extend_from_slice(binding);
+    digest_input.extend_from_slice(&out[BUNDLE_ROOT_MAGIC.len()..]);
+    let digest = blake3::hash(&digest_input);
+    out.extend_from_slice(digest.as_bytes());
     Ok(Bytes::from(out))
 }
 
-fn decode_bundle(bytes: Bytes) -> Result<DecodedBundle, LixError> {
-    if !bytes.starts_with(BUNDLE_MAGIC) {
-        return Err(codec_error("untracked bundle has an unsupported format"));
+fn decode_bundle_root(binding: &[u8], bytes: Bytes) -> Result<BundleRoot, LixError> {
+    if !bytes.starts_with(BUNDLE_ROOT_MAGIC) {
+        return Err(codec_error(
+            "untracked bundle root has an unsupported format",
+        ));
     }
-    let mut offset = BUNDLE_MAGIC.len();
+    let mut offset = BUNDLE_ROOT_MAGIC.len();
     let count = u32::from_be_bytes(
-        take(&bytes, &mut offset, 4, "bundle variant count")?
+        take(&bytes, &mut offset, 4, "bundle root variant count")?
             .try_into()
             .expect("four bytes"),
     ) as usize;
     if count == 0 {
-        return Err(codec_error("untracked bundle cannot have zero variants"));
+        return Err(codec_error(
+            "untracked bundle root cannot have zero variants",
+        ));
     }
-    let mut bundle = BTreeMap::new();
+    let mut root = BTreeMap::new();
     let mut previous: Option<String> = None;
     for _ in 0..count {
-        let file_id = match take(&bytes, &mut offset, 1, "bundle file tag")?[0] {
+        let file_id = match take(&bytes, &mut offset, 1, "bundle root file tag")?[0] {
             0 => None,
-            1 => Some(read_text(&bytes, &mut offset, "bundle file")?),
-            _ => return Err(codec_error("untracked bundle has an invalid file tag")),
+            1 => Some(read_text(&bytes, &mut offset, "bundle root file")?),
+            _ => return Err(codec_error("untracked bundle root has an invalid file tag")),
         };
         if let Some(file_id) = &file_id {
             if previous
                 .as_deref()
                 .is_some_and(|previous| previous >= file_id.as_str())
             {
-                return Err(codec_error("untracked bundle variants are not canonical"));
+                return Err(codec_error(
+                    "untracked bundle root variants are not canonical",
+                ));
             }
             previous = Some(file_id.clone());
         } else if previous.is_some() {
-            return Err(codec_error("untracked bundle null variant is out of order"));
+            return Err(codec_error(
+                "untracked bundle root null variant is out of order",
+            ));
         }
-        let value_len = u32::from_be_bytes(
-            take(&bytes, &mut offset, 4, "bundle member length")?
+        let hash: [u8; 32] = take(&bytes, &mut offset, 32, "bundle root chunk hash")?
+            .try_into()
+            .expect("32 bytes");
+        let len = u32::from_be_bytes(
+            take(&bytes, &mut offset, 4, "bundle root chunk length")?
                 .try_into()
                 .expect("four bytes"),
-        ) as usize;
-        let encoded =
-            Bytes::copy_from_slice(take(&bytes, &mut offset, value_len, "bundle member value")?);
-        let value = decode_value(encoded.clone())?;
-        if bundle
-            .insert(file_id, BundleMember { encoded, value })
+        );
+        if len == 0 {
+            return Err(codec_error("untracked bundle root chunk length is zero"));
+        }
+        if root
+            .insert(file_id, ChunkDescriptor { hash, len })
             .is_some()
         {
             return Err(codec_error(
-                "untracked bundle contains a duplicate file variant",
+                "untracked bundle root contains a duplicate variant",
             ));
         }
     }
+    let digest_start = offset;
+    let expected_digest: [u8; 32] = take(&bytes, &mut offset, 32, "bundle root digest")?
+        .try_into()
+        .expect("32 bytes");
     if offset != bytes.len() {
-        return Err(codec_error("untracked bundle has trailing bytes"));
+        return Err(codec_error("untracked bundle root has trailing bytes"));
     }
-    Ok(bundle)
+    let mut digest_input = Vec::with_capacity(binding.len() + digest_start);
+    digest_input.extend_from_slice(binding);
+    digest_input.extend_from_slice(&bytes[BUNDLE_ROOT_MAGIC.len()..digest_start]);
+    let actual_digest = blake3::hash(&digest_input);
+    if *actual_digest.as_bytes() != expected_digest {
+        return Err(codec_error(
+            "untracked bundle root digest validation failed",
+        ));
+    }
+    Ok(root)
+}
+
+fn chunk_descriptor(encoded: &Bytes) -> Result<ChunkDescriptor, LixError> {
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| codec_error("untracked bundle chunk is too large"))?;
+    Ok(ChunkDescriptor {
+        hash: *blake3::hash(encoded).as_bytes(),
+        len,
+    })
+}
+
+#[cfg(test)]
+fn bundle_root_from_decoded(bundle: &DecodedBundle) -> Result<BundleRoot, LixError> {
+    bundle
+        .iter()
+        .map(|(file_id, member)| Ok((file_id.clone(), chunk_descriptor(&member.encoded)?)))
+        .collect::<Result<BundleRoot, LixError>>()
 }
 
 fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, field: &str) -> Result<&'a [u8], LixError> {
@@ -1523,13 +1986,20 @@ mod tests {
                 encoded,
             },
         );
-        let bytes = encode_bundle(&bundle)?;
-        assert_eq!(decode_bundle(bytes)?.len(), 1);
-        let mut malformed = BUNDLE_MAGIC.to_vec();
+        let bytes = encode_bundle_root(b"bundle-codec-key", &bundle_root_from_decoded(&bundle)?)?;
+        assert_eq!(
+            decode_bundle_root(b"bundle-codec-key", bytes.clone())?.len(),
+            1
+        );
+        let mut tampered = bytes.to_vec();
+        tampered[BUNDLE_ROOT_MAGIC.len() + 4 + 1] ^= 1;
+        assert!(decode_bundle_root(b"bundle-codec-key", Bytes::from(tampered)).is_err());
+        let mut malformed = BUNDLE_ROOT_MAGIC.to_vec();
         malformed.extend_from_slice(&1_u32.to_be_bytes());
         malformed.push(0);
+        malformed.extend_from_slice(&[0; 32]);
         malformed.extend_from_slice(&0_u32.to_be_bytes());
-        assert!(decode_bundle(Bytes::from(malformed)).is_err());
+        assert!(decode_bundle_root(b"bundle-codec-key", Bytes::from(malformed)).is_err());
         Ok(())
     }
 
@@ -1563,7 +2033,7 @@ mod tests {
         );
         commit_deltas(&storage, branch_id, &[update], &[false]).await?;
         let profile = take_untracked_mutation_read_profile();
-        assert_eq!(profile.previous_point_read_keys, 1);
+        assert_eq!(profile.previous_point_read_keys, 2);
         assert_eq!(profile.previous_scan_rows, 0);
         assert_eq!(profile.previous_scan_bytes, 0);
         Ok(())
@@ -1595,6 +2065,7 @@ mod tests {
             ),
         ];
         commit_deltas(&storage, branch_id, &initial, &[true, true]).await?;
+        let _ = take_untracked_mutation_read_profile();
         let replacement = untracked(
             "bundle-schema",
             Some("file-a"),
@@ -1603,6 +2074,12 @@ mod tests {
             second_created,
         );
         commit_deltas(&storage, branch_id, &[replacement], &[false]).await?;
+        let profile = take_untracked_mutation_read_profile();
+        assert_eq!(
+            profile.previous_point_read_keys, 2,
+            "sparse replacement reads one root and one selected payload chunk"
+        );
+        assert_eq!(profile.previous_scan_rows, 0);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -1613,18 +2090,11 @@ mod tests {
             "bundle-schema",
             &entity,
         )?));
-        let value = PointReadPlan::new(UNTRACKED_ROW_SPACE, &[key])
-            .materialize(&read, StorageGetOptions::default())
+        let bundle = read_untracked_bundles(&read, &[key])
             .await?
-            .value
-            .into_iter()
+            .into_values()
             .next()
-            .flatten()
             .ok_or_else(|| codec_error("replacement bundle disappeared"))?;
-        let StorageProjectedValue::FullValue(value) = value else {
-            return Err(codec_error("replacement bundle omitted its value"));
-        };
-        let bundle = decode_bundle(value)?;
         assert_eq!(bundle.len(), 2);
         assert_eq!(
             bundle[&Some("file-a".to_string())].value.created_at,
@@ -1660,7 +2130,7 @@ mod tests {
             .collect::<Vec<_>>();
         commit_deltas(&storage, "bundle-10k", &updates, &vec![false; ROWS]).await?;
         let profile = take_untracked_mutation_read_profile();
-        assert_eq!(profile.previous_point_read_keys, ROWS as u64);
+        assert_eq!(profile.previous_point_read_keys, ROWS as u64 + 1);
         assert_eq!(profile.previous_scan_rows, 0);
         assert_eq!(profile.previous_scan_bytes, 0);
         Ok(())
@@ -1771,6 +2241,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_variant_chunk_fails_closed_before_mutation_writes() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "bundle-missing-chunk";
+        let entity = EntityPk::single("member");
+        let initial = untracked("schema", Some("file-a"), &entity, r#"{"v":1}"#, timestamp());
+        commit_deltas(&storage, branch_id, &[initial], &[true]).await?;
+
+        let key = StorageKey(Bytes::from(encode_bundle_key(
+            branch_id, "schema", &entity,
+        )?));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let root = read_untracked_bundle_roots(&read, std::slice::from_ref(&key))
+            .await?
+            .remove(&key)
+            .ok_or_else(|| codec_error("bundle root disappeared"))?;
+        let descriptor = root
+            .get(&Some("file-a".to_string()))
+            .ok_or_else(|| codec_error("bundle chunk descriptor disappeared"))?;
+        let mut delete = storage.new_write_set();
+        delete.delete(
+            UNTRACKED_BUNDLE_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(&descriptor.hash)),
+        );
+        storage
+            .commit_write_set(delete, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let update = untracked("schema", Some("file-a"), &entity, r#"{"v":2}"#, timestamp());
+        assert!(
+            stage_untracked_deltas(
+                &read,
+                &mut writes,
+                branch_id,
+                test_control(branch_id),
+                &[update],
+                &[false],
+            )
+            .await
+            .is_err()
+        );
+        assert!(writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_delete_validates_chunks_before_staging_root_deletes() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "bundle-delete-missing-chunk";
+        let entity = EntityPk::single("member");
+        commit_deltas(
+            &storage,
+            branch_id,
+            &[untracked(
+                "schema",
+                Some("file-a"),
+                &entity,
+                r#"{"v":1}"#,
+                timestamp(),
+            )],
+            &[true],
+        )
+        .await?;
+        let key = StorageKey(Bytes::from(encode_bundle_key(
+            branch_id, "schema", &entity,
+        )?));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let root = read_untracked_bundle_roots(&read, std::slice::from_ref(&key))
+            .await?
+            .remove(&key)
+            .ok_or_else(|| codec_error("branch-delete root disappeared"))?;
+        let descriptor = root
+            .values()
+            .next()
+            .ok_or_else(|| codec_error("branch-delete descriptor disappeared"))?;
+        let mut delete_chunk = storage.new_write_set();
+        delete_chunk.delete(
+            UNTRACKED_BUNDLE_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(&descriptor.hash)),
+        );
+        storage
+            .commit_write_set(delete_chunk, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        assert!(
+            stage_untracked_deltas_for_branch_deletion(
+                &read,
+                &mut writes,
+                branch_id,
+                test_control(branch_id),
+                &[],
+                &[],
+            )
+            .await
+            .is_err()
+        );
+        assert!(writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chunk_gc_reclaims_orphans_and_rejects_unowned_or_missing_roots() -> Result<(), LixError>
+    {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "bundle-gc";
+        let entity = EntityPk::single("member");
+        commit_deltas(
+            &storage,
+            branch_id,
+            &[untracked(
+                "schema",
+                Some("file-a"),
+                &entity,
+                r#"{"v":1}"#,
+                timestamp(),
+            )],
+            &[true],
+        )
+        .await?;
+        let root_key = StorageKey(Bytes::from(encode_bundle_key(
+            branch_id, "schema", &entity,
+        )?));
+        let mut remove_root = storage.new_write_set();
+        remove_root.delete(UNTRACKED_ROW_SPACE, root_key);
+        storage
+            .commit_write_set(remove_root, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let mut controlled = BTreeSet::new();
+        controlled.insert(branch_id.to_owned());
+        controlled.insert(GLOBAL_BRANCH_ID.to_owned());
+        stage_untracked_chunk_gc(&read, &mut writes, &controlled).await?;
+        assert!(
+            !writes.is_empty(),
+            "orphan chunk must be staged for deletion"
+        );
+
+        let orphan_storage = StorageAdapter::new(Memory::new());
+        commit_deltas(
+            &orphan_storage,
+            "orphan-branch",
+            &[untracked(
+                "schema",
+                None,
+                &entity,
+                r#"{"v":1}"#,
+                timestamp(),
+            )],
+            &[true],
+        )
+        .await?;
+        let orphan_read = orphan_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut orphan_writes = orphan_storage.new_write_set();
+        let controlled = BTreeSet::from([GLOBAL_BRANCH_ID.to_owned()]);
+        assert!(
+            stage_untracked_chunk_gc(&orphan_read, &mut orphan_writes, &controlled)
+                .await
+                .is_err()
+        );
+        assert!(orphan_writes.is_empty());
+
+        let missing_storage = StorageAdapter::new(Memory::new());
+        let missing_branch = "missing-gc-chunk";
+        commit_deltas(
+            &missing_storage,
+            missing_branch,
+            &[untracked(
+                "schema",
+                None,
+                &entity,
+                r#"{"v":1}"#,
+                timestamp(),
+            )],
+            &[true],
+        )
+        .await?;
+        let missing_read = missing_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let missing_key = StorageKey(Bytes::from(encode_bundle_key(
+            missing_branch,
+            "schema",
+            &entity,
+        )?));
+        let missing_root =
+            read_untracked_bundle_roots(&missing_read, std::slice::from_ref(&missing_key))
+                .await?
+                .remove(&missing_key)
+                .ok_or_else(|| codec_error("missing-GC root disappeared"))?;
+        let missing_hash = missing_root
+            .values()
+            .next()
+            .ok_or_else(|| codec_error("missing-GC descriptor disappeared"))?
+            .hash;
+        let mut delete_chunk = missing_storage.new_write_set();
+        delete_chunk.delete(
+            UNTRACKED_BUNDLE_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(&missing_hash)),
+        );
+        missing_storage
+            .commit_write_set(delete_chunk, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let missing_read = missing_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut missing_writes = missing_storage.new_write_set();
+        let controlled = BTreeSet::from([missing_branch.to_owned(), GLOBAL_BRANCH_ID.to_owned()]);
+        assert!(
+            stage_untracked_chunk_gc(&missing_read, &mut missing_writes, &controlled)
+                .await
+                .is_err()
+        );
+        assert!(missing_writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn malformed_bundle_key_fails_closed_before_file_cascade_writes() -> Result<(), LixError>
     {
         let storage = StorageAdapter::new(Memory::new());
@@ -1795,7 +2510,10 @@ mod tests {
             UNTRACKED_ROW_SPACE,
             StorageKey(Bytes::from(malformed_key)),
             StorageValue {
-                bytes: encode_bundle(&member_bundle)?,
+                bytes: encode_bundle_root(
+                    b"malformed-key",
+                    &bundle_root_from_decoded(&member_bundle)?,
+                )?,
             },
         );
         storage

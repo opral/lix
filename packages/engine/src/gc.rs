@@ -414,9 +414,9 @@ pub(crate) struct RepositoryGcProfile {
 /// The caller must serialize this operation with repository writes and commit
 /// `writes` atomically. Planning and mutation are deliberately separated from
 /// storage commit so checkpoint/session code can retain lifecycle control.
-/// Content-addressed tree/CAS orphan repair is intentionally an offline path;
-/// out-of-band JSON is reclaimed here only from explicit ownership-loss
-/// candidates.
+/// Tracked content-addressed tree/CAS orphan repair remains an offline path;
+/// untracked bundle chunks are swept here from the pinned bundle roots, while
+/// out-of-band JSON is reclaimed only from explicit ownership-loss candidates.
 pub(crate) async fn stage_repository_gc<S>(
     store: S,
     writes: &mut StorageWriteSet,
@@ -444,6 +444,7 @@ where
         .into_iter()
         .map(GcRoot::CurrentPayload)
         .collect::<Vec<_>>();
+    crate::live_state::stage_untracked_chunk_gc(&store, writes, &controlled_branches).await?;
     // Branch controls, not their public `lix_branch_ref` projection rows,
     // are the authoritative tracked-history roots.
     for (_branch_id, control) in &controls {

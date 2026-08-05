@@ -42,7 +42,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V61 binds the exact bundle-valued untracked plane and tracked HOT cut while
+/// V62 binds the exact bundle-root plus content-addressed variant chunks and tracked HOT cut while
 /// retaining the V58 immutable commit-state authority.
 ///
 /// V58 splits immutable commit-state authority into a compact header and an
@@ -53,7 +53,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v61";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v62";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

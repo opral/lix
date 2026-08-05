@@ -50,8 +50,9 @@ pub(crate) use types::{
 };
 #[allow(unused_imports)]
 pub(crate) use untracked_state::{
-    UNTRACKED_ROW_SPACE, load_untracked_exact_batch, load_untracked_exact_owner_batch,
-    scan_untracked_batch, stage_untracked_deltas, stage_untracked_deltas_for_branch_deletion,
+    UNTRACKED_BUNDLE_CHUNK_SPACE, UNTRACKED_ROW_SPACE, load_untracked_exact_batch,
+    load_untracked_exact_owner_batch, scan_untracked_batch, stage_untracked_chunk_gc,
+    stage_untracked_deltas, stage_untracked_deltas_for_branch_deletion,
     stage_untracked_deltas_with_deleted_file_ids, untracked_json_refs,
 };
 #[allow(unused_imports)]
