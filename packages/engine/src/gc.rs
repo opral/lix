@@ -470,14 +470,11 @@ where
                     ),
                 ));
             }
-        } else if active_control.is_none_or(|control| {
-            control.generation != record.generation
-                || control.head_commit_id != record.head_commit_id
-        }) {
+        } else if active_control.is_none_or(|control| control.generation != record.generation) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "checkpoint reclamation for generation '{}' is not selected by branch '{}'",
+                    "checkpoint reclamation for generation '{}' is not selected by the active generation of branch '{}'",
                     record.generation, branch_id
                 ),
             ));
@@ -1828,6 +1825,7 @@ mod tests {
         let branch_id = "partial-gc-branch";
         let generation = CommitId::for_test_label("partial-generation");
         let head_commit_id = CommitId::for_test_label("partial-head");
+        let advanced_head_commit_id = CommitId::for_test_label("partial-advanced-head");
         let checkpoint_commit_id = CommitId::for_test_label("partial-current-checkpoint");
         let old_checkpoint_commit_id = CommitId::for_test_label("partial-old-checkpoint");
         let digest = crate::branch::generation_scope_digest(branch_id, generation);
@@ -1838,7 +1836,11 @@ mod tests {
             &mut writes,
             branch_id,
             BranchHeadControl {
-                head_commit_id,
+                // The active generation can advance after a checkpoint
+                // reclamation record is queued.  The queue is scoped to the
+                // generation and exact old checkpoint prefix, not to the
+                // head that happened to be current when it was enqueued.
+                head_commit_id: advanced_head_commit_id,
                 generation,
                 current_state_revision: 0,
                 working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -1856,7 +1858,7 @@ mod tests {
             branch_id,
             GenerationChunkManifest {
                 generation,
-                head_commit_id,
+                head_commit_id: advanced_head_commit_id,
                 checkpoint_commit_id: Some(checkpoint_commit_id),
                 scope_digest: digest,
                 indexed_chunk_count: 0,
