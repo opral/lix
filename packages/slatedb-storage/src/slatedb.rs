@@ -3139,69 +3139,8 @@ async fn scan_snapshot_ranges_all(
         .cloned()
         .map(|range| EncodedBounds::new(range, None))
         .collect::<Vec<_>>();
-    if encoded.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ordered_disjoint = encoded
-        .windows(2)
-        .all(|pair| upper_before_or_equal_lower(&pair[0].upper, &pair[1].lower));
-    if !ordered_disjoint {
-        // The public contract permits overlapping/out-of-order ranges and
-        // requires independent duplicate buckets. Such ranges cannot be
-        // represented by one forward-only SlateDB iterator without losing
-        // rows, so each independent run gets its own coherent-snapshot scan.
-        let mut buckets = Vec::with_capacity(encoded.len());
-        for bounds in encoded {
-            buckets.push(
-                scan_snapshot_range_all(Arc::clone(&snapshot), bounds, durability, projection)
-                    .await?,
-            );
-        }
-        return Ok(buckets);
-    }
-
-    let broad = EncodedBounds {
-        lower: encoded[0].lower.clone(),
-        upper: encoded
-            .last()
-            .expect("non-empty encoded ranges")
-            .upper
-            .clone(),
-    };
-    let mut iter = open_snapshot_scan(Arc::clone(&snapshot), broad, durability).await?;
-    let mut pending = None;
-    let mut buckets = Vec::with_capacity(encoded.len());
-    for bounds in encoded {
-        let mut entries = Vec::new();
-        loop {
-            let Some(row) = (match pending.take() {
-                Some(row) => Some(row),
-                None => iter.next().await.map_err(slatedb_error)?,
-            }) else {
-                break;
-            };
-            if !bounds.after_lower_bytes(&row.key) {
-                continue;
-            }
-            if !bounds.before_upper_bytes(&row.key) {
-                pending = Some(row);
-                break;
-            }
-            if row.key.len() < SPACE_PREFIX_LEN {
-                return Err(StorageError::Corruption(
-                    "slatedb multi-range key was shorter than space prefix".to_owned(),
-                ));
-            }
-            let key = Key(Bytes::copy_from_slice(&row.key[SPACE_PREFIX_LEN..]));
-            let value = match projection {
-                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-                CoreProjection::FullValue => ProjectedValue::FullValue(row.value),
-            };
-            entries.push(ReadEntry { key, value });
-        }
-        buckets.push(entries);
-    }
-    Ok(buckets)
+    scan_snapshot_ranges_from_overlay(snapshot, encoded, durability, BTreeMap::new(), projection)
+        .await
 }
 
 /// Merges publication overlays into one forward snapshot traversal for the
@@ -3218,9 +3157,6 @@ async fn scan_snapshot_ranges_with_writes(
     visible_writes: Vec<Arc<PublishedWrite>>,
     projection: CoreProjection,
 ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
-    if ranges.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut overlay = BTreeMap::new();
     for write in visible_writes {
         overlay.extend(
@@ -3230,157 +3166,152 @@ async fn scan_snapshot_ranges_with_writes(
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
     }
-    let ordered_disjoint = ranges
-        .windows(2)
-        .all(|pair| upper_before_or_equal_lower(&pair[0].upper, &pair[1].lower));
-    if !ordered_disjoint {
-        let mut buckets = Vec::with_capacity(ranges.len());
-        for bounds in ranges {
-            if bounds.is_empty() {
-                buckets.push(Vec::new());
-                continue;
-            }
-            let chunk = scan_snapshot_with_writes(
-                Arc::clone(&snapshot),
-                bounds,
-                durability,
-                vec![Arc::new(PublishedWrite {
-                    publication_id: 0,
-                    overlay: Arc::new(overlay.clone()),
-                    persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
-                })],
-                usize::MAX,
-                projection,
-            )
-            .await?;
-            buckets.push(chunk.entries);
-        }
+    scan_snapshot_ranges_from_overlay(snapshot, ranges, durability, overlay, projection).await
+}
+
+/// Traverses one coherent SlateDB snapshot for every range shape. Ranges are
+/// sorted only for activation; output buckets retain the caller's order and
+/// overlapping ranges receive independent duplicate rows. Publication rows
+/// are merged into the same ordered stream, so there is no per-range adapter
+/// future or fallback scan.
+async fn scan_snapshot_ranges_from_overlay(
+    snapshot: Arc<DbSnapshot>,
+    ranges: Vec<EncodedBounds>,
+    durability: ReadDurability,
+    overlay: BTreeMap<Key, Option<Bytes>>,
+    projection: CoreProjection,
+) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ordered = ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, bounds)| !bounds.is_empty())
+        .map(|(index, bounds)| (index, bounds.clone()))
+        .collect::<Vec<_>>();
+    let mut buckets = (0..ranges.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    if ordered.is_empty() {
         return Ok(buckets);
     }
-
+    ordered.sort_by(|left, right| compare_lower_bounds(&left.1.lower, &right.1.lower));
     let broad = EncodedBounds {
-        lower: ranges[0].lower.clone(),
-        upper: ranges
-            .last()
-            .expect("non-empty ordered range list")
-            .upper
+        lower: ordered[0].1.lower.clone(),
+        upper: ordered
+            .iter()
+            .map(|(_, bounds)| &bounds.upper)
+            .max_by(|left, right| compare_upper_bounds(left, right))
+            .expect("non-empty range list")
             .clone(),
     };
-    let mut base_iter = open_snapshot_scan(Arc::clone(&snapshot), broad, durability).await?;
-    let mut base_pending = base_iter.next().await.map_err(slatedb_error)?;
+    let mut iter = open_snapshot_scan(Arc::clone(&snapshot), broad, durability).await?;
+    let mut base_pending = iter.next().await.map_err(slatedb_error)?;
     let overlay = overlay.into_iter().collect::<Vec<_>>();
     let mut overlay_index = 0usize;
-    let mut buckets = Vec::with_capacity(ranges.len());
-    for bounds in ranges {
-        let mut entries = Vec::new();
-        loop {
-            while let Some(row) = base_pending.as_ref()
-                && !bounds.after_lower_bytes(&row.key)
-            {
-                base_pending = base_iter.next().await.map_err(slatedb_error)?;
+    let mut next_range = 0usize;
+    let mut active = Vec::<(usize, EncodedBounds)>::new();
+    let mut last_key = None::<Bytes>;
+    loop {
+        let next_overlay = overlay.get(overlay_index);
+        let (key, value) = match (base_pending.as_ref(), next_overlay) {
+            (None, None) => break,
+            (Some(row), None) => {
+                let result = (row.key.clone(), Some(row.value.clone()));
+                base_pending = iter.next().await.map_err(slatedb_error)?;
+                result
             }
-            while overlay_index < overlay.len()
-                && !bounds.after_lower_bytes(&(overlay[overlay_index].0).0)
-            {
+            (None, Some((key, value))) => {
+                let result = (key.0.clone(), value.clone());
                 overlay_index += 1;
+                result
             }
-            let overlay_row = overlay
-                .get(overlay_index)
-                .filter(|(key, _)| bounds.before_upper_bytes(&key.0));
-            let base_in_range = base_pending
-                .as_ref()
-                .filter(|row| bounds.before_upper_bytes(&row.key));
-            let Some((key, value)) = (match (base_in_range, overlay_row) {
-                (None, None) => None,
-                (Some(row), None) => {
-                    let value = row.value.clone();
-                    let key = row.key.clone();
-                    base_pending = base_iter.next().await.map_err(slatedb_error)?;
-                    Some((key, Some(value)))
-                }
-                (None, Some((key, value))) => {
-                    let row = (key.0.clone(), value.clone());
-                    overlay_index += 1;
-                    Some(row)
-                }
-                (Some(base), Some((overlay_key, overlay_value))) => {
-                    match base.key.cmp(&overlay_key.0) {
-                        std::cmp::Ordering::Less => {
-                            let value = base.value.clone();
-                            let key = base.key.clone();
-                            base_pending = base_iter.next().await.map_err(slatedb_error)?;
-                            Some((key, Some(value)))
-                        }
-                        std::cmp::Ordering::Equal => {
-                            let key = overlay_key.0.clone();
-                            let value = overlay_value.clone();
-                            base_pending = base_iter.next().await.map_err(slatedb_error)?;
-                            overlay_index += 1;
-                            Some((key, value))
-                        }
-                        std::cmp::Ordering::Greater => {
-                            let row = (overlay_key.0.clone(), overlay_value.clone());
-                            overlay_index += 1;
-                            Some(row)
-                        }
+            (Some(base), Some((overlay_key, overlay_value))) => {
+                match base.key.cmp(&overlay_key.0) {
+                    std::cmp::Ordering::Less => {
+                        let result = (base.key.clone(), Some(base.value.clone()));
+                        base_pending = iter.next().await.map_err(slatedb_error)?;
+                        result
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let result = (overlay_key.0.clone(), overlay_value.clone());
+                        base_pending = iter.next().await.map_err(slatedb_error)?;
+                        overlay_index += 1;
+                        result
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let result = (overlay_key.0.clone(), overlay_value.clone());
+                        overlay_index += 1;
+                        result
                     }
                 }
-            }) else {
-                break;
-            };
-            if let Some(value) = value {
-                if key.len() < SPACE_PREFIX_LEN {
-                    return Err(StorageError::Corruption(
-                        "slatedb key was shorter than space prefix".to_owned(),
-                    ));
-                }
-                entries.push(ReadEntry {
+            }
+        };
+        if last_key.as_ref().is_some_and(|previous| previous >= &key) {
+            return Err(StorageError::Corruption(
+                "slatedb multi-range stream keys are not strictly increasing".to_owned(),
+            ));
+        }
+        last_key = Some(key.clone());
+        if key.len() < SPACE_PREFIX_LEN {
+            return Err(StorageError::Corruption(
+                "slatedb multi-range key was shorter than space prefix".to_owned(),
+            ));
+        }
+        while next_range < ordered.len() && ordered[next_range].1.after_lower_bytes(&key) {
+            active.push(ordered[next_range].clone());
+            next_range += 1;
+        }
+        active.retain(|(_, bounds)| bounds.before_upper_bytes(&key));
+        if active.is_empty() {
+            continue;
+        }
+        let value = value.map(|value| project_value(value, projection));
+        for (index, _) in &active {
+            if let Some(value) = &value {
+                buckets[*index].push(ReadEntry {
                     key: Key(Bytes::copy_from_slice(&key[SPACE_PREFIX_LEN..])),
-                    value: project_value(value, projection),
+                    value: value.clone(),
                 });
             }
         }
-        buckets.push(entries);
     }
     Ok(buckets)
 }
 
-async fn scan_snapshot_range_all(
-    snapshot: Arc<DbSnapshot>,
-    bounds: EncodedBounds,
-    durability: ReadDurability,
-    projection: CoreProjection,
-) -> Result<Vec<ReadEntry>, StorageError> {
-    let mut iter = open_snapshot_scan(Arc::clone(&snapshot), bounds, durability).await?;
-    let mut pending = None;
-    let mut entries = Vec::new();
-    loop {
-        let batch = scan_snapshot_batch(iter, pending, SCAN_BATCH_ROWS, projection, false).await?;
-        let ScanBatch {
-            iter: next_iter,
-            pending: next_pending,
-            entries: batch_entries,
-            state,
-        } = batch;
-        entries.extend(
-            batch_entries
-                .into_iter()
-                .map(|(key, value)| ReadEntry { key, value }),
-        );
-        match state {
-            ScanBatchState::Exhausted => break,
-            ScanBatchState::MoreUnknown => {
-                iter = next_iter;
-                pending = next_pending;
-            }
-            ScanBatchState::HasMore => {
-                return Err(StorageError::Corruption(
-                    "slatedb unbounded multi-range scan returned an unexpected cursor".to_string(),
-                ));
-            }
-        }
+fn compare_lower_bounds(left: &Bound<Vec<u8>>, right: &Bound<Vec<u8>>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Bound::Unbounded, Bound::Unbounded) => std::cmp::Ordering::Equal,
+        (Bound::Unbounded, _) => std::cmp::Ordering::Less,
+        (_, Bound::Unbounded) => std::cmp::Ordering::Greater,
+        (Bound::Included(left), Bound::Included(right))
+        | (Bound::Excluded(left), Bound::Excluded(right)) => left.cmp(right),
+        (Bound::Included(left), Bound::Excluded(right)) => match left.cmp(right) {
+            std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+            order => order,
+        },
+        (Bound::Excluded(left), Bound::Included(right)) => match left.cmp(right) {
+            std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
+            order => order,
+        },
     }
-    Ok(entries)
+}
+
+fn compare_upper_bounds(left: &Bound<Vec<u8>>, right: &Bound<Vec<u8>>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Bound::Unbounded, Bound::Unbounded) => std::cmp::Ordering::Equal,
+        (Bound::Unbounded, _) => std::cmp::Ordering::Greater,
+        (_, Bound::Unbounded) => std::cmp::Ordering::Less,
+        (Bound::Included(left), Bound::Included(right))
+        | (Bound::Excluded(left), Bound::Excluded(right)) => left.cmp(right),
+        (Bound::Included(left), Bound::Excluded(right)) => match left.cmp(right) {
+            std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
+            order => order,
+        },
+        (Bound::Excluded(left), Bound::Included(right)) => match left.cmp(right) {
+            std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+            order => order,
+        },
+    }
 }
 
 async fn hydrate_immutable_value_gets(
@@ -4600,6 +4531,7 @@ impl EncodedBounds {
     }
 }
 
+#[cfg(test)]
 fn upper_before_or_equal_lower(upper: &Bound<Vec<u8>>, lower: &Bound<Vec<u8>>) -> bool {
     match (upper, lower) {
         (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,

@@ -1,4 +1,6 @@
-use crate::storage::{CoreProjection, KeyRange, Prefix, ScanChunk, ScanOptions, StorageError};
+use crate::storage::{
+    CoreProjection, Key, KeyRange, Prefix, ProjectedValue, ScanChunk, ScanOptions, StorageError,
+};
 use crate::storage_adapter::{
     StorageAdapterRead, StorageReadResult, StorageReadStats, StorageSpace,
 };
@@ -102,6 +104,31 @@ where
             ranges.len()
         )));
     }
+    for (range, bucket) in ranges.iter().zip(&buckets) {
+        let mut previous = None;
+        for entry in bucket {
+            if previous
+                .as_ref()
+                .is_some_and(|previous: &Key| previous >= &entry.key)
+                || !key_in_range(range, &entry.key)
+            {
+                return Err(StorageError::Corruption(
+                    "storage multi-range bucket is not strictly ordered or escaped its range"
+                        .to_string(),
+                ));
+            }
+            if matches!(
+                (projection, &entry.value),
+                (CoreProjection::KeyOnly, ProjectedValue::FullValue(_))
+                    | (CoreProjection::FullValue, ProjectedValue::KeyOnly)
+            ) {
+                return Err(StorageError::Corruption(
+                    "storage multi-range bucket returned the wrong projection".to_string(),
+                ));
+            }
+            previous = Some(entry.key.clone());
+        }
+    }
     #[cfg(feature = "storage-benches")]
     {
         let rows = buckets
@@ -123,6 +150,20 @@ where
         });
     }
     Ok(buckets)
+}
+
+fn key_in_range(range: &KeyRange, key: &Key) -> bool {
+    let lower = match &range.lower {
+        std::ops::Bound::Included(bound) => key >= bound,
+        std::ops::Bound::Excluded(bound) => key > bound,
+        std::ops::Bound::Unbounded => true,
+    };
+    let upper = match &range.upper {
+        std::ops::Bound::Included(bound) => key <= bound,
+        std::ops::Bound::Excluded(bound) => key < bound,
+        std::ops::Bound::Unbounded => true,
+    };
+    lower && upper
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

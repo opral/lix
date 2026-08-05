@@ -29,6 +29,7 @@ const LEGACY_ENTRIES_TABLE: &str = "lix_internal_entries";
 /// so a full chunk uses 800 of SQLite's historical 999-parameter floor.
 /// The specific value is bench-chosen.
 const POINT_READ_CHUNK_KEYS: usize = 400;
+const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
 /// Rows per multi-row upsert statement; each row binds 2 parameters
 /// (key + value), so a full chunk uses 256 parameters. Bench-chosen.
 const PUT_CHUNK_ROWS: usize = 128;
@@ -477,6 +478,11 @@ impl StorageRead for SQLiteRead {
             sql.push_str(&table);
             sql.push_str(" WHERE 1 = 1");
             push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
+            if binds.len() > SQLITE_MAX_VARIABLE_NUMBER {
+                return Err(StorageError::Io(
+                    "sqlite multi-range plan exceeds the variable limit".to_string(),
+                ));
+            }
         }
         sql.push_str(" ) ORDER BY bucket ASC, key ASC");
         let mut statement = conn.prepare_cached(&sql).map_err(sqlite_error)?;
