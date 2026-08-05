@@ -13876,11 +13876,11 @@ mod tests {
         .expect("ordered direct fixture should use the streaming route");
         assert_eq!(
             direct_stage.mutation_inventory().direct_part_row_counts,
-            vec![128, 128, 128, 128, 1]
+            vec![512, 1]
         );
-        let hole_change_id = super::addressable_change_id(direct_commit, 4, 1)
+        let hole_change_id = super::addressable_change_id(direct_commit, 1, 1)
             .expect("short-part hole should retain its direct-shaped id");
-        let out_of_range_change_id = super::addressable_change_id(direct_commit, 5, 0)
+        let out_of_range_change_id = super::addressable_change_id(direct_commit, 2, 0)
             .expect("out-of-range part should retain its direct-shaped id");
         let explicit_commit = CommitId::for_test_label("direct-hole-explicit");
         let mut explicit_hole = fixtures[0].clone();
