@@ -1166,14 +1166,17 @@ pub(crate) async fn stage_delete_untracked_file_locator(
 ///
 /// This is intentionally not called by reads or by the cascade path.  It
 /// validates a complete authoritative branch snapshot first, then replaces
-/// every old locator member and root in one write set.  The locator remains a
-/// projection: all logical values come from `UNTRACKED_ROW_SPACE`.
+/// every old locator member and root in one write set. `live_file_ids` is the
+/// exact lifecycle set supplied by tracked authority; it contributes only
+/// zero-member anchors, never row values or locator truth. The locator remains
+/// a projection: all logical member values come from `UNTRACKED_ROW_SPACE`.
 #[allow(dead_code)]
 pub(crate) async fn rebuild_untracked_file_locator(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     branch_id: &str,
     control: BranchHeadControl,
+    live_file_ids: &BTreeSet<String>,
 ) -> Result<BranchHeadControl, LixError> {
     let authority_prefix = branch_prefix(branch_id)?;
     let authority_plan = ScanPlan::prefix(
@@ -1246,6 +1249,14 @@ pub(crate) async fn rebuild_untracked_file_locator(
             break;
         }
         resume_after = next_cursor;
+    }
+    // The tracked authority supplies lifecycle identities, not payload truth.
+    // Keeping an empty summary for every live file lets a later descriptor
+    // delete fail closed if its member projection is missing, while all
+    // locator entries/counts/digests still come exclusively from untracked
+    // authoritative rows above.
+    for file_id in live_file_ids {
+        rebuilt_summaries.entry(file_id.clone()).or_default();
     }
     let locator_prefix = branch_prefix(branch_id)?;
     let locator_plan = ScanPlan::prefix(
@@ -2439,7 +2450,7 @@ mod tests {
                 .filter_map(|delta| delta.file_id)
                 .collect::<BTreeSet<_>>();
             owned_file_pks.extend(file_ids.iter().map(|file_id| EntityPk::single(*file_id)));
-            for (file_id, entity_pk) in file_ids.into_iter().zip(owned_file_pks.iter()) {
+            for (_file_id, entity_pk) in file_ids.into_iter().zip(owned_file_pks.iter()) {
                 staged_deltas.push(file_descriptor(entity_pk, timestamp()));
                 staged_known_absent.push(true);
             }
@@ -3068,11 +3079,13 @@ mod tests {
             .await
             .map_err(LixError::from)?;
         let mut rebuild_writes = storage.new_write_set();
+        let live_file_ids = BTreeSet::from([target_file_id.to_owned(), "file-other".to_owned()]);
         let rebuilt = rebuild_untracked_file_locator(
             &read,
             &mut rebuild_writes,
             branch_id,
             test_control(branch_id),
+            &live_file_ids,
         )
         .await?;
         crate::branch::stage_branch_head_control(&mut rebuild_writes, branch_id, rebuilt)?;
@@ -3363,6 +3376,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_rebuild_retains_tracked_zero_member_anchor() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "locator-rebuild-zero";
+        let file_id = "file-rebuild-zero";
+        let file_entity = EntityPk::single(file_id);
+        let descriptor = file_descriptor(&file_entity, timestamp());
+        commit_deltas(&storage, branch_id, &[descriptor], &[true]).await?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .map_err(LixError::from)?
+            .expect("zero-member rebuild fixture control");
+        let mut writes = storage.new_write_set();
+        let live_file_ids = BTreeSet::from([file_id.to_owned()]);
+        let rebuilt_control =
+            rebuild_untracked_file_locator(&read, &mut writes, branch_id, control, &live_file_ids)
+                .await?;
+        crate::branch::stage_branch_head_control(&mut writes, branch_id, rebuilt_control)?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let summary = PointReadPlan::new(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            &[locator_summary_key(branch_id, file_id)?],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await?
+        .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = summary.into_iter().next() else {
+            return Err(codec_error(
+                "rebuild dropped the tracked zero-member anchor",
+            ));
+        };
+        assert_eq!(decode_locator_summary(&bytes)?.count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn malformed_locator_marker_fails_closed_without_staging() -> Result<(), LixError> {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "locator-corrupt";
@@ -3443,8 +3506,10 @@ mod tests {
             .map_err(LixError::from)?
             .expect("rebuild fixture control");
         let mut writes = storage.new_write_set();
+        let live_file_ids = BTreeSet::from([file_id.to_owned()]);
         let rebuilt_control =
-            rebuild_untracked_file_locator(&read, &mut writes, branch_id, control).await?;
+            rebuild_untracked_file_locator(&read, &mut writes, branch_id, control, &live_file_ids)
+                .await?;
         assert_eq!(rebuilt_control.untracked_locator_count, 1);
         assert_eq!(take_untracked_file_locator_read_profile().rebuilt_rows, 1);
         assert!(!writes.is_empty());
