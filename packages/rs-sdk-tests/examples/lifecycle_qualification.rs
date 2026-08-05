@@ -15,6 +15,8 @@
 //!   worker slatedb 1000000 dense 70
 //! ```
 
+#![recursion_limit = "512"]
+
 use async_trait::async_trait;
 use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
