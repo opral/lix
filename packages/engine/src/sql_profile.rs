@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::time::Duration;
 
+use crate::storage_adapter::StorageReadStats;
 use crate::{ExecuteResult, LixError};
 
 tokio::task_local! {
@@ -28,6 +29,19 @@ pub struct SqlReadProfile {
     /// Sum of Arrow's in-memory array sizes at the scan output boundary.
     /// This is not the number of bytes read from the storage backend.
     pub scan_arrow_bytes: u64,
+    /// Diagnostic provider/catalog setup time. These fields may overlap the
+    /// four disjoint public phases above and are intentionally not included
+    /// in `unattributed_overhead`.
+    pub provider_registration: Duration,
+    pub catalog_lookup: Duration,
+    pub live_state_overlay: Duration,
+    pub storage_read: Duration,
+    pub storage_requested_keys: u64,
+    pub storage_unique_keys: u64,
+    pub storage_calls: u64,
+    pub storage_scan_chunks: u64,
+    pub storage_scan_rows: u64,
+    pub storage_scan_bytes: u64,
 }
 
 impl SqlReadProfile {
@@ -49,6 +63,10 @@ pub(crate) enum Phase {
     PhysicalPlanning,
     ArrowExecution,
     PublicResultMaterialization,
+    ProviderRegistration,
+    CatalogLookup,
+    LiveStateOverlay,
+    StorageRead,
 }
 
 pub(crate) fn is_active() -> bool {
@@ -63,8 +81,29 @@ pub(crate) fn record_phase(phase: Phase, elapsed: Duration) {
             Phase::PhysicalPlanning => &mut profile.physical_planning,
             Phase::ArrowExecution => &mut profile.arrow_execution,
             Phase::PublicResultMaterialization => &mut profile.public_result_materialization,
+            Phase::ProviderRegistration => &mut profile.provider_registration,
+            Phase::CatalogLookup => &mut profile.catalog_lookup,
+            Phase::LiveStateOverlay => &mut profile.live_state_overlay,
+            Phase::StorageRead => &mut profile.storage_read,
         };
         *target += elapsed;
+    });
+}
+
+pub(crate) fn record_storage_stats(stats: StorageReadStats) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.storage_requested_keys = profile
+            .storage_requested_keys
+            .saturating_add(stats.requested_keys);
+        profile.storage_unique_keys = profile
+            .storage_unique_keys
+            .saturating_add(stats.unique_storage_keys);
+        profile.storage_calls = profile.storage_calls.saturating_add(stats.storage_calls);
+        profile.storage_scan_chunks = profile
+            .storage_scan_chunks
+            .saturating_add(stats.range_scan_chunks + stats.prefix_scan_chunks);
+        profile.storage_scan_rows = profile.storage_scan_rows.saturating_add(stats.scan_rows);
     });
 }
 

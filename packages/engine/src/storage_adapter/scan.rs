@@ -2,6 +2,8 @@ use crate::storage::{CoreProjection, KeyRange, Prefix, ScanChunk, ScanOptions, S
 use crate::storage_adapter::{
     StorageAdapterRead, StorageReadResult, StorageReadStats, StorageSpace,
 };
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanPlan {
@@ -47,6 +49,8 @@ impl ScanPlan {
             ScanPlanKind::Prefix(prefix) => prefix.to_range()?,
         };
         let storage_calls = u64::from(opts.limit_rows != 0);
+        #[cfg(feature = "storage-benches")]
+        let started = crate::sql_profile::is_active().then(Instant::now);
         let chunk = if opts.limit_rows == 0 {
             ScanChunk {
                 entries: Vec::new(),
@@ -65,6 +69,15 @@ impl ScanPlan {
         if matches!(kind, ScanKind::Prefix) {
             stats.prefix_lowered = 1;
         }
+        #[cfg(feature = "storage-benches")]
+        if let Some(started) = started {
+            crate::sql_profile::record_phase(
+                crate::sql_profile::Phase::StorageRead,
+                started.elapsed(),
+            );
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_storage_stats(stats);
         Ok(StorageReadResult::new(chunk, stats))
     }
 }

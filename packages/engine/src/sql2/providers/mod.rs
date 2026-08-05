@@ -222,12 +222,21 @@ where
         return Ok(());
     }
     let dynamic_catalog;
+    #[cfg(feature = "storage-benches")]
+    let catalog_started = crate::sql_profile::is_active().then(std::time::Instant::now);
     let catalog = if selection.requires_visible_schemas() {
         dynamic_catalog = ctx.public_catalog().await?;
         dynamic_catalog.as_ref()
     } else {
         PublicCatalog::fixed_system()
     };
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = catalog_started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::CatalogLookup,
+            started.elapsed(),
+        );
+    }
     register_read_from_catalog(
         session,
         ctx,

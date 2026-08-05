@@ -1754,6 +1754,36 @@ async fn execute<StorageImpl>(session: &SessionContext<StorageImpl>, sql: &str) 
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_PHASES").is_some()
+        && sql.trim_start().starts_with("SELECT")
+    {
+        let (result, profile) = session
+            .execute_profiled(sql, &[])
+            .await
+            .expect("execute profiled tracked-state crud SQL");
+        println!(
+            "sql_profile total_ns={} logical_ns={} physical_ns={} arrow_ns={} materialize_ns={} provider_ns={} catalog_ns={} overlay_ns={} storage_ns={} scan_elapsed_ns={} scan_rows={} scan_batches={} scan_arrow_bytes={} storage_requested_keys={} storage_unique_keys={} storage_calls={} storage_scan_chunks={} storage_scan_rows={}",
+            profile.total.as_nanos(),
+            profile.logical_planning.as_nanos(),
+            profile.physical_planning.as_nanos(),
+            profile.arrow_execution.as_nanos(),
+            profile.public_result_materialization.as_nanos(),
+            profile.provider_registration.as_nanos(),
+            profile.catalog_lookup.as_nanos(),
+            profile.live_state_overlay.as_nanos(),
+            profile.storage_read.as_nanos(),
+            profile.scan_elapsed.as_nanos(),
+            profile.scan_rows,
+            profile.scan_batches,
+            profile.scan_arrow_bytes,
+            profile.storage_requested_keys,
+            profile.storage_unique_keys,
+            profile.storage_calls,
+            profile.storage_scan_chunks,
+            profile.storage_scan_rows,
+        );
+        return result;
+    }
     session
         .execute(sql, &[])
         .await

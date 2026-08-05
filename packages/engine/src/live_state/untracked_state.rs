@@ -636,6 +636,8 @@ pub(crate) async fn stage_untracked_deltas(
     deltas: &[CurrentStateDeltaRef<'_>],
     known_absent: &[bool],
 ) -> Result<BranchHeadControl, LixError> {
+    let live_file_ids = BTreeSet::new();
+    let deleted_file_ids = BTreeSet::new();
     stage_untracked_deltas_inner(
         store,
         writes,
@@ -643,6 +645,39 @@ pub(crate) async fn stage_untracked_deltas(
         control,
         deltas,
         known_absent,
+        &live_file_ids,
+        &deleted_file_ids,
+        false,
+    )
+    .await
+}
+
+/// Stages the ordinary untracked mutation set together with tracked file
+/// lifecycle identities that were certified absent by the tracked planner.
+/// These identities contribute only zero-member locator anchors; all member
+/// truth remains in `UNTRACKED_ROW_SPACE`. Keeping this handoff explicit lets
+/// selected merge/restore rows publish their anchor in the same write set as
+/// the tracked generation without treating every descriptor update as a new
+/// file.
+pub(crate) async fn stage_untracked_deltas_with_live_file_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    control: BranchHeadControl,
+    deltas: &[CurrentStateDeltaRef<'_>],
+    known_absent: &[bool],
+    live_file_ids: &BTreeSet<String>,
+    deleted_file_ids: &BTreeSet<String>,
+) -> Result<BranchHeadControl, LixError> {
+    stage_untracked_deltas_inner(
+        store,
+        writes,
+        branch_id,
+        control,
+        deltas,
+        known_absent,
+        live_file_ids,
+        deleted_file_ids,
         false,
     )
     .await
@@ -656,6 +691,8 @@ pub(crate) async fn stage_untracked_deltas_for_branch_deletion(
     deltas: &[CurrentStateDeltaRef<'_>],
     known_absent: &[bool],
 ) -> Result<BranchHeadControl, LixError> {
+    let live_file_ids = BTreeSet::new();
+    let deleted_file_ids = BTreeSet::new();
     stage_untracked_deltas_inner(
         store,
         writes,
@@ -663,6 +700,8 @@ pub(crate) async fn stage_untracked_deltas_for_branch_deletion(
         control,
         deltas,
         known_absent,
+        &live_file_ids,
+        &deleted_file_ids,
         true,
     )
     .await
@@ -675,6 +714,8 @@ async fn stage_untracked_deltas_inner(
     control: BranchHeadControl,
     deltas: &[CurrentStateDeltaRef<'_>],
     known_absent: &[bool],
+    live_file_ids: &BTreeSet<String>,
+    lifecycle_deleted_file_ids: &BTreeSet<String>,
     drop_locator: bool,
 ) -> Result<BranchHeadControl, LixError> {
     if known_absent.len() != deltas.len() {
@@ -798,11 +839,12 @@ async fn stage_untracked_deltas_inner(
         }
     }
 
-    let deleted_file_ids = deltas
+    let mut deleted_file_ids = deltas
         .iter()
         .filter(|delta| delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted)
         .map(|delta| delta.entity_pk.as_single_string_owned())
         .collect::<Result<BTreeSet<_>, _>>()?;
+    deleted_file_ids.extend(lifecycle_deleted_file_ids.iter().cloned());
     let affected_file_ids = deltas
         .iter()
         .filter_map(|delta| delta.file_id.map(str::to_owned))
@@ -812,10 +854,18 @@ async fn stage_untracked_deltas_inner(
         .iter()
         .zip(known_absent)
         .filter(|(delta, absent)| {
+            // The lifecycle owner is the tracked file descriptor, not an
+            // untracked row. A tracked file can become live with zero
+            // untracked members, so publish its zero-member anchor in this
+            // same write set before any locator invariant is checked.
             delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && !delta.deleted && **absent
         })
         .map(|(delta, _)| delta.entity_pk.as_single_string_owned())
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let new_file_ids = new_file_ids
+        .into_iter()
+        .chain(live_file_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let affected_file_ids = affected_file_ids
         .into_iter()
         .chain(new_file_ids.iter().cloned())
@@ -828,6 +878,11 @@ async fn stage_untracked_deltas_inner(
     for file_id in &new_file_ids {
         locator_summaries
             .entry(file_id.clone())
+            .and_modify(|summary| {
+                if summary.is_none() {
+                    *summary = Some(LocatorSummary::default());
+                }
+            })
             .or_insert(Some(LocatorSummary::default()));
     }
     let mut locator_delete_keys = BTreeSet::new();
@@ -2655,6 +2710,121 @@ mod tests {
                 .is_err()
         );
         assert!(writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn certified_tracked_file_lifecycle_publishes_zero_member_anchor() -> Result<(), LixError>
+    {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch-certified-anchor";
+        let file_id = "file-certified-anchor";
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let control = test_control(branch_id);
+        let live_file_ids = BTreeSet::from([file_id.to_owned()]);
+        let deleted_file_ids = BTreeSet::new();
+        let updated = stage_untracked_deltas_with_live_file_ids(
+            &read,
+            &mut writes,
+            branch_id,
+            control,
+            &[],
+            &[],
+            &live_file_ids,
+            &deleted_file_ids,
+        )
+        .await?;
+        assert!(!writes.is_empty());
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let summary = PointReadPlan::new(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            &[locator_summary_key(branch_id, file_id)?],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await?
+        .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = summary.into_iter().next() else {
+            return Err(codec_error(
+                "certified tracked file anchor was not persisted",
+            ));
+        };
+        assert_eq!(decode_locator_summary(&bytes)?.count, 0);
+        assert_eq!(updated.untracked_locator_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn certified_tracked_file_lifecycle_deletes_anchor_atomically() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch-certified-delete";
+        let file_id = "file-certified-delete";
+        let empty = BTreeSet::new();
+        let live_file_ids = BTreeSet::from([file_id.to_owned()]);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let control = stage_untracked_deltas_with_live_file_ids(
+            &read,
+            &mut writes,
+            branch_id,
+            test_control(branch_id),
+            &[],
+            &[],
+            &live_file_ids,
+            &empty,
+        )
+        .await?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let deleted = BTreeSet::from([file_id.to_owned()]);
+        stage_untracked_deltas_with_live_file_ids(
+            &read,
+            &mut writes,
+            branch_id,
+            control,
+            &[],
+            &[],
+            &empty,
+            &deleted,
+        )
+        .await?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let summary = PointReadPlan::new(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            &[locator_summary_key(branch_id, file_id)?],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await?
+        .value;
+        assert!(summary.into_iter().next().flatten().is_none());
         Ok(())
     }
 

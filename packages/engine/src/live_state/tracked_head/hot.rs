@@ -5302,6 +5302,34 @@ impl HotTrackedSnapshot {
         }
         Ok(Self { rows })
     }
+
+    /// Returns tracked file identities that are live in this complete
+    /// snapshot. The descriptor payload is not consulted; the snapshot's
+    /// canonical row key and fixed value header are sufficient to classify
+    /// lifecycle presence for branch publication.
+    pub(crate) fn live_file_descriptor_ids(&self) -> Result<BTreeSet<String>, LixError> {
+        let mut file_ids = BTreeSet::new();
+        for (identity, bytes) in &self.rows {
+            if identity.schema_key != "lix_file_descriptor" {
+                continue;
+            }
+            let value = decode_head_value(bytes.as_ref())?;
+            if value.deleted {
+                continue;
+            }
+            let file_id = identity
+                .entity_pk
+                .as_single_string_owned()
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("tracked file descriptor has invalid identity: {error}"),
+                    )
+                })?;
+            file_ids.insert(file_id);
+        }
+        Ok(file_ids)
+    }
 }
 
 /// Writer for row-addressable current state.

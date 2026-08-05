@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 
 use ahash::RandomState;
 
@@ -124,6 +126,8 @@ impl PointReadPlan {
     where
         R: StorageAdapterRead + ?Sized,
     {
+        #[cfg(feature = "storage-benches")]
+        let started = crate::sql_profile::is_active().then(Instant::now);
         let unique_values = exact_get_many(
             read,
             &[GetManyRequest {
@@ -134,6 +138,15 @@ impl PointReadPlan {
         )
         .await?
         .values;
+        #[cfg(feature = "storage-benches")]
+        if let Some(started) = started {
+            crate::sql_profile::record_phase(
+                crate::sql_profile::Phase::StorageRead,
+                started.elapsed(),
+            );
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::sql_profile::record_storage_stats(self.stats());
         Ok(StorageReadResult::new(
             PointValues {
                 unique_values,

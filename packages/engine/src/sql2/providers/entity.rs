@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 
 use async_trait::async_trait;
 #[cfg(test)]
@@ -371,10 +373,19 @@ impl EntitySpec {
                 .into_iter()
                 .collect();
         }
+        #[cfg(feature = "storage-benches")]
+        let started = crate::sql_profile::is_active().then(Instant::now);
         let rows = WriteContextLiveStateReader::new(write_ctx.clone())
             .scan_batch(&request)
             .await
             .map_err(lix_error_to_datafusion_error)?;
+        #[cfg(feature = "storage-benches")]
+        if let Some(started) = started {
+            crate::sql_profile::record_phase(
+                crate::sql_profile::Phase::LiveStateOverlay,
+                started.elapsed(),
+            );
+        }
         let batch = entity_record_batch_with_parsed(
             &self.spec,
             Arc::clone(&self.schema),
@@ -429,10 +440,19 @@ impl EntitySpec {
                 batch_projection,
             ),
             |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
+                #[cfg(feature = "storage-benches")]
+                let started = crate::sql_profile::is_active().then(Instant::now);
                 let rows = live_state
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
+                #[cfg(feature = "storage-benches")]
+                if let Some(started) = started {
+                    crate::sql_profile::record_phase(
+                        crate::sql_profile::Phase::LiveStateOverlay,
+                        started.elapsed(),
+                    );
+                }
                 let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                 entity_record_batch_with_parsed(
                     &spec,
@@ -633,10 +653,19 @@ impl TableSpec for EntitySpec {
                         return RecordBatch::try_new(schema, columns)
                             .map_err(DataFusionError::from);
                     }
+                    #[cfg(feature = "storage-benches")]
+                    let started = crate::sql_profile::is_active().then(Instant::now);
                     let rows = live_state
                         .scan_batch(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
+                    #[cfg(feature = "storage-benches")]
+                    if let Some(started) = started {
+                        crate::sql_profile::record_phase(
+                            crate::sql_profile::Phase::LiveStateOverlay,
+                            started.elapsed(),
+                        );
+                    }
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
@@ -691,10 +720,19 @@ impl TableSpec for EntitySpec {
                 batch_projection,
             ),
             |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
+                #[cfg(feature = "storage-benches")]
+                let started = crate::sql_profile::is_active().then(Instant::now);
                 let rows = live_state
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
+                #[cfg(feature = "storage-benches")]
+                if let Some(started) = started {
+                    crate::sql_profile::record_phase(
+                        crate::sql_profile::Phase::LiveStateOverlay,
+                        started.elapsed(),
+                    );
+                }
                 let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                 entity_record_batch_with_parsed(
                     &spec,

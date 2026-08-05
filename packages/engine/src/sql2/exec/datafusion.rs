@@ -126,8 +126,18 @@ where
     C: SqlExecutionContext + ?Sized,
 {
     let planning_environment = ctx.sql_planning_environment().await?;
+    #[cfg(feature = "storage-benches")]
+    let provider_started = crate::sql_profile::is_active().then(Instant::now);
+    let session = build_read_session(ctx, statements).await?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = provider_started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::ProviderRegistration,
+            started.elapsed(),
+        );
+    }
     Ok(ReadSqlSession {
-        session: build_read_session(ctx, statements).await?,
+        session,
         planning_environment,
         _context: PhantomData,
     })
@@ -142,8 +152,18 @@ where
     C: SqlExecutionContext + ?Sized,
 {
     let planning_environment = ctx.sql_planning_environment().await?;
+    #[cfg(feature = "storage-benches")]
+    let provider_started = crate::sql_profile::is_active().then(Instant::now);
+    let session = build_read_session_at_head(ctx, active_head, statements).await?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = provider_started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::ProviderRegistration,
+            started.elapsed(),
+        );
+    }
     Ok(ReadSqlSession {
-        session: build_read_session_at_head(ctx, active_head, statements).await?,
+        session,
         planning_environment,
         _context: PhantomData,
     })

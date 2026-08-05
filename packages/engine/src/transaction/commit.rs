@@ -3064,13 +3064,9 @@ fn lifecycle_snapshot_commit_ids(
             required.insert(root.commit_id);
         }
     }
-    for (branch_id, target) in explicit_branch_targets {
+    for (_branch_id, target) in explicit_branch_targets {
         if let Some(commit_id) = target.head_commit_id
             && roots_by_id.contains_key(&commit_id)
-            && observations
-                .get(branch_id)
-                .and_then(|observation| observation.control)
-                .is_some()
         {
             required.insert(commit_id);
         }
@@ -3111,6 +3107,22 @@ fn selected_refs_require_complete_snapshot(
     })
 }
 
+fn live_file_descriptor_ids(
+    rows: &BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>,
+) -> Result<BTreeSet<String>, LixError> {
+    rows.iter()
+        .filter(|(key, row)| key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && !row.deleted)
+        .map(|(_, row)| {
+            row.entity_pk.as_single_string_owned().map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("tracked file descriptor has invalid identity: {error}"),
+                )
+            })
+        })
+        .collect()
+}
+
 /// Resolves the full tracked view for only the rare lifecycle commits selected
 /// by [`lifecycle_snapshot_commit_ids`].  Persisted ancestors come from the
 /// canonical tracked-state history.  Pending ancestors are replayed from the
@@ -3125,6 +3137,8 @@ async fn build_lifecycle_tracked_snapshots(
     selected_payloads: &HashMap<SelectedChangeKey, crate::changelog::MaterializedChangePayload>,
     insert_selection: &PreparedInsertSelection,
     required: &BTreeSet<CommitId>,
+    new_live_file_ids_by_branch: &mut BTreeMap<String, BTreeSet<String>>,
+    deleted_live_file_ids_by_branch: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<BTreeMap<CommitId, HotTrackedSnapshot>, LixError> {
     if required.is_empty() {
         return Ok(BTreeMap::new());
@@ -3183,6 +3197,7 @@ async fn build_lifecycle_tracked_snapshots(
                 load_persisted_lifecycle_tracked_snapshot(read, parent_commit_id).await?
             }
         };
+        let parent_live_file_ids = live_file_descriptor_ids(&rows)?;
         let row_indices = tracked_row_indices_by_commit
             .get(&root.commit_id)
             .map(Vec::as_slice)
@@ -3213,6 +3228,24 @@ async fn build_lifecycle_tracked_snapshots(
             let tracked =
                 lifecycle_selected_tracked_row(change_ref, root.commit_id, source, payload)?;
             apply_lifecycle_tracked_snapshot_row(&mut rows, tracked, false)?;
+        }
+        if root.publish_head {
+            let final_live_file_ids = live_file_descriptor_ids(&rows)?;
+            let newly_live_file_ids: BTreeSet<String> = final_live_file_ids
+                .difference(&parent_live_file_ids)
+                .cloned()
+                .collect();
+            let deleted_live_file_ids: BTreeSet<String> = parent_live_file_ids
+                .difference(&final_live_file_ids)
+                .cloned()
+                .collect();
+            if !newly_live_file_ids.is_empty() {
+                new_live_file_ids_by_branch.insert(root.branch_id.clone(), newly_live_file_ids);
+            }
+            if !deleted_live_file_ids.is_empty() {
+                deleted_live_file_ids_by_branch
+                    .insert(root.branch_id.clone(), deleted_live_file_ids);
+            }
         }
         snapshots.insert(root.commit_id, rows);
     }
@@ -3456,6 +3489,8 @@ async fn stage_tracked_head(
         observations,
         checkpoint_epochs,
     )?;
+    let mut new_live_file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut deleted_live_file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
     let mut tracked_snapshots = build_lifecycle_tracked_snapshots(
         read,
         state_rows,
@@ -3465,12 +3500,55 @@ async fn stage_tracked_head(
         selected_change_payloads,
         insert_selection,
         &lifecycle_ids,
+        &mut new_live_file_ids_by_branch,
+        &mut deleted_live_file_ids_by_branch,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
         "lix.perf.materialization.tracked_head.lifecycle"
     ))
     .await?;
+    // Explicit branch restores/repoints publish a tracked root under the
+    // target branch ID, which may differ from the source commit's branch.
+    // Derive only target absent->live descriptor identities against the
+    // target branch's current tracked head so anchors are staged atomically
+    // without repairing pre-existing missing summaries.
+    for (branch_id, target) in explicit_branch_targets {
+        let Some(head_commit_id) = target.head_commit_id else {
+            continue;
+        };
+        let target_snapshot = if let Some(snapshot) = tracked_snapshots.get(&head_commit_id) {
+            snapshot.clone()
+        } else {
+            let rows = load_persisted_lifecycle_tracked_snapshot(read, head_commit_id).await?;
+            HotTrackedSnapshot::from_materialized_rows(rows.into_values().collect())?
+        };
+        let target_live_file_ids = target_snapshot.live_file_descriptor_ids()?;
+        let previous_live_file_ids = if let Some(control) = observations
+            .get(branch_id)
+            .and_then(|observation| observation.control)
+        {
+            let rows =
+                load_persisted_lifecycle_tracked_snapshot(read, control.head_commit_id).await?;
+            live_file_descriptor_ids(&rows)?
+        } else {
+            BTreeSet::new()
+        };
+        let newly_live_file_ids: BTreeSet<String> = target_live_file_ids
+            .difference(&previous_live_file_ids)
+            .cloned()
+            .collect();
+        let deleted_live_file_ids: BTreeSet<String> = previous_live_file_ids
+            .difference(&target_live_file_ids)
+            .cloned()
+            .collect();
+        if !newly_live_file_ids.is_empty() {
+            new_live_file_ids_by_branch.insert(branch_id.clone(), newly_live_file_ids);
+        }
+        if !deleted_live_file_ids.is_empty() {
+            deleted_live_file_ids_by_branch.insert(branch_id.clone(), deleted_live_file_ids);
+        }
+    }
     // Validate the complete tracked/untracked final lane before the first
     // untracked write is staged.  The read is the transaction opening
     // snapshot; pending rows are overlaid in their final order so an atomic
@@ -3517,7 +3595,10 @@ async fn stage_tracked_head(
         })
         .map(|row| row.branch_id.as_str())
         .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
+        .chain(new_live_file_ids_by_branch.keys().map(String::as_str))
+        .chain(deleted_live_file_ids_by_branch.keys().map(String::as_str))
         .collect::<BTreeSet<_>>();
+    let no_new_live_file_ids = BTreeSet::new();
     let mut untracked_controls = BTreeMap::new();
     for branch_id in untracked_branches {
         let selected_rows = state_rows
@@ -3593,13 +3674,19 @@ async fn stage_tracked_head(
             )
             .await?
         } else {
-            crate::live_state::stage_untracked_deltas(
+            crate::live_state::stage_untracked_deltas_with_live_file_ids(
                 read,
                 writes,
                 branch_id,
                 previous_control,
                 &deltas,
                 &known_absent,
+                new_live_file_ids_by_branch
+                    .get(branch_id)
+                    .unwrap_or(&no_new_live_file_ids),
+                deleted_live_file_ids_by_branch
+                    .get(branch_id)
+                    .unwrap_or(&no_new_live_file_ids),
             )
             .await?
         };
