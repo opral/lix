@@ -101,6 +101,7 @@ struct FrontierMetrics {
     diff_batch_calls: AtomicU64,
     diff_batch_keys: AtomicU64,
     diff_decoded_bytes: AtomicU64,
+    diff_decoded_nodes: AtomicU64,
 }
 
 static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
@@ -123,6 +124,7 @@ static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
     diff_batch_calls: AtomicU64::new(0),
     diff_batch_keys: AtomicU64::new(0),
     diff_decoded_bytes: AtomicU64::new(0),
+    diff_decoded_nodes: AtomicU64::new(0),
 };
 
 fn frontier_metrics_enabled() -> bool {
@@ -154,6 +156,7 @@ fn reset_frontier_metrics() {
         &FRONTIER_METRICS.diff_batch_calls,
         &FRONTIER_METRICS.diff_batch_keys,
         &FRONTIER_METRICS.diff_decoded_bytes,
+        &FRONTIER_METRICS.diff_decoded_nodes,
     ] {
         metric.store(0, Ordering::Relaxed);
     }
@@ -164,7 +167,7 @@ fn emit_frontier_metrics() {
         return;
     }
     eprintln!(
-        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={} range_events={} cascade_nodes_scanned={} cascade_decoded_rows={} cascade_streamed_outputs={} covered_subtrees={} pruned_subtrees={} boundary_descents={} diff_batch_calls={} diff_batch_keys={} diff_decoded_bytes={}",
+        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={} range_events={} cascade_nodes_scanned={} cascade_decoded_rows={} cascade_streamed_outputs={} covered_subtrees={} pruned_subtrees={} boundary_descents={} diff_batch_calls={} diff_batch_keys={} diff_decoded_bytes={} diff_decoded_nodes={}",
         FRONTIER_METRICS.visited_nodes.load(Ordering::Relaxed),
         FRONTIER_METRICS.decoded_nodes.load(Ordering::Relaxed),
         FRONTIER_METRICS.encoded_nodes.load(Ordering::Relaxed),
@@ -194,6 +197,7 @@ fn emit_frontier_metrics() {
         FRONTIER_METRICS.diff_batch_calls.load(Ordering::Relaxed),
         FRONTIER_METRICS.diff_batch_keys.load(Ordering::Relaxed),
         FRONTIER_METRICS.diff_decoded_bytes.load(Ordering::Relaxed),
+        FRONTIER_METRICS.diff_decoded_nodes.load(Ordering::Relaxed),
     );
 }
 
@@ -623,6 +627,9 @@ impl TrackedStateTree {
                 FRONTIER_METRICS
                     .diff_decoded_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                FRONTIER_METRICS
+                    .diff_decoded_nodes
+                    .fetch_add(1, Ordering::Relaxed);
             }
             nodes.insert(hash, decode_node(&bytes)?);
         }
@@ -2292,6 +2299,14 @@ impl PendingChunkBatchBuilder {
         subtree_count: u64,
         subtree_height: u32,
     ) -> ChildSummary {
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .transient_encoded_chunks
+                .fetch_add(1, Ordering::Relaxed);
+            FRONTIER_METRICS
+                .transient_encoded_bytes
+                .fetch_add(node.len() as u64, Ordering::Relaxed);
+        }
         let hash = hash_bytes(&node);
         if !self.chunks.contains_key(&hash) {
             let start = self.data.len();
