@@ -2614,47 +2614,9 @@ mod tests {
             } else {
                 Vec::new()
             };
-            let snapshots = branch_rows
-                .iter()
-                .map(|row| {
-                    row.snapshot_content.as_deref().map_or(
-                        crate::json_store::JsonSlot::None,
-                        crate::json_store::JsonSlot::from_json,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let metadata = branch_rows
-                .iter()
-                .map(|row| {
-                    row.metadata.as_deref().map_or(
-                        crate::json_store::JsonSlot::None,
-                        crate::json_store::JsonSlot::from_json,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let deltas = branch_rows
-                .iter()
-                .zip(snapshots.iter())
-                .zip(metadata.iter())
-                .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: row.deleted,
-                    created_at: ts(&row.created_at),
-                    updated_at: ts(&row.updated_at),
-                    snapshot: snapshot.as_ref_slot(),
-                    metadata: metadata.as_ref_slot(),
-                    columnar_base_coordinate: None,
-                })
-                .collect::<Vec<_>>();
             let schema_keys = parent_rows
                 .iter()
                 .map(|row| row.schema_key.clone())
-                .chain(branch_rows.iter().map(|row| row.schema_key.clone()))
                 .collect::<Vec<_>>();
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             let generation = TrackedHeadContext::new()
@@ -2663,7 +2625,7 @@ mod tests {
                     &branch_id,
                     None,
                     head_commit_id,
-                    &deltas,
+                    &[],
                     &std::collections::BTreeSet::new(),
                     Some(parent_rows),
                     None,
@@ -2685,6 +2647,57 @@ mod tests {
                 untracked_locator_count: 0,
             };
             control.note_schemas(schema_keys.iter().map(String::as_str));
+            let control = if branch_rows.is_empty() {
+                control
+            } else {
+                let snapshots = branch_rows
+                    .iter()
+                    .map(|row| {
+                        row.snapshot_content.as_deref().map_or(
+                            crate::json_store::JsonSlot::None,
+                            crate::json_store::JsonSlot::from_json,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let metadata = branch_rows
+                    .iter()
+                    .map(|row| {
+                        row.metadata.as_deref().map_or(
+                            crate::json_store::JsonSlot::None,
+                            crate::json_store::JsonSlot::from_json,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let deltas = branch_rows
+                    .iter()
+                    .zip(snapshots.iter())
+                    .zip(metadata.iter())
+                    .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        entity_pk: &row.entity_pk,
+                        change_id: None,
+                        commit_id: None,
+                        untracked: true,
+                        deleted: row.deleted,
+                        created_at: ts(&row.created_at),
+                        updated_at: ts(&row.updated_at),
+                        snapshot: snapshot.as_ref_slot(),
+                        metadata: metadata.as_ref_slot(),
+                        columnar_base_coordinate: None,
+                    })
+                    .collect::<Vec<_>>();
+                crate::live_state::stage_untracked_deltas(
+                    &read,
+                    &mut writes,
+                    &branch_id,
+                    control,
+                    &deltas,
+                    &vec![false; deltas.len()],
+                )
+                .await
+                .expect("test branch untracked rows should stage")
+            };
             crate::branch::stage_branch_head_control(&mut writes, &branch_id, control)
                 .expect("test branch-head control should stage");
         }

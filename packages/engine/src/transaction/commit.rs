@@ -4485,24 +4485,11 @@ async fn stage_tracked_head(
                 ))
                 .await?
         } else if let Some(generation) = packed_generation {
-            if !untracked_deltas.is_empty() {
-                writer
-                    .stage_current_state_with_working_diff(
-                        &root.branch_id,
-                        Some(parent_generation),
-                        root.commit_id,
-                        &untracked_deltas,
-                        &BTreeSet::new(),
-                        None,
-                        None,
-                        &mut coverage,
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.materialization.tracked_head.stage_current_overlay"
-                    ))
-                    .await?;
-            }
+            // Untracked rows are published only by the authoritative mutable
+            // plane above.  A packed tracked publication must never mirror
+            // them into HOT, even when tracked and untracked deltas share one
+            // transaction.  The branch-control publication below carries the
+            // tracked generation and the separately staged untracked control.
             generation
         } else if let Some(certified_live_increments) =
             host_certified_live_increments.get(&root.branch_id)
