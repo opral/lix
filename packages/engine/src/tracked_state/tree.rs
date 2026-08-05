@@ -12,7 +12,10 @@ use std::{
     num::NonZeroUsize,
     ops::Range,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -45,6 +48,77 @@ use crate::{LixError, NullableKeyFilter};
 // about 64 MiB (excluding cache metadata and live `Bytes` views held by callers).
 const TRACKED_STATE_NODE_CACHE_CAPACITY: usize = 4096;
 type TrackedStateNodeCache = LruCache<[u8; TRACKED_STATE_HASH_BYTES], Bytes>;
+
+#[derive(Debug, Default)]
+struct FrontierMetrics {
+    visited_nodes: AtomicU64,
+    decoded_nodes: AtomicU64,
+    encoded_nodes: AtomicU64,
+    reused_nodes: AtomicU64,
+    transient_encoded_chunks: AtomicU64,
+    transient_encoded_bytes: AtomicU64,
+    final_staged_chunks: AtomicU64,
+    final_staged_bytes: AtomicU64,
+    storage_reads: AtomicU64,
+}
+
+static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
+    visited_nodes: AtomicU64::new(0),
+    decoded_nodes: AtomicU64::new(0),
+    encoded_nodes: AtomicU64::new(0),
+    reused_nodes: AtomicU64::new(0),
+    transient_encoded_chunks: AtomicU64::new(0),
+    transient_encoded_bytes: AtomicU64::new(0),
+    final_staged_chunks: AtomicU64::new(0),
+    final_staged_bytes: AtomicU64::new(0),
+    storage_reads: AtomicU64::new(0),
+};
+
+fn frontier_metrics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LIX_TRACKED_STATE_FRONTIER_STATS").is_some())
+}
+
+fn reset_frontier_metrics() {
+    if !frontier_metrics_enabled() {
+        return;
+    }
+    for metric in [
+        &FRONTIER_METRICS.visited_nodes,
+        &FRONTIER_METRICS.decoded_nodes,
+        &FRONTIER_METRICS.encoded_nodes,
+        &FRONTIER_METRICS.reused_nodes,
+        &FRONTIER_METRICS.transient_encoded_chunks,
+        &FRONTIER_METRICS.transient_encoded_bytes,
+        &FRONTIER_METRICS.final_staged_chunks,
+        &FRONTIER_METRICS.final_staged_bytes,
+        &FRONTIER_METRICS.storage_reads,
+    ] {
+        metric.store(0, Ordering::Relaxed);
+    }
+}
+
+fn emit_frontier_metrics() {
+    if !frontier_metrics_enabled() {
+        return;
+    }
+    eprintln!(
+        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={}",
+        FRONTIER_METRICS.visited_nodes.load(Ordering::Relaxed),
+        FRONTIER_METRICS.decoded_nodes.load(Ordering::Relaxed),
+        FRONTIER_METRICS.encoded_nodes.load(Ordering::Relaxed),
+        FRONTIER_METRICS.reused_nodes.load(Ordering::Relaxed),
+        FRONTIER_METRICS
+            .transient_encoded_chunks
+            .load(Ordering::Relaxed),
+        FRONTIER_METRICS
+            .transient_encoded_bytes
+            .load(Ordering::Relaxed),
+        FRONTIER_METRICS.final_staged_chunks.load(Ordering::Relaxed),
+        FRONTIER_METRICS.final_staged_bytes.load(Ordering::Relaxed),
+        FRONTIER_METRICS.storage_reads.load(Ordering::Relaxed),
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeOptions {
@@ -323,7 +397,11 @@ impl TrackedStateTree {
                 .await;
         }
         if let Some(root_id) = base_root {
-            let mutations = sort_unique_mutations(mutations)?;
+            let mutations = if mutations_are_strictly_sorted(&mutations) {
+                mutations
+            } else {
+                sort_unique_mutations(mutations)?
+            };
             return self
                 .apply_sorted_mutation_frontier(
                     store, writes, overlay, root_id, mutations, commit_id,
@@ -752,7 +830,6 @@ impl TrackedStateTree {
         Ok(())
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     async fn apply_sorted_mutation_frontier(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -768,6 +845,7 @@ impl TrackedStateTree {
                 "tracked-state parent mutation frontier must not be empty",
             ));
         }
+        reset_frontier_metrics();
 
         if mutations.len() == 1 {
             let mutation = mutations
@@ -779,23 +857,14 @@ impl TrackedStateTree {
                 .await;
         }
 
-        let levels = self
-            .collect_summary_levels_with_overlay(store, overlay, root_id)
+        let root_node = self
+            .load_node_with_overlay(store, overlay, root_id.as_bytes())
             .await?;
-        let leaves = levels.first().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state parent root has no authenticated leaf summaries",
-            )
-        })?;
-        let base_row_count = leaves
-            .iter()
-            .map(|leaf| leaf.subtree_count as usize)
-            .sum::<usize>();
-        let first_mutation_key = &mutations[0].encoded_key;
-        let append_only = leaves
-            .last()
-            .is_some_and(|leaf| first_mutation_key.as_ref() > leaf.last_key.as_ref());
+        let base_row_count = decoded_node_row_count(&root_node);
+        let root_last_key = decoded_node_last_key(&root_node);
+        let append_only = root_last_key
+            .as_deref()
+            .is_some_and(|last_key| mutations[0].encoded_key.as_ref() > last_key);
         if !append_only && mutations.len() * 2 > base_row_count {
             return self
                 .rebuild_from_sorted_mutations(
@@ -803,146 +872,420 @@ impl TrackedStateTree {
                 )
                 .await;
         }
+        self.apply_sparse_mutation_frontier(
+            store,
+            writes,
+            overlay,
+            root_id,
+            root_node,
+            mutations,
+            append_only,
+            commit_id,
+        )
+        .await
+    }
 
-        // The caller has supplied a canonical sorted-unique frontier. Keep
-        // descriptors in their arena-backed order; only affected leaves are
-        // decoded and rebuilt.
-        let mut mutations = VecDeque::from(mutations);
-        let mut output_leaves = Vec::new();
+    async fn apply_sparse_mutation_frontier(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        root_id: &TrackedStateRootId,
+        root_node: DecodedNode,
+        mutations: Vec<TrackedStateMutation>,
+        append_only: bool,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
+        let fallback_mutations = mutations
+            .iter()
+            .map(|mutation| TrackedStateMutation {
+                encoded_key: mutation.encoded_key.clone(),
+                encoded_value: mutation.encoded_value.clone(),
+            })
+            .collect();
         let mut chunks = PendingChunkBatchBuilder::default();
-        let mut leaf_index = 0usize;
-        let mut changed = false;
-
-        while leaf_index < leaves.len() {
-            let current_leaf_has_mutation = mutations.front().is_some_and(|mutation| {
-                mutation.encoded_key.as_ref() <= leaves[leaf_index].last_key.as_ref()
-            });
-            if !current_leaf_has_mutation {
-                output_leaves.push(leaves[leaf_index].clone());
-                leaf_index += 1;
-                continue;
-            }
-
-            let window_start = leaf_index;
-            let mut window_entries = BTreeMap::new();
-            let mut window_mutation_ceiling = mutations
-                .front()
-                .map(|mutation| mutation.encoded_key.clone())
-                .expect("window with mutation should have front mutation");
-
-            loop {
-                if leaf_index < leaves.len() {
-                    let leaf = &leaves[leaf_index];
-                    for entry in self
-                        .load_leaf_entries_with_overlay(store, overlay, &leaf.child_hash)
-                        .await?
-                    {
-                        window_entries.insert(entry.key, entry.value);
-                    }
-
-                    while mutations.front().is_some_and(|mutation| {
-                        mutation.encoded_key.as_ref() <= leaf.last_key.as_ref()
-                    }) {
-                        let mutation = mutations
-                            .pop_front()
-                            .expect("front mutation should be present");
-                        if window_entries
-                            .get(mutation.encoded_key.as_ref())
-                            .is_none_or(|value| value.as_ref() != mutation.encoded_value.as_ref())
-                        {
-                            changed = true;
-                        }
-                        window_mutation_ceiling.clone_from(&mutation.encoded_key);
-                        window_entries.insert(mutation.encoded_key, mutation.encoded_value);
-                    }
-                    leaf_index += 1;
-                }
-
-                while let Some(mutation) = mutations.front() {
-                    if leaf_index < leaves.len()
-                        && mutation.encoded_key.as_ref() >= leaves[leaf_index].first_key.as_ref()
-                    {
-                        break;
-                    }
-                    let mutation = mutations
-                        .pop_front()
-                        .expect("front mutation should be present");
-                    changed = true;
-                    window_mutation_ceiling.clone_from(&mutation.encoded_key);
-                    window_entries.insert(mutation.encoded_key, mutation.encoded_value);
-                }
-
-                if leaf_index < leaves.len()
-                    && mutations.front().is_some_and(|mutation| {
-                        mutation.encoded_key.as_ref() <= leaves[leaf_index].last_key.as_ref()
-                    })
-                {
-                    continue;
-                }
-
-                let mut candidate_chunks = PendingChunkBatchBuilder::default();
-                let candidate_leaves = self.build_leaf_level_from_refs(
-                    window_entries
-                        .iter()
-                        .map(|(key, value)| EncodedLeafEntryRef { key, value }),
-                    &mut candidate_chunks,
-                );
-
-                if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
-                    &candidate_leaves,
-                    &leaves[window_start..],
-                    &window_mutation_ceiling,
-                ) {
-                    for summary in &candidate_leaves[..generated_resync_index] {
-                        chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
-                    }
-                    output_leaves.extend(candidate_leaves.into_iter().take(generated_resync_index));
-                    leaf_index = window_start + existing_resync_index;
-                    break;
-                }
-
-                if leaf_index >= leaves.len() {
-                    chunks.extend(candidate_chunks);
-                    output_leaves.extend(candidate_leaves);
-                    break;
-                }
-            }
+        let mut replacement = self
+            .apply_sparse_node(
+                store,
+                overlay,
+                *root_id.as_bytes(),
+                Some(root_node),
+                mutations,
+                0,
+                &mut chunks,
+            )
+            .await?;
+        if replacement.needs_rebalance && !append_only {
+            return self
+                .rebuild_from_sorted_mutations(
+                    store,
+                    writes,
+                    overlay,
+                    root_id,
+                    fallback_mutations,
+                    commit_id,
+                )
+                .await;
         }
-
-        if !mutations.is_empty() {
-            changed = true;
-            let entries = mutations
-                .into_iter()
-                .map(|mutation| EncodedLeafEntry {
-                    key: mutation.encoded_key,
-                    value: mutation.encoded_value,
-                })
-                .collect();
-            output_leaves.extend(self.build_leaf_level(entries, &mut chunks));
+        let mut tree_height = replacement.height;
+        while replacement.summaries.len() > 1 {
+            replacement.summaries =
+                self.build_internal_level(replacement.summaries, tree_height, &mut chunks);
+            tree_height += 1;
         }
-
-        if !changed {
-            let root = levels
-                .last()
-                .and_then(|summaries| summaries.last())
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked-state parent root summary disappeared",
-                    )
-                })?;
+        let root = replacement.summaries.pop().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state sparse frontier produced no root",
+            )
+        })?;
+        if !replacement.changed {
+            emit_frontier_metrics();
             return Ok(TrackedStateApplyResult {
-                root_id: TrackedStateRootId::new(root.child_hash),
+                root_id: root_id.clone(),
                 row_count: root.subtree_count as usize,
-                tree_height: levels.len(),
+                tree_height,
                 chunk_count: 0,
                 chunk_bytes: 0,
             });
         }
-
-        let built = self.build_tree_from_frontier(&levels, output_leaves, chunks)?;
+        let chunk_bytes = chunks.data.len();
+        let built = BuiltTree {
+            root_id: TrackedStateRootId::new(root.child_hash),
+            chunks: chunks.finish(),
+            row_count: root.subtree_count as usize,
+            tree_height,
+            chunk_bytes,
+        };
         self.persist_built_tree(writes, overlay, built, commit_id)
             .await
+    }
+
+    fn apply_sparse_node<'a, S>(
+        &'a self,
+        store: &'a S,
+        overlay: &'a storage::TrackedStateChunkOverlay,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        preloaded: Option<DecodedNode>,
+        mutations: Vec<TrackedStateMutation>,
+        level: usize,
+        chunks: &'a mut PendingChunkBatchBuilder,
+    ) -> Pin<Box<dyn Future<Output = Result<SparseFrontierNode, LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+    {
+        Box::pin(async move {
+            let node = match preloaded {
+                Some(node) => node,
+                None => self.load_node_with_overlay(store, overlay, &hash).await?,
+            };
+            match node {
+                DecodedNode::Leaf(leaf) => {
+                    let original_summary = decoded_leaf_summary(hash, &leaf);
+                    let mut entries = leaf.into_entries();
+                    let mut changed = false;
+                    let mut needs_rebalance = false;
+                    for mutation in mutations {
+                        match entries.binary_search_by(|entry| {
+                            entry.key.as_ref().cmp(mutation.encoded_key.as_ref())
+                        }) {
+                            Ok(index) => {
+                                if entries[index].value != mutation.encoded_value {
+                                    entries[index].value = mutation.encoded_value;
+                                    changed = true;
+                                }
+                            }
+                            Err(index) => {
+                                entries.insert(
+                                    index,
+                                    EncodedLeafEntry {
+                                        key: mutation.encoded_key,
+                                        value: mutation.encoded_value,
+                                    },
+                                );
+                                changed = true;
+                                needs_rebalance = true;
+                            }
+                        }
+                    }
+                    if !changed {
+                        return Ok(SparseFrontierNode {
+                            summaries: vec![original_summary],
+                            height: 1,
+                            changed: false,
+                            needs_rebalance: false,
+                        });
+                    }
+                    let summaries = self.build_leaf_level(entries, chunks);
+                    Ok(SparseFrontierNode {
+                        summaries,
+                        height: 1,
+                        changed: true,
+                        needs_rebalance,
+                    })
+                }
+                DecodedNode::Internal(internal) => {
+                    let children = internal.into_children();
+                    if children.is_empty() {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked-state internal node has no children",
+                        ));
+                    }
+                    let mut groups: Vec<(usize, Vec<TrackedStateMutation>)> = Vec::new();
+                    for mutation in mutations {
+                        let child_index = children
+                            .iter()
+                            .position(|child| {
+                                child.last_key.as_ref() >= mutation.encoded_key.as_ref()
+                            })
+                            .unwrap_or(children.len() - 1);
+                        if let Some((last_index, group)) = groups.last_mut() {
+                            if *last_index == child_index {
+                                group.push(mutation);
+                                continue;
+                            }
+                        }
+                        groups.push((child_index, vec![mutation]));
+                    }
+                    let first_group = groups.first().map(|(index, _)| *index);
+                    let last_group = groups.last().map(|(index, _)| *index);
+                    if let (Some(first_group), Some(last_group)) = (first_group, last_group) {
+                        let contiguous = last_group - first_group + 1 == groups.len();
+                        if contiguous {
+                            let first_child = self
+                                .load_node_with_overlay(
+                                    store,
+                                    overlay,
+                                    &children[first_group].child_hash,
+                                )
+                                .await?;
+                            if matches!(first_child, DecodedNode::Leaf(_)) {
+                                return self
+                                    .apply_sparse_leaf_window(
+                                        store,
+                                        overlay,
+                                        hash,
+                                        children,
+                                        groups,
+                                        first_group,
+                                        last_group,
+                                        first_child,
+                                        chunks,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    let mut replacement_children = Vec::new();
+                    let mut changed = false;
+                    let mut needs_rebalance = false;
+                    let mut child_height = 0usize;
+                    let mut next_group = 0usize;
+                    for (child_index, child) in children.iter().enumerate() {
+                        let Some((group_index, _)) = groups.get(next_group) else {
+                            replacement_children.push(child.clone());
+                            continue;
+                        };
+                        if *group_index != child_index {
+                            replacement_children.push(child.clone());
+                            if frontier_metrics_enabled() {
+                                FRONTIER_METRICS
+                                    .reused_nodes
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                        let (_, group) = groups
+                            .get_mut(next_group)
+                            .expect("group index was checked above");
+                        let group = std::mem::take(group);
+                        let replacement = self
+                            .apply_sparse_node(
+                                store,
+                                overlay,
+                                child.child_hash,
+                                None,
+                                group,
+                                level + 1,
+                                chunks,
+                            )
+                            .await?;
+                        child_height = child_height.max(replacement.height);
+                        changed |= replacement.changed;
+                        needs_rebalance |= replacement.needs_rebalance;
+                        replacement_children.extend(replacement.summaries);
+                        next_group += 1;
+                    }
+                    if !changed {
+                        let summary = internal_summary(hash, &children)?;
+                        return Ok(SparseFrontierNode {
+                            summaries: vec![summary],
+                            height: child_height + 1,
+                            changed: false,
+                            needs_rebalance: false,
+                        });
+                    }
+                    let summaries =
+                        self.build_internal_level(replacement_children, child_height, chunks);
+                    Ok(SparseFrontierNode {
+                        summaries,
+                        height: child_height + 1,
+                        changed: true,
+                        needs_rebalance,
+                    })
+                }
+            }
+        })
+    }
+
+    async fn apply_sparse_leaf_window(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        children: Vec<ChildSummary>,
+        groups: Vec<(usize, Vec<TrackedStateMutation>)>,
+        first_group: usize,
+        last_group: usize,
+        first_child: DecodedNode,
+        chunks: &mut PendingChunkBatchBuilder,
+    ) -> Result<SparseFrontierNode, LixError> {
+        let start = first_group.saturating_sub(usize::from(first_group > 0));
+        let mut end = (last_group + 2).min(children.len());
+        let mut entries = BTreeMap::new();
+        let mut changed = false;
+        let mutation_ceiling = groups
+            .last()
+            .and_then(|(_, mutations)| mutations.last())
+            .map(|mutation| mutation.encoded_key.clone())
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state leaf frontier has no mutation groups",
+                )
+            })?;
+        let mut loaded_end = start;
+        let mut needs_rebalance = false;
+
+        loop {
+            while loaded_end < end {
+                let child = &children[loaded_end];
+                let node = if loaded_end == first_group {
+                    first_child.clone()
+                } else {
+                    self.load_node_with_overlay(store, overlay, &child.child_hash)
+                        .await?
+                };
+                match node {
+                    DecodedNode::Leaf(leaf) => {
+                        for entry in leaf.into_entries() {
+                            entries.insert(entry.key, entry.value);
+                        }
+                    }
+                    DecodedNode::Internal(_) => {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked-state leaf frontier encountered an internal child",
+                        ));
+                    }
+                }
+                loaded_end += 1;
+            }
+
+            for (_, mutations) in &groups {
+                for mutation in mutations {
+                    match entries.get(mutation.encoded_key.as_ref()) {
+                        Some(value) if value.as_ref() == mutation.encoded_value.as_ref() => {}
+                        _ => {
+                            changed = true;
+                            needs_rebalance |= !entries.contains_key(mutation.encoded_key.as_ref());
+                            entries.insert(
+                                mutation.encoded_key.clone(),
+                                mutation.encoded_value.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+            if !changed {
+                return Ok(SparseFrontierNode {
+                    summaries: vec![internal_summary(hash, &children)?],
+                    height: 2,
+                    changed: false,
+                    needs_rebalance: false,
+                });
+            }
+
+            let candidate_entries = entries
+                .iter()
+                .map(|(key, value)| EncodedLeafEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>();
+            let candidate_groups = chunk_leaf_entries(candidate_entries, &self.options);
+            let resync = candidate_groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| {
+                    group
+                        .entries
+                        .first()
+                        .is_some_and(|entry| entry.key.as_ref() > mutation_ceiling.as_ref())
+                })
+                .find_map(|(generated_index, group)| {
+                    let first = group.entries.first()?.key.as_ref();
+                    let last = group.entries.last()?.key.as_ref();
+                    let count = group.entries.len() as u64;
+                    children[start..end]
+                        .iter()
+                        .position(|summary| {
+                            summary.first_key.as_ref() == first
+                                && summary.last_key.as_ref() == last
+                                && summary.subtree_count == count
+                        })
+                        .map(|existing_offset| (generated_index, start + existing_offset))
+                });
+
+            if let Some((generated_index, existing_index)) = resync {
+                let prefix_entries = candidate_groups
+                    .into_iter()
+                    .take(generated_index)
+                    .flat_map(|group| group.entries)
+                    .collect::<Vec<_>>();
+                let generated = self.build_leaf_level(prefix_entries, chunks);
+                let mut replacement_children = children[..start].to_vec();
+                replacement_children.extend(generated);
+                replacement_children.extend(children[existing_index..].iter().cloned());
+                let summaries = self.build_internal_level(replacement_children, 1, chunks);
+                return Ok(SparseFrontierNode {
+                    summaries,
+                    height: 2,
+                    changed: true,
+                    needs_rebalance,
+                });
+            }
+
+            if end == children.len() {
+                let replacement_entries = candidate_groups
+                    .into_iter()
+                    .flat_map(|group| group.entries)
+                    .collect::<Vec<_>>();
+                let replacement_leaves = self.build_leaf_level(replacement_entries, chunks);
+                let mut replacement_children = children[..start].to_vec();
+                replacement_children.extend(replacement_leaves);
+                let summaries = self.build_internal_level(replacement_children, 1, chunks);
+                return Ok(SparseFrontierNode {
+                    summaries,
+                    height: 2,
+                    changed: true,
+                    needs_rebalance,
+                });
+            }
+
+            end += 1;
+        }
     }
 
     /// Applies one sorted frontier event by decoding exactly one authenticated
@@ -1202,7 +1545,16 @@ impl TrackedStateTree {
         built: BuiltTree,
         _commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .final_staged_chunks
+                .fetch_add(built.chunks.len() as u64, Ordering::Relaxed);
+            FRONTIER_METRICS
+                .final_staged_bytes
+                .fetch_add(built.chunk_bytes as u64, Ordering::Relaxed);
+        }
         overlay.stage_chunks(writes, &built.chunks);
+        emit_frontier_metrics();
         Ok(TrackedStateApplyResult {
             root_id: built.root_id,
             row_count: built.row_count,
@@ -1281,70 +1633,6 @@ impl TrackedStateTree {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked-state tree build from leaves produced no root",
-            )
-        })?;
-        let chunk_bytes = chunks.data.len();
-        let chunks = chunks.finish();
-        Ok(BuiltTree {
-            root_id: TrackedStateRootId::new(root.child_hash),
-            chunks,
-            row_count,
-            tree_height,
-            chunk_bytes,
-        })
-    }
-
-    /// Rebuilds only the authenticated ancestor frontier when leaf topology
-    /// is unchanged. Candidate internal nodes are encoded in a private batch,
-    /// then only hashes absent from the old level are copied into the final
-    /// publication batch. Unchanged subtrees remain referenced by their old
-    /// content hashes and are never staged again.
-    #[expect(clippy::cast_possible_truncation)]
-    fn build_tree_from_frontier(
-        &self,
-        old_levels: &[Vec<ChildSummary>],
-        leaf_summaries: Vec<ChildSummary>,
-        mut chunks: PendingChunkBatchBuilder,
-    ) -> Result<BuiltTree, LixError> {
-        let Some(old_leaves) = old_levels.first() else {
-            return self.build_tree_from_leaf_summaries(leaf_summaries, chunks);
-        };
-        if old_leaves.len() != leaf_summaries.len() {
-            return self.build_tree_from_leaf_summaries(leaf_summaries, chunks);
-        }
-
-        let row_count = leaf_summaries
-            .iter()
-            .map(|summary| summary.subtree_count as usize)
-            .sum();
-        let mut summaries = leaf_summaries;
-        let original_leaf_summaries = summaries.clone();
-        let mut tree_height = 1usize;
-        while summaries.len() > 1 {
-            let mut candidate_chunks = PendingChunkBatchBuilder::default();
-            let candidate =
-                self.build_internal_level(summaries, tree_height, &mut candidate_chunks);
-            let old_level = old_levels.get(tree_height);
-            if old_level.is_none_or(|old| old.len() != candidate.len()) {
-                // A changed fanout or height invalidates positional reuse;
-                // publish the canonical rebuilt tree in one final batch.
-                return self.build_tree_from_leaf_summaries(original_leaf_summaries, chunks);
-            }
-            for (index, summary) in candidate.iter().enumerate() {
-                if old_level
-                    .and_then(|old| old.get(index))
-                    .is_none_or(|old| old.child_hash != summary.child_hash)
-                {
-                    chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
-                }
-            }
-            summaries = candidate;
-            tree_height += 1;
-        }
-        let root = summaries.pop().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state frontier rebuild produced no root",
             )
         })?;
         let chunk_bytes = chunks.data.len();
@@ -1694,81 +1982,6 @@ impl TrackedStateTree {
         })
     }
 
-    async fn collect_summary_levels_with_overlay(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        overlay: &storage::TrackedStateChunkOverlay,
-        root_id: &TrackedStateRootId,
-    ) -> Result<Vec<Vec<ChildSummary>>, LixError> {
-        let mut levels = Vec::new();
-        self.collect_summary_levels_for_node_with_overlay(
-            store,
-            overlay,
-            *root_id.as_bytes(),
-            &mut levels,
-        )
-        .await?;
-        Ok(levels)
-    }
-
-    fn collect_summary_levels_for_node_with_overlay<'a, S>(
-        &'a self,
-        store: &'a S,
-        overlay: &'a storage::TrackedStateChunkOverlay,
-        hash: [u8; TRACKED_STATE_HASH_BYTES],
-        levels: &'a mut Vec<Vec<ChildSummary>>,
-    ) -> Pin<Box<dyn Future<Output = Result<(ChildSummary, usize), LixError>> + Send + 'a>>
-    where
-        S: StorageAdapterRead + ?Sized + 'a,
-    {
-        Box::pin(async move {
-            match self.load_node_with_overlay(store, overlay, &hash).await? {
-                DecodedNode::Leaf(leaf) => {
-                    let summary = decoded_leaf_summary(hash, &leaf);
-                    push_level_summary(levels, 0, summary.clone());
-                    Ok((summary, 0))
-                }
-                DecodedNode::Internal(internal) => {
-                    let children = internal.children().to_vec();
-                    let child_height = match children.first() {
-                        Some(child) => match self
-                            .load_node_with_overlay(store, overlay, &child.child_hash)
-                            .await?
-                        {
-                            DecodedNode::Leaf(_) => {
-                                if levels.is_empty() {
-                                    levels.push(Vec::new());
-                                }
-                                levels[0].extend(children.iter().cloned());
-                                0
-                            }
-                            DecodedNode::Internal(_) => {
-                                let mut child_height = None;
-                                for child in &children {
-                                    let (_, height) = self
-                                        .collect_summary_levels_for_node_with_overlay(
-                                            store,
-                                            overlay,
-                                            child.child_hash,
-                                            levels,
-                                        )
-                                        .await?;
-                                    child_height = Some(height);
-                                }
-                                child_height.unwrap_or(0)
-                            }
-                        },
-                        None => 0,
-                    };
-                    let height = child_height + 1;
-                    let summary = internal_summary(hash, &children)?;
-                    push_level_summary(levels, height, summary.clone());
-                    Ok((summary, height))
-                }
-            }
-        })
-    }
-
     async fn load_leaf_entries_with_overlay(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -1809,6 +2022,11 @@ impl TrackedStateTree {
             return Ok(bytes);
         }
 
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .storage_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
             LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
         })?;
@@ -1829,13 +2047,30 @@ impl TrackedStateTree {
         overlay: &storage::TrackedStateChunkOverlay,
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .visited_nodes
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(bytes) = overlay.staged_chunk(hash) {
             // Overlay chunks are not cached until a later durable-store read.
             storage::debug_verify_chunk_hash(hash, bytes)?;
-            return decode_node(bytes);
+            let node = decode_node(bytes);
+            if frontier_metrics_enabled() {
+                FRONTIER_METRICS
+                    .decoded_nodes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return node;
         }
         let bytes = self.load_node_bytes(store, hash).await?;
-        decode_node(&bytes)
+        let node = decode_node(&bytes);
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .decoded_nodes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        node
     }
 }
 
@@ -1881,6 +2116,11 @@ impl PendingChunkBatchBuilder {
             let len = node.len();
             self.data.extend_from_slice(&node);
             self.chunks.insert(hash, PendingChunkSpan { start, len });
+            if frontier_metrics_enabled() {
+                FRONTIER_METRICS
+                    .encoded_nodes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         ChildSummary {
             first_key,
@@ -1909,6 +2149,11 @@ impl PendingChunkBatchBuilder {
                 len: span.len,
             },
         );
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .reused_nodes
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn extend(&mut self, source: Self) {
@@ -1957,6 +2202,13 @@ struct OrderedLeafCursorFrame {
 struct FrontierPathFrame {
     children: Vec<ChildSummary>,
     child_index: usize,
+}
+
+struct SparseFrontierNode {
+    summaries: Vec<ChildSummary>,
+    height: usize,
+    changed: bool,
+    needs_rebalance: bool,
 }
 
 impl OrderedLeafCursor {
@@ -2641,6 +2893,16 @@ fn decoded_node_row_count(node: &DecodedNode) -> usize {
     }
 }
 
+fn decoded_node_last_key(node: &DecodedNode) -> Option<Bytes> {
+    match node {
+        DecodedNode::Leaf(leaf) => leaf.last_key_owned(),
+        DecodedNode::Internal(internal) => internal
+            .children()
+            .last()
+            .map(|child| child.last_key.clone()),
+    }
+}
+
 fn tree_diff_capacity_hint(node: &DecodedNode, request: &TrackedStateTreeScanRequest) -> usize {
     let row_count = decoded_node_row_count(node);
     if request.include_tombstones
@@ -2696,13 +2958,6 @@ fn internal_summary(
         child_hash: hash,
         subtree_count: children.iter().map(|child| child.subtree_count).sum(),
     })
-}
-
-fn push_level_summary(levels: &mut Vec<Vec<ChildSummary>>, level: usize, summary: ChildSummary) {
-    while levels.len() <= level {
-        levels.push(Vec::new());
-    }
-    levels[level].push(summary);
 }
 
 fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
@@ -3253,15 +3508,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let overlay = storage::TrackedStateChunkOverlay::new();
-        let levels = tree
-            .collect_summary_levels_with_overlay(&read, &overlay, &base.root_id)
+        let leaf_entries = tree
+            .collect_leaf_entries(&read, &base.root_id)
             .await
-            .expect("summary levels should load");
-        let leaf_summaries = levels.first().expect("base should have a leaf level");
-        assert!(leaf_summaries.len() > 2, "fixture needs several leaves");
-        let boundary_key = decode_key(&leaf_summaries[leaf_summaries.len() / 2].last_key)
-            .expect("leaf boundary key should decode");
+            .expect("base entries should load");
+        assert!(leaf_entries.len() > 2, "fixture needs several leaves");
+        let boundary_key = decode_key(&leaf_entries[leaf_entries.len() / 2].key)
+            .expect("boundary key should decode");
         let boundary_number = boundary_key
             .entity_pk
             .as_single_string()
