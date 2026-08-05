@@ -9184,7 +9184,19 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 },
             )
             .await?;
-        for entry in &page.value.entries {
+        let commit_ids = page
+            .value
+            .entries
+            .iter()
+            .map(|entry| commit_id_from_delta_key(&entry.key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let states = load_commit_state_manifests(store, &commit_ids).await?;
+        for (entry, (commit_id, state)) in page
+            .value
+            .entries
+            .iter()
+            .zip(commit_ids.into_iter().zip(states))
+        {
             if entry.key.0.len() != 16 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -9194,15 +9206,12 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
             let StorageProjectedValue::FullValue(_) = &entry.value else {
                 unreachable!("full commit-delta scan returned a key-only row");
             };
-            let commit_id = commit_id_from_delta_key(&entry.key)?;
-            let state = load_commit_state_manifest(store, commit_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit-state scan lost its split authority",
-                    )
-                })?;
+            let state = state.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit-state scan lost its split authority",
+                )
+            })?;
             if state.commit_id != commit_id {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
