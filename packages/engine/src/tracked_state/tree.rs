@@ -1140,13 +1140,18 @@ impl TrackedStateTree {
                     if let (Some(first_group), Some(last_group)) = (first_group, last_group) {
                         let contiguous = last_group - first_group + 1 == groups.len();
                         if contiguous {
-                            let first_child = self
-                                .load_node_with_overlay(
-                                    store,
-                                    overlay,
-                                    &children[first_group].child_hash,
-                                )
-                                .await?;
+                            let first_child =
+                                match decoded_frontier.remove(&children[first_group].child_hash) {
+                                    Some(node) => node,
+                                    None => {
+                                        self.load_node_with_overlay(
+                                            store,
+                                            overlay,
+                                            &children[first_group].child_hash,
+                                        )
+                                        .await?
+                                    }
+                                };
                             if matches!(first_child, DecodedNode::Leaf(_)) {
                                 return self
                                     .apply_sparse_leaf_window(
@@ -1158,6 +1163,7 @@ impl TrackedStateTree {
                                         first_group,
                                         last_group,
                                         first_child,
+                                        decoded_frontier,
                                         chunks,
                                     )
                                     .await;
@@ -1233,6 +1239,7 @@ impl TrackedStateTree {
         first_group: usize,
         last_group: usize,
         first_child: DecodedNode,
+        decoded_frontier: &mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
         chunks: &mut PendingChunkBatchBuilder,
     ) -> Result<SparseFrontierNode, LixError> {
         let start = first_group.saturating_sub(usize::from(first_group > 0));
@@ -1256,6 +1263,8 @@ impl TrackedStateTree {
                 let child = &children[loaded_end];
                 let node = if loaded_end == first_group {
                     first_child.clone()
+                } else if let Some(node) = decoded_frontier.remove(&child.child_hash) {
+                    node
                 } else {
                     self.load_node_with_overlay(store, overlay, &child.child_hash)
                         .await?
