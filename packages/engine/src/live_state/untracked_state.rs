@@ -872,6 +872,17 @@ async fn stage_untracked_deltas_inner(
         .collect::<BTreeSet<_>>();
     let mut locator_summaries =
         load_locator_summaries(store, branch_id, &affected_file_ids).await?;
+    // A certified absent->live transition may create a zero-member anchor
+    // only when the file prefix is also empty. This bounded check prevents a
+    // missing summary from masking stale locator entries after file-ID reuse
+    // or corruption; existing summaries continue through the authenticated
+    // count/digest path below.
+    for file_id in new_file_ids
+        .iter()
+        .filter(|file_id| locator_summaries.get(*file_id).is_none_or(Option::is_none))
+    {
+        scan_locator_members(store, branch_id, file_id, None).await?;
+    }
     // A live file descriptor owns a zero-member summary even before its first
     // member. This lifecycle anchor makes simultaneous loss of a summary and
     // all of its entries fail closed instead of being mistaken for emptiness.
