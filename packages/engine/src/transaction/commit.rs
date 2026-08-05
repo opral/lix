@@ -3513,7 +3513,7 @@ async fn stage_tracked_head(
         .iter()
         .filter(|row| {
             (row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY)
-                || (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.snapshot.is_none())
+                || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
         })
         .map(|row| row.branch_id.as_str())
         .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
@@ -3526,8 +3526,7 @@ async fn stage_tracked_head(
             .filter(|row| {
                 row.1.branch_id == branch_id
                     && ((row.1.untracked && row.1.schema_key != BRANCH_REF_SCHEMA_KEY)
-                        || (row.1.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-                            && row.1.snapshot.is_none()))
+                        || row.1.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
             })
             .collect::<Vec<_>>();
         let mut deltas = selected_rows
@@ -3536,7 +3535,10 @@ async fn stage_tracked_head(
             .collect::<Result<Vec<_>, _>>()?;
         let mut known_absent = selected_rows
             .iter()
-            .map(|(row_index, row)| row.untracked && insert_selection.contains(*row_index))
+            .map(|(row_index, row)| {
+                (row.untracked || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+                    && insert_selection.contains(*row_index)
+            })
             .collect::<Vec<_>>();
         deltas.extend(
             engine_rows

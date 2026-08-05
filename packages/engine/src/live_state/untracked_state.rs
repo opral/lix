@@ -889,10 +889,18 @@ async fn stage_untracked_deltas_inner(
             continue;
         }
         let key = locator_entry_key(branch_id, file_id, delta.schema_key, delta.entity_pk)?;
-        let summary = locator_summaries
-            .entry(file_id.to_owned())
-            .or_insert_with(|| Some(LocatorSummary::default()))
-            .get_or_insert_default();
+        let summary = match locator_summaries.get_mut(file_id) {
+            Some(Some(summary)) => summary,
+            Some(None) if new_file_ids.contains(file_id) => locator_summaries
+                .get_mut(file_id)
+                .expect("new file summary entry exists")
+                .get_or_insert_default(),
+            Some(None) | None => {
+                return Err(codec_error(format!(
+                    "untracked locator summary is missing for existing file '{file_id}'"
+                )));
+            }
+        };
         if delta.deleted {
             if !*absent {
                 if summary.count == 0 {
@@ -969,8 +977,16 @@ async fn stage_untracked_deltas_inner(
     }
     for (file_id, summary) in locator_summaries {
         let key = locator_summary_key(branch_id, &file_id)?;
-        match summary {
-            Some(summary) if summary.count != 0 => {
+        if deleted_file_ids.contains(&file_id) {
+            record_locator_summary_write();
+            writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key);
+        } else {
+            let Some(summary) = summary else {
+                return Err(codec_error(format!(
+                    "untracked locator summary is missing for live file '{file_id}'"
+                )));
+            };
+            {
                 record_locator_summary_write();
                 writes.put(
                     UNTRACKED_FILE_LOCATOR_SPACE,
@@ -978,11 +994,7 @@ async fn stage_untracked_deltas_inner(
                     StorageValue {
                         bytes: encode_locator_summary(&summary),
                     },
-                )
-            }
-            _ => {
-                record_locator_summary_write();
-                writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key)
+                );
             }
         }
     }
@@ -1012,7 +1024,13 @@ async fn stage_file_cascade_from_locator(
 ) -> Result<(), LixError> {
     for file_id in deleted_file_ids {
         let expected = locator_summaries.get(file_id).and_then(Option::as_ref);
+        let summary_missing = expected.is_none();
         let members = scan_locator_members(store, branch_id, file_id, expected).await?;
+        if summary_missing && members.is_empty() {
+            return Err(codec_error(format!(
+                "untracked locator summary is missing for deleted file '{file_id}'"
+            )));
+        }
         let authoritative = validate_locator_authority(store, branch_id, &members).await?;
         for member in members {
             let key = StorageKey(Bytes::from(encode_key(
@@ -2366,6 +2384,23 @@ mod tests {
         }
     }
 
+    fn file_descriptor(entity_pk: &EntityPk, timestamp: LixTimestamp) -> CurrentStateDeltaRef<'_> {
+        CurrentStateDeltaRef {
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
+            file_id: None,
+            entity_pk,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            snapshot: JsonSlotRef::Inline("{}"),
+            metadata: JsonSlotRef::None,
+            columnar_base_coordinate: None,
+        }
+    }
+
     async fn commit_deltas(
         storage: &StorageAdapter<Memory>,
         branch_id: &str,
@@ -2383,9 +2418,29 @@ mod tests {
             .await
             .map_err(LixError::from)?
             .unwrap_or_else(|| test_control(branch_id));
-        let updated_control =
-            stage_untracked_deltas(&read, &mut writes, branch_id, control, deltas, known_absent)
-                .await?;
+        let mut owned_file_pks = Vec::new();
+        let mut staged_deltas = deltas.to_vec();
+        let mut staged_known_absent = known_absent.to_vec();
+        if control.untracked_locator_generation == 0 {
+            let file_ids = deltas
+                .iter()
+                .filter_map(|delta| delta.file_id)
+                .collect::<BTreeSet<_>>();
+            owned_file_pks.extend(file_ids.iter().map(|file_id| EntityPk::single(*file_id)));
+            for (file_id, entity_pk) in file_ids.into_iter().zip(owned_file_pks.iter()) {
+                staged_deltas.push(file_descriptor(entity_pk, timestamp()));
+                staged_known_absent.push(true);
+            }
+        }
+        let updated_control = stage_untracked_deltas(
+            &read,
+            &mut writes,
+            branch_id,
+            control,
+            &staged_deltas,
+            &staged_known_absent,
+        )
+        .await?;
         crate::branch::stage_branch_head_control(&mut writes, branch_id, updated_control)?;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2480,7 +2535,26 @@ mod tests {
     async fn file_cascade_with_zero_members_uses_one_locator_scan() -> Result<(), LixError> {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch-empty";
-        let file_pk = EntityPk::single("file-empty");
+        let file_id = "file-empty";
+        let file_pk = EntityPk::single(file_id);
+        let member_pk = EntityPk::single("member");
+        let member = untracked(
+            "schema",
+            Some(file_id),
+            &member_pk,
+            r#"{"v":1}"#,
+            timestamp(),
+        );
+        commit_deltas(&storage, branch_id, &[member], &[true]).await?;
+        let mut member_delete = untracked(
+            "schema",
+            Some(file_id),
+            &member_pk,
+            r#"{"v":1}"#,
+            timestamp(),
+        );
+        member_delete.deleted = true;
+        commit_deltas(&storage, branch_id, &[member_delete], &[false]).await?;
         let delete = file_delete(&file_pk, timestamp());
         let _ = take_untracked_file_locator_read_profile();
 
@@ -2500,6 +2574,64 @@ mod tests {
         assert_eq!(profile.locator_scans, 1);
         assert_eq!(profile.locator_rows, 0);
         assert_eq!(profile.authoritative_exact_reads, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_member_summary_anchor_is_persisted_and_missing_fails_closed()
+    -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch-zero-anchor";
+        let file_id = "file-zero-anchor";
+        let entity = EntityPk::single("member");
+        let member = untracked("schema", Some(file_id), &entity, r#"{"v":1}"#, timestamp());
+        commit_deltas(&storage, branch_id, &[member], &[true]).await?;
+        let mut member_delete =
+            untracked("schema", Some(file_id), &entity, r#"{"v":1}"#, timestamp());
+        member_delete.deleted = true;
+        commit_deltas(&storage, branch_id, &[member_delete], &[false]).await?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let summary_key = locator_summary_key(branch_id, file_id)?;
+        let summary = PointReadPlan::new(UNTRACKED_FILE_LOCATOR_SPACE, &[summary_key.clone()])
+            .materialize(&read, StorageGetOptions::default())
+            .await?
+            .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = summary.into_iter().next() else {
+            return Err(codec_error(
+                "zero-member locator summary anchor was not persisted",
+            ));
+        };
+        assert_eq!(decode_locator_summary(&bytes)?.count, 0);
+
+        let mut corrupt = storage.new_write_set();
+        corrupt.delete(UNTRACKED_FILE_LOCATOR_SPACE, summary_key);
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .map_err(LixError::from)?
+            .expect("zero-anchor fixture control");
+        let mut writes = storage.new_write_set();
+        let file_entity = EntityPk::single(file_id);
+        let delete = file_delete(&file_entity, timestamp());
+        assert!(
+            stage_untracked_deltas(&read, &mut writes, branch_id, control, &[delete], &[false])
+                .await
+                .is_err()
+        );
+        assert!(writes.is_empty());
         Ok(())
     }
 

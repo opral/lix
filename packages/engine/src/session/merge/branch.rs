@@ -501,6 +501,7 @@ where
             "lix.perf.merge_branch_total"
         ))
         .await
+        .map_err(map_merge_branch_collision_error)
     }
 }
 
@@ -1998,6 +1999,32 @@ fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixErro
     })))
 }
 
+/// Reclassifies only the final-lane tracked/untracked ownership error raised
+/// by commit validation. The authority check itself remains in the generic
+/// transaction path; this boundary adds merge semantics without converting
+/// unrelated unique violations (including duplicate entity inserts).
+fn map_merge_branch_collision_error(error: LixError) -> LixError {
+    if error.code != LixError::CODE_UNIQUE
+        || !error
+            .message
+            .starts_with("tracked/untracked identity collision")
+    {
+        return error;
+    }
+    let cause = error.message;
+    LixError::new(
+        LixError::CODE_MERGE_CONFLICT,
+        format!(
+            "merge_branch found a tracked/untracked identity collision with an untracked current row: {cause}"
+        ),
+    )
+    .with_hint("Resolve the tracked/untracked ownership collision, then retry the merge.")
+    .with_details(json!({
+        "kind": "trackedUntrackedIdentityCollision",
+        "cause": cause,
+    }))
+}
+
 fn merge_conflict_details(conflict: &MergeConflict) -> serde_json::Value {
     json!({
         "kind": match conflict.kind {
@@ -2416,5 +2443,31 @@ mod tests {
             ),
             Some("/docs/readme.md".to_owned())
         );
+    }
+
+    #[test]
+    fn merge_maps_only_final_lane_tracked_untracked_unique_errors() {
+        let collision = LixError::new(
+            LixError::CODE_UNIQUE,
+            "tracked/untracked identity collision on branch 'main' for schema 'lix_key_value' entity_pk [\"same\"]",
+        );
+        let mapped = map_merge_branch_collision_error(collision);
+        assert_eq!(mapped.code, LixError::CODE_MERGE_CONFLICT);
+        assert!(mapped.message.contains("untracked current row"));
+        assert_eq!(
+            mapped
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(JsonValue::as_str),
+            Some("trackedUntrackedIdentityCollision")
+        );
+
+        let ordinary = LixError::new(
+            LixError::CODE_UNIQUE,
+            "primary-key constraint violation on schema 'lix_key_value'",
+        );
+        let unchanged = map_merge_branch_collision_error(ordinary);
+        assert_eq!(unchanged.code, LixError::CODE_UNIQUE);
     }
 }

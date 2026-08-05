@@ -971,6 +971,15 @@ simulation_test!(
                 .and_then(JsonValue::as_str),
             Some("trackedUntrackedIdentityCollision")
         );
+        assert!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("cause"))
+                .and_then(JsonValue::as_str)
+                .is_some_and(|cause| { cause.starts_with("tracked/untracked identity collision") }),
+            "merge conflict must retain the exact final-lane authority cause: {error:?}"
+        );
         assert_eq!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
