@@ -5,13 +5,12 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonRef, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
-use crate::storage::{
-    GetManyRequest, GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanOptions, StorageError,
-    StorageSpace,
-};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageReadOptions,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageError,
+    StorageGetManyRequest as GetManyRequest, StorageGetManyResult as GetManyResult,
+    StorageKeyRange as KeyRange, StorageProjectedValue as ProjectedValue, StorageReadOptions,
+    StorageScanChunk as ScanChunk, StorageScanOptions as ScanOptions, StorageSpace,
     StorageWriteOptions, StorageWriteSet, StorageWriteSetStats,
 };
 use crate::tracked_state::{
