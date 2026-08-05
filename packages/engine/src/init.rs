@@ -43,7 +43,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V59 adds authenticated branch summaries and generation reclamation records
+/// V60 adds authenticated branch summaries and generation reclamation records
 /// beside the compact immutable commit-state authority. The generation queue
 /// is the only hot-state reclamation route.
 ///
