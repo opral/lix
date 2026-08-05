@@ -219,6 +219,7 @@ impl DecodedLeafNodeRef {
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedInternalNode {
     children: Vec<ChildSummary>,
+    radix_depth: usize,
 }
 
 impl DecodedInternalNode {
@@ -229,14 +230,18 @@ impl DecodedInternalNode {
     pub(crate) fn into_children(self) -> Vec<ChildSummary> {
         self.children
     }
+
+    pub(crate) fn radix_depth(&self) -> usize {
+        self.radix_depth
+    }
 }
 
-// V4 is a deliberate hard cut: the authenticated internal summaries carry
-// subtree height so a frontier can rebuild only affected ancestors without
-// walking untouched descendants. V3 roots are rejected rather than silently
-// interpreted as a different authority shape.
+// V5 is a deliberate hard cut: authenticated internal summaries carry
+// subtree height and the key-space radix depth, allowing a frontier to skip
+// unary prefix paths without walking untouched descendants. Older roots are
+// rejected rather than silently interpreted as a different authority shape.
 const NODE_KIND_LEAF_V4: u8 = 5;
-const NODE_KIND_INTERNAL_V4: u8 = 6;
+const NODE_KIND_INTERNAL_V5: u8 = 7;
 
 #[derive(Debug, Clone, Copy)]
 struct MutationSpan {
@@ -1778,15 +1783,21 @@ fn read_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64, L
     }
 }
 
-pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
+pub(crate) fn encode_internal_node_at_depth(
+    children: &[ChildSummary],
+    radix_depth: usize,
+) -> Vec<u8> {
     let children = children
         .iter()
         .map(ChildSummary::as_ref)
         .collect::<Vec<_>>();
-    encode_internal_node_refs(&children)
+    encode_internal_node_refs_at_depth(&children, radix_depth)
 }
 
-pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
+pub(crate) fn encode_internal_node_refs_at_depth(
+    children: &[ChildSummaryRef<'_>],
+    radix_depth: usize,
+) -> Vec<u8> {
     assert!(
         !children.is_empty(),
         "tracked-state internal nodes must contain at least one child"
@@ -1799,12 +1810,18 @@ pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec
     debug_assert!(
         children
             .windows(2)
-            .all(|pair| { pair[0].last_key < pair[1].first_key })
+            .all(|pair| { pair[0].last_key < pair[1].first_key }),
+        "overlapping internal children: {:?}",
+        children
+            .iter()
+            .map(|child| (&child.first_key[..], &child.last_key[..]))
+            .collect::<Vec<_>>()
     );
 
-    let mut out = Vec::with_capacity(2 + children.len() * 40);
-    out.push(NODE_KIND_INTERNAL_V4);
+    let mut out = Vec::with_capacity(3 + children.len() * 40);
+    out.push(NODE_KIND_INTERNAL_V5);
     write_varint(&mut out, children.len() as u64);
+    write_varint(&mut out, radix_depth as u64);
     let mut previous_last: &[u8] = &[];
     for child in children {
         write_front_coded(&mut out, previous_last, child.first_key);
@@ -1824,7 +1841,7 @@ fn write_front_coded(out: &mut Vec<u8>, base: &[u8], value: &[u8]) {
     out.extend_from_slice(&value[shared..]);
 }
 
-fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
+fn decode_internal_v5(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1898,6 +1915,16 @@ fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
             "tracked-state internal node has no children",
         ));
     }
+    let radix_depth = usize_from(
+        read_varint(body, &mut offset, "tracked-state internal node")?,
+        "radix depth",
+    )?;
+    if radix_depth > 4096 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state internal node radix depth exceeds the hard limit",
+        ));
+    }
     let mut boundary_arena = Vec::with_capacity(body.len());
     let mut child_spans = Vec::with_capacity(child_count.min(body.len()));
     let mut previous_last = None;
@@ -1961,6 +1988,7 @@ fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
     }
     let boundary_arena = Bytes::from(boundary_arena);
     Ok(DecodedInternalNode {
+        radix_depth,
         children: child_spans
             .into_iter()
             .map(|child| ChildSummary {
@@ -1987,7 +2015,7 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> 
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
     match kind {
         NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v4(body)?)),
-        NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
+        NODE_KIND_INTERNAL_V5 => Ok(DecodedNodeRef::Internal(decode_internal_v5(body)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
@@ -3084,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_v4_round_trips_and_pins_front_coded_boundaries() {
+    fn internal_v5_round_trips_and_pins_front_coded_boundaries() {
         let children = vec![
             ChildSummary {
                 first_key: Bytes::from_static(b"aa"),
@@ -3101,8 +3129,8 @@ mod tests {
                 subtree_height: 2,
             },
         ];
-        let encoded = encode_internal_node(&children);
-        assert_eq!(encoded.first(), Some(&NODE_KIND_INTERNAL_V4));
+        let encoded = encode_internal_node_at_depth(&children, 0);
+        assert_eq!(encoded.first(), Some(&NODE_KIND_INTERNAL_V5));
         assert!(encoded.ends_with(&[4, 2]), "height fields must be encoded");
 
         let DecodedNode::Internal(decoded) = decode_node(&encoded).expect("internal node") else {
@@ -3112,10 +3140,10 @@ mod tests {
     }
 
     #[test]
-    fn internal_v4_rejects_empty_truncated_and_invalid_boundaries() {
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 0]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 1]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 1, 1, 0]).is_err());
+    fn internal_v5_rejects_empty_truncated_and_invalid_boundaries() {
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V5, 0]).is_err());
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V5, 1]).is_err());
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V5, 1, 1, 0]).is_err());
 
         let child = ChildSummary {
             first_key: Bytes::from_static(b"a"),
@@ -3124,7 +3152,7 @@ mod tests {
             subtree_count: 1,
             subtree_height: 1,
         };
-        let encoded = encode_internal_node(&[child]);
+        let encoded = encode_internal_node_at_depth(&[child], 0);
         let mut zero_subtree = encoded.clone();
         *zero_subtree.last_mut().expect("subtree count") = 0;
         assert!(decode_node(&zero_subtree).is_err());

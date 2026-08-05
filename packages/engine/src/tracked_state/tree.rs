@@ -26,9 +26,9 @@ use crate::tracked_state::codec::{
     ChildSummary, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, PendingChunk,
     PendingChunkBatch, TrackedStateKeyBatchBuilder, decode_key, decode_key_shared,
     decode_key_with_trusted_prefix, decode_node, decode_node_ref, decode_value,
-    decode_visible_value, encode_internal_node, encode_key, encode_key_ref_into, encode_leaf_node,
-    encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref, encode_value_ref_into,
-    hash_bytes,
+    decode_visible_value, encode_internal_node_at_depth, encode_key, encode_key_ref_into,
+    encode_leaf_node, encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref,
+    encode_value_ref_into, hash_bytes,
 };
 use crate::tracked_state::diff::{TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder};
 use crate::tracked_state::storage;
@@ -1021,15 +1021,86 @@ impl TrackedStateTree {
                     })
                 }
                 DecodedNode::Internal(internal) => {
+                    let node_depth = internal.radix_depth();
+                    if node_depth > depth {
+                        let existing_first = internal
+                            .children()
+                            .first()
+                            .expect("validated radix internal has a first child")
+                            .first_key
+                            .clone();
+                        if let Some(divergence_depth) = mutations.iter().find_map(|mutation| {
+                            (depth..node_depth).find(|&candidate_depth| {
+                                radix_digit(mutation.encoded_key.as_ref(), candidate_depth)
+                                    != radix_digit(existing_first.as_ref(), candidate_depth)
+                            })
+                        }) {
+                            let existing_children = internal.into_children();
+                            let existing = internal_summary(hash, &existing_children)?;
+                            let mut replacement_children = vec![existing];
+                            for (_, group) in radix_mutation_groups(mutations, divergence_depth) {
+                                let entries = group
+                                    .into_iter()
+                                    .map(|mutation| EncodedLeafEntry {
+                                        key: mutation.encoded_key,
+                                        value: mutation.encoded_value,
+                                    })
+                                    .collect();
+                                let (summary, _) = self.build_radix_subtree(
+                                    entries,
+                                    divergence_depth + 1,
+                                    chunks,
+                                )?;
+                                replacement_children.push(summary);
+                            }
+                            replacement_children
+                                .sort_by(|left, right| left.first_key.cmp(&right.first_key));
+                            let first_key = replacement_children
+                                .first()
+                                .expect("radix divergence has children")
+                                .first_key
+                                .clone();
+                            let last_key = replacement_children
+                                .last()
+                                .expect("radix divergence has children")
+                                .last_key
+                                .clone();
+                            let subtree_count = replacement_children
+                                .iter()
+                                .map(|child| child.subtree_count)
+                                .sum();
+                            let subtree_height = replacement_children
+                                .iter()
+                                .map(|child| child.subtree_height)
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1);
+                            let node = encode_internal_node_at_depth(
+                                &replacement_children,
+                                divergence_depth,
+                            );
+                            let summary = chunks.insert_node(
+                                node,
+                                first_key,
+                                last_key,
+                                subtree_count,
+                                subtree_height,
+                            );
+                            return Ok(RadixFrontierNode {
+                                summary,
+                                changed: true,
+                            });
+                        }
+                    }
                     let children = internal.into_children();
-                    validate_radix_children(&children, depth)?;
-                    let mut groups = radix_mutation_groups(mutations, depth);
+                    validate_radix_children(&children, node_depth)?;
+                    let mut groups = radix_mutation_groups(mutations, node_depth);
                     let mut replacement_children =
                         Vec::with_capacity(children.len() + groups.len());
                     let mut group_index = 0usize;
                     let mut changed = false;
                     for child in children {
-                        let child_digit = radix_digit(child.first_key.as_ref(), depth);
+                        let child_digit = radix_digit(child.first_key.as_ref(), node_depth);
                         while group_index < groups.len() && groups[group_index].0 < child_digit {
                             let group = std::mem::take(&mut groups[group_index].1);
                             let entries = group
@@ -1040,7 +1111,7 @@ impl TrackedStateTree {
                                 })
                                 .collect();
                             let (summary, _) =
-                                self.build_radix_subtree(entries, depth + 1, chunks)?;
+                                self.build_radix_subtree(entries, node_depth + 1, chunks)?;
                             replacement_children.push(summary);
                             changed = true;
                             group_index += 1;
@@ -1057,7 +1128,7 @@ impl TrackedStateTree {
                                     child.child_hash,
                                     child_node,
                                     group,
-                                    depth + 1,
+                                    node_depth + 1,
                                     chunks,
                                 )
                                 .await?;
@@ -1083,7 +1154,8 @@ impl TrackedStateTree {
                                 value: mutation.encoded_value,
                             })
                             .collect();
-                        let (summary, _) = self.build_radix_subtree(entries, depth + 1, chunks)?;
+                        let (summary, _) =
+                            self.build_radix_subtree(entries, node_depth + 1, chunks)?;
                         replacement_children.push(summary);
                         changed = true;
                         group_index += 1;
@@ -1114,7 +1186,7 @@ impl TrackedStateTree {
                         .expect("non-empty radix replacement")
                         .last_key
                         .clone();
-                    let node = encode_internal_node(&replacement_children);
+                    let node = encode_internal_node_at_depth(&replacement_children, node_depth);
                     let summary = chunks.insert_node(
                         node,
                         first_key,
@@ -1170,8 +1242,11 @@ impl TrackedStateTree {
             ));
         }
         let key_bytes = entries.iter().map(|entry| entry.key.len()).sum::<usize>();
-        let value_bytes = entries.iter().map(|entry| entry.value.len()).sum::<usize>();
-        let leaf_size = estimate_leaf_chunk_size(entries.len(), key_bytes, value_bytes);
+        // Physical boundaries depend only on the canonical key stream. Value
+        // bytes are authenticated leaf payload but must not move an existing
+        // key-space boundary when an update changes payload size; otherwise an
+        // incremental rewrite could not produce the same root as a rebuild.
+        let leaf_size = estimate_radix_leaf_size(entries.len(), key_bytes);
         if leaf_size <= self.options.max_chunk_bytes || depth >= RADIX_MAX_DEPTH {
             let first_key = entries
                 .first()
@@ -1203,6 +1278,10 @@ impl TrackedStateTree {
             }
             groups.push((digit, vec![entry]));
         }
+        if groups.len() == 1 {
+            let (_, group) = groups.pop().expect("radix group exists");
+            return self.build_radix_subtree(group, depth + 1, chunks);
+        }
         let mut children = Vec::with_capacity(groups.len());
         for (_, group) in groups {
             let (summary, _) = self.build_radix_subtree(group, depth + 1, chunks)?;
@@ -1225,7 +1304,7 @@ impl TrackedStateTree {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let node = encode_internal_node(&children);
+        let node = encode_internal_node_at_depth(&children, depth);
         let summary = chunks.insert_node(node, first_key, last_key, subtree_count, subtree_height);
         Ok((summary, subtree_height as usize))
     }
@@ -1733,6 +1812,12 @@ fn validate_radix_children(children: &[ChildSummary], depth: usize) -> Result<()
             ));
         }
         let digit = radix_digit(child.first_key.as_ref(), depth);
+        if radix_digit(child.last_key.as_ref(), depth) != digit {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state radix child crosses a key-space bucket",
+            ));
+        }
         if previous_digit.is_some_and(|previous| previous >= digit) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -2100,8 +2185,8 @@ fn sort_unique_mutations(
     Ok(unique)
 }
 
-fn estimate_leaf_chunk_size(entry_count: usize, key_bytes: usize, value_bytes: usize) -> usize {
-    10 + entry_count * 12 + key_bytes + value_bytes
+fn estimate_radix_leaf_size(entry_count: usize, key_bytes: usize) -> usize {
+    10 + entry_count * 12 + key_bytes
 }
 
 fn node_diff_frontier(
@@ -3802,6 +3887,18 @@ mod tests {
         }
 
         assert_eq!(forward_root, reverse_root);
+    }
+
+    #[test]
+    fn radix_validation_rejects_a_child_crossing_buckets() {
+        let child = ChildSummary {
+            first_key: Bytes::from_static(b"a"),
+            last_key: Bytes::from_static(b"z"),
+            child_hash: [1; TRACKED_STATE_HASH_BYTES],
+            subtree_count: 2,
+            subtree_height: 1,
+        };
+        assert!(validate_radix_children(&[child], 0).is_err());
     }
 
     async fn apply_mutations_for_test(
