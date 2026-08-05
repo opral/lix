@@ -81,24 +81,23 @@ pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
         TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
     );
 
-// The durable direct-ChangeId address stride. Physical ordered parts may be
-// smaller, but their logical slots must remain stable at this width.
+// The canonical ordered mutation-part width and durable direct-ChangeId
+// address stride. Physical ordered parts and their packed coordinates must
+// use the same width so a part boundary never needs a second geometry.
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 // Scan pages are bounded by row count, not bytes. Keep authority hydration
 // bounded as well when a page contains large authenticated directories.
 const COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS: usize = 64;
-// Bound newly authored ordered parts tightly enough that point and small-batch
-// reads do not decompress an entire 512-row payload neighborhood. The 128-row
-// bound halves 1K segment puts versus 64-row parts while controlled RocksDB
-// CRUD keeps every point and bulk operation within the 5% latency envelope.
-const ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
-// Version 14 makes every ordinary commit member self-contained and complete
+// Version 15 makes every ordinary commit member self-contained and complete
 // replacements authoritative through their immutable part manifest. The
-// payload-less certified-reference encoding is intentionally rejected.
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
+// payload-less certified-reference encoding is intentionally rejected. The
+// version also binds ordered mutation parts to the canonical 512-row geometry;
+// LXCD14 is intentionally rejected rather than read through a compatibility
+// decoder.
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD15";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
@@ -4145,7 +4144,7 @@ where
     };
     let mut compressor = None;
     let mut source = deltas;
-    let mut pending = VecDeque::with_capacity(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut pending = VecDeque::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
     let mut manifest = CommitDeltaManifest {
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
@@ -4158,7 +4157,7 @@ where
         })?,
         selection_fingerprint: [0; 32],
         direct_segment_row_counts: Vec::with_capacity(
-            row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS),
+            row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
         ),
         single_partition: None,
         lifecycle_summary,
@@ -4166,11 +4165,11 @@ where
         replacement_parts: None,
         columnar_parts: None,
         inline_segment: Vec::new(),
-        segments: Vec::with_capacity(row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS)),
+        segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
     let mut segment_row_counts = Vec::with_capacity(manifest.segments.capacity());
     while !pending.is_empty() || source.len() > 0 {
-        while pending.len() < ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS {
+        while pending.len() < COMMIT_DELTA_SEGMENT_MAX_ROWS {
             let Some(delta) = source.next() else {
                 break;
             };
@@ -4216,7 +4215,7 @@ where
         if segment_index == 1 {
             writes.reserve_space(
                 TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-                row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS),
+                row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
                 0,
             );
             let (first_bounds, first_encoded) = first_segment
@@ -4508,10 +4507,10 @@ where
         .as_ref()
         .and_then(|prefix| prefix.3.last())
         .map_or_else(Vec::new, |part| part.last_key().to_vec());
-    let mut pending = Vec::with_capacity(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut pending = Vec::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut key_arena = Vec::new();
     let mut parts = prefix.map_or_else(Vec::new, |prefix| prefix.3);
-    parts.reserve(row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS));
+    parts.reserve(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
     let mut compressor = None;
     for delta in deltas {
         let delta = delta?.into_replacement_part_input(&mut key_arena)?;
@@ -4571,7 +4570,7 @@ where
             snapshot: delta.snapshot,
             metadata: delta.metadata,
         });
-        if pending.len() == ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS {
+        if pending.len() == COMMIT_DELTA_SEGMENT_MAX_ROWS {
             encode_replacement_part_prefix(
                 &mut pending,
                 &mut key_arena,
@@ -4594,7 +4593,7 @@ where
         parts: &mut Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
         compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
     ) -> Result<(), LixError> {
-        let mut candidate_len = pending.len().min(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
+        let mut candidate_len = pending.len().min(COMMIT_DELTA_SEGMENT_MAX_ROWS);
         let encoded = loop {
             let refs = pending[..candidate_len]
                 .iter()
@@ -13538,6 +13537,31 @@ mod tests {
             assert_eq!(generic_loaded.created_at, loaded.created_at);
             assert_eq!(generic_loaded.origin_key, loaded.origin_key);
         }
+    }
+
+    #[test]
+    fn ordered_change_id_geometry_matches_canonical_512_row_parts() {
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_5678_0000_0000,
+        ));
+        assert_eq!(super::COMMIT_DELTA_SEGMENT_MAX_ROWS, 512);
+
+        let first = super::addressable_change_id(commit_id, 0, 0)
+            .expect("first ordered coordinate should encode");
+        let last = super::addressable_change_id(commit_id, 0, 511)
+            .expect("last coordinate in the first ordered part should encode");
+        let next = super::addressable_change_id(commit_id, 1, 0)
+            .expect("first coordinate in the second ordered part should encode");
+
+        assert_eq!(
+            super::direct_change_locator(first).unwrap().segment_index,
+            0
+        );
+        assert_eq!(super::direct_change_locator(first).unwrap().ordinal, 0);
+        assert_eq!(super::direct_change_locator(last).unwrap().segment_index, 0);
+        assert_eq!(super::direct_change_locator(last).unwrap().ordinal, 511);
+        assert_eq!(super::direct_change_locator(next).unwrap().segment_index, 1);
+        assert_eq!(super::direct_change_locator(next).unwrap().ordinal, 0);
     }
 
     #[tokio::test]
