@@ -2,9 +2,10 @@
 //!
 //! Untracked rows do not participate in commit history, merge, diff, working
 //! diff, or generation rotation. Their canonical storage key is `(branch,
-//! schema, entity)` and its value is an authenticated root for the complete
-//! set of file variants. Variant payloads live in immutable content-addressed
-//! chunks; deleting the final member removes the root physically.
+//! schema, entity)` and its value is authenticated metadata for a
+//! content-addressed descriptor hierarchy over all file variants. Variant
+//! payloads and descriptor nodes live in immutable chunks; deleting the final
+//! member removes the root physically.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -41,18 +42,23 @@ pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0033),
     "live_state.untracked_bundle.v2",
 );
-/// Immutable payload chunks referenced by an authoritative bundle root. A
-/// chunk is content addressed and has no entity/file lookup semantics; the
-/// root is the sole owner of logical untracked facts.
+/// Immutable descriptor and payload chunks referenced by an authoritative
+/// bundle root. A chunk is content addressed and has no entity/file lookup
+/// semantics; the root is the sole owner of logical untracked facts.
 pub(crate) const UNTRACKED_BUNDLE_CHUNK_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_0034),
     "live_state.untracked_bundle_chunk.v1",
 );
 const VALUE_VERSION: u8 = 2;
-// The physical key names one canonical entity, while this value contains the
-// complete, strictly ordered chunk descriptor set for that entity. A bundle
-// root is the sole untracked authority; chunks never supply logical identity.
-const BUNDLE_ROOT_MAGIC: &[u8] = b"LXUB3";
+// The physical key names one canonical entity, while this value contains only
+// authenticated root metadata for that entity's descriptor hierarchy. The
+// root is the sole untracked authority; nodes/chunks never supply logical
+// identity.
+const BUNDLE_ROOT_MAGIC: &[u8] = b"LXUB4";
+const BUNDLE_NODE_LEAF_MAGIC: &[u8] = b"LXBNL4";
+const BUNDLE_NODE_BRANCH_MAGIC: &[u8] = b"LXBNB4";
+const BUNDLE_NODE_FANOUT: usize = 32;
+const BUNDLE_LEAF_CAPACITY: usize = 32;
 const SLOT_NONE: u8 = 0;
 const SLOT_REF: u8 = 1;
 const SLOT_INLINE: u8 = 2;
@@ -65,6 +71,12 @@ pub(crate) struct UntrackedMutationReadProfile {
     pub(crate) previous_point_read_keys: u64,
     pub(crate) previous_scan_rows: u64,
     pub(crate) previous_scan_bytes: u64,
+    pub(crate) descriptor_node_reads: u64,
+    pub(crate) descriptor_node_writes: u64,
+    pub(crate) descriptor_node_reused: u64,
+    pub(crate) descriptor_splits: u64,
+    pub(crate) descriptor_max_depth: u16,
+    pub(crate) descriptor_node_bytes: u64,
 }
 
 #[cfg(test)]
@@ -72,6 +84,12 @@ thread_local! {
     static PREVIOUS_POINT_READ_KEYS: Cell<u64> = const { Cell::new(0) };
     static PREVIOUS_SCAN_ROWS: Cell<u64> = const { Cell::new(0) };
     static PREVIOUS_SCAN_BYTES: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_NODE_READS: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_NODE_WRITES: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_NODE_REUSED: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_SPLITS: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_MAX_DEPTH: Cell<u16> = const { Cell::new(0) };
+    static DESCRIPTOR_NODE_BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(all(feature = "storage-benches", not(test)))]
@@ -80,6 +98,18 @@ static PREVIOUS_POINT_READ_KEYS: AtomicU64 = AtomicU64::new(0);
 static PREVIOUS_SCAN_ROWS: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "storage-benches", not(test)))]
 static PREVIOUS_SCAN_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static DESCRIPTOR_NODE_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static DESCRIPTOR_NODE_WRITES: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static DESCRIPTOR_NODE_REUSED: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static DESCRIPTOR_SPLITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static DESCRIPTOR_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static DESCRIPTOR_NODE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -88,6 +118,12 @@ pub(crate) fn take_untracked_mutation_read_profile() -> UntrackedMutationReadPro
         previous_point_read_keys: PREVIOUS_POINT_READ_KEYS.with(|value| value.replace(0)),
         previous_scan_rows: PREVIOUS_SCAN_ROWS.with(|value| value.replace(0)),
         previous_scan_bytes: PREVIOUS_SCAN_BYTES.with(|value| value.replace(0)),
+        descriptor_node_reads: DESCRIPTOR_NODE_READS.with(|value| value.replace(0)),
+        descriptor_node_writes: DESCRIPTOR_NODE_WRITES.with(|value| value.replace(0)),
+        descriptor_node_reused: DESCRIPTOR_NODE_REUSED.with(|value| value.replace(0)),
+        descriptor_splits: DESCRIPTOR_SPLITS.with(|value| value.replace(0)),
+        descriptor_max_depth: DESCRIPTOR_MAX_DEPTH.with(|value| value.replace(0)),
+        descriptor_node_bytes: DESCRIPTOR_NODE_BYTES.with(|value| value.replace(0)),
     }
 }
 
@@ -98,6 +134,12 @@ pub(crate) fn take_untracked_mutation_read_profile() -> UntrackedMutationReadPro
         previous_point_read_keys: PREVIOUS_POINT_READ_KEYS.swap(0, Ordering::Relaxed),
         previous_scan_rows: PREVIOUS_SCAN_ROWS.swap(0, Ordering::Relaxed),
         previous_scan_bytes: PREVIOUS_SCAN_BYTES.swap(0, Ordering::Relaxed),
+        descriptor_node_reads: DESCRIPTOR_NODE_READS.swap(0, Ordering::Relaxed),
+        descriptor_node_writes: DESCRIPTOR_NODE_WRITES.swap(0, Ordering::Relaxed),
+        descriptor_node_reused: DESCRIPTOR_NODE_REUSED.swap(0, Ordering::Relaxed),
+        descriptor_splits: DESCRIPTOR_SPLITS.swap(0, Ordering::Relaxed),
+        descriptor_max_depth: DESCRIPTOR_MAX_DEPTH.swap(0, Ordering::Relaxed) as u16,
+        descriptor_node_bytes: DESCRIPTOR_NODE_BYTES.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -133,6 +175,81 @@ fn record_previous_scan_row(bytes: usize) {
 fn record_previous_scan_row(bytes: usize) {
     PREVIOUS_SCAN_ROWS.fetch_add(1, Ordering::Relaxed);
     PREVIOUS_SCAN_BYTES.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn record_descriptor_node_read() {
+    DESCRIPTOR_NODE_READS.with(|value| value.set(value.get().saturating_add(1)));
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_descriptor_node_read() {
+    DESCRIPTOR_NODE_READS.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_descriptor_node_read() {}
+
+#[cfg(test)]
+fn record_descriptor_node_write(bytes: usize) {
+    DESCRIPTOR_NODE_WRITES.with(|value| value.set(value.get().saturating_add(1)));
+    DESCRIPTOR_NODE_BYTES.with(|value| {
+        value.set(
+            value
+                .get()
+                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        )
+    });
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_descriptor_node_write(bytes: usize) {
+    DESCRIPTOR_NODE_WRITES.fetch_add(1, Ordering::Relaxed);
+    DESCRIPTOR_NODE_BYTES.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_descriptor_node_write(_bytes: usize) {}
+
+#[cfg(test)]
+fn record_descriptor_reuse() {
+    DESCRIPTOR_NODE_REUSED.with(|value| value.set(value.get().saturating_add(1)));
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_descriptor_reuse() {
+    DESCRIPTOR_NODE_REUSED.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_descriptor_reuse() {}
+
+#[cfg(test)]
+fn record_descriptor_split() {
+    DESCRIPTOR_SPLITS.with(|value| value.set(value.get().saturating_add(1)));
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_descriptor_split() {
+    DESCRIPTOR_SPLITS.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_descriptor_split() {}
+
+#[cfg(test)]
+fn record_descriptor_depth(depth: u16) {
+    DESCRIPTOR_MAX_DEPTH.with(|value| value.set(value.get().max(depth)));
+}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_descriptor_depth(_depth: u16) {}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_descriptor_depth(depth: u16) {
+    let mut previous = DESCRIPTOR_MAX_DEPTH.load(Ordering::Relaxed);
+    while previous < u64::from(depth)
+        && DESCRIPTOR_MAX_DEPTH
+            .compare_exchange(
+                previous,
+                u64::from(depth),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        previous = DESCRIPTOR_MAX_DEPTH.load(Ordering::Relaxed);
+    }
 }
 
 pub(crate) async fn stage_untracked_deltas(
@@ -230,34 +347,22 @@ async fn read_untracked_bundles(
     resolve_untracked_bundle_roots(store, roots).await
 }
 
+#[cfg(test)]
 async fn read_untracked_bundle_roots(
     store: &(impl StorageAdapterRead + ?Sized),
     keys: &[StorageKey],
-) -> Result<BTreeMap<StorageKey, BundleRoot>, LixError> {
-    if keys.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    #[cfg(any(test, feature = "storage-benches"))]
-    record_previous_point_read_keys(keys.len());
-    let values = PointReadPlan::from_unique_keys(UNTRACKED_ROW_SPACE, keys.to_vec())
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value;
+) -> Result<BTreeMap<StorageKey, DescriptorMap>, LixError> {
+    let metas = read_untracked_bundle_root_metas(store, keys).await?;
     let mut roots = BTreeMap::new();
-    for (key, value) in keys.iter().cloned().zip(values) {
-        let Some(value) = value else { continue };
-        let StorageProjectedValue::FullValue(value) = value else {
-            return Err(codec_error("untracked bundle point read omitted its value"));
-        };
-        decode_bundle_key(&key.0)?;
-        roots.insert(key.clone(), decode_bundle_root(&key.0, value)?);
+    for (key, meta) in metas {
+        roots.insert(key, load_descriptor_tree(store, &meta).await?);
     }
     Ok(roots)
 }
 
 async fn resolve_untracked_bundle_roots(
     store: &(impl StorageAdapterRead + ?Sized),
-    roots: BTreeMap<StorageKey, BundleRoot>,
+    roots: BTreeMap<StorageKey, DescriptorMap>,
 ) -> Result<BTreeMap<StorageKey, DecodedBundle>, LixError> {
     if roots.is_empty() {
         return Ok(BTreeMap::new());
@@ -331,7 +436,7 @@ async fn resolve_untracked_bundle_roots(
 /// identities rather than the number of variants already present.
 async fn resolve_selected_bundle_members(
     store: &(impl StorageAdapterRead + ?Sized),
-    roots: &BTreeMap<StorageKey, BundleRoot>,
+    roots: &BTreeMap<StorageKey, DescriptorMap>,
     requested: &BTreeMap<StorageKey, BTreeSet<Option<String>>>,
 ) -> Result<BTreeMap<(StorageKey, Option<String>), BundleMember>, LixError> {
     let mut descriptors = BTreeMap::<[u8; 32], ChunkDescriptor>::new();
@@ -406,7 +511,7 @@ async fn resolve_selected_bundle_members(
 async fn scan_all_untracked_bundles(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
-) -> Result<BTreeMap<StorageKey, BundleRoot>, LixError> {
+) -> Result<BTreeMap<StorageKey, DescriptorMap>, LixError> {
     let prefix = branch_prefix(branch_id)?;
     let plan = ScanPlan::prefix(
         UNTRACKED_ROW_SPACE,
@@ -442,7 +547,8 @@ async fn scan_all_untracked_bundles(
             }
             #[cfg(any(test, feature = "storage-benches"))]
             record_previous_scan_row(entry.key.0.len().saturating_add(value.len()));
-            roots.insert(entry.key.clone(), decode_bundle_root(&entry.key.0, value)?);
+            let root = decode_bundle_root(&entry.key.0, value)?;
+            roots.insert(entry.key.clone(), load_descriptor_tree(store, &root).await?);
         }
         if !page.value.has_more {
             break;
@@ -460,7 +566,7 @@ async fn scan_untracked_bundles_for_file_cascade(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     deleted_file_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<StorageKey, BundleRoot>, LixError> {
+) -> Result<BTreeMap<StorageKey, DescriptorMap>, LixError> {
     let prefix = branch_prefix(branch_id)?;
     let plan = ScanPlan::prefix(
         UNTRACKED_ROW_SPACE,
@@ -501,12 +607,16 @@ async fn scan_untracked_bundles_for_file_cascade(
             #[cfg(any(test, feature = "storage-benches"))]
             record_previous_scan_row(entry.key.0.len().saturating_add(value.len()));
             let root = decode_bundle_root(&entry.key.0, value)?;
-            if root.keys().any(|file_id| {
-                file_id
-                    .as_deref()
-                    .is_some_and(|file_id| deleted_file_ids.contains(file_id))
-            }) {
-                affected_roots.insert(entry.key, root);
+            let mut contains = false;
+            for file_id in deleted_file_ids {
+                let target = Some(file_id.clone());
+                if lookup_descriptor(store, &root, &target).await?.is_some() {
+                    contains = true;
+                    break;
+                }
+            }
+            if contains {
+                affected_roots.insert(entry.key, load_descriptor_tree(store, &root).await?);
             }
         }
         if !page.value.has_more {
@@ -535,26 +645,42 @@ async fn load_untracked_bundle_points(
         }
     }
     let keys = keys.into_iter().collect::<Vec<_>>();
-    let roots = read_untracked_bundle_roots(store, &keys).await?;
+    let roots = read_untracked_bundle_root_metas(store, &keys).await?;
     let mut requested_members = BTreeMap::new();
+    let mut dense_roots = BTreeMap::new();
     for (key, root) in &roots {
-        let files = if request.filter.file_ids.is_empty() {
-            root.keys().cloned().collect::<BTreeSet<_>>()
+        let mut files = BTreeSet::new();
+        let needs_dense = request.filter.file_ids.is_empty()
+            || request
+                .filter
+                .file_ids
+                .iter()
+                .any(|filter| matches!(filter, NullableKeyFilter::Any));
+        if needs_dense {
+            let materialized = load_descriptor_tree(store, root).await?;
+            files.extend(materialized.keys().cloned());
+            dense_roots.insert(key.clone(), materialized);
         } else {
-            root.keys()
-                .filter(|file_id| {
-                    request.filter.file_ids.iter().any(|filter| match filter {
-                        NullableKeyFilter::Any => true,
-                        NullableKeyFilter::Null => file_id.is_none(),
-                        NullableKeyFilter::Value(value) => file_id.as_ref() == Some(value),
-                    })
-                })
-                .cloned()
-                .collect::<BTreeSet<_>>()
-        };
+            for filter in &request.filter.file_ids {
+                let target = match filter {
+                    NullableKeyFilter::Null => None,
+                    NullableKeyFilter::Value(value) => Some(value.clone()),
+                    NullableKeyFilter::Any => unreachable!("handled above"),
+                };
+                if lookup_descriptor(store, root, &target).await?.is_some() {
+                    files.insert(target);
+                }
+            }
+        }
         requested_members.insert(key.clone(), files);
     }
-    let members = resolve_selected_bundle_members(store, &roots, &requested_members).await?;
+    let members = if dense_roots.len() == roots.len() {
+        resolve_selected_bundle_members(store, &dense_roots, &requested_members).await?
+    } else {
+        let descriptors =
+            load_selected_bundle_descriptors(store, &roots, &requested_members).await?;
+        resolve_selected_bundle_members_from_descriptors(store, &descriptors).await?
+    };
     let mut decoded = Vec::new();
     for (key, files) in requested_members {
         let identity = decode_bundle_key(&key.0)?;
@@ -580,6 +706,82 @@ async fn load_untracked_bundle_points(
         }
     }
     materialize_rows(store, decoded).await
+}
+
+async fn load_selected_bundle_descriptors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    roots: &BTreeMap<StorageKey, BundleRootMeta>,
+    requested: &BTreeMap<StorageKey, BTreeSet<Option<String>>>,
+) -> Result<BTreeMap<(StorageKey, Option<String>), ChunkDescriptor>, LixError> {
+    let mut descriptors = BTreeMap::new();
+    for (key, files) in requested {
+        let Some(root) = roots.get(key) else { continue };
+        for file_id in files {
+            if let Some(descriptor) = lookup_descriptor(store, root, file_id).await? {
+                descriptors.insert((key.clone(), file_id.clone()), descriptor);
+            }
+        }
+    }
+    Ok(descriptors)
+}
+
+async fn resolve_selected_bundle_members_from_descriptors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    descriptors: &BTreeMap<(StorageKey, Option<String>), ChunkDescriptor>,
+) -> Result<BTreeMap<(StorageKey, Option<String>), BundleMember>, LixError> {
+    let mut by_hash = BTreeMap::<[u8; 32], ChunkDescriptor>::new();
+    for descriptor in descriptors.values() {
+        by_hash
+            .entry(descriptor.hash)
+            .or_insert_with(|| descriptor.clone());
+    }
+    let keys = by_hash
+        .keys()
+        .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_previous_point_read_keys(keys.len());
+    let values = PointReadPlan::from_unique_keys(UNTRACKED_BUNDLE_CHUNK_SPACE, keys.clone())
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
+    let mut chunks = BTreeMap::new();
+    for (key, value) in keys.into_iter().zip(values) {
+        let Some(value) = value else {
+            return Err(codec_error("untracked bundle selected chunk is missing"));
+        };
+        let StorageProjectedValue::FullValue(value) = value else {
+            return Err(codec_error(
+                "untracked bundle selected chunk omitted its value",
+            ));
+        };
+        let hash: [u8; 32] = key.0.as_ref().try_into().expect("chunk hash is 32 bytes");
+        let descriptor = by_hash
+            .get(&hash)
+            .ok_or_else(|| codec_error("untracked selected chunk descriptor disappeared"))?;
+        if value.len() != descriptor.len as usize || *blake3::hash(&value).as_bytes() != hash {
+            return Err(codec_error("untracked selected chunk validation failed"));
+        }
+        chunks.insert(hash, value);
+    }
+    let mut members = BTreeMap::new();
+    for (identity, descriptor) in descriptors {
+        let encoded = chunks
+            .get(&descriptor.hash)
+            .ok_or_else(|| codec_error("untracked selected chunk was not loaded"))?
+            .clone();
+        if encoded.len() != descriptor.len as usize {
+            return Err(codec_error(
+                "untracked selected descriptor length validation failed",
+            ));
+        }
+        let value = decode_value(encoded.clone())?;
+        members.insert(identity.clone(), BundleMember { encoded, value });
+    }
+    Ok(members)
 }
 
 async fn stage_untracked_bundles(
@@ -618,12 +820,7 @@ async fn stage_untracked_bundles(
         keys.insert(key);
     }
     let key_vec = keys.iter().cloned().collect::<Vec<_>>();
-    let root_states = read_untracked_bundle_roots(store, &key_vec).await?;
-    let mut existing_chunk_hashes = root_states
-        .values()
-        .flat_map(|root| root.values().map(|descriptor| descriptor.hash))
-        .collect::<BTreeSet<_>>();
-    let mut roots = root_states;
+    let mut root_metas = read_untracked_bundle_root_metas(store, &key_vec).await?;
     let mut changed_keys = keys.clone();
 
     let mut requested_members = BTreeMap::<StorageKey, BTreeSet<Option<String>>>::new();
@@ -639,6 +836,8 @@ async fn stage_untracked_bundles(
             .insert(delta.file_id.map(str::to_owned));
     }
 
+    let mut cascade_roots = BTreeMap::new();
+
     // Validate the caller's absence proof against the exact bundle member.
     for (delta, absent) in deltas.iter().zip(known_absent).filter(|(d, _)| d.untracked) {
         let key = StorageKey(Bytes::from(encode_bundle_key(
@@ -646,10 +845,12 @@ async fn stage_untracked_bundles(
             delta.schema_key,
             delta.entity_pk,
         )?));
-        let present = roots
-            .get(&key)
-            .and_then(|root| root.get(&delta.file_id.map(str::to_owned)))
-            .is_some();
+        let file_id = delta.file_id.map(str::to_owned);
+        let present = if let Some(root) = root_metas.get(&key) {
+            lookup_descriptor(store, root, &file_id).await?.is_some()
+        } else {
+            false
+        };
         if *absent && present {
             return Err(codec_error(format!(
                 "untracked bundle presence violates caller absence proof for schema '{}' entity {:?} file {:?}",
@@ -677,13 +878,25 @@ async fn stage_untracked_bundles(
                 .entry(key.clone())
                 .or_default()
                 .extend(files);
-            roots.entry(key).or_insert(root);
+            cascade_roots.insert(key, root);
         }
     }
 
-    let mut members = resolve_selected_bundle_members(store, &roots, &requested_members).await?;
+    let cascade_keys = cascade_roots.keys().cloned().collect::<BTreeSet<_>>();
+    let additional_keys = cascade_keys.difference(&keys).cloned().collect::<Vec<_>>();
+    if !additional_keys.is_empty() {
+        root_metas.extend(read_untracked_bundle_root_metas(store, &additional_keys).await?);
+    }
+    changed_keys.extend(cascade_keys.clone());
+    let previous_descriptors =
+        load_selected_bundle_descriptors(store, &root_metas, &requested_members).await?;
+    let mut members =
+        resolve_selected_bundle_members_from_descriptors(store, &previous_descriptors).await?;
 
     let mut retired_refs = BTreeSet::new();
+    let mut mutations =
+        BTreeMap::<StorageKey, BTreeMap<Option<String>, Option<ChunkDescriptor>>>::new();
+    let mut new_payloads = BTreeMap::<[u8; 32], Bytes>::new();
     for delta in deltas.iter().filter(|delta| delta.untracked) {
         let key = StorageKey(Bytes::from(encode_bundle_key(
             branch_id,
@@ -696,7 +909,7 @@ async fn stage_untracked_bundles(
             collect_value_refs(&previous.value, &mut retired_refs);
         }
         if delta.deleted {
-            roots.entry(key).or_default().remove(&file_id);
+            mutations.entry(key).or_default().insert(file_id, None);
         } else {
             let created_at = previous
                 .as_ref()
@@ -705,26 +918,28 @@ async fn stage_untracked_bundles(
             let encoded = Bytes::from(encode_value(*delta, created_at)?);
             let value = decode_value(encoded.clone())?;
             let descriptor = chunk_descriptor(&encoded)?;
-            roots
+            new_payloads.insert(descriptor.hash, encoded.clone());
+            mutations
                 .entry(key.clone())
                 .or_default()
-                .insert(file_id.clone(), descriptor);
+                .insert(file_id.clone(), Some(descriptor));
             members.insert((key, file_id), BundleMember { encoded, value });
         }
     }
-    let mut cascaded_keys = BTreeSet::new();
-    for (key, root) in roots.iter_mut() {
+    for (key, root) in &cascade_roots {
         for file_id in deleted_file_ids.iter() {
             let member_key = (key.clone(), Some(file_id.clone()));
-            if root.remove(&Some(file_id.clone())).is_some() {
+            if root.contains_key(&Some(file_id.clone())) {
                 if let Some(member) = members.remove(&member_key) {
                     collect_value_refs(&member.value, &mut retired_refs);
                 }
-                cascaded_keys.insert(key.clone());
+                mutations
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(Some(file_id.clone()), None);
             }
         }
     }
-    changed_keys.extend(cascaded_keys);
 
     if drop_branch {
         let existing = scan_all_untracked_bundles(store, branch_id).await?;
@@ -736,29 +951,26 @@ async fn stage_untracked_bundles(
             writes.delete(UNTRACKED_ROW_SPACE, key.clone());
         }
     } else {
-        let mut new_chunks = BTreeMap::<[u8; 32], Bytes>::new();
+        let mut new_nodes = BTreeMap::<[u8; 32], Bytes>::new();
         for key in changed_keys {
-            let Some(root) = roots.remove(&key) else {
+            let Some(ops) = mutations.remove(&key) else {
                 continue;
             };
-            if root.is_empty() {
-                writes.delete(UNTRACKED_ROW_SPACE, key);
-            } else {
-                if let Some(files) = requested_members.get(&key) {
-                    for file_id in files {
-                        if let Some(member) = members.get(&(key.clone(), file_id.clone())) {
-                            let descriptor = chunk_descriptor(&member.encoded)?;
-                            if existing_chunk_hashes.insert(descriptor.hash) {
-                                new_chunks.insert(descriptor.hash, member.encoded.clone());
-                            }
-                        }
-                    }
-                }
+            let mut editor = DescriptorEditor::new(store, root_metas.get(&key).cloned());
+            for (file_id, descriptor) in ops {
+                editor.update(file_id, descriptor).await?;
+            }
+            for (hash, bytes) in editor.staged {
+                new_nodes.insert(hash, bytes);
+            }
+            if let Some(root) = editor.root {
                 let root_bytes = encode_bundle_root(&key.0, &root)?;
                 writes.put(UNTRACKED_ROW_SPACE, key, StorageValue { bytes: root_bytes });
+            } else {
+                writes.delete(UNTRACKED_ROW_SPACE, key);
             }
         }
-        for (hash, bytes) in new_chunks {
+        for (hash, bytes) in new_payloads.into_iter().chain(new_nodes) {
             writes.put(
                 UNTRACKED_BUNDLE_CHUNK_SPACE,
                 StorageKey(Bytes::copy_from_slice(&hash)),
@@ -915,7 +1127,7 @@ async fn load_untracked_exact_bundle_batch(
         requested_keys.push(Some((branch_key, global_key)));
     }
     let keys = keys.into_iter().collect::<Vec<_>>();
-    let roots = read_untracked_bundle_roots(store, &keys).await?;
+    let roots = read_untracked_bundle_root_metas(store, &keys).await?;
     let mut requested_members = BTreeMap::<StorageKey, BTreeSet<Option<String>>>::new();
     for (row, requested) in request.rows.iter().zip(&requested_keys) {
         if let Some((branch_key, global_key)) = requested {
@@ -931,7 +1143,8 @@ async fn load_untracked_exact_bundle_batch(
             }
         }
     }
-    let members = resolve_selected_bundle_members(store, &roots, &requested_members).await?;
+    let descriptors = load_selected_bundle_descriptors(store, &roots, &requested_members).await?;
+    let members = resolve_selected_bundle_members_from_descriptors(store, &descriptors).await?;
     let mut decoded = Vec::new();
     let mut selections = Vec::with_capacity(request.rows.len());
     for (row, requested) in request.rows.iter().zip(requested_keys) {
@@ -1034,7 +1247,11 @@ async fn untracked_bundle_json_refs(
             };
             page_roots.insert(entry.key.clone(), decode_bundle_root(&entry.key.0, value)?);
         }
-        for bundle in resolve_untracked_bundle_roots(store, page_roots)
+        let mut descriptor_roots = BTreeMap::new();
+        for (key, root) in page_roots {
+            descriptor_roots.insert(key, load_descriptor_tree(store, &root).await?);
+        }
+        for bundle in resolve_untracked_bundle_roots(store, descriptor_roots)
             .await?
             .values()
         {
@@ -1067,6 +1284,7 @@ pub(crate) async fn stage_untracked_chunk_gc(
     );
     let mut root_cursor = None;
     let mut reachable = BTreeSet::<[u8; 32]>::new();
+    let mut descriptor_cache = BTreeMap::new();
     loop {
         let page = root_plan
             .collect(
@@ -1103,7 +1321,18 @@ pub(crate) async fn stage_untracked_chunk_gc(
                 return Err(codec_error("untracked chunk GC root omitted its value"));
             };
             let root = decode_bundle_root(&entry.key.0, value)?;
-            reachable.extend(root.values().map(|descriptor| descriptor.hash));
+            // Validation is per root: a content-addressed node may be shared
+            // by multiple roots, and skipping it globally would hide a bad
+            // count/depth relationship in a later root.
+            let mut descriptor_visited = BTreeSet::new();
+            collect_descriptor_tree_hashes(
+                store,
+                &root,
+                &mut reachable,
+                &mut descriptor_cache,
+                &mut descriptor_visited,
+            )
+            .await?;
         }
         if !page.value.has_more {
             break;
@@ -1230,9 +1459,12 @@ async fn scan_bundle_prefix(
                 (identity, decode_bundle_root(&entry.key.0, value)?),
             );
         }
-        let roots = page_roots
-            .iter()
-            .map(|(key, (_, root))| (key.clone(), root.clone()))
+        let roots = page_roots.iter().map(|(key, (_, root))| async move {
+            Ok::<_, LixError>((key.clone(), load_descriptor_tree(store, root).await?))
+        });
+        let roots = futures_util::future::try_join_all(roots)
+            .await?
+            .into_iter()
             .collect::<BTreeMap<_, _>>();
         let bundles = resolve_untracked_bundle_roots(store, roots).await?;
         for (key, (identity, _)) in page_roots {
@@ -1370,6 +1602,7 @@ struct DecodedValue {
 
 #[derive(Clone)]
 struct BundleMember {
+    #[allow(dead_code)]
     encoded: Bytes,
     value: DecodedValue,
 }
@@ -1380,7 +1613,28 @@ struct ChunkDescriptor {
     len: u32,
 }
 
-type BundleRoot = BTreeMap<Option<String>, ChunkDescriptor>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BundleRootMeta {
+    node_hash: [u8; 32],
+    count: u32,
+    depth: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DescriptorChild {
+    first: Option<String>,
+    hash: [u8; 32],
+    count: u32,
+    depth: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DescriptorNode {
+    Leaf(Vec<(Option<String>, ChunkDescriptor)>),
+    Branch(Vec<DescriptorChild>),
+}
+
+type DescriptorMap = BTreeMap<Option<String>, ChunkDescriptor>;
 
 type DecodedBundle = BTreeMap<Option<String>, BundleMember>;
 
@@ -1459,47 +1713,59 @@ fn decode_bundle_key(bytes: &Bytes) -> Result<DecodedIdentity, LixError> {
     })
 }
 
-fn encode_bundle_root(binding: &[u8], root: &BundleRoot) -> Result<Bytes, LixError> {
-    let count = u32::try_from(root.len())
-        .map_err(|_| codec_error("untracked bundle has too many file variants"))?;
-    let mut out = Vec::new();
-    out.extend_from_slice(BUNDLE_ROOT_MAGIC);
-    out.extend_from_slice(&count.to_be_bytes());
-    let mut previous: Option<&str> = None;
-    for (file_id, descriptor) in root {
-        match file_id {
-            None => {
-                if previous.is_some() {
-                    return Err(codec_error("untracked bundle variants are not sorted"));
-                }
-                out.push(0);
-            }
-            Some(file_id) => {
-                if previous.is_none() {
-                    previous = Some(file_id);
-                } else if previous.is_some_and(|previous| previous >= file_id.as_str()) {
-                    return Err(codec_error(
-                        "untracked bundle variants are not strictly sorted",
-                    ));
-                } else {
-                    previous = Some(file_id);
-                }
-                out.push(1);
-                push_text(&mut out, file_id)?;
-            }
+fn encode_file_id(out: &mut Vec<u8>, file_id: &Option<String>) -> Result<(), LixError> {
+    match file_id {
+        None => out.push(0),
+        Some(file_id) => {
+            out.push(1);
+            push_text(out, file_id)?;
         }
-        out.extend_from_slice(&descriptor.hash);
-        out.extend_from_slice(&descriptor.len.to_be_bytes());
     }
-    let mut digest_input = Vec::with_capacity(binding.len() + out.len());
+    Ok(())
+}
+
+fn decode_file_id(
+    bytes: &Bytes,
+    offset: &mut usize,
+    context: &str,
+) -> Result<Option<String>, LixError> {
+    match take(bytes, offset, 1, context)?[0] {
+        0 => Ok(None),
+        1 => Ok(Some(read_text(bytes, offset, context)?)),
+        _ => Err(codec_error(format!("{context} has an invalid file tag"))),
+    }
+}
+
+fn ensure_strict_file_order(
+    previous: Option<&Option<String>>,
+    current: &Option<String>,
+    context: &str,
+) -> Result<(), LixError> {
+    if previous.is_some_and(|previous| previous >= current) {
+        return Err(codec_error(format!("{context} are not strictly sorted")));
+    }
+    Ok(())
+}
+
+fn encode_bundle_root_meta(binding: &[u8], root: &BundleRootMeta) -> Result<Bytes, LixError> {
+    if root.count == 0 || root.node_hash == [0; 32] {
+        return Err(codec_error("untracked bundle root has no descriptor node"));
+    }
+    let mut body = Vec::with_capacity(4 + 2 + 32);
+    body.extend_from_slice(&root.count.to_be_bytes());
+    body.extend_from_slice(&root.depth.to_be_bytes());
+    body.extend_from_slice(&root.node_hash);
+    let mut out = Vec::with_capacity(BUNDLE_ROOT_MAGIC.len() + body.len() + 32);
+    out.extend_from_slice(BUNDLE_ROOT_MAGIC);
+    out.extend_from_slice(&body);
+    let mut digest_input = Vec::with_capacity(binding.len() + body.len());
     digest_input.extend_from_slice(binding);
-    digest_input.extend_from_slice(&out[BUNDLE_ROOT_MAGIC.len()..]);
-    let digest = blake3::hash(&digest_input);
-    out.extend_from_slice(digest.as_bytes());
+    digest_input.extend_from_slice(&body);
+    out.extend_from_slice(blake3::hash(&digest_input).as_bytes());
     Ok(Bytes::from(out))
 }
 
-fn decode_bundle_root(binding: &[u8], bytes: Bytes) -> Result<BundleRoot, LixError> {
+fn decode_bundle_root_meta(binding: &[u8], bytes: Bytes) -> Result<BundleRootMeta, LixError> {
     if !bytes.starts_with(BUNDLE_ROOT_MAGIC) {
         return Err(codec_error(
             "untracked bundle root has an unsupported format",
@@ -1507,75 +1773,705 @@ fn decode_bundle_root(binding: &[u8], bytes: Bytes) -> Result<BundleRoot, LixErr
     }
     let mut offset = BUNDLE_ROOT_MAGIC.len();
     let count = u32::from_be_bytes(
-        take(&bytes, &mut offset, 4, "bundle root variant count")?
+        take(&bytes, &mut offset, 4, "bundle root descriptor count")?
             .try_into()
             .expect("four bytes"),
-    ) as usize;
-    if count == 0 {
+    );
+    let depth = u16::from_be_bytes(
+        take(&bytes, &mut offset, 2, "bundle root descriptor depth")?
+            .try_into()
+            .expect("two bytes"),
+    );
+    let node_hash: [u8; 32] = take(&bytes, &mut offset, 32, "bundle root descriptor hash")?
+        .try_into()
+        .expect("32 bytes");
+    if count == 0 || node_hash == [0; 32] {
         return Err(codec_error(
-            "untracked bundle root cannot have zero variants",
+            "untracked bundle root has an empty descriptor tree",
         ));
     }
-    let mut root = BTreeMap::new();
-    let mut previous: Option<String> = None;
-    for _ in 0..count {
-        let file_id = match take(&bytes, &mut offset, 1, "bundle root file tag")?[0] {
-            0 => None,
-            1 => Some(read_text(&bytes, &mut offset, "bundle root file")?),
-            _ => return Err(codec_error("untracked bundle root has an invalid file tag")),
-        };
-        if let Some(file_id) = &file_id {
-            if previous
-                .as_deref()
-                .is_some_and(|previous| previous >= file_id.as_str())
-            {
-                return Err(codec_error(
-                    "untracked bundle root variants are not canonical",
-                ));
-            }
-            previous = Some(file_id.clone());
-        } else if previous.is_some() {
-            return Err(codec_error(
-                "untracked bundle root null variant is out of order",
-            ));
-        }
-        let hash: [u8; 32] = take(&bytes, &mut offset, 32, "bundle root chunk hash")?
-            .try_into()
-            .expect("32 bytes");
-        let len = u32::from_be_bytes(
-            take(&bytes, &mut offset, 4, "bundle root chunk length")?
-                .try_into()
-                .expect("four bytes"),
-        );
-        if len == 0 {
-            return Err(codec_error("untracked bundle root chunk length is zero"));
-        }
-        if root
-            .insert(file_id, ChunkDescriptor { hash, len })
-            .is_some()
-        {
-            return Err(codec_error(
-                "untracked bundle root contains a duplicate variant",
-            ));
-        }
-    }
     let digest_start = offset;
-    let expected_digest: [u8; 32] = take(&bytes, &mut offset, 32, "bundle root digest")?
+    let expected: [u8; 32] = take(&bytes, &mut offset, 32, "bundle root digest")?
         .try_into()
         .expect("32 bytes");
     if offset != bytes.len() {
         return Err(codec_error("untracked bundle root has trailing bytes"));
     }
-    let mut digest_input = Vec::with_capacity(binding.len() + digest_start);
+    let mut digest_input =
+        Vec::with_capacity(binding.len() + digest_start - BUNDLE_ROOT_MAGIC.len());
     digest_input.extend_from_slice(binding);
     digest_input.extend_from_slice(&bytes[BUNDLE_ROOT_MAGIC.len()..digest_start]);
-    let actual_digest = blake3::hash(&digest_input);
-    if *actual_digest.as_bytes() != expected_digest {
+    if *blake3::hash(&digest_input).as_bytes() != expected {
         return Err(codec_error(
             "untracked bundle root digest validation failed",
         ));
     }
-    Ok(root)
+    Ok(BundleRootMeta {
+        node_hash,
+        count,
+        depth,
+    })
+}
+
+fn encode_descriptor_node(node: &DescriptorNode) -> Result<Bytes, LixError> {
+    let mut out = Vec::new();
+    match node {
+        DescriptorNode::Leaf(entries) => {
+            if entries.is_empty() || entries.len() > BUNDLE_LEAF_CAPACITY {
+                return Err(codec_error("descriptor leaf has an invalid entry count"));
+            }
+            out.extend_from_slice(BUNDLE_NODE_LEAF_MAGIC);
+            out.extend_from_slice(
+                &u32::try_from(entries.len())
+                    .map_err(|_| codec_error("descriptor leaf is too large"))?
+                    .to_be_bytes(),
+            );
+            let mut previous = None;
+            for (file_id, descriptor) in entries {
+                ensure_strict_file_order(previous.as_ref(), file_id, "descriptor leaf entries")?;
+                if descriptor.len == 0 || descriptor.hash == [0; 32] {
+                    return Err(codec_error(
+                        "descriptor leaf contains an invalid chunk descriptor",
+                    ));
+                }
+                encode_file_id(&mut out, file_id)?;
+                out.extend_from_slice(&descriptor.hash);
+                out.extend_from_slice(&descriptor.len.to_be_bytes());
+                previous = Some(file_id.clone());
+            }
+        }
+        DescriptorNode::Branch(children) => {
+            if children.len() < 2 || children.len() > BUNDLE_NODE_FANOUT {
+                return Err(codec_error("descriptor branch has an invalid child count"));
+            }
+            out.extend_from_slice(BUNDLE_NODE_BRANCH_MAGIC);
+            out.extend_from_slice(
+                &u32::try_from(children.len())
+                    .map_err(|_| codec_error("descriptor branch is too large"))?
+                    .to_be_bytes(),
+            );
+            let mut previous = None;
+            let expected_depth = children[0].depth;
+            let mut total = 0_u64;
+            for child in children {
+                if child.depth != expected_depth || child.count == 0 || child.hash == [0; 32] {
+                    return Err(codec_error(
+                        "descriptor branch child metadata is inconsistent",
+                    ));
+                }
+                ensure_strict_file_order(
+                    previous.as_ref(),
+                    &child.first,
+                    "descriptor branch keys",
+                )?;
+                encode_file_id(&mut out, &child.first)?;
+                out.extend_from_slice(&child.hash);
+                out.extend_from_slice(&child.count.to_be_bytes());
+                out.extend_from_slice(&child.depth.to_be_bytes());
+                total = total
+                    .checked_add(u64::from(child.count))
+                    .ok_or_else(|| codec_error("descriptor branch count overflow"))?;
+                previous = Some(child.first.clone());
+            }
+            if total > u64::from(u32::MAX) {
+                return Err(codec_error("descriptor branch count overflow"));
+            }
+        }
+    }
+    Ok(Bytes::from(out))
+}
+
+fn decode_descriptor_node(bytes: Bytes) -> Result<DescriptorNode, LixError> {
+    let mut offset = 0;
+    if bytes.starts_with(BUNDLE_NODE_LEAF_MAGIC) {
+        offset += BUNDLE_NODE_LEAF_MAGIC.len();
+        let count = u32::from_be_bytes(
+            take(&bytes, &mut offset, 4, "descriptor leaf count")?
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        if count == 0 || count > BUNDLE_LEAF_CAPACITY {
+            return Err(codec_error("descriptor leaf has an invalid entry count"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut previous = None;
+        for _ in 0..count {
+            let file_id = decode_file_id(&bytes, &mut offset, "descriptor leaf file")?;
+            ensure_strict_file_order(previous.as_ref(), &file_id, "descriptor leaf entries")?;
+            let hash: [u8; 32] = take(&bytes, &mut offset, 32, "descriptor leaf hash")?
+                .try_into()
+                .expect("32 bytes");
+            let len = u32::from_be_bytes(
+                take(&bytes, &mut offset, 4, "descriptor leaf length")?
+                    .try_into()
+                    .expect("four bytes"),
+            );
+            if len == 0 || hash == [0; 32] {
+                return Err(codec_error(
+                    "descriptor leaf contains an invalid chunk descriptor",
+                ));
+            }
+            entries.push((file_id.clone(), ChunkDescriptor { hash, len }));
+            previous = Some(file_id);
+        }
+        if offset != bytes.len() {
+            return Err(codec_error("descriptor leaf has trailing bytes"));
+        }
+        return Ok(DescriptorNode::Leaf(entries));
+    }
+    if bytes.starts_with(BUNDLE_NODE_BRANCH_MAGIC) {
+        offset += BUNDLE_NODE_BRANCH_MAGIC.len();
+        let count = u32::from_be_bytes(
+            take(&bytes, &mut offset, 4, "descriptor branch count")?
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        if count < 2 || count > BUNDLE_NODE_FANOUT {
+            return Err(codec_error("descriptor branch has an invalid child count"));
+        }
+        let mut children = Vec::with_capacity(count);
+        let mut previous = None;
+        let mut expected_depth = None;
+        for _ in 0..count {
+            let first = decode_file_id(&bytes, &mut offset, "descriptor branch key")?;
+            ensure_strict_file_order(previous.as_ref(), &first, "descriptor branch keys")?;
+            let hash: [u8; 32] = take(&bytes, &mut offset, 32, "descriptor branch hash")?
+                .try_into()
+                .expect("32 bytes");
+            let child_count = u32::from_be_bytes(
+                take(&bytes, &mut offset, 4, "descriptor branch child count")?
+                    .try_into()
+                    .expect("four bytes"),
+            );
+            let depth = u16::from_be_bytes(
+                take(&bytes, &mut offset, 2, "descriptor branch child depth")?
+                    .try_into()
+                    .expect("two bytes"),
+            );
+            if hash == [0; 32] || child_count == 0 {
+                return Err(codec_error("descriptor branch child metadata is invalid"));
+            }
+            if let Some(expected) = expected_depth {
+                if expected != depth {
+                    return Err(codec_error("descriptor branch child depths differ"));
+                }
+            } else {
+                expected_depth = Some(depth);
+            }
+            children.push(DescriptorChild {
+                first: first.clone(),
+                hash,
+                count: child_count,
+                depth,
+            });
+            previous = Some(first);
+        }
+        if offset != bytes.len() {
+            return Err(codec_error("descriptor branch has trailing bytes"));
+        }
+        return Ok(DescriptorNode::Branch(children));
+    }
+    Err(codec_error("descriptor node has an unsupported format"))
+}
+
+fn descriptor_node_ref(node: &DescriptorNode) -> Result<DescriptorChild, LixError> {
+    let bytes = encode_descriptor_node(node)?;
+    let hash = *blake3::hash(&bytes).as_bytes();
+    match node {
+        DescriptorNode::Leaf(entries) => Ok(DescriptorChild {
+            first: entries
+                .first()
+                .map(|(file_id, _)| file_id.clone())
+                .ok_or_else(|| codec_error("descriptor leaf cannot be empty"))?,
+            hash,
+            count: u32::try_from(entries.len())
+                .map_err(|_| codec_error("descriptor count overflow"))?,
+            depth: 0,
+        }),
+        DescriptorNode::Branch(children) => Ok(DescriptorChild {
+            first: children
+                .first()
+                .map(|child| child.first.clone())
+                .ok_or_else(|| codec_error("descriptor branch cannot be empty"))?,
+            hash,
+            count: children.iter().try_fold(0_u32, |total, child| {
+                total
+                    .checked_add(child.count)
+                    .ok_or_else(|| codec_error("descriptor count overflow"))
+            })?,
+            depth: children[0]
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| codec_error("descriptor depth overflow"))?,
+        }),
+    }
+}
+
+async fn read_untracked_bundle_root_metas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    keys: &[StorageKey],
+) -> Result<BTreeMap<StorageKey, BundleRootMeta>, LixError> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_previous_point_read_keys(keys.len());
+    let values = PointReadPlan::from_unique_keys(UNTRACKED_ROW_SPACE, keys.to_vec())
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
+    let mut roots = BTreeMap::new();
+    for (key, value) in keys.iter().cloned().zip(values) {
+        let Some(value) = value else { continue };
+        let StorageProjectedValue::FullValue(value) = value else {
+            return Err(codec_error(
+                "untracked bundle point read omitted its root value",
+            ));
+        };
+        decode_bundle_key(&key.0)?;
+        roots.insert(key.clone(), decode_bundle_root_meta(&key.0, value)?);
+    }
+    Ok(roots)
+}
+
+async fn load_descriptor_node(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hash: [u8; 32],
+    cache: &mut BTreeMap<[u8; 32], DescriptorNode>,
+) -> Result<DescriptorNode, LixError> {
+    if let Some(node) = cache.get(&hash) {
+        return Ok(node.clone());
+    }
+    record_descriptor_node_read();
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_previous_point_read_keys(1);
+    let value = PointReadPlan::new(
+        UNTRACKED_BUNDLE_CHUNK_SPACE,
+        &[StorageKey(Bytes::copy_from_slice(&hash))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?
+    .value
+    .into_iter()
+    .next()
+    .flatten()
+    .ok_or_else(|| codec_error("untracked descriptor node is missing"))?;
+    let StorageProjectedValue::FullValue(value) = value else {
+        return Err(codec_error("untracked descriptor node omitted its value"));
+    };
+    if *blake3::hash(&value).as_bytes() != hash {
+        return Err(codec_error(
+            "untracked descriptor node hash validation failed",
+        ));
+    }
+    let node = decode_descriptor_node(value)?;
+    cache.insert(hash, node.clone());
+    Ok(node)
+}
+
+async fn load_descriptor_tree(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &BundleRootMeta,
+) -> Result<DescriptorMap, LixError> {
+    let mut cache = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let mut out = BTreeMap::new();
+    load_descriptor_tree_node(
+        store,
+        root.node_hash,
+        root.depth,
+        root.count,
+        &mut cache,
+        &mut visited,
+        &mut out,
+    )
+    .await?;
+    if out.len() != root.count as usize {
+        return Err(codec_error(
+            "descriptor tree count does not match root metadata",
+        ));
+    }
+    Ok(out)
+}
+
+async fn load_descriptor_tree_node(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hash: [u8; 32],
+    expected_depth: u16,
+    expected_count: u32,
+    cache: &mut BTreeMap<[u8; 32], DescriptorNode>,
+    visited: &mut BTreeSet<[u8; 32]>,
+    out: &mut DescriptorMap,
+) -> Result<(), LixError> {
+    let mut stack = vec![(hash, expected_depth, expected_count, None::<Option<String>>)];
+    while let Some((hash, expected_depth, expected_count, expected_first)) = stack.pop() {
+        if !visited.insert(hash) {
+            continue;
+        }
+        let node = load_descriptor_node(store, hash, cache).await?;
+        match node {
+            DescriptorNode::Leaf(entries) => {
+                if expected_depth != 0 || expected_count != entries.len() as u32 {
+                    return Err(codec_error("descriptor leaf metadata does not match root"));
+                }
+                if let Some(expected_first) = expected_first.as_ref()
+                    && entries.first().map(|(file_id, _)| file_id) != Some(expected_first)
+                {
+                    return Err(codec_error(
+                        "descriptor leaf first key disagrees with parent",
+                    ));
+                }
+                for (file_id, descriptor) in entries {
+                    if out.insert(file_id, descriptor).is_some() {
+                        return Err(codec_error("descriptor tree contains a duplicate variant"));
+                    }
+                }
+            }
+            DescriptorNode::Branch(children) => {
+                if expected_depth == 0
+                    || children
+                        .iter()
+                        .any(|child| child.depth + 1 != expected_depth)
+                {
+                    return Err(codec_error("descriptor branch depth is invalid"));
+                }
+                let count = children.iter().try_fold(0_u32, |total, child| {
+                    total
+                        .checked_add(child.count)
+                        .ok_or_else(|| codec_error("descriptor tree count overflow"))
+                })?;
+                if count != expected_count {
+                    return Err(codec_error("descriptor branch count does not match root"));
+                }
+                if let Some(expected_first) = expected_first.as_ref()
+                    && children.first().map(|child| &child.first) != Some(expected_first)
+                {
+                    return Err(codec_error(
+                        "descriptor branch first key disagrees with parent",
+                    ));
+                }
+                stack.extend(
+                    children
+                        .into_iter()
+                        .map(|child| (child.hash, child.depth, child.count, Some(child.first))),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn lookup_descriptor(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &BundleRootMeta,
+    target: &Option<String>,
+) -> Result<Option<ChunkDescriptor>, LixError> {
+    let mut cache = BTreeMap::new();
+    let mut hash = root.node_hash;
+    let mut depth = root.depth;
+    let mut expected_first = None;
+    loop {
+        let node = load_descriptor_node(store, hash, &mut cache).await?;
+        match node {
+            DescriptorNode::Leaf(entries) => {
+                if let Some(expected_first) = expected_first.as_ref()
+                    && entries.first().map(|(file_id, _)| file_id) != Some(expected_first)
+                {
+                    return Err(codec_error(
+                        "descriptor lookup first key disagrees with parent",
+                    ));
+                }
+                return Ok(entries
+                    .binary_search_by(|(file_id, _)| file_id.cmp(target))
+                    .ok()
+                    .map(|index| entries[index].1.clone()));
+            }
+            DescriptorNode::Branch(children) => {
+                if depth == 0 || children.iter().any(|child| child.depth + 1 != depth) {
+                    return Err(codec_error("descriptor lookup encountered invalid depth"));
+                }
+                let index = children.partition_point(|child| {
+                    child.first.cmp(target) != std::cmp::Ordering::Greater
+                });
+                let child = children
+                    .get(index.saturating_sub(1))
+                    .ok_or_else(|| codec_error("descriptor branch has no target child"))?;
+                if let Some(expected_first) = expected_first.as_ref()
+                    && children.first().map(|child| &child.first) != Some(expected_first)
+                {
+                    return Err(codec_error("descriptor lookup branch first key is invalid"));
+                }
+                expected_first = Some(child.first.clone());
+                hash = child.hash;
+                depth = child.depth;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_descriptor_tree_hashes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &BundleRootMeta,
+    reachable: &mut BTreeSet<[u8; 32]>,
+    cache: &mut BTreeMap<[u8; 32], DescriptorNode>,
+    visited: &mut BTreeSet<[u8; 32]>,
+) -> Result<(), LixError> {
+    let mut stack = vec![(
+        root.node_hash,
+        root.depth,
+        root.count,
+        None::<Option<String>>,
+    )];
+    let mut count = 0_u32;
+    while let Some((hash, depth, expected_count, expected_first)) = stack.pop() {
+        if !visited.insert(hash) {
+            continue;
+        }
+        reachable.insert(hash);
+        let node = load_descriptor_node(store, hash, cache).await?;
+        match node {
+            DescriptorNode::Leaf(entries) => {
+                if depth != 0 || expected_count != entries.len() as u32 {
+                    return Err(codec_error("descriptor GC leaf metadata is invalid"));
+                }
+                if let Some(expected_first) = expected_first.as_ref()
+                    && entries.first().map(|(file_id, _)| file_id) != Some(expected_first)
+                {
+                    return Err(codec_error("descriptor GC leaf first key is invalid"));
+                }
+                count = count
+                    .checked_add(expected_count)
+                    .ok_or_else(|| codec_error("descriptor GC count overflow"))?;
+                reachable.extend(entries.into_iter().map(|(_, descriptor)| descriptor.hash));
+            }
+            DescriptorNode::Branch(children) => {
+                if depth == 0 || children.iter().any(|child| child.depth + 1 != depth) {
+                    return Err(codec_error("descriptor GC branch depth is invalid"));
+                }
+                let branch_count = children.iter().try_fold(0_u32, |total, child| {
+                    total
+                        .checked_add(child.count)
+                        .ok_or_else(|| codec_error("descriptor GC count overflow"))
+                })?;
+                if branch_count != expected_count {
+                    return Err(codec_error("descriptor GC branch count is invalid"));
+                }
+                if let Some(expected_first) = expected_first.as_ref()
+                    && children.first().map(|child| &child.first) != Some(expected_first)
+                {
+                    return Err(codec_error("descriptor GC branch first key is invalid"));
+                }
+                stack.extend(
+                    children
+                        .into_iter()
+                        .map(|child| (child.hash, child.depth, child.count, Some(child.first))),
+                );
+            }
+        }
+    }
+    if count != root.count {
+        return Err(codec_error("descriptor GC root count is invalid"));
+    }
+    Ok(())
+}
+
+struct DescriptorEditor<'a, S: ?Sized> {
+    store: &'a S,
+    root: Option<BundleRootMeta>,
+    cache: BTreeMap<[u8; 32], DescriptorNode>,
+    staged: BTreeMap<[u8; 32], Bytes>,
+    reused: u64,
+    splits: u64,
+    max_depth: u16,
+}
+
+impl<'a, S: StorageAdapterRead + ?Sized> DescriptorEditor<'a, S> {
+    fn new(store: &'a S, root: Option<BundleRootMeta>) -> Self {
+        let max_depth = root.as_ref().map_or(0, |root| root.depth);
+        Self {
+            store,
+            root,
+            cache: BTreeMap::new(),
+            staged: BTreeMap::new(),
+            reused: 0,
+            splits: 0,
+            max_depth,
+        }
+    }
+
+    async fn load(&mut self, hash: [u8; 32]) -> Result<DescriptorNode, LixError> {
+        load_descriptor_node(self.store, hash, &mut self.cache).await
+    }
+
+    fn stage_node(&mut self, node: DescriptorNode) -> Result<DescriptorChild, LixError> {
+        let child = descriptor_node_ref(&node)?;
+        let bytes = encode_descriptor_node(&node)?;
+        if self.staged.contains_key(&child.hash) {
+            self.reused = self.reused.saturating_add(1);
+            record_descriptor_reuse();
+        } else {
+            record_descriptor_node_write(bytes.len());
+            self.staged.insert(child.hash, bytes);
+        }
+        self.cache.insert(child.hash, node);
+        record_descriptor_depth(child.depth);
+        Ok(child)
+    }
+
+    fn leaf_groups(
+        &mut self,
+        entries: Vec<(Option<String>, ChunkDescriptor)>,
+    ) -> Result<Vec<DescriptorChild>, LixError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut groups = Vec::new();
+        for group in entries.chunks(BUNDLE_LEAF_CAPACITY) {
+            groups.push(self.stage_node(DescriptorNode::Leaf(group.to_vec()))?);
+        }
+        if groups.len() > 1 {
+            self.splits = self.splits.saturating_add(1);
+            record_descriptor_split();
+        }
+        Ok(groups)
+    }
+
+    fn branch_groups(
+        &mut self,
+        children: Vec<DescriptorChild>,
+    ) -> Result<Vec<DescriptorChild>, LixError> {
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+        if children.len() == 1 {
+            return Ok(children);
+        }
+        let mut groups = Vec::new();
+        for group in children.chunks(BUNDLE_NODE_FANOUT) {
+            groups.push(self.stage_node(DescriptorNode::Branch(group.to_vec()))?);
+        }
+        if groups.len() > 1 {
+            self.splits = self.splits.saturating_add(1);
+            record_descriptor_split();
+        }
+        Ok(groups)
+    }
+
+    async fn update(
+        &mut self,
+        target: Option<String>,
+        replacement: Option<ChunkDescriptor>,
+    ) -> Result<(), LixError> {
+        let Some(root) = self.root.clone() else {
+            let Some(replacement) = replacement else {
+                return Ok(());
+            };
+            let refs = self.leaf_groups(vec![(target, replacement)])?;
+            return self.finish_refs(refs);
+        };
+        let mut path = Vec::<(DescriptorNode, usize)>::new();
+        let mut hash = root.node_hash;
+        let mut depth = root.depth;
+        let (mut refs, found) = loop {
+            let node = self.load(hash).await?;
+            match node.clone() {
+                DescriptorNode::Leaf(mut entries) => {
+                    let index = entries.binary_search_by(|(file_id, _)| file_id.cmp(&target));
+                    let found = index.is_ok();
+                    if let (Some(replacement), Ok(index)) = (&replacement, index)
+                        && entries[index].1 == *replacement
+                    {
+                        return Ok(());
+                    }
+                    match (replacement.clone(), index) {
+                        (Some(replacement), Ok(index)) => entries[index].1 = replacement,
+                        (Some(replacement), Err(index)) => {
+                            entries.insert(index, (target.clone(), replacement))
+                        }
+                        (None, Ok(index)) => {
+                            entries.remove(index);
+                        }
+                        (None, Err(_)) => {}
+                    }
+                    break (self.leaf_groups(entries)?, found);
+                }
+                DescriptorNode::Branch(children) => {
+                    if depth == 0 || children.iter().any(|child| child.depth + 1 != depth) {
+                        return Err(codec_error("descriptor update encountered invalid depth"));
+                    }
+                    let index = children.partition_point(|child| {
+                        child.first.cmp(&target) != std::cmp::Ordering::Greater
+                    });
+                    let index = index.saturating_sub(1);
+                    let child = children
+                        .get(index)
+                        .ok_or_else(|| codec_error("descriptor branch has no update child"))?;
+                    path.push((node, index));
+                    hash = child.hash;
+                    depth = child.depth;
+                }
+            }
+        };
+        if !found && replacement.is_none() {
+            // A delete of an absent member must not rewrite the path.
+            return Ok(());
+        }
+        for (node, index) in path.into_iter().rev() {
+            let DescriptorNode::Branch(mut children) = node else {
+                return Err(codec_error("descriptor update path contained a leaf"));
+            };
+            if index >= children.len() {
+                return Err(codec_error(
+                    "descriptor update child index is out of bounds",
+                ));
+            }
+            let old_len = children.len();
+            children.splice(index..=index, refs);
+            let reused = u64::try_from(old_len.saturating_sub(1)).unwrap_or(u64::MAX);
+            self.reused = self.reused.saturating_add(reused);
+            for _ in 0..old_len.saturating_sub(1) {
+                record_descriptor_reuse();
+            }
+            refs = self.branch_groups(children)?;
+        }
+        self.finish_refs(refs)
+    }
+
+    fn finish_refs(&mut self, refs: Vec<DescriptorChild>) -> Result<(), LixError> {
+        let Some(mut root_ref) = refs.first().cloned() else {
+            self.root = None;
+            self.max_depth = 0;
+            return Ok(());
+        };
+        if refs.len() > 1 {
+            let mut children = refs;
+            while children.len() > 1 {
+                let groups = self.branch_groups(children)?;
+                if groups.len() == 1 {
+                    root_ref = groups[0].clone();
+                    break;
+                }
+                children = groups;
+            }
+        }
+        self.max_depth = root_ref.depth;
+        record_descriptor_depth(root_ref.depth);
+        self.root = Some(BundleRootMeta {
+            node_hash: root_ref.hash,
+            count: root_ref.count,
+            depth: root_ref.depth,
+        });
+        Ok(())
+    }
+}
+
+fn encode_bundle_root(binding: &[u8], root: &BundleRootMeta) -> Result<Bytes, LixError> {
+    encode_bundle_root_meta(binding, root)
+}
+
+fn decode_bundle_root(binding: &[u8], bytes: Bytes) -> Result<BundleRootMeta, LixError> {
+    decode_bundle_root_meta(binding, bytes)
 }
 
 fn chunk_descriptor(encoded: &Bytes) -> Result<ChunkDescriptor, LixError> {
@@ -1588,11 +2484,24 @@ fn chunk_descriptor(encoded: &Bytes) -> Result<ChunkDescriptor, LixError> {
 }
 
 #[cfg(test)]
-fn bundle_root_from_decoded(bundle: &DecodedBundle) -> Result<BundleRoot, LixError> {
-    bundle
+fn bundle_tree_from_decoded(
+    bundle: &DecodedBundle,
+) -> Result<(BundleRootMeta, BTreeMap<[u8; 32], Bytes>), LixError> {
+    let entries = bundle
         .iter()
         .map(|(file_id, member)| Ok((file_id.clone(), chunk_descriptor(&member.encoded)?)))
-        .collect::<Result<BundleRoot, LixError>>()
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let node = DescriptorNode::Leaf(entries);
+    let child = descriptor_node_ref(&node)?;
+    let bytes = encode_descriptor_node(&node)?;
+    Ok((
+        BundleRootMeta {
+            node_hash: child.hash,
+            count: child.count,
+            depth: child.depth,
+        },
+        BTreeMap::from([(child.hash, bytes)]),
+    ))
 }
 
 fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, field: &str) -> Result<&'a [u8], LixError> {
@@ -1986,20 +2895,90 @@ mod tests {
                 encoded,
             },
         );
-        let bytes = encode_bundle_root(b"bundle-codec-key", &bundle_root_from_decoded(&bundle)?)?;
+        let (meta, _) = bundle_tree_from_decoded(&bundle)?;
+        let bytes = encode_bundle_root(b"bundle-codec-key", &meta)?;
         assert_eq!(
-            decode_bundle_root(b"bundle-codec-key", bytes.clone())?.len(),
+            decode_bundle_root(b"bundle-codec-key", bytes.clone())?.count,
             1
         );
+        assert!(decode_bundle_root(b"other-bundle-key", bytes.clone()).is_err());
         let mut tampered = bytes.to_vec();
-        tampered[BUNDLE_ROOT_MAGIC.len() + 4 + 1] ^= 1;
+        tampered[BUNDLE_ROOT_MAGIC.len() + 4] ^= 1;
         assert!(decode_bundle_root(b"bundle-codec-key", Bytes::from(tampered)).is_err());
         let mut malformed = BUNDLE_ROOT_MAGIC.to_vec();
         malformed.extend_from_slice(&1_u32.to_be_bytes());
-        malformed.push(0);
+        malformed.extend_from_slice(&0_u16.to_be_bytes());
         malformed.extend_from_slice(&[0; 32]);
-        malformed.extend_from_slice(&0_u32.to_be_bytes());
+        malformed.extend_from_slice(&[0; 32]);
         assert!(decode_bundle_root(b"bundle-codec-key", Bytes::from(malformed)).is_err());
+        let node_bytes = encode_descriptor_node(&DescriptorNode::Leaf(vec![(
+            None,
+            ChunkDescriptor {
+                hash: [3; 32],
+                len: 1,
+            },
+        )]))?;
+        let mut corrupt_node = node_bytes.to_vec();
+        *corrupt_node
+            .last_mut()
+            .expect("descriptor node is non-empty") ^= 1;
+        assert!(decode_descriptor_node(Bytes::from(corrupt_node)).is_err());
+        let duplicate = DescriptorNode::Leaf(vec![
+            (
+                None,
+                ChunkDescriptor {
+                    hash: [1; 32],
+                    len: 1,
+                },
+            ),
+            (
+                None,
+                ChunkDescriptor {
+                    hash: [2; 32],
+                    len: 1,
+                },
+            ),
+        ]);
+        assert!(encode_descriptor_node(&duplicate).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn descriptor_hierarchy_sparse_update_rewrites_only_frontier() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "descriptor-frontier";
+        let entity = EntityPk::single("one-entity");
+        let file_ids = (0..40)
+            .map(|index| format!("file-{index:02}"))
+            .collect::<Vec<_>>();
+        let initial = file_ids
+            .iter()
+            .map(|file_id| {
+                untracked(
+                    "schema",
+                    Some(file_id.as_str()),
+                    &entity,
+                    r#"{"v":1}"#,
+                    timestamp(),
+                )
+            })
+            .collect::<Vec<_>>();
+        commit_deltas(&storage, branch_id, &initial, &vec![true; initial.len()]).await?;
+        let _ = take_untracked_mutation_read_profile();
+        let update = untracked(
+            "schema",
+            Some("file-17"),
+            &entity,
+            r#"{"v":2}"#,
+            timestamp(),
+        );
+        commit_deltas(&storage, branch_id, &[update], &[false]).await?;
+        let profile = take_untracked_mutation_read_profile();
+        assert_eq!(profile.previous_scan_rows, 0);
+        assert!(profile.descriptor_node_reads <= 8, "{profile:?}");
+        assert!(profile.descriptor_node_writes <= 3, "{profile:?}");
+        assert!(profile.descriptor_node_writes < 40);
+        assert!(profile.descriptor_max_depth >= 1);
         Ok(())
     }
 
@@ -2033,7 +3012,7 @@ mod tests {
         );
         commit_deltas(&storage, branch_id, &[update], &[false]).await?;
         let profile = take_untracked_mutation_read_profile();
-        assert_eq!(profile.previous_point_read_keys, 2);
+        assert_eq!(profile.previous_point_read_keys, 5);
         assert_eq!(profile.previous_scan_rows, 0);
         assert_eq!(profile.previous_scan_bytes, 0);
         Ok(())
@@ -2076,8 +3055,8 @@ mod tests {
         commit_deltas(&storage, branch_id, &[replacement], &[false]).await?;
         let profile = take_untracked_mutation_read_profile();
         assert_eq!(
-            profile.previous_point_read_keys, 2,
-            "sparse replacement reads one root and one selected payload chunk"
+            profile.previous_point_read_keys, 5,
+            "sparse replacement reads one root, descriptor frontier, and selected payload"
         );
         assert_eq!(profile.previous_scan_rows, 0);
 
@@ -2130,7 +3109,7 @@ mod tests {
             .collect::<Vec<_>>();
         commit_deltas(&storage, "bundle-10k", &updates, &vec![false; ROWS]).await?;
         let profile = take_untracked_mutation_read_profile();
-        assert_eq!(profile.previous_point_read_keys, ROWS as u64 + 1);
+        assert_eq!(profile.previous_point_read_keys, ROWS as u64 * 4 + 1);
         assert_eq!(profile.previous_scan_rows, 0);
         assert_eq!(profile.previous_scan_bytes, 0);
         Ok(())
@@ -2506,14 +3485,12 @@ mod tests {
             },
         );
         let mut corrupt = storage.new_write_set();
+        let (malformed_root, _) = bundle_tree_from_decoded(&member_bundle)?;
         corrupt.put(
             UNTRACKED_ROW_SPACE,
-            StorageKey(Bytes::from(malformed_key)),
+            StorageKey(Bytes::from(malformed_key.clone())),
             StorageValue {
-                bytes: encode_bundle_root(
-                    b"malformed-key",
-                    &bundle_root_from_decoded(&member_bundle)?,
-                )?,
+                bytes: encode_bundle_root(&malformed_key, &malformed_root)?,
             },
         );
         storage
