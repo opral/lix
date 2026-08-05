@@ -24,9 +24,10 @@ pub(crate) use commit_root_rebuild::{
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
+#[cfg(test)]
+pub(crate) use current_state_data_part::decode_current_state_data_part_refs;
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
-    decode_current_state_data_part_refs,
 };
 pub(crate) use current_state_envelope::current_state_descriptor_from_scoped_range_part;
 pub(crate) use diff::{
@@ -75,12 +76,10 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
-    stage_current_state_scoped_ranges_from_topology, stage_delete_change_locators,
-    stage_delete_commit_delta_inventory_entry, stage_delete_commit_state_manifest_for_gc,
+    stage_current_state_scoped_ranges_from_topology, stage_delete_commit_state_manifest_for_gc,
     stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
     stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
-    validate_current_state_scoped_range_serving_base_manifest,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
@@ -97,6 +96,11 @@ pub(crate) use storage::{
     change_id_from_packed_address, load_commit_delta_change_ids,
     load_complete_current_state_values_from_scoped_root, load_snapshot_commit_root,
     scan_commit_delta_members, stage_resealed_commit_state_manifest_for_test,
+};
+#[cfg(test)]
+pub(crate) use storage::{
+    stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
+    validate_current_state_scoped_range_serving_base_manifest,
 };
 #[cfg(test)]
 pub(crate) use types::TrackedStateRootId;

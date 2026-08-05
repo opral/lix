@@ -30,7 +30,9 @@ pub(crate) struct ColumnarBaseCoordinate {
     pub(crate) row_index: u32,
 }
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -274,6 +276,7 @@ struct BranchRef<'a> {
 
 #[derive(Debug, Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
+#[cfg(test)]
 struct BranchRefKey {
     branch_id: String,
 }
@@ -473,6 +476,7 @@ impl TrackedHeadContext {
     /// may use historical replay, but that same generation preserves the
     /// branch's history-free untracked members until a fresh complete serving
     /// generation is published.
+    #[cfg(test)]
     pub(crate) async fn stage_collect_stale_current_state_generations<S>(
         &self,
         store: &S,
@@ -489,6 +493,7 @@ impl TrackedHeadContext {
 /// Converts the branch-control plane into the exact derived generations that
 /// are still reachable. A branch generation is meaningful only together with
 /// its branch id; a generation UUID alone is not a repository-global root.
+#[cfg(test)]
 fn active_current_state_generations(
     controls: &[(String, BranchHeadControl)],
 ) -> BTreeSet<(String, CommitId)> {
@@ -736,6 +741,7 @@ async fn load_tracked_working_diff_epoch(
 /// checkpoint epoch. This deliberately runs only from repository GC: a
 /// checkpoint reset is O(1), while old index prefixes are unreachable as soon
 /// as its marker commits.
+#[cfg(test)]
 pub(crate) async fn stage_collect_stale_working_diff_indexes<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -767,6 +773,7 @@ where
         .await
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveWorkingDiffScope {
     checkpoint_commit_id: CommitId,
@@ -777,6 +784,7 @@ struct ActiveWorkingDiffScope {
 /// authoritative branch control. Broken auxiliary bytes are reclaimed here
 /// rather than turning background GC into a retry loop; normal readers already
 /// select canonical replay for the same cases.
+#[cfg(test)]
 async fn stage_active_working_diff_scopes<S>(
     store: &S,
     writes: &mut StorageWriteSet,

@@ -1254,6 +1254,7 @@ fn current_inventory_may_contain_any_key(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn validate_current_state_scoped_range_serving_base_manifest(
     state: &CommitStateManifest,
     serving_base: Option<&CommitStateManifest>,
@@ -5334,6 +5335,7 @@ pub(crate) fn stage_change_locators(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stage_delete_change_locators(
     writes: &mut StorageWriteSet,
     change_ids: impl IntoIterator<Item = crate::changelog::ChangeId>,
@@ -9850,6 +9852,7 @@ fn validate_physical_commit_delta_segments(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn stage_delete_commit_delta_inventory_entry(
     writes: &mut StorageWriteSet,
     commit_id: CommitId,
