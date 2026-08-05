@@ -2680,6 +2680,9 @@ mod tests {
                 created_at,
                 updated_at,
                 ref_change_id: ChangeId::for_test_label(&format!("test-branch-ref-{branch_id}")),
+                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+                untracked_locator_generation: 0,
+                untracked_locator_count: 0,
             };
             control.note_schemas(schema_keys.iter().map(String::as_str));
             crate::branch::stage_branch_head_control(&mut writes, &branch_id, control)
@@ -2733,23 +2736,18 @@ mod tests {
                     columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
-            crate::live_state::stage_untracked_deltas(
+            let updated_control = crate::live_state::stage_untracked_deltas(
                 &read,
                 &mut writes,
                 &branch_id,
+                control,
                 &deltas,
                 &vec![false; deltas.len()],
             )
             .await
             .expect("test untracked current state should stage");
-            crate::branch::stage_branch_head_control(
-                &mut writes,
-                &branch_id,
-                control
-                    .next_current_state_revision()
-                    .expect("test branch control revision should advance"),
-            )
-            .expect("test untracked control should stage");
+            crate::branch::stage_branch_head_control(&mut writes, &branch_id, updated_control)
+                .expect("test untracked control should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

@@ -50,13 +50,15 @@ pub(crate) use types::{
 };
 #[allow(unused_imports)]
 pub(crate) use untracked_state::{
-    UNTRACKED_ROW_SPACE, load_untracked_exact_batch, load_untracked_exact_owner_batch,
-    scan_untracked_batch, stage_untracked_deltas, untracked_json_refs,
+    UNTRACKED_FILE_LOCATOR_SPACE, UNTRACKED_ROW_SPACE, empty_locator_root_hash,
+    load_untracked_exact_batch, load_untracked_exact_owner_batch, rebuild_untracked_file_locator,
+    scan_untracked_batch, stage_delete_untracked_file_locator, stage_untracked_deltas,
+    stage_untracked_deltas_for_branch_deletion, untracked_json_refs,
 };
-#[cfg(any(test, feature = "storage-benches"))]
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use untracked_state::{
-    UntrackedFileCascadeReadProfile, take_untracked_file_cascade_read_profile,
+    UntrackedFileLocatorReadProfile, take_untracked_file_locator_read_profile,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{

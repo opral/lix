@@ -2298,10 +2298,17 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
         let mut writes = storage_adapter.new_write_set();
-        crate::live_state::stage_untracked_deltas(
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(GLOBAL_BRANCH_ID)
+            .await
+            .expect("GC owner control read should succeed")
+            .expect("GC owner fixture needs a global control");
+        let updated_control = crate::live_state::stage_untracked_deltas(
             &read,
             &mut writes,
             GLOBAL_BRANCH_ID,
+            control,
             &[CurrentStateDeltaRef {
                 schema_key: "gc_untracked_owner",
                 file_id: None,
@@ -2320,6 +2327,8 @@ mod tests {
         )
         .await
         .expect("untracked current-state owner should stage");
+        crate::branch::stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, updated_control)
+            .expect("GC owner control should stage");
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

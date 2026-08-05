@@ -42,6 +42,9 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
+/// V59 binds a rebuildable file-locator projection to branch-head control while
+/// retaining the V58 immutable commit-state authority.
+///
 /// V58 splits immutable commit-state authority into a compact header and an
 /// authenticated, hierarchical mutation catalog. Semantic commit facts remain
 /// owned exclusively by `changelog.commit`; canonical snapshot metadata stays
@@ -50,7 +53,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v58";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v59";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -260,6 +263,9 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
             schema_presence_bloom: [0; 4],
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         },
         branch_ref_change: global_branch_ref_change,
     };
@@ -280,6 +286,9 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
             schema_presence_bloom: [0; 4],
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         },
         branch_ref_change: main_branch_ref_change,
     };
@@ -474,10 +483,15 @@ where
             })
             .collect::<Vec<_>>();
         let init_untracked_known_absent = vec![true; init_untracked_deltas.len()];
-        crate::live_state::stage_untracked_deltas(
+        let global_locator_control = crate::live_state::stage_untracked_deltas(
             &read,
             &mut writes,
             GLOBAL_BRANCH_ID,
+            plan.branch_controls
+                .iter()
+                .find(|branch| branch.branch_id == GLOBAL_BRANCH_ID)
+                .expect("global branch control exists in init plan")
+                .control,
             &init_untracked_deltas,
             &init_untracked_known_absent,
         )
@@ -507,6 +521,13 @@ where
                 },
             )?;
             let mut control = branch.control;
+            if branch.branch_id == GLOBAL_BRANCH_ID {
+                control.untracked_locator_root = global_locator_control.untracked_locator_root;
+                control.untracked_locator_generation =
+                    global_locator_control.untracked_locator_generation;
+                control.untracked_locator_count = global_locator_control.untracked_locator_count;
+                control.current_state_revision = global_locator_control.current_state_revision;
+            }
             control.note_schemas(
                 tracked_head_deltas
                     .iter()

@@ -91,10 +91,11 @@ pub(crate) async fn stage_sequence(
         [NormalizedJsonRef::from(&snapshot)],
     )?;
     let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
-    crate::live_state::stage_untracked_deltas(
+    let control = crate::live_state::stage_untracked_deltas(
         read,
         writes,
         GLOBAL_BRANCH_ID,
+        control,
         &[CurrentStateDeltaRef {
             schema_key: KEY_VALUE_SCHEMA_KEY,
             file_id: None,
@@ -115,11 +116,7 @@ pub(crate) async fn stage_sequence(
     // The hot-state mutation is fenced by an actual control-byte
     // change. Merely restaging the old control would let two writers both
     // satisfy the same CAS after the first write, losing one group update.
-    stage_branch_head_control(
-        writes,
-        GLOBAL_BRANCH_ID,
-        control.next_current_state_revision()?,
-    )?;
+    stage_branch_head_control(writes, GLOBAL_BRANCH_ID, control)?;
     branch_head_control_precondition(GLOBAL_BRANCH_ID, observation.raw_token)
 }
 
@@ -390,11 +387,18 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(GLOBAL_BRANCH_ID)
+            .await
+            .expect("global control should load")
+            .expect("global control should exist");
         let snapshot = JsonSlot::from_json(&snapshot_content);
-        crate::live_state::stage_untracked_deltas(
+        let control = crate::live_state::stage_untracked_deltas(
             &read,
             &mut writes,
             GLOBAL_BRANCH_ID,
+            control,
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
@@ -413,6 +417,8 @@ mod tests {
         )
         .await
         .expect("test key-value current row should stage");
+        stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, control)
+            .expect("test global control should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

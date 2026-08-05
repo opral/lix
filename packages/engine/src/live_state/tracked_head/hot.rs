@@ -10904,6 +10904,9 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             ref_change_id: ChangeId::for_test_label("packed-system-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         assert!(
             reader
@@ -11269,6 +11272,9 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             ref_change_id: ChangeId::for_test_label("active-packed-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         let mut gc_writes = StorageWriteSet::new();
         stage_collect_stale_hot_generations(
@@ -11820,6 +11826,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             ref_change_id: ChangeId::for_test_label("certified-inherited-donor-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         let empty_control = BranchHeadControl {
             generation: CommitId::for_test_label("certified-inherited-empty"),
@@ -13208,6 +13217,9 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 ref_change_id: ChangeId::for_test_label("active-ref"),
+                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+                untracked_locator_generation: 0,
+                untracked_locator_count: 0,
             },
         )
         .expect("stage active control");
@@ -13234,6 +13246,9 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 ref_change_id: ChangeId::for_test_label("stale-ref"),
+                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+                untracked_locator_generation: 0,
+                untracked_locator_count: 0,
             },
         )
         .expect("stage stale control");

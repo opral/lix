@@ -398,23 +398,18 @@ where
         metadata: crate::json_store::JsonSlotRef::None,
         columnar_base_coordinate: None,
     }];
-    crate::live_state::stage_untracked_deltas(
+    let updated_control = crate::live_state::stage_untracked_deltas(
         &read,
         &mut writes,
         GLOBAL_BRANCH_ID,
+        control,
         &deltas,
         &[false],
     )
     .await
     .expect("deterministic mode current row should stage");
-    stage_branch_head_control(
-        &mut writes,
-        GLOBAL_BRANCH_ID,
-        control
-            .next_current_state_revision()
-            .expect("deterministic mode control revision should advance"),
-    )
-    .expect("deterministic mode control should stage");
+    stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, updated_control)
+        .expect("deterministic mode control should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
         .expect("deterministic mode row should commit");
@@ -609,6 +604,9 @@ async fn seed_visible_schema_rows<StorageImpl>(
             updated_at: timestamp,
             ref_change_id: *change_id,
             schema_presence_bloom: [0; 4],
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         control.note_schemas(rows.iter().map(|row| row.schema_key.as_str()));
         stage_branch_head_control(&mut writes, branch_id, control)

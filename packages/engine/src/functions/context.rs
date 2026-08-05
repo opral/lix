@@ -353,10 +353,11 @@ mod tests {
             .expect("global branch control should load")
             .expect("global branch control should exist");
         let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
-        crate::live_state::stage_untracked_deltas(
+        let control = crate::live_state::stage_untracked_deltas(
             &read,
             &mut writes,
             GLOBAL_BRANCH_ID,
+            control,
             &[CurrentStateDeltaRef {
                 schema_key: "lix_key_value",
                 file_id: None,
@@ -375,14 +376,8 @@ mod tests {
         )
         .await
         .expect("test key-value current row should stage");
-        stage_branch_head_control(
-            &mut writes,
-            GLOBAL_BRANCH_ID,
-            control
-                .next_current_state_revision()
-                .expect("global control revision should advance"),
-        )
-        .expect("global control should publish current state");
+        stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, control)
+            .expect("global control should publish current state");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

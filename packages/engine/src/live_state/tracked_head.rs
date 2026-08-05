@@ -595,6 +595,9 @@ fn stage_test_current_control(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("tracked-head-test-control"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         },
     )
 }
@@ -2145,6 +2148,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("working-diff-branch-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         }
     }
 
@@ -2931,6 +2937,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
 
         let read = storage
@@ -3402,6 +3411,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         let snapshot_content = r#"{"snapshot":true}"#;
         let long_metadata = format!("\"{}\"", "x".repeat(300));
@@ -3577,6 +3589,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         let mut writes = StorageWriteSet::new();
         for (entity, file_id) in [("a", "z-file"), ("b", "a-file")] {
@@ -3643,6 +3658,9 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+            untracked_locator_generation: 0,
+            untracked_locator_count: 0,
         };
         let entity_pk = EntityPk::single("row");
         let second_entity_pk = EntityPk::single("row-2");

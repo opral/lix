@@ -16406,6 +16406,7 @@ mod tests {
             CHECKPOINT_RECOVERY_REF_SPACE,
             CHECKPOINT_GC_STATE_SPACE,
             crate::live_state::UNTRACKED_ROW_SPACE,
+            crate::live_state::UNTRACKED_FILE_LOCATOR_SPACE,
         ];
         let mut seen = BTreeMap::new();
         for space in spaces {
