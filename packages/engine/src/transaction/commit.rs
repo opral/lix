@@ -3545,15 +3545,38 @@ async fn stage_tracked_head(
                 .map(current_state_delta_from_engine_row),
         );
         known_absent.resize(deltas.len(), false);
-        let previous_control = observations
+        let previous_control = if let Some(control) = observations
             .get(branch_id)
             .and_then(|observation| observation.control)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("missing branch control for untracked publication '{branch_id}'"),
-                )
-            })?;
+        {
+            control
+        } else {
+            let target = explicit_branch_targets
+                .get(branch_id)
+                .filter(|target| target.head_commit_id.is_some())
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("missing branch control for untracked publication '{branch_id}'"),
+                    )
+                })?;
+            let head_commit_id = target
+                .head_commit_id
+                .expect("explicit target was checked for a head commit");
+            BranchHeadControl {
+                head_commit_id,
+                generation: head_commit_id,
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: None,
+                created_at: target.created_at,
+                updated_at: target.updated_at,
+                ref_change_id: target.ref_change_id,
+                schema_presence_bloom: [0; 4],
+                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
+                untracked_locator_generation: 0,
+                untracked_locator_count: 0,
+            }
+        };
         let updated_control = if explicit_branch_targets
             .get(branch_id)
             .is_some_and(|target| target.head_commit_id.is_none())
@@ -5051,7 +5074,7 @@ async fn stage_branch_head_control_publications(
             None => None,
             Some(head_commit_id) => {
                 if existing.is_none() {
-                    let control = Box::pin(stage_root_backed_branch_publication(
+                    let mut control = Box::pin(stage_root_backed_branch_publication(
                         read,
                         writes,
                         branch_id,
@@ -5059,6 +5082,13 @@ async fn stage_branch_head_control_publications(
                         target,
                     ))
                     .await?;
+                    if let Some(untracked_control) = untracked_controls.get(branch_id) {
+                        control.untracked_locator_root = untracked_control.untracked_locator_root;
+                        control.untracked_locator_generation =
+                            untracked_control.untracked_locator_generation;
+                        control.untracked_locator_count = untracked_control.untracked_locator_count;
+                        control.current_state_revision = untracked_control.current_state_revision;
+                    }
                     root_backed_branch_publications.insert(branch_id.clone());
                     Some(control)
                 } else {

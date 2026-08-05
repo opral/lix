@@ -48,6 +48,8 @@ const LOCATOR_ROOT_MAGIC: &[u8] = b"LXULR1";
 const LOCATOR_ENTRY_MARKER: &[u8] = b"LXULE1";
 const LOCATOR_ROOT_TAG: u8 = 0;
 const LOCATOR_ENTRY_TAG: u8 = 1;
+const LOCATOR_SUMMARY_TAG: u8 = 2;
+const LOCATOR_SUMMARY_MAGIC: &[u8] = b"LXULS1";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -64,6 +66,10 @@ pub(crate) struct UntrackedMutationReadProfile {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct UntrackedFileLocatorReadProfile {
     pub(crate) root_point_reads: u64,
+    pub(crate) summary_point_reads: u64,
+    pub(crate) root_bytes_written: u64,
+    pub(crate) summary_writes: u64,
+    pub(crate) entry_writes: u64,
     pub(crate) locator_scans: u64,
     pub(crate) locator_rows: u64,
     pub(crate) authoritative_exact_reads: u64,
@@ -76,6 +82,10 @@ thread_local! {
     static PREVIOUS_SCAN_ROWS: Cell<u64> = const { Cell::new(0) };
     static PREVIOUS_SCAN_BYTES: Cell<u64> = const { Cell::new(0) };
     static LOCATOR_ROOT_POINT_READS: Cell<u64> = const { Cell::new(0) };
+    static LOCATOR_SUMMARY_POINT_READS: Cell<u64> = const { Cell::new(0) };
+    static LOCATOR_ROOT_BYTES_WRITTEN: Cell<u64> = const { Cell::new(0) };
+    static LOCATOR_SUMMARY_WRITES: Cell<u64> = const { Cell::new(0) };
+    static LOCATOR_ENTRY_WRITES: Cell<u64> = const { Cell::new(0) };
     static LOCATOR_SCANS: Cell<u64> = const { Cell::new(0) };
     static LOCATOR_ROWS: Cell<u64> = const { Cell::new(0) };
     static LOCATOR_AUTHORITATIVE_EXACT_READS: Cell<u64> = const { Cell::new(0) };
@@ -90,6 +100,14 @@ static PREVIOUS_SCAN_ROWS: AtomicU64 = AtomicU64::new(0);
 static PREVIOUS_SCAN_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "storage-benches", not(test)))]
 static LOCATOR_ROOT_POINT_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static LOCATOR_SUMMARY_POINT_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static LOCATOR_ROOT_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static LOCATOR_SUMMARY_WRITES: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static LOCATOR_ENTRY_WRITES: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "storage-benches", not(test)))]
 static LOCATOR_SCANS: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "storage-benches", not(test)))]
@@ -113,6 +131,10 @@ pub(crate) fn take_untracked_mutation_read_profile() -> UntrackedMutationReadPro
 pub(crate) fn take_untracked_file_locator_read_profile() -> UntrackedFileLocatorReadProfile {
     UntrackedFileLocatorReadProfile {
         root_point_reads: LOCATOR_ROOT_POINT_READS.with(|value| value.replace(0)),
+        summary_point_reads: LOCATOR_SUMMARY_POINT_READS.with(|value| value.replace(0)),
+        root_bytes_written: LOCATOR_ROOT_BYTES_WRITTEN.with(|value| value.replace(0)),
+        summary_writes: LOCATOR_SUMMARY_WRITES.with(|value| value.replace(0)),
+        entry_writes: LOCATOR_ENTRY_WRITES.with(|value| value.replace(0)),
         locator_scans: LOCATOR_SCANS.with(|value| value.replace(0)),
         locator_rows: LOCATOR_ROWS.with(|value| value.replace(0)),
         authoritative_exact_reads: LOCATOR_AUTHORITATIVE_EXACT_READS.with(|value| value.replace(0)),
@@ -177,6 +199,56 @@ fn record_locator_root_point_read() {
 fn record_locator_scan() {
     LOCATOR_SCANS.with(|value| value.set(value.get().saturating_add(1)));
 }
+
+#[cfg(test)]
+fn record_locator_summary_point_reads(keys: usize) {
+    LOCATOR_SUMMARY_POINT_READS.with(|value| {
+        value.set(
+            value
+                .get()
+                .saturating_add(u64::try_from(keys).unwrap_or(u64::MAX)),
+        )
+    });
+}
+
+#[cfg(test)]
+fn record_locator_root_write(bytes: usize) {
+    LOCATOR_ROOT_BYTES_WRITTEN.with(|value| {
+        value.set(
+            value
+                .get()
+                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        )
+    });
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_locator_root_write(bytes: usize) {
+    LOCATOR_ROOT_BYTES_WRITTEN
+        .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn record_locator_summary_write() {
+    LOCATOR_SUMMARY_WRITES.with(|value| value.set(value.get().saturating_add(1)));
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_locator_summary_write() {
+    LOCATOR_SUMMARY_WRITES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn record_locator_entry_write() {
+    LOCATOR_ENTRY_WRITES.with(|value| value.set(value.get().saturating_add(1)));
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_locator_entry_write() {
+    LOCATOR_ENTRY_WRITES.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_locator_summary_point_reads(keys: usize) {
+    LOCATOR_SUMMARY_POINT_READS
+        .fetch_add(u64::try_from(keys).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
 #[cfg(all(feature = "storage-benches", not(test)))]
 fn record_locator_scan() {
     LOCATOR_SCANS.fetch_add(1, Ordering::Relaxed);
@@ -211,6 +283,14 @@ fn record_locator_authoritative_exact_reads(keys: usize) {
 fn record_locator_rebuilt_row() {
     LOCATOR_REBUILT_ROWS.with(|value| value.set(value.get().saturating_add(1)));
 }
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_locator_summary_point_reads(_keys: usize) {}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_locator_root_write(_bytes: usize) {}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_locator_summary_write() {}
+#[cfg(not(any(test, feature = "storage-benches")))]
+fn record_locator_entry_write() {}
 #[cfg(all(feature = "storage-benches", not(test)))]
 fn record_locator_rebuilt_row() {
     LOCATOR_REBUILT_ROWS.fetch_add(1, Ordering::Relaxed);
@@ -232,6 +312,10 @@ fn record_locator_rebuilt_row() {}
 pub(crate) fn take_untracked_file_locator_read_profile() -> UntrackedFileLocatorReadProfile {
     UntrackedFileLocatorReadProfile {
         root_point_reads: LOCATOR_ROOT_POINT_READS.swap(0, Ordering::Relaxed),
+        summary_point_reads: LOCATOR_SUMMARY_POINT_READS.swap(0, Ordering::Relaxed),
+        root_bytes_written: LOCATOR_ROOT_BYTES_WRITTEN.swap(0, Ordering::Relaxed),
+        summary_writes: LOCATOR_SUMMARY_WRITES.swap(0, Ordering::Relaxed),
+        entry_writes: LOCATOR_ENTRY_WRITES.swap(0, Ordering::Relaxed),
         locator_scans: LOCATOR_SCANS.swap(0, Ordering::Relaxed),
         locator_rows: LOCATOR_ROWS.swap(0, Ordering::Relaxed),
         authoritative_exact_reads: LOCATOR_AUTHORITATIVE_EXACT_READS.swap(0, Ordering::Relaxed),
@@ -383,6 +467,38 @@ async fn load_locator_root(
         ));
     }
     Ok(root)
+}
+
+async fn load_locator_summaries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    file_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Option<LocatorSummary>>, LixError> {
+    if file_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let names = file_ids.iter().cloned().collect::<Vec<_>>();
+    let keys = names
+        .iter()
+        .map(|file_id| locator_summary_key(branch_id, file_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    record_locator_summary_point_reads(keys.len());
+    let values = PointReadPlan::from_unique_keys(UNTRACKED_FILE_LOCATOR_SPACE, keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
+    let mut summaries = BTreeMap::new();
+    for (file_id, value) in names.into_iter().zip(values) {
+        let summary = match value {
+            None => None,
+            Some(StorageProjectedValue::FullValue(value)) => Some(decode_locator_summary(&value)?),
+            Some(StorageProjectedValue::KeyOnly) => {
+                return Err(codec_error("untracked locator summary omitted its value"));
+            }
+        };
+        summaries.insert(file_id, summary);
+    }
+    Ok(summaries)
 }
 
 struct LocatorMember {
@@ -687,12 +803,40 @@ async fn stage_untracked_deltas_inner(
         .filter(|delta| delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted)
         .map(|delta| delta.entity_pk.as_single_string_owned())
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let affected_file_ids = deltas
+        .iter()
+        .filter_map(|delta| delta.file_id.map(str::to_owned))
+        .chain(deleted_file_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let new_file_ids = deltas
+        .iter()
+        .zip(known_absent)
+        .filter(|(delta, absent)| {
+            delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && !delta.deleted && **absent
+        })
+        .map(|(delta, _)| delta.entity_pk.as_single_string_owned())
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let affected_file_ids = affected_file_ids
+        .into_iter()
+        .chain(new_file_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut locator_summaries =
+        load_locator_summaries(store, branch_id, &affected_file_ids).await?;
+    // A live file descriptor owns a zero-member summary even before its first
+    // member. This lifecycle anchor makes simultaneous loss of a summary and
+    // all of its entries fail closed instead of being mistaken for emptiness.
+    for file_id in &new_file_ids {
+        locator_summaries
+            .entry(file_id.clone())
+            .or_insert(Some(LocatorSummary::default()));
+    }
     let mut locator_delete_keys = BTreeSet::new();
     if !deleted_file_ids.is_empty() {
         stage_file_cascade_from_locator(
             store,
             branch_id,
             &mut locator_root,
+            &mut locator_summaries,
             &deleted_file_ids,
             &mut mutations,
             &mut retired_refs,
@@ -745,14 +889,27 @@ async fn stage_untracked_deltas_inner(
             continue;
         }
         let key = locator_entry_key(branch_id, file_id, delta.schema_key, delta.entity_pk)?;
-        let summary = locator_root.files.entry(file_id.to_owned()).or_default();
+        let summary = locator_summaries
+            .entry(file_id.to_owned())
+            .or_insert_with(|| Some(LocatorSummary::default()))
+            .get_or_insert_default();
         if delta.deleted {
             if !*absent {
+                if summary.count == 0 {
+                    return Err(codec_error(
+                        "untracked locator member deletion has no authenticated summary",
+                    ));
+                }
                 summary.count = summary
                     .count
                     .checked_sub(1)
                     .ok_or_else(|| codec_error("untracked locator member count underflowed"))?;
                 xor_digest(&mut summary.digest, locator_key_digest(&key));
+                locator_root.count = locator_root
+                    .count
+                    .checked_sub(1)
+                    .ok_or_else(|| codec_error("untracked locator total count underflowed"))?;
+                xor_digest(&mut locator_root.digest, locator_key_digest(&key));
                 locator_delete_keys.insert(key);
             }
         } else if *absent {
@@ -761,6 +918,12 @@ async fn stage_untracked_deltas_inner(
                 .checked_add(1)
                 .ok_or_else(|| codec_error("untracked locator member count overflowed"))?;
             xor_digest(&mut summary.digest, locator_key_digest(&key));
+            locator_root.count = locator_root
+                .count
+                .checked_add(1)
+                .ok_or_else(|| codec_error("untracked locator total count overflowed"))?;
+            xor_digest(&mut locator_root.digest, locator_key_digest(&key));
+            record_locator_entry_write();
             writes.put(
                 UNTRACKED_FILE_LOCATOR_SPACE,
                 key,
@@ -787,20 +950,12 @@ async fn stage_untracked_deltas_inner(
         );
         return control.next_current_state_revision();
     }
-    locator_root.files.retain(|_, summary| summary.count != 0);
-    locator_root.count = locator_root
-        .files
-        .values()
-        .try_fold(0_u64, |count, summary| {
-            count
-                .checked_add(summary.count)
-                .ok_or_else(|| codec_error("untracked locator total count overflowed"))
-        })?;
     locator_root.generation = control
         .untracked_locator_generation
         .checked_add(1)
         .ok_or_else(|| codec_error("untracked locator generation overflowed"))?;
     let root_bytes = encode_locator_root(&locator_root)?;
+    record_locator_root_write(root_bytes.len());
     writes.put(
         UNTRACKED_FILE_LOCATOR_SPACE,
         locator_root_key(branch_id)?,
@@ -809,7 +964,27 @@ async fn stage_untracked_deltas_inner(
         },
     );
     for key in locator_delete_keys {
+        record_locator_entry_write();
         writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key);
+    }
+    for (file_id, summary) in locator_summaries {
+        let key = locator_summary_key(branch_id, &file_id)?;
+        match summary {
+            Some(summary) if summary.count != 0 => {
+                record_locator_summary_write();
+                writes.put(
+                    UNTRACKED_FILE_LOCATOR_SPACE,
+                    key,
+                    StorageValue {
+                        bytes: encode_locator_summary(&summary),
+                    },
+                )
+            }
+            _ => {
+                record_locator_summary_write();
+                writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key)
+            }
+        }
     }
 
     for (key, value) in mutations {
@@ -829,13 +1004,14 @@ async fn stage_file_cascade_from_locator(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     locator_root: &mut LocatorRoot,
+    locator_summaries: &mut BTreeMap<String, Option<LocatorSummary>>,
     deleted_file_ids: &BTreeSet<String>,
     mutations: &mut BTreeMap<StorageKey, Option<StorageValue>>,
     retired_refs: &mut BTreeSet<[u8; 32]>,
     locator_delete_keys: &mut BTreeSet<StorageKey>,
 ) -> Result<(), LixError> {
     for file_id in deleted_file_ids {
-        let expected = locator_root.files.get(file_id);
+        let expected = locator_summaries.get(file_id).and_then(Option::as_ref);
         let members = scan_locator_members(store, branch_id, file_id, expected).await?;
         let authoritative = validate_locator_authority(store, branch_id, &members).await?;
         for member in members {
@@ -853,9 +1029,15 @@ async fn stage_file_cascade_from_locator(
                 collect_value_refs(&decode_value(staged.bytes.clone())?, retired_refs);
             }
             mutations.insert(key, None);
+            let locator_key_digest_value = locator_key_digest(&member.locator_key);
             locator_delete_keys.insert(member.locator_key);
+            locator_root.count = locator_root
+                .count
+                .checked_sub(1)
+                .ok_or_else(|| codec_error("untracked locator total count underflowed"))?;
+            xor_digest(&mut locator_root.digest, locator_key_digest_value);
         }
-        locator_root.files.remove(file_id);
+        locator_summaries.insert(file_id.clone(), None);
     }
     Ok(())
 }
@@ -917,6 +1099,20 @@ pub(crate) async fn stage_delete_untracked_file_locator(
                     decode_locator_key(&entry.key.0)?;
                     keys.push(entry.key);
                 }
+                Some(LOCATOR_SUMMARY_TAG) => {
+                    let mut offset = prefix.len() + 1;
+                    read_text(&entry.key.0, &mut offset, "locator summary file")?;
+                    if offset != entry.key.0.len() {
+                        return Err(codec_error(
+                            "untracked locator summary key has trailing bytes",
+                        ));
+                    }
+                    let StorageProjectedValue::FullValue(value) = entry.value else {
+                        return Err(codec_error("untracked locator deletion omitted a summary"));
+                    };
+                    decode_locator_summary(&value)?;
+                    keys.push(entry.key);
+                }
                 _ => {
                     return Err(codec_error(
                         "untracked locator deletion found an invalid key",
@@ -958,6 +1154,7 @@ pub(crate) async fn rebuild_untracked_file_locator(
     );
     let mut resume_after = None;
     let mut rebuilt_entries = Vec::<StorageKey>::new();
+    let mut rebuilt_summaries = BTreeMap::<String, LocatorSummary>::new();
     let mut rebuilt_root = LocatorRoot {
         generation: control
             .untracked_locator_generation
@@ -1001,12 +1198,17 @@ pub(crate) async fn rebuild_untracked_file_locator(
                 &identity.schema_key,
                 &identity.entity_pk,
             )?;
-            let summary = rebuilt_root.files.entry(file_id.to_owned()).or_default();
+            let summary = rebuilt_summaries.entry(file_id.to_owned()).or_default();
             summary.count = summary
                 .count
                 .checked_add(1)
                 .ok_or_else(|| codec_error("untracked locator member count overflowed"))?;
             xor_digest(&mut summary.digest, locator_key_digest(&locator_key));
+            rebuilt_root.count = rebuilt_root
+                .count
+                .checked_add(1)
+                .ok_or_else(|| codec_error("untracked locator total count overflowed"))?;
+            xor_digest(&mut rebuilt_root.digest, locator_key_digest(&locator_key));
             rebuilt_entries.push(locator_key);
             record_locator_rebuilt_row();
         }
@@ -1015,14 +1217,6 @@ pub(crate) async fn rebuild_untracked_file_locator(
         }
         resume_after = next_cursor;
     }
-    rebuilt_root.count = rebuilt_root
-        .files
-        .values()
-        .try_fold(0_u64, |count, summary| {
-            count
-                .checked_add(summary.count)
-                .ok_or_else(|| codec_error("untracked locator total count overflowed"))
-        })?;
     let locator_prefix = branch_prefix(branch_id)?;
     let locator_plan = ScanPlan::prefix(
         UNTRACKED_FILE_LOCATOR_SPACE,
@@ -1048,32 +1242,11 @@ pub(crate) async fn rebuild_untracked_file_locator(
             page.value.entries.iter().map(|entry| &entry.key),
             page.value.has_more,
         )?;
+        // Rebuild is the explicit repair boundary: after the authoritative
+        // scan has validated every row, old projection bytes are opaque and
+        // are deleted/replaced regardless of stale markers or key grammar.
         for entry in page.value.entries {
-            let suffix = entry
-                .key
-                .0
-                .get(locator_prefix.len()..)
-                .ok_or_else(|| codec_error("untracked locator key escaped branch prefix"))?;
-            match suffix.first().copied() {
-                Some(LOCATOR_ROOT_TAG) if suffix.len() == 1 => {}
-                Some(LOCATOR_ENTRY_TAG) => {
-                    let StorageProjectedValue::FullValue(value) = entry.value else {
-                        return Err(codec_error("untracked locator rebuild omitted a marker"));
-                    };
-                    if value.as_ref() != LOCATOR_ENTRY_MARKER {
-                        return Err(codec_error(
-                            "untracked locator rebuild found a malformed marker",
-                        ));
-                    }
-                    decode_locator_key(&entry.key.0)?;
-                    old_locator_keys.push(entry.key);
-                }
-                _ => {
-                    return Err(codec_error(
-                        "untracked locator rebuild found an invalid key",
-                    ));
-                }
-            }
+            old_locator_keys.push(entry.key);
         }
         if !page.value.has_more {
             break;
@@ -1081,31 +1254,46 @@ pub(crate) async fn rebuild_untracked_file_locator(
         resume_after = next_cursor;
     }
     let root_bytes = encode_locator_root(&rebuilt_root)?;
-    let old_locator_set = old_locator_keys.iter().cloned().collect::<BTreeSet<_>>();
-    let rebuilt_locator_set = rebuilt_entries.iter().cloned().collect::<BTreeSet<_>>();
+    let root_key = locator_root_key(branch_id)?;
+    let mut rebuilt_locator_set = rebuilt_entries.iter().cloned().collect::<BTreeSet<_>>();
+    for file_id in rebuilt_summaries.keys() {
+        rebuilt_locator_set.insert(locator_summary_key(branch_id, file_id)?);
+    }
+    rebuilt_locator_set.insert(root_key.clone());
     for key in old_locator_keys {
         if !rebuilt_locator_set.contains(&key) {
+            record_locator_entry_write();
             writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key);
         }
     }
     for key in rebuilt_entries {
-        if !old_locator_set.contains(&key) {
-            writes.put(
-                UNTRACKED_FILE_LOCATOR_SPACE,
-                key,
-                StorageValue {
-                    bytes: Bytes::from_static(LOCATOR_ENTRY_MARKER),
-                },
-            );
-        }
+        record_locator_entry_write();
+        writes.put(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            key,
+            StorageValue {
+                bytes: Bytes::from_static(LOCATOR_ENTRY_MARKER),
+            },
+        );
+    }
+    for (file_id, summary) in rebuilt_summaries {
+        record_locator_summary_write();
+        writes.put(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            locator_summary_key(branch_id, &file_id)?,
+            StorageValue {
+                bytes: encode_locator_summary(&summary),
+            },
+        );
     }
     writes.put(
         UNTRACKED_FILE_LOCATOR_SPACE,
-        locator_root_key(branch_id)?,
+        root_key,
         StorageValue {
             bytes: root_bytes.clone(),
         },
     );
+    record_locator_root_write(root_bytes.len());
     update_locator_control(control, &rebuilt_root, &root_bytes)
 }
 
@@ -1515,6 +1703,19 @@ async fn validate_file_locator_branches(
                     }
                     decode_locator_key(&entry.key.0)?;
                 }
+                LOCATOR_SUMMARY_TAG => {
+                    let mut summary_offset = offset;
+                    read_text(&entry.key.0, &mut summary_offset, "locator summary file")?;
+                    if summary_offset != entry.key.0.len() {
+                        return Err(codec_error(
+                            "untracked locator summary key has trailing bytes",
+                        ));
+                    }
+                    let StorageProjectedValue::FullValue(value) = entry.value else {
+                        return Err(codec_error("untracked locator summary omitted its value"));
+                    };
+                    decode_locator_summary(&value)?;
+                }
                 _ => return Err(codec_error("untracked locator key has an invalid tag")),
             }
         }
@@ -1692,7 +1893,7 @@ struct LocatorSummary {
 struct LocatorRoot {
     generation: u64,
     count: u64,
-    files: BTreeMap<String, LocatorSummary>,
+    digest: [u8; 32],
 }
 
 fn locator_root_key(branch_id: &str) -> Result<StorageKey, LixError> {
@@ -1723,6 +1924,13 @@ fn locator_entry_prefix(branch_id: &str, file_id: &str) -> Result<Vec<u8>, LixEr
     Ok(prefix)
 }
 
+fn locator_summary_key(branch_id: &str, file_id: &str) -> Result<StorageKey, LixError> {
+    let mut key = branch_prefix(branch_id)?;
+    key.push(LOCATOR_SUMMARY_TAG);
+    push_text(&mut key, file_id)?;
+    Ok(StorageKey(Bytes::from(key)))
+}
+
 fn locator_key_digest(key: &StorageKey) -> [u8; 32] {
     *blake3::hash(&key.0).as_bytes()
 }
@@ -1738,14 +1946,7 @@ fn encode_locator_root(root: &LocatorRoot) -> Result<Bytes, LixError> {
     bytes.extend_from_slice(LOCATOR_ROOT_MAGIC);
     bytes.extend_from_slice(&root.generation.to_be_bytes());
     bytes.extend_from_slice(&root.count.to_be_bytes());
-    let file_count = u32::try_from(root.files.len())
-        .map_err(|_| codec_error("untracked locator root has too many files"))?;
-    bytes.extend_from_slice(&file_count.to_be_bytes());
-    for (file_id, summary) in &root.files {
-        push_text(&mut bytes, file_id)?;
-        bytes.extend_from_slice(&summary.count.to_be_bytes());
-        bytes.extend_from_slice(&summary.digest);
-    }
+    bytes.extend_from_slice(&root.digest);
     Ok(Bytes::from(bytes))
 }
 
@@ -1764,52 +1965,46 @@ fn decode_locator_root(bytes: &Bytes) -> Result<LocatorRoot, LixError> {
             .try_into()
             .expect("eight bytes"),
     );
-    let file_count = u32::from_be_bytes(
-        take(bytes, &mut offset, 4, "locator file count")?
-            .try_into()
-            .expect("four bytes"),
-    );
-    let mut files = BTreeMap::new();
-    for _ in 0..file_count {
-        let file_id = read_text(bytes, &mut offset, "locator file")?;
-        let summary_count = u64::from_be_bytes(
-            take(bytes, &mut offset, 8, "locator member count")?
-                .try_into()
-                .expect("eight bytes"),
-        );
-        let digest = take(bytes, &mut offset, 32, "locator digest")?
-            .try_into()
-            .expect("thirty-two bytes");
-        if files
-            .insert(
-                file_id,
-                LocatorSummary {
-                    count: summary_count,
-                    digest,
-                },
-            )
-            .is_some()
-        {
-            return Err(codec_error("untracked locator root repeats a file"));
-        }
-    }
+    let digest = take(bytes, &mut offset, 32, "locator digest")?
+        .try_into()
+        .expect("thirty-two bytes");
     if offset != bytes.len() {
         return Err(codec_error("untracked locator root has trailing bytes"));
-    }
-    let summed = files.values().try_fold(0_u64, |sum, summary| {
-        sum.checked_add(summary.count)
-            .ok_or_else(|| codec_error("untracked locator member count overflowed"))
-    })?;
-    if summed != count {
-        return Err(codec_error(
-            "untracked locator root total count disagrees with file summaries",
-        ));
     }
     Ok(LocatorRoot {
         generation,
         count,
-        files,
+        digest,
     })
+}
+
+fn encode_locator_summary(summary: &LocatorSummary) -> Bytes {
+    let mut bytes = Vec::with_capacity(LOCATOR_SUMMARY_MAGIC.len() + 8 + 32);
+    bytes.extend_from_slice(LOCATOR_SUMMARY_MAGIC);
+    bytes.extend_from_slice(&summary.count.to_be_bytes());
+    bytes.extend_from_slice(&summary.digest);
+    Bytes::from(bytes)
+}
+
+fn decode_locator_summary(bytes: &Bytes) -> Result<LocatorSummary, LixError> {
+    if !bytes.starts_with(LOCATOR_SUMMARY_MAGIC) {
+        return Err(codec_error(
+            "untracked locator summary has an invalid format",
+        ));
+    }
+    let mut offset = LOCATOR_SUMMARY_MAGIC.len();
+    let count = u64::from_be_bytes(
+        take(bytes, &mut offset, 8, "locator summary count")?
+            .try_into()
+            .expect("eight bytes"),
+    );
+    let digest = take(bytes, &mut offset, 32, "locator summary digest")?
+        .try_into()
+        .expect("thirty-two bytes");
+    if offset != bytes.len() {
+        return Err(codec_error("untracked locator summary has trailing bytes"));
+    }
+    Ok(LocatorSummary { count, digest })
 }
 
 fn locator_root_hash(bytes: &Bytes) -> [u8; 32] {
