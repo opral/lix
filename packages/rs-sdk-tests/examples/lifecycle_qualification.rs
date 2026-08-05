@@ -202,7 +202,7 @@ where
 
     let retention_ok = exercise_retention(&lix).await;
     let (undo_ms, redo_ms, undo_redo_ok) = exercise_undo_redo(&lix).await;
-    let (branch_ms, merge_preview_ms, merge_ms, branch_delete_ms, merge_ok) =
+    let (branch_ms, merge_preview_ms, merge_ms, branch_delete_ms, merge_ok, branch_details) =
         exercise_branches_and_merge(&lix, rows, shape).await;
 
     let gc_start = Instant::now();
@@ -321,6 +321,7 @@ where
             "undo": undo_ms,
             "redo": redo_ms,
             "branch_create_advance_switch": branch_ms,
+            "branch_detail": branch_details,
             "merge_preview": merge_preview_ms,
             "merge_commit": merge_ms,
             "branch_delete": branch_delete_ms,
@@ -473,15 +474,18 @@ async fn exercise_branches_and_merge<S>(
     lix: &Lix<S>,
     rows: usize,
     shape: MergeShape,
-) -> (f64, f64, f64, f64, bool)
+) -> (f64, f64, f64, f64, bool, JsonValue)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let active_branch_start = Instant::now();
     let main_branch_id = lix
         .active_branch_id()
         .await
         .expect("read lifecycle main branch");
+    let active_branch_ms = millis(active_branch_start.elapsed());
     let branch_start = Instant::now();
+    let branch_create_start = Instant::now();
     let branch = lix
         .create_branch(CreateBranchOptions {
             id: Some(SOURCE_BRANCH_ID.to_owned()),
@@ -490,19 +494,28 @@ where
         })
         .await
         .expect("create lifecycle source branch");
+    let branch_create_ms = millis(branch_create_start.elapsed());
+    let switch_to_source_start = Instant::now();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: branch.id.clone(),
     })
     .await
     .expect("switch to lifecycle source branch");
+    let switch_to_source_ms = millis(switch_to_source_start.elapsed());
     let changes = merge_change_count(rows, shape);
+    let source_update_start = Instant::now();
     update_files(lix, rows / 2, changes, "source-merge").await;
+    let source_update_ms = millis(source_update_start.elapsed());
+    let switch_to_target_start = Instant::now();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: main_branch_id,
     })
     .await
     .expect("switch to lifecycle target branch");
+    let switch_to_target_ms = millis(switch_to_target_start.elapsed());
+    let target_update_start = Instant::now();
     update_files(lix, 1, changes, "target-merge").await;
+    let target_update_ms = millis(target_update_start.elapsed());
     let branch_ms = millis(branch_start.elapsed());
 
     let preview_start = Instant::now();
@@ -539,6 +552,14 @@ where
         merge_ms,
         branch_delete_ms,
         merge_ok,
+        json!({
+            "active_branch_id": active_branch_ms,
+            "create": branch_create_ms,
+            "switch_to_source": switch_to_source_ms,
+            "source_update": source_update_ms,
+            "switch_to_target": switch_to_target_ms,
+            "target_update": target_update_ms,
+        }),
     )
 }
 
