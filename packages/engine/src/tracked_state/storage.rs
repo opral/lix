@@ -9872,6 +9872,83 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
     Ok(())
 }
 
+/// Deletes one authenticated physical commit authority by identity.  Ordinary
+/// GC uses this point-shaped helper after a reachability delta has proved the
+/// root unreachable; it never scans the inventory space to discover rows.
+pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    manifest: &CommitStateManifest,
+) -> Result<(), LixError> {
+    writes.delete(
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        key(commit_state_manifest_key(commit_id)),
+    );
+    writes.delete(
+        TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        key(commit_mutation_inventory_key(commit_id)),
+    );
+    for (segment_index, part) in manifest.mutations.parts.iter().enumerate() {
+        writes.delete(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            key(commit_delta_segment_key_for_part(
+                commit_id,
+                segment_index,
+                part,
+            )?),
+        );
+    }
+    for (segment_index, digest) in manifest
+        .mutations
+        .replacement_part_digests
+        .iter()
+        .enumerate()
+    {
+        let mut segment_key = commit_delta_segment_key(commit_id, segment_index)?;
+        segment_key.extend_from_slice(digest);
+        writes.delete(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, key(segment_key));
+    }
+    if let Some(parts) = manifest.mutations.columnar_parts.as_ref() {
+        let owner = CommitId::new(uuid::Uuid::from_bytes(parts.owner_commit_id));
+        if owner != commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("retired columnar mutation authority '{commit_id}' names owner '{owner}'"),
+            ));
+        }
+        let row_group_id = crate::live_state::entity_row_group_set_id(commit_id, &parts.schema_key);
+        if row_group_id.as_bytes() != parts.row_group_set_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "retired columnar mutation authority '{commit_id}' names an unexpected row-group set"
+                ),
+            ));
+        }
+        let row_group_manifest = crate::columnar_row_group::load_row_group_manifest(store, row_group_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "retired columnar mutation authority '{commit_id}' is missing its row-group manifest"
+                    ),
+                )
+            })?;
+        if row_group_manifest.content_digest()? != parts.manifest_digest {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "retired columnar mutation authority '{commit_id}' has a row-group digest mismatch"
+                ),
+            ));
+        }
+        crate::columnar_row_group::stage_delete_row_group_set(store, writes, row_group_id).await?;
+    }
+    Ok(())
+}
+
 async fn scan_full_space(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,

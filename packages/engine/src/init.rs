@@ -42,15 +42,15 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V58 splits immutable commit-state authority into a compact header and an
-/// authenticated, hierarchical mutation catalog. Semantic commit facts remain
+/// V59 adds the authenticated root-reachability frontier consumed by ordinary
+/// GC on top of the compact immutable commit-state authority. Semantic commit facts remain
 /// owned exclusively by `changelog.commit`; canonical snapshot metadata stays
 /// inside the immutable physical authority while its content-addressed tree
 /// chunks remain rebuildable.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v58";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v60";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -498,6 +498,7 @@ where
         }
     }
     crate::catalog::stage_catalog_revision(&mut writes);
+    crate::gc::stage_reachability_queue_seed(&mut writes)?;
     stage_repository_protocol(&mut writes);
 
     storage

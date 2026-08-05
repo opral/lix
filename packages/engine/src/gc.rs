@@ -11,19 +11,25 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::branch::BranchHeadControlContext;
+#[cfg(test)]
+use crate::changelog::ChangeRecord;
 use crate::changelog::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeRecord, ChangeScanRequest,
+    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeScanRequest,
     ChangelogContext, ChangelogReader, CommitId, CommitScanRequest, GcLiveSet, GcPlan, GcRepairSet,
     GcRoot, GcSweepSet, change_key, commit_change_id_key, commit_key,
 };
+use crate::commit_graph::CommitGraphContext;
+use crate::json_store::JsonRef;
+#[cfg(test)]
 use crate::json_store::{
-    JsonRef, JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
+    JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
 };
+#[cfg(test)]
 use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
-    StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageKey, StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageScanOptions,
+    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -35,10 +41,22 @@ pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::mut
 pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
+/// Authenticated publication deltas are the sole ordinary-GC input.  The
+/// queue is mutable because its head/tail are CAS-protected, while each
+/// record is immutable after publication and addressed by a monotonic slot.
+pub(crate) const GC_REACHABILITY_DELTA_NAMESPACE: &str = "gc.reachability_delta.v1";
+pub(crate) const GC_REACHABILITY_DELTA_SPACE: StorageSpace =
+    StorageSpace::mutable(StorageSpaceId(0x0008_0003), GC_REACHABILITY_DELTA_NAMESPACE);
+pub(crate) const GC_REACHABILITY_QUEUE_NAMESPACE: &str = "gc.reachability_queue.v1";
+pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace =
+    StorageSpace::mutable(StorageSpaceId(0x0008_0004), GC_REACHABILITY_QUEUE_NAMESPACE);
 
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
+const GC_REACHABILITY_FORMAT_VERSION: u32 = 2;
+const GC_REACHABILITY_QUEUE_KEY: &[u8] = b"queue";
+const GC_REACHABILITY_BATCH_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointRecoveryRef {
@@ -90,7 +108,7 @@ struct CheckpointRecoveryRefKey<'a> {
     branch_id: &'a str,
 }
 
-#[derive(musli::Encode, musli::Decode)]
+#[derive(Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct StoredCheckpointRecoveryRef {
     format_version: u32,
@@ -107,6 +125,65 @@ struct StoredCheckpointGcState {
     checkpoint_sequence: u64,
     last_gc_sequence: u64,
     collectible_interval_count: u64,
+}
+
+/// One branch-root transition.  The digest fields bind the delta to the
+/// exact control bytes observed by the publisher; a queue record with a
+/// forged root or stale CAS token is rejected before any physical delete is
+/// staged.
+#[derive(Clone, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredRootReachabilityDelta {
+    branch_id: String,
+    #[musli(with = storage_codec::option)]
+    old_root: Option<CommitId>,
+    #[musli(with = storage_codec::option)]
+    new_root: Option<CommitId>,
+    #[musli(with = storage_codec::option)]
+    old_control: Option<crate::branch::BranchHeadControl>,
+    #[musli(with = storage_codec::option)]
+    new_control: Option<crate::branch::BranchHeadControl>,
+    old_control_digest: [u8; 32],
+    new_control_digest: [u8; 32],
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredRootReachabilityBatch {
+    format_version: u32,
+    sequence: u64,
+    deltas: Vec<StoredRootReachabilityDelta>,
+    checkpoint_roots: Vec<CommitId>,
+    digest: [u8; 32],
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredRootReachabilityBatchBody {
+    format_version: u32,
+    sequence: u64,
+    deltas: Vec<StoredRootReachabilityDelta>,
+    checkpoint_roots: Vec<CommitId>,
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredReachabilityQueue {
+    format_version: u32,
+    head_sequence: u64,
+    tail_sequence: u64,
+    next_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RootReachabilityDelta {
+    pub(crate) branch_id: String,
+    pub(crate) old_root: Option<CommitId>,
+    pub(crate) new_root: Option<CommitId>,
+    pub(crate) old_control: Option<crate::branch::BranchHeadControl>,
+    pub(crate) new_control: Option<crate::branch::BranchHeadControl>,
+    pub(crate) old_control_digest: [u8; 32],
+    pub(crate) new_control_digest: [u8; 32],
 }
 
 /// Stages one branch's recovery-root rotation.
@@ -167,6 +244,284 @@ pub(crate) fn stage_checkpoint_gc_state(
         },
     );
     Ok(())
+}
+
+/// Seeds the empty authenticated frontier during repository initialization.
+/// There is deliberately no reader-side migration: a repository without this
+/// control is an old protocol and ordinary GC fails closed.
+pub(crate) fn stage_reachability_queue_seed(writes: &mut StorageWriteSet) -> Result<(), LixError> {
+    let value = storage_codec::encode(
+        "GC reachability queue",
+        &StoredReachabilityQueue {
+            format_version: GC_REACHABILITY_FORMAT_VERSION,
+            head_sequence: 0,
+            tail_sequence: 0,
+            next_sequence: 1,
+        },
+    )?;
+    writes.put(
+        GC_REACHABILITY_QUEUE_SPACE,
+        StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
+        StorageValue {
+            bytes: Bytes::from(value),
+        },
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn ensure_reachability_queue_for_test(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+) -> Result<bool, LixError> {
+    let result = PointReadPlan::new(
+        GC_REACHABILITY_QUEUE_SPACE,
+        &[StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY))],
+    )
+    .materialize(read, StorageGetOptions::default())
+    .await?;
+    if result.value.into_iter().next().flatten().is_none() {
+        stage_reachability_queue_seed(writes)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn reachability_sequence_key(sequence: u64) -> StorageKey {
+    StorageKey(Bytes::copy_from_slice(&sequence.to_be_bytes()))
+}
+
+async fn load_reachability_queue(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(StoredReachabilityQueue, Bytes), LixError> {
+    let result = PointReadPlan::new(
+        GC_REACHABILITY_QUEUE_SPACE,
+        &[StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    let Some(Some(StorageProjectedValue::FullValue(bytes))) = result.value.into_iter().next()
+    else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "authenticated GC reachability queue is missing",
+        ));
+    };
+    let queue: StoredReachabilityQueue = storage_codec::decode("GC reachability queue", &bytes)?;
+    if queue.format_version != GC_REACHABILITY_FORMAT_VERSION
+        || queue.next_sequence == 0
+        || (queue.head_sequence == 0) != (queue.tail_sequence == 0)
+        || (queue.head_sequence != 0 && queue.head_sequence > queue.tail_sequence)
+        || queue.tail_sequence >= queue.next_sequence
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "authenticated GC reachability queue has invalid bounds",
+        ));
+    }
+    Ok((queue, bytes))
+}
+
+fn root_control_digest(raw: Option<&Bytes>) -> [u8; 32] {
+    match raw {
+        Some(raw) => *blake3::hash(raw.as_ref()).as_bytes(),
+        None => *blake3::hash(b"lix.gc.root.absent.v1").as_bytes(),
+    }
+}
+
+fn validate_stored_root_reachability_delta(
+    delta: &StoredRootReachabilityDelta,
+) -> Result<(), LixError> {
+    if delta.branch_id.is_empty()
+        || delta.old_control_digest == [0; 32]
+        || delta.new_control_digest == [0; 32]
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "GC reachability delta has an invalid branch or control digest",
+        ));
+    }
+    if root_control_digest_for_control(delta.old_control.as_ref())? != delta.old_control_digest
+        || root_control_digest_for_control(delta.new_control.as_ref())? != delta.new_control_digest
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "GC reachability delta for branch '{}' has a control digest mismatch",
+                delta.branch_id
+            ),
+        ));
+    }
+    match (delta.old_root, delta.old_control) {
+        (Some(root), Some(control)) if control.head_commit_id == root => {}
+        (None, None) => {}
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "GC reachability delta for branch '{}' has an invalid old-root binding",
+                    delta.branch_id
+                ),
+            ));
+        }
+    }
+    match (delta.new_root, delta.new_control) {
+        (Some(root), Some(control)) if control.head_commit_id == root => {}
+        (None, None) => {}
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "GC reachability delta for branch '{}' has an invalid new-root binding",
+                    delta.branch_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn root_control_digest_for_control(
+    control: Option<&crate::branch::BranchHeadControl>,
+) -> Result<[u8; 32], LixError> {
+    let Some(control) = control else {
+        return Ok(root_control_digest(None));
+    };
+    let bytes = storage_codec::encode("branch-head control", control)?;
+    Ok(root_control_digest(Some(&Bytes::from(bytes))))
+}
+
+fn encode_reachability_batch_body(
+    sequence: u64,
+    deltas: Vec<StoredRootReachabilityDelta>,
+    checkpoint_roots: Vec<CommitId>,
+) -> Result<(StoredRootReachabilityBatchBody, [u8; 32]), LixError> {
+    let body = StoredRootReachabilityBatchBody {
+        format_version: GC_REACHABILITY_FORMAT_VERSION,
+        sequence,
+        deltas,
+        checkpoint_roots,
+    };
+    let encoded = storage_codec::encode("GC reachability delta body", &body)?;
+    Ok((body, *blake3::hash(&encoded).as_bytes()))
+}
+
+/// Appends one transaction's complete root transition set.  A single queue
+/// CAS makes branch advance/delete and checkpoint pin publication atomic with
+/// their controls; consumers never infer liveness from semantic parent rows.
+pub(crate) async fn stage_reachability_delta_batch(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    deltas: &[RootReachabilityDelta],
+    checkpoint_roots: &[CommitId],
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<(), LixError> {
+    if deltas.is_empty() && checkpoint_roots.is_empty() {
+        return Ok(());
+    }
+    let (mut queue, raw_queue) = load_reachability_queue(read).await?;
+    let sequence = queue.next_sequence;
+    queue.next_sequence = queue.next_sequence.checked_add(1).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "GC reachability queue sequence overflow",
+        )
+    })?;
+    if queue.head_sequence == 0 {
+        queue.head_sequence = sequence;
+    }
+    queue.tail_sequence = sequence;
+    let stored_deltas = deltas
+        .iter()
+        .map(|delta| StoredRootReachabilityDelta {
+            branch_id: delta.branch_id.clone(),
+            old_root: delta.old_root,
+            new_root: delta.new_root,
+            old_control: delta.old_control,
+            new_control: delta.new_control,
+            old_control_digest: delta.old_control_digest,
+            new_control_digest: delta.new_control_digest,
+        })
+        .collect::<Vec<_>>();
+    let checkpoint_roots = checkpoint_roots.to_vec();
+    let (body, digest) = encode_reachability_batch_body(sequence, stored_deltas, checkpoint_roots)?;
+    let batch = StoredRootReachabilityBatch {
+        format_version: GC_REACHABILITY_FORMAT_VERSION,
+        sequence,
+        deltas: body.deltas,
+        checkpoint_roots: body.checkpoint_roots,
+        digest,
+    };
+    writes.put(
+        GC_REACHABILITY_DELTA_SPACE,
+        reachability_sequence_key(sequence),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode("GC reachability delta", &batch)?),
+        },
+    );
+    writes.put(
+        GC_REACHABILITY_QUEUE_SPACE,
+        StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode("GC reachability queue", &queue)?),
+        },
+    );
+    preconditions.push(StoragePrecondition::KeyValueEquals {
+        space: GC_REACHABILITY_QUEUE_SPACE,
+        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
+        expected: raw_queue,
+    });
+    Ok(())
+}
+
+async fn load_reachability_batches(
+    store: &(impl StorageAdapterRead + ?Sized),
+    queue: &StoredReachabilityQueue,
+) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError> {
+    if queue.head_sequence == 0 {
+        return Ok(Vec::new());
+    }
+    let end = queue
+        .head_sequence
+        .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
+        .min(queue.tail_sequence.saturating_add(1));
+    let keys = (queue.head_sequence..end)
+        .map(reachability_sequence_key)
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut batches = Vec::with_capacity(keys.len());
+    for (sequence, value) in (queue.head_sequence..end).zip(result.value) {
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("GC reachability delta {sequence} is missing"),
+            ));
+        };
+        let batch: StoredRootReachabilityBatch =
+            storage_codec::decode("GC reachability delta", &bytes)?;
+        if batch.format_version != GC_REACHABILITY_FORMAT_VERSION || batch.sequence != sequence {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("GC reachability delta {sequence} has invalid identity"),
+            ));
+        }
+        let (body, digest) = encode_reachability_batch_body(
+            batch.sequence,
+            batch.deltas.clone(),
+            batch.checkpoint_roots.clone(),
+        )?;
+        let _ = body;
+        if digest != batch.digest {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("GC reachability delta {sequence} digest mismatch"),
+            ));
+        }
+        batches.push((sequence, batch));
+    }
+    Ok(batches)
 }
 
 pub(crate) async fn load_recovery_refs(
@@ -236,6 +591,7 @@ pub(crate) async fn load_recovery_refs(
     Ok(refs.into_values().collect())
 }
 
+#[cfg(test)]
 async fn stage_sweep_unreachable_content_nodes(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -417,7 +773,370 @@ pub(crate) struct RepositoryGcProfile {
 /// Content-addressed tree/CAS orphan repair is intentionally an offline path;
 /// out-of-band JSON is reclaimed here only from explicit ownership-loss
 /// candidates.
+/// Ordinary GC consumes only authenticated publication deltas.  Branch-head
+/// controls and checkpoint recovery refs are the complete active-root set;
+/// no semantic parent walk or full-space inventory discovery is permitted on
+/// this path.
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn stage_repository_gc<S>(
+    store: S,
+    writes: &mut StorageWriteSet,
+) -> Result<RepositoryGcPlan, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let mut preconditions = Vec::new();
+    stage_repository_gc_with_preconditions(store, writes, &mut preconditions).await
+}
+
+pub(crate) async fn stage_repository_gc_with_preconditions<S>(
+    store: S,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<RepositoryGcPlan, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let started = Instant::now();
+    let controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .scan()
+        .await?;
+    let recovery_refs = load_recovery_refs(&store).await?;
+    let mut active_roots = controls
+        .iter()
+        .flat_map(|(_, control)| {
+            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
+        })
+        .collect::<BTreeSet<_>>();
+    active_roots.extend(
+        recovery_refs
+            .iter()
+            .map(|recovery| recovery.recovered_head_commit_id),
+    );
+    if active_roots.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "authenticated GC active-root set is empty",
+        ));
+    }
+
+    let (queue, raw_queue) = load_reachability_queue(&store).await?;
+    let batches = load_reachability_batches(&store, &queue).await?;
+    // Checkpoint pins carried by the authenticated batches are folded into
+    // the same active-root set before any retirement candidate is evaluated.
+    // Recovery refs normally provide the same roots; retaining both proofs
+    // makes a torn ref rotation fail closed instead of silently reclaiming a
+    // checkpoint-only authority.
+    active_roots.extend(
+        batches
+            .iter()
+            .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
+    );
+    if batches.is_empty() {
+        return Ok(RepositoryGcPlan {
+            changelog: GcPlan {
+                roots: active_roots
+                    .iter()
+                    .copied()
+                    .map(GcRoot::BranchHead)
+                    .collect(),
+                live: GcLiveSet {
+                    commits: active_roots.iter().copied().collect(),
+                    changes: Vec::new(),
+                    payloads: Vec::new(),
+                },
+                sweep: GcSweepSet {
+                    commits: Vec::new(),
+                    commit_change_ids: Vec::new(),
+                    changes: Vec::new(),
+                    json_payloads: Vec::new(),
+                },
+                repair: GcRepairSet::default(),
+            },
+            sweep: RepositoryGcSweep {
+                tracked_commit_roots: Vec::new(),
+            },
+            profile: RepositoryGcProfile {
+                root_discovery_us: elapsed_micros(started),
+                changelog_us: 0,
+                tracked_root_stage_us: 0,
+                total_us: elapsed_micros(started),
+            },
+        });
+    }
+    let mut active_authority_ids = active_roots.clone();
+    let mut active_dependency_ids = BTreeSet::new();
+    let mut active_manifests = BTreeMap::new();
+    let mut pending = active_roots.iter().copied().collect::<Vec<_>>();
+    while let Some(commit_id) = pending.pop() {
+        if active_manifests.contains_key(&commit_id) {
+            continue;
+        }
+        let manifest = crate::tracked_state::load_commit_state_manifest(&store, commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("active GC root '{commit_id}' has no authenticated physical manifest"),
+                )
+            })?;
+        if let Some(source) = manifest.mutations.selected_source_commit_id() {
+            active_authority_ids.insert(source);
+            pending.push(source);
+        }
+        if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+            if let Some(base) = root.serving_base_commit_id {
+                active_dependency_ids.insert(base);
+            }
+        }
+        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+            active_dependency_ids.extend(
+                snapshot_root
+                    .parent_roots
+                    .iter()
+                    .map(|parent| parent.commit_id),
+            );
+        }
+        active_manifests.insert(commit_id, manifest);
+    }
+
+    let mut active_mutation_nodes = BTreeSet::new();
+    let mut active_scoped_nodes = BTreeSet::new();
+    let mut active_current_parts = BTreeSet::new();
+    let replay_debt_ids = active_manifests
+        .iter()
+        .filter_map(|(commit_id, manifest)| (manifest.replay_debt.depth != 0).then_some(*commit_id))
+        .collect::<Vec<_>>();
+    // Rootless active commits retain their semantic parents for bounded replay,
+    // but unrelated retired roots must not be blocked by a repository-global
+    // replay-debt flag. Resolve only the direct parent closure of the active
+    // replay-debt roots; this is bounded by active roots and preserves the
+    // history dependency proof without a changelog sweep.
+    if !replay_debt_ids.is_empty() {
+        let replay_nodes = CommitGraphContext::new()
+            .reader(store.clone())
+            .load_nodes(&replay_debt_ids)
+            .await?;
+        for (_, node) in replay_nodes.iter() {
+            if let Some(node) = node {
+                active_dependency_ids.extend(node.parent_commit_ids.iter().copied());
+            }
+        }
+    }
+    let scoped_roots = active_manifests
+        .values()
+        .filter_map(|manifest| {
+            manifest
+                .current_state_scoped_ranges
+                .as_ref()
+                .map(|root| root.tree.clone())
+        })
+        .collect::<Vec<_>>();
+    if !scoped_roots.is_empty() {
+        let reachable =
+            crate::tracked_state::validate_scoped_range_trees(&store, &scoped_roots).await?;
+        active_scoped_nodes.extend(reachable.node_ids);
+        for part in reachable.parts {
+            let descriptor =
+                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
+            if descriptor.source_kind == 1 {
+                active_current_parts.insert(descriptor.content_digest);
+            }
+        }
+    }
+    let active_ids = active_manifests.keys().copied().collect::<Vec<_>>();
+    let mutation_roots =
+        crate::tracked_state::load_commit_mutation_directory_roots(&store, &active_ids).await?;
+    for root in mutation_roots.into_iter().flatten() {
+        active_mutation_nodes.extend(
+            crate::tracked_state::collect_mutation_directory_node_ids(&store, &root).await?,
+        );
+    }
+
+    // A delta is a candidate until every active history/checkpoint/replay
+    // dependency releases the old root.  Never consume a batch containing a
+    // blocked candidate: dropping that signal would make the root permanently
+    // unreclaimable after the pin is later released.  The whole batch remains
+    // at the queue head; this intentionally delays later deltas but preserves
+    // the authenticated publication order and retry semantics.
+    let mut blocked_sequences = BTreeSet::new();
+    for (sequence, batch) in &batches {
+        for delta in &batch.deltas {
+            validate_stored_root_reachability_delta(delta)?;
+            let Some(old_root) = delta.old_root else {
+                continue;
+            };
+            if !retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_authority_ids,
+                &active_dependency_ids,
+            ) || replay_debt_ids.contains(&old_root)
+            {
+                blocked_sequences.insert(*sequence);
+            }
+        }
+    }
+
+    let mut next_queue = queue;
+    let queue_head = next_queue.head_sequence;
+    let mut consumed_through = queue_head;
+    let mut queue_open = true;
+    let mut reclaimed_commits = Vec::new();
+    for (sequence, batch) in batches {
+        if queue_open && blocked_sequences.contains(&sequence) {
+            queue_open = false;
+        }
+        if queue_open {
+            consumed_through = sequence.saturating_add(1);
+        }
+        for delta in batch.deltas {
+            validate_stored_root_reachability_delta(&delta)?;
+            let Some(old_root) = delta.old_root else {
+                continue;
+            };
+            if !retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_authority_ids,
+                &active_dependency_ids,
+            ) || replay_debt_ids.contains(&old_root)
+            {
+                continue;
+            }
+            let manifest = crate::tracked_state::load_commit_state_manifest(&store, old_root)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("retired GC root '{old_root}' has no authenticated manifest"),
+                    )
+                })?;
+            let retired_root =
+                crate::tracked_state::load_commit_mutation_directory_roots(&store, &[old_root])
+                    .await?
+                    .into_iter()
+                    .next()
+                    .flatten();
+            if let Some(root) = retired_root {
+                let nodes =
+                    crate::tracked_state::collect_mutation_directory_node_ids(&store, &root)
+                        .await?;
+                for node_id in nodes.difference(&active_mutation_nodes) {
+                    writes.delete(
+                        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+                        StorageKey(Bytes::copy_from_slice(node_id)),
+                    );
+                }
+            }
+            if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+                let reachable =
+                    crate::tracked_state::validate_scoped_range_trees(&store, &[root.tree.clone()])
+                        .await?;
+                for node_id in reachable.node_ids.difference(&active_scoped_nodes) {
+                    writes.delete(
+                        crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+                        StorageKey(Bytes::copy_from_slice(node_id)),
+                    );
+                }
+                for part in reachable.parts {
+                    let descriptor =
+                        crate::tracked_state::current_state_descriptor_from_scoped_range_part(
+                            &part,
+                        )?;
+                    if descriptor.source_kind == 1
+                        && !active_current_parts.contains(&descriptor.content_digest)
+                    {
+                        writes.delete(
+                            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+                            StorageKey(Bytes::copy_from_slice(&descriptor.content_digest)),
+                        );
+                        writes.delete(
+                            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+                            StorageKey(Bytes::copy_from_slice(&descriptor.payload_refs_digest)),
+                        );
+                    }
+                }
+            }
+            crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
+                &store, writes, old_root, &manifest,
+            )
+            .await?;
+            reclaimed_commits.push(old_root);
+        }
+    }
+
+    if consumed_through > queue_head {
+        consumed_through = consumed_through
+            .min(queue_head.saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64))
+            .min(next_queue.tail_sequence.saturating_add(1));
+        for sequence in next_queue.head_sequence..consumed_through {
+            writes.delete(
+                GC_REACHABILITY_DELTA_SPACE,
+                reachability_sequence_key(sequence),
+            );
+        }
+        if consumed_through > next_queue.tail_sequence {
+            next_queue.head_sequence = 0;
+            next_queue.tail_sequence = 0;
+        } else {
+            next_queue.head_sequence = consumed_through;
+        }
+        writes.put(
+            GC_REACHABILITY_QUEUE_SPACE,
+            StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
+            StorageValue {
+                bytes: Bytes::from(storage_codec::encode("GC reachability queue", &next_queue)?),
+            },
+        );
+        // The queue CAS is the publication/consumption fence.  The caller
+        // carries this exact read token into the backend write options.
+        preconditions.push(StoragePrecondition::KeyValueEquals {
+            space: GC_REACHABILITY_QUEUE_SPACE,
+            key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
+            expected: raw_queue,
+        });
+        writes.seal_changelog_gc();
+    }
+
+    Ok(RepositoryGcPlan {
+        changelog: GcPlan {
+            roots: active_roots
+                .iter()
+                .copied()
+                .map(GcRoot::BranchHead)
+                .collect(),
+            live: GcLiveSet {
+                commits: active_authority_ids.into_iter().collect(),
+                changes: Vec::new(),
+                payloads: Vec::new(),
+            },
+            sweep: GcSweepSet {
+                commits: Vec::new(),
+                commit_change_ids: Vec::new(),
+                changes: Vec::new(),
+                json_payloads: Vec::new(),
+            },
+            repair: GcRepairSet::default(),
+        },
+        sweep: RepositoryGcSweep {
+            tracked_commit_roots: reclaimed_commits,
+        },
+        profile: RepositoryGcProfile {
+            root_discovery_us: elapsed_micros(started),
+            changelog_us: 0,
+            tracked_root_stage_us: 0,
+            total_us: elapsed_micros(started),
+        },
+    })
+}
+
+/// Recovery-only verifier retained for explicit rebuild tooling and tests.
+/// Ordinary maintenance never calls this path: it would rediscover liveness
+/// by scanning the changelog and every immutable inventory.
+#[cfg(test)]
+async fn stage_repository_gc_full_recovery<S>(
     store: S,
     writes: &mut StorageWriteSet,
 ) -> Result<RepositoryGcPlan, LixError>
@@ -544,6 +1263,7 @@ where
     })
 }
 
+#[cfg(test)]
 async fn plan_and_stage_authority_gc<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -1135,6 +1855,7 @@ where
     })
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct GcCommitInventoryEntry {
     commit_id: CommitId,
@@ -1143,12 +1864,14 @@ struct GcCommitInventoryEntry {
     parent_len: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct GcCommitInventory {
     entries: Vec<GcCommitInventoryEntry>,
     parent_commit_ids: Vec<CommitId>,
 }
 
+#[cfg(test)]
 impl GcCommitInventory {
     fn get(&self, commit_id: CommitId) -> Option<&GcCommitInventoryEntry> {
         self.entries
@@ -1166,6 +1889,7 @@ impl GcCommitInventory {
     }
 }
 
+#[cfg(test)]
 async fn scan_all_gc_commits<S>(store: S) -> Result<GcCommitInventory, LixError>
 where
     S: StorageAdapterRead,
@@ -1214,6 +1938,7 @@ where
     Ok(commits)
 }
 
+#[cfg(test)]
 async fn scan_all_gc_standalone_changes<S>(
     store: S,
 ) -> Result<BTreeMap<ChangeId, ChangeRecord>, LixError>
@@ -1249,6 +1974,7 @@ where
     Ok(changes)
 }
 
+#[cfg(test)]
 fn collect_change_payload_hashes(change: &ChangeRecord, hashes: &mut BTreeSet<[u8; 32]>) {
     for slot in [&change.snapshot, &change.metadata] {
         if let JsonSlot::Ref(json_ref) = slot {
@@ -1261,12 +1987,23 @@ fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+fn retirement_is_proven(
+    old_root: CommitId,
+    new_root: Option<CommitId>,
+    active_authority_ids: &BTreeSet<CommitId>,
+    active_dependency_ids: &BTreeSet<CommitId>,
+) -> bool {
+    new_root != Some(old_root)
+        && !active_authority_ids.contains(&old_root)
+        && !active_dependency_ids.contains(&old_root)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
+    use crate::branch::{BranchHeadControl, BranchHeadControlContext, stage_branch_head_control};
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
@@ -1296,8 +2033,10 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, load_checkpoint_gc_state, load_recovery_ref,
-        load_recovery_refs, stage_checkpoint_gc_state, stage_recovery_ref_rotation,
+        CheckpointGcState, CheckpointRecoveryRef, RootReachabilityDelta, load_checkpoint_gc_state,
+        load_reachability_batches, load_reachability_queue, load_recovery_ref, load_recovery_refs,
+        retirement_is_proven, root_control_digest_for_control, stage_checkpoint_gc_state,
+        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
     };
 
     #[tokio::test]
@@ -1341,6 +2080,110 @@ mod tests {
                 .expect("main recovery ref should load"),
             Some(second_main)
         );
+    }
+
+    #[tokio::test]
+    async fn reachability_delta_queue_round_trips_with_authenticated_digest() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("queue seed should commit");
+
+        let old_root = CommitId::for_test_label("delta-old-root");
+        let new_root = CommitId::for_test_label("delta-new-root");
+        let timestamp =
+            LixTimestamp::expect_parse("reachability delta test timestamp", "2026-01-01T00:00:00Z");
+        let old_control = BranchHeadControl {
+            head_commit_id: old_root,
+            generation: old_root,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("delta-old-control"),
+            schema_presence_bloom: [0; 4],
+        };
+        let new_control = BranchHeadControl {
+            head_commit_id: new_root,
+            generation: new_root,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("delta-new-control"),
+            schema_presence_bloom: [0; 4],
+        };
+        let delta = RootReachabilityDelta {
+            branch_id: "main".to_string(),
+            old_root: Some(old_root),
+            new_root: Some(new_root),
+            old_control: Some(old_control),
+            new_control: Some(new_control),
+            old_control_digest: root_control_digest_for_control(Some(&old_control))
+                .expect("old control should encode"),
+            new_control_digest: root_control_digest_for_control(Some(&new_control))
+                .expect("new control should encode"),
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("queue read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            std::slice::from_ref(&delta),
+            &[new_root],
+            &mut preconditions,
+        )
+        .await
+        .expect("delta should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("delta should commit atomically");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("queue read should reopen");
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("queue should decode");
+        let batches = load_reachability_batches(&read, &queue)
+            .await
+            .expect("delta should decode");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].1.checkpoint_roots, vec![new_root]);
+        assert_eq!(batches[0].1.deltas[0].old_root, Some(old_root));
+    }
+
+    #[test]
+    fn retirement_requires_history_and_pin_dependency_closure() {
+        let old = CommitId::for_test_label("history-old");
+        let new = CommitId::for_test_label("history-new");
+        let active = BTreeSet::from([new]);
+        let mut dependencies = BTreeSet::from([old]);
+        assert!(!retirement_is_proven(
+            old,
+            Some(new),
+            &active,
+            &dependencies
+        ));
+        // Once history/diff/undo/redo/checkpoint pins release the old root,
+        // the delta is a valid physical-retirement proof.
+        dependencies.clear();
+        assert!(retirement_is_proven(old, Some(new), &active, &dependencies));
     }
 
     #[tokio::test]
@@ -1456,7 +2299,7 @@ mod tests {
                 .expect("GC read should open"),
         );
         let mut writes = storage.new_write_set();
-        let plan = super::stage_repository_gc(read, &mut writes)
+        let plan = super::stage_repository_gc_full_recovery(read, &mut writes)
             .await
             .expect("GC should plan from direct branch controls");
         let initial_commit = CommitId::parse_lix(&receipt.initial_commit_id, "initial commit")
@@ -2372,7 +3215,7 @@ mod tests {
                 .expect("GC read should open"),
         );
         let mut writes = storage_adapter.new_write_set();
-        super::stage_repository_gc(read, &mut writes)
+        super::stage_repository_gc_full_recovery(read, &mut writes)
             .await
             .expect("repository GC should stage");
         storage_adapter

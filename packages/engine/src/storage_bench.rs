@@ -629,7 +629,12 @@ where
     let arena = writes.arena_stats();
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
-        swept_commits: plan.changelog.sweep.commits.len(),
+        swept_commits: plan
+            .changelog
+            .sweep
+            .commits
+            .len()
+            .saturating_add(plan.sweep.tracked_commit_roots.len()),
         swept_standalone_changes: plan.changelog.sweep.changes.len(),
         swept_payloads: plan.changelog.sweep.json_payloads.len(),
         staged_puts: stats.staged_puts,

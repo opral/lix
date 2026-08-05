@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix_engine::Engine;
-use lix_engine::changelog::bench::{append_ordered_commits, stage_append_once};
 use lix_engine::storage::Storage;
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::storage_bench::{RepositoryGcBenchResult, plan_repository_gc_for_bench};
+use lix_engine::{CreateBranchOptions, Engine, Value};
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
@@ -96,7 +95,7 @@ async fn run() {
                     let seed = seed_unreachable_commits(
                         storage.clone(),
                         expected_swept_commits,
-                        batch_commits,
+                        commit_width,
                     )
                     .await;
                     storage.flush().expect("flush repository-GC RocksDB");
@@ -123,7 +122,7 @@ async fn run() {
                     let seed = seed_unreachable_commits(
                         storage.clone(),
                         expected_swept_commits,
-                        batch_commits,
+                        commit_width,
                     )
                     .await;
                     let memtable_flushed = env_bool("LIX_REPOSITORY_GC_MEMTABLE_FLUSH", false);
@@ -215,28 +214,87 @@ struct SeedResult {
 async fn seed_unreachable_commits<StorageImpl>(
     storage: StorageImpl,
     commit_count: usize,
-    batch_commits: usize,
+    changes_per_commit: usize,
 ) -> SeedResult
 where
-    StorageImpl: Storage + Clone + Sync,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let started = Instant::now();
-    let mut puts = 0usize;
-    let mut written_bytes = 0usize;
-    for batch_start in (0..commit_count).step_by(batch_commits) {
-        let count = (commit_count - batch_start).min(batch_commits);
-        let append =
-            append_ordered_commits(batch_start, count).expect("build repository-GC commit batch");
-        let stats = stage_append_once(storage.clone(), &append)
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("open repository-GC engine");
+    let main = engine
+        .open_workspace_session()
+        .await
+        .expect("open repository-GC main session");
+    let schema = serde_json::json!({
+        "x-lix-key": "repository_gc_fixture",
+        "x-lix-primary-key": ["/path"],
+        "type": "object",
+        "required": ["path", "value"],
+        "properties": {
+            "path": { "type": "string" },
+            "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
+        },
+        "additionalProperties": false
+    });
+    main.execute(
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+        &[Value::Text(schema.to_string())],
+    )
+    .await
+    .expect("register repository-GC schema");
+    let branch = main
+        .create_branch(CreateBranchOptions {
+            id: Some("01990000-0000-7000-8000-000000000001".to_owned()),
+            name: "repository-gc-unreachable".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create repository-GC disposable branch");
+    let branch_session = engine
+        .open_session(branch.id.clone())
+        .await
+        .expect("open repository-GC disposable branch");
+    for commit_index in 0..commit_count {
+        let mut transaction = branch_session
+            .begin_transaction()
             .await
-            .expect("stage repository-GC commit batch");
-        puts = puts.saturating_add(stats.puts);
-        written_bytes = written_bytes.saturating_add(stats.bytes_written);
+            .expect("begin repository-GC fixture transaction");
+        for row_index in 0..changes_per_commit {
+            let row = commit_index
+                .checked_mul(changes_per_commit)
+                .and_then(|base| base.checked_add(row_index))
+                .expect("repository-GC fixture row index overflow");
+            transaction
+                .execute(
+                    "INSERT INTO repository_gc_fixture (path, value) VALUES ($1, lix_json($2))",
+                    &[
+                        Value::Text(format!("/row/{row:08}")),
+                        Value::Text(format!(r#"{{"commit":{commit_index},"row":{row}}}"#)),
+                    ],
+                )
+                .await
+                .expect("stage repository-GC fixture row");
+        }
+        transaction
+            .commit()
+            .await
+            .expect("publish repository-GC fixture commit");
     }
+    main.execute(
+        "DELETE FROM lix_branch WHERE id = $1",
+        &[Value::Text(branch.id)],
+    )
+    .await
+    .expect("delete repository-GC disposable branch");
+    main.create_checkpoint()
+        .await
+        .expect("checkpoint repository-GC main after branch deletion");
     SeedResult {
         elapsed: started.elapsed(),
-        puts,
-        written_bytes,
+        puts: commit_count.saturating_mul(changes_per_commit),
+        written_bytes: 0,
     }
 }
 

@@ -76,9 +76,9 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_delete_change_locators,
-    stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
-    stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
-    stage_preencoded_ordered_addressable_replacement_parts,
+    stage_delete_commit_delta_inventory_entry, stage_delete_commit_state_manifest_for_gc,
+    stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
+    stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
     validate_current_state_scoped_range_serving_base_manifest,
 };
