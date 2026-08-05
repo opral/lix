@@ -450,6 +450,11 @@ async fn load_locator_root(
             && control.untracked_locator_count == 0
             && control.untracked_locator_root == empty_locator_root_hash()
         {
+            // A missing root is a valid state only for a genuinely fresh
+            // branch.  Prove that no derived locator bytes survived a control
+            // loss or branch-ID reuse; otherwise the default root would make
+            // stale entries disappear from the authority boundary.
+            ensure_locator_branch_empty(store, branch_id).await?;
             return Ok(LocatorRoot::default());
         }
         return Err(codec_error("untracked locator root is missing"));
@@ -462,11 +467,62 @@ async fn load_locator_root(
         || root.generation != control.untracked_locator_generation
         || root.count != control.untracked_locator_count
     {
-        return Err(codec_error(
-            "untracked locator root is stale or disagrees with branch control",
-        ));
+        return Err(codec_error(format!(
+            "untracked locator root is stale or disagrees with branch control (root generation={} count={} control generation={} count={})",
+            root.generation,
+            root.count,
+            control.untracked_locator_generation,
+            control.untracked_locator_count
+        )));
+    }
+    if root == LocatorRoot::default() {
+        // A serialized zero root is still only a pristine marker.  Prove the
+        // branch prefix is empty so a stale root record cannot mask surviving
+        // entries after partial corruption.
+        ensure_locator_branch_empty(store, branch_id).await?;
     }
     Ok(root)
+}
+
+async fn ensure_locator_branch_empty(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+) -> Result<(), LixError> {
+    let prefix = branch_prefix(branch_id)?;
+    let plan = ScanPlan::prefix(
+        UNTRACKED_FILE_LOCATOR_SPACE,
+        StoragePrefix {
+            bytes: Bytes::copy_from_slice(&prefix),
+        },
+    );
+    record_locator_scan();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        let next_cursor = validate_scan_page_progress(
+            &prefix,
+            resume_after.as_ref(),
+            page.value.entries.iter().map(|entry| &entry.key),
+            page.value.has_more,
+        )?;
+        if !page.value.entries.is_empty() {
+            return Err(codec_error(
+                "untracked locator root is missing while locator bytes remain",
+            ));
+        }
+        if !page.value.has_more {
+            return Ok(());
+        }
+        resume_after = next_cursor;
+    }
 }
 
 async fn load_locator_summaries(
@@ -873,15 +929,18 @@ async fn stage_untracked_deltas_inner(
     let mut locator_summaries =
         load_locator_summaries(store, branch_id, &affected_file_ids).await?;
     // A certified absent->live transition may create a zero-member anchor
-    // only when the file prefix is also empty. This bounded check prevents a
-    // missing summary from masking stale locator entries after file-ID reuse
-    // or corruption; existing summaries continue through the authenticated
-    // count/digest path below.
-    for file_id in new_file_ids
-        .iter()
-        .filter(|file_id| locator_summaries.get(*file_id).is_none_or(Option::is_none))
-    {
-        scan_locator_members(store, branch_id, file_id, None).await?;
+    // only when the entire locator prefix is absent. Always inspect the
+    // prefix on this transition: an old summary (even a valid zero-member
+    // summary) or any member is stale state from a prior incarnation and
+    // must fail closed rather than being reused for the new file.
+    for file_id in &new_file_ids {
+        let expected = locator_summaries.get(file_id).and_then(Option::as_ref);
+        let members = scan_locator_members(store, branch_id, file_id, expected).await?;
+        if expected.is_some() || !members.is_empty() {
+            return Err(codec_error(format!(
+                "untracked locator state already exists for fresh file '{file_id}'"
+            )));
+        }
     }
     // A live file descriptor owns a zero-member summary even before its first
     // member. This lifecycle anchor makes simultaneous loss of a summary and
@@ -936,8 +995,14 @@ async fn stage_untracked_deltas_inner(
                 delta.file_id,
                 delta.entity_pk,
             )?));
-            if let Some(Some(value)) = mutations.remove(&key) {
-                collect_value_refs(&decode_value(value.bytes)?, &mut retired_refs);
+            // Keep an authoritative tombstone that the cascade already
+            // staged.  Removing the map entry here would silently resurrect
+            // a replaced member; only discard a staged-only put and retain
+            // the `None` deletion for the final write set.
+            if let Some(slot) = mutations.get_mut(&key) {
+                if let Some(value) = slot.take() {
+                    collect_value_refs(&decode_value(value.bytes)?, &mut retired_refs);
+                }
             }
         }
     }
@@ -2078,6 +2143,11 @@ fn decode_locator_root(bytes: &Bytes) -> Result<LocatorRoot, LixError> {
     if offset != bytes.len() {
         return Err(codec_error("untracked locator root has trailing bytes"));
     }
+    if count == 0 && digest != [0; 32] {
+        return Err(codec_error(
+            "untracked locator root has a non-empty digest with zero members",
+        ));
+    }
     Ok(LocatorRoot {
         generation,
         count,
@@ -2110,6 +2180,11 @@ fn decode_locator_summary(bytes: &Bytes) -> Result<LocatorSummary, LixError> {
         .expect("thirty-two bytes");
     if offset != bytes.len() {
         return Err(codec_error("untracked locator summary has trailing bytes"));
+    }
+    if count == 0 && digest != [0; 32] {
+        return Err(codec_error(
+            "untracked locator summary has a non-empty digest with zero members",
+        ));
     }
     Ok(LocatorSummary { count, digest })
 }
@@ -2255,12 +2330,32 @@ fn decode_locator_key(bytes: &Bytes) -> Result<DecodedIdentity, LixError> {
     if offset != bytes.len() {
         return Err(codec_error("untracked locator key has trailing bytes"));
     }
-    Ok(DecodedIdentity {
+    let identity = DecodedIdentity {
         branch_id,
         schema_key,
         file_id: Some(file_id),
         entity_pk,
-    })
+    };
+    // The locator is only a derived locator, but its key grammar is part of
+    // the corruption boundary.  Re-encoding catches alternate/non-canonical
+    // component encodings that a permissive decoder could otherwise accept
+    // as a different member.  Such a key must never be treated as an empty
+    // file or allowed to alter a summary.
+    let canonical = locator_entry_key(
+        &identity.branch_id,
+        identity
+            .file_id
+            .as_deref()
+            .expect("locator file is present"),
+        &identity.schema_key,
+        &identity.entity_pk,
+    )?;
+    if canonical.0.as_ref() != bytes.as_ref() {
+        return Err(codec_error(
+            "untracked locator key is not in canonical format",
+        ));
+    }
+    Ok(identity)
 }
 
 fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, field: &str) -> Result<&'a [u8], LixError> {
@@ -2652,7 +2747,12 @@ mod tests {
             .await
             .map_err(LixError::from)?;
         let mut writes = storage.new_write_set();
-        let control = test_control(branch_id);
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .map_err(LixError::from)?
+            .expect("empty-file cascade control");
         let _updated_control =
             stage_untracked_deltas(&read, &mut writes, branch_id, control, &[delete], &[false])
                 .await?;
@@ -2721,6 +2821,113 @@ mod tests {
                 .is_err()
         );
         assert!(writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_file_transition_rejects_existing_zero_member_summary() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch-fresh-summary";
+        let file_id = "file-fresh-summary";
+        let live_file_ids = BTreeSet::from([file_id.to_owned()]);
+        let empty = BTreeSet::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let mut writes = storage.new_write_set();
+        let control = stage_untracked_deltas_with_live_file_ids(
+            &read,
+            &mut writes,
+            branch_id,
+            test_control(branch_id),
+            &[],
+            &[],
+            &live_file_ids,
+            &empty,
+        )
+        .await?;
+        crate::branch::stage_branch_head_control(&mut writes, branch_id, control)?;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .map_err(LixError::from)?
+            .expect("fresh-summary control");
+        let mut writes = storage.new_write_set();
+        let error = stage_untracked_deltas_with_live_file_ids(
+            &read,
+            &mut writes,
+            branch_id,
+            control,
+            &[],
+            &[],
+            &live_file_ids,
+            &empty,
+        )
+        .await
+        .expect_err("a fresh lifecycle must not reuse an old zero-member summary");
+        assert!(error.message.contains("already exists"));
+        assert!(writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_delete_preserves_exact_multi_member_summary() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch-summary-count";
+        let file_id = "file-summary-count";
+        let first = EntityPk::single("first");
+        let second = EntityPk::single("second");
+        let now = timestamp();
+        let rows = [
+            untracked("schema-a", Some(file_id), &first, r#"{"v":1}"#, now),
+            untracked("schema-b", Some(file_id), &second, r#"{"v":1}"#, now),
+        ];
+        commit_deltas(&storage, branch_id, &rows, &[true, true]).await?;
+        let mut first_delete = untracked("schema-a", Some(file_id), &first, r#"{"v":1}"#, now);
+        first_delete.deleted = true;
+        commit_deltas(&storage, branch_id, &[first_delete], &[false]).await?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let summary = PointReadPlan::new(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            &[locator_summary_key(branch_id, file_id)?],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await?
+        .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = summary.into_iter().next() else {
+            return Err(codec_error("multi-member locator summary is missing"));
+        };
+        let summary = decode_locator_summary(&bytes)?;
+        let remaining_key = locator_entry_key(branch_id, file_id, "schema-b", &second)?;
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.digest, locator_key_digest(&remaining_key));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_member_locator_metadata_rejects_nonzero_digest() -> Result<(), LixError> {
+        let mut summary = encode_locator_summary(&LocatorSummary::default()).to_vec();
+        *summary.last_mut().expect("summary has digest") = 1;
+        assert!(decode_locator_summary(&Bytes::from(summary)).is_err());
+
+        let mut root = encode_locator_root(&LocatorRoot::default())?.to_vec();
+        *root.last_mut().expect("root has digest") = 1;
+        assert!(decode_locator_root(&Bytes::from(root)).is_err());
         Ok(())
     }
 
@@ -3128,17 +3335,16 @@ mod tests {
             .await
             .map_err(LixError::from)?;
         let mut writes = storage.new_write_set();
-        assert!(
-            stage_untracked_deltas(
-                &read,
-                &mut writes,
-                branch_id,
-                test_control(branch_id),
-                &[delete],
-                &[false],
-            )
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
             .await
-            .is_err()
+            .map_err(LixError::from)?
+            .expect("malformed-key cascade control");
+        assert!(
+            stage_untracked_deltas(&read, &mut writes, branch_id, control, &[delete], &[false],)
+                .await
+                .is_err()
         );
         assert!(writes.is_empty());
         let profile = take_untracked_file_locator_read_profile();
@@ -3185,17 +3391,16 @@ mod tests {
             .await
             .map_err(LixError::from)?;
         let mut writes = storage.new_write_set();
-        assert!(
-            stage_untracked_deltas(
-                &read,
-                &mut writes,
-                branch_id,
-                test_control(branch_id),
-                &[delete],
-                &[false],
-            )
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
             .await
-            .is_err()
+            .map_err(LixError::from)?
+            .expect("malformed-authority cascade control");
+        assert!(
+            stage_untracked_deltas(&read, &mut writes, branch_id, control, &[delete], &[false],)
+                .await
+                .is_err()
         );
         assert!(
             writes.is_empty(),
@@ -3412,6 +3617,10 @@ mod tests {
         };
         let read = ScriptedScanRead::new([
             StorageScanChunk {
+                entries: Vec::new(),
+                has_more: false,
+            },
+            StorageScanChunk {
                 entries: vec![entry.clone()],
                 has_more: true,
             },
@@ -3438,7 +3647,7 @@ mod tests {
         assert!(writes.is_empty());
         let profile = take_untracked_file_locator_read_profile();
         assert_eq!(profile.root_point_reads, 1);
-        assert_eq!(profile.locator_scans, 1);
+        assert_eq!(profile.locator_scans, 2);
         assert_eq!(profile.locator_rows, 1);
         assert_eq!(profile.authoritative_exact_reads, 0);
         Ok(())
@@ -3449,10 +3658,16 @@ mod tests {
     {
         let branch_id = "branch-empty-page";
         let file_pk = EntityPk::single("file-target");
-        let read = ScriptedScanRead::new([StorageScanChunk {
-            entries: Vec::new(),
-            has_more: true,
-        }]);
+        let read = ScriptedScanRead::new([
+            StorageScanChunk {
+                entries: Vec::new(),
+                has_more: false,
+            },
+            StorageScanChunk {
+                entries: Vec::new(),
+                has_more: true,
+            },
+        ]);
         let delete = file_delete(&file_pk, timestamp());
         let _ = take_untracked_file_locator_read_profile();
         let mut writes = StorageWriteSet::new();
@@ -3471,7 +3686,7 @@ mod tests {
         assert!(writes.is_empty());
         let profile = take_untracked_file_locator_read_profile();
         assert_eq!(profile.root_point_reads, 1);
-        assert_eq!(profile.locator_scans, 1);
+        assert_eq!(profile.locator_scans, 2);
         assert_eq!(profile.locator_rows, 0);
         assert_eq!(profile.authoritative_exact_reads, 0);
         Ok(())
@@ -3493,6 +3708,10 @@ mod tests {
             value: StorageProjectedValue::FullValue(Bytes::from_static(b"malformed-marker")),
         };
         let read = ScriptedScanRead::new([
+            StorageScanChunk {
+                entries: Vec::new(),
+                has_more: false,
+            },
             StorageScanChunk {
                 entries: vec![first],
                 has_more: true,
@@ -3521,7 +3740,7 @@ mod tests {
         assert!(writes.is_empty());
         let profile = take_untracked_file_locator_read_profile();
         assert_eq!(profile.root_point_reads, 1);
-        assert_eq!(profile.locator_scans, 1);
+        assert_eq!(profile.locator_scans, 2);
         assert_eq!(profile.locator_rows, 1);
         assert_eq!(profile.authoritative_exact_reads, 0);
         Ok(())

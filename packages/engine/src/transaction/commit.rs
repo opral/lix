@@ -50,7 +50,7 @@ use crate::transaction::staging::{
 use crate::transaction::types::StagedCommitChangeBatchBuilder;
 use crate::transaction::types::{
     PreparedStateBatch, PreparedStateRowRef, StagedCommitChangeBatch, StagedCommitChangeRef,
-    StagedCommitChangeRefs,
+    StagedCommitChangeRefs, TransactionWriteOperation,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -3482,13 +3482,35 @@ async fn stage_tracked_head(
     replacement_generation_commits: &BTreeSet<CommitId>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> Result<StagedHotHeads, LixError> {
-    let lifecycle_ids = lifecycle_snapshot_commit_ids(
+    let mut lifecycle_ids = lifecycle_snapshot_commit_ids(
         tracked_roots,
         staged_commits,
         explicit_branch_targets,
         observations,
         checkpoint_epochs,
     )?;
+    // Descriptor rows are the tracked lifecycle authority even when a
+    // replay/redo packet carries no selected changelog refs. Materialize
+    // those roots so parent/final live-file sets can publish an
+    // absent-to-live locator anchor atomically with the descriptor row.
+    for root in tracked_roots.iter().filter(|root| root.publish_head) {
+        if tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .into_iter()
+            .flatten()
+            .any(|&row_index| {
+                let row = state_rows.row(row_index);
+                row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                    && row.snapshot.is_some()
+                    && !insert_selection.contains(row_index)
+                    && !row
+                        .origin
+                        .is_some_and(|origin| origin.operation == TransactionWriteOperation::Insert)
+            })
+        {
+            lifecycle_ids.insert(root.commit_id);
+        }
+    }
     let mut new_live_file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
     let mut deleted_live_file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
     let mut tracked_snapshots = build_lifecycle_tracked_snapshots(
@@ -3617,8 +3639,18 @@ async fn stage_tracked_head(
         let mut known_absent = selected_rows
             .iter()
             .map(|(row_index, row)| {
+                // The fast `lix_file` upsert path deliberately uses Replace
+                // mode for its physical descriptor/blob rows, so those rows
+                // are not present in `insert_selection` even when the logical
+                // file identity is newly created.  Preserve the insert origin
+                // as the lifecycle proof for the descriptor row; updates and
+                // deletes must continue to require an existing locator state.
+                let fresh_file_descriptor = row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                    && row.origin.is_some_and(|origin| {
+                        origin.operation == TransactionWriteOperation::Insert
+                    });
                 (row.untracked || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-                    && insert_selection.contains(*row_index)
+                    && (insert_selection.contains(*row_index) || fresh_file_descriptor)
             })
             .collect::<Vec<_>>();
         deltas.extend(
@@ -3910,6 +3942,12 @@ async fn stage_tracked_head(
                     .map(String::as_str)
                     .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
             );
+            if let Some(untracked_control) = untracked_controls.get(&root.branch_id) {
+                control.untracked_locator_root = untracked_control.untracked_locator_root;
+                control.untracked_locator_generation =
+                    untracked_control.untracked_locator_generation;
+                control.untracked_locator_count = untracked_control.untracked_locator_count;
+            }
             tracked_snapshots.insert(root.commit_id, final_tracked);
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
@@ -4604,6 +4642,19 @@ async fn stage_tracked_head(
         let mut control = control.next_current_state_revision()?;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
+    }
+    // A tracked lifecycle replay can stage descriptor rows without publishing
+    // a normal tracked root (undo/redo branch-ref packets are one example).
+    // The locator root was still written in this same transaction, so retain
+    // its exact control binding instead of dropping it and leaving a persisted
+    // root one generation ahead of branch control.
+    for (branch_id, control) in &untracked_controls {
+        if !rooted_branches.contains(branch_id.as_str())
+            && !explicit_branches.contains(branch_id.as_str())
+            && !controls.contains_key(branch_id)
+        {
+            insert_direct_branch_control(&mut controls, branch_id, *control)?;
+        }
     }
     Ok(StagedHotHeads {
         controls,
