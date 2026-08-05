@@ -1,6 +1,7 @@
 //! Canonical HTTP transport for independent pinned sessions on a workspace-mode
 //! root [`lix_sdk::Lix`] handle.
 
+#![recursion_limit = "256"]
 #![cfg_attr(test, allow(clippy::large_futures))]
 
 use axum::{
