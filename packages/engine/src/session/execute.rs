@@ -2597,6 +2597,37 @@ where
                         &mut self.prepared_literal_shape,
                     )
                 {
+                    #[cfg(feature = "storage-benches")]
+                    {
+                        let key_bytes = decoded_values.first().map_or(0, |value| value.len());
+                        let value_bytes = decoded_values.get(1).map_or(0, |value| value.len());
+                        let owned_bytes = decoded_values
+                            .iter()
+                            .filter_map(|value| match value {
+                                std::borrow::Cow::Borrowed(_) => None,
+                                std::borrow::Cow::Owned(value) => Some(value.len()),
+                            })
+                            .sum::<usize>();
+                        crate::storage_bench::record_crud_ownership(
+                            crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
+                            1,
+                            key_bytes,
+                            value_bytes,
+                            decoded_values.len(),
+                            decoded_values
+                                .iter()
+                                .filter(|value| matches!(value, std::borrow::Cow::Owned(_)))
+                                .count(),
+                            0,
+                        );
+                        crate::storage_bench::record_crud_ownership_transfer(
+                            crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
+                            owned_bytes,
+                            0,
+                            owned_bytes,
+                            0,
+                        );
+                    }
                     let transaction = self
                         .transaction
                         .as_mut()

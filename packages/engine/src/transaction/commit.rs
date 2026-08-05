@@ -278,6 +278,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             )
         });
     let mut state_rows = prepared_writes.state_rows;
+    #[cfg(feature = "storage-benches")]
+    state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_AUTHORITY);
     // Explicit branch publications are the final commit-planning consumer of
     // decoded JSON. Project them into one typed batch map before dropping the
     // shared parsed column; every later materialization stage consumes this
@@ -804,6 +806,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &root_backed_branch_publications,
     )
     .await?;
+    #[cfg(feature = "storage-benches")]
+    state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_ROOT_PUBLICATION);
     if !staged_hot_heads.deferred_fresh_hot_plans.is_empty() {
         if staged_hot_heads.deferred_fresh_hot_plans.len() != 1 {
             return Err(LixError::new(
