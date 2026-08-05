@@ -831,6 +831,7 @@ async fn stage_untracked_deltas_inner(
             .or_insert(Some(LocatorSummary::default()));
     }
     let mut locator_delete_keys = BTreeSet::new();
+    let mut locator_entry_put_keys = BTreeSet::new();
     if !deleted_file_ids.is_empty() {
         stage_file_cascade_from_locator(
             store,
@@ -931,14 +932,7 @@ async fn stage_untracked_deltas_inner(
                 .checked_add(1)
                 .ok_or_else(|| codec_error("untracked locator total count overflowed"))?;
             xor_digest(&mut locator_root.digest, locator_key_digest(&key));
-            record_locator_entry_write();
-            writes.put(
-                UNTRACKED_FILE_LOCATOR_SPACE,
-                key,
-                StorageValue {
-                    bytes: Bytes::from_static(LOCATOR_ENTRY_MARKER),
-                },
-            );
+            locator_entry_put_keys.insert(key);
         }
     }
     // The branch-deletion wrapper deliberately leaves locator bytes to the
@@ -963,39 +957,57 @@ async fn stage_untracked_deltas_inner(
         .checked_add(1)
         .ok_or_else(|| codec_error("untracked locator generation overflowed"))?;
     let root_bytes = encode_locator_root(&locator_root)?;
-    record_locator_root_write(root_bytes.len());
-    writes.put(
-        UNTRACKED_FILE_LOCATOR_SPACE,
-        locator_root_key(branch_id)?,
-        StorageValue {
-            bytes: root_bytes.clone(),
-        },
-    );
-    for key in locator_delete_keys {
-        record_locator_entry_write();
-        writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key);
-    }
+    let root_key = locator_root_key(branch_id)?;
+    let mut locator_summary_writes = Vec::with_capacity(locator_summaries.len());
     for (file_id, summary) in locator_summaries {
         let key = locator_summary_key(branch_id, &file_id)?;
         if deleted_file_ids.contains(&file_id) {
-            record_locator_summary_write();
-            writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key);
+            locator_summary_writes.push((key, None));
         } else {
             let Some(summary) = summary else {
                 return Err(codec_error(format!(
                     "untracked locator summary is missing for live file '{file_id}'"
                 )));
             };
-            {
-                record_locator_summary_write();
-                writes.put(
-                    UNTRACKED_FILE_LOCATOR_SPACE,
-                    key,
-                    StorageValue {
-                        bytes: encode_locator_summary(&summary),
-                    },
-                );
-            }
+            locator_summary_writes.push((
+                key,
+                Some(StorageValue {
+                    bytes: encode_locator_summary(&summary),
+                }),
+            ));
+        }
+    }
+
+    // All locator validation and encoding is complete. Publish the projection
+    // as one final append to the caller's write set so any terminal failure
+    // above leaves no partial locator writes staged.
+    record_locator_root_write(root_bytes.len());
+    writes.put(
+        UNTRACKED_FILE_LOCATOR_SPACE,
+        root_key,
+        StorageValue {
+            bytes: root_bytes.clone(),
+        },
+    );
+    for key in locator_entry_put_keys {
+        record_locator_entry_write();
+        writes.put(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            key,
+            StorageValue {
+                bytes: Bytes::from_static(LOCATOR_ENTRY_MARKER),
+            },
+        );
+    }
+    for key in locator_delete_keys {
+        record_locator_entry_write();
+        writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key);
+    }
+    for (key, value) in locator_summary_writes {
+        record_locator_summary_write();
+        match value {
+            Some(value) => writes.put(UNTRACKED_FILE_LOCATOR_SPACE, key, value),
+            None => writes.delete(UNTRACKED_FILE_LOCATOR_SPACE, key),
         }
     }
 
@@ -2632,6 +2644,83 @@ mod tests {
                 .is_err()
         );
         assert!(writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_summary_in_late_file_leaves_valid_file_unstaged() -> Result<(), LixError> {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch-summary-atomic";
+        let first_file_id = "file-summary-first";
+        let second_file_id = "file-summary-second";
+        let first_entity = EntityPk::single("first");
+        let second_entity = EntityPk::single("second");
+        let first = untracked(
+            "schema",
+            Some(first_file_id),
+            &first_entity,
+            r#"{"v":1}"#,
+            timestamp(),
+        );
+        let second = untracked(
+            "schema",
+            Some(second_file_id),
+            &second_entity,
+            r#"{"v":1}"#,
+            timestamp(),
+        );
+        commit_deltas(&storage, branch_id, &[first, second], &[true, true]).await?;
+
+        let mut corrupt = storage.new_write_set();
+        corrupt.delete(
+            UNTRACKED_FILE_LOCATOR_SPACE,
+            locator_summary_key(branch_id, second_file_id)?,
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .map_err(LixError::from)?
+            .expect("summary atomicity fixture control");
+        let first_update = untracked(
+            "schema",
+            Some(first_file_id),
+            &first_entity,
+            r#"{"v":2}"#,
+            timestamp(),
+        );
+        let second_update = untracked(
+            "schema",
+            Some(second_file_id),
+            &second_entity,
+            r#"{"v":2}"#,
+            timestamp(),
+        );
+        let mut writes = storage.new_write_set();
+        let error = stage_untracked_deltas(
+            &read,
+            &mut writes,
+            branch_id,
+            control,
+            &[first_update, second_update],
+            &[false, false],
+        )
+        .await
+        .expect_err("a missing later summary must fail closed");
+        assert!(error.message.contains("summary is missing"));
+        assert!(
+            writes.is_empty(),
+            "summary validation failure must stage no locator or authoritative writes"
+        );
         Ok(())
     }
 
