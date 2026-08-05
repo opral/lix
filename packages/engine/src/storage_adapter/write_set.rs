@@ -715,6 +715,20 @@ impl StorageWriteSet {
         stats
     }
 
+    /// Returns the number of point-delete descriptors staged in each logical
+    /// storage space.  This is benchmark/test observability only: production
+    /// planning continues to use the aggregate write-set counters and never
+    /// depends on this classification.
+    #[cfg(any(test, feature = "storage-benches"))]
+    pub fn delete_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
+        self.groups
+            .iter()
+            .filter_map(|group| {
+                (!group.deletes.is_empty()).then_some((group.space, group.deletes.len()))
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
         self.group_index

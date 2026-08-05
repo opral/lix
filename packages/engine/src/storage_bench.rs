@@ -595,6 +595,15 @@ pub struct RepositoryGcBenchResult {
     pub swept_payloads: usize,
     pub staged_puts: u64,
     pub staged_deletes: u64,
+    /// Point-delete descriptors grouped by logical storage-space id.  This
+    /// makes GC benchmark expectations resilient to additions of a new
+    /// derived projection while still proving each authority lane explicitly.
+    pub delete_counts_by_space: Vec<(u32, usize)>,
+    pub deleted_commit_state_manifests: usize,
+    pub deleted_mutation_inventories: usize,
+    pub deleted_semantic_commit_projections: usize,
+    pub deleted_semantic_change_rows: usize,
+    pub deleted_semantic_reverse_index_rows: usize,
     pub staged_written_bytes: u64,
     pub delete_descriptors: usize,
     pub delete_descriptor_capacity: usize,
@@ -628,6 +637,32 @@ where
     let plan = crate::gc::stage_repository_gc(read, &mut writes).await?;
     let stats = writes.stats();
     let arena = writes.arena_stats();
+    let mut delete_counts_by_space: Vec<(u32, usize)> = writes
+        .delete_counts_by_space()
+        .into_iter()
+        .map(|(space, count)| (space.id.0, count))
+        .collect();
+    delete_counts_by_space.sort_unstable_by_key(|(space_id, _)| *space_id);
+    let delete_count = |space_id| {
+        delete_counts_by_space
+            .iter()
+            .find_map(|(candidate, count)| (*candidate == space_id).then_some(*count))
+            .unwrap_or_default()
+    };
+    let deleted_commit_state_manifests = delete_count(
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+            .id
+            .0,
+    );
+    let deleted_mutation_inventories = delete_count(
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
+            .id
+            .0,
+    );
+    let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
+    let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
+    let deleted_semantic_reverse_index_rows =
+        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -651,6 +686,12 @@ where
         swept_payloads: plan.changelog.sweep.json_payloads.len(),
         staged_puts: stats.staged_puts,
         staged_deletes: stats.staged_deletes,
+        delete_counts_by_space,
+        deleted_commit_state_manifests,
+        deleted_mutation_inventories,
+        deleted_semantic_commit_projections,
+        deleted_semantic_change_rows,
+        deleted_semantic_reverse_index_rows,
         staged_written_bytes: stats.written_bytes,
         delete_descriptors: arena.delete_descriptors,
         delete_descriptor_capacity: arena.delete_descriptor_capacity,
@@ -856,7 +897,7 @@ pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
     JSON_STORE_STAGE_BYTES.fetch_add(hash.len() as u64, Ordering::Relaxed);
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageLayoutAccounting {
     pub space_id: u32,
     pub space: &'static str,
@@ -1980,20 +2021,77 @@ mod tests {
         .expect("delete benchmark branch");
         let adapter = StorageAdapter::new(storage);
 
+        let before_layout = super::layout_accounting(
+            &adapter
+                .begin_read(crate::ReadOptions::default())
+                .await
+                .expect("begin pre-GC inventory read"),
+        )
+        .await;
+
         let first = plan_repository_gc_for_bench(&adapter)
             .await
             .expect("plan repository gc");
+        let after_first_layout = super::layout_accounting(
+            &adapter
+                .begin_read(crate::ReadOptions::default())
+                .await
+                .expect("begin post-first-plan inventory read"),
+        )
+        .await;
         let second = plan_repository_gc_for_bench(&adapter)
             .await
             .expect("repeat repository gc plan");
+        let after_second_layout = super::layout_accounting(
+            &adapter
+                .begin_read(crate::ReadOptions::default())
+                .await
+                .expect("begin post-second-plan inventory read"),
+        )
+        .await;
 
         assert_eq!(first.swept_commits, 10);
-        // Each unreachable commit removes its changelog projection, the
-        // unified commit-state authority, and its standalone change fact.
-        assert_eq!(first.staged_deletes, 30);
-        assert_eq!(first.key_shared_buffers, 30);
-        assert_eq!(first.key_shared_bytes, 30 * 16);
+        assert_eq!(first.swept_standalone_changes, 10);
+        assert_eq!(first.deleted_commit_state_manifests, 10);
+        assert_eq!(first.deleted_mutation_inventories, 10);
+        assert_eq!(first.deleted_semantic_commit_projections, 11);
+        assert_eq!(first.deleted_semantic_change_rows, 21);
+        assert_eq!(first.deleted_semantic_reverse_index_rows, 11);
+        assert_eq!(
+            first.delete_counts_by_space,
+            vec![
+                (
+                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                        .id
+                        .0,
+                    10,
+                ), // commit-state manifest authority
+                (
+                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
+                        .id
+                        .0,
+                    10,
+                ), // mutation inventory authority
+                (crate::changelog::COMMIT_SPACE.id.0, 11), // semantic commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 21), // semantic change facts
+                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 11), // commit -> change reverse index
+            ]
+        );
+        assert_eq!(
+            first
+                .delete_counts_by_space
+                .iter()
+                .map(|(_, count)| *count as u64)
+                .sum::<u64>(),
+            first.staged_deletes
+        );
+        assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
+        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize);
+        assert_eq!(first.key_shared_bytes, first.staged_deletes as usize * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
+        assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
         assert_eq!(second.staged_deletes, first.staged_deletes);
+        assert_eq!(before_layout, after_first_layout);
+        assert_eq!(after_first_layout, after_second_layout);
     }
 }
