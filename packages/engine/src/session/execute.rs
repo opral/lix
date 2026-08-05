@@ -8058,34 +8058,64 @@ mod tests {
             "full updates must preserve the newer lifecycle of a reinserted identity"
         );
 
+        // Pick a part from the authenticated current head, rather than the
+        // lexicographically first object in the space. Historical and
+        // unreachable parts may remain in this immutable space and deleting
+        // one of those must not make GC fail closed.
         let read = session
             .storage
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let native = crate::storage_adapter::ScanPlan::prefix(
+        let controls = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .expect("branch-head controls should load");
+        let mut live_descriptor = None;
+        for (_, control) in controls {
+            let manifest =
+                crate::tracked_state::load_commit_state_manifest(&read, control.head_commit_id)
+                    .await
+                    .expect("active head manifest should load");
+            let Some(root) = manifest.and_then(|manifest| manifest.current_state_scoped_ranges)
+            else {
+                continue;
+            };
+            let reachable = crate::tracked_state::validate_scoped_range_trees(
+                &read,
+                std::slice::from_ref(&root.tree),
+            )
+            .await
+            .expect("active head current-state tree should authenticate");
+            live_descriptor = reachable
+                .parts
+                .iter()
+                .map(crate::tracked_state::current_state_descriptor_from_scoped_range_part)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("active head part descriptors should decode")
+                .into_iter()
+                .find(|descriptor| descriptor.source_kind == 1);
+            if live_descriptor.is_some() {
+                break;
+            }
+        }
+        let live_descriptor =
+            live_descriptor.expect("an active head should retain a live native part");
+        let native_key = crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+            &live_descriptor.content_digest,
+        ));
+        let native_presence = crate::storage_adapter::PointReadPlan::new(
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            crate::storage_adapter::StoragePrefix {
-                bytes: bytes::Bytes::new(),
-            },
+            std::slice::from_ref(&native_key),
         )
-        .collect(
-            &read,
-            crate::storage_adapter::StorageScanOptions {
-                projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
-                limit_rows: 1,
-                ..Default::default()
-            },
-        )
+        .materialize(&read, Default::default())
         .await
-        .unwrap();
-        let native_key = native
-            .value
-            .entries
-            .first()
-            .expect("sparse descendants must publish a native current-state part")
-            .key
-            .clone();
+        .expect("live native part presence should read");
+        assert!(
+            native_presence.value[0].is_some(),
+            "live part must exist before delete"
+        );
         drop(read);
         let mut corrupt = session.storage.new_write_set();
         corrupt.delete(
