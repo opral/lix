@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -18,6 +19,7 @@ type InMemoryMap = PersistentMap<Key, Bytes>;
 const SNAPSHOT_MAGIC: &[u8; 8] = b"LIXMEM\0\x01";
 const SNAPSHOT_HEADER_BYTES: usize = SNAPSHOT_MAGIC.len() + size_of::<u32>();
 const SNAPSHOT_ENTRY_HEADER_BYTES: usize = size_of::<u32>() * 2;
+static NEXT_SNAPSHOT_CACHE_KEY: AtomicU64 = AtomicU64::new(1);
 
 /// The in-memory storage has no native namespaces; it scopes keys to spaces
 /// by prefixing the 4-byte big-endian space id internally. The prefix never
@@ -65,6 +67,7 @@ pub struct MemoryFixture {
 #[expect(missing_debug_implementations)]
 pub struct MemoryRead {
     entries: InMemoryMap,
+    snapshot_cache_key: u128,
 }
 
 #[expect(missing_debug_implementations)]
@@ -276,6 +279,7 @@ impl Storage for Memory {
         }
         Ok(MemoryRead {
             entries: self.snapshot()?,
+            snapshot_cache_key: u128::from(NEXT_SNAPSHOT_CACHE_KEY.fetch_add(1, Ordering::Relaxed)),
         })
     }
 
@@ -292,6 +296,10 @@ impl Storage for Memory {
 }
 
 impl StorageRead for MemoryRead {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        Some(self.snapshot_cache_key)
+    }
+
     async fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],

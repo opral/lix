@@ -313,6 +313,10 @@ impl<R> StorageAdapterRead for StorageAdapterReadTransaction<R>
 where
     R: crate::storage::StorageRead,
 {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.read.snapshot_cache_key()
+    }
+
     fn get_many(
         &self,
         requests: &[crate::storage::GetManyRequest<'_>],

@@ -43,7 +43,7 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     let typed_commit_id = CommitId::parse_lix(commit_id, "commit-root rebuild authority")?;
-    let manifest = storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
+    let _manifest = storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
         .await?
         .ok_or_else(|| {
             LixError::new(
@@ -53,17 +53,9 @@ where
                 ),
             )
         })?;
-    if manifest.snapshot_root.is_none() {
-        // Rootless commits are intentionally bounded-replay layouts. Build and
-        // audit the canonical state transiently, but do not persist chunks that
-        // immutable authority cannot address.
-        let mut scratch_writes = StorageWriteSet::new();
-        let mut scratch_rebuilder = TrackedStateRootRebuilder {
-            store: rebuilder.store,
-            writes: &mut scratch_writes,
-        };
-        return rebuild_commit_root_at_inner(&mut scratch_rebuilder, commit_id).await;
-    }
+    // A rootless selector is a valid generation-1 state, not a reason to
+    // discard the rebuild. The verified result below can promote it to a new
+    // immutable generation under the same semantic commit selector.
     rebuild_commit_root_at_inner(rebuilder, commit_id).await
 }
 
@@ -80,7 +72,7 @@ where
     let context = TrackedStateContext::new();
     let mut state = TrackedStateTransientRebuildState::default();
     for plan in plans.iter().rev() {
-        let manifest = storage::load_commit_state_manifest(rebuilder.store, plan.commit_id)
+        let _manifest = storage::load_commit_state_manifest(rebuilder.store, plan.commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -91,7 +83,15 @@ where
                     ),
                 )
             })?;
-        if manifest.snapshot_root.is_some() {
+        // The mutable selector, not the legacy manifest field, decides which
+        // immutable physical generation currently serves this semantic
+        // commit. The manifest is still loaded above for its authenticated
+        // mutation payload, but its embedded root is only the generation-1
+        // publication seed and is never used for routing.
+        if storage::load_commit_state_generation_root(rebuilder.store, plan.commit_id)
+            .await?
+            .is_some()
+        {
             let mut writer =
                 context.writer_with_rebuild_state(rebuilder.store, rebuilder.writes, state);
             let rooted_report = stage_rebuild_plan_with_writer(&mut writer, plan).await?;
@@ -128,7 +128,7 @@ where
     let staged_roots = writer.staged_commit_roots().cloned().collect::<Vec<_>>();
     drop(writer);
     for snapshot_root in staged_roots {
-        let manifest = storage::load_published_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
+        let _manifest = storage::load_published_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -139,19 +139,22 @@ where
                     ),
                 )
             })?;
-        if let Some(expected) = manifest.snapshot_root.as_ref()
-            && !expected.has_same_authoritative_layout(&snapshot_root)
+        let selected =
+            storage::load_commit_state_generation_root(rebuilder.store, snapshot_root.commit_id)
+                .await?;
+        if selected
+            .as_ref()
+            .is_none_or(|selected| !selected.has_same_authoritative_layout(&snapshot_root))
         {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "rebuilt tracked_state root for commit '{}' disagrees with immutable commit authority: expected {expected:?}, rebuilt {snapshot_root:?}",
-                    snapshot_root.commit_id,
-                ),
-            ));
+            let precondition = storage::stage_commit_state_generation_replacement(
+                rebuilder.store,
+                rebuilder.writes,
+                snapshot_root.commit_id,
+                &snapshot_root,
+            )
+            .await?;
+            rebuilder.selector_preconditions.push(precondition);
         }
-        // Root metadata is immutable authority. Rebuilds restore its
-        // content-addressed chunks; rootless commits remain replay-only.
     }
     Ok(report)
 }

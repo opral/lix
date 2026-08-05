@@ -709,6 +709,16 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &external_parent_manifests,
     )
     .await?;
+    // Every semantic commit gets exactly one initial selector publication.
+    // The immutable generation body is staged before this CAS fence; a stale
+    // retry cannot overwrite a selector that another writer already owns.
+    for staged in staged_commits.values() {
+        preconditions.push(
+            crate::tracked_state::commit_state_selector_absent_precondition(
+                staged.record.commit_id,
+            ),
+        );
+    }
     // HOT publication has adapter-specific checkpoint, packed-base, and
     // point-row futures. Keep their combined async state out of the parent
     // commit future so an inactive bulk branch cannot inflate every ordinary

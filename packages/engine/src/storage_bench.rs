@@ -61,6 +61,9 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
+static CRUD_ROOT_SELECTOR_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CRUD_ROOT_SELECTOR_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static CRUD_ROOT_SELECTOR_STORAGE_GETS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -391,6 +394,18 @@ pub(crate) fn record_crud_replay_manifest_load() {
     CRUD_REPLAY_MANIFEST_LOADS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn record_crud_root_selector_cache_hit() {
+    CRUD_ROOT_SELECTOR_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_crud_root_selector_cache_miss() {
+    CRUD_ROOT_SELECTOR_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_crud_root_selector_storage_get() {
+    CRUD_ROOT_SELECTOR_STORAGE_GETS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn record_crud_ordered_delta_fallback() {
     CRUD_ORDERED_DELTA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
@@ -403,6 +418,21 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudRootSelectorAccounting {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub storage_gets: u64,
+}
+
+pub fn take_crud_root_selector_accounting() -> CrudRootSelectorAccounting {
+    CrudRootSelectorAccounting {
+        cache_hits: CRUD_ROOT_SELECTOR_CACHE_HITS.swap(0, Ordering::Relaxed),
+        cache_misses: CRUD_ROOT_SELECTOR_CACHE_MISSES.swap(0, Ordering::Relaxed),
+        storage_gets: CRUD_ROOT_SELECTOR_STORAGE_GETS.swap(0, Ordering::Relaxed),
     }
 }
 

@@ -15,9 +15,9 @@ use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapterRead,
     StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
-    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
-    exact_get_many,
+    StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition, StorageProjectedValue,
+    StorageScanChunk, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet, exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -80,6 +80,19 @@ pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
         StorageSpaceId(0x0004_002c),
         TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
     );
+/// Immutable content-addressed physical generation records. A generation
+/// contains the complete verified root metadata for one semantic commit.
+pub(crate) const TRACKED_STATE_COMMIT_GENERATION_SPACE: StorageSpace = StorageSpace::immutable(
+    StorageSpaceId(0x0004_0031),
+    "tracked_state.commit_generation.v1",
+);
+/// The sole mutable selector from a semantic commit to its latest immutable
+/// physical generation. Every selector update is protected by an exact-byte
+/// CAS precondition supplied by the publication boundary.
+pub(crate) const TRACKED_STATE_COMMIT_SELECTOR_SPACE: StorageSpace = StorageSpace::mutable(
+    StorageSpaceId(0x0004_0033),
+    "tracked_state.commit_selector.v1",
+);
 
 // The durable direct-ChangeId address stride. Physical ordered parts may be
 // smaller, but their logical slots must remain stable at this width.
@@ -115,6 +128,8 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
 // catalog and authenticates a content-addressed hierarchical part directory.
 const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
 const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
+const COMMIT_STATE_GENERATION_FORMAT_MAGIC: &[u8] = b"LXCG1";
+const COMMIT_STATE_SELECTOR_FORMAT_MAGIC: &[u8] = b"LXCS1";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -612,6 +627,31 @@ struct StoredCommitStateManifest {
     current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
+}
+
+/// Immutable generation body addressed by `generation_id`. The root is
+/// optional so rootless replay authority and a later root promotion share one
+/// selector lifecycle without a sentinel or a second serving plane.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCommitStateGeneration {
+    format: Vec<u8>,
+    commit_id: CommitId,
+    generation: u64,
+    #[musli(with = storage_codec::option)]
+    root: Option<Box<TrackedStateCommitRoot>>,
+}
+
+/// Mutable exact-CAS selector value. It contains no payload and cannot serve
+/// rows; it only names one immutable generation record.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCommitStateSelector {
+    format: Vec<u8>,
+    commit_id: CommitId,
+    generation: u64,
+    #[musli(bytes)]
+    generation_id: Vec<u8>,
 }
 
 /// Small separately keyed mutation catalog. Large ordered part metadata lives
@@ -2337,19 +2377,302 @@ async fn get_one(
         .and_then(full_value_bytes))
 }
 
+fn commit_state_selector_key(commit_id: CommitId) -> Vec<u8> {
+    commit_id.as_uuid().as_bytes().to_vec()
+}
+
+fn encode_commit_state_generation(
+    commit_id: CommitId,
+    generation: u64,
+    root: Option<&TrackedStateCommitRoot>,
+) -> Result<(Vec<u8>, [u8; TRACKED_STATE_HASH_BYTES]), LixError> {
+    let body = StoredCommitStateGeneration {
+        format: COMMIT_STATE_GENERATION_FORMAT_MAGIC.to_vec(),
+        commit_id,
+        generation,
+        root: root.cloned().map(Box::new),
+    };
+    let bytes = storage_codec::encode("tracked_state commit generation", &body)?;
+    let id = *blake3::hash(&bytes).as_bytes();
+    Ok((bytes, id))
+}
+
+fn encode_commit_state_selector(
+    commit_id: CommitId,
+    generation: u64,
+    generation_id: [u8; TRACKED_STATE_HASH_BYTES],
+) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "tracked_state commit selector",
+        &StoredCommitStateSelector {
+            format: COMMIT_STATE_SELECTOR_FORMAT_MAGIC.to_vec(),
+            commit_id,
+            generation,
+            generation_id: generation_id.to_vec(),
+        },
+    )
+}
+
+fn decode_commit_state_generation(
+    expected_id: &[u8],
+    bytes: &[u8],
+) -> Result<StoredCommitStateGeneration, LixError> {
+    if blake3::hash(bytes).as_bytes() != expected_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit generation content address does not match its key",
+        ));
+    }
+    let generation: StoredCommitStateGeneration =
+        storage_codec::decode("tracked_state commit generation", bytes)?;
+    if generation.format != COMMIT_STATE_GENERATION_FORMAT_MAGIC || generation.generation == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit generation has an unsupported format",
+        ));
+    }
+    Ok(generation)
+}
+
+fn decode_commit_state_selector(
+    expected_commit_id: CommitId,
+    bytes: &[u8],
+) -> Result<StoredCommitStateSelector, LixError> {
+    let selector: StoredCommitStateSelector =
+        storage_codec::decode("tracked_state commit selector", bytes)?;
+    if selector.format != COMMIT_STATE_SELECTOR_FORMAT_MAGIC
+        || selector.commit_id != expected_commit_id
+        || selector.generation == 0
+        || selector.generation_id.len() != TRACKED_STATE_HASH_BYTES
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit selector is malformed or names another commit",
+        ));
+    }
+    Ok(selector)
+}
+
+/// Stages one immutable generation and its initial selector. The caller adds
+/// the selector CAS precondition at the publication boundary; keeping this
+/// helper write-only makes generation and selector bytes part of one atomic
+/// write set.
+fn stage_commit_state_generation(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    generation: u64,
+    root: Option<&TrackedStateCommitRoot>,
+) -> Result<[u8; TRACKED_STATE_HASH_BYTES], LixError> {
+    let (generation_bytes, generation_id) =
+        encode_commit_state_generation(commit_id, generation, root)?;
+    writes.put(
+        TRACKED_STATE_COMMIT_GENERATION_SPACE,
+        key(generation_id.to_vec()),
+        value(generation_bytes),
+    );
+    writes.put(
+        TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        key(commit_state_selector_key(commit_id)),
+        value(encode_commit_state_selector(
+            commit_id,
+            generation,
+            generation_id,
+        )?),
+    );
+    Ok(generation_id)
+}
+
+pub(crate) fn commit_state_selector_absent_precondition(
+    commit_id: CommitId,
+) -> StoragePrecondition {
+    StoragePrecondition::KeyAbsent {
+        space: TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        key: StorageKey(Bytes::from(commit_state_selector_key(commit_id))),
+    }
+}
+
+pub(crate) async fn load_commit_state_generation_root(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<TrackedStateCommitRoot>, LixError> {
+    let selector_bytes = get_one(
+        store,
+        TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        commit_state_selector_key(commit_id),
+    )
+    .await?
+    .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state commit selector is missing for commit '{commit_id}'"),
+        )
+    })?;
+    let selector = decode_commit_state_selector(commit_id, &selector_bytes)?;
+    let generation_id: [u8; TRACKED_STATE_HASH_BYTES] = selector
+        .generation_id
+        .as_slice()
+        .try_into()
+        .expect("selector generation id length validated");
+    let generation_bytes = get_one(
+        store,
+        TRACKED_STATE_COMMIT_GENERATION_SPACE,
+        generation_id.to_vec(),
+    )
+    .await?
+    .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state commit selector for '{commit_id}' names a missing generation"),
+        )
+    })?;
+    let generation = decode_commit_state_generation(&generation_id, &generation_bytes)?;
+    if generation.commit_id != commit_id || generation.generation != selector.generation {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit selector and generation disagree",
+        ));
+    }
+    if generation.root.as_ref().is_some_and(|root| {
+        root.commit_id != commit_id || root.root_id.as_bytes() == &[0; TRACKED_STATE_HASH_BYTES]
+    }) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit generation root belongs to another commit",
+        ));
+    }
+    Ok(generation.root.map(|root| *root))
+}
+
+/// Loads the selected immutable generation ids for a batch of semantic
+/// commits. The selector values are the only durable reachability edges into
+/// the generation plane; callers such as GC must mark exactly these ids and
+/// may not infer reachability from the manifest seed root.
+pub(crate) async fn load_commit_state_generation_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_ids: &[CommitId],
+) -> Result<Vec<[u8; TRACKED_STATE_HASH_BYTES]>, LixError> {
+    if commit_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_state_selector_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let request = [StorageGetManyRequest {
+        space: TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        keys: &keys,
+        opts: StorageGetOptions::default(),
+    }];
+    let values = exact_get_many(store, &request).await?.values;
+    let selectors = values
+        .into_iter()
+        .zip(commit_ids.iter().copied())
+        .map(|(value, commit_id)| {
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("tracked_state commit selector is missing for '{commit_id}'"),
+                )
+            })?;
+            let selector = decode_commit_state_selector(commit_id, &bytes)?;
+            let generation_id = selector.generation_id.as_slice().try_into().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit selector generation id has an invalid length",
+                )
+            })?;
+            Ok((generation_id, commit_id, selector.generation))
+        })
+        .collect::<Result<Vec<([u8; TRACKED_STATE_HASH_BYTES], CommitId, u64)>, LixError>>()?;
+    let generation_keys = selectors
+        .iter()
+        .map(|(generation_id, _, _)| StorageKey(Bytes::copy_from_slice(generation_id)))
+        .collect::<Vec<_>>();
+    let generation_request = [StorageGetManyRequest {
+        space: TRACKED_STATE_COMMIT_GENERATION_SPACE,
+        keys: &generation_keys,
+        opts: StorageGetOptions::default(),
+    }];
+    let generation_values = exact_get_many(store, &generation_request).await?.values;
+    generation_values
+        .into_iter()
+        .zip(selectors)
+        .map(|(value, (generation_id, commit_id, generation_number))| {
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit selector for '{commit_id}' names a missing generation"
+                    ),
+                )
+            })?;
+            let generation = decode_commit_state_generation(&generation_id, &bytes)?;
+            if generation.commit_id != commit_id || generation.generation != generation_number {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit selector and generation disagree for '{commit_id}'"
+                    ),
+                ));
+            }
+            Ok(generation_id)
+        })
+        .collect()
+}
+
+/// Stages a successor immutable generation for an already published commit
+/// and returns the exact selector CAS fence required by the caller. This is
+/// the recovery/promotion path: the old generation remains immutable and
+/// reachable until normal GC observes the selector move.
+pub(crate) async fn stage_commit_state_generation_replacement(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    root: &TrackedStateCommitRoot,
+) -> Result<StoragePrecondition, LixError> {
+    let selector_key = commit_state_selector_key(commit_id);
+    let old_bytes = get_one(
+        store,
+        TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        selector_key.clone(),
+    )
+    .await?
+    .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state commit selector is missing for promotion '{commit_id}'"),
+        )
+    })?;
+    let old = decode_commit_state_selector(commit_id, &old_bytes)?;
+    let generation = old.generation.checked_add(1).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit generation ordinal overflowed",
+        )
+    })?;
+    stage_commit_state_generation(writes, commit_id, generation, Some(root))?;
+    Ok(StoragePrecondition::KeyValueEquals {
+        space: TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        key: StorageKey(Bytes::from(selector_key)),
+        expected: Bytes::from(old_bytes),
+    })
+}
+
 pub(crate) async fn load_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    Ok(load_snapshot_commit_root(store, commit_id)
+    let commit_id = CommitId::parse_lix(commit_id, "tracked-state snapshot root lookup")?;
+    Ok(load_commit_state_generation_root(store, commit_id)
         .await?
         .map(|metadata| metadata.root_id))
 }
 
 /// Resolves canonical snapshot metadata from immutable physical authority.
 ///
-/// Tree chunks are rebuildable by content hash, but the manifest-owned root
-/// pointer is the authority that permits readers to serve them.
+/// Tree chunks are rebuildable by content hash, but the commit-keyed mutable
+/// selector is the authority that permits readers to serve one immutable
+/// generation.
 pub(crate) async fn load_snapshot_commit_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
@@ -2359,7 +2682,7 @@ pub(crate) async fn load_snapshot_commit_root(
     // authority first so they do not pay a second semantic lookup merely to
     // prove the absence of a root pointer. A present pointer still requires
     // semantic liveness before it may authorize any chunk reads.
-    let Some(snapshot_root) = load_manifest_snapshot_commit_root(store, commit_id).await? else {
+    let Some(snapshot_root) = load_commit_state_generation_root(store, commit_id).await? else {
         return Ok(None);
     };
     let commit_ids = [commit_id];
@@ -2384,30 +2707,11 @@ pub(crate) async fn load_snapshot_commit_root(
 /// Only code that has already proved semantic liveness and integrity tests may
 /// use this helper; all commit-addressed read APIs must use
 /// [`load_snapshot_commit_root`].
-pub(super) async fn load_manifest_snapshot_commit_root(
+pub(super) async fn load_published_commit_state_generation_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<TrackedStateCommitRoot>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        commit_state_manifest_key(commit_id),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let stored = decode_stored_commit_state_manifest(&bytes)?;
-    if stored.commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked_state commit_state_manifest key for commit '{commit_id}' contains manifest for commit '{}'",
-                stored.commit_id
-            ),
-        ));
-    }
-    Ok(stored.snapshot_root.map(|root| *root))
+    load_commit_state_generation_root(store, commit_id).await
 }
 
 fn commit_delta_manifest_key(commit_id: CommitId) -> Vec<u8> {
@@ -2452,13 +2756,6 @@ impl PublishedCommitStateTopology {
 
     pub(crate) fn current_state_scoped_ranges(&self) -> Option<&CurrentStateScopedRangeRoot> {
         self.header.current_state_scoped_ranges.as_deref()
-    }
-
-    pub(crate) fn snapshot_root_id(&self) -> Option<TrackedStateRootId> {
-        self.header
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.root_id.clone())
     }
 
     fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
@@ -3927,6 +4224,16 @@ fn stage_commit_state_manifest_bytes(
         key(commit_mutation_inventory_key(manifest.commit_id)),
         value(encoded.mutation_inventory),
     );
+    // The manifest bytes are retained as commit metadata, but serving root
+    // resolution is exclusively through the generation selector. Generation 1
+    // is published beside every semantic commit, including rootless replay
+    // commits (whose generation root is explicitly empty).
+    stage_commit_state_generation(
+        writes,
+        manifest.commit_id,
+        1,
+        manifest.snapshot_root.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -4034,6 +4341,12 @@ pub(crate) fn stage_resealed_commit_state_manifest_for_test(
         key(commit_mutation_inventory_key(manifest.commit_id)),
         value(encoded.mutation_inventory),
     );
+    stage_commit_state_generation(
+        writes,
+        manifest.commit_id,
+        1,
+        manifest.snapshot_root.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -9863,6 +10176,10 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
         TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
         key(commit_mutation_inventory_key(commit_id)),
     );
+    writes.delete(
+        TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+        key(commit_state_selector_key(commit_id)),
+    );
     for segment_key in &entry.physical_segment_keys {
         writes.delete(
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
@@ -11533,6 +11850,8 @@ pub(crate) struct TrackedStateStagedRead<'a, S: ?Sized> {
     chunks: &'a TrackedStateChunkOverlay,
     commit_states: HashMap<Vec<u8>, Bytes>,
     mutation_inventories: HashMap<Vec<u8>, Bytes>,
+    commit_generations: HashMap<Vec<u8>, Bytes>,
+    commit_selectors: HashMap<Vec<u8>, Bytes>,
     mutation_directory_nodes: HashMap<Vec<u8>, Bytes>,
 }
 
@@ -11546,6 +11865,8 @@ where
             chunks,
             commit_states: HashMap::new(),
             mutation_inventories: HashMap::new(),
+            commit_generations: HashMap::new(),
+            commit_selectors: HashMap::new(),
             mutation_directory_nodes: HashMap::new(),
         }
     }
@@ -11572,7 +11893,7 @@ where
                 Ok((key, encoded))
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let commit_states = encoded
+        let commit_states: HashMap<Vec<u8>, Bytes> = encoded
             .iter()
             .map(|(key, encoded)| (key.clone(), Bytes::copy_from_slice(&encoded.header)))
             .collect();
@@ -11591,11 +11912,34 @@ where
             .flat_map(|directory| directory.node_bytes())
             .map(|(node_id, bytes)| (node_id.to_vec(), bytes.clone()))
             .collect();
+        let mut generation_bytes = HashMap::new();
+        let mut selector_bytes = HashMap::new();
+        for (key, _) in &encoded {
+            let commit_bytes: [u8; 16] = key.as_slice().try_into().map_err(|_| {
+                replacement_payload_error(
+                    "staged tracked-state generation key is not a canonical commit id",
+                )
+            })?;
+            let commit_id = CommitId::new(uuid::Uuid::from_bytes(commit_bytes));
+            let root = commit_states
+                .get(key)
+                .and_then(|bytes| decode_stored_commit_state_manifest(bytes).ok())
+                .and_then(|manifest| manifest.snapshot_root.map(|root| *root));
+            let (generation, generation_id) =
+                encode_commit_state_generation(commit_id, 1, root.as_ref())?;
+            generation_bytes.insert(generation_id.to_vec(), Bytes::from(generation));
+            selector_bytes.insert(
+                commit_state_selector_key(commit_id),
+                Bytes::from(encode_commit_state_selector(commit_id, 1, generation_id)?),
+            );
+        }
         Ok(Self {
             store,
             chunks,
             commit_states,
             mutation_inventories,
+            commit_generations: generation_bytes,
+            commit_selectors: selector_bytes,
             mutation_directory_nodes,
         })
     }
@@ -11611,6 +11955,12 @@ where
         if space == TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id {
             return self.mutation_inventories.get(key.0.as_ref()).cloned();
         }
+        if space == TRACKED_STATE_COMMIT_GENERATION_SPACE.id {
+            return self.commit_generations.get(key.0.as_ref()).cloned();
+        }
+        if space == TRACKED_STATE_COMMIT_SELECTOR_SPACE.id {
+            return self.commit_selectors.get(key.0.as_ref()).cloned();
+        }
         if space == super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id {
             return self.mutation_directory_nodes.get(key.0.as_ref()).cloned();
         }
@@ -11622,6 +11972,10 @@ impl<S> StorageAdapterRead for TrackedStateStagedRead<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.store.snapshot_cache_key()
+    }
+
     async fn get_many(
         &self,
         requests: &[StorageGetManyRequest<'_>],
@@ -12518,17 +12872,20 @@ mod tests {
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        TRACKED_STATE_COMMIT_GENERATION_SPACE, TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        TRACKED_STATE_COMMIT_SELECTOR_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, columnar_identity_row_map,
-        decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
-        decode_stored_commit_state_authority, encode_commit_delta_segment,
-        encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
-        encode_commit_state_manifest, key, load_change_record_by_id, load_commit_delta_change_ids,
-        load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-        load_commit_delta_values_encoded, load_commit_state_manifest,
+        commit_state_selector_key, decode_commit_delta_with_payloads,
+        decode_encoded_commit_state_manifest, decode_stored_commit_state_authority,
+        encode_commit_delta_segment, encode_commit_delta_segment_with_payloads,
+        encode_commit_delta_segment_with_raw_sidecar, encode_commit_state_manifest, key,
+        load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
+        load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
+        load_commit_state_generation_root, load_commit_state_manifest,
         load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
         scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
-        stage_change_locators, stage_commit_state_manifest,
-        stage_delete_commit_delta_inventory_entry,
+        stage_change_locators, stage_commit_state_generation_replacement,
+        stage_commit_state_manifest, stage_delete_commit_delta_inventory_entry,
         stage_fragmented_scoped_current_state_descriptor, value,
     };
 
@@ -14866,8 +15223,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &deltas).expect("packed deltas should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            7,
-            "generic history keeps three read-friendly segments plus an atomic header, catalog, directory root, and semantic owner"
+            9,
+            "generic history keeps three read-friendly segments plus an atomic header, catalog, directory root, semantic owner, generation, and selector"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -15062,8 +15419,8 @@ mod tests {
             .expect("individually valid rows should split below the sidecar limit");
         assert_eq!(
             writes.stats().staged_puts,
-            6,
-            "the oversized four-row candidate should become two segments plus an atomic header, catalog, directory root, and semantic owner"
+            8,
+            "the oversized four-row candidate should become two segments plus an atomic header, catalog, directory root, semantic owner, generation, and selector"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -16142,8 +16499,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &[delta]).expect("inline delta should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            3,
-            "a one-segment commit should remain inline in its atomic header/catalog authority plus semantic owner"
+            5,
+            "a one-segment commit should remain inline in its atomic header/catalog authority plus semantic owner, generation, and selector"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -16184,8 +16541,8 @@ mod tests {
         .expect("inline delta should stage for deletion");
         assert_eq!(
             deletes.stats().staged_deletes,
-            2,
-            "physical inventory deletion should remove its header and catalog authority"
+            3,
+            "physical inventory deletion should remove its header, catalog, and selector authority"
         );
     }
 
@@ -16326,7 +16683,7 @@ mod tests {
                 .get(&commit_id)
                 .expect("packed commit should be inventoried")
                 .segment_count
-                + 2,
+                + 3,
         )
         .expect("test segment count fits u64");
         assert_eq!(deletes.stats().staged_deletes, expected_deletes);
@@ -16379,7 +16736,7 @@ mod tests {
         let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..128]);
         stage_commit_deltas(&mut inline_writes, &inline_deltas)
             .expect("128 generic deltas should fit the history read boundary");
-        assert_eq!(inline_writes.stats().staged_puts, 3);
+        assert_eq!(inline_writes.stats().staged_puts, 5);
         storage
             .commit_write_set(inline_writes, StorageWriteOptions::default())
             .await
@@ -16389,7 +16746,7 @@ mod tests {
         let indexed_deltas = commit_delta_refs(indexed_commit_id, &fixtures);
         stage_commit_deltas(&mut indexed_writes, &indexed_deltas)
             .expect("129 generic deltas should use indexed segments");
-        assert_eq!(indexed_writes.stats().staged_puts, 6);
+        assert_eq!(indexed_writes.stats().staged_puts, 8);
         storage
             .commit_write_set(indexed_writes, StorageWriteOptions::default())
             .await
@@ -16489,6 +16846,10 @@ mod tests {
             TRACKED_STATE_TREE_CHUNK_SPACE,
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
             TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            TRACKED_STATE_COMMIT_GENERATION_SPACE,
+            TRACKED_STATE_COMMIT_SELECTOR_SPACE,
             crate::tracked_state::scoped_range::SCOPED_RANGE_NODE_SPACE,
             BINARY_CAS_MANIFEST_SPACE,
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
@@ -16793,6 +17154,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_state_selector_promotes_generations_and_rejects_stale_cas() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut manifest = commit_state_manifest_fixture();
+        // Generation 1 is explicitly rootless; the selector, rather than the
+        // manifest's optional seed field, is the serving decision.
+        manifest.replay_debt = CommitStateReplayDebt {
+            depth: 1,
+            rows: 1,
+            bytes: 64,
+        };
+        manifest.snapshot_root = None;
+        let mut initial = storage.new_write_set();
+        stage_commit_state_manifest(&mut initial, &manifest).expect("rootless authority stages");
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("generation 1 should commit");
+
+        let first_root = TrackedStateCommitRoot {
+            commit_id: manifest.commit_id,
+            root_id: TrackedStateRootId::new([21; 32]),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: 32,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("promotion read should open");
+        assert_eq!(
+            load_commit_state_generation_root(&read, manifest.commit_id)
+                .await
+                .expect("rootless selector should decode"),
+            None
+        );
+        let mut first_writes = storage.new_write_set();
+        let first_guard = stage_commit_state_generation_replacement(
+            &read,
+            &mut first_writes,
+            manifest.commit_id,
+            &first_root,
+        )
+        .await
+        .expect("rootless-to-rooted promotion should stage");
+        storage
+            .commit_write_set(
+                first_writes,
+                StorageWriteOptions {
+                    preconditions: vec![first_guard],
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("rootless-to-rooted promotion should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rooted selector read should open");
+        assert_eq!(
+            load_commit_state_generation_root(&read, manifest.commit_id)
+                .await
+                .expect("rooted selector should decode")
+                .expect("generation 2 should be rooted")
+                .root_id,
+            first_root.root_id
+        );
+
+        let second_root = TrackedStateCommitRoot {
+            root_id: TrackedStateRootId::new([22; 32]),
+            ..first_root.clone()
+        };
+        let mut current_writes = storage.new_write_set();
+        let current_guard = stage_commit_state_generation_replacement(
+            &read,
+            &mut current_writes,
+            manifest.commit_id,
+            &second_root,
+        )
+        .await
+        .expect("rooted replacement should stage");
+        let mut stale_writes = storage.new_write_set();
+        let stale_guard = stage_commit_state_generation_replacement(
+            &read,
+            &mut stale_writes,
+            manifest.commit_id,
+            &TrackedStateCommitRoot {
+                root_id: TrackedStateRootId::new([23; 32]),
+                ..first_root.clone()
+            },
+        )
+        .await
+        .expect("stale replacement should stage against the same snapshot");
+        storage
+            .commit_write_set(
+                current_writes,
+                StorageWriteOptions {
+                    preconditions: vec![current_guard],
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("rooted replacement should commit");
+        let error = storage
+            .commit_write_set(
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: vec![stale_guard],
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale selector CAS must fail closed");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                crate::storage_adapter::StorageError::PreconditionFailed(_)
+            )
+        ));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("final selector read should open");
+        assert_eq!(
+            load_commit_state_generation_root(&read, manifest.commit_id)
+                .await
+                .expect("final selector should decode")
+                .expect("final generation should remain rooted")
+                .root_id,
+            second_root.root_id
+        );
+
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            TRACKED_STATE_COMMIT_SELECTOR_SPACE,
+            key(commit_state_selector_key(manifest.commit_id)),
+            value(vec![0xff, 0x00]),
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("test selector corruption should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt selector read should open");
+        let error = load_commit_state_generation_root(&read, manifest.commit_id)
+            .await
+            .expect_err("malformed selector must fail closed");
+        assert!(error.message.contains("selector"));
+    }
+
+    #[tokio::test]
     async fn split_mutation_authority_publishes_atomically_and_fails_closed() {
         const PART_COUNT: usize = 260;
         let manifest = external_commit_state_manifest_fixture(
@@ -16987,12 +17505,12 @@ mod tests {
         };
 
         assert_eq!(
-            super::load_manifest_snapshot_commit_root(&read, manifest.commit_id)
+            super::load_published_commit_state_generation_root(&read, manifest.commit_id)
                 .await
                 .expect("physical root should load"),
             Some(authoritative.clone())
         );
-        assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 0);
         assert_eq!(inventory_requests.load(Ordering::Relaxed), 0);
         assert_eq!(directory_requests.load(Ordering::Relaxed), 0);
 

@@ -891,6 +891,11 @@ where
         .iter()
         .copied()
         .collect::<Vec<_>>();
+    let live_commit_generation_ids =
+        crate::tracked_state::load_commit_state_generation_ids(store, &retained_authority_ids)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
     let retained_mutation_roots =
         crate::tracked_state::load_commit_mutation_directory_roots(store, &retained_authority_ids)
             .await?;
@@ -1064,6 +1069,13 @@ where
         writes,
         crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
         &live_mutation_directory_nodes,
+    )
+    .await?;
+    stage_sweep_unreachable_content_nodes(
+        store,
+        writes,
+        crate::tracked_state::TRACKED_STATE_COMMIT_GENERATION_SPACE,
+        &live_commit_generation_ids,
     )
     .await?;
     stage_sweep_unreachable_content_nodes(

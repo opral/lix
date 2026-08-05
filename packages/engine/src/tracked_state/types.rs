@@ -440,9 +440,10 @@ pub(crate) struct CommitStateManifest {
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
-    /// Canonical snapshot metadata when this commit was published as a root
-    /// fence. The tree chunks are rebuildable by content hash; this immutable
-    /// pointer is the authority that permits readers to serve them.
+    /// Generation-one seed metadata when this commit was first published as a
+    /// root fence. The serving authority is the commit-keyed mutable selector
+    /// and its immutable generation body; this retained field is never a
+    /// reader or GC reachability edge.
     #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }

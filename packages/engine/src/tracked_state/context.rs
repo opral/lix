@@ -969,7 +969,11 @@ impl TrackedStateContext {
         S: StorageAdapterRead + ?Sized,
     {
         let _ = self;
-        TrackedStateRootRebuilder { store, writes }
+        TrackedStateRootRebuilder {
+            store,
+            writes,
+            selector_preconditions: Vec::new(),
+        }
     }
 }
 
@@ -1925,9 +1929,10 @@ where
             .await?;
         let typed_commit_id =
             CommitId::parse_lix(commit_id, "tracked-state required snapshot root lookup")?;
-        let metadata = storage::load_manifest_snapshot_commit_root(&self.store, typed_commit_id)
-            .await?
-            .ok_or_else(|| missing_commit_root_error(commit_id))?;
+        let metadata =
+            storage::load_published_commit_state_generation_root(&self.store, typed_commit_id)
+                .await?
+                .ok_or_else(|| missing_commit_root_error(commit_id))?;
         cache
             .commit_root_metadata
             .insert(commit_id.to_string(), metadata.clone());
@@ -1946,7 +1951,7 @@ where
             CommitId::parse_lix(commit_id, "tracked-state optional snapshot root lookup")?;
         self.load_cached_changelog_first_parent(commit_id, cache)
             .await?;
-        let topology = storage::load_published_commit_state_topology(&self.store, typed_commit_id)
+        let _topology = storage::load_published_commit_state_topology(&self.store, typed_commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -1956,7 +1961,9 @@ where
                     ),
                 )
             })?;
-        let root_id = topology.snapshot_root_id();
+        let root_id = storage::load_commit_state_generation_root(&self.store, typed_commit_id)
+            .await?
+            .map(|root| root.root_id);
         cache
             .commit_roots
             .insert(commit_id.to_string(), root_id.clone());
@@ -2108,7 +2115,10 @@ where
             return Ok(None);
         };
         for parent_id in commit.parent_commit_ids.iter().skip(1) {
-            let Some(parent_root) = storage::load_root(&self.store, &parent_id.to_string()).await?
+            let Some(parent_root) = self
+                .tree
+                .load_root(&self.store, &parent_id.to_string())
+                .await?
             else {
                 continue;
             };
@@ -3550,11 +3560,11 @@ where
                     ),
                 )
             })?;
-        let rootless = manifest.replay_debt.depth > 0;
-        let root_id = manifest
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.root_id.clone());
+        let root_id = self
+            .tree
+            .load_root(&self.store, &commit_id.to_string())
+            .await?;
+        let rootless = root_id.is_none();
         let replacement_generation = if rootless && manifest.mutations.member_count != 0 {
             storage::seed_commit_delta_point_cache_from_replay_manifest(
                 &manifest,
@@ -3831,6 +3841,7 @@ impl TrackedStateTransientRebuildState {
 pub(crate) struct TrackedStateRootRebuilder<'a, S: ?Sized> {
     pub(super) store: &'a S,
     pub(super) writes: &'a mut StorageWriteSet,
+    pub(super) selector_preconditions: Vec<crate::storage_adapter::StoragePrecondition>,
 }
 
 impl<S> TrackedStateRootRebuilder<'_, S>
@@ -3842,6 +3853,12 @@ where
         commit_id: &str,
     ) -> Result<TrackedStateWriteReport, LixError> {
         crate::tracked_state::commit_root_rebuild::rebuild_commit_root_at(self, commit_id).await
+    }
+
+    pub(crate) fn take_selector_preconditions(
+        &mut self,
+    ) -> Vec<crate::storage_adapter::StoragePrecondition> {
+        std::mem::take(&mut self.selector_preconditions)
     }
 }
 
@@ -5954,7 +5971,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("bulk result read should open");
-        let bulk_root = storage::load_manifest_snapshot_commit_root(
+        let bulk_root = storage::load_published_commit_state_generation_root(
             &bulk_read,
             CommitId::parse_lix(&child_commit_id, "bulk child fixture").expect("test commit id"),
         )
@@ -5966,7 +5983,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("generic result read should open");
-        let generic_root = storage::load_manifest_snapshot_commit_root(
+        let generic_root = storage::load_published_commit_state_generation_root(
             &generic_read,
             CommitId::parse_lix(&child_commit_id, "generic child fixture").expect("test commit id"),
         )
@@ -6622,7 +6639,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should reopen");
-        let child_metadata = storage::load_manifest_snapshot_commit_root(
+        let child_metadata = storage::load_published_commit_state_generation_root(
             &read,
             CommitId::for_test_label("empty-child"),
         )
@@ -7206,7 +7223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_rebuild_rejects_stale_immutable_root_missing_inherited_row() {
+    async fn explicit_rebuild_promotes_stale_selector_root_after_canonical_validation() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let inherited = row_with_value("entity-a", "change-base", "base", "base");
@@ -7236,16 +7253,42 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let error = tracked_state
-            .root_rebuilder(&read, &mut writes)
+        let mut rebuilder = tracked_state.root_rebuilder(&read, &mut writes);
+        rebuilder
             .rebuild_commit_root_at("child")
             .await
-            .expect_err("rebuild must not rewrite stale immutable root authority");
+            .expect("canonical changelog should repair the stale selected generation");
+        let selector_preconditions = rebuilder.take_selector_preconditions();
+        assert!(!selector_preconditions.is_empty());
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions: selector_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("selector promotion should commit atomically");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("promoted read should open");
+        let root = storage::load_root(&read, "child")
+            .await
+            .expect("promoted selector should decode")
+            .expect("promoted child root should exist");
+        let rows = TrackedStateTree::new()
+            .scan(&read, &root, &TrackedStateTreeScanRequest::default())
+            .await
+            .expect("promoted root should scan");
+        assert_eq!(rows.len(), 2);
         assert!(
-            error
-                .message
-                .contains("disagrees with immutable commit authority")
+            rows.iter()
+                .any(|(key, _)| key.entity_pk == inherited.entity_pk)
         );
+        assert!(rows.iter().any(|(key, _)| key.entity_pk == child.entity_pk));
     }
 
     #[tokio::test]
@@ -8192,7 +8235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_rebuild_audits_rootless_commit_without_publishing_unreachable_chunks() {
+    async fn explicit_rebuild_promotes_rootless_commit_through_selector() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
@@ -8222,16 +8265,37 @@ mod tests {
             .await
             .expect("rebuild read should open");
         let mut writes = storage.new_write_set();
-        let report = tracked_state
-            .root_rebuilder(&read, &mut writes)
+        let mut rebuilder = tracked_state.root_rebuilder(&read, &mut writes);
+        let report = rebuilder
             .rebuild_commit_root_at("rootless")
             .await
-            .expect("rootless state should pass transient rebuild audit");
+            .expect("rootless state should promote through the selector");
+        let selector_preconditions = rebuilder.take_selector_preconditions();
 
         assert_eq!(report.commit_id, CommitId::for_test_label("rootless"));
-        assert_eq!(writes.stats().staged_puts, 0);
+        assert!(!selector_preconditions.is_empty());
+        assert!(writes.stats().staged_puts > 0);
         assert_eq!(writes.stats().staged_deletes, 0);
-        assert_eq!(writes.stats().written_bytes, 0);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions: selector_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("rootless selector promotion should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("promoted root read should open");
+        assert!(
+            storage::load_root(&read, "rootless")
+                .await
+                .expect("promoted selector should decode")
+                .is_some()
+        );
     }
 
     #[tokio::test]

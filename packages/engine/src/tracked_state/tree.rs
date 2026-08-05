@@ -47,6 +47,32 @@ use crate::{LixError, NullableKeyFilter};
 // about 64 MiB (excluding cache metadata and live `Bytes` views held by callers).
 const TRACKED_STATE_NODE_CACHE_CAPACITY: usize = 4096;
 type TrackedStateNodeCache = LruCache<[u8; TRACKED_STATE_HASH_BYTES], Bytes>;
+const TRACKED_STATE_ROOT_SELECTOR_CACHE_CAPACITY: usize = 256;
+
+/// Snapshot-scoped cache for the immutable root selector.
+///
+/// A miss still loads and validates durable commit authority. This cache only
+/// removes repeated selector reads from readers sharing one coherent snapshot;
+/// it cannot publish, mutate, or substitute a root.
+#[derive(Debug, Default)]
+struct RootSelectorCache {
+    entries: BTreeMap<(u128, String), Option<TrackedStateRootId>>,
+}
+
+impl RootSelectorCache {
+    fn get(&self, snapshot: u128, commit_id: &str) -> Option<Option<TrackedStateRootId>> {
+        self.entries.get(&(snapshot, commit_id.to_owned())).cloned()
+    }
+
+    fn put(&mut self, snapshot: u128, commit_id: &str, root: Option<TrackedStateRootId>) {
+        if self.entries.len() >= TRACKED_STATE_ROOT_SELECTOR_CACHE_CAPACITY {
+            if let Some(key) = self.entries.keys().next().cloned() {
+                self.entries.remove(&key);
+            }
+        }
+        self.entries.insert((snapshot, commit_id.to_owned()), root);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeOptions {
@@ -90,6 +116,7 @@ impl Default for TrackedStateTreeOptions {
 pub(crate) struct TrackedStateTree {
     options: TrackedStateTreeOptions,
     node_cache: Arc<Mutex<TrackedStateNodeCache>>,
+    root_selector_cache: Arc<Mutex<RootSelectorCache>>,
 }
 
 impl TrackedStateTree {
@@ -109,6 +136,7 @@ impl TrackedStateTree {
                 NonZeroUsize::new(TRACKED_STATE_NODE_CACHE_CAPACITY)
                     .expect("tracked-state node cache capacity must be non-zero"),
             ))),
+            root_selector_cache: Arc::new(Mutex::new(RootSelectorCache::default())),
         }
     }
 
@@ -117,7 +145,29 @@ impl TrackedStateTree {
         store: &(impl StorageAdapterRead + ?Sized),
         commit_id: &str,
     ) -> Result<Option<TrackedStateRootId>, LixError> {
-        storage::load_root(store, commit_id).await
+        let Some(snapshot) = store.snapshot_cache_key() else {
+            return storage::load_root(store, commit_id).await;
+        };
+        if let Some(root) = self
+            .root_selector_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(snapshot, commit_id)
+        {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_crud_root_selector_cache_hit();
+            return Ok(root);
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_root_selector_cache_miss();
+        let root = storage::load_root(store, commit_id).await?;
+        self.root_selector_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(snapshot, commit_id, root.clone());
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_root_selector_storage_get();
+        Ok(root)
     }
 
     #[cfg(test)]

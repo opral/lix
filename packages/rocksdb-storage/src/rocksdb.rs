@@ -61,6 +61,7 @@ struct RocksDBInner {
 pub struct RocksDBRead<'a> {
     db: &'a DB,
     snapshot: Snapshot<'a>,
+    snapshot_cache_key: u128,
 }
 
 #[allow(missing_debug_implementations)]
@@ -73,6 +74,7 @@ pub struct RocksDBWrite {
 }
 
 static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<RocksDBInner>>>> = OnceLock::new();
+static NEXT_SNAPSHOT_CACHE_KEY: AtomicU64 = AtomicU64::new(1);
 
 impl Default for RocksDBFactory {
     fn default() -> Self {
@@ -175,6 +177,9 @@ impl Storage for RocksDB {
             Ok(RocksDBRead {
                 db: &self.inner.db,
                 snapshot: self.inner.db.snapshot(),
+                snapshot_cache_key: u128::from(
+                    NEXT_SNAPSHOT_CACHE_KEY.fetch_add(1, Ordering::Relaxed),
+                ),
             })
         }
     }
@@ -315,6 +320,10 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 }
 
 impl StorageRead for RocksDBRead<'_> {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        Some(self.snapshot_cache_key)
+    }
+
     fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
