@@ -1942,21 +1942,11 @@ where
         if let Some(root_id) = cache.commit_roots.get(commit_id) {
             return Ok(root_id.clone());
         }
-        let typed_commit_id =
-            CommitId::parse_lix(commit_id, "tracked-state optional snapshot root lookup")?;
         self.load_cached_changelog_first_parent(commit_id, cache)
             .await?;
-        let topology = storage::load_published_commit_state_topology(&self.store, typed_commit_id)
+        let root_id = storage::load_snapshot_commit_root(&self.store, commit_id)
             .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state commit_state_manifest is missing for commit '{commit_id}'"
-                    ),
-                )
-            })?;
-        let root_id = topology.snapshot_root_id();
+            .map(|root| root.root_id);
         cache
             .commit_roots
             .insert(commit_id.to_string(), root_id.clone());
