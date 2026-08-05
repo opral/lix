@@ -10,7 +10,9 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(all(feature = "storage-benches", not(test)))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1015,9 +1017,14 @@ async fn stage_untracked_bundles(
         return control.next_current_state_revision();
     }
     let mut editor = DescriptorEditor::new(store, root_meta);
-    for (token, descriptor) in mutations {
-        editor.update(Some(token), descriptor).await?;
-    }
+    editor
+        .update_many(
+            mutations
+                .into_iter()
+                .map(|(token, descriptor)| (Some(token), descriptor))
+                .collect(),
+        )
+        .await?;
     for (hash, bytes) in new_payloads.into_iter().chain(editor.staged) {
         writes.put(
             UNTRACKED_BUNDLE_CHUNK_SPACE,
@@ -2712,6 +2719,95 @@ impl<'a, S: StorageAdapterRead + ?Sized> DescriptorEditor<'a, S> {
         Ok(groups)
     }
 
+    /// Apply one sorted mutation frontier. Each descriptor node is loaded at
+    /// most once and untouched subtrees are reused by hash, so sparse updates
+    /// visit only the authenticated frontier plus the changed identities.
+    async fn update_many(
+        &mut self,
+        updates: BTreeMap<Option<String>, Option<ChunkDescriptor>>,
+    ) -> Result<(), LixError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let Some(root) = self.root.clone() else {
+            let entries = updates
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect::<Vec<_>>();
+            let refs = self.leaf_groups(entries)?;
+            return self.finish_refs(refs);
+        };
+        let updates = updates.into_iter().collect::<Vec<_>>();
+        let refs = self
+            .apply_node(root.node_hash, root.depth, &updates)
+            .await?;
+        self.finish_refs(refs)
+    }
+
+    fn apply_node<'b>(
+        &'b mut self,
+        hash: [u8; 32],
+        depth: u16,
+        updates: &'b [(Option<String>, Option<ChunkDescriptor>)],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DescriptorChild>, LixError>> + 'b>> {
+        Box::pin(async move {
+            let node = self.load(hash).await?;
+            match node {
+                DescriptorNode::Leaf(mut entries) => {
+                    for (target, replacement) in updates {
+                        let index = entries.binary_search_by(|(key, _)| key.cmp(target));
+                        match (replacement, index) {
+                            (Some(value), Ok(index)) => entries[index].1 = value.clone(),
+                            (Some(value), Err(index)) => {
+                                entries.insert(index, (target.clone(), value.clone()))
+                            }
+                            (None, Ok(index)) => {
+                                entries.remove(index);
+                            }
+                            (None, Err(_)) => {}
+                        }
+                    }
+                    self.leaf_groups(entries)
+                }
+                DescriptorNode::Branch(children) => {
+                    if depth == 0 || children.iter().any(|child| child.depth + 1 != depth) {
+                        return Err(codec_error(
+                            "descriptor batch update encountered invalid depth",
+                        ));
+                    }
+                    let mut grouped = vec![
+                        Vec::<(Option<String>, Option<ChunkDescriptor>)>::new();
+                        children.len()
+                    ];
+                    for update in updates {
+                        let index = children.partition_point(|child| {
+                            child.first.cmp(&update.0) != std::cmp::Ordering::Greater
+                        });
+                        let index = index.saturating_sub(1);
+                        if index >= children.len() {
+                            return Err(codec_error("descriptor batch update escaped its root"));
+                        }
+                        grouped[index].push(update.clone());
+                    }
+                    let mut rebuilt = Vec::new();
+                    for (child, child_updates) in children.into_iter().zip(grouped) {
+                        if child_updates.is_empty() {
+                            rebuilt.push(child);
+                            record_descriptor_reuse();
+                            continue;
+                        }
+                        let refs = self
+                            .apply_node(child.hash, child.depth, &child_updates)
+                            .await?;
+                        rebuilt.extend(refs);
+                    }
+                    self.branch_groups(rebuilt)
+                }
+            }
+        })
+    }
+
+    #[cfg(test)]
     async fn update(
         &mut self,
         target: Option<String>,
