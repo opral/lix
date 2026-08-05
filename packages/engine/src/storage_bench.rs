@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::changelog::ChangelogReader;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
@@ -1795,6 +1794,7 @@ mod tests {
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageKey, StorageValue, StorageWriteOptions,
     };
+    use crate::{CreateBranchOptions, Value};
 
     #[tokio::test]
     async fn checkpoint_commit_scan_baseline_matches_materialized_records_across_pages() {
@@ -1911,10 +1911,73 @@ mod tests {
         Engine::initialize(storage.clone())
             .await
             .expect("initialize engine");
-        let append = append_ordered_commits(100, 10).expect("build unreachable commit fixture");
-        stage_append_once(storage.clone(), &append)
+        let engine = Engine::new(storage.clone())
             .await
-            .expect("stage unreachable commit fixture");
+            .expect("open benchmark engine");
+        let main = engine
+            .open_workspace_session()
+            .await
+            .expect("open benchmark main session");
+        let schema = serde_json::json!({
+            "x-lix-key": "repository_gc_benchmark_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": "integer" }
+            },
+            "additionalProperties": false
+        });
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (lix_json($1), false, false)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("register benchmark schema");
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-000000000010".to_owned()),
+                name: "repository-gc-benchmark-unreachable".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create benchmark branch");
+        let branch_session = engine
+            .open_session(branch.id.clone())
+            .await
+            .expect("open benchmark branch session");
+        for commit_index in 0..10 {
+            let mut transaction = branch_session
+                .begin_transaction()
+                .await
+                .expect("begin benchmark transaction");
+            for row_index in 0..10 {
+                let row = commit_index * 10 + row_index;
+                transaction
+                    .execute(
+                        "INSERT INTO repository_gc_benchmark_fixture (path, value) \
+                         VALUES ($1, $2)",
+                        &[
+                            Value::Text(format!("/row/{row:08}")),
+                            Value::Integer(row as i64),
+                        ],
+                    )
+                    .await
+                    .expect("stage benchmark row");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("publish benchmark commit");
+        }
+        main.execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch.id)],
+        )
+        .await
+        .expect("delete benchmark branch");
         let adapter = StorageAdapter::new(storage);
 
         let first = plan_repository_gc_for_bench(&adapter)
@@ -1925,12 +1988,11 @@ mod tests {
             .expect("repeat repository gc plan");
 
         assert_eq!(first.swept_commits, 10);
-        // Each unreachable commit removes its changelog projection and the
-        // unified commit-state authority. The hard cut retired the separate
-        // tracked-root record.
-        assert_eq!(first.staged_deletes, 20);
-        assert_eq!(first.key_shared_buffers, 2);
-        assert_eq!(first.key_shared_bytes, 20 * 16);
+        // Each unreachable commit removes its changelog projection, the
+        // unified commit-state authority, and its standalone change fact.
+        assert_eq!(first.staged_deletes, 30);
+        assert_eq!(first.key_shared_buffers, 30);
+        assert_eq!(first.key_shared_bytes, 30 * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.staged_deletes, first.staged_deletes);
     }

@@ -5194,6 +5194,7 @@ where
         load_tracked_working_diff_epoch(&self.store, branch_id).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn untracked_json_refs(
         &self,
         controls: &[(String, BranchHeadControl)],
@@ -10274,6 +10275,7 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
+#[cfg(test)]
 fn decode_hot_row_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -10309,6 +10311,7 @@ fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
     key
 }
 
+#[cfg(test)]
 fn decode_hot_file_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -10331,6 +10334,7 @@ fn decode_hot_file_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     Ok((branch_id, generation))
 }
 
+#[cfg_attr(not(test), expect(dead_code))]
 struct HotDiffSegmentScope {
     branch_id: String,
     checkpoint_commit_id: CommitId,
@@ -10446,6 +10450,7 @@ fn visit_hot_diff_segment(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -10490,6 +10495,7 @@ fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8;
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn stage_collect_stale_hot_generations<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -10565,6 +10571,7 @@ where
         .collect())
 }
 
+#[cfg(test)]
 fn decode_hot_collection_control_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -10577,6 +10584,7 @@ fn decode_hot_collection_control_scope(bytes: &[u8]) -> Result<(String, CommitId
     Ok((branch_id, generation))
 }
 
+#[cfg(test)]
 async fn stage_collect_stale_hot_collection_controls(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -10614,6 +10622,7 @@ async fn stage_collect_stale_hot_collection_controls(
     Ok(())
 }
 
+#[cfg(test)]
 async fn stage_collect_stale_hot_space(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -10662,6 +10671,7 @@ async fn stage_collect_stale_hot_space(
     Ok(deleted_any)
 }
 
+#[cfg(test)]
 pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
     store: &S,
     writes: &mut StorageWriteSet,

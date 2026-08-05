@@ -623,7 +623,7 @@ impl TrackedStateTree {
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
-        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        _hash: [u8; TRACKED_STATE_HASH_BYTES],
         children: Vec<ChildSummary>,
         events: &[FrontierMutation],
         chunks: &mut PendingChunkBatchBuilder,
@@ -742,7 +742,7 @@ impl TrackedStateTree {
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
-        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        _hash: [u8; TRACKED_STATE_HASH_BYTES],
         level: usize,
         children: Vec<ChildSummary>,
         events: &[FrontierMutation],
@@ -1335,7 +1335,6 @@ impl TrackedStateTree {
         })
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn build_leaf_level(
         &self,
         entries: Vec<EncodedLeafEntry>,

@@ -24,6 +24,8 @@ pub(crate) use reader::LiveStateReader;
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[cfg(test)]
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
+#[cfg(test)]
+pub(crate) use tracked_head::stage_collect_stale_working_diff_indexes;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
@@ -36,8 +38,7 @@ pub(crate) use tracked_head::{
     TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
     TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, materialize_certified_root_rows,
     scan_certified_history_rows, stage_certified_entity_batches,
-    stage_collect_stale_working_diff_indexes, stage_delete_tracked_working_diff_epoch,
-    stage_tracked_working_diff_epoch,
+    stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

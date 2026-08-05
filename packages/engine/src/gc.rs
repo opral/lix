@@ -11,21 +11,26 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::branch::BranchHeadControlContext;
-#[cfg(test)]
-use crate::changelog::ChangeRecord;
 use crate::changelog::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId, CommitScanRequest, GcLiveSet, GcPlan, GcRepairSet,
-    GcRoot, GcSweepSet, change_key, commit_change_id_key, commit_key,
+    CHANGE_SPACE, ChangeId, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitId,
+    GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, change_key,
+};
+#[cfg(test)]
+use crate::changelog::{
+    COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeRecord, CommitScanRequest, commit_change_id_key,
+    commit_key,
 };
 use crate::commit_graph::CommitGraphContext;
+#[cfg(test)]
 use crate::json_store::JsonRef;
 #[cfg(test)]
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
 };
 #[cfg(test)]
-use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
+use crate::live_state::TrackedHeadContext;
+#[cfg(test)]
+use crate::live_state::stage_collect_stale_working_diff_indexes;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageScanOptions,
@@ -1088,6 +1093,7 @@ where
             }
         }
     }
+    validate_live_native_parts(&store, &active_current_parts).await?;
     let active_ids = active_manifests.keys().copied().collect::<Vec<_>>();
     let mutation_roots =
         crate::tracked_state::load_commit_mutation_directory_roots(&store, &active_ids).await?;
@@ -1175,9 +1181,11 @@ where
                 }
             }
             if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-                let reachable =
-                    crate::tracked_state::validate_scoped_range_trees(&store, &[root.tree.clone()])
-                        .await?;
+                let reachable = crate::tracked_state::validate_scoped_range_trees(
+                    &store,
+                    std::slice::from_ref(&root.tree),
+                )
+                .await?;
                 for node_id in reachable.node_ids.difference(&active_scoped_nodes) {
                     writes.delete(
                         crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
@@ -1301,6 +1309,46 @@ where
             total_us: elapsed_micros(started),
         },
     })
+}
+
+/// Every authenticated active scoped-range descriptor must have its native
+/// payload present before ordinary GC is allowed to stage any sweep.  The
+/// descriptor is authority for the digest, but not proof that the immutable
+/// payload still exists; treating a missing payload as an empty live set would
+/// silently turn corruption into deletion.
+async fn validate_live_native_parts<S>(
+    store: &S,
+    digests: &BTreeSet<[u8; 32]>,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    if digests.is_empty() {
+        return Ok(());
+    }
+    let keys = digests
+        .iter()
+        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
+        .collect::<Vec<_>>();
+    let presence = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?;
+    if presence
+        .value
+        .into_iter()
+        .any(|value| !matches!(value, Some(StorageProjectedValue::KeyOnly)))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "live current-state directory references a missing native data part",
+        ));
+    }
+    Ok(())
 }
 
 /// Recovery-only verifier retained for explicit rebuild tooling and tests.
