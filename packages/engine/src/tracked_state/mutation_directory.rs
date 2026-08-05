@@ -108,7 +108,20 @@ pub(crate) mod test_read_accounting {
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct ScopedMutationDirectoryReadAccounting {
+        pub(crate) direct_route_calls: u64,
         pub(crate) selector_all_roots: u64,
+        pub(crate) selector_direct_calls: u64,
+        pub(crate) external_parts_loaded: u64,
+        pub(crate) parts_decoded: u64,
+        pub(crate) decoded_rows: u64,
+        pub(crate) raw_bytes: u64,
+        pub(crate) resident_bytes: u64,
+        pub(crate) explicit_fallback_rows: u64,
+        pub(crate) not_owned_missing_commit: u64,
+        pub(crate) not_owned_unsupported_layout: u64,
+        pub(crate) not_owned_absent_inline: u64,
+        pub(crate) not_owned_part_index: u64,
+        pub(crate) not_owned_local_row: u64,
     }
 
     tokio::task_local! {
@@ -127,10 +140,80 @@ pub(crate) mod test_read_accounting {
         (output, accounting)
     }
 
-    pub(crate) fn record_selector_all_roots(roots: usize) {
+    fn update(update: impl FnOnce(&mut ScopedMutationDirectoryReadAccounting)) {
         let _ = ACTIVE.try_with(|state| {
-            let mut state = state.borrow_mut();
+            update(&mut state.borrow_mut());
+        });
+    }
+
+    pub(crate) fn record_direct_route_start() {
+        update(|state| state.direct_route_calls = state.direct_route_calls.saturating_add(1));
+    }
+
+    pub(crate) fn record_selector_all_roots(roots: usize) {
+        update(|state| {
             state.selector_all_roots = state.selector_all_roots.saturating_add(roots as u64);
+        });
+    }
+
+    pub(crate) fn record_selector_direct() {
+        update(|state| {
+            state.selector_direct_calls = state.selector_direct_calls.saturating_add(1);
+        });
+    }
+
+    pub(crate) fn record_external_parts_loaded(parts: usize) {
+        update(|state| {
+            state.external_parts_loaded = state.external_parts_loaded.saturating_add(parts as u64);
+        });
+    }
+
+    pub(crate) fn record_part_decoded(rows: usize, raw_bytes: usize, resident_bytes: usize) {
+        update(|state| {
+            state.parts_decoded = state.parts_decoded.saturating_add(1);
+            state.decoded_rows = state.decoded_rows.saturating_add(rows as u64);
+            state.raw_bytes = state.raw_bytes.saturating_add(raw_bytes as u64);
+            state.resident_bytes = state.resident_bytes.saturating_add(resident_bytes as u64);
+        });
+    }
+
+    pub(crate) fn record_explicit_fallback(rows: usize) {
+        update(|state| {
+            state.explicit_fallback_rows = state.explicit_fallback_rows.saturating_add(rows as u64);
+        });
+    }
+
+    pub(crate) fn record_not_owned_missing_commit(rows: usize) {
+        update(|state| {
+            state.not_owned_missing_commit =
+                state.not_owned_missing_commit.saturating_add(rows as u64);
+        });
+    }
+
+    pub(crate) fn record_not_owned_unsupported_layout(rows: usize) {
+        update(|state| {
+            state.not_owned_unsupported_layout = state
+                .not_owned_unsupported_layout
+                .saturating_add(rows as u64);
+        });
+    }
+
+    pub(crate) fn record_not_owned_absent_inline(rows: usize) {
+        update(|state| {
+            state.not_owned_absent_inline =
+                state.not_owned_absent_inline.saturating_add(rows as u64);
+        });
+    }
+
+    pub(crate) fn record_not_owned_part_index(rows: usize) {
+        update(|state| {
+            state.not_owned_part_index = state.not_owned_part_index.saturating_add(rows as u64);
+        });
+    }
+
+    pub(crate) fn record_not_owned_local_row(rows: usize) {
+        update(|state| {
+            state.not_owned_local_row = state.not_owned_local_row.saturating_add(rows as u64);
         });
     }
 }
@@ -227,6 +310,8 @@ pub(crate) fn snapshot_mutation_directory_read_accounting() -> MutationDirectory
 pub(crate) fn record_direct_route_start(requested_rows: usize) {
     read_accounting::add(read_accounting::DIRECT_ROUTE_CALLS, 1);
     read_accounting::add(read_accounting::REQUESTED_ROWS, requested_rows);
+    #[cfg(test)]
+    test_read_accounting::record_direct_route_start();
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -247,6 +332,8 @@ pub(crate) fn record_direct_route_scattered_rows(scattered_rows: usize) {
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn record_direct_route_explicit_fallback(rows: usize) {
     read_accounting::add(read_accounting::EXPLICIT_FALLBACK_ROWS, rows);
+    #[cfg(test)]
+    test_read_accounting::record_explicit_fallback(rows);
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -261,16 +348,32 @@ pub(crate) fn record_direct_route_not_owned(reason: MutationDirectoryNotOwnedRea
         MutationDirectoryNotOwnedReason::LocalRowOutOfRange => read_accounting::NOT_OWNED_LOCAL_ROW,
     };
     read_accounting::add(counter, rows);
+    #[cfg(test)]
+    match reason {
+        MutationDirectoryNotOwnedReason::UnsupportedLayout => {
+            test_read_accounting::record_not_owned_unsupported_layout(rows)
+        }
+        MutationDirectoryNotOwnedReason::PartIndexOutOfRange => {
+            test_read_accounting::record_not_owned_part_index(rows)
+        }
+        MutationDirectoryNotOwnedReason::LocalRowOutOfRange => {
+            test_read_accounting::record_not_owned_local_row(rows)
+        }
+    }
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn record_direct_route_missing_commit(rows: usize) {
     read_accounting::add(read_accounting::NOT_OWNED_MISSING_COMMIT, rows);
+    #[cfg(test)]
+    test_read_accounting::record_not_owned_missing_commit(rows);
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn record_direct_route_absent_inline(rows: usize) {
     read_accounting::add(read_accounting::NOT_OWNED_ABSENT_INLINE, rows);
+    #[cfg(test)]
+    test_read_accounting::record_not_owned_absent_inline(rows);
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -281,6 +384,8 @@ pub(crate) fn record_direct_route_corruption() {
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn record_direct_external_parts_loaded(parts: usize) {
     read_accounting::add(read_accounting::EXTERNAL_PARTS_LOADED, parts);
+    #[cfg(test)]
+    test_read_accounting::record_external_parts_loaded(parts);
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -289,6 +394,8 @@ pub(crate) fn record_direct_part_decoded(rows: usize, raw_bytes: usize, resident
     read_accounting::add(read_accounting::DECODED_ROWS, rows);
     read_accounting::add(read_accounting::RAW_BYTES, raw_bytes);
     read_accounting::add(read_accounting::RESIDENT_BYTES, resident_bytes);
+    #[cfg(test)]
+    test_read_accounting::record_part_decoded(rows, raw_bytes, resident_bytes);
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
@@ -455,6 +562,8 @@ fn record_selector(selection: MutationDirectoryReadSelection<'_>) {
         }
         MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(_) => {
             counters::add(counters::SELECTOR_DIRECT_CALLS, 1);
+            #[cfg(test)]
+            test_read_accounting::record_selector_direct();
         }
     }
 }

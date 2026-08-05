@@ -13958,14 +13958,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             requested
         );
-        let accounting =
-            super::super::mutation_directory::snapshot_mutation_directory_read_accounting();
-        assert!(accounting.direct_route_calls >= 3);
+        assert!(invocation_accounting.direct_route_calls > 0);
         assert_eq!(invocation_accounting.selector_all_roots, 0);
-        assert!(accounting.selector_direct_calls > 0);
-        assert!(accounting.not_owned_part_index > 0);
-        assert!(accounting.not_owned_local_row > 0);
-        assert!(accounting.explicit_fallback_rows > 0);
+        assert!(invocation_accounting.selector_direct_calls > 0);
+        assert!(invocation_accounting.not_owned_part_index > 0);
+        assert!(invocation_accounting.not_owned_local_row > 0);
+        assert!(invocation_accounting.explicit_fallback_rows > 0);
 
         // A claimed direct slot remains authoritative even when its immutable
         // payload is missing: the explicit locator collision must not become a
@@ -14071,15 +14069,14 @@ mod tests {
             .expect("compact direct row should exist");
         assert_eq!(loaded.change_id, change_id);
         assert_eq!(loaded.entity_pk, EntityPk::single("compact-001"));
-        let accounting =
-            super::super::mutation_directory::snapshot_mutation_directory_read_accounting();
         assert_eq!(invocation_accounting.selector_all_roots, 0);
-        assert!(accounting.selector_direct_calls > 0);
-        assert_eq!(accounting.external_parts_loaded, 1);
-        assert_eq!(accounting.parts_decoded, 1);
-        assert_eq!(accounting.decoded_rows, 2);
-        assert!(accounting.raw_bytes > 0);
-        assert!(accounting.resident_bytes > 0);
+        assert!(invocation_accounting.direct_route_calls > 0);
+        assert!(invocation_accounting.selector_direct_calls > 0);
+        assert_eq!(invocation_accounting.external_parts_loaded, 1);
+        assert_eq!(invocation_accounting.parts_decoded, 1);
+        assert_eq!(invocation_accounting.decoded_rows, 2);
+        assert!(invocation_accounting.raw_bytes > 0);
+        assert!(invocation_accounting.resident_bytes > 0);
     }
 
     #[test]
