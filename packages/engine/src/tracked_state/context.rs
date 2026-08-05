@@ -4207,7 +4207,6 @@ where
         let mut mutation_batch = TrackedStateMutationBatchBuilder::with_row_capacity(
             cascade_mutations.len().saturating_add(deltas.len()),
         );
-        let has_cascade_mutations = !cascade_mutations.is_empty();
         for (key, value) in cascade_mutations {
             mutation_batch.push_encoded(&key, &value);
         }
@@ -4251,35 +4250,17 @@ where
         }
         let mutations = mutation_batch.finish();
         let changed_rows = mutations.len();
-        let sparse_existing_batch = base_root.is_some()
-            && !has_cascade_mutations
-            && parent_values.iter().all(Option::is_some)
-            && mutations.len() > 1;
-        let result = if sparse_existing_batch {
-            self.tree
-                .apply_point_mutations_with_overlay(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    base_root
-                        .as_ref()
-                        .expect("sparse batch requires parent root"),
-                    mutations,
-                    Some(commit_id),
-                )
-                .await?
-        } else {
-            self.tree
-                .apply_mutations_with_overlay(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    base_root.as_ref(),
-                    mutations,
-                    Some(commit_id),
-                )
-                .await?
-        };
+        let result = self
+            .tree
+            .apply_mutations_with_overlay(
+                self.store,
+                self.writes,
+                &mut self.chunk_overlay,
+                base_root.as_ref(),
+                mutations,
+                Some(commit_id),
+            )
+            .await?;
         let metadata = TrackedStateCommitRoot {
             commit_id: typed_commit_id,
             root_id: result.root_id.clone(),
