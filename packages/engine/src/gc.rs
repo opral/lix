@@ -2720,6 +2720,14 @@ mod tests {
         let before = before_changes.len();
         assert!(after < before, "deleted branch refs should be reclaimed");
 
+        drop(session);
+        let reopened_engine = Engine::new(storage.clone())
+            .await
+            .expect("repository should reopen after GC");
+        let session = reopened_engine
+            .open_workspace_session()
+            .await
+            .expect("reopened workspace session should open");
         let head = session
             .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
             .await
