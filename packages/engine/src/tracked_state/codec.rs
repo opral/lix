@@ -11,8 +11,6 @@ use crate::tracked_state::types::{
     TrackedStateKeyRef, TrackedStateMutation, TrackedStateMutationBatch,
 };
 
-const WEIBULL_K: i32 = 4;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
     pub(crate) key: Bytes,
@@ -231,8 +229,8 @@ impl DecodedInternalNode {
     }
 }
 
-const NODE_KIND_LEAF_V3: u8 = 3;
-const NODE_KIND_INTERNAL_V3: u8 = 4;
+const NODE_KIND_LEAF_V4: u8 = 5;
+const NODE_KIND_INTERNAL_V4: u8 = 6;
 
 #[derive(Debug, Clone, Copy)]
 struct MutationSpan {
@@ -1417,10 +1415,10 @@ const VALUE_TAIL_DISTINCT_MIN: u8 = VALUE_TIMESTAMP_WIDTH_COUNT;
 const VALUE_TAIL_DISTINCT_MAX: u8 =
     VALUE_TAIL_DISTINCT_MIN + VALUE_TIMESTAMP_WIDTH_COUNT * VALUE_TIMESTAMP_WIDTH_COUNT - 1;
 
-/// Leaf node wire format (v3):
+/// Leaf node wire format (v4):
 ///
 /// ```text
-/// [NODE_KIND_LEAF_V3]
+/// [NODE_KIND_LEAF_V4]
 /// varint entry_count
 /// varint commit_dict_len ++ commit_dict_len x 16 commit-id bytes
 /// varint tail_dict_len ++ tail_dict_len x self-delimiting state tails
@@ -1470,7 +1468,7 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
     let tail_dictionary = repeated_tail_dictionary(entries);
 
     let mut out = Vec::with_capacity(64 + entries.len() * 24);
-    out.push(NODE_KIND_LEAF_V3);
+    out.push(NODE_KIND_LEAF_V4);
     write_varint(&mut out, entries.len() as u64);
     write_varint(&mut out, commit_dictionary.len() as u64);
     for commit_id in &commit_dictionary {
@@ -1578,7 +1576,7 @@ fn slice_dictionary_ref(dictionary: &[&[u8]], value: &[u8]) -> u64 {
         .map_or(0, |index| index as u64 + 1)
 }
 
-fn decode_leaf_v3(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1799,7 +1797,7 @@ pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec
     );
 
     let mut out = Vec::with_capacity(2 + children.len() * 40);
-    out.push(NODE_KIND_INTERNAL_V3);
+    out.push(NODE_KIND_INTERNAL_V4);
     write_varint(&mut out, children.len() as u64);
     let mut previous_last: &[u8] = &[];
     for child in children {
@@ -1819,7 +1817,7 @@ fn write_front_coded(out: &mut Vec<u8>, base: &[u8], value: &[u8]) {
     out.extend_from_slice(&value[shared..]);
 }
 
-fn decode_internal_v3(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
+fn decode_internal_v4(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1961,8 +1959,8 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> 
         .split_first()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
     match kind {
-        NODE_KIND_LEAF_V3 => Ok(DecodedNodeRef::Leaf(decode_leaf_v3(body)?)),
-        NODE_KIND_INTERNAL_V3 => Ok(DecodedNodeRef::Internal(decode_internal_v3(body)?)),
+        NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v4(body)?)),
+        NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
@@ -1974,7 +1972,7 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> 
 pub(crate) fn boundary_trigger(
     encoded_key: &[u8],
     level: usize,
-    chunk_size: usize,
+    _chunk_size: usize,
     item_size: usize,
     target_chunk_bytes: usize,
 ) -> bool {
@@ -1982,24 +1980,13 @@ pub(crate) fn boundary_trigger(
         return false;
     }
 
-    let start =
-        weibull_cdf(chunk_size.saturating_sub(item_size) as f64 / target_chunk_bytes as f64);
-    let end = weibull_cdf(chunk_size as f64 / target_chunk_bytes as f64);
-    let remaining = 1.0 - start;
-    if remaining <= 0.0 {
-        return true;
-    }
-
-    let split_probability = ((end - start) / remaining).clamp(0.0, 1.0);
     let hash = xxh3_64_with_seed(encoded_key, level_salt(level));
-    (hash as f64) < split_probability * (u64::MAX as f64)
-}
-
-fn weibull_cdf(normalized_size: f64) -> f64 {
-    if normalized_size <= 0.0 {
-        return 0.0;
-    }
-    -f64::exp_m1(-normalized_size.powi(WEIBULL_K))
+    // The boundary is a property of the first key, not of the preceding
+    // entries.  This makes insertion order-independent intervals resync
+    // after the next authenticated key boundary instead of shifting every
+    // suffix.  The caller still enforces min/max byte ceilings.
+    let probability = (item_size as f64 / target_chunk_bytes as f64).clamp(0.01, 1.0);
+    (hash as f64) < probability * (u64::MAX as f64)
 }
 
 fn level_salt(level: usize) -> u64 {
@@ -2055,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_round_trips_representative_shapes() {
+    fn leaf_v4_round_trips_representative_shapes() {
         leaf_entries_round_trip(&[]);
         leaf_entries_round_trip(&[(b"only".to_vec(), raw_value(1, 2, 3))]);
         leaf_entries_round_trip(&[
@@ -2074,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_round_trips_dictionaries_with_variable_tail_widths() {
+    fn leaf_v4_round_trips_dictionaries_with_variable_tail_widths() {
         leaf_entries_round_trip(&[
             (b"a".to_vec(), raw_value(1, 9, 0)),
             (b"b".to_vec(), raw_value(2, 9, 0)),
@@ -2084,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_round_trips_generated_sorted_keys() {
+    fn leaf_v4_round_trips_generated_sorted_keys() {
         // Deterministic pseudo-random keys with heavy shared prefixes,
         // mimicking encoded (schema_key, file_id, entity_pk) keys.
         let mut entries = (0..512usize)
@@ -2111,7 +2098,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_round_trips_multibyte_key_varints() {
+    fn leaf_v4_round_trips_multibyte_key_varints() {
         // Keys long enough that shared and suffix lengths need two-byte
         // varints, with >127 entries so the count does too.
         let mut entries = Vec::new();
@@ -2145,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_round_trips_repeated_and_literal_value_parts() {
+    fn leaf_v4_round_trips_repeated_and_literal_value_parts() {
         let mut entries = Vec::new();
         for index in 0..300usize {
             let key = format!("rows/{index:05}").into_bytes();
@@ -2182,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_wire_format_is_pinned() {
+    fn leaf_v4_wire_format_is_pinned() {
         let entries = [
             (b"k1".to_vec(), raw_value(0xAA, 0xCC, 0xDD)),
             (b"k2".to_vec(), raw_value(0xBB, 0xCC, 0xDD)),
@@ -2197,7 +2184,7 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = encode_leaf_refs_for_tests(&refs);
         let mut expected = vec![
-            3, // NODE_KIND_LEAF_V3
+            5, // NODE_KIND_LEAF_V4
             3, // entry count
             1, // commit dictionary length
         ];
@@ -2219,11 +2206,11 @@ mod tests {
         expected.extend_from_slice(&[0xFF; 16]);
         expected.push(0);
         expected.extend_from_slice(&[0x93, 0x11, 0x12]);
-        assert_eq!(encoded, expected, "v3 wire bytes must stay stable");
+        assert_eq!(encoded, expected, "v4 wire bytes must stay stable");
     }
 
     #[test]
-    fn leaf_v3_tail_dictionary_saves_83_bytes_for_modeled_shape() {
+    fn leaf_v4_tail_dictionary_saves_83_bytes_for_modeled_shape() {
         let entries = (0..32usize)
             .map(|index| {
                 (
@@ -2264,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v3_rejects_malformed_and_legacy_bytes() {
+    fn leaf_v4_rejects_malformed_and_legacy_bytes() {
         let entries = [(b"key-a".to_vec(), raw_value(1, 2, 3))];
         let encoded = encode_leaf_refs_for_tests(
             &entries
@@ -3098,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_v3_round_trips_and_pins_front_coded_boundaries() {
+    fn internal_v4_round_trips_and_pins_front_coded_boundaries() {
         let children = vec![
             ChildSummary {
                 first_key: Bytes::from_static(b"aa"),
@@ -3115,7 +3102,7 @@ mod tests {
         ];
         let encoded = encode_internal_node(&children);
         let mut expected = vec![
-            4, 2, // kind, child count
+            6, 2, // kind, child count
             0, 2, b'a', b'a', // first "aa" relative to empty
             1, 1, b'z', // last "az" relative to "aa"
         ];
@@ -3127,7 +3114,7 @@ mod tests {
         ]);
         expected.extend_from_slice(&[2; TRACKED_STATE_HASH_BYTES]);
         expected.push(4);
-        assert_eq!(encoded, expected, "internal v3 wire bytes must stay stable");
+        assert_eq!(encoded, expected, "internal v4 wire bytes must stay stable");
 
         let DecodedNode::Internal(decoded) = decode_node(&encoded).expect("internal node") else {
             panic!("expected internal node");
@@ -3136,10 +3123,10 @@ mod tests {
     }
 
     #[test]
-    fn internal_v3_rejects_empty_truncated_and_invalid_boundaries() {
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 0]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 1]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 1, 1, 0]).is_err());
+    fn internal_v4_rejects_empty_truncated_and_invalid_boundaries() {
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 0]).is_err());
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 1]).is_err());
+        assert!(decode_node(&[NODE_KIND_INTERNAL_V4, 1, 1, 0]).is_err());
 
         let child = ChildSummary {
             first_key: Bytes::from_static(b"a"),
