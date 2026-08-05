@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{
