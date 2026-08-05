@@ -1416,6 +1416,9 @@ impl TrackedStateTree {
                                 child.clone()
                             });
                             group_index += 1;
+                        } else if cascades.is_empty() {
+                            record_reused_node();
+                            replacement_children.push(child);
                         } else {
                             match cascade_coverage(&child, cascades)? {
                                 CascadeCoverage::None => {
