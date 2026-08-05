@@ -17,6 +17,8 @@ use lix_engine::storage_adapter::{
 };
 use lix_engine::{Engine, SessionContext, Storage};
 use lix_rocksdb_storage::RocksDB;
+#[cfg(feature = "slatedb")]
+use lix_slatedb_storage::SlateDB;
 use lix_sqlite_storage::SQLite;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
@@ -335,16 +337,24 @@ where
 enum LixStorageProfile {
     SQLite,
     RocksDB,
+    #[cfg(feature = "slatedb")]
+    SlateDB,
 }
 
-const LIX_STORAGE_PROFILES: [LixStorageProfile; 2] =
-    [LixStorageProfile::SQLite, LixStorageProfile::RocksDB];
+fn lix_storage_profiles() -> Vec<LixStorageProfile> {
+    let mut profiles = vec![LixStorageProfile::SQLite, LixStorageProfile::RocksDB];
+    #[cfg(feature = "slatedb")]
+    profiles.push(LixStorageProfile::SlateDB);
+    profiles
+}
 
 impl LixStorageProfile {
     fn name(self) -> &'static str {
         match self {
             Self::SQLite => "lix_sqlite",
             Self::RocksDB => "lix_rocksdb",
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB => "lix_slatedb",
         }
     }
 }
@@ -391,7 +401,7 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
 
     for (label, row_count) in workloads {
         let rows = bench_rows(&all_rows[..row_count]);
-        for profile in LIX_STORAGE_PROFILES {
+        for profile in lix_storage_profiles() {
             for operation in [
                 "insert_all_rows",
                 "select_all_rows",
@@ -524,7 +534,7 @@ fn bench_lix(
     label: &str,
 ) {
     let rows = bench_rows(&all_rows[..row_count]);
-    for profile in LIX_STORAGE_PROFILES {
+    for profile in lix_storage_profiles() {
         let mut group =
             c.benchmark_group(format!("untracked_state_crud/{}/{label}", profile.name()));
         configure_group(&mut group, row_count);
@@ -648,7 +658,7 @@ fn bench_session_execute_untracked_insert(
     label: &str,
 ) {
     let rows = all_rows[..row_count].to_vec();
-    for profile in LIX_STORAGE_PROFILES {
+    for profile in lix_storage_profiles() {
         let mut group = c.benchmark_group(format!(
             "untracked_state_crud/session_execute_untracked/{}/{label}",
             profile.name()
@@ -683,6 +693,8 @@ async fn measure_lix_io(profile: LixStorageProfile, operation: &str, rows: &[Ben
     match profile {
         LixStorageProfile::SQLite => measure_lix_io_for_storage(sqlite(), operation, rows).await,
         LixStorageProfile::RocksDB => measure_lix_io_for_storage(rocksdb(), operation, rows).await,
+        #[cfg(feature = "slatedb")]
+        LixStorageProfile::SlateDB => measure_lix_io_for_storage(slatedb(), operation, rows).await,
     }
 }
 
@@ -872,17 +884,23 @@ fn profile_storage(profile: LixStorageProfile) -> ProfileStorage {
     match profile {
         LixStorageProfile::SQLite => ProfileStorage::SQLite(StorageAdapter::new(sqlite())),
         LixStorageProfile::RocksDB => ProfileStorage::RocksDB(StorageAdapter::new(rocksdb())),
+        #[cfg(feature = "slatedb")]
+        LixStorageProfile::SlateDB => ProfileStorage::SlateDB(StorageAdapter::new(slatedb())),
     }
 }
 
 enum ProfileStorage {
     SQLite(StorageAdapter<TempStorage<SQLite>>),
     RocksDB(StorageAdapter<TempStorage<RocksDB>>),
+    #[cfg(feature = "slatedb")]
+    SlateDB(StorageAdapter<TempStorage<SlateDB>>),
 }
 
 enum ProfileSession {
     SQLite(SessionContext<TempStorage<SQLite>>),
     RocksDB(SessionContext<TempStorage<RocksDB>>),
+    #[cfg(feature = "slatedb")]
+    SlateDB(SessionContext<TempStorage<SlateDB>>),
 }
 
 async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSession {
@@ -890,6 +908,10 @@ async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSes
         LixStorageProfile::SQLite => ProfileSession::SQLite(prepare_session_empty(sqlite()).await),
         LixStorageProfile::RocksDB => {
             ProfileSession::RocksDB(prepare_session_empty(rocksdb()).await)
+        }
+        #[cfg(feature = "slatedb")]
+        LixStorageProfile::SlateDB => {
+            ProfileSession::SlateDB(prepare_session_empty(slatedb()).await)
         }
     }
 }
@@ -953,6 +975,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_insert_all(storage, rows).await,
             Self::RocksDB(storage) => lix_insert_all(storage, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_insert_all(storage, rows).await,
         }
     }
 
@@ -960,6 +984,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_update_all(storage, rows).await,
             Self::RocksDB(storage) => lix_update_all(storage, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_update_all(storage, rows).await,
         }
     }
 
@@ -967,6 +993,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_delete_one(storage, row).await,
             Self::RocksDB(storage) => lix_delete_one(storage, row).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_delete_one(storage, row).await,
         }
     }
 
@@ -974,6 +1002,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_delete_all(storage).await,
             Self::RocksDB(storage) => lix_delete_all(storage).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_delete_all(storage).await,
         }
     }
 
@@ -981,6 +1011,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_select_all(storage, expected_rows, projection).await,
             Self::RocksDB(storage) => lix_select_all(storage, expected_rows, projection).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_select_all(storage, expected_rows, projection).await,
         }
     }
 
@@ -988,6 +1020,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_select_points(storage, rows).await,
             Self::RocksDB(storage) => lix_select_points(storage, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_select_points(storage, rows).await,
         }
     }
 }
@@ -997,6 +1031,8 @@ impl ProfileSession {
         match self {
             Self::SQLite(session) => insert_untracked_json_pointer_rows(session, rows).await,
             Self::RocksDB(session) => insert_untracked_json_pointer_rows(session, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(session) => insert_untracked_json_pointer_rows(session, rows).await,
         }
     }
 }
@@ -1011,6 +1047,15 @@ fn rocksdb() -> TempStorage<RocksDB> {
     let dir = TempDir::new().expect("create rocksdb storage tempdir");
     let path = dir.path().join("bench.rocksdb");
     TempStorage::new(RocksDB::open(path).expect("open rocksdb storage"), dir)
+}
+
+#[cfg(feature = "slatedb")]
+fn slatedb() -> TempStorage<SlateDB> {
+    let dir = TempDir::new().expect("create slatedb storage tempdir");
+    TempStorage::new(
+        SlateDB::open(dir.path()).expect("open slatedb storage"),
+        dir,
+    )
 }
 
 fn configure_group(
