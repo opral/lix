@@ -3997,6 +3997,74 @@ mod tests {
         assert_eq!(updated.root_id, canonical.root_id);
     }
 
+    #[tokio::test]
+    async fn radix_frontier_uses_earliest_divergence_across_sorted_mutations() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 128,
+            min_chunk_bytes: 64,
+            max_chunk_bytes: 256,
+        });
+        let base_rows = (0..128usize)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("entity-{index:03}")),
+                    value(&format!("base-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = apply_mutations_for_test(&tree, &storage, None, base_rows, None)
+            .await
+            .expect("base root should build");
+        // The first sorted mutation diverges late in the compressed schema
+        // prefix; the second diverges earlier. The splice must choose the
+        // earliest depth globally, not the first mutation's depth.
+        let mutation_specs = vec![
+            (
+                key("schenX", None, "entity-128"),
+                value("late-prefix", Some("{}")),
+            ),
+            (
+                key("szhema", None, "entity-000"),
+                value("early-prefix", Some("{}")),
+            ),
+        ];
+        let mutations = mutation_specs
+            .iter()
+            .map(|(key, value)| mutation(key, value))
+            .collect::<Vec<_>>();
+        let updated =
+            apply_mutations_for_test(&tree, &storage, Some(&base.root_id), mutations, None)
+                .await
+                .expect("earliest-divergence splice should build");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut canonical_entries = tree
+            .collect_leaf_entries(&read, &base.root_id)
+            .await
+            .expect("base entries should collect");
+        for (key, value) in mutation_specs {
+            let encoded_key = encode_key(&key);
+            let encoded_value = encode_value(&value);
+            let index = canonical_entries
+                .binary_search_by(|entry| entry.key.as_ref().cmp(&encoded_key))
+                .expect_err("global-divergence mutation should be a new key");
+            canonical_entries.insert(
+                index,
+                EncodedLeafEntry {
+                    key: encoded_key.into(),
+                    value: encoded_value.into(),
+                },
+            );
+        }
+        let canonical = tree
+            .build_tree_from_entries(canonical_entries)
+            .expect("canonical global-divergence root should build");
+        assert_eq!(updated.root_id, canonical.root_id);
+    }
+
     async fn apply_mutations_for_test(
         tree: &TrackedStateTree,
         storage: &StorageAdapter,
