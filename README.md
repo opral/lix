@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Database + filesystem + version control in one system</h3>
+<h3 align="center">A version control system beyond code</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,16 +11,15 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Agents and tools work with files. Applications need a database. Teams need version control.
+Code lives in version control. The documents, spreadsheets, and data a company runs on do not.
 
-Lix combines all three: normal files for tools, SQL rows for apps, and version control for every change.
+Lix is a version control system for work beyond code: any file format, SQL over content and history, and review for every change.
 
-- 📁 **Keep normal files.** Existing tools and agents can keep reading and writing files on disk.
-- 🧠 **Query everything with SQL.** Query file content, app data, and change history without rereading whole files.
-- 🔍 **Track semantic changes.** Review the paragraph, CSV record, property, or app row that changed.
-- 🔀 **Branch and merge safely.** Give every user or agent an isolated workspace, then review and merge its work.
-- ✅ **Use ACID transactions.** Update files and rows together while Lix records their history.
-- 🤝 **Run locally or remotely.** Embed Lix in an app or connect to a shared workspace through the server protocol.
+- 📄 **Works with any file format.** Plugins map DOCX, CSV, Markdown, or your own format to versioned entities.
+- 🔍 **Semantic changes.** Review the clause, cell, or row that changed, not lines of bytes.
+- 🗄️ **SQL and transactions.** Query file content, app data, and history; update files and rows in one ACID transaction.
+- 👥 **Real-time collaboration.** People and agents share a repository and see changes live.
+- 🏁 **Checkpoints instead of commits.** Lix records every change automatically; a checkpoint marks a state you want to return to.
 
 ## Try a demo app
 
@@ -41,6 +40,8 @@ Lix combines all three: normal files for tools, SQL rows for apps, and version c
 npm install @lix-js/sdk
 ```
 
+Run locally with `LocalFilesystem`:
+
 ```ts
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
@@ -54,7 +55,7 @@ await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 ]);
 ```
 
-Connect to a shared Lix server with the same API:
+Or against a server:
 
 ```ts
 const lix = await openLix({
@@ -69,50 +70,38 @@ const lix = await openLix({
 
 ### Files × database
 
-Plugins map file parts such as paragraphs, cells, and properties to SQL rows. Your app can also define its own rows.
+Plugins map files to SQL rows. A paragraph, cell, or property becomes a row Lix can version.
 
-```text
-what tools see                 what your app can query
+<img src="./website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
 
-                               entity      field      value
-/orders.csv   ── plugin ──▶   row 1001    status     shipped
-                               row 1002    status     pending
-```
-
-Apps read and write the rows with SQL. Lix tracks every change. With `LocalFilesystem`, other tools and agents keep working with the files on disk.
+The file stays a normal file on disk. The rows are queryable with SQL. Lix tracks every change to both.
 
 The SDK includes plugins for Markdown and CSV. Add a plugin for other formats, such as JSON, XLSX, DOCX, or PDF.
 
-### The map: interoperability × database semantics
-
-```text
-                           database semantics
-                       (query · transact · track)
-                                  ▲
-                                  │
-       PostgreSQL / SQLite        │                 ★ Lix
-       SQL and transactions,      │          normal files and SQL rows,
-       but data lives in tables   │          with every change tracked
-                                  │
-   ───────────────────────────────┼──────────────────────────────────▶
-                                  │              file interoperability
-                                  │       (any agent or tool can read/write)
-                                  │
-                                  │             Filesystem / Git
-                                  │             normal files,
-                                  │         but no queryable rows
-```
-
 ### Comparison
 
-| Capability                                 | Filesystem / Git                     | PostgreSQL / SQLite    | Lix                |
-| ------------------------------------------ | ------------------------------------ | ---------------------- | ------------------ |
-| Works with normal workspace files          | Yes                                  | No                     | Yes                |
-| Queries file content with SQL              | No                                   | Only after import      | Yes, with a plugin |
-| ACID transactions                          | No                                   | Yes                    | Yes                |
-| Change history                             | Git: blobs and lines; filesystem: no | You build audit tables | Files and rows     |
-| Branches and merging                       | Git: yes; filesystem: no             | You build them         | Yes                |
-| Reviews changes by paragraph, cell, or row | Text lines only                      | You build it           | Yes, with a plugin |
+Git versions files but cannot query them. PostgreSQL and SQLite query rows but have no files and no history. Lix does both.
+
+```text
+                     database
+                         │
+   PostgreSQL / SQLite   │        ★ Lix
+   rows, no history      │     rows + files,
+                         │       versioned
+                         │
+   ──────────────────────┼──────────────────▶  version control
+                         │
+                         │          Git
+                         │    text files only
+                         │
+```
+
+| Capability                    | Git             | PostgreSQL / SQLite | Lix                 |
+| ----------------------------- | --------------- | ------------------- | ------------------- |
+| Normal files                  | Yes             | No                  | Yes                 |
+| SQL and transactions          | No              | Yes                 | Yes                 |
+| Branches and merging          | Yes             | No                  | Yes                 |
+| Diffs by cell, clause, or row | Text lines only | No                  | Yes, via plugins    |
 
 ### Prime use cases
 
@@ -135,13 +124,11 @@ if (preview.conflicts.length === 0) {
 }
 ```
 
-#### Build file-based apps with SQL and version control
+#### Put your company's files under agent operation
 
-Build editors, knowledge bases, and document workflows on normal files. Use SQL for app logic and Lix for history, rollback, branches, merging, and review.
+Agents already know how to read and write files. Put contracts, pricing sheets, and order data in a repository, and agents can work on them without custom integrations.
 
-Plugins define the parts Lix tracks. You can review a change to a paragraph, cell, property, or row instead of only bytes and lines.
-
-For example, when an agent updates an orders CSV, Lix can show the row field that changed:
+Lix records every change automatically. When an agent updates an orders CSV, reviewers see the row field that changed before the change merges:
 
 ```diff
 order_id 1002 status:
@@ -149,6 +136,14 @@ order_id 1002 status:
 - pending
 + shipped
 ```
+
+Merge good changes, discard bad ones, and restore any earlier state of the company.
+
+#### Build file-based apps with SQL and version control
+
+Build editors, knowledge bases, and document workflows on normal files. Use SQL for app logic and Lix for history, rollback, branches, merging, and review.
+
+Plugins define the parts Lix tracks. You can review a change to a paragraph, cell, property, or row instead of only bytes and lines.
 
 Query changes without reading every file:
 
@@ -167,7 +162,7 @@ Update Lix files and rows in one ACID transaction. Lix records the history autom
 
 ## Where this is going
 
-Git makes code available to every developer tool. Lix aims to do the same for documents, spreadsheets, app data, and agent output while keeping SQL and version control.
+The goal is one repository for everything a company produces. Code lives in git. Contracts, spreadsheets, app data, and agent output get the same foundation with Lix: one history, queryable with SQL, safe to branch and merge.
 
 ```text
  contracts.docx    pricing.xlsx      app data     agent output

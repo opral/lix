@@ -1,4 +1,5 @@
-import { createFileRoute, notFound } from "@tanstack/react-router";
+import { createFileRoute, notFound, redirect } from "@tanstack/react-router";
+import redirects from "./redirects.json";
 import {
   DocsLayout,
   type PageTocItem,
@@ -232,6 +233,12 @@ export const Route = createFileRoute("/docs/$slugId")({
     const doc = docsBySlug[params.slugId];
 
     if (!doc) {
+      const redirectTarget = (redirects as Record<string, string>)[
+        `/docs/${params.slugId}`
+      ];
+      if (redirectTarget) {
+        throw redirect({ href: redirectTarget });
+      }
       throw notFound();
     }
 
@@ -242,7 +249,10 @@ export const Route = createFileRoute("/docs/$slugId")({
       resolveHref: (href) =>
         resolveDocsMarkdownHref(href, doc, docsByRelativePath),
     });
-    const html = normalizeMarkdownHtml(parsedMarkdown.html);
+    const html = normalizeMarkdownHtml(parsedMarkdown.html).replaceAll(
+      'src="../website/public/assets/',
+      'src="/assets/',
+    );
     const pageToc = buildPageToc(html);
 
     return {

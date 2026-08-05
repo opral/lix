@@ -13,9 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | Database + filesystem + version control in one system";
+    const title = "Lix | A version control system beyond code";
     const description =
-      "Lix gives tools normal files, apps queryable SQL rows, and teams version control for every change.";
+      "A version control system beyond code. Lix versions any file format, queryable with SQL, with review for every change.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

@@ -1,12 +1,60 @@
 ---
-description: Run Lix in memory, in a local filesystem, in a SQLite file, or through a remote Lix server.
+description: Lix has pluggable storage. Open Lix in memory, on the local filesystem, or against a remote server, or implement the Rust storage traits for another store.
 ---
 
-# Persistence
+# Persistence and Storage
 
-`openLix()` can open a local repository or connect to a remote Lix server. Local repositories use memory, `LocalFilesystem`, or SQLite. A remote server owns workspace persistence.
+Lix has pluggable storage. A storage adapter decides where the bytes live. The Lix API stays the same: `execute`, `createBranch`, and `mergeBranch` do not change with the adapter.
 
-## Remote workspace
+`openLix()` opens a local repository or connects to a remote Lix server.
+
+| Adapter            | Available in     | Use for                                        |
+| ------------------ | ---------------- | ---------------------------------------------- |
+| `Memory` (default) | JavaScript, Rust | tests, demos, and ephemeral work               |
+| `LocalFilesystem`  | JavaScript, Rust | a local directory synchronized with Lix        |
+| `RocksDB`          | Rust             | native embedded persistence                    |
+| `SlateDB`          | Rust             | object storage, for example S3                 |
+| Remote server      | any client       | shared workspaces; the server owns persistence |
+
+In JavaScript, `LocalFilesystem` requires Node.js. The default `Memory` storage also works in browsers.
+
+## In-memory (default)
+
+Omit the `storage` option to open an ephemeral in-memory Lix:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix();
+// ... use it ...
+await lix.close();
+```
+
+## Local filesystem
+
+Persist a directory as a Lix workspace with `LocalFilesystem`:
+
+```ts
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  storage: new LocalFilesystem({
+    path: "/var/data/workspace",
+    syncAllFiles: true,
+  }),
+});
+```
+
+Lix stores its repository state in `<workspace>/.lix/.internal` and synchronizes workspace files. Reopen the same path to resume the existing state.
+
+Two options change this behavior:
+
+- `lixDir` stores the repository state outside the workspace. The workspace does not receive a `.lix` directory.
+- `syncAllFiles: false` starts without importing files. Import exact file paths with `storage.importPaths(["notes/today.md"])`.
+
+Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
+
+## Remote server
 
 Connect to a hosted workspace with `server`:
 
@@ -21,128 +69,37 @@ const lix = await openLix({
 });
 ```
 
-The client does not need a local workspace storage option. Files, SQL rows, and branches live on the server.
+The client needs no local storage option. Files, SQL rows, and branches live on the server.
 
-For an S3 deployment, host Lix with the shipped Rust SlateDB storage implementation backed by an S3-compatible object store. Expose the workspace through the [Lix server protocol](https://github.com/opral/lix/blob/main/packages/server-protocol/README.md). JavaScript clients do not pass S3 directly to `openLix()`.
+For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the workspace through the [Lix server protocol](https://github.com/opral/lix/blob/main/packages/server-protocol/README.md). Clients do not pass S3 to `openLix()`.
 
-## In-memory (tests, demos)
-
-```ts
-import { openLix } from "@lix-js/sdk";
-
-const lix = await openLix();
-// ... use it ...
-await lix.close();
+```text
+JS client ── HTTP ──▶ Lix server ──▶ SlateDB ──▶ S3
 ```
-
-## Filesystem workspace (persistent mode)
-
-Persist a directory as a Lix workspace using `LocalFilesystem`:
-
-```bash
-npm install @lix-js/sdk
-```
-
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "/var/data/workspace",
-    syncAllFiles: true,
-  }),
-});
-
-// ... use it ...
-await lix.close();
-```
-
-Reopening the same path resumes existing RocksDB filesystem storage state. Lix stores its private repository data in `<workspace>/.lix/.internal/rocksdb` and syncs workspace files through Lix.
-
-Filesystem sync imports, watches, materializes, and deletes regular files. It
-does not follow or import symbolic links or other special filesystem entries.
-Those entries may coexist at unrelated paths, but if one blocks a path that
-Lix needs to materialize, the write reports
-`LIX_FILESYSTEM_UNSUPPORTED_ENTRY` instead of silently leaving disk and Lix in
-different states. Executable and other permission bits are currently outside
-the sync contract.
-
-Older SQLite filesystem storage metadata is not migrated. If Lix detects the
-old SQLite metadata files in `<workspace>/.lix/.internal` before a RocksDB store
-exists, it clears `.lix/.internal` and initializes a fresh RocksDB storage.
-
-## Filesystem workspace (external `.lix` directory)
-
-Use `lixDir` when you want filesystem sync with Lix repository metadata outside
-the workspace directory:
-
-```ts
-const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "/var/data/workspace",
-    lixDir: "/tmp/session/.lix",
-    syncAllFiles: true,
-  }),
-});
-```
-
-This imports, watches, and materializes workspace files, but the Lix repository
-state is stored under `lixDir` and no `.lix` directory is written in the
-workspace. Reusing the same `lixDir` resumes that metadata; using a fresh temp
-`.lix` directory reimports the files from disk.
-
-For tests, point at a temp directory so each run is isolated:
-
-```ts
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-
-const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
-const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: path.join(dir, "workspace"),
-    syncAllFiles: true,
-  }),
-});
-```
-
-Set `syncAllFiles: false` when filesystem sync should start with no regular
-workspace files, then import selected files with `storage.importPaths()`. Imported paths
-are exact workspace-relative file paths, not directories or globs. They may be
-written with or without a leading slash, for example `"notes/today.md"` or
-`"/notes/today.md"`. This scopes disk import, file watching, and
-materialization; it does not filter unrelated Lix SQL state.
-
-```ts
-const storage = new LocalFilesystem({
-  path: "/Users/me/Downloads",
-  syncAllFiles: false,
-});
-const lix = await openLix({ storage });
-await storage.importPaths(["notes/today.md"]);
-```
-
-## Single .lix application file
-
-Use `SQLite` when the `.lix` SQLite file is the application document itself. This is useful if you are defining a new file format and want Lix to be the application's file format: a single portable file that contains the app's versioned state.
-
-```ts
-import { openLix, SQLite } from "@lix-js/sdk";
-
-const lix = await openLix({
-  storage: new SQLite({ path: "/var/data/app.lix" }),
-});
-```
-
-Reopening the same path resumes existing state. Don't open the file with raw SQLite tools; Lix manages its own schema and transactions.
 
 ## Closing
 
-Always `await lix.close()` in scripts and tests. Long-lived servers can hold a single Lix instance for the lifetime of the process.
+Always `await lix.close()` in scripts and tests. Long-lived servers can hold one Lix instance for the process lifetime.
 
-## Other storage targets
+## Custom storage (Rust)
 
-PostgreSQL, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, and other storage engines require a custom storage implementation. S3-compatible object storage is available through the shipped Rust SlateDB implementation in a server deployment.
+The engine runs on any ordered transactional key-value store. A storage implementation only provides ordered byte-key persistence, coherent read views, and atomic writes. It does not parse Lix SQL and does not interpret engine concepts such as branches or changes.
 
-The storage interface is public and small enough to implement yourself. The [Storage](./storage.md) page documents the full contract.
+Implement three asynchronous traits from `lix_engine`: `Storage`, `StorageRead`, and `StorageWrite`. An implementation must guarantee:
+
+1. **Space isolation.** Keys in different spaces never collide.
+2. **Coherent read views.** A read handle observes one coherent view for its lifetime.
+3. **Ordered scans.** Scans return keys in ascending byte order.
+4. **Atomic commits.** A commit publishes all staged mutations or none.
+5. **Persistence.** Persistent implementations define their durability boundary. `Memory` is ephemeral.
+
+Validate an implementation with the public conformance suite:
+
+```rust
+use lix_engine::run_storage_conformance;
+
+let report = run_storage_conformance(&factory).await;
+report.assert_no_failures();
+```
+
+PostgreSQL, IndexedDB, OPFS, Cloudflare D1, and similar targets need such a custom implementation.
