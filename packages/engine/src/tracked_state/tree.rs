@@ -7,7 +7,7 @@
 )]
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroUsize,
     ops::Range,
@@ -884,9 +884,16 @@ impl TrackedStateTree {
                 )
                 .await;
         }
+        let mut decoded_frontier = HashMap::new();
         if !append_only
             && self
-                .frontier_contains_interior_insert(store, overlay, &root_node, &mutations)
+                .frontier_contains_interior_insert(
+                    store,
+                    overlay,
+                    &root_node,
+                    &mutations,
+                    &mut decoded_frontier,
+                )
                 .await?
         {
             return self
@@ -896,7 +903,14 @@ impl TrackedStateTree {
                 .await;
         }
         self.apply_sparse_mutation_frontier(
-            store, writes, overlay, root_id, root_node, mutations, commit_id,
+            store,
+            writes,
+            overlay,
+            root_id,
+            root_node,
+            mutations,
+            &mut decoded_frontier,
+            commit_id,
         )
         .await
     }
@@ -907,6 +921,7 @@ impl TrackedStateTree {
         overlay: &'a storage::TrackedStateChunkOverlay,
         node: &'a DecodedNode,
         mutations: &'a [TrackedStateMutation],
+        decoded_frontier: &'a mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
     ) -> Pin<Box<dyn Future<Output = Result<bool, LixError>> + Send + 'a>>
     where
         S: StorageAdapterRead + ?Sized + 'a,
@@ -946,15 +961,23 @@ impl TrackedStateTree {
                         if start == mutation_start {
                             continue;
                         }
-                        let child_node = self
-                            .load_node_with_overlay(store, overlay, &child.child_hash)
-                            .await?;
+                        let child_node =
+                            if let Some(child_node) = decoded_frontier.get(&child.child_hash) {
+                                child_node.clone()
+                            } else {
+                                let child_node = self
+                                    .load_node_with_overlay(store, overlay, &child.child_hash)
+                                    .await?;
+                                decoded_frontier.insert(child.child_hash, child_node.clone());
+                                child_node
+                            };
                         if self
                             .frontier_contains_interior_insert(
                                 store,
                                 overlay,
                                 &child_node,
                                 &mutations[start..mutation_start],
+                                decoded_frontier,
                             )
                             .await?
                         {
@@ -975,6 +998,7 @@ impl TrackedStateTree {
         root_id: &TrackedStateRootId,
         root_node: DecodedNode,
         mutations: Vec<TrackedStateMutation>,
+        decoded_frontier: &mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
         let mut chunks = PendingChunkBatchBuilder::default();
@@ -986,6 +1010,7 @@ impl TrackedStateTree {
                 Some(root_node),
                 mutations,
                 0,
+                decoded_frontier,
                 &mut chunks,
             )
             .await?;
@@ -1031,6 +1056,7 @@ impl TrackedStateTree {
         preloaded: Option<DecodedNode>,
         mutations: Vec<TrackedStateMutation>,
         level: usize,
+        decoded_frontier: &'a mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
         chunks: &'a mut PendingChunkBatchBuilder,
     ) -> Pin<Box<dyn Future<Output = Result<SparseFrontierNode, LixError>> + Send + 'a>>
     where
@@ -1039,7 +1065,10 @@ impl TrackedStateTree {
         Box::pin(async move {
             let node = match preloaded {
                 Some(node) => node,
-                None => self.load_node_with_overlay(store, overlay, &hash).await?,
+                None => match decoded_frontier.remove(&hash) {
+                    Some(node) => node,
+                    None => self.load_node_with_overlay(store, overlay, &hash).await?,
+                },
             };
             match node {
                 DecodedNode::Leaf(leaf) => {
@@ -1165,6 +1194,7 @@ impl TrackedStateTree {
                                 None,
                                 group,
                                 level + 1,
+                                decoded_frontier,
                                 chunks,
                             )
                             .await?;
