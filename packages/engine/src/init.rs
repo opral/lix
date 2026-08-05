@@ -455,6 +455,7 @@ where
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 columnar_base_coordinate: None,
+                durable_predecessor: None,
             })
             .collect::<Vec<_>>();
         let tracked_head = TrackedHeadContext::new();
@@ -481,6 +482,7 @@ where
                 snapshot: snapshot.as_ref_slot(),
                 metadata: crate::json_store::JsonSlotRef::None,
                 columnar_base_coordinate: None,
+                durable_predecessor: None,
             })
             .collect::<Vec<_>>();
         let init_untracked_known_absent = vec![true; init_untracked_deltas.len()];

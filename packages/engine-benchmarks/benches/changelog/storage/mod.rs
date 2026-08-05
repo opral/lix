@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use lix_engine::Storage;
 use lix_engine::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
-    PutBatch, ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead, StorageSpace,
-    StorageWrite, WriteOptions,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead,
+    MemoryWrite, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, StorageError,
+    StorageRead, StorageSpace, StorageWrite, WriteOptions,
 };
 use lix_rocksdb_storage::{RocksDB, RocksDBRead, RocksDBWrite};
 use lix_sqlite_storage::{SQLite, SQLiteRead, SQLiteWrite};
@@ -130,6 +130,19 @@ impl StorageRead for ChangelogScoreRead<'_> {
             Self::Unit(read) => read.scan(space, range, opts).await,
             Self::SQLite(read) => read.scan(space, range, opts).await,
             Self::RocksDB(read) => read.scan(space, range, opts).await,
+        }
+    }
+
+    async fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+        match self {
+            Self::Unit(read) => read.scan_many(space, ranges, projection).await,
+            Self::SQLite(read) => read.scan_many(space, ranges, projection).await,
+            Self::RocksDB(read) => read.scan_many(space, ranges, projection).await,
         }
     }
 }

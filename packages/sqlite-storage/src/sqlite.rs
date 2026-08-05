@@ -430,6 +430,45 @@ impl StorageRead for SQLiteRead {
             })
         }
     }
+    async fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+        let mut buckets = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let mut entries = Vec::new();
+            let mut resume_after = None;
+            loop {
+                let chunk = self
+                    .scan(
+                        space,
+                        range.clone(),
+                        ScanOptions {
+                            projection,
+                            limit_rows: crate::storage::MAX_SCAN_PAGE_ROWS,
+                            resume_after: resume_after.clone(),
+                        },
+                    )
+                    .await?;
+                let has_more = chunk.has_more;
+                let last = chunk.entries.last().map(|entry| entry.key.clone());
+                entries.extend(chunk.entries);
+                if !has_more {
+                    break;
+                }
+                let Some(last) = last else {
+                    return Err(StorageError::Corruption(
+                        "sqlite multi-range scan has_more page has no cursor".to_string(),
+                    ));
+                };
+                resume_after = Some(last);
+            }
+            buckets.push(entries);
+        }
+        Ok(buckets)
+    }
 }
 
 impl SQLiteRead {

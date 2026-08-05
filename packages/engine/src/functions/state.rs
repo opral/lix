@@ -109,6 +109,7 @@ pub(crate) async fn stage_sequence(
             snapshot: snapshot_slot.as_ref_slot(),
             metadata: crate::json_store::JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         }],
         &[false],
     )
@@ -412,6 +413,7 @@ mod tests {
                 snapshot: snapshot.as_ref_slot(),
                 metadata: crate::json_store::JsonSlotRef::None,
                 columnar_base_coordinate: None,
+                durable_predecessor: None,
             }],
             &[false],
         )

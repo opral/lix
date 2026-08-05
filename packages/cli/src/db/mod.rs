@@ -383,6 +383,28 @@ impl StorageRead for FileStorageRead {
             })
         }
     }
+    async fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+        let mut buckets = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let physical = physical_range(space.id, range.clone());
+            let rows = self
+                .kv
+                .iter()
+                .filter(|(key, _)| key_matches_range(key, &physical, None))
+                .map(|(key, value)| ReadEntry {
+                    key: Key(Bytes::copy_from_slice(&key[4..])),
+                    value: project_value(value, projection),
+                })
+                .collect();
+            buckets.push(rows);
+        }
+        Ok(buckets)
+    }
 }
 
 impl StorageWrite for FileStorageWrite {

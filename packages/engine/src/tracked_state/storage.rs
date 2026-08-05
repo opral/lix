@@ -15,9 +15,9 @@ use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapterRead,
     StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
-    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
-    exact_get_many,
+    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageReadEntry,
+    StorageScanChunk, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet, exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -11562,6 +11562,21 @@ where
         }
         self.store.scan(space, range, opts).await
     }
+
+    async fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[StorageKeyRange],
+        projection: StorageCoreProjection,
+    ) -> Result<Vec<Vec<StorageReadEntry>>, StorageError> {
+        if space == TRACKED_STATE_TREE_CHUNK_SPACE {
+            return Err(StorageError::Io(
+                "tracked-state staged audit supports point reads only for overlay spaces"
+                    .to_string(),
+            ));
+        }
+        self.store.scan_many(space, ranges, projection).await
+    }
 }
 
 fn key(bytes: Vec<u8>) -> StorageKey {
@@ -12725,6 +12740,17 @@ mod tests {
         ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
         {
             self.inner.scan(space, range, opts)
+        }
+
+        fn scan_many(
+            &self,
+            space: StorageSpace,
+            ranges: &[crate::storage::KeyRange],
+            projection: crate::storage::CoreProjection,
+        ) -> impl Future<
+            Output = Result<Vec<Vec<crate::storage::ReadEntry>>, crate::storage::StorageError>,
+        > + Send {
+            self.inner.scan_many(space, ranges, projection)
         }
     }
 

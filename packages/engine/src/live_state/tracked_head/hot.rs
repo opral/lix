@@ -10697,6 +10697,18 @@ mod tests {
             }
             self.inner.scan(space, range, opts).await
         }
+
+        async fn scan_many(
+            &self,
+            space: StorageSpace,
+            ranges: &[StorageKeyRange],
+            projection: crate::storage_adapter::StorageCoreProjection,
+        ) -> Result<
+            Vec<Vec<crate::storage_adapter::StorageReadEntry>>,
+            crate::storage_adapter::StorageError,
+        > {
+            self.inner.scan_many(space, ranges, projection).await
+        }
     }
 
     struct JsonCountingRead<R> {
@@ -10729,6 +10741,18 @@ mod tests {
             opts: StorageScanOptions,
         ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
             self.inner.scan(space, range, opts).await
+        }
+
+        async fn scan_many(
+            &self,
+            space: StorageSpace,
+            ranges: &[StorageKeyRange],
+            projection: crate::storage_adapter::StorageCoreProjection,
+        ) -> Result<
+            Vec<Vec<crate::storage_adapter::StorageReadEntry>>,
+            crate::storage_adapter::StorageError,
+        > {
+            self.inner.scan_many(space, ranges, projection).await
         }
     }
 
@@ -11153,6 +11177,7 @@ mod tests {
                 snapshot: JsonSlotRef::Inline(r#"{"replacement":true}"#),
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
+                durable_predecessor: None,
             })
             .collect::<Vec<_>>();
         let read = storage
@@ -11466,6 +11491,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline(snapshot),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let mut checkpoint_writes = StorageWriteSet::new();
         let mut coverage = WorkingDiffIndexCoverage::default();
@@ -12512,6 +12538,7 @@ mod tests {
                 snapshot: JsonSlotRef::Inline("{\"updated\":true}"),
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
+                durable_predecessor: None,
             };
             let inherited = next_columnar_base_coordinate(false, &delta, Some(&predecessor))
                 .expect("inherit coordinate");
@@ -12626,6 +12653,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let second = CurrentStateDeltaRef {
             schema_key: "schema_without_file",
@@ -12640,6 +12668,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let deltas = [&first, &second];
         let capacity = encoded_hot_mutation_identity_capacity(scope.len(), &deltas)
@@ -12728,6 +12757,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{\"tracked\":true}"),
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let tombstone = CurrentStateDeltaRef {
             schema_key: "tracked_schema",
@@ -12743,6 +12773,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{\"ignored\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let deltas = [&tracked, &tombstone];
 
@@ -12980,6 +13011,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let deltas = vec![&delta; DELTAS];
         let generation = CommitId::for_test_label("ordinary-import-generation");
@@ -13031,6 +13063,7 @@ mod tests {
                 snapshot: JsonSlotRef::Inline("{}"),
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
+                durable_predecessor: None,
             })
             .collect::<Vec<_>>();
         let delta_refs = deltas.iter().collect::<Vec<_>>();

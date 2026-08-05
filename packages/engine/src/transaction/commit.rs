@@ -1923,6 +1923,7 @@ fn current_state_delta_from_state_row(
             crate::transaction::types::StageJson::slot_ref,
         ),
         columnar_base_coordinate: None,
+        durable_predecessor: row.durable_predecessor,
     })
 }
 
@@ -1970,6 +1971,7 @@ impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
                     crate::transaction::types::StageJson::slot_ref,
                 ),
                 columnar_base_coordinate: None,
+                durable_predecessor: row.durable_predecessor,
             },
         }
     }
@@ -1991,6 +1993,7 @@ fn current_state_delta_from_engine_row(
         snapshot: row.change.snapshot.as_ref_slot(),
         metadata: row.change.metadata.as_ref_slot(),
         columnar_base_coordinate: None,
+        durable_predecessor: None,
     }
 }
 
@@ -4282,6 +4285,7 @@ async fn stage_tracked_head(
                             snapshot: snapshot.as_ref_slot(),
                             metadata: metadata.as_ref_slot(),
                             columnar_base_coordinate: None,
+                            durable_predecessor: None,
                         }
                     }),
             );
@@ -7057,6 +7061,7 @@ mod tests {
             snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"value":1}"#),
             metadata: crate::json_store::JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         };
         let guard = TrackedStateKeyRef {
             schema_key: "untracked_schema",
@@ -7199,6 +7204,15 @@ mod tests {
                     .fetch_add(1, Ordering::Relaxed);
             }
             self.inner.scan(space, range, opts).await
+        }
+
+        async fn scan_many(
+            &self,
+            space: StorageSpace,
+            ranges: &[KeyRange],
+            projection: crate::storage::CoreProjection,
+        ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
+            self.inner.scan_many(space, ranges, projection).await
         }
     }
 

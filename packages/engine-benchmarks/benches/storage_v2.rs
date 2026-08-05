@@ -17,8 +17,8 @@ use criterion::{
 use lix_engine::Storage;
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
-    Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    Prefix, ProjectedValue, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterReadScope, StorageReadStats,
@@ -1698,6 +1698,15 @@ impl StorageRead for EmptyRead {
         _range: KeyRange,
         _opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
+        unreachable!("write-set benchmark does not scan")
+    }
+
+    async fn scan_many(
+        &self,
+        _space: StorageSpace,
+        _ranges: &[KeyRange],
+        _projection: CoreProjection,
+    ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
         unreachable!("write-set benchmark does not scan")
     }
 }

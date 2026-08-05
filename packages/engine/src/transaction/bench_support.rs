@@ -397,6 +397,7 @@ where
         snapshot: snapshot.as_ref_slot(),
         metadata: crate::json_store::JsonSlotRef::None,
         columnar_base_coordinate: None,
+        durable_predecessor: None,
     }];
     let updated_control = crate::live_state::stage_untracked_deltas(
         &read,

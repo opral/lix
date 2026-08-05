@@ -2904,6 +2904,17 @@ mod tests {
         {
             self.inner.scan(space, range, opts)
         }
+
+        fn scan_many(
+            &self,
+            space: StorageSpace,
+            ranges: &[crate::storage::KeyRange],
+            projection: crate::storage::CoreProjection,
+        ) -> impl Future<
+            Output = Result<Vec<Vec<crate::storage::ReadEntry>>, crate::storage::StorageError>,
+        > + Send {
+            self.inner.scan_many(space, ranges, projection)
+        }
     }
 
     #[test]

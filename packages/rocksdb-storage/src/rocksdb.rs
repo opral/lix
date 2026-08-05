@@ -441,6 +441,57 @@ impl StorageRead for RocksDBRead<'_> {
             })
         }
     }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+        async move {
+            let cf = column_family(self.db, space);
+            // RocksDB has no portable multi-range call, so keep one snapshot
+            // iterator/request arena and seek it for each requested range.
+            // This preserves independent ordered buckets without creating an
+            // engine↔adapter iterator for every entity prefix.
+            let mut iterator = self.snapshot.raw_iterator_cf(cf);
+            let mut buckets = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let bounds = EncodedBounds::new(physical_range(space.id, range.clone()), None);
+                let mut entries = Vec::new();
+                iterator.seek(&bounds.lower_seek);
+                while let Some(encoded_key) = iterator.key() {
+                    if !bounds.after_lower(encoded_key) {
+                        iterator.next();
+                        continue;
+                    }
+                    if !bounds.before_upper(encoded_key) {
+                        break;
+                    }
+                    let key = logical_key_from_physical(encoded_key.to_vec().into_boxed_slice());
+                    let value = match projection {
+                        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                        CoreProjection::FullValue => ProjectedValue::FullValue(
+                            iterator
+                                .value()
+                                .ok_or_else(|| {
+                                    StorageError::Corruption(
+                                        "rocksdb multi-range iterator omitted value".to_owned(),
+                                    )
+                                })?
+                                .to_vec()
+                                .into(),
+                        ),
+                    };
+                    entries.push(ReadEntry { key, value });
+                    iterator.next();
+                }
+                iterator.status().map_err(rocksdb_error)?;
+                buckets.push(entries);
+            }
+            Ok(buckets)
+        }
+    }
 }
 
 impl StorageWrite for RocksDBWrite {

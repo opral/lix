@@ -2685,6 +2685,7 @@ mod tests {
                         snapshot: snapshot.as_ref_slot(),
                         metadata: metadata.as_ref_slot(),
                         columnar_base_coordinate: None,
+                        durable_predecessor: None,
                     })
                     .collect::<Vec<_>>();
                 crate::live_state::stage_untracked_deltas(
@@ -2747,6 +2748,7 @@ mod tests {
                     snapshot: snapshot.as_ref_slot(),
                     metadata: metadata.as_ref_slot(),
                     columnar_base_coordinate: None,
+                    durable_predecessor: None,
                 })
                 .collect::<Vec<_>>();
             let updated_control = crate::live_state::stage_untracked_deltas(

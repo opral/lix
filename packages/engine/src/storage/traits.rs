@@ -1,6 +1,6 @@
 use crate::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
-    ScanOptions, StorageError, StorageSpace, WriteOptions,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch,
+    ReadEntry, ReadOptions, ScanChunk, ScanOptions, StorageError, StorageSpace, WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -83,6 +83,21 @@ pub trait StorageRead: Send + Sync {
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send;
+
+    /// Reads a set of disjoint ranges from this one coherent read view.
+    ///
+    /// The returned buckets preserve the input range order and contain every
+    /// row in their corresponding range. Duplicate or overlapping input ranges
+    /// produce independent duplicate buckets; a backend must not deduplicate
+    /// across requests. Implementations may page internally, but must not open
+    /// another read view. Any malformed key order, cursor, or projection is a
+    /// corruption error rather than a partial result.
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send;
 }
 
 pub trait StorageWrite: Send {

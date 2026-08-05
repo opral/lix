@@ -141,6 +141,35 @@ impl StorageRead for CountingRead {
         );
         Ok(result)
     }
+
+    async fn scan_many(
+        &self,
+        space: lix_engine::storage::StorageSpace,
+        ranges: &[KeyRange],
+        projection: lix_engine::storage::CoreProjection,
+    ) -> Result<Vec<Vec<lix_engine::storage::ReadEntry>>, StorageError> {
+        self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.scan_many(space, ranges, projection).await?;
+        self.counters.scan_entries.fetch_add(
+            result.iter().map(|entries| entries.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        self.counters.scan_bytes.fetch_add(
+            result
+                .iter()
+                .flatten()
+                .map(|entry| {
+                    entry.key.0.len()
+                        + match &entry.value {
+                            lix_engine::storage::ProjectedValue::KeyOnly => 0,
+                            lix_engine::storage::ProjectedValue::FullValue(value) => value.len(),
+                        }
+                })
+                .sum::<usize>() as u64,
+            Ordering::Relaxed,
+        );
+        Ok(result)
+    }
 }
 
 impl CounterSnapshot {

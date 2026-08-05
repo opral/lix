@@ -5783,6 +5783,8 @@ fn append_entity_replace_row_from_live<'a>(
             row.branch_id().into()
         },
     );
+    let row_index = rows.len() - 1;
+    rows.set_durable_predecessor(row_index, row.durable_predecessor().cloned());
     Ok(())
 }
 

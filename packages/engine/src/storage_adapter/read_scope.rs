@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    GetManyRequest, GetManyResult, KeyRange, ScanChunk, ScanOptions, StorageError, StorageRead,
-    StorageSpace,
+    CoreProjection, GetManyRequest, GetManyResult, KeyRange, ReadEntry, ScanChunk, ScanOptions,
+    StorageError, StorageRead, StorageSpace,
 };
 
 /// The async read capability consumed by engine stores.
@@ -25,6 +25,13 @@ pub trait StorageAdapterRead: Send + Sync {
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send;
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send;
 }
 
 #[derive(Debug)]
@@ -109,6 +116,15 @@ where
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         self.read.scan(space, range, opts)
     }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+        self.read.scan_many(space, ranges, projection)
+    }
 }
 
 impl<R> StorageAdapterRead for SharedStorageAdapterRead<R>
@@ -133,6 +149,15 @@ where
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         self.read.scan(space, range, opts)
+    }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+        self.read.scan_many(space, ranges, projection)
     }
 }
 
@@ -159,6 +184,15 @@ where
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         (*self).scan(space, range, opts)
     }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+        (*self).scan_many(space, ranges, projection)
+    }
 }
 
 impl<T> StorageAdapterRead for &mut T
@@ -183,5 +217,14 @@ where
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         (**self).scan(space, range, opts)
+    }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+        (**self).scan_many(space, ranges, projection)
     }
 }

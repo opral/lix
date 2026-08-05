@@ -3324,6 +3324,16 @@ mod tests {
         ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
             self.read.scan(space, range, opts)
         }
+
+        fn scan_many(
+            &self,
+            space: crate::storage::StorageSpace,
+            ranges: &[KeyRange],
+            projection: crate::storage::CoreProjection,
+        ) -> impl Future<Output = Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError>> + Send
+        {
+            self.read.scan_many(space, ranges, projection)
+        }
     }
 
     impl StorageRead for CountingChunkRead {
@@ -3363,6 +3373,15 @@ mod tests {
             _opts: ScanOptions,
         ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
             async { unreachable!("tracked-state node cache test only performs point reads") }
+        }
+
+        async fn scan_many(
+            &self,
+            _space: crate::storage::StorageSpace,
+            _ranges: &[KeyRange],
+            _projection: crate::storage::CoreProjection,
+        ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
+            unreachable!("tracked-state node cache test only performs point reads")
         }
     }
 

@@ -81,6 +81,20 @@ mod tests {
                 })
             }
         }
+
+        async fn scan_many(
+            &self,
+            _space: StorageSpace,
+            ranges: &[KeyRange],
+            _projection: crate::storage::CoreProjection,
+        ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
+            self.scan_calls.fetch_add(1, Ordering::Relaxed);
+            self.scan_ranges
+                .lock()
+                .expect("spy lock")
+                .extend(ranges.iter().cloned());
+            Ok((0..ranges.len()).map(|_| Vec::new()).collect())
+        }
     }
 
     #[derive(Clone)]
@@ -110,6 +124,15 @@ mod tests {
         ) -> Result<ScanChunk, StorageError> {
             unreachable!("wrong-cardinality test does not scan")
         }
+
+        async fn scan_many(
+            &self,
+            _space: StorageSpace,
+            _ranges: &[KeyRange],
+            _projection: crate::storage::CoreProjection,
+        ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
+            unreachable!("wrong-cardinality test does not scan")
+        }
     }
 
     impl StorageRead for OverlapRead {
@@ -132,6 +155,15 @@ mod tests {
             _range: KeyRange,
             _opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {
+            unreachable!("overlap test does not scan")
+        }
+
+        async fn scan_many(
+            &self,
+            _space: StorageSpace,
+            _ranges: &[KeyRange],
+            _projection: crate::storage::CoreProjection,
+        ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
             unreachable!("overlap test does not scan")
         }
     }

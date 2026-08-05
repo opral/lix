@@ -851,6 +851,16 @@ impl StorageRead for CountingRead {
         self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.scan(space, range, opts).await
     }
+
+    async fn scan_many(
+        &self,
+        space: lix_engine::storage::StorageSpace,
+        ranges: &[KeyRange],
+        projection: lix_engine::storage::CoreProjection,
+    ) -> Result<Vec<Vec<lix_engine::storage::ReadEntry>>, StorageError> {
+        self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.scan_many(space, ranges, projection).await
+    }
 }
 
 #[derive(Default)]

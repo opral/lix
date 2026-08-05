@@ -29,7 +29,7 @@ use crate::live_state::{
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteSet,
+    StorageWriteSet, collect_many,
 };
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
@@ -802,7 +802,28 @@ async fn stage_untracked_deltas_inner(
         .filter(|(delta, absent)| delta.untracked && !**absent)
         .map(|(delta, _)| delta)
         .collect::<Vec<_>>();
-    let previous = load_previous_untracked_values(store, branch_id, &untracked).await?;
+    let mut previous = BTreeMap::new();
+    let mut missing_predecessors = Vec::new();
+    for delta in &untracked {
+        match delta.durable_predecessor {
+            Some(crate::live_state::CertifiedCurrentStatePredecessor::Encoded(bytes)) => {
+                let key = StorageKey(Bytes::from(encode_key(
+                    branch_id,
+                    delta.schema_key,
+                    delta.file_id,
+                    delta.entity_pk,
+                )?));
+                previous.insert(key, decode_value(bytes.clone())?);
+            }
+            Some(crate::live_state::CertifiedCurrentStatePredecessor::Packed(_)) => {
+                return Err(codec_error(
+                    "untracked predecessor used tracked packed authority",
+                ));
+            }
+            None => missing_predecessors.push(*delta),
+        }
+    }
+    previous.extend(load_previous_untracked_values(store, branch_id, &missing_predecessors).await?);
     let mut previous_created_at = BTreeMap::new();
     for (key, decoded) in previous {
         collect_value_refs(&decoded, &mut retired_refs);
@@ -1555,26 +1576,76 @@ async fn load_untracked_entities(
     request: &LiveStateScanRequest,
     branch_ids: &[String],
 ) -> Result<MaterializedLiveStateBatch, LixError> {
-    let mut decoded = Vec::new();
     let requested = request.filter.entity_pks.iter().collect::<BTreeSet<_>>();
     tracing::debug!(
         target: "lix_perf",
         route = "entity_prefix",
         entity_count = requested.len(),
         branch_count = branch_ids.len(),
-        "bounded untracked entity candidate probes"
+        "batched untracked entity prefix probes"
+    );
+    let mut prefixes = Vec::with_capacity(
+        branch_ids
+            .len()
+            .saturating_mul(request.filter.schema_keys.len())
+            .saturating_mul(requested.len()),
     );
     for branch_id in branch_ids {
         for schema_key in &request.filter.schema_keys {
             for entity_pk in requested.iter().copied() {
-                scan_prefix(
-                    store,
-                    &entity_prefix(branch_id, schema_key, entity_pk)?,
-                    request,
-                    &mut decoded,
-                )
-                .await?;
+                let prefix = entity_prefix(branch_id, schema_key, entity_pk)?;
+                prefixes.push((
+                    prefix.clone(),
+                    StoragePrefix {
+                        bytes: Bytes::from(prefix),
+                    }
+                    .to_range()?,
+                ));
             }
+        }
+    }
+    let ranges = prefixes
+        .iter()
+        .map(|(_, range)| range.clone())
+        .collect::<Vec<_>>();
+    let buckets = collect_many(
+        store,
+        UNTRACKED_ROW_SPACE,
+        &ranges,
+        crate::storage_adapter::StorageCoreProjection::FullValue,
+    )
+    .await?;
+    let mut decoded = Vec::new();
+    for ((prefix, _), entries) in prefixes.into_iter().zip(buckets) {
+        let mut previous = None;
+        for entry in entries {
+            if !entry.key.0.starts_with(&prefix)
+                || previous
+                    .as_ref()
+                    .is_some_and(|previous: &StorageKey| previous >= &entry.key)
+            {
+                return Err(codec_error(
+                    "batched untracked entity scan returned an invalid key order or prefix",
+                ));
+            }
+            previous = Some(entry.key.clone());
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(codec_error("untracked scan omitted its row value"));
+            };
+            let identity = decode_key(&entry.key.0)?;
+            let encoded_value = value.clone();
+            let value = decode_value(value)?;
+            if !matches_filter(&identity, request) {
+                continue;
+            }
+            decoded.push(DecodedRow {
+                branch_id: identity.branch_id,
+                schema_key: identity.schema_key,
+                file_id: identity.file_id,
+                entity_pk: identity.entity_pk,
+                encoded_value,
+                value,
+            });
         }
     }
     materialize_rows(store, decoded).await
@@ -1642,6 +1713,7 @@ async fn load_untracked_points(
                 schema_key: identity.schema_key,
                 file_id: identity.file_id,
                 entity_pk: identity.entity_pk,
+                encoded_value: Bytes::new(),
                 value: decode_value(value)?,
             });
         }
@@ -1749,6 +1821,7 @@ async fn load_untracked_exact_batch_inner(
             schema_key: requested.schema_key.clone(),
             file_id: requested.file_id.clone(),
             entity_pk: requested.entity_pk.clone(),
+            encoded_value: Bytes::new(),
             value,
         });
         selected.push(Some((index, branch_override)));
@@ -1933,6 +2006,7 @@ async fn scan_prefix(
             let StorageProjectedValue::FullValue(value) = entry.value else {
                 return Err(codec_error("untracked scan omitted its row value"));
             };
+            let encoded_value = value.clone();
             let value = decode_value(value)?;
             if !matches_filter(&identity, request) {
                 continue;
@@ -1942,6 +2016,7 @@ async fn scan_prefix(
                 schema_key: identity.schema_key,
                 file_id: identity.file_id,
                 entity_pk: identity.entity_pk,
+                encoded_value,
                 value,
             });
         }
@@ -1993,8 +2068,12 @@ async fn materialize_rows(
     let mut loaded = loaded.into_iter();
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(rows.len());
     for row in &mut rows {
+        let predecessor = (!row.encoded_value.is_empty()).then(|| {
+            crate::live_state::CertifiedCurrentStatePredecessor::Encoded(row.encoded_value.clone())
+        });
         let snapshot = materialize_slot(&mut row.value.snapshot, &mut loaded)?;
         let metadata = materialize_slot(&mut row.value.metadata, &mut loaded)?;
+        let ordinal = builder.len();
         builder.push_owned(MaterializedLiveStateRow {
             entity_pk: row.entity_pk.clone(),
             schema_key: std::mem::take(&mut row.schema_key),
@@ -2010,6 +2089,9 @@ async fn materialize_rows(
             untracked: true,
             branch_id: Arc::from(std::mem::take(&mut row.branch_id)),
         });
+        if let Some(predecessor) = predecessor {
+            builder.set_durable_predecessor(ordinal, predecessor);
+        }
     }
     Ok(builder.finish())
 }
@@ -2045,6 +2127,7 @@ struct DecodedRow {
     schema_key: String,
     file_id: Option<String>,
     entity_pk: EntityPk,
+    encoded_value: Bytes,
     value: DecodedValue,
 }
 
@@ -2548,6 +2631,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline(snapshot),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         }
     }
 
@@ -2565,6 +2649,7 @@ mod tests {
             snapshot: JsonSlotRef::None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         }
     }
 
@@ -2582,6 +2667,7 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         }
     }
 
@@ -2712,6 +2798,29 @@ mod tests {
                 .pop_front()
                 .expect("scripted scan should not request an extra page");
             async move { Ok(page) }
+        }
+
+        fn scan_many(
+            &self,
+            _space: StorageSpace,
+            ranges: &[StorageKeyRange],
+            _projection: crate::storage_adapter::StorageCoreProjection,
+        ) -> impl Future<
+            Output = Result<Vec<Vec<crate::storage_adapter::StorageReadEntry>>, StorageError>,
+        > + Send {
+            let mut pages = self.pages.lock().expect("scripted scan pages lock");
+            let mut buckets = Vec::with_capacity(ranges.len());
+            for _ in ranges {
+                let page = pages
+                    .pop_front()
+                    .expect("scripted multi-range scan should not request an extra page");
+                buckets.push(page.entries);
+                assert!(
+                    !page.has_more,
+                    "scripted multi-range scan uses one page per range"
+                );
+            }
+            async move { Ok(buckets) }
         }
     }
 

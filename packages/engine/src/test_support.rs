@@ -150,6 +150,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             snapshot: snapshot.as_ref_slot(),
             metadata: metadata.as_ref_slot(),
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         })
         .collect::<Vec<_>>();
     let mut working_diff_coverage = WorkingDiffIndexCoverage::default();

@@ -329,6 +329,31 @@ impl StorageRead for MemoryRead {
         }
         Ok(chunk)
     }
+
+    async fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+        let mut buckets = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let physical = physical_range(space.id, range.clone());
+            let lower = lower_bound(&physical, None);
+            let upper = upper_bound(&physical);
+            let entries = self
+                .entries
+                .entries_range(lower, upper, usize::MAX)
+                .into_iter()
+                .map(|(key, value)| ReadEntry {
+                    key: Key(key.0.slice(4..)),
+                    value: project_value(&value, projection),
+                })
+                .collect();
+            buckets.push(entries);
+        }
+        Ok(buckets)
+    }
 }
 
 impl StorageWrite for MemoryWrite {

@@ -82,6 +82,42 @@ impl ScanPlan {
     }
 }
 
+/// Collects disjoint ranges through one coherent adapter read. The adapter
+/// owns pagination and may lower the request to one backend-native multi-range
+/// operation; callers receive one bucket per input range.
+pub(crate) async fn collect_many<R>(
+    read: &R,
+    space: StorageSpace,
+    ranges: &[KeyRange],
+    projection: CoreProjection,
+) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let buckets = read.scan_many(space, ranges, projection).await?;
+    #[cfg(feature = "storage-benches")]
+    {
+        let rows = buckets
+            .iter()
+            .map(|bucket| bucket.len() as u64)
+            .sum::<u64>();
+        crate::sql_profile::record_storage_stats(StorageReadStats {
+            storage_calls: 1,
+            prefix_lowered: ranges.len() as u64,
+            prefix_scan_chunks: ranges.len() as u64,
+            scan_full_value_chunks: (projection == CoreProjection::FullValue)
+                .then_some(ranges.len() as u64)
+                .unwrap_or_default(),
+            scan_key_only_chunks: (projection == CoreProjection::KeyOnly)
+                .then_some(ranges.len() as u64)
+                .unwrap_or_default(),
+            scan_rows: rows,
+            ..StorageReadStats::default()
+        });
+    }
+    Ok(buckets)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanKind {
     Range,

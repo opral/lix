@@ -41,6 +41,7 @@ pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUnique
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub use scan::ScanPlan;
+pub(crate) use scan::collect_many;
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };

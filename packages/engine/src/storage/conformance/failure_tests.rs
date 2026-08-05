@@ -400,6 +400,34 @@ impl StorageRead for BrokenRead {
             Ok(chunk)
         }
     }
+    async fn scan_many(
+        &self,
+        space: crate::storage::StorageSpace,
+        ranges: &[KeyRange],
+        projection: crate::storage::CoreProjection,
+    ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
+        let mut buckets = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let chunk = self
+                .scan(
+                    space,
+                    range.clone(),
+                    ScanOptions {
+                        projection,
+                        limit_rows: crate::storage::MAX_SCAN_PAGE_ROWS,
+                        resume_after: None,
+                    },
+                )
+                .await?;
+            if chunk.has_more {
+                return Err(StorageError::Corruption(
+                    "broken test scan_many did not consume its range".to_string(),
+                ));
+            }
+            buckets.push(chunk.entries);
+        }
+        Ok(buckets)
+    }
 }
 
 impl StorageWrite for BrokenWrite {

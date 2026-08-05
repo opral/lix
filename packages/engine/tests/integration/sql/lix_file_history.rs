@@ -94,6 +94,21 @@ impl StorageRead for CountingRead {
             .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
         Ok(chunk)
     }
+
+    async fn scan_many(
+        &self,
+        space: lix_engine::storage::StorageSpace,
+        ranges: &[KeyRange],
+        projection: lix_engine::storage::CoreProjection,
+    ) -> Result<Vec<Vec<lix_engine::storage::ReadEntry>>, lix_engine::storage::StorageError> {
+        self.scan_calls.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.scan_many(space, ranges, projection).await?;
+        self.scanned_rows.fetch_add(
+            result.iter().map(|entries| entries.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        Ok(result)
+    }
 }
 
 #[tokio::test]

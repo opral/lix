@@ -1432,6 +1432,16 @@ impl StorageRead for RecordingRead {
         self.fail_if_space_matches(space)?;
         self.inner.scan(space, range, opts).await
     }
+
+    async fn scan_many(
+        &self,
+        space: lix_engine::storage::StorageSpace,
+        ranges: &[KeyRange],
+        projection: lix_engine::storage::CoreProjection,
+    ) -> Result<Vec<Vec<lix_engine::storage::ReadEntry>>, StorageError> {
+        self.fail_if_space_matches(space)?;
+        self.inner.scan_many(space, ranges, projection).await
+    }
 }
 
 impl StorageWrite for RecordingWrite {

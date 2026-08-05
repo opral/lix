@@ -562,6 +562,15 @@ mod tests {
         ) -> Result<ScanChunk, StorageError> {
             self.inner.scan(space, range, opts).await
         }
+
+        async fn scan_many(
+            &self,
+            space: crate::storage::StorageSpace,
+            ranges: &[KeyRange],
+            projection: crate::storage::CoreProjection,
+        ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
+            self.inner.scan_many(space, ranges, projection).await
+        }
     }
 
     fn ts(value: &str) -> crate::common::LixTimestamp {

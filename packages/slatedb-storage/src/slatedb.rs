@@ -3049,6 +3049,338 @@ impl StorageRead for SlateDBRead {
             }
         }
     }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+        let ranges = ranges.to_vec();
+        let snapshot = Arc::clone(&self.snapshot);
+        let durability = self.durability;
+        let worker = self.worker.clone();
+        let immutable_value_store = self.immutable_value_store.clone();
+        let visible_writes = self
+            .publication_view
+            .as_ref()
+            .map_or_else(Vec::new, |view| {
+                self.write_pipeline
+                    .visible_writes(view.snapshot_sequence, view.publication_id)
+            });
+        async move {
+            worker
+                .call_read(move |_db| async move {
+                    let physical_ranges = ranges
+                        .into_iter()
+                        .map(|range| physical_range(space.id, range))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut buckets = if visible_writes.is_empty() {
+                        // The common entity-prefix workload supplies
+                        // ascending, disjoint ranges. Traverse them with one
+                        // SlateDB iterator and seek between ranges; this
+                        // avoids one iterator/object-store planning round
+                        // trip per identity while preserving one coherent
+                        // snapshot and independent buckets.
+                        scan_snapshot_ranges_all(
+                            Arc::clone(&snapshot),
+                            &physical_ranges,
+                            durability,
+                            projection,
+                        )
+                        .await?
+                    } else {
+                        let encoded = physical_ranges
+                            .into_iter()
+                            .map(|range| EncodedBounds::new(range, None))
+                            .collect::<Vec<_>>();
+                        scan_snapshot_ranges_with_writes(
+                            Arc::clone(&snapshot),
+                            encoded,
+                            durability,
+                            visible_writes,
+                            projection,
+                        )
+                        .await?
+                    };
+                    for entries in &mut buckets {
+                        if space.value_semantics == ValueSemantics::Immutable
+                            && projection == CoreProjection::FullValue
+                        {
+                            let mut chunk = ScanChunk {
+                                entries: std::mem::take(entries),
+                                has_more: false,
+                            };
+                            hydrate_immutable_value_scan(
+                                &immutable_value_store,
+                                space,
+                                projection,
+                                &mut chunk,
+                            )
+                            .await?;
+                            *entries = chunk.entries;
+                        }
+                    }
+                    Ok(buckets)
+                })
+                .await
+        }
+    }
+}
+
+async fn scan_snapshot_ranges_all(
+    snapshot: Arc<DbSnapshot>,
+    ranges: &[KeyRange],
+    durability: ReadDurability,
+    projection: CoreProjection,
+) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+    let encoded = ranges
+        .iter()
+        .cloned()
+        .map(|range| EncodedBounds::new(range, None))
+        .collect::<Vec<_>>();
+    if encoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ordered_disjoint = encoded
+        .windows(2)
+        .all(|pair| upper_before_or_equal_lower(&pair[0].upper, &pair[1].lower));
+    if !ordered_disjoint {
+        // The public contract permits overlapping/out-of-order ranges and
+        // requires independent duplicate buckets. Such ranges cannot be
+        // represented by one forward-only SlateDB iterator without losing
+        // rows, so each independent run gets its own coherent-snapshot scan.
+        let mut buckets = Vec::with_capacity(encoded.len());
+        for bounds in encoded {
+            buckets.push(
+                scan_snapshot_range_all(Arc::clone(&snapshot), bounds, durability, projection)
+                    .await?,
+            );
+        }
+        return Ok(buckets);
+    }
+
+    let broad = EncodedBounds {
+        lower: encoded[0].lower.clone(),
+        upper: encoded
+            .last()
+            .expect("non-empty encoded ranges")
+            .upper
+            .clone(),
+    };
+    let mut iter = open_snapshot_scan(Arc::clone(&snapshot), broad, durability).await?;
+    let mut pending = None;
+    let mut buckets = Vec::with_capacity(encoded.len());
+    for bounds in encoded {
+        let mut entries = Vec::new();
+        loop {
+            let Some(row) = (match pending.take() {
+                Some(row) => Some(row),
+                None => iter.next().await.map_err(slatedb_error)?,
+            }) else {
+                break;
+            };
+            if !bounds.after_lower_bytes(&row.key) {
+                continue;
+            }
+            if !bounds.before_upper_bytes(&row.key) {
+                pending = Some(row);
+                break;
+            }
+            if row.key.len() < SPACE_PREFIX_LEN {
+                return Err(StorageError::Corruption(
+                    "slatedb multi-range key was shorter than space prefix".to_owned(),
+                ));
+            }
+            let key = Key(Bytes::copy_from_slice(&row.key[SPACE_PREFIX_LEN..]));
+            let value = match projection {
+                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                CoreProjection::FullValue => ProjectedValue::FullValue(row.value),
+            };
+            entries.push(ReadEntry { key, value });
+        }
+        buckets.push(entries);
+    }
+    Ok(buckets)
+}
+
+/// Merges publication overlays into one forward snapshot traversal for the
+/// normal ordered/disjoint range plan. The overlay is already a sorted map, so
+/// the base iterator and publication rows advance together without opening an
+/// iterator or issuing an adapter/backend scan per range. Overlapping or
+/// out-of-order ranges retain independent bucket semantics through the
+/// single-range merge helper; that is a contract-preserving exceptional shape,
+/// not a default implementation of `scan_many`.
+async fn scan_snapshot_ranges_with_writes(
+    snapshot: Arc<DbSnapshot>,
+    ranges: Vec<EncodedBounds>,
+    durability: ReadDurability,
+    visible_writes: Vec<Arc<PublishedWrite>>,
+    projection: CoreProjection,
+) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut overlay = BTreeMap::new();
+    for write in visible_writes {
+        overlay.extend(
+            write
+                .overlay
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    let ordered_disjoint = ranges
+        .windows(2)
+        .all(|pair| upper_before_or_equal_lower(&pair[0].upper, &pair[1].lower));
+    if !ordered_disjoint {
+        let mut buckets = Vec::with_capacity(ranges.len());
+        for bounds in ranges {
+            if bounds.is_empty() {
+                buckets.push(Vec::new());
+                continue;
+            }
+            let chunk = scan_snapshot_with_writes(
+                Arc::clone(&snapshot),
+                bounds,
+                durability,
+                vec![Arc::new(PublishedWrite {
+                    publication_id: 0,
+                    overlay: Arc::new(overlay.clone()),
+                    persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
+                })],
+                usize::MAX,
+                projection,
+            )
+            .await?;
+            buckets.push(chunk.entries);
+        }
+        return Ok(buckets);
+    }
+
+    let broad = EncodedBounds {
+        lower: ranges[0].lower.clone(),
+        upper: ranges
+            .last()
+            .expect("non-empty ordered range list")
+            .upper
+            .clone(),
+    };
+    let mut base_iter = open_snapshot_scan(Arc::clone(&snapshot), broad, durability).await?;
+    let mut base_pending = base_iter.next().await.map_err(slatedb_error)?;
+    let overlay = overlay.into_iter().collect::<Vec<_>>();
+    let mut overlay_index = 0usize;
+    let mut buckets = Vec::with_capacity(ranges.len());
+    for bounds in ranges {
+        let mut entries = Vec::new();
+        loop {
+            while let Some(row) = base_pending.as_ref()
+                && !bounds.after_lower_bytes(&row.key)
+            {
+                base_pending = base_iter.next().await.map_err(slatedb_error)?;
+            }
+            while overlay_index < overlay.len()
+                && !bounds.after_lower_bytes(&(overlay[overlay_index].0).0)
+            {
+                overlay_index += 1;
+            }
+            let overlay_row = overlay
+                .get(overlay_index)
+                .filter(|(key, _)| bounds.before_upper_bytes(&key.0));
+            let base_in_range = base_pending
+                .as_ref()
+                .filter(|row| bounds.before_upper_bytes(&row.key));
+            let Some((key, value)) = (match (base_in_range, overlay_row) {
+                (None, None) => None,
+                (Some(row), None) => {
+                    let value = row.value.clone();
+                    let key = row.key.clone();
+                    base_pending = base_iter.next().await.map_err(slatedb_error)?;
+                    Some((key, Some(value)))
+                }
+                (None, Some((key, value))) => {
+                    let row = (key.0.clone(), value.clone());
+                    overlay_index += 1;
+                    Some(row)
+                }
+                (Some(base), Some((overlay_key, overlay_value))) => {
+                    match base.key.cmp(&overlay_key.0) {
+                        std::cmp::Ordering::Less => {
+                            let value = base.value.clone();
+                            let key = base.key.clone();
+                            base_pending = base_iter.next().await.map_err(slatedb_error)?;
+                            Some((key, Some(value)))
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let key = overlay_key.0.clone();
+                            let value = overlay_value.clone();
+                            base_pending = base_iter.next().await.map_err(slatedb_error)?;
+                            overlay_index += 1;
+                            Some((key, value))
+                        }
+                        std::cmp::Ordering::Greater => {
+                            let row = (overlay_key.0.clone(), overlay_value.clone());
+                            overlay_index += 1;
+                            Some(row)
+                        }
+                    }
+                }
+            }) else {
+                break;
+            };
+            if let Some(value) = value {
+                if key.len() < SPACE_PREFIX_LEN {
+                    return Err(StorageError::Corruption(
+                        "slatedb key was shorter than space prefix".to_owned(),
+                    ));
+                }
+                entries.push(ReadEntry {
+                    key: Key(Bytes::copy_from_slice(&key[SPACE_PREFIX_LEN..])),
+                    value: project_value(value, projection),
+                });
+            }
+        }
+        buckets.push(entries);
+    }
+    Ok(buckets)
+}
+
+async fn scan_snapshot_range_all(
+    snapshot: Arc<DbSnapshot>,
+    bounds: EncodedBounds,
+    durability: ReadDurability,
+    projection: CoreProjection,
+) -> Result<Vec<ReadEntry>, StorageError> {
+    let mut iter = open_snapshot_scan(Arc::clone(&snapshot), bounds, durability).await?;
+    let mut pending = None;
+    let mut entries = Vec::new();
+    loop {
+        let batch = scan_snapshot_batch(iter, pending, SCAN_BATCH_ROWS, projection, false).await?;
+        let ScanBatch {
+            iter: next_iter,
+            pending: next_pending,
+            entries: batch_entries,
+            state,
+        } = batch;
+        entries.extend(
+            batch_entries
+                .into_iter()
+                .map(|(key, value)| ReadEntry { key, value }),
+        );
+        match state {
+            ScanBatchState::Exhausted => break,
+            ScanBatchState::MoreUnknown => {
+                iter = next_iter;
+                pending = next_pending;
+            }
+            ScanBatchState::HasMore => {
+                return Err(StorageError::Corruption(
+                    "slatedb unbounded multi-range scan returned an unexpected cursor".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 async fn hydrate_immutable_value_gets(
@@ -4249,6 +4581,36 @@ impl EncodedBounds {
             Bound::Unbounded => true,
         };
         above_lower && below_upper
+    }
+
+    fn after_lower_bytes(&self, key: &[u8]) -> bool {
+        match &self.lower {
+            Bound::Included(lower) => key >= lower.as_slice(),
+            Bound::Excluded(lower) => key > lower.as_slice(),
+            Bound::Unbounded => true,
+        }
+    }
+
+    fn before_upper_bytes(&self, key: &[u8]) -> bool {
+        match &self.upper {
+            Bound::Included(upper) => key <= upper.as_slice(),
+            Bound::Excluded(upper) => key < upper.as_slice(),
+            Bound::Unbounded => true,
+        }
+    }
+}
+
+fn upper_before_or_equal_lower(upper: &Bound<Vec<u8>>, lower: &Bound<Vec<u8>>) -> bool {
+    let (Some(upper), Some(lower)) = (bound_bytes(upper), bound_bytes(lower)) else {
+        return false;
+    };
+    upper <= lower
+}
+
+fn bound_bytes(bound: &Bound<Vec<u8>>) -> Option<&[u8]> {
+    match bound {
+        Bound::Included(value) | Bound::Excluded(value) => Some(value.as_slice()),
+        Bound::Unbounded => None,
     }
 }
 

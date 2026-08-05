@@ -328,6 +328,16 @@ where
     ) -> impl Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send {
         self.read.scan(space, range, opts)
     }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError>> + Send
+    {
+        self.read.scan_many(space, ranges, projection)
+    }
 }
 
 #[expect(missing_debug_implementations)]
@@ -384,6 +394,16 @@ where
         opts: crate::storage::ScanOptions,
     ) -> impl Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send {
         self.read.scan(space, range, opts)
+    }
+
+    fn scan_many(
+        &self,
+        space: StorageSpace,
+        ranges: &[KeyRange],
+        projection: CoreProjection,
+    ) -> impl Future<Output = Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError>> + Send
+    {
+        self.read.scan_many(space, ranges, projection)
     }
 }
 

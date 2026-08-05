@@ -308,6 +308,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             snapshot: self.snapshot,
             metadata: self.metadata,
             columnar_base_coordinate: None,
+            durable_predecessor: None,
         }
     }
 }
@@ -331,6 +332,9 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) snapshot: JsonSlotRef<'a>,
     pub(crate) metadata: JsonSlotRef<'a>,
     pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
+    /// Exact predecessor bytes captured by an authoritative untracked scan.
+    /// This is transaction-local evidence; it never becomes tracked history.
+    pub(crate) durable_predecessor: Option<&'a CertifiedCurrentStatePredecessor>,
 }
 
 /// Durable exact-read evidence aligned with a transaction delta.

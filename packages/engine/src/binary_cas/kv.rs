@@ -2168,6 +2168,15 @@ mod tests {
             }
             result
         }
+
+        async fn scan_many(
+            &self,
+            space: StorageSpace,
+            ranges: &[StorageKeyRange],
+            projection: crate::storage_adapter::StorageCoreProjection,
+        ) -> Result<Vec<Vec<crate::storage_adapter::StorageReadEntry>>, StorageError> {
+            self.inner.scan_many(space, ranges, projection).await
+        }
     }
 
     fn manifest_hash_from_range(range: &StorageKeyRange) -> Option<BlobId> {
