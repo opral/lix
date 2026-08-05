@@ -7,7 +7,7 @@
 )]
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -22,7 +22,10 @@ use lru::LruCache;
 
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
-use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
+use crate::storage_adapter::{
+    StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
+    StorageProjectedValue, StorageWriteSet,
+};
 use crate::tracked_state::codec::{
     ChildSummary, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, PendingChunk,
     PendingChunkBatch, TrackedStateKeyBatchBuilder, decode_key, decode_key_shared,
@@ -95,6 +98,9 @@ struct FrontierMetrics {
     covered_subtrees: AtomicU64,
     pruned_subtrees: AtomicU64,
     boundary_descents: AtomicU64,
+    diff_batch_calls: AtomicU64,
+    diff_batch_keys: AtomicU64,
+    diff_decoded_bytes: AtomicU64,
 }
 
 static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
@@ -114,6 +120,9 @@ static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
     covered_subtrees: AtomicU64::new(0),
     pruned_subtrees: AtomicU64::new(0),
     boundary_descents: AtomicU64::new(0),
+    diff_batch_calls: AtomicU64::new(0),
+    diff_batch_keys: AtomicU64::new(0),
+    diff_decoded_bytes: AtomicU64::new(0),
 };
 
 fn frontier_metrics_enabled() -> bool {
@@ -142,6 +151,9 @@ fn reset_frontier_metrics() {
         &FRONTIER_METRICS.covered_subtrees,
         &FRONTIER_METRICS.pruned_subtrees,
         &FRONTIER_METRICS.boundary_descents,
+        &FRONTIER_METRICS.diff_batch_calls,
+        &FRONTIER_METRICS.diff_batch_keys,
+        &FRONTIER_METRICS.diff_decoded_bytes,
     ] {
         metric.store(0, Ordering::Relaxed);
     }
@@ -152,7 +164,7 @@ fn emit_frontier_metrics() {
         return;
     }
     eprintln!(
-        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={} range_events={} cascade_nodes_scanned={} cascade_decoded_rows={} cascade_streamed_outputs={} covered_subtrees={} pruned_subtrees={} boundary_descents={}",
+        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={} range_events={} cascade_nodes_scanned={} cascade_decoded_rows={} cascade_streamed_outputs={} covered_subtrees={} pruned_subtrees={} boundary_descents={} diff_batch_calls={} diff_batch_keys={} diff_decoded_bytes={}",
         FRONTIER_METRICS.visited_nodes.load(Ordering::Relaxed),
         FRONTIER_METRICS.decoded_nodes.load(Ordering::Relaxed),
         FRONTIER_METRICS.encoded_nodes.load(Ordering::Relaxed),
@@ -179,6 +191,9 @@ fn emit_frontier_metrics() {
         FRONTIER_METRICS.covered_subtrees.load(Ordering::Relaxed),
         FRONTIER_METRICS.pruned_subtrees.load(Ordering::Relaxed),
         FRONTIER_METRICS.boundary_descents.load(Ordering::Relaxed),
+        FRONTIER_METRICS.diff_batch_calls.load(Ordering::Relaxed),
+        FRONTIER_METRICS.diff_batch_keys.load(Ordering::Relaxed),
+        FRONTIER_METRICS.diff_decoded_bytes.load(Ordering::Relaxed),
     );
 }
 
@@ -380,7 +395,8 @@ impl TrackedStateTree {
         right_root: Option<&TrackedStateRootId>,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
-        match (left_root, right_root) {
+        reset_frontier_metrics();
+        let result = match (left_root, right_root) {
             (None, None) => Ok(TrackedStateTreeDiffBatch::default()),
             (Some(left), Some(right)) if left == right => Ok(TrackedStateTreeDiffBatch::default()),
             (Some(left), Some(right)) => {
@@ -423,7 +439,9 @@ impl TrackedStateTree {
                 .await?;
                 out.finish()
             }
-        }
+        };
+        emit_frontier_metrics();
+        result
     }
 
     #[cfg(test)]
@@ -542,6 +560,116 @@ impl TrackedStateTree {
         }
     }
 
+    async fn load_diff_nodes_many(
+        &self,
+        store: &impl StorageAdapterRead,
+        hashes: &[[u8; TRACKED_STATE_HASH_BYTES]],
+    ) -> Result<HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>, LixError> {
+        let mut unique = Vec::with_capacity(hashes.len());
+        let mut seen = HashSet::with_capacity(hashes.len());
+        for hash in hashes {
+            if seen.insert(*hash) {
+                unique.push(*hash);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let keys = unique
+            .iter()
+            .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+            .collect::<Vec<_>>();
+        let result = store
+            .get_many(&[StorageGetManyRequest {
+                space: storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                keys: &keys,
+                opts: StorageGetOptions::default(),
+            }])
+            .await?;
+        if result.values.len() != keys.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state diff node batch returned the wrong cardinality",
+            ));
+        }
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .diff_batch_calls
+                .fetch_add(1, Ordering::Relaxed);
+            FRONTIER_METRICS
+                .diff_batch_keys
+                .fetch_add(unique.len() as u64, Ordering::Relaxed);
+        }
+        let mut nodes = HashMap::with_capacity(unique.len());
+        for (hash, value) in unique.into_iter().zip(result.values) {
+            let bytes = match value {
+                Some(StorageProjectedValue::FullValue(bytes)) => bytes,
+                Some(StorageProjectedValue::KeyOnly) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state diff node batch returned key-only data",
+                    ));
+                }
+                None => {
+                    return Err(LixError::new(
+                        LixError::CODE_UNKNOWN,
+                        "tracked-state diff node is missing",
+                    ));
+                }
+            };
+            storage::verify_chunk_hash(&hash, &bytes)?;
+            if frontier_metrics_enabled() {
+                FRONTIER_METRICS
+                    .diff_decoded_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+            nodes.insert(hash, decode_node(&bytes)?);
+        }
+        Ok(nodes)
+    }
+
+    async fn prefetch_diff_frontier(
+        &self,
+        store: &impl StorageAdapterRead,
+        left: &VecDeque<ChildSummary>,
+        right: &VecDeque<ChildSummary>,
+        prefetched: &mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
+    ) -> Result<(), LixError> {
+        const DIFF_PREFETCH_WIDTH: usize = 64;
+        let width = DIFF_PREFETCH_WIDTH.min(left.len().max(right.len()));
+        let mut hashes = Vec::with_capacity(width.saturating_mul(2));
+        for index in 0..width {
+            let left_summary = left.get(index);
+            let right_summary = right.get(index);
+            if let (Some(left_summary), Some(right_summary)) = (left_summary, right_summary)
+                && left_summary.child_hash == right_summary.child_hash
+            {
+                continue;
+            }
+            if let Some(summary) = left_summary
+                && !prefetched.contains_key(&summary.child_hash)
+            {
+                hashes.push(summary.child_hash);
+            }
+            if let Some(summary) = right_summary
+                && !prefetched.contains_key(&summary.child_hash)
+            {
+                hashes.push(summary.child_hash);
+            }
+        }
+        // Preserve the sparse path: a small unequal frontier is cheaper as
+        // bounded path reads than as a speculative level-wide batch. Dense
+        // diffs cross this threshold and amortize one backend request.
+        if hashes.len() < 32 {
+            return Ok(());
+        }
+        for (hash, node) in self.load_diff_nodes_many(store, &hashes).await? {
+            prefetched.insert(hash, node);
+        }
+        Ok(())
+    }
+
     async fn diff_nodes(
         &self,
         store: &impl StorageAdapterRead,
@@ -566,8 +694,11 @@ impl TrackedStateTree {
         let mut right_window = Vec::new();
         let mut left_loaded = None;
         let mut right_loaded = None;
+        let mut prefetched = HashMap::new();
 
         loop {
+            self.prefetch_diff_frontier(store, &left, &right, &mut prefetched)
+                .await?;
             match (left.front().cloned(), right.front().cloned()) {
                 (Some(left_node), Some(right_node))
                     if left_node.child_hash == right_node.child_hash =>
@@ -583,11 +714,17 @@ impl TrackedStateTree {
                 (Some(left_summary), Some(right_summary)) => {
                     let left_node = match left_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &left_summary.child_hash).await?,
+                        None => match prefetched.remove(&left_summary.child_hash) {
+                            Some(node) => node,
+                            None => self.load_node(store, &left_summary.child_hash).await?,
+                        },
                     };
                     let right_node = match right_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &right_summary.child_hash).await?,
+                        None => match prefetched.remove(&right_summary.child_hash) {
+                            Some(node) => node,
+                            None => self.load_node(store, &right_summary.child_hash).await?,
+                        },
                     };
                     match (left_node, right_node) {
                         (DecodedNode::Internal(left_node), DecodedNode::Internal(right_node)) => {
@@ -644,7 +781,10 @@ impl TrackedStateTree {
                 (Some(left_summary), None) => {
                     let left_node = match left_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &left_summary.child_hash).await?,
+                        None => match prefetched.remove(&left_summary.child_hash) {
+                            Some(node) => node,
+                            None => self.load_node(store, &left_summary.child_hash).await?,
+                        },
                     };
                     match left_node {
                         DecodedNode::Internal(node) => {
@@ -659,7 +799,10 @@ impl TrackedStateTree {
                 (None, Some(right_summary)) => {
                     let right_node = match right_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &right_summary.child_hash).await?,
+                        None => match prefetched.remove(&right_summary.child_hash) {
+                            Some(node) => node,
+                            None => self.load_node(store, &right_summary.child_hash).await?,
+                        },
                     };
                     match right_node {
                         DecodedNode::Internal(node) => {
@@ -1266,44 +1409,79 @@ impl TrackedStateTree {
                                 child.clone()
                             });
                             group_index += 1;
-                        } else if cascades.is_empty() || !cascade_overlaps_child(&child, cascades)?
-                        {
-                            if !cascades.is_empty() && frontier_metrics_enabled() {
-                                FRONTIER_METRICS
-                                    .pruned_subtrees
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            record_reused_node();
-                            replacement_children.push(child);
                         } else {
-                            if frontier_metrics_enabled() {
-                                FRONTIER_METRICS
-                                    .boundary_descents
-                                    .fetch_add(1, Ordering::Relaxed);
+                            match cascade_coverage(&child, cascades)? {
+                                CascadeCoverage::None => {
+                                    if frontier_metrics_enabled() {
+                                        FRONTIER_METRICS
+                                            .pruned_subtrees
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    record_reused_node();
+                                    replacement_children.push(child);
+                                }
+                                CascadeCoverage::Full(index) => {
+                                    if frontier_metrics_enabled() {
+                                        FRONTIER_METRICS
+                                            .covered_subtrees
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    let child_node = self
+                                        .load_node_with_overlay(store, overlay, &child.child_hash)
+                                        .await?;
+                                    let replacement = self
+                                        .apply_fully_covered_cascade_subtree(
+                                            store,
+                                            overlay,
+                                            child.child_hash,
+                                            child_node,
+                                            &cascades[index],
+                                            node_depth + 1,
+                                            chunks,
+                                        )
+                                        .await?;
+                                    changed |= replacement.changed;
+                                    cascaded_rows =
+                                        cascaded_rows.saturating_add(replacement.cascaded_rows);
+                                    replacement_children.push(if replacement.changed {
+                                        replacement.summary
+                                    } else {
+                                        record_reused_node();
+                                        child
+                                    });
+                                }
+                                CascadeCoverage::Partial => {
+                                    if frontier_metrics_enabled() {
+                                        FRONTIER_METRICS
+                                            .boundary_descents
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    let child_node = self
+                                        .load_node_with_overlay(store, overlay, &child.child_hash)
+                                        .await?;
+                                    let replacement = self
+                                        .apply_radix_node(
+                                            store,
+                                            overlay,
+                                            child.child_hash,
+                                            child_node,
+                                            Vec::new(),
+                                            cascades,
+                                            node_depth + 1,
+                                            chunks,
+                                        )
+                                        .await?;
+                                    changed |= replacement.changed;
+                                    cascaded_rows =
+                                        cascaded_rows.saturating_add(replacement.cascaded_rows);
+                                    replacement_children.push(if replacement.changed {
+                                        replacement.summary
+                                    } else {
+                                        record_reused_node();
+                                        child
+                                    });
+                                }
                             }
-                            let child_node = self
-                                .load_node_with_overlay(store, overlay, &child.child_hash)
-                                .await?;
-                            let replacement = self
-                                .apply_radix_node(
-                                    store,
-                                    overlay,
-                                    child.child_hash,
-                                    child_node,
-                                    Vec::new(),
-                                    cascades,
-                                    node_depth + 1,
-                                    chunks,
-                                )
-                                .await?;
-                            changed |= replacement.changed;
-                            cascaded_rows = cascaded_rows.saturating_add(replacement.cascaded_rows);
-                            replacement_children.push(if replacement.changed {
-                                replacement.summary
-                            } else {
-                                record_reused_node();
-                                child
-                            });
                         }
                     }
                     while group_index < groups.len() {
@@ -1346,6 +1524,223 @@ impl TrackedStateTree {
                     let last_key = replacement_children
                         .last()
                         .expect("non-empty radix replacement")
+                        .last_key
+                        .clone();
+                    let node = encode_internal_node_at_depth(&replacement_children, node_depth);
+                    let summary = chunks.insert_node(
+                        node,
+                        first_key,
+                        last_key,
+                        subtree_count,
+                        subtree_height,
+                    );
+                    Ok(RadixFrontierNode {
+                        summary,
+                        changed: true,
+                        cascaded_rows,
+                    })
+                }
+            }
+        })
+    }
+
+    /// Streams a fully covered file interval without constructing a second
+    /// parent-state arena. The internal summaries still decide which child
+    /// intervals are covered; only the leaf-sized output window is decoded.
+    fn apply_fully_covered_cascade_subtree<'a, S>(
+        &'a self,
+        store: &'a S,
+        overlay: &'a storage::TrackedStateChunkOverlay,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        node: DecodedNode,
+        cascade: &'a TrackedStateCascade,
+        depth: usize,
+        chunks: &'a mut PendingChunkBatchBuilder,
+    ) -> Pin<Box<dyn Future<Output = Result<RadixFrontierNode, LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+    {
+        Box::pin(async move {
+            if frontier_metrics_enabled() {
+                FRONTIER_METRICS
+                    .cascade_nodes_scanned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            match node {
+                DecodedNode::Leaf(leaf) => {
+                    let mut entries = leaf.into_entries();
+                    if frontier_metrics_enabled() {
+                        FRONTIER_METRICS
+                            .cascade_decoded_rows
+                            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+                    }
+                    let mut changed = false;
+                    let mut cascaded_rows = 0usize;
+                    for entry in &mut entries {
+                        let key = decode_key(&entry.key)?;
+                        if key.file_id.as_deref() != Some(cascade.file_id.as_str()) {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "tracked-state full cascade interval does not match leaf key",
+                            ));
+                        }
+                        let parent_value = decode_value(&entry.value)?;
+                        if parent_value.deleted() {
+                            continue;
+                        }
+                        entry.value = encode_value_ref(TrackedStateIndexValueRef {
+                            change_id: cascade.change_id,
+                            commit_id: cascade.commit_id,
+                            deleted: true,
+                            created_at: parent_value.created_at(),
+                            updated_at: cascade.updated_at,
+                        })
+                        .into();
+                        changed = true;
+                        cascaded_rows = cascaded_rows.saturating_add(1);
+                        if frontier_metrics_enabled() {
+                            FRONTIER_METRICS
+                                .cascade_streamed_outputs
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    let first_key = entries
+                        .first()
+                        .map(|entry| entry.key.clone())
+                        .unwrap_or_default();
+                    let last_key = entries
+                        .last()
+                        .map(|entry| entry.key.clone())
+                        .unwrap_or_default();
+                    if !changed {
+                        return Ok(RadixFrontierNode {
+                            summary: ChildSummary {
+                                first_key,
+                                last_key,
+                                child_hash: hash,
+                                subtree_count: entries.len() as u64,
+                                subtree_height: 1,
+                            },
+                            changed: false,
+                            cascaded_rows: 0,
+                        });
+                    }
+                    let node = encode_leaf_node(&entries);
+                    let summary =
+                        chunks.insert_node(node, first_key, last_key, entries.len() as u64, 1);
+                    Ok(RadixFrontierNode {
+                        summary,
+                        changed: true,
+                        cascaded_rows,
+                    })
+                }
+                DecodedNode::Internal(internal) => {
+                    let node_depth = internal.radix_depth();
+                    if node_depth < depth {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked-state covered cascade depth regressed below its parent",
+                        ));
+                    }
+                    let children = internal.into_children();
+                    validate_radix_children(&children, node_depth)?;
+                    let mut replacement_children = Vec::with_capacity(children.len());
+                    let mut changed = false;
+                    let mut cascaded_rows = 0usize;
+                    for child in children {
+                        match cascade_coverage(&child, std::slice::from_ref(cascade))? {
+                            CascadeCoverage::None => {
+                                record_reused_node();
+                                replacement_children.push(child);
+                            }
+                            CascadeCoverage::Full(_) => {
+                                if frontier_metrics_enabled() {
+                                    FRONTIER_METRICS
+                                        .covered_subtrees
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let child_node = self
+                                    .load_node_with_overlay(store, overlay, &child.child_hash)
+                                    .await?;
+                                let replacement = self
+                                    .apply_fully_covered_cascade_subtree(
+                                        store,
+                                        overlay,
+                                        child.child_hash,
+                                        child_node,
+                                        cascade,
+                                        node_depth + 1,
+                                        chunks,
+                                    )
+                                    .await?;
+                                cascaded_rows =
+                                    cascaded_rows.saturating_add(replacement.cascaded_rows);
+                                changed |= replacement.changed;
+                                replacement_children.push(if replacement.changed {
+                                    replacement.summary
+                                } else {
+                                    record_reused_node();
+                                    child
+                                });
+                            }
+                            CascadeCoverage::Partial => {
+                                if frontier_metrics_enabled() {
+                                    FRONTIER_METRICS
+                                        .boundary_descents
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let child_node = self
+                                    .load_node_with_overlay(store, overlay, &child.child_hash)
+                                    .await?;
+                                let replacement = self
+                                    .apply_radix_node(
+                                        store,
+                                        overlay,
+                                        child.child_hash,
+                                        child_node,
+                                        Vec::new(),
+                                        std::slice::from_ref(cascade),
+                                        node_depth + 1,
+                                        chunks,
+                                    )
+                                    .await?;
+                                cascaded_rows =
+                                    cascaded_rows.saturating_add(replacement.cascaded_rows);
+                                changed |= replacement.changed;
+                                replacement_children.push(if replacement.changed {
+                                    replacement.summary
+                                } else {
+                                    record_reused_node();
+                                    child
+                                });
+                            }
+                        }
+                    }
+                    if !changed {
+                        return Ok(RadixFrontierNode {
+                            summary: internal_summary(hash, &replacement_children)?,
+                            changed: false,
+                            cascaded_rows: 0,
+                        });
+                    }
+                    let subtree_count = replacement_children
+                        .iter()
+                        .map(|child| child.subtree_count)
+                        .sum();
+                    let subtree_height = replacement_children
+                        .iter()
+                        .map(|child| child.subtree_height)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    let first_key = replacement_children
+                        .first()
+                        .expect("covered cascade replacement has children")
+                        .first_key
+                        .clone();
+                    let last_key = replacement_children
+                        .last()
+                        .expect("covered cascade replacement has children")
                         .last_key
                         .clone();
                     let node = encode_internal_node_at_depth(&replacement_children, node_depth);
@@ -2000,29 +2395,59 @@ fn validate_radix_children(children: &[ChildSummary], depth: usize) -> Result<()
     Ok(())
 }
 
-/// Uses authenticated child bounds to prune cascade subtrees whose complete
-/// key interval cannot contain any targeted file id. A child spanning schema
-/// boundaries is conservatively retained for descent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CascadeCoverage {
+    None,
+    Partial,
+    Full(usize),
+}
+
+/// Classifies a child using only its authenticated key interval. A child
+/// spanning schema boundaries is conservatively retained for descent. A
+/// full-file interval may use the bounded cascade stream below: the normal
+/// point-mutation frontier does not materialize that subtree's rows.
+fn cascade_coverage(
+    child: &ChildSummary,
+    cascades: &[TrackedStateCascade],
+) -> Result<CascadeCoverage, LixError> {
+    let first = decode_key(&child.first_key)?;
+    let last = decode_key(&child.last_key)?;
+    let mut partial = false;
+    let mut full = None;
+    for (index, cascade) in cascades.iter().enumerate() {
+        let Some(first_file) = first.file_id.as_deref() else {
+            return Ok(CascadeCoverage::Partial);
+        };
+        let Some(last_file) = last.file_id.as_deref() else {
+            return Ok(CascadeCoverage::Partial);
+        };
+        if first.schema_key != last.schema_key {
+            partial = true;
+        } else if first_file == cascade.file_id && last_file == cascade.file_id {
+            if full.replace(index).is_some() {
+                partial = true;
+            }
+        } else if first_file <= cascade.file_id.as_str() && last_file >= cascade.file_id.as_str() {
+            partial = true;
+        }
+    }
+    if partial {
+        Ok(CascadeCoverage::Partial)
+    } else if let Some(index) = full {
+        Ok(CascadeCoverage::Full(index))
+    } else {
+        Ok(CascadeCoverage::None)
+    }
+}
+
 fn cascade_overlaps_child(
     child: &ChildSummary,
     cascades: &[TrackedStateCascade],
 ) -> Result<bool, LixError> {
-    let first = decode_key(&child.first_key)?;
-    let last = decode_key(&child.last_key)?;
-    for cascade in cascades {
-        let Some(first_file) = first.file_id.as_deref() else {
-            return Ok(true);
-        };
-        let Some(last_file) = last.file_id.as_deref() else {
-            return Ok(true);
-        };
-        if first.schema_key != last.schema_key
-            || (first_file <= cascade.file_id.as_str() && last_file >= cascade.file_id.as_str())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(!matches!(
+        cascade_coverage(child, cascades)?,
+        CascadeCoverage::None
+    ))
 }
 
 fn validate_cascades(cascades: &[TrackedStateCascade]) -> Result<(), LixError> {
