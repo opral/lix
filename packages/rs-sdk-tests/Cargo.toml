@@ -44,3 +44,7 @@ zip = { version = "8", default-features = false }
 [[example]]
 name = "branch_merge_benchmark"
 path = "examples/branch_merge_benchmark.rs"
+
+[[example]]
+name = "lifecycle_qualification"
+path = "examples/lifecycle_qualification.rs"
