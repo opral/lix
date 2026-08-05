@@ -3385,6 +3385,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_ref_untracked_rows_reopen_without_tracked_hot_mirror() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let branch_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        let mut tracked_row =
+            tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
+        tracked_row.entity_pk = identity("tracked-tab");
+        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
+            .await
+            .expect("tracked row should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tracked row should commit");
+
+        // A branch-ref materialization publishes its untracked members through
+        // the authoritative plane. The tracked HOT generation must contain
+        // only the tracked parent rows, including after a fresh read snapshot.
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[
+                branch_ref_row(branch_id, "commit-tracked"),
+                untracked_row("untracked-value"),
+            ],
+        )
+        .await;
+
+        let loaded = load_selected_tab_at(&live_state, &storage, branch_id)
+            .await
+            .expect("current-state read should succeed")
+            .expect("untracked row should be visible");
+        assert!(loaded.untracked);
+        assert_eq!(loaded.change_id, None);
+        assert_eq!(
+            loaded.snapshot_content.as_deref(),
+            Some("{\"value\":\"untracked-value\"}")
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reopened read should open");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .expect("branch control should load")
+            .expect("branch control should exist");
+        let hot_rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows(
+                branch_id,
+                control,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["lix_key_value".to_string()],
+                        entity_pks: vec![identity("selected-tab")],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tracked HOT scan should succeed");
+        assert!(
+            hot_rows.is_empty(),
+            "branch-ref untracked members must not be mirrored into tracked HOT"
+        );
+
+        let reopened = load_selected_tab_at(&live_state, &storage, branch_id)
+            .await
+            .expect("reopened current-state read should succeed")
+            .expect("untracked row should survive reopen");
+        assert!(reopened.untracked);
+        assert_eq!(reopened.change_id, None);
+        assert_eq!(reopened.snapshot_content, loaded.snapshot_content);
+    }
+
+    #[tokio::test]
     async fn exact_batch_preserves_duplicate_and_missing_slots_for_current_rows() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
