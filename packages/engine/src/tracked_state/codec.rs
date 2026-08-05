@@ -1910,10 +1910,10 @@ fn decode_internal_v5(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
         read_varint(body, &mut offset, "tracked-state internal node")?,
         "child count",
     )?;
-    if child_count == 0 {
+    if child_count < 2 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "tracked-state internal node has no children",
+            "tracked-state internal node must have at least two children",
         ));
     }
     let radix_depth = usize_from(
@@ -1929,6 +1929,7 @@ fn decode_internal_v5(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
     let mut boundary_arena = Vec::with_capacity(body.len());
     let mut child_spans = Vec::with_capacity(child_count.min(body.len()));
     let mut previous_last = None;
+    let mut previous_digit = None;
     for _ in 0..child_count {
         let first_key = front_coded_into(
             body,
@@ -1972,6 +1973,37 @@ fn decode_internal_v5(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
                 "tracked-state internal node child has zero height",
             ));
         }
+        let first_bytes = &boundary_arena[first_key.clone()];
+        let last_bytes = &boundary_arena[last_key.clone()];
+        if first_bytes > last_bytes {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node child has an invalid key interval",
+            ));
+        }
+        if previous_last
+            .as_ref()
+            .is_some_and(|previous| &boundary_arena[previous.clone()] >= first_bytes)
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node children overlap or are unordered",
+            ));
+        }
+        if first_bytes.get(radix_depth) != last_bytes.get(radix_depth) {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node child crosses a radix bucket",
+            ));
+        }
+        let digit = first_bytes.get(radix_depth).copied().unwrap_or_default();
+        if previous_digit.is_some_and(|previous| previous >= digit) {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal node children reuse a radix bucket",
+            ));
+        }
+        previous_digit = Some(digit);
         previous_last = Some(last_key.clone());
         child_spans.push(DecodedChildSpan {
             first_key,

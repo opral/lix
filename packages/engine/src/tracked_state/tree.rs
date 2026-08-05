@@ -580,7 +580,33 @@ impl TrackedStateTree {
             return Ok(HashMap::new());
         }
 
-        let keys = unique
+        let mut nodes = HashMap::with_capacity(unique.len());
+        let mut missing = Vec::with_capacity(unique.len());
+        for hash in unique {
+            let cached = self
+                .node_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&hash)
+                .cloned();
+            if let Some(bytes) = cached {
+                if frontier_metrics_enabled() {
+                    FRONTIER_METRICS
+                        .diff_decoded_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    FRONTIER_METRICS
+                        .diff_decoded_nodes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                nodes.insert(hash, decode_node(&bytes)?);
+            } else {
+                missing.push(hash);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(nodes);
+        }
+        let keys = missing
             .iter()
             .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
             .collect::<Vec<_>>();
@@ -603,10 +629,9 @@ impl TrackedStateTree {
                 .fetch_add(1, Ordering::Relaxed);
             FRONTIER_METRICS
                 .diff_batch_keys
-                .fetch_add(unique.len() as u64, Ordering::Relaxed);
+                .fetch_add(missing.len() as u64, Ordering::Relaxed);
         }
-        let mut nodes = HashMap::with_capacity(unique.len());
-        for (hash, value) in unique.into_iter().zip(result.values) {
+        for (hash, value) in missing.into_iter().zip(result.values) {
             let bytes = match value {
                 Some(StorageProjectedValue::FullValue(bytes)) => bytes,
                 Some(StorageProjectedValue::KeyOnly) => {
@@ -631,6 +656,12 @@ impl TrackedStateTree {
                     .diff_decoded_nodes
                     .fetch_add(1, Ordering::Relaxed);
             }
+            if bytes.len() <= self.options.max_chunk_bytes {
+                self.node_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .put(hash, bytes.clone());
+            }
             nodes.insert(hash, decode_node(&bytes)?);
         }
         Ok(nodes)
@@ -644,32 +675,61 @@ impl TrackedStateTree {
         prefetched: &mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
     ) -> Result<(), LixError> {
         const DIFF_PREFETCH_WIDTH: usize = 64;
-        let width = DIFF_PREFETCH_WIDTH.min(left.len().max(right.len()));
-        let mut hashes = Vec::with_capacity(width.saturating_mul(2));
-        for index in 0..width {
-            let left_summary = left.get(index);
-            let right_summary = right.get(index);
-            if let (Some(left_summary), Some(right_summary)) = (left_summary, right_summary)
-                && left_summary.child_hash == right_summary.child_hash
-            {
-                continue;
-            }
-            if let Some(summary) = left_summary
-                && !prefetched.contains_key(&summary.child_hash)
-            {
-                hashes.push(summary.child_hash);
-            }
-            if let Some(summary) = right_summary
-                && !prefetched.contains_key(&summary.child_hash)
-            {
-                hashes.push(summary.child_hash);
+        const DIFF_PREFETCH_MIN_PAIRS: usize = 16;
+        let width = DIFF_PREFETCH_WIDTH.min(left.len().min(right.len()));
+        if width < DIFF_PREFETCH_MIN_PAIRS {
+            return Ok(());
+        }
+
+        // Align by authenticated key ranges, not queue index. A prepend or
+        // local split can shift every child ordinal while leaving almost all
+        // subtrees equal; range alignment keeps that sparse case on paths.
+        let mut left_index = 0usize;
+        let mut right_index = 0usize;
+        let mut unequal_pairs = 0usize;
+        while left_index < width && right_index < width {
+            let left_summary = &left[left_index];
+            let right_summary = &right[right_index];
+            if left_summary.child_hash == right_summary.child_hash {
+                left_index += 1;
+                right_index += 1;
+            } else {
+                unequal_pairs = unequal_pairs.saturating_add(1);
+                if left_summary.last_key <= right_summary.last_key {
+                    left_index += 1;
+                } else {
+                    right_index += 1;
+                }
             }
         }
         // Preserve the sparse path: a small unequal frontier is cheaper as
         // bounded path reads than as a speculative level-wide batch. Dense
         // diffs cross this threshold and amortize one backend request.
-        if hashes.len() < 32 {
+        if unequal_pairs < DIFF_PREFETCH_MIN_PAIRS {
             return Ok(());
+        }
+        let mut hashes = Vec::with_capacity(unequal_pairs.saturating_mul(2));
+        left_index = 0;
+        right_index = 0;
+        while left_index < width && right_index < width {
+            let left_summary = &left[left_index];
+            let right_summary = &right[right_index];
+            if left_summary.child_hash == right_summary.child_hash {
+                left_index += 1;
+                right_index += 1;
+                continue;
+            }
+            if !prefetched.contains_key(&left_summary.child_hash) {
+                hashes.push(left_summary.child_hash);
+            }
+            if !prefetched.contains_key(&right_summary.child_hash) {
+                hashes.push(right_summary.child_hash);
+            }
+            if left_summary.last_key <= right_summary.last_key {
+                left_index += 1;
+            } else {
+                right_index += 1;
+            }
         }
         for (hash, node) in self.load_diff_nodes_many(store, &hashes).await? {
             prefetched.insert(hash, node);
@@ -1004,7 +1064,15 @@ impl TrackedStateTree {
         cascades: Vec<TrackedStateCascade>,
         commit_id: Option<&str>,
     ) -> Result<(TrackedStateApplyResult, usize), LixError> {
-        let mut chunks = PendingChunkBatchBuilder::default();
+        let encoded_input_bytes = mutations.iter().fold(0usize, |total, mutation| {
+            total
+                .saturating_add(mutation.encoded_key.len())
+                .saturating_add(mutation.encoded_value.len())
+        });
+        let chunk_capacity = encoded_input_bytes
+            .saturating_add(encoded_input_bytes / 4)
+            .saturating_add(mutations.len().saturating_mul(64));
+        let mut chunks = PendingChunkBatchBuilder::with_data_capacity(chunk_capacity);
         let replacement = self
             .apply_radix_node(
                 store,
@@ -1117,8 +1185,10 @@ impl TrackedStateTree {
                             let Some(file_id) = key.file_id.as_deref() else {
                                 continue;
                             };
-                            let Some(cascade) =
-                                cascades.iter().find(|cascade| cascade.file_id == file_id)
+                            let Some(cascade) = cascades
+                                .binary_search_by(|cascade| cascade.file_id.as_str().cmp(file_id))
+                                .ok()
+                                .and_then(|index| cascades.get(index))
                             else {
                                 continue;
                             };
@@ -2470,7 +2540,7 @@ fn cascade_overlaps_child(
 
 fn validate_cascades(cascades: &[TrackedStateCascade]) -> Result<(), LixError> {
     let mut file_ids = HashSet::with_capacity(cascades.len());
-    for cascade in cascades {
+    for (index, cascade) in cascades.iter().enumerate() {
         if cascade.file_id.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -2481,6 +2551,12 @@ fn validate_cascades(cascades: &[TrackedStateCascade]) -> Result<(), LixError> {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "tracked-state cascade file ids must be unique",
+            ));
+        }
+        if index > 0 && cascades[index - 1].file_id.as_str() >= cascade.file_id.as_str() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "tracked-state cascade file ids must be strictly sorted",
             ));
         }
     }
