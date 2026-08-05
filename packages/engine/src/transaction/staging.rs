@@ -213,6 +213,127 @@ impl ImmutableMutationJournalChunk {
     }
 
     #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_new_packed_single_string_identities(
+        schema_plan_id: SchemaPlanId,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        origin_key: Option<SharedStr>,
+        identity_arena: Vec<u8>,
+        identity_offsets: Vec<(u32, u32)>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(u32, u32)>,
+        durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
+        timestamp: LixTimestamp,
+    ) -> Result<Self, LixError> {
+        let row_count = identity_offsets.len();
+        if row_count == 0 || row_count != snapshot_offsets.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal columns are empty or misaligned",
+            ));
+        }
+        if durable_predecessors
+            .as_ref()
+            .is_some_and(|predecessors| predecessors.len() != row_count)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation predecessor column is misaligned",
+            ));
+        }
+
+        let identity_arena = Bytes::from(identity_arena);
+        let mut previous_end = 0u32;
+        let mut previous_identity = None;
+        for &(start, end) in &identity_offsets {
+            if start != previous_end || end < start || end as usize > identity_arena.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation identity offsets are invalid",
+                ));
+            }
+            let identity = std::str::from_utf8(&identity_arena[start as usize..end as usize])
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation identity offset splits UTF-8",
+                    )
+                })?;
+            if previous_identity.is_some_and(|previous| previous >= identity) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal identities are not strictly ordered",
+                ));
+            }
+            previous_identity = Some(identity);
+            previous_end = end;
+        }
+        if previous_end as usize != identity_arena.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation identity offsets do not cover the arena",
+            ));
+        }
+
+        std::str::from_utf8(&snapshot_arena).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal arena is not UTF-8",
+            )
+        })?;
+        let mut previous_end = 0u32;
+        for &(start, end) in &snapshot_offsets {
+            if start != previous_end || end <= start || end as usize > snapshot_arena.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal offsets are invalid",
+                ));
+            }
+            std::str::from_utf8(&snapshot_arena[start as usize..end as usize]).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal offset splits UTF-8",
+                )
+            })?;
+            previous_end = end;
+        }
+        if previous_end as usize != snapshot_arena.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal offsets do not cover the arena",
+            ));
+        }
+        let large_snapshot_refs = snapshot_offsets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(start, end))| {
+                let bytes = &snapshot_arena[start as usize..end as usize];
+                (bytes.len() > crate::json_store::JSON_INLINE_MAX_BYTES).then(|| {
+                    (
+                        u32::try_from(index)
+                            .expect("immutable mutation chunk row ordinal fits u32"),
+                        crate::json_store::JsonRef::for_content(bytes),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            schema_plan_id,
+            schema_key,
+            branch_id,
+            origin_key,
+            identity_arena,
+            identity_offsets: identity_offsets.into(),
+            snapshot_arena: Bytes::from(snapshot_arena),
+            snapshot_offsets: snapshot_offsets.into(),
+            large_snapshot_refs: large_snapshot_refs.into(),
+            sealed_replacement_parts: None,
+            durable_predecessors: durable_predecessors.map(Into::into),
+            timestamp,
+        })
+    }
+
+    #[expect(clippy::too_many_arguments)]
     fn try_new_validated_single_string_identities(
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,

@@ -29,6 +29,7 @@ pub(crate) use commit::take_ordered_packed_current_base_publications;
 #[cfg(test)]
 pub(crate) use commit::take_rootless_replacement_generation_publications;
 pub(crate) use commit_coordinator::CommitCoordinator;
+pub(crate) use context::CanonicalSortedMutationBatch;
 pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;

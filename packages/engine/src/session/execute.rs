@@ -17,7 +17,7 @@ use crate::storage_adapter::{
     StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::telemetry::TelemetrySpanKind;
-use crate::transaction::{begin_commit_boundary, commit_at_boundary};
+use crate::transaction::{CanonicalSortedMutationBatch, begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -2563,6 +2563,184 @@ where
     ) -> Result<ExecuteResult, LixError> {
         self.execute_with_options_inner(sql, params, ExecuteOptions::default())
             .await
+    }
+
+    /// Executes one cached scalar replacement shape as a single canonical
+    /// sorted mutation batch. This is the transaction-internal path used by
+    /// generated dense updates; unsupported shapes fail closed instead of
+    /// silently re-entering per-row publication.
+    pub async fn execute_cached_literal_mutation_batch(
+        &mut self,
+        statements: &[String],
+    ) -> Result<u64, LixError> {
+        self.ensure_session_open()?;
+        let Some(first_sql) = statements.first() else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "cached literal mutation batch requires at least one statement",
+            ));
+        };
+        let auto_parameterized = self
+            .sql_planning_cache
+            .auto_parameterized_update(first_sql)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "cached literal mutation batch requires an auto-parameterizable UPDATE",
+                )
+            })?;
+        let planning_sql = auto_parameterized.sql;
+        let statement = auto_parameterized.statement;
+        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "cached literal mutation batch requires a write statement",
+            ));
+        }
+        {
+            let transaction = self.transaction_mut()?;
+            let plan = transaction.prepare_sql_write_logical_plan(&planning_sql, &statement)?;
+            transaction.remember_prepared_mutation(&planning_sql, &plan)?;
+        }
+        let (normalized_shape, parameter_count) = self
+            .transaction
+            .as_ref()
+            .and_then(|transaction| transaction.prepared_literal_mutation_shape())
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "cached literal mutation batch shape is not a direct replacement",
+                )
+            })?;
+        // Size the final arenas from a bounded, evenly distributed sample.
+        // The first sorted identity can contain a very large document, so it
+        // must not determine O(rows * outlier) reservation.
+        let sample_count = statements.len().min(64);
+        let mut sampled_identity_bytes = 0usize;
+        let mut sampled_snapshot_bytes = 0usize;
+        for sample_ordinal in 0..sample_count {
+            let statement_index = if sample_count == 1 {
+                0
+            } else {
+                sample_ordinal.saturating_mul(statements.len() - 1) / (sample_count - 1)
+            };
+            let decoded = self
+                .sql_planning_cache
+                .decode_update_literals_for_cached_shape(
+                    &statements[statement_index],
+                    normalized_shape,
+                    parameter_count,
+                    &mut self.prepared_literal_escape_scratch,
+                    &mut self.prepared_literal_shape,
+                )
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "cached literal mutation batch contains a different SQL shape",
+                    )
+                })?;
+            if decoded.len() < 2 {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "cached literal mutation batch requires path and replacement value",
+                ));
+            }
+            sampled_identity_bytes = sampled_identity_bytes.saturating_add(decoded[1].len());
+            sampled_snapshot_bytes = sampled_snapshot_bytes
+                .saturating_add(decoded[1].len())
+                .saturating_add(decoded[0].len())
+                .saturating_add(24);
+            for (index, value) in decoded.into_iter().enumerate() {
+                if let std::borrow::Cow::Owned(value) = value {
+                    self.prepared_literal_escape_scratch[index] = value;
+                }
+            }
+        }
+        let mut batch = CanonicalSortedMutationBatch::with_estimated_capacity(
+            statements.len(),
+            sampled_identity_bytes.div_ceil(sample_count),
+            sampled_snapshot_bytes.div_ceil(sample_count),
+        );
+        for sql in statements {
+            let decoded = self
+                .sql_planning_cache
+                .decode_update_literals_for_cached_shape(
+                    sql,
+                    normalized_shape,
+                    parameter_count,
+                    &mut self.prepared_literal_escape_scratch,
+                    &mut self.prepared_literal_shape,
+                )
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "cached literal mutation batch contains a different SQL shape",
+                    )
+                })?;
+            if decoded.len() < 2 {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "cached literal mutation batch requires path and replacement value",
+                ));
+            }
+            #[cfg(feature = "storage-benches")]
+            {
+                let key_bytes = decoded.first().map_or(0, |value| value.len());
+                let value_bytes = decoded.get(1).map_or(0, |value| value.len());
+                let owned_bytes = decoded
+                    .iter()
+                    .filter_map(|value| match value {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(value) => Some(value.len()),
+                    })
+                    .sum::<usize>();
+                crate::storage_bench::record_crud_ownership(
+                    crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
+                    1,
+                    key_bytes,
+                    value_bytes,
+                    decoded.len(),
+                    decoded
+                        .iter()
+                        .filter(|value| matches!(value, std::borrow::Cow::Owned(_)))
+                        .count(),
+                    0,
+                );
+                crate::storage_bench::record_crud_ownership_transfer(
+                    crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
+                    owned_bytes,
+                    0,
+                    owned_bytes,
+                    0,
+                );
+            }
+            // The generated UPDATE shape is `SET value = lix_json($1)
+            // WHERE path = $2`. Copy both decoded slices directly into their
+            // final offset arenas so escaped literals and borrowed SQL storage
+            // share one publication representation.
+            let identity = decoded[1].as_ref();
+            let value = decoded[0].as_ref();
+            batch.push(identity, value)?;
+            for (index, value) in decoded.into_iter().enumerate() {
+                if let std::borrow::Cow::Owned(value) = value {
+                    self.prepared_literal_escape_scratch[index] = value;
+                }
+            }
+        }
+        let affected = {
+            let transaction = self.transaction_mut()?;
+            transaction
+                .try_execute_cached_literal_prepared_mutation_batch(None, batch)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "cached literal mutation batch cannot use the authenticated direct route",
+                    )
+                })?
+        };
+        self.has_started_statement = true;
+        Ok(affected)
     }
 
     async fn execute_with_options_inner(

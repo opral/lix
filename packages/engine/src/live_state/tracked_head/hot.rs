@@ -1994,6 +1994,76 @@ pub(crate) struct PackedIdentityMembership {
 }
 
 impl PackedIdentityMembership {
+    pub(crate) async fn contains_sorted_identities(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        identity_arena: &[u8],
+        identity_offsets: &[(u32, u32)],
+    ) -> Result<Option<Vec<bool>>, LixError> {
+        if identity_offsets.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "packed membership batch requires strictly sorted unique identities",
+            ));
+        }
+        let mut encoded_arena = Vec::new();
+        let mut offsets = Vec::with_capacity(identity_offsets.len());
+        let mut previous = None;
+        for &(start, end) in identity_offsets {
+            let identity_bytes = identity_arena
+                .get(start as usize..end as usize)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "packed membership identity offset is outside its arena",
+                    )
+                })?;
+            if identity_bytes.is_empty()
+                || previous.is_some_and(|previous| previous >= identity_bytes)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "packed membership batch requires strictly sorted unique identities",
+                ));
+            }
+            previous = Some(identity_bytes);
+            let identity = std::str::from_utf8(identity_bytes).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "packed membership identity arena is not UTF-8",
+                )
+            })?;
+            let range = crate::tracked_state::encode_single_string_key_ref_into(
+                &mut encoded_arena,
+                &self.schema_key,
+                None,
+                identity,
+            );
+            offsets.push((
+                u32::try_from(range.start).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "packed membership encoded key arena exceeds u32",
+                    )
+                })?,
+                u32::try_from(range.end).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "packed membership encoded key arena exceeds u32",
+                    )
+                })?,
+            ));
+        }
+        self.cursor
+            .live_members(
+                store,
+                &self.cache.commit_delta_points,
+                &encoded_arena,
+                &offsets,
+            )
+            .await
+    }
+
     pub(crate) async fn contains_single_string(
         &mut self,
         store: &(impl StorageAdapterRead + ?Sized),

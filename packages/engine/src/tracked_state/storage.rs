@@ -1603,6 +1603,183 @@ impl CommitDeltaPointReadCache {
 }
 
 impl CommitDeltaLiveMembershipCursor {
+    async fn initialize(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        cache: &CommitDeltaPointReadCache,
+    ) -> Result<bool, LixError> {
+        if self.initialized {
+            return Ok(true);
+        }
+        let state = match cache.authority(self.commit_id)? {
+            Some(state) => state,
+            None => {
+                let Some(state) = load_point_replay_commit_state(store, self.commit_id).await?
+                else {
+                    return Ok(false);
+                };
+                let state = Arc::new(state);
+                cache.remember_authority(Arc::clone(&state))?;
+                state
+            }
+        };
+        if state.mutations.selected_source_commit_id().is_some() {
+            return Ok(false);
+        }
+        if let Some(root) = state.mutation_directory_root.as_ref().filter(|root| {
+            root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+                || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
+        }) {
+            self.bounded_root = Some(root.clone());
+        } else if state.mutation_directory_root.is_some() || state.mutations.inline_part.is_empty()
+        {
+            return Ok(false);
+        } else {
+            let decoded = match cache.segment(self.commit_id, 0, None)? {
+                Some(decoded) => decoded,
+                None => decode_owned_commit_delta_segment(&state.mutations.inline_part, None)?,
+            };
+            if decoded.leaf.len() != state.mutations.member_count as usize {
+                return Err(replacement_payload_error(
+                    "inline membership payload row count disagrees with authenticated authority",
+                ));
+            }
+            self.segment = Some(decoded);
+            self.segment_index = Some(0);
+        }
+        // The cursor is initialized only after an authenticated serving mode
+        // has been selected. Unsupported/rootless authorities return false.
+        self.initialized = true;
+        Ok(true)
+    }
+
+    /// Resolves a strictly sorted, unique batch against one authenticated
+    /// snapshot. Directory routing and selected-part reads happen once for
+    /// the whole batch; the result preserves selector order.
+    pub(crate) async fn live_members(
+        &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        cache: &CommitDeltaPointReadCache,
+        arena: &[u8],
+        offsets: &[(u32, u32)],
+    ) -> Result<Option<Vec<bool>>, LixError> {
+        if offsets.is_empty() || !self.initialize(store, cache).await? {
+            return Ok(None);
+        }
+        let Some(root) = self.bounded_root.as_ref() else {
+            // The inline layout has no directory fanout; keep it on the
+            // existing canonical path rather than inventing another reader.
+            return Ok(None);
+        };
+        let plan = super::mutation_directory::load_mutation_part_read_plan(
+            store,
+            root,
+            super::mutation_directory::MutationDirectoryReadSelection::SortedUniquePointRefs {
+                arena,
+                offsets,
+            },
+        )
+        .await?;
+        let runs = plan.into_runs();
+        if runs.is_empty() {
+            return Ok(Some(vec![false; offsets.len()]));
+        }
+
+        let storage_keys = runs
+            .iter()
+            .map(|run| {
+                let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } =
+                    &run.entry
+                else {
+                    return Err(replacement_payload_error(
+                        "bounded membership batch selected a non-bounded part",
+                    ));
+                };
+                let bounds = CommitDeltaSegmentBounds {
+                    first_key: part.first_key.clone(),
+                    last_key: part.last_key.clone(),
+                    replacement_part: part.replacement_part.clone(),
+                };
+                let storage_key = commit_delta_segment_key_for_bounds(
+                    self.commit_id,
+                    usize::try_from(run.entry_index)
+                        .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                    &bounds,
+                )?;
+                Ok(StorageKey(Bytes::from(storage_key)))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let values =
+            PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value;
+        if values.len() != runs.len() {
+            return Err(replacement_payload_error(
+                "membership batch returned a different number of parts",
+            ));
+        }
+
+        let mut output = vec![false; offsets.len()];
+        for (run, value) in runs.into_iter().zip(values) {
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                replacement_payload_error("membership batch references a missing immutable part")
+            })?;
+            let (bounds, direct_row_count) = match &run.entry {
+                super::mutation_directory::MutationDirectoryEntry::Bounded {
+                    part,
+                    direct_row_count,
+                } => (
+                    CommitDeltaSegmentBounds {
+                        first_key: part.first_key.clone(),
+                        last_key: part.last_key.clone(),
+                        replacement_part: part.replacement_part.clone(),
+                    },
+                    *direct_row_count,
+                ),
+                _ => {
+                    return Err(replacement_payload_error(
+                        "bounded membership batch selected a non-bounded part",
+                    ));
+                }
+            };
+            let segment = decode_owned_commit_delta_segment(&bytes, Some(&bounds))?;
+            validate_bounded_direct_row_count(root.layout, direct_row_count, segment.leaf.len())?;
+            for selector in run.selector_span {
+                let (start, end) = offsets.get(selector).copied().ok_or_else(|| {
+                    replacement_payload_error("membership selector is out of bounds")
+                })?;
+                let start = usize::try_from(start).map_err(|_| {
+                    replacement_payload_error("membership key offset exceeds usize")
+                })?;
+                let end = usize::try_from(end).map_err(|_| {
+                    replacement_payload_error("membership key offset exceeds usize")
+                })?;
+                let key = arena.get(start..end).ok_or_else(|| {
+                    replacement_payload_error("membership key offset is outside its arena")
+                })?;
+                let position = commit_delta_entry_lower_bound_from(&segment.leaf, key, 0)?;
+                if position >= segment.leaf.len() {
+                    continue;
+                }
+                let entry = segment.leaf.entry(position)?.ok_or_else(|| {
+                    replacement_payload_error("membership part contains a missing entry")
+                })?;
+                if entry.key != key {
+                    continue;
+                }
+                let value = decode_value(entry.value)?;
+                if value.commit_id != self.commit_id {
+                    return Err(replacement_payload_error(
+                        "membership part contains an entry for another commit",
+                    ));
+                }
+                output[selector] = !value.deleted;
+            }
+        }
+        Ok(Some(output))
+    }
+
     /// Resolves one key through a monotonically consumed immutable generation.
     ///
     /// The shared point cache is only an opportunistic source. An ordered
@@ -1616,54 +1793,8 @@ impl CommitDeltaLiveMembershipCursor {
         cache: &CommitDeltaPointReadCache,
         encoded_key: &[u8],
     ) -> Result<Option<bool>, LixError> {
-        if !self.initialized {
-            let state = match cache.authority(self.commit_id)? {
-                Some(state) => state,
-                None => {
-                    let Some(state) = load_point_replay_commit_state(store, self.commit_id).await?
-                    else {
-                        return Ok(None);
-                    };
-                    let state = Arc::new(state);
-                    cache.remember_authority(Arc::clone(&state))?;
-                    state
-                }
-            };
-            if state.mutations.selected_source_commit_id().is_some() {
-                return Ok(None);
-            }
-            if let Some(root) = state.mutation_directory_root.as_ref().filter(|root| {
-                root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
-                    || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
-            }) {
-                self.bounded_root = Some(root.clone());
-            } else if state.mutation_directory_root.is_some()
-                || state.mutations.inline_part.is_empty()
-            {
-                // Point/range selectors are meaningful only for bounded
-                // directory layouts. Do not reconstruct an alternate catalog
-                // for ordinal or columnar layouts; the caller must use its
-                // canonical fail-closed path.
-                return Ok(None);
-            } else {
-                let decoded = match cache.segment(self.commit_id, 0, None)? {
-                    Some(decoded) => decoded,
-                    None => decode_owned_commit_delta_segment(&state.mutations.inline_part, None)?,
-                };
-                if decoded.leaf.len() != state.mutations.member_count as usize {
-                    return Err(replacement_payload_error(
-                        "inline membership payload row count disagrees with authenticated authority",
-                    ));
-                }
-                self.segment = Some(decoded);
-                self.segment_index = Some(0);
-            }
-            // Mark the cursor initialized only after an authenticated
-            // membership authority has selected a serving mode. Unsupported,
-            // rootless, and missing authorities return `None` above; leaving
-            // the cursor uninitialized prevents a later call from entering
-            // the scan loop with no segment.
-            self.initialized = true;
+        if !self.initialize(store, cache).await? {
+            return Ok(None);
         }
 
         if let Some(root) = self.bounded_root.clone() {

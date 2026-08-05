@@ -589,9 +589,9 @@ struct TransactionMutationJournal {
     program: Arc<crate::sql2::PreparedPathValueReplacementProgram>,
     origin_key: Option<SharedStr>,
     identity_arena: Vec<u8>,
-    identity_offsets: Vec<(usize, usize)>,
+    identity_offsets: Vec<(u32, u32)>,
     snapshot_arena: Vec<u8>,
-    snapshot_offsets: Vec<(usize, usize)>,
+    snapshot_offsets: Vec<(u32, u32)>,
     timestamp: Option<LixTimestamp>,
 }
 
@@ -605,6 +605,117 @@ enum PreparedMutationMembership {
     Packed(crate::live_state::PackedIdentityMembership),
 }
 
+/// One transaction-owned, strictly ordered mutation page. Decoded literals
+/// enter their final journal arenas immediately; membership routing borrows the
+/// identity offsets and successful dense batches move both arenas into
+/// publication without reconstructing per-row DTOs.
+pub(crate) struct CanonicalSortedMutationBatch {
+    identity_arena: Vec<u8>,
+    identity_offsets: Vec<(u32, u32)>,
+    snapshot_arena: Vec<u8>,
+    snapshot_offsets: Vec<(u32, u32)>,
+}
+
+impl CanonicalSortedMutationBatch {
+    pub(crate) fn with_estimated_capacity(
+        row_count: usize,
+        identity_bytes_per_row: usize,
+        snapshot_bytes_per_row: usize,
+    ) -> Self {
+        Self {
+            identity_arena: Vec::with_capacity(row_count.saturating_mul(identity_bytes_per_row)),
+            identity_offsets: Vec::with_capacity(row_count),
+            snapshot_arena: Vec::with_capacity(row_count.saturating_mul(snapshot_bytes_per_row)),
+            snapshot_offsets: Vec::with_capacity(row_count),
+        }
+    }
+
+    pub(crate) fn push(&mut self, identity: &str, value: &str) -> Result<(), LixError> {
+        if identity.is_empty()
+            || self.identity_offsets.last().is_some_and(|&(start, end)| {
+                &self.identity_arena[start as usize..end as usize] >= identity.as_bytes()
+            })
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "canonical mutation batch requires strictly sorted unique identities",
+            ));
+        }
+        let identity_start = self.identity_arena.len();
+        self.identity_arena.extend_from_slice(identity.as_bytes());
+        self.identity_offsets.push((
+            u32::try_from(identity_start).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "canonical mutation identity arena exceeds u32",
+                )
+            })?,
+            u32::try_from(self.identity_arena.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "canonical mutation identity arena exceeds u32",
+                )
+            })?,
+        ));
+        let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
+            identity,
+            Some(value),
+            &mut self.snapshot_arena,
+        )?;
+        self.snapshot_offsets.push((
+            u32::try_from(snapshot_offset.0).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "canonical mutation snapshot arena exceeds u32",
+                )
+            })?,
+            u32::try_from(snapshot_offset.1).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "canonical mutation snapshot arena exceeds u32",
+                )
+            })?,
+        ));
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.identity_offsets.len()
+    }
+
+    fn identity(&self, index: usize) -> Result<&str, LixError> {
+        let &(start, end) = self.identity_offsets.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "canonical mutation identity offset is missing",
+            )
+        })?;
+        std::str::from_utf8(&self.identity_arena[start as usize..end as usize]).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "canonical mutation identity arena is not UTF-8",
+            )
+        })
+    }
+
+    fn snapshot(&self, index: usize) -> Result<&[u8], LixError> {
+        let &(start, end) = self.snapshot_offsets.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "canonical mutation snapshot offset is missing",
+            )
+        })?;
+        self.snapshot_arena
+            .get(start as usize..end as usize)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "canonical mutation snapshot offset is outside its arena",
+                )
+            })
+    }
+}
+
 impl TransactionMutationJournal {
     fn len(&self) -> usize {
         self.identity_offsets.len()
@@ -613,16 +724,47 @@ impl TransactionMutationJournal {
     fn last_identity(&self) -> Option<&str> {
         let &(start, end) = self.identity_offsets.last()?;
         Some(
-            std::str::from_utf8(&self.identity_arena[start..end])
+            std::str::from_utf8(&self.identity_arena[start as usize..end as usize])
                 .expect("transaction journal identities are appended from str"),
         )
     }
 
-    fn append_identity(&mut self, identity: &str) {
+    fn append_identity(&mut self, identity: &str) -> Result<(), LixError> {
         let start = self.identity_arena.len();
         self.identity_arena.extend_from_slice(identity.as_bytes());
-        self.identity_offsets
-            .push((start, self.identity_arena.len()));
+        self.identity_offsets.push((
+            u32::try_from(start).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "transaction mutation identity arena exceeds u32",
+                )
+            })?,
+            u32::try_from(self.identity_arena.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "transaction mutation identity arena exceeds u32",
+                )
+            })?,
+        ));
+        Ok(())
+    }
+
+    fn append_snapshot_offset(&mut self, offset: (usize, usize)) -> Result<(), LixError> {
+        self.snapshot_offsets.push((
+            u32::try_from(offset.0).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "transaction mutation snapshot arena exceeds u32",
+                )
+            })?,
+            u32::try_from(offset.1).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "transaction mutation snapshot arena exceeds u32",
+                )
+            })?,
+        ));
+        Ok(())
     }
 
     #[cfg(feature = "storage-benches")]
@@ -6583,8 +6725,8 @@ where
             )?,
         };
         let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
-        journal.append_identity(primary_key);
-        journal.snapshot_offsets.push(snapshot_offset);
+        journal.append_identity(primary_key)?;
+        journal.append_snapshot_offset(snapshot_offset)?;
         #[cfg(feature = "storage-benches")]
         journal.record_row_ownership(
             primary_key.len(),
@@ -6725,8 +6867,8 @@ where
             Some(replacement_value),
             &mut journal.snapshot_arena,
         )?;
-        journal.append_identity(primary_key);
-        journal.snapshot_offsets.push(snapshot_offset);
+        journal.append_identity(primary_key)?;
+        journal.append_snapshot_offset(snapshot_offset)?;
         #[cfg(feature = "storage-benches")]
         journal.record_row_ownership(
             primary_key.len(),
@@ -6735,6 +6877,140 @@ where
         let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
         debug_assert_eq!(*journal_timestamp, timestamp);
         Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
+    }
+
+    /// Applies one shape-certified scalar-update page through a single
+    /// canonical mutation arena. The page is strictly sorted and unique, so
+    /// membership routing, snapshot construction, and journal ownership all
+    /// happen once before commit publication.
+    pub(crate) async fn try_execute_cached_literal_prepared_mutation_batch(
+        &mut self,
+        next_origin_key: Option<&str>,
+        batch: CanonicalSortedMutationBatch,
+    ) -> Result<Option<u64>, LixError> {
+        if let Some(error) = &self.mutation_journal_terminal_error {
+            return Err(error.clone());
+        }
+        let Some((_, program)) = self.prepared_mutation_program.as_ref() else {
+            return Ok(None);
+        };
+        let program = Arc::clone(program);
+        if self.mutation_journal.is_some() {
+            return Ok(None);
+        }
+        self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
+        if !self.prepared_mutation_overlay_empty {
+            return Ok(None);
+        }
+        if matches!(
+            self.prepared_mutation_membership,
+            PreparedMutationMembership::Unprepared
+        ) {
+            let read = self.opening_read();
+            let base = self
+                .live_state
+                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            self.prepared_mutation_membership = match base
+                .prepare_packed_identity_membership(&self.active_branch_id, &program.schema_key)
+                .await?
+            {
+                Some(membership) => PreparedMutationMembership::Packed(membership),
+                None => PreparedMutationMembership::Unavailable,
+            };
+        }
+        let opening_read = self.opening_read();
+        let membership = match &mut self.prepared_mutation_membership {
+            PreparedMutationMembership::Packed(membership) => {
+                membership
+                    .contains_sorted_identities(
+                        &opening_read,
+                        &batch.identity_arena,
+                        &batch.identity_offsets,
+                    )
+                    .await?
+            }
+            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
+                None
+            }
+        };
+        let Some(membership) = membership else {
+            return Ok(None);
+        };
+        if membership.len() != batch.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "cached literal membership batch changed its row count",
+            ));
+        }
+
+        let affected = u64::try_from(membership.iter().filter(|present| **present).count())
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "canonical mutation affected count exceeds u64",
+                )
+            })?;
+        if !membership.iter().any(|present| *present) {
+            return Ok(Some(0));
+        }
+
+        let origin_key = next_origin_key.map(SharedStr::from);
+        let timestamp = match self.prepared_mutation_timestamp {
+            Some(timestamp) => timestamp,
+            None => {
+                let timestamp = self.functions.call_timestamp();
+                self.prepared_mutation_timestamp = Some(timestamp);
+                timestamp
+            }
+        };
+        let all_present = membership.iter().all(|present| *present);
+        let journal = if all_present {
+            TransactionMutationJournal {
+                program,
+                origin_key: origin_key.clone(),
+                identity_arena: batch.identity_arena,
+                identity_offsets: batch.identity_offsets,
+                snapshot_arena: batch.snapshot_arena,
+                snapshot_offsets: batch.snapshot_offsets,
+                timestamp: Some(timestamp),
+            }
+        } else {
+            let present_count = membership.iter().filter(|present| **present).count();
+            let mut journal = TransactionMutationJournal {
+                program,
+                origin_key: origin_key.clone(),
+                identity_arena: Vec::with_capacity(batch.identity_arena.len()),
+                identity_offsets: Vec::with_capacity(present_count),
+                snapshot_arena: Vec::with_capacity(batch.snapshot_arena.len()),
+                snapshot_offsets: Vec::with_capacity(present_count),
+                timestamp: Some(timestamp),
+            };
+            for (index, present) in membership.iter().copied().enumerate() {
+                if !present {
+                    continue;
+                }
+                journal.append_identity(batch.identity(index)?)?;
+                let snapshot = batch.snapshot(index)?;
+                let start = journal.snapshot_arena.len();
+                journal.snapshot_arena.extend_from_slice(snapshot);
+                journal.append_snapshot_offset((start, journal.snapshot_arena.len()))?;
+            }
+            journal
+        };
+        #[cfg(feature = "storage-benches")]
+        for (&(identity_start, identity_end), &(snapshot_start, snapshot_end)) in journal
+            .identity_offsets
+            .iter()
+            .zip(&journal.snapshot_offsets)
+        {
+            journal.record_row_ownership(
+                identity_end.saturating_sub(identity_start) as usize,
+                snapshot_end.saturating_sub(snapshot_start) as usize,
+            );
+        }
+        debug_assert_eq!(journal.origin_key, origin_key);
+        self.mutation_journal = Some(journal);
+        Ok(Some(affected))
     }
 
     pub(crate) fn remember_prepared_mutation(
@@ -6994,7 +7270,7 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let mut chunk = ImmutableMutationJournalChunk::try_new_packed_single_string_identities(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),

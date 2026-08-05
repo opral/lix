@@ -1771,14 +1771,10 @@ where
         .begin_transaction()
         .await
         .expect("begin tracked-state CRUD transaction");
-    let mut affected = 0;
-    for sql in statements {
-        affected += transaction
-            .execute(sql, &[])
-            .await
-            .expect("execute tracked-state CRUD transaction SQL")
-            .rows_affected();
-    }
+    let affected = transaction
+        .execute_cached_literal_mutation_batch(statements)
+        .await
+        .expect("execute tracked-state CRUD transaction SQL");
     transaction
         .commit()
         .await

@@ -503,6 +503,11 @@ pub(crate) enum MutationDirectoryReadSelection<'a> {
     All(MutationDirectoryFullTraversalContext),
     SortedRanges(&'a [MutationDirectoryKeyRange]),
     SortedUniquePoints(&'a [Bytes]),
+    /// Sorted keys borrowed from one caller-owned encoded arena.
+    SortedUniquePointRefs {
+        arena: &'a [u8],
+        offsets: &'a [(u32, u32)],
+    },
     SortedUniqueDirectCoordinates(&'a [MutationDirectoryDirectCoordinate]),
 }
 
@@ -557,7 +562,8 @@ fn record_selector(selection: MutationDirectoryReadSelection<'_>) {
         MutationDirectoryReadSelection::SortedRanges(_) => {
             counters::add(counters::SELECTOR_RANGE_CALLS, 1);
         }
-        MutationDirectoryReadSelection::SortedUniquePoints(_) => {
+        MutationDirectoryReadSelection::SortedUniquePoints(_)
+        | MutationDirectoryReadSelection::SortedUniquePointRefs { .. } => {
             counters::add(counters::SELECTOR_POINT_CALLS, 1);
         }
         MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(_) => {
@@ -1385,6 +1391,7 @@ impl MutationDirectoryReadSelection<'_> {
             Self::All(_) => 0,
             Self::SortedRanges(ranges) => ranges.len(),
             Self::SortedUniquePoints(points) => points.len(),
+            Self::SortedUniquePointRefs { offsets, .. } => offsets.len(),
             Self::SortedUniqueDirectCoordinates(coordinates) => coordinates.len(),
         }
     }
@@ -1408,6 +1415,30 @@ fn validate_selection(
                 return Err(directory_error(
                     "point selection must be strictly sorted and unique",
                 ));
+            }
+            Ok(())
+        }
+        MutationDirectoryReadSelection::SortedUniquePointRefs { arena, offsets } => {
+            if !is_bounded(root.layout) {
+                return Err(directory_error(
+                    "point selection requires a bounded directory",
+                ));
+            }
+            let mut previous = None;
+            for &(start, end) in offsets {
+                let start = usize::try_from(start)
+                    .map_err(|_| directory_error("point key offset exceeds usize"))?;
+                let end = usize::try_from(end)
+                    .map_err(|_| directory_error("point key offset exceeds usize"))?;
+                let point = arena
+                    .get(start..end)
+                    .ok_or_else(|| directory_error("point key offset is outside its arena"))?;
+                if point.is_empty() || previous.is_some_and(|previous| previous >= point) {
+                    return Err(directory_error(
+                        "point selection must be strictly sorted and unique",
+                    ));
+                }
+                previous = Some(point);
             }
             Ok(())
         }
@@ -1474,6 +1505,29 @@ fn selection_span_for_entry(
             }
             let start = *cursor;
             while *cursor < selector_end && points[*cursor].as_ref() <= last_key {
+                *cursor += 1;
+            }
+            Ok((start < *cursor).then_some(start..*cursor))
+        }
+        MutationDirectoryReadSelection::SortedUniquePointRefs { arena, offsets } => {
+            let point = |index: usize| -> Result<&[u8], LixError> {
+                let (start, end) = offsets
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| directory_error("point selector index is out of bounds"))?;
+                let start = usize::try_from(start)
+                    .map_err(|_| directory_error("point key offset exceeds usize"))?;
+                let end = usize::try_from(end)
+                    .map_err(|_| directory_error("point key offset exceeds usize"))?;
+                arena
+                    .get(start..end)
+                    .ok_or_else(|| directory_error("point key offset is outside its arena"))
+            };
+            while *cursor < selector_end && point(*cursor)? < first_key {
+                *cursor += 1;
+            }
+            let start = *cursor;
+            while *cursor < selector_end && point(*cursor)? <= last_key {
                 *cursor += 1;
             }
             Ok((start < *cursor).then_some(start..*cursor))
