@@ -10,8 +10,11 @@ pub(crate) use context::BranchContext;
 pub(crate) use control::BRANCH_HEAD_CONTROL_SPACE;
 pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
-    BranchHeadControlReader, branch_head_control_precondition, stage_branch_head_control,
-    stage_delete_branch_head_control,
+    BranchHeadControlReader, GENERATION_MANIFEST_SPACE, GENERATION_RECLAMATION_SPACE,
+    GenerationChunkManifest, GenerationReclamation, branch_head_control_precondition,
+    decode_reclamation_key, encode_generation_key, generation_scope_digest,
+    stage_branch_head_control, stage_delete_branch_head_control, stage_generation_manifest,
+    stage_generation_reclamation, untracked_identity_digest,
 };
 pub(crate) use lifecycle::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 pub(crate) use stage_rows::{

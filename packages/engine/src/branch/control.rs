@@ -12,6 +12,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
+use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey,
     StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
@@ -19,9 +20,17 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v8";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0004_0033), BRANCH_HEAD_CONTROL_NAMESPACE);
+pub(crate) const GENERATION_MANIFEST_NAMESPACE: &str = "live_state.generation_manifest.v1";
+pub(crate) const GENERATION_MANIFEST_SPACE: StorageSpace =
+    StorageSpace::mutable(StorageSpaceId(0x0004_0035), GENERATION_MANIFEST_NAMESPACE);
+pub(crate) const GENERATION_RECLAMATION_NAMESPACE: &str = "live_state.generation_reclamation.v1";
+pub(crate) const GENERATION_RECLAMATION_SPACE: StorageSpace = StorageSpace::mutable(
+    StorageSpaceId(0x0004_0036),
+    GENERATION_RECLAMATION_NAMESPACE,
+);
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
 
@@ -56,9 +65,28 @@ pub(crate) struct BranchHeadControl {
     /// therefore skip an otherwise-empty schema range scan; a collision only
     /// falls back to the normal scan.
     pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
+    /// Authenticated exact number of branch-local untracked rows in the
+    /// serving generation.  Destructive branch-ref operations use this value
+    /// instead of scanning the generation.  The count is updated under the
+    /// same control CAS as every hot-state publication.
+    pub(crate) untracked_row_count: u64,
+    /// Ordered-identity checksum for the untracked set.  This is a compact
+    /// corruption guard: zero must accompany an empty count and non-zero
+    /// counts must carry a non-zero digest.  It is not a second authority.
+    pub(crate) untracked_identity_xor: [u8; 32],
 }
 
 impl BranchHeadControl {
+    pub(crate) fn validate_untracked_summary(&self) -> Result<(), LixError> {
+        if (self.untracked_row_count == 0) != (self.untracked_identity_xor == [0; 32]) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "branch-head control has an inconsistent untracked-row summary",
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the same public branch ref with a fresh private current-state
     /// revision. A mutable hot-row write must publish this alongside its exact
     /// control precondition; otherwise two writers could both compare the
@@ -106,6 +134,37 @@ impl BranchHeadControl {
     }
 }
 
+pub(crate) fn untracked_identity_digest(
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    entity_pk: &EntityPk,
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(branch_id.as_bytes());
+    bytes.push(0xff);
+    bytes.extend_from_slice(schema_key.as_bytes());
+    bytes.push(0xfe);
+    if let Some(file_id) = file_id {
+        bytes.push(1);
+        bytes.extend_from_slice(file_id.as_bytes());
+    } else {
+        bytes.push(0);
+    }
+    bytes.push(0xfd);
+    if let Ok(entity_pk) = entity_pk.as_json_array_text() {
+        bytes.extend_from_slice(entity_pk.as_bytes());
+    }
+    *blake3::hash(&bytes).as_bytes()
+}
+
+pub(crate) fn generation_scope_digest(branch_id: &str, generation: CommitId) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(branch_id.len() + 16);
+    bytes.extend_from_slice(branch_id.as_bytes());
+    bytes.extend_from_slice(generation.as_uuid().as_bytes());
+    *blake3::hash(&bytes).as_bytes()
+}
+
 /// One coherent point-read observation used for both generation selection and
 /// the final exact-byte CAS guard. Keeping the decoded control and original
 /// bytes together prevents a materializer from issuing a second control read
@@ -126,6 +185,56 @@ struct BranchHeadControlKey {
 #[musli(packed)]
 struct BranchHeadControlKeyRef<'a> {
     branch_id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct GenerationChunkManifest {
+    pub(crate) generation: CommitId,
+    pub(crate) head_commit_id: CommitId,
+    #[musli(with = storage_codec::option)]
+    pub(crate) checkpoint_commit_id: Option<CommitId>,
+    /// Digest of the generation scope and the indexed physical spaces. The
+    /// actual chunks remain backend rows under those authenticated prefixes;
+    /// GC validates this record before enumerating only the retired prefixes.
+    pub(crate) scope_digest: [u8; 32],
+    pub(crate) indexed_chunk_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct GenerationReclamation {
+    pub(crate) generation: CommitId,
+    pub(crate) head_commit_id: CommitId,
+    #[musli(with = storage_codec::option)]
+    pub(crate) checkpoint_commit_id: Option<CommitId>,
+    pub(crate) full_generation: bool,
+    pub(crate) manifest_digest: [u8; 32],
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct GenerationScopeKeyRef<'a> {
+    branch_id: &'a str,
+    generation: CommitId,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct ReclamationScopeKeyRef<'a> {
+    branch_id: &'a str,
+    generation: CommitId,
+    #[musli(with = storage_codec::option)]
+    checkpoint_commit_id: Option<CommitId>,
+}
+
+#[derive(musli::Decode)]
+#[musli(packed)]
+struct ReclamationScopeKey {
+    branch_id: String,
+    generation: CommitId,
+    #[musli(with = storage_codec::option)]
+    checkpoint_commit_id: Option<CommitId>,
 }
 
 /// Read-side access for direct branch-head control records.
@@ -184,7 +293,9 @@ where
                     raw_token: None,
                 }),
                 Some(StorageProjectedValue::FullValue(bytes)) => {
-                    let control = storage_codec::decode("branch-head control", &bytes)?;
+                    let control: BranchHeadControl =
+                        storage_codec::decode("branch-head control", &bytes)?;
+                    control.validate_untracked_summary()?;
                     Ok(BranchHeadControlObservation {
                         control: Some(control),
                         raw_token: Some(bytes),
@@ -280,6 +391,84 @@ pub(crate) fn stage_delete_branch_head_control(
     Ok(())
 }
 
+pub(crate) fn stage_generation_manifest(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    manifest: GenerationChunkManifest,
+) -> Result<(), LixError> {
+    writes.put(
+        GENERATION_MANIFEST_SPACE,
+        StorageKey(Bytes::from(encode_generation_key(
+            branch_id,
+            manifest.generation,
+        )?)),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode(
+                "generation chunk manifest",
+                &manifest,
+            )?),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn stage_generation_reclamation(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    reclamation: GenerationReclamation,
+) -> Result<(), LixError> {
+    writes.put(
+        GENERATION_RECLAMATION_SPACE,
+        StorageKey(Bytes::from(encode_reclamation_key(
+            branch_id,
+            reclamation.generation,
+            reclamation.checkpoint_commit_id,
+        )?)),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode(
+                "generation reclamation",
+                &reclamation,
+            )?),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn encode_generation_key(
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "generation manifest key",
+        &GenerationScopeKeyRef {
+            branch_id,
+            generation,
+        },
+    )
+}
+
+pub(crate) fn encode_reclamation_key(
+    branch_id: &str,
+    generation: CommitId,
+    checkpoint_commit_id: Option<CommitId>,
+) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "generation reclamation key",
+        &ReclamationScopeKeyRef {
+            branch_id,
+            generation,
+            checkpoint_commit_id,
+        },
+    )
+}
+
+pub(crate) fn decode_reclamation_key(
+    bytes: &[u8],
+) -> Result<(String, CommitId, Option<CommitId>), LixError> {
+    let key: ReclamationScopeKey = storage_codec::decode("generation reclamation key", bytes)?;
+    Ok((key.branch_id, key.generation, key.checkpoint_commit_id))
+}
+
 /// Converts an observed opaque value into the one backend-neutral publication
 /// guard. A missing control is guarded as absent, so concurrent branch
 /// creation cannot both succeed.
@@ -315,7 +504,9 @@ fn decode_projected_value(value: StorageProjectedValue) -> Result<BranchHeadCont
             "branch-head control read unexpectedly omitted its value",
         ));
     };
-    storage_codec::decode("branch-head control", &bytes)
+    let control: BranchHeadControl = storage_codec::decode("branch-head control", &bytes)?;
+    control.validate_untracked_summary()?;
+    Ok(control)
 }
 
 #[cfg(test)]
@@ -332,6 +523,8 @@ mod tests {
             generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
@@ -342,6 +535,8 @@ mod tests {
             generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 1,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
@@ -430,5 +625,28 @@ mod tests {
                 crate::storage_adapter::StorageError::PreconditionFailed(_)
             )
         ));
+
+        let corrupt_branch = "01920000-0000-7000-8000-0000000000c1";
+        let mut corrupt = storage.new_write_set();
+        let mut corrupt_control = first;
+        corrupt_control.untracked_row_count = 1;
+        stage_branch_head_control(&mut corrupt, corrupt_branch, corrupt_control)
+            .expect("corrupt control should stage for the decoder gate");
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("corrupt fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt read should open");
+        assert!(
+            BranchHeadControlContext::new()
+                .reader(read)
+                .load(corrupt_branch)
+                .await
+                .is_err(),
+            "inconsistent authenticated untracked summary must fail closed"
+        );
     }
 }

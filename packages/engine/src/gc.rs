@@ -6,11 +6,16 @@
 //! the same storage write set that publishes the compacted checkpoint.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(test, feature = "storage-benches"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::branch::BranchHeadControlContext;
+use crate::branch::{
+    BranchHeadControlContext, GENERATION_MANIFEST_SPACE, GENERATION_RECLAMATION_SPACE,
+    GenerationChunkManifest, GenerationReclamation, decode_reclamation_key,
+};
 use crate::changelog::{
     CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeRecord, ChangeScanRequest,
     ChangelogContext, ChangelogReader, CommitId, CommitScanRequest, GcLiveSet, GcPlan, GcRepairSet,
@@ -19,7 +24,11 @@ use crate::changelog::{
 use crate::json_store::{
     JsonRef, JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
 };
-use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
+use crate::live_state::{
+    HOT_COLLECTION_CONTROL_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, ROOT_CURRENT_BASE_SPACE,
+    TrackedHeadContext, generation_scope_prefix, stage_delete_tracked_working_diff_epoch,
+};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
@@ -39,6 +48,39 @@ pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
+
+#[cfg(any(test, feature = "storage-benches"))]
+static GENERATION_RECLAMATION_RECORDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+static GENERATION_RECLAMATION_MANIFESTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+static GENERATION_RECLAIMED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GenerationReclamationCounters {
+    pub(crate) records: u64,
+    pub(crate) manifests: u64,
+    /// Generation-scoped storage rows staged for deletion. This is not a
+    /// backend-native physical chunk count.
+    pub(crate) reclaimed_rows: u64,
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn reset_generation_reclamation_counters() {
+    GENERATION_RECLAMATION_RECORDS.store(0, Ordering::Relaxed);
+    GENERATION_RECLAMATION_MANIFESTS.store(0, Ordering::Relaxed);
+    GENERATION_RECLAIMED_ROWS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn generation_reclamation_counters() -> GenerationReclamationCounters {
+    GenerationReclamationCounters {
+        records: GENERATION_RECLAMATION_RECORDS.load(Ordering::Relaxed),
+        manifests: GENERATION_RECLAMATION_MANIFESTS.load(Ordering::Relaxed),
+        reclaimed_rows: GENERATION_RECLAIMED_ROWS.load(Ordering::Relaxed),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointRecoveryRef {
@@ -282,6 +324,255 @@ async fn stage_sweep_unreachable_content_nodes(
     Ok(())
 }
 
+const GENERATION_RECLAIM_SPACES: [StorageSpace; 7] = [
+    HOT_ROW_SPACE,
+    HOT_FILE_SPACE,
+    HOT_COLLECTION_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    ROOT_CURRENT_BASE_SPACE,
+];
+
+async fn stage_delete_generation_prefix<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    space: StorageSpace,
+    branch_id: &str,
+    generation: CommitId,
+    stale_untracked_refs: &mut BTreeSet<[u8; 32]>,
+) -> Result<u64, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::from(generation_scope_prefix(branch_id, generation)),
+        },
+    );
+    let mut resume_after = None;
+    let mut deleted = 0_u64;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: if space == HOT_ROW_SPACE {
+                        StorageCoreProjection::FullValue
+                    } else {
+                        StorageCoreProjection::KeyOnly
+                    },
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            if space == HOT_ROW_SPACE
+                && let StorageProjectedValue::FullValue(bytes) = &entry.value
+            {
+                crate::live_state::collect_untracked_json_refs_from_head_bytes(
+                    bytes,
+                    stale_untracked_refs,
+                )?;
+            }
+            writes.delete(space, entry.key);
+            deleted = deleted.checked_add(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "generation reclamation count overflowed",
+                )
+            })?;
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    GENERATION_RECLAIMED_ROWS.fetch_add(deleted, Ordering::Relaxed);
+    Ok(deleted)
+}
+
+/// Consumes authenticated generation reclamation records. Every delete is
+/// prefix-local to one retired `(branch,generation)` and is validated against
+/// its immutable manifest before any payload mutation is staged.
+async fn stage_collect_reclaimed_generations<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+) -> Result<Vec<JsonRef>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let queue_plan = ScanPlan::prefix(
+        GENERATION_RECLAMATION_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    let mut records = Vec::new();
+    loop {
+        let page = queue_plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let (branch_id, generation, checkpoint_commit_id) =
+                decode_reclamation_key(entry.key.0.as_ref())?;
+            let StorageProjectedValue::FullValue(bytes) = entry.value else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "generation reclamation record omitted its value",
+                ));
+            };
+            let record: GenerationReclamation =
+                storage_codec::decode("generation reclamation", &bytes)?;
+            if record.generation != generation {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "generation reclamation key/value generation mismatch",
+                ));
+            }
+            if record.checkpoint_commit_id != checkpoint_commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "generation reclamation key/value checkpoint mismatch",
+                ));
+            }
+            records.push((entry.key, branch_id, record));
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+
+    let mut stale_untracked_refs = BTreeSet::new();
+    for (queue_key, branch_id, record) in records {
+        let active_control = BranchHeadControlContext::new()
+            .reader(store)
+            .load(&branch_id)
+            .await?;
+        if record.full_generation {
+            if active_control.is_some_and(|control| control.generation == record.generation) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "generation '{}' is still selected by branch '{}' but is queued for reclamation",
+                        record.generation, branch_id
+                    ),
+                ));
+            }
+        } else if active_control.is_none_or(|control| {
+            control.generation != record.generation
+                || control.head_commit_id != record.head_commit_id
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "checkpoint reclamation for generation '{}' is not selected by branch '{}'",
+                    record.generation, branch_id
+                ),
+            ));
+        }
+        let manifest_key = StorageKey(Bytes::from(crate::branch::encode_generation_key(
+            &branch_id,
+            record.generation,
+        )?));
+        let manifest = PointReadPlan::new(GENERATION_MANIFEST_SPACE, &[manifest_key])
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "generation '{}' has a reclamation record but no authenticated manifest",
+                        record.generation
+                    ),
+                )
+            })?;
+        let StorageProjectedValue::FullValue(manifest_bytes) = manifest else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "generation manifest omitted its value",
+            ));
+        };
+        let manifest: GenerationChunkManifest =
+            storage_codec::decode("generation chunk manifest", &manifest_bytes)?;
+        let expected_digest = crate::branch::generation_scope_digest(&branch_id, record.generation);
+        if manifest.generation != record.generation
+            || (record.full_generation && manifest.head_commit_id != record.head_commit_id)
+            || (record.full_generation
+                && manifest.checkpoint_commit_id != record.checkpoint_commit_id)
+            || record.manifest_digest != expected_digest
+            || manifest.scope_digest != record.manifest_digest
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "generation reclamation manifest binding mismatch",
+            ));
+        }
+        if record.full_generation {
+            for space in GENERATION_RECLAIM_SPACES {
+                stage_delete_generation_prefix(
+                    store,
+                    writes,
+                    space,
+                    &branch_id,
+                    record.generation,
+                    &mut stale_untracked_refs,
+                )
+                .await?;
+            }
+        } else if record.checkpoint_commit_id.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "partial generation reclamation omitted checkpoint scope",
+            ));
+        }
+        #[cfg(any(test, feature = "storage-benches"))]
+        {
+            GENERATION_RECLAMATION_RECORDS.fetch_add(1, Ordering::Relaxed);
+            GENERATION_RECLAMATION_MANIFESTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(checkpoint_commit_id) = record.checkpoint_commit_id {
+            stage_delete_tracked_working_diff_epoch(
+                store,
+                writes,
+                &branch_id,
+                checkpoint_commit_id,
+                record.generation,
+            )
+            .await?;
+        }
+        if record.full_generation {
+            writes.delete(
+                GENERATION_MANIFEST_SPACE,
+                StorageKey(Bytes::from(crate::branch::encode_generation_key(
+                    &branch_id,
+                    record.generation,
+                )?)),
+            );
+        }
+        writes.delete(GENERATION_RECLAMATION_SPACE, queue_key);
+    }
+    Ok(stale_untracked_refs
+        .into_iter()
+        .map(JsonRef::from_hash_bytes)
+        .collect())
+}
+
 pub(crate) async fn load_recovery_ref(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -467,9 +758,11 @@ where
     // Old serving generations are derived data. Removing them in the same
     // atomic sweep as their untracked payload-root withdrawal prevents stale
     // branch generations from accumulating indefinitely.
-    let stale_untracked_refs = TrackedHeadContext::new()
-        .stage_collect_stale_current_state_generations(&store, writes, &controls)
-        .await?;
+    let stale_untracked_refs = stage_collect_reclaimed_generations(&store, writes).await?;
+    crate::transaction::plugin_checkpoint::stage_collect_branch_plugin_checkpoint_reclamations(
+        &store, writes,
+    )
+    .await?;
     // The changelog plan contains every payload reachable from tracked
     // history plus the active untracked roots supplied above. A retired
     // untracked JSON ref is only a deletion candidate: content-addressed
@@ -524,10 +817,6 @@ where
     let json_writer = JsonStoreContext::new().writer();
     json_writer.stage_delete_refs(writes, reclaimable_untracked_refs);
     JsonStoreWriter::stage_delete_untracked_reclaim_candidates(writes, consumed_candidate_keys);
-    // Checkpoint publication leaves prior dirty-index generations unreachable
-    // in O(1). Reclaim those auxiliary records only in the asynchronous GC
-    // pass so a foreground checkpoint never pays a history-sized delete cost.
-    stage_collect_stale_working_diff_indexes(&store, writes).await?;
     let tracked_root_stage_us = elapsed_micros(phase_started);
 
     Ok(RepositoryGcPlan {
@@ -1266,7 +1555,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
+    use crate::branch::{
+        BranchHeadControl, BranchHeadControlContext, GENERATION_MANIFEST_SPACE,
+        GenerationChunkManifest, GenerationReclamation, stage_branch_head_control,
+        stage_generation_manifest, stage_generation_reclamation,
+    };
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
@@ -1277,7 +1570,10 @@ mod tests {
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
     };
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::live_state::{
+        CurrentStateDeltaRef, HOT_FILE_SPACE, TrackedHeadContext, WorkingDiffIndexCoverage,
+        generation_scope_prefix,
+    };
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
@@ -1368,6 +1664,255 @@ mod tests {
                 .await
                 .expect("checkpoint GC state should load"),
             expected
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_reclamation_is_authenticated_and_prefix_local() {
+        super::reset_generation_reclamation_counters();
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "gc-branch";
+        let generation = CommitId::for_test_label("retired-generation");
+        let head_commit_id = CommitId::for_test_label("retired-head");
+        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+
+        let mut writes = storage.new_write_set();
+        let mut retired_key = generation_scope_prefix(branch_id, generation);
+        retired_key.extend_from_slice(b"retired-row");
+        writes.put(
+            HOT_FILE_SPACE,
+            StorageKey(Bytes::from(retired_key)),
+            StorageValue {
+                bytes: Bytes::from_static(b"marker"),
+            },
+        );
+        stage_generation_manifest(
+            &mut writes,
+            branch_id,
+            GenerationChunkManifest {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: None,
+                scope_digest: digest,
+                indexed_chunk_count: 1,
+            },
+        )
+        .expect("generation manifest should stage");
+        stage_generation_reclamation(
+            &mut writes,
+            branch_id,
+            GenerationReclamation {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: None,
+                full_generation: true,
+                manifest_digest: digest,
+            },
+        )
+        .expect("generation reclamation should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("generation fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("generation read should open");
+        let mut gc_writes = storage.new_write_set();
+        let reclaimed = super::stage_collect_reclaimed_generations(&read, &mut gc_writes)
+            .await
+            .expect("authenticated generation should reclaim");
+        assert!(reclaimed.is_empty());
+        let counters = super::generation_reclamation_counters();
+        assert!(counters.records >= 1);
+        assert!(counters.manifests >= 1);
+        assert!(counters.reclaimed_rows >= 1);
+        drop(read);
+        storage
+            .commit_write_set(gc_writes, StorageWriteOptions::default())
+            .await
+            .expect("generation reclamation should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("generation verification read should open");
+        let mut retired_key = generation_scope_prefix(branch_id, generation);
+        retired_key.extend_from_slice(b"retired-row");
+        assert!(
+            PointReadPlan::new(HOT_FILE_SPACE, &[StorageKey(Bytes::from(retired_key))])
+                .materialize(&read, StorageGetOptions::default())
+                .await
+                .expect("retired prefix should be readable")
+                .value
+                .into_iter()
+                .next()
+                .flatten()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_reclamation_rejects_an_active_generation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "active-gc-branch";
+        let generation = CommitId::for_test_label("active-generation");
+        let head_commit_id = CommitId::for_test_label("active-head");
+        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let timestamp =
+            LixTimestamp::expect_parse("active generation test timestamp", "2026-01-01T00:00:00Z");
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id,
+                generation,
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                ref_change_id: ChangeId::for_test_label("active-ref"),
+                schema_presence_bloom: [0; 4],
+                untracked_row_count: 0,
+                untracked_identity_xor: [0; 32],
+            },
+        )
+        .expect("active control should stage");
+        stage_generation_manifest(
+            &mut writes,
+            branch_id,
+            GenerationChunkManifest {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: None,
+                scope_digest: digest,
+                indexed_chunk_count: 0,
+            },
+        )
+        .expect("active manifest should stage");
+        stage_generation_reclamation(
+            &mut writes,
+            branch_id,
+            GenerationReclamation {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: None,
+                full_generation: true,
+                manifest_digest: digest,
+            },
+        )
+        .expect("active reclamation should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("active generation fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("active generation read should open");
+        let mut gc_writes = storage.new_write_set();
+        assert!(
+            super::stage_collect_reclaimed_generations(&read, &mut gc_writes)
+                .await
+                .is_err()
+        );
+        assert!(gc_writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reclamation_keeps_the_active_generation_manifest() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "partial-gc-branch";
+        let generation = CommitId::for_test_label("partial-generation");
+        let head_commit_id = CommitId::for_test_label("partial-head");
+        let checkpoint_commit_id = CommitId::for_test_label("partial-current-checkpoint");
+        let old_checkpoint_commit_id = CommitId::for_test_label("partial-old-checkpoint");
+        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let timestamp =
+            LixTimestamp::expect_parse("partial generation timestamp", "2026-01-01T00:00:00Z");
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id,
+                generation,
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
+                created_at: timestamp,
+                updated_at: timestamp,
+                ref_change_id: ChangeId::for_test_label("partial-ref"),
+                schema_presence_bloom: [0; 4],
+                untracked_row_count: 0,
+                untracked_identity_xor: [0; 32],
+            },
+        )
+        .expect("partial control should stage");
+        stage_generation_manifest(
+            &mut writes,
+            branch_id,
+            GenerationChunkManifest {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: Some(checkpoint_commit_id),
+                scope_digest: digest,
+                indexed_chunk_count: 0,
+            },
+        )
+        .expect("partial manifest should stage");
+        stage_generation_reclamation(
+            &mut writes,
+            branch_id,
+            GenerationReclamation {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: Some(old_checkpoint_commit_id),
+                full_generation: false,
+                manifest_digest: digest,
+            },
+        )
+        .expect("partial reclamation should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("partial fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("partial read should open");
+        let mut gc_writes = storage.new_write_set();
+        super::stage_collect_reclaimed_generations(&read, &mut gc_writes)
+            .await
+            .expect("partial reclamation should collect");
+        drop(read);
+        storage
+            .commit_write_set(gc_writes, StorageWriteOptions::default())
+            .await
+            .expect("partial reclamation should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("partial verification read should open");
+        assert!(
+            PointReadPlan::new(
+                GENERATION_MANIFEST_SPACE,
+                &[StorageKey(Bytes::from(
+                    crate::branch::encode_generation_key(branch_id, generation).unwrap(),
+                ))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .unwrap()
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some(),
+            "checkpoint-only reclamation must retain the active manifest"
         );
     }
 

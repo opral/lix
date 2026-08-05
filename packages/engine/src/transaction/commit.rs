@@ -9,8 +9,10 @@ use crate::NullableKeyFilter;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
-    BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control,
+    BranchHeadControlObservation, BranchRefReader, GenerationChunkManifest, GenerationReclamation,
+    branch_head_control_precondition, generation_scope_digest, stage_branch_head_control,
+    stage_delete_branch_head_control, stage_generation_manifest, stage_generation_reclamation,
+    untracked_identity_digest as branch_untracked_identity_digest,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
@@ -374,14 +376,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &deleted_checkpoint_files,
     )
     .await?;
-    for branch_id in &deleted_checkpoint_branches {
-        crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
-            &*read,
-            &mut writes,
-            branch_id,
-        )
-        .await?;
-    }
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
@@ -664,6 +658,24 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
 
     let branch_control_observations =
         observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
+
+    for branch_id in &deleted_checkpoint_branches {
+        let generation = branch_control_observations
+            .get(branch_id)
+            .and_then(|observation| observation.control)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("deleted branch '{branch_id}' has no observed control generation"),
+                )
+            })?
+            .generation;
+        crate::transaction::plugin_checkpoint::stage_enqueue_branch_plugin_checkpoint_reclamation(
+            &mut writes,
+            branch_id,
+            *generation.as_uuid().as_bytes(),
+        )?;
+    }
 
     reject_explicit_branch_ref_lifecycle_with_untracked_rows(
         read,
@@ -4631,6 +4643,8 @@ fn normal_branch_head_control(
         updated_at: root.ref_updated_at,
         ref_change_id: root.ref_change_id,
         schema_presence_bloom: previous.map_or([0; 4], |control| control.schema_presence_bloom),
+        untracked_row_count: previous.map_or(0, |control| control.untracked_row_count),
+        untracked_identity_xor: previous.map_or([0; 32], |control| control.untracked_identity_xor),
     })
 }
 
@@ -4686,6 +4700,8 @@ async fn stage_root_backed_branch_publication(
         // Root reads answer schema presence directly. Keep the bloom
         // conservative until immutable roots carry schema summaries.
         schema_presence_bloom: [u64::MAX; 4],
+        untracked_row_count: 0,
+        untracked_identity_xor: [0; 32],
     };
     let untracked_deltas = state_rows
         .iter()
@@ -4863,6 +4879,12 @@ async fn stage_branch_head_control_publications(
                         schema_presence_bloom: existing
                             .expect("existing lifecycle publication was handled above")
                             .schema_presence_bloom,
+                        untracked_row_count: existing
+                            .expect("existing lifecycle publication was handled above")
+                            .untracked_row_count,
+                        untracked_identity_xor: existing
+                            .expect("existing lifecycle publication was handled above")
+                            .untracked_identity_xor,
                     };
                     control.note_schemas(schema_keys.iter().map(String::as_str));
                     Some(control)
@@ -4893,6 +4915,15 @@ async fn stage_branch_head_control_publications(
             })?;
             control.working_diff_checkpoint_commit_id = Some(*checkpoint_commit_id);
         }
+        if let Some(control) = desired.as_mut() {
+            let previous = observations
+                .get(branch_id)
+                .and_then(|observation| observation.control);
+            let (count, digest) =
+                next_untracked_summary(read, branch_id, previous, state_rows, engine_rows).await?;
+            control.untracked_row_count = count;
+            control.untracked_identity_xor = digest;
+        }
         let observation = observations.get(branch_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -4906,8 +4937,79 @@ async fn stage_branch_head_control_publications(
             observation.raw_token.clone(),
         )?);
         match desired {
-            Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
-            None => stage_delete_branch_head_control(writes, branch_id)?,
+            Some(control) => {
+                control.validate_untracked_summary()?;
+                let manifest_digest = generation_scope_digest(branch_id, control.generation);
+                stage_generation_manifest(
+                    writes,
+                    branch_id,
+                    GenerationChunkManifest {
+                        generation: control.generation,
+                        head_commit_id: control.head_commit_id,
+                        checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
+                        scope_digest: manifest_digest,
+                        indexed_chunk_count: 0,
+                    },
+                )?;
+                if let Some(previous) = observation.control
+                    && previous.generation != control.generation
+                {
+                    stage_generation_reclamation(
+                        writes,
+                        branch_id,
+                        GenerationReclamation {
+                            generation: previous.generation,
+                            head_commit_id: previous.head_commit_id,
+                            checkpoint_commit_id: previous.working_diff_checkpoint_commit_id,
+                            full_generation: true,
+                            manifest_digest: generation_scope_digest(
+                                branch_id,
+                                previous.generation,
+                            ),
+                        },
+                    )?;
+                } else if let Some(previous) = observation.control
+                    && previous.working_diff_checkpoint_commit_id
+                        != control.working_diff_checkpoint_commit_id
+                    && let Some(previous_checkpoint_commit_id) =
+                        previous.working_diff_checkpoint_commit_id
+                {
+                    // A checkpoint rotation can retain the hot generation.
+                    // Retire only the old checkpoint-scoped diff prefix; the
+                    // current manifest authenticates the active generation.
+                    stage_generation_reclamation(
+                        writes,
+                        branch_id,
+                        GenerationReclamation {
+                            generation: control.generation,
+                            head_commit_id: control.head_commit_id,
+                            checkpoint_commit_id: Some(previous_checkpoint_commit_id),
+                            full_generation: false,
+                            manifest_digest: generation_scope_digest(branch_id, control.generation),
+                        },
+                    )?;
+                }
+                stage_branch_head_control(writes, branch_id, *control)?;
+            }
+            None => {
+                if let Some(previous) = observation.control {
+                    stage_generation_reclamation(
+                        writes,
+                        branch_id,
+                        GenerationReclamation {
+                            generation: previous.generation,
+                            head_commit_id: previous.head_commit_id,
+                            checkpoint_commit_id: previous.working_diff_checkpoint_commit_id,
+                            full_generation: true,
+                            manifest_digest: generation_scope_digest(
+                                branch_id,
+                                previous.generation,
+                            ),
+                        },
+                    )?;
+                }
+                stage_delete_branch_head_control(writes, branch_id)?;
+            }
         }
     }
     Ok(publications
@@ -5141,6 +5243,137 @@ fn explicit_branch_head_targets(
 /// The observed branch-control token is published as an exact-byte CAS below,
 /// so a concurrent untracked mutation makes this safety decision retry rather
 /// than racing a deletion.
+fn untracked_identity_digest(branch_id: &str, identity: &TrackedStateKey) -> [u8; 32] {
+    branch_untracked_identity_digest(
+        branch_id,
+        &identity.schema_key,
+        identity.file_id.as_deref(),
+        &identity.entity_pk,
+    )
+}
+
+fn xor_untracked_identity(target: &mut [u8; 32], digest: [u8; 32]) {
+    for (left, right) in target.iter_mut().zip(digest) {
+        *left ^= right;
+    }
+}
+
+async fn next_untracked_summary(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    previous: Option<BranchHeadControl>,
+    state_rows: &PreparedStateBatch,
+    engine_rows: &[EngineCurrentRow],
+) -> Result<(u64, [u8; 32]), LixError> {
+    let mut mutations = BTreeMap::<TrackedStateKey, bool>::new();
+    for row in state_rows.iter().filter(|row| {
+        row.untracked && row.branch_id == branch_id && row.schema_key != BRANCH_REF_SCHEMA_KEY
+    }) {
+        mutations.insert(
+            TrackedStateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                entity_pk: row.entity_pk.clone(),
+            },
+            row.snapshot.is_some(),
+        );
+    }
+    for row in engine_rows.iter().filter(|row| row.branch_id == branch_id) {
+        mutations.insert(
+            TrackedStateKey {
+                schema_key: row.change.schema_key.clone(),
+                file_id: row.change.file_id.clone(),
+                entity_pk: row.change.entity_pk.clone(),
+            },
+            row.change.snapshot != crate::json_store::JsonSlot::None,
+        );
+    }
+    let Some(previous) = previous else {
+        let mut count = 0_u64;
+        let mut digest = [0; 32];
+        for (identity, present) in mutations {
+            if present {
+                count = count.checked_add(1).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "untracked-row summary count overflowed",
+                    )
+                })?;
+                xor_untracked_identity(
+                    &mut digest,
+                    untracked_identity_digest(branch_id, &identity),
+                );
+            }
+        }
+        return Ok((count, digest));
+    };
+    previous.validate_untracked_summary()?;
+    if mutations.is_empty() {
+        return Ok((
+            previous.untracked_row_count,
+            previous.untracked_identity_xor,
+        ));
+    }
+    let keys = mutations.keys().cloned().collect::<Vec<_>>();
+    let existing = TrackedHeadContext::new()
+        .reader(read)
+        .load_projected_live_rows(
+            branch_id,
+            previous,
+            &keys,
+            &ChangeRecordProjection {
+                snapshot_content: false,
+                metadata: false,
+            },
+        )
+        .await?
+        .into_iter()
+        .flatten()
+        .filter(|row| row.untracked)
+        .map(|row| {
+            (
+                TrackedStateKey {
+                    schema_key: row.schema_key,
+                    file_id: row.file_id,
+                    entity_pk: row.entity_pk,
+                },
+                true,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut count = previous.untracked_row_count;
+    let mut digest = previous.untracked_identity_xor;
+    for (identity, final_present) in mutations {
+        let prior_present = existing.get(&identity).copied().unwrap_or(false);
+        if prior_present == final_present {
+            continue;
+        }
+        if final_present {
+            count = count.checked_add(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "untracked-row summary count overflowed",
+                )
+            })?;
+        } else {
+            count = count.checked_sub(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "untracked-row summary count underflowed",
+                )
+            })?;
+        }
+        xor_untracked_identity(&mut digest, untracked_identity_digest(branch_id, &identity));
+    }
+    if (count == 0) != (digest == [0; 32]) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "untracked-row summary became inconsistent",
+        ));
+    }
+    Ok((count, digest))
+}
+
 async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
     read: &(impl StorageAdapterRead + ?Sized),
     state_rows: &PreparedStateBatch,
@@ -5148,7 +5381,6 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<(), LixError> {
-    let current_state = TrackedHeadContext::new().reader(read);
     for (branch_id, target) in explicit_branch_targets {
         let Some(existing) = observations
             .get(branch_id)
@@ -5162,35 +5394,10 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
         if !destructive {
             continue;
         }
-        let mut untracked_identities = current_state
-            .scan_live_rows(
-                branch_id,
-                existing,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        include_tombstones: true,
-                        ..TrackedStateFilter::default()
-                    },
-                    read_columns: TrackedStateReadColumns::default(),
-                    limit: None,
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|row| row.untracked)
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key,
-                entity_pk: row.entity_pk,
-                file_id: row.file_id,
-            })
-            .collect();
-        apply_pending_untracked_identities(
-            &mut untracked_identities,
-            branch_id,
-            state_rows,
-            engine_rows,
-        );
-        if !untracked_identities.is_empty() {
+        let (untracked_row_count, _) =
+            next_untracked_summary(read, branch_id, Some(existing), state_rows, engine_rows)
+                .await?;
+        if untracked_row_count != 0 {
             return Err(branch_ref_with_untracked_rows_error(
                 branch_id,
                 target.head_commit_id.is_none(),

@@ -73,6 +73,28 @@ pub struct BenchLayoutAccounting {
     pub value_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchGenerationReclamationCounters {
+    pub records: u64,
+    pub manifests: u64,
+    /// Generation-scoped storage rows staged for deletion; not physical
+    /// backend chunk bytes.
+    pub reclaimed_rows: u64,
+}
+
+pub fn reset_generation_reclamation_counters() {
+    crate::gc::reset_generation_reclamation_counters();
+}
+
+pub fn generation_reclamation_counters() -> BenchGenerationReclamationCounters {
+    let counters = crate::gc::generation_reclamation_counters();
+    BenchGenerationReclamationCounters {
+        records: counters.records,
+        manifests: counters.manifests,
+        reclaimed_rows: counters.reclaimed_rows,
+    }
+}
+
 impl<StorageImpl> BenchTransactionFixture<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -605,6 +627,8 @@ async fn seed_visible_schema_rows<StorageImpl>(
             updated_at: timestamp,
             ref_change_id: *change_id,
             schema_presence_bloom: [0; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
         };
         control.note_schemas(rows.iter().map(|row| row.schema_key.as_str()));
         stage_branch_head_control(&mut writes, branch_id, control)

@@ -4,7 +4,8 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
     BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY, BranchHeadControl,
-    stage_branch_head_control,
+    GenerationChunkManifest, generation_scope_digest, stage_branch_head_control,
+    stage_generation_manifest, untracked_identity_digest,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
@@ -42,7 +43,11 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V58 splits immutable commit-state authority into a compact header and an
+/// V59 adds authenticated branch summaries and generation reclamation records
+/// beside the compact immutable commit-state authority. The generation queue
+/// is the only hot-state reclamation route.
+///
+/// V58 split immutable commit-state authority into a compact header and an
 /// authenticated, hierarchical mutation catalog. Semantic commit facts remain
 /// owned exclusively by `changelog.commit`; canonical snapshot metadata stays
 /// inside the immutable physical authority while its content-addressed tree
@@ -50,7 +55,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v58";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v59";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -260,6 +265,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
             schema_presence_bloom: [0; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
         },
         branch_ref_change: global_branch_ref_change,
     };
@@ -280,6 +287,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
             schema_presence_bloom: [0; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
         },
         branch_ref_change: main_branch_ref_change,
     };
@@ -494,6 +503,38 @@ where
             )?;
             let mut control = branch.control;
             control.note_schemas(head_deltas.iter().map(|delta| delta.schema_key));
+            for delta in head_deltas.iter().filter(|delta| {
+                delta.untracked && !delta.deleted && delta.schema_key != BRANCH_REF_SCHEMA_KEY
+            }) {
+                control.untracked_row_count =
+                    control.untracked_row_count.checked_add(1).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "initial untracked-row summary count overflowed",
+                        )
+                    })?;
+                let digest = untracked_identity_digest(
+                    &branch.branch_id,
+                    delta.schema_key,
+                    delta.file_id,
+                    delta.entity_pk,
+                );
+                for (left, right) in control.untracked_identity_xor.iter_mut().zip(digest) {
+                    *left ^= right;
+                }
+            }
+            control.validate_untracked_summary()?;
+            stage_generation_manifest(
+                &mut writes,
+                &branch.branch_id,
+                GenerationChunkManifest {
+                    generation: control.generation,
+                    head_commit_id: control.head_commit_id,
+                    checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
+                    scope_digest: generation_scope_digest(&branch.branch_id, control.generation),
+                    indexed_chunk_count: 0,
+                },
+            )?;
             stage_branch_head_control(&mut writes, &branch.branch_id, control)?;
         }
     }

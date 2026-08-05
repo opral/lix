@@ -6,10 +6,28 @@ use crate::storage_adapter::{
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
     StorageSpaceId, StorageValue, StorageWriteSet,
 };
+use crate::storage_codec;
 use crate::{Blob, LixError};
 
 pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
+pub(crate) const PLUGIN_CHECKPOINT_RECLAMATION_SPACE: StorageSpace = StorageSpace::mutable(
+    StorageSpaceId(0x0004_0034),
+    "plugin.current_checkpoint_reclamation.v1",
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct PluginCheckpointReclamation {
+    generation: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct PluginCheckpointReclamationKey {
+    branch_id: [u8; 16],
+    generation: [u8; 16],
+}
 
 const MAGIC: &[u8; 4] = b"LPC2";
 const HEADER_BYTES: usize = 4 + 32 + 32 + 16 + 4 + 4;
@@ -87,15 +105,12 @@ pub(crate) async fn stage_delete_current_plugin_checkpoints(
     Ok(())
 }
 
-/// Deletes every derived checkpoint owned by a branch lifecycle record.
-///
-/// Checkpoints are a current-state accelerator, not repository history. Like
-/// an index maintained beside an MVCC log, their lifetime follows the current
-/// owner and a branch deletion removes the entire UUID-prefixed key range.
-pub(crate) async fn stage_delete_branch_plugin_checkpoints(
-    read: &(impl StorageAdapterRead + ?Sized),
+/// Enqueues branch-local plugin checkpoint reclamation. The foreground branch
+/// lifecycle remains O(1); GC consumes the authenticated branch prefix later.
+pub(crate) fn stage_enqueue_branch_plugin_checkpoint_reclamation(
     writes: &mut StorageWriteSet,
     branch_id: &str,
+    generation: [u8; 16],
 ) -> Result<(), LixError> {
     let branch_id = uuid::Uuid::parse_str(branch_id).map_err(|error| {
         LixError::new(
@@ -103,34 +118,119 @@ pub(crate) async fn stage_delete_branch_plugin_checkpoints(
             format!("plugin checkpoint branch id is not a UUID: {error}"),
         )
     })?;
+    writes.put(
+        PLUGIN_CHECKPOINT_RECLAMATION_SPACE,
+        StorageKey(Bytes::from(storage_codec::encode(
+            "plugin checkpoint reclamation key",
+            &PluginCheckpointReclamationKey {
+                branch_id: *branch_id.as_bytes(),
+                generation,
+            },
+        )?)),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode(
+                "plugin checkpoint reclamation",
+                &PluginCheckpointReclamation { generation },
+            )?),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) async fn stage_collect_branch_plugin_checkpoint_reclamations<S>(
+    read: &S,
+    writes: &mut StorageWriteSet,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
     let plan = ScanPlan::prefix(
-        PLUGIN_CHECKPOINT_SPACE,
+        PLUGIN_CHECKPOINT_RECLAMATION_SPACE,
         StoragePrefix {
-            bytes: Bytes::copy_from_slice(branch_id.as_bytes()),
+            bytes: Bytes::new(),
         },
     );
     let mut resume_after = None;
     loop {
-        let chunk = plan
+        let page = plan
             .collect(
                 read,
                 StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
+                    projection: StorageCoreProjection::FullValue,
                     resume_after: resume_after.clone(),
                     ..StorageScanOptions::default()
                 },
             )
             .await?
             .value;
-        if chunk.entries.is_empty() {
-            break;
+        resume_after = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let key: PluginCheckpointReclamationKey =
+                storage_codec::decode("plugin checkpoint reclamation key", entry.key.0.as_ref())?;
+            if key.generation == [0; 16] {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin checkpoint reclamation key has an invalid generation token",
+                ));
+            }
+            let branch_id = uuid::Uuid::from_bytes(key.branch_id);
+            let branch_bytes = branch_id.as_bytes();
+            let StorageProjectedValue::FullValue(bytes) = entry.value else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin checkpoint reclamation omitted its value",
+                ));
+            };
+            let stored: PluginCheckpointReclamation =
+                storage_codec::decode("plugin checkpoint reclamation", &bytes)?;
+            if stored.generation != key.generation {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin checkpoint reclamation key/value generation mismatch",
+                ));
+            }
+            let branch_id_string = branch_id.to_string();
+            let control = crate::branch::BranchHeadControlContext::new()
+                .reader(read)
+                .load(&branch_id_string)
+                .await?;
+            if control.is_some() {
+                // A branch may have been recreated before GC. Its new
+                // checkpoints share the branch prefix, so fail closed rather
+                // than deleting the recreated branch's active files.
+                continue;
+            }
+            let checkpoint_plan = ScanPlan::prefix(
+                PLUGIN_CHECKPOINT_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::copy_from_slice(branch_bytes),
+                },
+            );
+            let mut checkpoint_resume = None;
+            loop {
+                let chunk = checkpoint_plan
+                    .collect(
+                        read,
+                        StorageScanOptions {
+                            projection: StorageCoreProjection::KeyOnly,
+                            resume_after: checkpoint_resume.clone(),
+                            ..StorageScanOptions::default()
+                        },
+                    )
+                    .await?
+                    .value;
+                checkpoint_resume = chunk.entries.last().map(|item| item.key.clone());
+                writes.delete_batch(
+                    PLUGIN_CHECKPOINT_SPACE,
+                    chunk.entries.into_iter().map(|item| item.key),
+                );
+                if !chunk.has_more || checkpoint_resume.is_none() {
+                    break;
+                }
+            }
+            writes.delete(PLUGIN_CHECKPOINT_RECLAMATION_SPACE, entry.key);
         }
-        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
-        writes.delete_batch(
-            PLUGIN_CHECKPOINT_SPACE,
-            chunk.entries.into_iter().map(|entry| entry.key),
-        );
-        if !chunk.has_more {
+        if !page.has_more || resume_after.is_none() {
             break;
         }
     }
@@ -229,6 +329,9 @@ fn checkpoint_too_large() -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branch::{BranchHeadControl, stage_branch_head_control};
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     const BRANCH_ID: &str = "01920000-0000-7000-8000-000000000001";
@@ -356,12 +459,23 @@ mod tests {
             .await
             .unwrap();
 
+        let mut writes = storage.new_write_set();
+        stage_enqueue_branch_plugin_checkpoint_reclamation(
+            &mut writes,
+            BRANCH_ID,
+            generation.as_bytes()[..16].try_into().unwrap(),
+        )
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
         let mut writes = storage.new_write_set();
-        stage_delete_branch_plugin_checkpoints(&read, &mut writes, BRANCH_ID)
+        stage_collect_branch_plugin_checkpoint_reclamations(&read, &mut writes)
             .await
             .unwrap();
         storage
@@ -428,6 +542,81 @@ mod tests {
             .await
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_recreation_defers_plugin_checkpoint_reclamation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = BlobId::from_content(b"generation");
+        let blob_hash = BlobId::from_content(b"file");
+        let mut writes = storage.new_write_set();
+        stage_current_plugin_checkpoint(
+            &mut writes,
+            BRANCH_ID,
+            FILE_ID,
+            &generation.to_hex(),
+            SEMANTIC_ROOT,
+            blob_hash,
+            b"runtime",
+            b"authority",
+        )
+        .unwrap();
+        stage_enqueue_branch_plugin_checkpoint_reclamation(
+            &mut writes,
+            BRANCH_ID,
+            generation.as_bytes()[..16].try_into().unwrap(),
+        )
+        .unwrap();
+        stage_branch_head_control(
+            &mut writes,
+            BRANCH_ID,
+            BranchHeadControl {
+                head_commit_id: CommitId::for_test_label("recreated-head"),
+                generation: CommitId::for_test_label("recreated-generation"),
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: None,
+                created_at: LixTimestamp::expect_parse(
+                    "plugin recreation timestamp",
+                    "2026-01-01T00:00:00Z",
+                ),
+                updated_at: LixTimestamp::expect_parse(
+                    "plugin recreation timestamp",
+                    "2026-01-01T00:00:00Z",
+                ),
+                ref_change_id: ChangeId::for_test_label("recreated-ref"),
+                schema_presence_bloom: [0; 4],
+                untracked_row_count: 0,
+                untracked_identity_xor: [0; 32],
+            },
+        )
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut gc_writes = storage.new_write_set();
+        stage_collect_branch_plugin_checkpoint_reclamations(&read, &mut gc_writes)
+            .await
+            .unwrap();
+        assert!(gc_writes.is_empty());
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                SEMANTIC_ROOT,
+                blob_hash,
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
     }
 }

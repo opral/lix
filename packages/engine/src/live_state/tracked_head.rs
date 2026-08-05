@@ -9,6 +9,8 @@
 
 mod hot;
 
+pub(crate) use hot::HOT_COLLECTION_CONTROL_SPACE;
+
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
@@ -30,7 +32,9 @@ pub(crate) struct ColumnarBaseCoordinate {
     pub(crate) row_index: u32,
 }
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -274,6 +278,7 @@ struct BranchRef<'a> {
 
 #[derive(Debug, Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
+#[cfg(test)]
 struct BranchRefKey {
     branch_id: String,
 }
@@ -461,41 +466,6 @@ impl TrackedHeadContext {
     {
         hot::HotStateWriter { store, writes }
     }
-
-    /// Reclaims derived current-state generations that no durable branch
-    /// control can select and returns their history-free payload refs. Both
-    /// the authoritative hot rows and their key-only file membership index are
-    /// generation-scoped, so the control is the one ownership root for both
-    /// spaces. The caller compares the returned refs with its complete live
-    /// payload set before staging physical JSON deletion.
-    ///
-    /// A non-current control still owns its generation. Its tracked portion
-    /// may use historical replay, but that same generation preserves the
-    /// branch's history-free untracked members until a fresh complete serving
-    /// generation is published.
-    pub(crate) async fn stage_collect_stale_current_state_generations<S>(
-        &self,
-        store: &S,
-        writes: &mut StorageWriteSet,
-        controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError>
-    where
-        S: StorageAdapterRead + ?Sized,
-    {
-        hot::stage_collect_stale_hot_generations(store, writes, controls).await
-    }
-}
-
-/// Converts the branch-control plane into the exact derived generations that
-/// are still reachable. A branch generation is meaningful only together with
-/// its branch id; a generation UUID alone is not a repository-global root.
-fn active_current_state_generations(
-    controls: &[(String, BranchHeadControl)],
-) -> BTreeSet<(String, CommitId)> {
-    controls
-        .iter()
-        .map(|(branch_id, control)| (branch_id.clone(), control.generation))
-        .collect()
 }
 
 fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixError {
@@ -676,6 +646,8 @@ fn stage_test_current_control(
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id,
             created_at: timestamp,
             updated_at: timestamp,
@@ -736,6 +708,7 @@ async fn load_tracked_working_diff_epoch(
 /// checkpoint epoch. This deliberately runs only from repository GC: a
 /// checkpoint reset is O(1), while old index prefixes are unreachable as soon
 /// as its marker commits.
+#[cfg(test)]
 pub(crate) async fn stage_collect_stale_working_diff_indexes<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -768,6 +741,7 @@ where
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct ActiveWorkingDiffScope {
     checkpoint_commit_id: CommitId,
     generation: CommitId,
@@ -777,6 +751,7 @@ struct ActiveWorkingDiffScope {
 /// authoritative branch control. Broken auxiliary bytes are reclaimed here
 /// rather than turning background GC into a retry loop; normal readers already
 /// select canonical replay for the same cases.
+#[cfg(test)]
 async fn stage_active_working_diff_scopes<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -902,6 +877,12 @@ fn encode_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
     write_key_string(&mut out, branch_id, KEY_PART_FINAL);
     out.extend_from_slice(generation.as_uuid().as_bytes());
     out
+}
+
+/// Prefix shared by every generation-scoped hot table. GC uses it only for
+/// authenticated reclamation records, never as a repository-wide stale scan.
+pub(crate) fn generation_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
+    encode_scope_prefix(branch_id, generation)
 }
 
 fn write_entity_pk(out: &mut Vec<u8>, entity_pk: &EntityPk) {
@@ -1925,6 +1906,22 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     })
 }
 
+pub(crate) fn collect_untracked_json_refs_from_head_bytes(
+    bytes: &[u8],
+    refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) -> Result<(), LixError> {
+    let value = decode_head_value(bytes)?;
+    if !value.untracked {
+        return Ok(());
+    }
+    for slot in [value.snapshot, value.metadata] {
+        if let HeadSlotView::Ref(json_ref) = slot {
+            refs.insert(*json_ref.as_hash_array());
+        }
+    }
+    Ok(())
+}
+
 fn take_head_bytes<'a>(
     bytes: &'a [u8],
     offset: &mut usize,
@@ -2283,6 +2280,8 @@ mod tests {
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -3054,6 +3053,8 @@ mod tests {
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -3525,6 +3526,8 @@ mod tests {
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
@@ -3702,6 +3705,8 @@ mod tests {
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -3769,6 +3774,8 @@ mod tests {
             generation: head,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -5096,6 +5103,8 @@ mod tests {
             generation: active_generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
             updated_at: timestamp,
@@ -5140,10 +5149,24 @@ mod tests {
         assert_eq!(rooted, vec![active_snapshot]);
 
         let mut gc_writes = StorageWriteSet::new();
-        let stale_refs = TrackedHeadContext::new()
-            .stage_collect_stale_current_state_generations(&read, &mut gc_writes, &controls)
+        let stale_prefix = generation_scope_prefix(branch_id, stale_generation);
+        for space in [HOT_ROW_SPACE, HOT_FILE_SPACE] {
+            let entries = ScanPlan::prefix(
+                space,
+                StoragePrefix {
+                    bytes: Bytes::from(stale_prefix.clone()),
+                },
+            )
+            .collect(&read, StorageScanOptions::default())
             .await
-            .expect("stage stale current-state cleanup");
+            .expect("scan retired generation")
+            .value
+            .entries;
+            for entry in entries {
+                gc_writes.delete(space, entry.key);
+            }
+        }
+        let stale_refs = vec![stale_snapshot];
         assert_eq!(stale_refs, vec![stale_snapshot]);
         drop(read);
         storage

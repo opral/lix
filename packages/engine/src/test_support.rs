@@ -176,6 +176,8 @@ pub(crate) async fn seed_branch_head_with_rows(
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_row_count: 0,
+            untracked_identity_xor: [0; 32],
             working_diff_checkpoint_commit_id: None,
             created_at: test_timestamp(),
             updated_at: test_timestamp(),
