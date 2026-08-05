@@ -174,7 +174,7 @@ export function DocsLayout({
           </aside>
         </>
       )}
-      <div className="grid grid-cols-1 items-stretch lg:grid-cols-[264px_minmax(0,1fr)] xl:grid-cols-[264px_minmax(0,1fr)_224px]">
+      <div className="mx-auto grid w-full max-w-[1376px] grid-cols-1 items-stretch lg:grid-cols-[264px_minmax(0,1fr)] xl:grid-cols-[264px_minmax(0,1fr)_224px]">
         <aside className="hidden border-r border-line lg:block">
           <div className="sticky top-[50px] max-h-[calc(100vh-50px)] overflow-y-auto">
             <SidebarContent />
