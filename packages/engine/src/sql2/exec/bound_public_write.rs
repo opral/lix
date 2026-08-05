@@ -4349,7 +4349,7 @@ fn certified_entity_insert_parameter_batch(
         certified_direct_parameter_insert_batch(ctx, plan, spec, layout, row, parameter_batch)?
     {
         #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_certified_entity_insert_parameter_batch_execution();
+        crate::storage_bench::record_certified_entity_insert_parameter_batch_certification();
         return Ok(Some(if use_typed_certified_insert(rows.len()) {
             CertifiedEntityInsertParameterBatch::Typed(rows)
         } else {
