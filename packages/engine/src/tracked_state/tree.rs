@@ -1022,6 +1022,13 @@ impl TrackedStateTree {
                 }
                 DecodedNode::Internal(internal) => {
                     let node_depth = internal.radix_depth();
+                    if node_depth < depth {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked-state radix internal depth regressed below its parent",
+                        ));
+                    }
+                    validate_radix_children(internal.children(), node_depth)?;
                     if node_depth > depth {
                         let existing_first = internal
                             .children()
@@ -1035,10 +1042,41 @@ impl TrackedStateTree {
                                     != radix_digit(existing_first.as_ref(), candidate_depth)
                             })
                         }) {
+                            let existing_internal = internal.clone();
                             let existing_children = internal.into_children();
                             let existing = internal_summary(hash, &existing_children)?;
-                            let mut replacement_children = vec![existing];
+                            let existing_digit =
+                                radix_digit(existing.first_key.as_ref(), divergence_depth);
+                            let mut replacement_children = Vec::new();
+                            let mut existing_bucket_replaced = false;
                             for (_, group) in radix_mutation_groups(mutations, divergence_depth) {
+                                let group_digit = radix_digit(
+                                    group
+                                        .first()
+                                        .expect("radix divergence group is non-empty")
+                                        .encoded_key
+                                        .as_ref(),
+                                    divergence_depth,
+                                );
+                                if group_digit == existing_digit {
+                                    existing_bucket_replaced = true;
+                                    let replacement = self
+                                        .apply_radix_node(
+                                            store,
+                                            overlay,
+                                            hash,
+                                            DecodedNode::Internal(existing_internal.clone()),
+                                            group,
+                                            node_depth,
+                                            chunks,
+                                        )
+                                        .await?;
+                                    if !replacement.changed {
+                                        record_reused_node();
+                                    }
+                                    replacement_children.push(replacement.summary);
+                                    continue;
+                                }
                                 let entries = group
                                     .into_iter()
                                     .map(|mutation| EncodedLeafEntry {
@@ -1052,6 +1090,10 @@ impl TrackedStateTree {
                                     chunks,
                                 )?;
                                 replacement_children.push(summary);
+                            }
+                            if !existing_bucket_replaced {
+                                record_reused_node();
+                                replacement_children.push(existing);
                             }
                             replacement_children
                                 .sort_by(|left, right| left.first_key.cmp(&right.first_key));
@@ -3899,6 +3941,71 @@ mod tests {
             subtree_height: 1,
         };
         assert!(validate_radix_children(&[child], 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn radix_frontier_handles_mixed_compressed_prefix_mutations() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 128,
+            min_chunk_bytes: 64,
+            max_chunk_bytes: 256,
+        });
+        let base_rows = (0..128usize)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("entity-{index:03}")),
+                    value(&format!("base-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = apply_mutations_for_test(&tree, &storage, None, base_rows, None)
+            .await
+            .expect("base root should build");
+        let mutation_specs = vec![
+            (
+                key("aaa", None, "outside-prefix"),
+                value("outside", Some("{}")),
+            ),
+            (
+                key("schema", None, "entity-128"),
+                value("inside-prefix", Some("{}")),
+            ),
+        ];
+        let mutations = mutation_specs
+            .iter()
+            .map(|(key, value)| mutation(key, value))
+            .collect::<Vec<_>>();
+        let updated =
+            apply_mutations_for_test(&tree, &storage, Some(&base.root_id), mutations, None)
+                .await
+                .expect("mixed compressed-prefix mutation should build");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut canonical_entries = tree
+            .collect_leaf_entries(&read, &base.root_id)
+            .await
+            .expect("base entries should collect");
+        for (key, value) in mutation_specs {
+            let encoded_key = encode_key(&key);
+            let encoded_value = encode_value(&value);
+            let index = canonical_entries
+                .binary_search_by(|entry| entry.key.as_ref().cmp(encoded_key.as_slice()))
+                .expect_err("mixed mutation should be a new key");
+            canonical_entries.insert(
+                index,
+                EncodedLeafEntry {
+                    key: encoded_key.into(),
+                    value: encoded_value.into(),
+                },
+            );
+        }
+        let canonical = tree
+            .build_tree_from_entries(canonical_entries)
+            .expect("canonical mixed root should build");
+        assert_eq!(updated.root_id, canonical.root_id);
     }
 
     async fn apply_mutations_for_test(
