@@ -502,6 +502,7 @@ pub(crate) struct TrackedStateScanRequest {
 pub(crate) struct TrackedStateMutation {
     pub(crate) encoded_key: Bytes,
     pub(crate) encoded_value: Bytes,
+    pub(crate) require_absence: bool,
 }
 
 impl TrackedStateMutation {
@@ -510,13 +511,19 @@ impl TrackedStateMutation {
         Self {
             encoded_key: Bytes::from(encoded_key),
             encoded_value: Bytes::from(encoded_value),
+            require_absence: false,
         }
     }
 
-    pub(crate) fn from_shared(encoded_key: Bytes, encoded_value: Bytes) -> Self {
+    pub(crate) fn from_shared_with_absence(
+        encoded_key: Bytes,
+        encoded_value: Bytes,
+        require_absence: bool,
+    ) -> Self {
         Self {
             encoded_key,
             encoded_value,
+            require_absence,
         }
     }
 }

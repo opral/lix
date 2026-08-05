@@ -945,8 +945,24 @@ impl TrackedStateTree {
                             entry.key.as_ref().cmp(mutation.encoded_key.as_ref())
                         }) {
                             Ok(index) => {
-                                if entries[index].value != mutation.encoded_value {
-                                    entries[index].value = mutation.encoded_value;
+                                let existing_value = decode_value(&entries[index].value)?;
+                                if mutation.require_absence && !existing_value.deleted() {
+                                    return Err(LixError::new(
+                                        LixError::CODE_UNIQUE,
+                                        "tracked-state insert would replace a live row",
+                                    ));
+                                }
+                                let incoming_value = decode_value(&mutation.encoded_value)?;
+                                let normalized_value =
+                                    encode_value_ref(TrackedStateIndexValueRef {
+                                        change_id: incoming_value.change_id,
+                                        commit_id: incoming_value.commit_id,
+                                        deleted: incoming_value.deleted,
+                                        created_at: existing_value.created_at(),
+                                        updated_at: incoming_value.updated_at,
+                                    });
+                                if entries[index].value != normalized_value {
+                                    entries[index].value = normalized_value.into();
                                     changed = true;
                                 }
                             }

@@ -4444,18 +4444,35 @@ where
             let parent_metadata = parent_metadata
                 .as_ref()
                 .expect("dense ordered parent merge requires parent metadata");
-            self.tree
-                .merge_and_stage_ordered_parent_mutations(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    &parent_metadata.root_id,
-                    mutation_count,
-                    file_delete_cascades,
-                    mutations,
-                    Some(commit_id),
+            if file_delete_cascades.is_empty() {
+                let mutation_batch = build_ordered_root_mutation_batch(mutation_count, mutations)?;
+                (
+                    self.tree
+                        .apply_mutations_with_overlay(
+                            self.store,
+                            self.writes,
+                            &mut self.chunk_overlay,
+                            Some(&parent_metadata.root_id),
+                            mutation_batch,
+                            Some(commit_id),
+                        )
+                        .await?,
+                    0,
                 )
-                .await?
+            } else {
+                self.tree
+                    .merge_and_stage_ordered_parent_mutations(
+                        self.store,
+                        self.writes,
+                        &mut self.chunk_overlay,
+                        &parent_metadata.root_id,
+                        mutation_count,
+                        file_delete_cascades,
+                        mutations,
+                        Some(commit_id),
+                    )
+                    .await?
+            }
         };
         let changed_rows = mutation_count.checked_add(cascaded_rows).ok_or_else(|| {
             LixError::new(
@@ -4535,7 +4552,7 @@ where
         }
         let mutation = mutation?;
         let delta = mutation.delta;
-        if !batch.push_strictly_ordered(
+        if !batch.push_strictly_ordered_with_absence(
             TrackedStateKeyRef {
                 schema_key: delta.schema_key,
                 file_id: delta.file_id,
@@ -4548,6 +4565,7 @@ where
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
             },
+            mutation.require_absence,
         ) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

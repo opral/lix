@@ -249,6 +249,7 @@ struct MutationSpan {
     key_end: usize,
     value_start: usize,
     value_end: usize,
+    require_absence: bool,
 }
 
 /// Builds one contiguous encoded-key arena for point-read and replay batches.
@@ -376,21 +377,17 @@ impl TrackedStateMutationBatchBuilder {
     }
 
     pub(crate) fn push(&mut self, key: TrackedStateKeyRef<'_>, value: TrackedStateIndexValueRef) {
-        self.push_inner(key, value);
+        self.push_inner(key, value, false);
     }
 
-    /// Appends one mutation and reports whether its encoded key is strictly
-    /// greater than the preceding key in this batch.
-    ///
-    /// Ordered root staging uses this check to preserve duplicate and ordering
-    /// semantics without materializing an owned `TrackedStateKey` per row.
-    pub(crate) fn push_strictly_ordered(
+    pub(crate) fn push_strictly_ordered_with_absence(
         &mut self,
         key: TrackedStateKeyRef<'_>,
         value: TrackedStateIndexValueRef,
+        require_absence: bool,
     ) -> bool {
         let previous = self.spans.last().copied();
-        let current = self.push_inner(key, value);
+        let current = self.push_inner(key, value, require_absence);
         previous.is_none_or(|previous| {
             self.key_arena[previous.key_start..previous.key_end]
                 < self.key_arena[current.key_start..current.key_end]
@@ -401,6 +398,7 @@ impl TrackedStateMutationBatchBuilder {
         &mut self,
         key: TrackedStateKeyRef<'_>,
         value: TrackedStateIndexValueRef,
+        require_absence: bool,
     ) -> MutationSpan {
         let key_start = self.key_arena.len();
         encode_key_parts_into(
@@ -418,6 +416,7 @@ impl TrackedStateMutationBatchBuilder {
             key_end,
             value_start,
             value_end,
+            require_absence,
         };
         self.spans.push(span);
         span
@@ -435,6 +434,7 @@ impl TrackedStateMutationBatchBuilder {
             key_end,
             value_start,
             value_end,
+            require_absence: false,
         });
     }
 
@@ -445,9 +445,10 @@ impl TrackedStateMutationBatchBuilder {
             self.spans
                 .into_iter()
                 .map(|span| {
-                    TrackedStateMutation::from_shared(
+                    TrackedStateMutation::from_shared_with_absence(
                         key_arena.slice(span.key_start..span.key_end),
                         value_arena.slice(span.value_start..span.value_end),
+                        span.require_absence,
                     )
                 })
                 .collect(),
