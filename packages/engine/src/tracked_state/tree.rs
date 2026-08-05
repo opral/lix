@@ -413,59 +413,26 @@ impl TrackedStateTree {
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
         let mutations = mutations.into_mutations();
-        // The normal bulk tracked-write path already arrives in primary-key
-        // order.  With no parent root there is nothing to merge it with, so
-        // preserve that order directly instead of routing every row through a
-        // BTreeMap merely to sort it again.
-        if base_root.is_none() && mutations_are_strictly_sorted(&mutations) {
-            return self
-                .build_and_stage_sorted_mutations(writes, overlay, mutations, commit_id)
-                .await;
-        }
-        if let Some(root_id) = base_root {
+        if base_root.is_none() {
             let mutations = if mutations_are_strictly_sorted(&mutations) {
+                mutations
+            } else if mutations.is_empty() {
                 mutations
             } else {
                 sort_unique_mutations(mutations)?
             };
             return self
-                .apply_sorted_mutation_frontier(
-                    store, writes, overlay, root_id, mutations, commit_id,
-                )
+                .build_and_stage_sorted_mutations(writes, overlay, mutations, commit_id)
                 .await;
         }
-
-        let mut entries = match base_root {
-            Some(root_id) => self
-                .collect_leaf_entries_with_overlay(store, overlay, root_id)
-                .await?
-                .into_iter()
-                .map(|entry| (entry.key, entry.value))
-                .collect::<BTreeMap<_, _>>(),
-            None => BTreeMap::new(),
+        let root_id = base_root.expect("parent root exists after parentless branch");
+        let mutations = if mutations_are_strictly_sorted(&mutations) {
+            mutations
+        } else {
+            sort_unique_mutations(mutations)?
         };
-
-        // Apply in caller order so repeated writes to the same key behave like
-        // normal transaction staging: the latest mutation wins.
-        for mutation in mutations {
-            entries.insert(mutation.encoded_key, mutation.encoded_value);
-        }
-
-        let built = self.build_tree_from_entries(
-            entries
-                .into_iter()
-                .map(|(key, value)| EncodedLeafEntry { key, value })
-                .collect(),
-        )?;
-        overlay.stage_chunks(writes, &built.chunks);
-
-        Ok(TrackedStateApplyResult {
-            root_id: built.root_id,
-            row_count: built.row_count,
-            tree_height: built.tree_height,
-            chunk_count: built.chunks.len(),
-            chunk_bytes: built.chunk_bytes,
-        })
+        self.apply_sorted_mutation_frontier(store, writes, overlay, root_id, mutations, commit_id)
+            .await
     }
 
     /// Merges a full, primary-key-sorted mutation batch with a parent root in
@@ -1036,12 +1003,14 @@ impl TrackedStateTree {
                             .expect("validated radix internal has a first child")
                             .first_key
                             .clone();
-                        if let Some(divergence_depth) = mutations.iter().find_map(|mutation| {
+                        if let Some(divergence_depth) =
                             (depth..node_depth).find(|&candidate_depth| {
-                                radix_digit(mutation.encoded_key.as_ref(), candidate_depth)
-                                    != radix_digit(existing_first.as_ref(), candidate_depth)
+                                mutations.iter().any(|mutation| {
+                                    radix_digit(mutation.encoded_key.as_ref(), candidate_depth)
+                                        != radix_digit(existing_first.as_ref(), candidate_depth)
+                                })
                             })
-                        }) {
+                        {
                             let existing_internal = internal.clone();
                             let existing_children = internal.into_children();
                             let existing = internal_summary(hash, &existing_children)?;
@@ -1067,7 +1036,7 @@ impl TrackedStateTree {
                                             hash,
                                             DecodedNode::Internal(existing_internal.clone()),
                                             group,
-                                            node_depth,
+                                            divergence_depth + 1,
                                             chunks,
                                         )
                                         .await?;
@@ -1303,30 +1272,49 @@ impl TrackedStateTree {
             return Ok((summary, 1));
         }
 
-        let mut groups: Vec<(u8, Vec<EncodedLeafEntry>)> = Vec::new();
-        for entry in entries {
-            let digit = radix_digit(entry.key.as_ref(), depth);
-            if let Some((last_digit, group)) = groups.last_mut() {
-                if *last_digit == digit {
-                    group.push(entry);
-                    continue;
-                }
-                if *last_digit > digit {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked-state radix entries are not ordered by key space",
-                    ));
-                }
+        let mut radix_depth = depth;
+        let mut current_entries = entries;
+        let groups = loop {
+            if radix_depth >= RADIX_MAX_DEPTH {
+                let first_key = current_entries
+                    .first()
+                    .map(|entry| entry.key.clone())
+                    .unwrap_or_default();
+                let last_key = current_entries
+                    .last()
+                    .map(|entry| entry.key.clone())
+                    .unwrap_or_default();
+                let node = encode_leaf_node(&current_entries);
+                let summary =
+                    chunks.insert_node(node, first_key, last_key, current_entries.len() as u64, 1);
+                return Ok((summary, 1));
             }
-            groups.push((digit, vec![entry]));
-        }
-        if groups.len() == 1 {
-            let (_, group) = groups.pop().expect("radix group exists");
-            return self.build_radix_subtree(group, depth + 1, chunks);
-        }
+            let mut groups: Vec<(u8, Vec<EncodedLeafEntry>)> = Vec::new();
+            for entry in current_entries {
+                let digit = radix_digit(entry.key.as_ref(), radix_depth);
+                if let Some((last_digit, group)) = groups.last_mut() {
+                    if *last_digit == digit {
+                        group.push(entry);
+                        continue;
+                    }
+                    if *last_digit > digit {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked-state radix entries are not ordered by key space",
+                        ));
+                    }
+                }
+                groups.push((digit, vec![entry]));
+            }
+            if groups.len() != 1 {
+                break groups;
+            }
+            current_entries = groups.pop().expect("radix group exists").1;
+            radix_depth += 1;
+        };
         let mut children = Vec::with_capacity(groups.len());
         for (_, group) in groups {
-            let (summary, _) = self.build_radix_subtree(group, depth + 1, chunks)?;
+            let (summary, _) = self.build_radix_subtree(group, radix_depth + 1, chunks)?;
             children.push(summary);
         }
         let first_key = children
@@ -1346,7 +1334,7 @@ impl TrackedStateTree {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let node = encode_internal_node_at_depth(&children, depth);
+        let node = encode_internal_node_at_depth(&children, radix_depth);
         let summary = chunks.insert_node(node, first_key, last_key, subtree_count, subtree_height);
         Ok((summary, subtree_height as usize))
     }
@@ -1396,6 +1384,7 @@ impl TrackedStateTree {
             .await
     }
 
+    #[cfg(test)]
     async fn collect_leaf_entries_with_overlay(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -3968,8 +3957,8 @@ mod tests {
                 value("outside", Some("{}")),
             ),
             (
-                key("schema", None, "entity-128"),
-                value("inside-prefix", Some("{}")),
+                key("sXhema", None, "entity-128"),
+                value("inside-skipped-prefix", Some("{}")),
             ),
         ];
         let mutations = mutation_specs
