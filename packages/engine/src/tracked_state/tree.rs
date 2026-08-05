@@ -10,7 +10,6 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroUsize,
-    ops::Range,
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
@@ -21,24 +20,24 @@ use std::{
 use bytes::Bytes;
 use lru::LruCache;
 
+use crate::changelog::{ChangeId, CommitId};
+use crate::common::LixTimestamp;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
     ChildSummary, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, PendingChunk,
     PendingChunkBatch, TrackedStateKeyBatchBuilder, decode_key, decode_key_shared,
     decode_key_with_trusted_prefix, decode_node, decode_node_ref, decode_value,
-    decode_visible_value, encode_internal_node_at_depth, encode_key, encode_key_ref_into,
-    encode_leaf_node, encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref,
-    encode_value_ref_into, hash_bytes,
+    decode_visible_value, encode_internal_node_at_depth, encode_key, encode_leaf_node,
+    encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref, hash_bytes,
 };
 use crate::tracked_state::diff::{TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder};
 use crate::tracked_state::storage;
 #[cfg(test)]
 use crate::tracked_state::types::TrackedStateTreeDiffEntry;
 use crate::tracked_state::types::{
-    TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateDeltaRef,
-    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateMutation, TrackedStateMutationBatch, TrackedStateRootId,
-    TrackedStateRootMutationRef, TrackedStateTreeScanRequest,
+    TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateIndexValue,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
+    TrackedStateMutationBatch, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -48,6 +47,17 @@ use crate::{LixError, NullableKeyFilter};
 // about 64 MiB (excluding cache metadata and live `Bytes` views held by callers).
 const TRACKED_STATE_NODE_CACHE_CAPACITY: usize = 4096;
 type TrackedStateNodeCache = LruCache<[u8; TRACKED_STATE_HASH_BYTES], Bytes>;
+
+/// Authenticated range event for rows owned by one deleted physical file.
+/// The event is applied during the same radix traversal as point mutations;
+/// it is not materialized as a second parent-state arena.
+#[derive(Debug, Clone)]
+pub(crate) struct TrackedStateCascade {
+    pub(crate) file_id: String,
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
+    pub(crate) updated_at: LixTimestamp,
+}
 
 // A byte radix is deliberately independent of row order and encoded value
 // bytes. Every internal node has at most 256 ordered children, so an
@@ -78,6 +88,13 @@ struct FrontierMetrics {
     final_staged_chunks: AtomicU64,
     final_staged_bytes: AtomicU64,
     storage_reads: AtomicU64,
+    range_events: AtomicU64,
+    cascade_nodes_scanned: AtomicU64,
+    cascade_decoded_rows: AtomicU64,
+    cascade_streamed_outputs: AtomicU64,
+    covered_subtrees: AtomicU64,
+    pruned_subtrees: AtomicU64,
+    boundary_descents: AtomicU64,
 }
 
 static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
@@ -90,6 +107,13 @@ static FRONTIER_METRICS: FrontierMetrics = FrontierMetrics {
     final_staged_chunks: AtomicU64::new(0),
     final_staged_bytes: AtomicU64::new(0),
     storage_reads: AtomicU64::new(0),
+    range_events: AtomicU64::new(0),
+    cascade_nodes_scanned: AtomicU64::new(0),
+    cascade_decoded_rows: AtomicU64::new(0),
+    cascade_streamed_outputs: AtomicU64::new(0),
+    covered_subtrees: AtomicU64::new(0),
+    pruned_subtrees: AtomicU64::new(0),
+    boundary_descents: AtomicU64::new(0),
 };
 
 fn frontier_metrics_enabled() -> bool {
@@ -111,6 +135,13 @@ fn reset_frontier_metrics() {
         &FRONTIER_METRICS.final_staged_chunks,
         &FRONTIER_METRICS.final_staged_bytes,
         &FRONTIER_METRICS.storage_reads,
+        &FRONTIER_METRICS.range_events,
+        &FRONTIER_METRICS.cascade_nodes_scanned,
+        &FRONTIER_METRICS.cascade_decoded_rows,
+        &FRONTIER_METRICS.cascade_streamed_outputs,
+        &FRONTIER_METRICS.covered_subtrees,
+        &FRONTIER_METRICS.pruned_subtrees,
+        &FRONTIER_METRICS.boundary_descents,
     ] {
         metric.store(0, Ordering::Relaxed);
     }
@@ -121,7 +152,7 @@ fn emit_frontier_metrics() {
         return;
     }
     eprintln!(
-        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={}",
+        "tracked_state_frontier_stats visited_nodes={} decoded_nodes={} encoded_nodes={} reused_nodes={} transient_encoded_chunks={} transient_encoded_bytes={} final_staged_chunks={} final_staged_bytes={} storage_reads={} range_events={} cascade_nodes_scanned={} cascade_decoded_rows={} cascade_streamed_outputs={} covered_subtrees={} pruned_subtrees={} boundary_descents={}",
         FRONTIER_METRICS.visited_nodes.load(Ordering::Relaxed),
         FRONTIER_METRICS.decoded_nodes.load(Ordering::Relaxed),
         FRONTIER_METRICS.encoded_nodes.load(Ordering::Relaxed),
@@ -135,6 +166,19 @@ fn emit_frontier_metrics() {
         FRONTIER_METRICS.final_staged_chunks.load(Ordering::Relaxed),
         FRONTIER_METRICS.final_staged_bytes.load(Ordering::Relaxed),
         FRONTIER_METRICS.storage_reads.load(Ordering::Relaxed),
+        FRONTIER_METRICS.range_events.load(Ordering::Relaxed),
+        FRONTIER_METRICS
+            .cascade_nodes_scanned
+            .load(Ordering::Relaxed),
+        FRONTIER_METRICS
+            .cascade_decoded_rows
+            .load(Ordering::Relaxed),
+        FRONTIER_METRICS
+            .cascade_streamed_outputs
+            .load(Ordering::Relaxed),
+        FRONTIER_METRICS.covered_subtrees.load(Ordering::Relaxed),
+        FRONTIER_METRICS.pruned_subtrees.load(Ordering::Relaxed),
+        FRONTIER_METRICS.boundary_descents.load(Ordering::Relaxed),
     );
 }
 
@@ -412,8 +456,38 @@ impl TrackedStateTree {
         mutations: TrackedStateMutationBatch,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
+        self.apply_mutations_with_cascades(
+            store,
+            writes,
+            overlay,
+            base_root,
+            mutations,
+            Vec::new(),
+            commit_id,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
+    pub(crate) async fn apply_mutations_with_cascades(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        base_root: Option<&TrackedStateRootId>,
+        mutations: TrackedStateMutationBatch,
+        cascades: Vec<TrackedStateCascade>,
+        commit_id: Option<&str>,
+    ) -> Result<(TrackedStateApplyResult, usize), LixError> {
+        validate_cascades(&cascades)?;
         let mutations = mutations.into_mutations();
         if base_root.is_none() {
+            if !cascades.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "tracked-state cascade requires an authenticated parent root",
+                ));
+            }
             let mutations = if mutations_are_strictly_sorted(&mutations) {
                 mutations
             } else if mutations.is_empty() {
@@ -423,7 +497,8 @@ impl TrackedStateTree {
             };
             return self
                 .build_and_stage_sorted_mutations(writes, overlay, mutations, commit_id)
-                .await;
+                .await
+                .map(|result| (result, 0));
         }
         let root_id = base_root.expect("parent root exists after parentless branch");
         let mutations = if mutations_are_strictly_sorted(&mutations) {
@@ -431,96 +506,10 @@ impl TrackedStateTree {
         } else {
             sort_unique_mutations(mutations)?
         };
-        self.apply_sorted_mutation_frontier(store, writes, overlay, root_id, mutations, commit_id)
-            .await
-    }
-
-    /// Merges a full, primary-key-sorted mutation batch with a parent root in
-    /// one pass and rebuilds canonical chunks directly from that merge.
-    ///
-    /// The normal tracked bulk path used to first point-read every changed key
-    /// for collision/created-at handling, then collect the parent leaves, then
-    /// materialize another complete merged vector. This path keeps only one
-    /// incoming mutation and one output leaf in memory at a time. It also
-    /// reads through `overlay`, so a parent root staged earlier in this write
-    /// set is a valid parent for a child commit.
-    pub(crate) async fn merge_and_stage_ordered_parent_mutations<'a, I>(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        writes: &mut StorageWriteSet,
-        overlay: &mut storage::TrackedStateChunkOverlay,
-        root_id: &TrackedStateRootId,
-        mutation_count: usize,
-        file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'a>>,
-        mutations: I,
-        commit_id: Option<&str>,
-    ) -> Result<(TrackedStateApplyResult, usize), LixError>
-    where
-        I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
-    {
-        let mut parent_entries = OrderedLeafCursor::new(*root_id.as_bytes());
-        let mut mutations = PendingRootMutationCursor::new(mutations.into_iter());
-        let mut next_mutation = mutations.next_pending()?;
-        let mut assembler = OrderedTreeAssembler::new(mutation_count);
-        let mut cascaded_rows = 0usize;
-
-        let mut next_parent_entry = parent_entries.next(self, store, overlay).await?;
-        while let Some(parent_entry) = next_parent_entry.take() {
-            let Some(mutation) = next_mutation.take() else {
-                let (parent_entry, cascaded) =
-                    cascade_parent_entry(parent_entry, file_delete_cascades)?;
-                cascaded_rows += usize::from(cascaded);
-                assembler.push(parent_entry)?;
-                next_parent_entry = parent_entries.next(self, store, overlay).await?;
-                continue;
-            };
-            match mutation.encoded_key.as_ref().cmp(parent_entry.key.as_ref()) {
-                std::cmp::Ordering::Less => {
-                    let created_at = mutation.delta.created_at;
-                    assembler.push_mutation(mutation, created_at)?;
-                    next_mutation = mutations.next_pending()?;
-                    next_parent_entry = Some(parent_entry);
-                }
-                std::cmp::Ordering::Equal => {
-                    let parent_value = decode_value(&parent_entry.value)?;
-                    if mutation.require_absence && !parent_value.deleted() {
-                        return Err(duplicate_root_insert_error(&mutation.delta));
-                    }
-                    assembler.push_mutation(mutation, parent_value.created_at())?;
-                    next_mutation = mutations.next_pending()?;
-                    next_parent_entry = parent_entries.next(self, store, overlay).await?;
-                }
-                std::cmp::Ordering::Greater => {
-                    let (parent_entry, cascaded) =
-                        cascade_parent_entry(parent_entry, file_delete_cascades)?;
-                    cascaded_rows += usize::from(cascaded);
-                    assembler.push(parent_entry)?;
-                    next_mutation = Some(mutation);
-                    next_parent_entry = parent_entries.next(self, store, overlay).await?;
-                }
-            }
-        }
-
-        while let Some(mutation) = next_mutation {
-            let created_at = mutation.delta.created_at;
-            assembler.push_mutation(mutation, created_at)?;
-            next_mutation = mutations.next_pending()?;
-        }
-        let actual_mutation_count = mutations.consumed_count();
-        if actual_mutation_count != mutation_count {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked-state ordered bulk mutation count mismatch: expected {mutation_count}, received {actual_mutation_count}"
-                ),
-            ));
-        }
-
-        let built = assembler.finish(self)?;
-        let result = self
-            .persist_built_tree(writes, overlay, built, commit_id)
-            .await?;
-        Ok((result, cascaded_rows))
+        self.apply_sorted_mutation_frontier(
+            store, writes, overlay, root_id, mutations, cascades, commit_id,
+        )
+        .await
     }
 
     /// Returns true when every sorted incoming key is strictly beyond the
@@ -830,9 +819,10 @@ impl TrackedStateTree {
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
         mutations: Vec<TrackedStateMutation>,
+        cascades: Vec<TrackedStateCascade>,
         commit_id: Option<&str>,
-    ) -> Result<TrackedStateApplyResult, LixError> {
-        if mutations.is_empty() {
+    ) -> Result<(TrackedStateApplyResult, usize), LixError> {
+        if mutations.is_empty() && cascades.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked-state parent mutation frontier must not be empty",
@@ -842,8 +832,13 @@ impl TrackedStateTree {
         let root_node = self
             .load_node_with_overlay(store, overlay, root_id.as_bytes())
             .await?;
+        if frontier_metrics_enabled() {
+            FRONTIER_METRICS
+                .range_events
+                .fetch_add(cascades.len() as u64, Ordering::Relaxed);
+        }
         self.apply_radix_mutation_frontier(
-            store, writes, overlay, root_id, root_node, mutations, commit_id,
+            store, writes, overlay, root_id, root_node, mutations, cascades, commit_id,
         )
         .await
     }
@@ -856,8 +851,9 @@ impl TrackedStateTree {
         root_id: &TrackedStateRootId,
         root_node: DecodedNode,
         mutations: Vec<TrackedStateMutation>,
+        cascades: Vec<TrackedStateCascade>,
         commit_id: Option<&str>,
-    ) -> Result<TrackedStateApplyResult, LixError> {
+    ) -> Result<(TrackedStateApplyResult, usize), LixError> {
         let mut chunks = PendingChunkBatchBuilder::default();
         let replacement = self
             .apply_radix_node(
@@ -866,6 +862,7 @@ impl TrackedStateTree {
                 *root_id.as_bytes(),
                 root_node,
                 mutations,
+                &cascades,
                 0,
                 &mut chunks,
             )
@@ -873,13 +870,16 @@ impl TrackedStateTree {
         if !replacement.changed {
             record_reused_node();
             emit_frontier_metrics();
-            return Ok(TrackedStateApplyResult {
-                root_id: root_id.clone(),
-                row_count: replacement.summary.subtree_count as usize,
-                tree_height: replacement.summary.subtree_height as usize,
-                chunk_count: 0,
-                chunk_bytes: 0,
-            });
+            return Ok((
+                TrackedStateApplyResult {
+                    root_id: root_id.clone(),
+                    row_count: replacement.summary.subtree_count as usize,
+                    tree_height: replacement.summary.subtree_height as usize,
+                    chunk_count: 0,
+                    chunk_bytes: 0,
+                },
+                replacement.cascaded_rows,
+            ));
         }
         let chunk_bytes = chunks.data.len();
         self.persist_built_tree(
@@ -895,6 +895,7 @@ impl TrackedStateTree {
             commit_id,
         )
         .await
+        .map(|result| (result, replacement.cascaded_rows))
     }
 
     async fn build_and_stage_sorted_mutations(
@@ -923,6 +924,7 @@ impl TrackedStateTree {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         node: DecodedNode,
         mutations: Vec<TrackedStateMutation>,
+        cascades: &'a [TrackedStateCascade],
         depth: usize,
         chunks: &'a mut PendingChunkBatchBuilder,
     ) -> Pin<Box<dyn Future<Output = Result<RadixFrontierNode, LixError>> + Send + 'a>>
@@ -930,16 +932,67 @@ impl TrackedStateTree {
         S: StorageAdapterRead + ?Sized + 'a,
     {
         Box::pin(async move {
-            if mutations.is_empty() {
+            if mutations.is_empty() && cascades.is_empty() {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked-state radix frontier received an empty mutation group",
                 ));
             }
+            if frontier_metrics_enabled() && !cascades.is_empty() {
+                FRONTIER_METRICS
+                    .cascade_nodes_scanned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             match node {
                 DecodedNode::Leaf(leaf) => {
                     let mut entries = leaf.into_entries();
                     let mut changed = false;
+                    let mut cascaded_rows = 0usize;
+                    if !cascades.is_empty() {
+                        if frontier_metrics_enabled() {
+                            FRONTIER_METRICS
+                                .cascade_decoded_rows
+                                .fetch_add(entries.len() as u64, Ordering::Relaxed);
+                        }
+                        for entry in &mut entries {
+                            if mutations
+                                .binary_search_by(|mutation| {
+                                    mutation.encoded_key.as_ref().cmp(entry.key.as_ref())
+                                })
+                                .is_ok()
+                            {
+                                continue;
+                            }
+                            let key = decode_key(&entry.key)?;
+                            let Some(file_id) = key.file_id.as_deref() else {
+                                continue;
+                            };
+                            let Some(cascade) =
+                                cascades.iter().find(|cascade| cascade.file_id == file_id)
+                            else {
+                                continue;
+                            };
+                            let parent_value = decode_value(&entry.value)?;
+                            if parent_value.deleted() {
+                                continue;
+                            }
+                            entry.value = encode_value_ref(TrackedStateIndexValueRef {
+                                change_id: cascade.change_id,
+                                commit_id: cascade.commit_id,
+                                deleted: true,
+                                created_at: parent_value.created_at(),
+                                updated_at: cascade.updated_at,
+                            })
+                            .into();
+                            changed = true;
+                            cascaded_rows = cascaded_rows.saturating_add(1);
+                            if frontier_metrics_enabled() {
+                                FRONTIER_METRICS
+                                    .cascade_streamed_outputs
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     for mutation in mutations {
                         match entries.binary_search_by(|entry| {
                             entry.key.as_ref().cmp(mutation.encoded_key.as_ref())
@@ -995,12 +1048,14 @@ impl TrackedStateTree {
                         return Ok(RadixFrontierNode {
                             summary,
                             changed: false,
+                            cascaded_rows: 0,
                         });
                     }
                     let (summary, _) = self.build_radix_subtree(entries, depth, chunks)?;
                     Ok(RadixFrontierNode {
                         summary,
                         changed: true,
+                        cascaded_rows,
                     })
                 }
                 DecodedNode::Internal(internal) => {
@@ -1034,6 +1089,7 @@ impl TrackedStateTree {
                                 radix_digit(existing.first_key.as_ref(), divergence_depth);
                             let mut replacement_children = Vec::new();
                             let mut existing_bucket_replaced = false;
+                            let mut cascaded_rows = 0usize;
                             for (_, group) in radix_mutation_groups(mutations, divergence_depth) {
                                 let group_digit = radix_digit(
                                     group
@@ -1052,10 +1108,13 @@ impl TrackedStateTree {
                                             hash,
                                             DecodedNode::Internal(existing_internal.clone()),
                                             group,
+                                            cascades,
                                             divergence_depth + 1,
                                             chunks,
                                         )
                                         .await?;
+                                    cascaded_rows =
+                                        cascaded_rows.saturating_add(replacement.cascaded_rows);
                                     if !replacement.changed {
                                         record_reused_node();
                                     }
@@ -1076,7 +1135,43 @@ impl TrackedStateTree {
                                 )?;
                                 replacement_children.push(summary);
                             }
-                            if !existing_bucket_replaced {
+                            if !existing_bucket_replaced && !cascades.is_empty() {
+                                if !cascade_overlaps_child(&existing, cascades)? {
+                                    if frontier_metrics_enabled() {
+                                        FRONTIER_METRICS
+                                            .pruned_subtrees
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    record_reused_node();
+                                    replacement_children.push(existing);
+                                } else {
+                                    if frontier_metrics_enabled() {
+                                        FRONTIER_METRICS
+                                            .boundary_descents
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    let replacement = self
+                                        .apply_radix_node(
+                                            store,
+                                            overlay,
+                                            hash,
+                                            DecodedNode::Internal(existing_internal),
+                                            Vec::new(),
+                                            cascades,
+                                            divergence_depth + 1,
+                                            chunks,
+                                        )
+                                        .await?;
+                                    cascaded_rows =
+                                        cascaded_rows.saturating_add(replacement.cascaded_rows);
+                                    replacement_children.push(if replacement.changed {
+                                        replacement.summary
+                                    } else {
+                                        record_reused_node();
+                                        replacement.summary
+                                    });
+                                }
+                            } else if !existing_bucket_replaced {
                                 record_reused_node();
                                 replacement_children.push(existing);
                             }
@@ -1116,6 +1211,7 @@ impl TrackedStateTree {
                             return Ok(RadixFrontierNode {
                                 summary,
                                 changed: true,
+                                cascaded_rows,
                             });
                         }
                     }
@@ -1126,6 +1222,7 @@ impl TrackedStateTree {
                         Vec::with_capacity(children.len() + groups.len());
                     let mut group_index = 0usize;
                     let mut changed = false;
+                    let mut cascaded_rows = 0usize;
                     for child in children {
                         let child_digit = radix_digit(child.first_key.as_ref(), node_depth);
                         while group_index < groups.len() && groups[group_index].0 < child_digit {
@@ -1155,11 +1252,13 @@ impl TrackedStateTree {
                                     child.child_hash,
                                     child_node,
                                     group,
+                                    cascades,
                                     node_depth + 1,
                                     chunks,
                                 )
                                 .await?;
                             changed |= replacement.changed;
+                            cascaded_rows = cascaded_rows.saturating_add(replacement.cascaded_rows);
                             replacement_children.push(if replacement.changed {
                                 replacement.summary
                             } else {
@@ -1167,9 +1266,44 @@ impl TrackedStateTree {
                                 child.clone()
                             });
                             group_index += 1;
-                        } else {
+                        } else if cascades.is_empty() || !cascade_overlaps_child(&child, cascades)?
+                        {
+                            if !cascades.is_empty() && frontier_metrics_enabled() {
+                                FRONTIER_METRICS
+                                    .pruned_subtrees
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             record_reused_node();
                             replacement_children.push(child);
+                        } else {
+                            if frontier_metrics_enabled() {
+                                FRONTIER_METRICS
+                                    .boundary_descents
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            let child_node = self
+                                .load_node_with_overlay(store, overlay, &child.child_hash)
+                                .await?;
+                            let replacement = self
+                                .apply_radix_node(
+                                    store,
+                                    overlay,
+                                    child.child_hash,
+                                    child_node,
+                                    Vec::new(),
+                                    cascades,
+                                    node_depth + 1,
+                                    chunks,
+                                )
+                                .await?;
+                            changed |= replacement.changed;
+                            cascaded_rows = cascaded_rows.saturating_add(replacement.cascaded_rows);
+                            replacement_children.push(if replacement.changed {
+                                replacement.summary
+                            } else {
+                                record_reused_node();
+                                child
+                            });
                         }
                     }
                     while group_index < groups.len() {
@@ -1191,6 +1325,7 @@ impl TrackedStateTree {
                         return Ok(RadixFrontierNode {
                             summary: internal_summary(hash, &replacement_children)?,
                             changed: false,
+                            cascaded_rows: 0,
                         });
                     }
                     let subtree_count = replacement_children
@@ -1224,6 +1359,7 @@ impl TrackedStateTree {
                     Ok(RadixFrontierNode {
                         summary,
                         changed: true,
+                        cascaded_rows,
                     })
                 }
             }
@@ -1797,31 +1933,10 @@ impl PendingChunkBatchBuilder {
     }
 }
 
-struct PendingRootMutation<'a> {
-    delta: TrackedStateDeltaRef<'a>,
-    require_absence: bool,
-    encoded_key: Bytes,
-}
-
-/// In-order cursor over leaf entries that reads staged chunks before the
-/// durable store. It retains only the internal-node path and one decoded leaf,
-/// so dense commit materialization does not clone a parent root into a
-/// full-workload vector before merging it with the incoming rows.
-struct OrderedLeafCursor {
-    pending_root: Option<[u8; TRACKED_STATE_HASH_BYTES]>,
-    frames: Vec<OrderedLeafCursorFrame>,
-    leaf: Option<DecodedLeafNodeRef>,
-    leaf_entry_index: usize,
-}
-
-struct OrderedLeafCursorFrame {
-    children: Vec<ChildSummary>,
-    next_child_index: usize,
-}
-
 struct RadixFrontierNode {
     summary: ChildSummary,
     changed: bool,
+    cascaded_rows: usize,
 }
 
 fn radix_mutation_groups(
@@ -1885,272 +2000,48 @@ fn validate_radix_children(children: &[ChildSummary], depth: usize) -> Result<()
     Ok(())
 }
 
-impl OrderedLeafCursor {
-    fn new(root_hash: [u8; TRACKED_STATE_HASH_BYTES]) -> Self {
-        Self {
-            pending_root: Some(root_hash),
-            frames: Vec::new(),
-            leaf: None,
-            leaf_entry_index: 0,
-        }
-    }
-
-    async fn next(
-        &mut self,
-        tree: &TrackedStateTree,
-        store: &(impl StorageAdapterRead + ?Sized),
-        overlay: &storage::TrackedStateChunkOverlay,
-    ) -> Result<Option<EncodedLeafEntry>, LixError> {
-        loop {
-            if let Some(leaf) = self.leaf.as_ref() {
-                if let Some(entry) = leaf.entry_owned(self.leaf_entry_index) {
-                    self.leaf_entry_index += 1;
-                    return Ok(Some(entry));
-                }
-                self.leaf = None;
-                self.leaf_entry_index = 0;
-            }
-
-            let Some(hash) = self.next_node_hash() else {
-                return Ok(None);
-            };
-            match tree.load_node_with_overlay(store, overlay, &hash).await? {
-                DecodedNode::Leaf(leaf) => self.leaf = Some(leaf),
-                DecodedNode::Internal(internal) => {
-                    self.frames.push(OrderedLeafCursorFrame {
-                        children: internal.into_children(),
-                        next_child_index: 0,
-                    });
-                }
-            }
-        }
-    }
-
-    fn next_node_hash(&mut self) -> Option<[u8; TRACKED_STATE_HASH_BYTES]> {
-        if let Some(root_hash) = self.pending_root.take() {
-            return Some(root_hash);
-        }
-        loop {
-            let frame = self.frames.last_mut()?;
-            if let Some(child) = frame.children.get(frame.next_child_index) {
-                frame.next_child_index += 1;
-                return Some(child.child_hash);
-            }
-            self.frames.pop();
-        }
-    }
-}
-
-fn cascade_parent_entry(
-    mut entry: EncodedLeafEntry,
-    file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'_>>,
-) -> Result<(EncodedLeafEntry, bool), LixError> {
-    if file_delete_cascades.is_empty() {
-        return Ok((entry, false));
-    }
-    let key = decode_key(&entry.key)?;
-    let Some(file_id) = key.file_id.as_deref() else {
-        return Ok((entry, false));
-    };
-    let Some(cascade) = file_delete_cascades.get(file_id) else {
-        return Ok((entry, false));
-    };
-    let parent_value = decode_value(&entry.value)?;
-    if parent_value.deleted() {
-        return Ok((entry, false));
-    }
-    entry.value = encode_value_ref(TrackedStateIndexValueRef {
-        change_id: cascade.change_id,
-        commit_id: cascade.commit_id,
-        deleted: true,
-        created_at: parent_value.created_at(),
-        updated_at: cascade.updated_at,
-    })
-    .into();
-    Ok((entry, true))
-}
-
-const PENDING_ROOT_MUTATION_WINDOW: usize = 4096;
-
-struct PendingRootMutationCursor<'a, I> {
-    source: Box<I>,
-    pending: VecDeque<PendingRootMutation<'a>>,
-    consumed_count: usize,
-}
-
-impl<'a, I> PendingRootMutationCursor<'a, I>
-where
-    I: Iterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
-{
-    fn new(source: I) -> Self {
-        Self {
-            source: Box::new(source),
-            pending: VecDeque::new(),
-            consumed_count: 0,
-        }
-    }
-
-    fn next_pending(&mut self) -> Result<Option<PendingRootMutation<'a>>, LixError> {
-        if let Some(mutation) = self.pending.pop_front() {
-            self.consumed_count = self.consumed_count.saturating_add(1);
-            return Ok(Some(mutation));
-        }
-        let mut key_arena = Vec::with_capacity(PENDING_ROOT_MUTATION_WINDOW * 96);
-        let mut pending = Vec::with_capacity(PENDING_ROOT_MUTATION_WINDOW);
-        for _ in 0..PENDING_ROOT_MUTATION_WINDOW {
-            let Some(mutation) = self.source.next() else {
-                break;
-            };
-            let mutation = mutation?;
-            let delta = mutation.delta;
-            let encoded_key = encode_key_ref_into(
-                &mut key_arena,
-                TrackedStateKeyRef {
-                    schema_key: delta.schema_key,
-                    file_id: delta.file_id,
-                    entity_pk: delta.entity_pk,
-                },
-            );
-            pending.push((delta, mutation.require_absence, encoded_key));
-        }
-        if pending.is_empty() {
-            return Ok(None);
-        }
-        let key_arena = Bytes::from(key_arena);
-        self.pending.extend(
-            pending.into_iter().map(
-                |(delta, require_absence, encoded_key)| PendingRootMutation {
-                    delta,
-                    require_absence,
-                    encoded_key: key_arena.slice(encoded_key),
-                },
-            ),
-        );
-        let mutation = self.pending.pop_front();
-        self.consumed_count = self
-            .consumed_count
-            .saturating_add(usize::from(mutation.is_some()));
-        Ok(mutation)
-    }
-
-    fn consumed_count(&self) -> usize {
-        self.consumed_count
-    }
-}
-
-fn duplicate_root_insert_error(delta: &TrackedStateDeltaRef<'_>) -> LixError {
-    let entity_pk = delta
-        .entity_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
-    LixError::new(
-        LixError::CODE_UNIQUE,
-        format!(
-            "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
-            delta.schema_key
-        ),
-    )
-}
-
-struct OrderedTreeAssembler {
-    entries: OrderedLeafAccumulator,
-}
-
-#[derive(Debug)]
-enum OrderedLeafValue {
-    Shared(Bytes),
-    Arena(Range<usize>),
-}
-
-#[derive(Debug)]
-struct OrderedLeafEntry {
-    key: Bytes,
-    value: OrderedLeafValue,
-}
-
-#[derive(Debug, Default)]
-struct OrderedLeafAccumulator {
-    entries: Vec<OrderedLeafEntry>,
-    value_arena: Vec<u8>,
-}
-
-impl OrderedLeafAccumulator {
-    fn into_entries(self) -> Vec<EncodedLeafEntry> {
-        let value_arena = Bytes::from(self.value_arena);
-        self.entries
-            .into_iter()
-            .map(|entry| EncodedLeafEntry {
-                key: entry.key,
-                value: match entry.value {
-                    OrderedLeafValue::Shared(value) => value,
-                    OrderedLeafValue::Arena(range) => value_arena.slice(range),
-                },
-            })
-            .collect()
-    }
-}
-
-impl OrderedTreeAssembler {
-    fn new(mutation_count: usize) -> Self {
-        Self {
-            entries: OrderedLeafAccumulator {
-                entries: Vec::with_capacity(mutation_count),
-                value_arena: Vec::with_capacity(mutation_count.saturating_mul(24)),
-            },
-        }
-    }
-
-    fn push(&mut self, entry: EncodedLeafEntry) -> Result<(), LixError> {
-        self.push_entry(OrderedLeafEntry {
-            key: entry.key,
-            value: OrderedLeafValue::Shared(entry.value),
-        })?;
-        Ok(())
-    }
-
-    fn push_mutation(
-        &mut self,
-        mutation: PendingRootMutation<'_>,
-        created_at: crate::common::LixTimestamp,
-    ) -> Result<(), LixError> {
-        let value_start = self.entries.value_arena.len();
-        encode_value_ref_into(
-            &mut self.entries.value_arena,
-            TrackedStateIndexValueRef {
-                change_id: mutation.delta.change_id,
-                commit_id: mutation.delta.commit_id,
-                deleted: mutation.delta.deleted,
-                created_at,
-                updated_at: mutation.delta.updated_at,
-            },
-        );
-        let value_end = self.entries.value_arena.len();
-        self.push_entry(OrderedLeafEntry {
-            key: mutation.encoded_key,
-            value: OrderedLeafValue::Arena(value_start..value_end),
-        })?;
-        Ok(())
-    }
-
-    fn push_entry(&mut self, entry: OrderedLeafEntry) -> Result<(), LixError> {
-        if self
-            .entries
-            .entries
-            .last()
-            .is_some_and(|previous| previous.key >= entry.key)
+/// Uses authenticated child bounds to prune cascade subtrees whose complete
+/// key interval cannot contain any targeted file id. A child spanning schema
+/// boundaries is conservatively retained for descent.
+fn cascade_overlaps_child(
+    child: &ChildSummary,
+    cascades: &[TrackedStateCascade],
+) -> Result<bool, LixError> {
+    let first = decode_key(&child.first_key)?;
+    let last = decode_key(&child.last_key)?;
+    for cascade in cascades {
+        let Some(first_file) = first.file_id.as_deref() else {
+            return Ok(true);
+        };
+        let Some(last_file) = last.file_id.as_deref() else {
+            return Ok(true);
+        };
+        if first.schema_key != last.schema_key
+            || (first_file <= cascade.file_id.as_str() && last_file >= cascade.file_id.as_str())
         {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_cascades(cascades: &[TrackedStateCascade]) -> Result<(), LixError> {
+    let mut file_ids = HashSet::with_capacity(cascades.len());
+    for cascade in cascades {
+        if cascade.file_id.is_empty() {
             return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state ordered bulk mutation keys must be strictly ascending",
+                LixError::CODE_INVALID_PARAM,
+                "tracked-state cascade file id must not be empty",
             ));
         }
-        self.entries.entries.push(entry);
-        Ok(())
+        if !file_ids.insert(cascade.file_id.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "tracked-state cascade file ids must be unique",
+            ));
+        }
     }
-
-    fn finish(self, tree: &TrackedStateTree) -> Result<BuiltTree, LixError> {
-        tree.build_tree_from_entries(self.entries.into_entries())
-    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -3812,6 +3703,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cascade_frontier_combines_range_event_with_point_mutation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 128,
+            min_chunk_bytes: 64,
+            max_chunk_bytes: 256,
+        });
+        let rows = (0..128usize)
+            .map(|index| {
+                let file_id = if index < 64 { "file-a" } else { "file-b" };
+                (
+                    key("schema", Some(file_id), &format!("entity-{index:03}")),
+                    value(&format!("value-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            rows.iter()
+                .map(|(key, value)| mutation_owned(key.clone(), value.clone()))
+                .collect(),
+            None,
+        )
+        .await
+        .expect("base cascade root should build");
+        let point_key = key("schema", Some("file-b"), "entity-100");
+        let point_value = value("point", Some("{\"point\":true}"));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("cascade read should open");
+        let mut writes = storage.new_write_set();
+        let mut overlay = storage::TrackedStateChunkOverlay::new();
+        let (updated, cascaded_rows) = tree
+            .apply_mutations_with_cascades(
+                &read,
+                &mut writes,
+                &mut overlay,
+                Some(&base.root_id),
+                TrackedStateMutationBatch::from_shared(vec![mutation(&point_key, &point_value)]),
+                vec![TrackedStateCascade {
+                    file_id: "file-a".to_string(),
+                    change_id: ChangeId::for_test_label("cascade"),
+                    commit_id: CommitId::for_test_label("cascade-commit"),
+                    updated_at: LixTimestamp::expect_parse(
+                        "cascade updated_at",
+                        "2026-02-01T00:00:00Z",
+                    ),
+                }],
+                None,
+            )
+            .await
+            .expect("cascade frontier should apply");
+        assert_eq!(cascaded_rows, 64);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("canonical read should open");
+        let mut canonical_entries = tree
+            .collect_leaf_entries(&read, &base.root_id)
+            .await
+            .expect("base cascade entries should collect");
+        for entry in &mut canonical_entries {
+            let decoded_key = decode_key(&entry.key).expect("cascade key should decode");
+            if decoded_key.file_id.as_deref() == Some("file-a") {
+                let previous = decode_value(&entry.value).expect("cascade value should decode");
+                entry.value = encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: ChangeId::for_test_label("cascade"),
+                    commit_id: CommitId::for_test_label("cascade-commit"),
+                    deleted: true,
+                    created_at: previous.created_at(),
+                    updated_at: LixTimestamp::expect_parse(
+                        "canonical cascade updated_at",
+                        "2026-02-01T00:00:00Z",
+                    ),
+                })
+                .into();
+            }
+        }
+        canonical_entries.sort_by(|left, right| left.key.cmp(&right.key));
+        let point_encoded_key = encode_key(&point_key);
+        let point_encoded_value = encode_value(&point_value);
+        let point_index = canonical_entries
+            .binary_search_by(|entry| entry.key.as_ref().cmp(&point_encoded_key))
+            .expect("point key should exist");
+        canonical_entries[point_index].value = point_encoded_value.into();
+        let canonical = tree
+            .build_tree_from_entries(canonical_entries)
+            .expect("canonical cascade root should build");
+        assert_eq!(updated.root_id, canonical.root_id);
+    }
+
+    #[test]
+    fn cascade_frontier_rejects_empty_and_duplicate_file_ids() {
+        let cascade = |file_id: &str| TrackedStateCascade {
+            file_id: file_id.to_string(),
+            change_id: ChangeId::for_test_label("cascade-validation"),
+            commit_id: CommitId::for_test_label("cascade-validation-commit"),
+            updated_at: LixTimestamp::expect_parse(
+                "cascade validation updated_at",
+                "2026-02-01T00:00:00Z",
+            ),
+        };
+
+        assert!(validate_cascades(&[cascade("")]).is_err());
+        assert!(validate_cascades(&[cascade("file-a"), cascade("file-a")]).is_err());
+        assert!(validate_cascades(&[cascade("file-a"), cascade("file-b")]).is_ok());
+    }
+
+    #[tokio::test]
     async fn batch_insert_matches_full_canonical_rebuild() {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
@@ -4150,14 +4154,8 @@ mod tests {
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label("commit"),
             deleted: snapshot_content.is_none(),
-            created_at: crate::common::LixTimestamp::expect_parse(
-                "created_at",
-                "2026-01-01T00:00:00Z",
-            ),
-            updated_at: crate::common::LixTimestamp::expect_parse(
-                "updated_at",
-                "2026-01-01T00:00:00Z",
-            ),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00Z"),
         }
     }
 }

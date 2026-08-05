@@ -34,7 +34,7 @@ use crate::tracked_state::diff::{
 #[cfg(test)]
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
-use crate::tracked_state::tree::TrackedStateTree;
+use crate::tracked_state::tree::{TrackedStateCascade, TrackedStateTree};
 #[cfg(test)]
 use crate::tracked_state::types::TrackedStateMutation;
 use crate::tracked_state::types::{
@@ -4444,35 +4444,27 @@ where
             let parent_metadata = parent_metadata
                 .as_ref()
                 .expect("dense ordered parent merge requires parent metadata");
-            if file_delete_cascades.is_empty() {
-                let mutation_batch = build_ordered_root_mutation_batch(mutation_count, mutations)?;
-                (
-                    self.tree
-                        .apply_mutations_with_overlay(
-                            self.store,
-                            self.writes,
-                            &mut self.chunk_overlay,
-                            Some(&parent_metadata.root_id),
-                            mutation_batch,
-                            Some(commit_id),
-                        )
-                        .await?,
-                    0,
+            let mutation_batch = build_ordered_root_mutation_batch(mutation_count, mutations)?;
+            let cascades = file_delete_cascades
+                .iter()
+                .map(|(file_id, delta)| TrackedStateCascade {
+                    file_id: file_id.clone(),
+                    change_id: delta.change_id,
+                    commit_id: delta.commit_id,
+                    updated_at: delta.updated_at,
+                })
+                .collect();
+            self.tree
+                .apply_mutations_with_cascades(
+                    self.store,
+                    self.writes,
+                    &mut self.chunk_overlay,
+                    Some(&parent_metadata.root_id),
+                    mutation_batch,
+                    cascades,
+                    Some(commit_id),
                 )
-            } else {
-                self.tree
-                    .merge_and_stage_ordered_parent_mutations(
-                        self.store,
-                        self.writes,
-                        &mut self.chunk_overlay,
-                        &parent_metadata.root_id,
-                        mutation_count,
-                        file_delete_cascades,
-                        mutations,
-                        Some(commit_id),
-                    )
-                    .await?
-            }
+                .await?
         };
         let changed_rows = mutation_count.checked_add(cascaded_rows).ok_or_else(|| {
             LixError::new(
