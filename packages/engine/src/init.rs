@@ -532,6 +532,7 @@ where
                     head_commit_id: control.head_commit_id,
                     checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
                     scope_digest: generation_scope_digest(&branch.branch_id, control.generation),
+                    root_backed: false,
                     indexed_chunk_count: 0,
                 },
             )?;

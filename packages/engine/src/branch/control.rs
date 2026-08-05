@@ -198,6 +198,10 @@ pub(crate) struct GenerationChunkManifest {
     /// actual chunks remain backend rows under those authenticated prefixes;
     /// GC validates this record before enumerating only the retired prefixes.
     pub(crate) scope_digest: [u8; 32],
+    /// Root-backed lifecycle publications own only the root pointer and
+    /// optional HOT rows. This authenticated scope lets deferred GC avoid
+    /// probing packed-generation spaces that cannot contain rows for it.
+    pub(crate) root_backed: bool,
     pub(crate) indexed_chunk_count: u64,
 }
 

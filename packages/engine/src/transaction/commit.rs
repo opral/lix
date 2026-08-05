@@ -4948,6 +4948,7 @@ async fn stage_branch_head_control_publications(
                         head_commit_id: control.head_commit_id,
                         checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
                         scope_digest: manifest_digest,
+                        root_backed: root_backed_branch_publications.contains(branch_id),
                         indexed_chunk_count: 0,
                     },
                 )?;

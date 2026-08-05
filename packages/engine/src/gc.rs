@@ -334,6 +334,13 @@ const GENERATION_RECLAIM_SPACES: [StorageSpace; 7] = [
     ROOT_CURRENT_BASE_SPACE,
 ];
 
+const ROOT_BACKED_RECLAIM_SPACES: [StorageSpace; 4] = [
+    HOT_ROW_SPACE,
+    HOT_FILE_SPACE,
+    HOT_COLLECTION_CONTROL_SPACE,
+    ROOT_CURRENT_BASE_SPACE,
+];
+
 async fn stage_delete_generation_prefix<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -454,12 +461,74 @@ where
         }
     }
 
+    let full_generations = records
+        .iter()
+        .filter_map(|(_, branch_id, record)| {
+            record
+                .full_generation
+                .then_some((branch_id.clone(), record.generation))
+        })
+        .collect::<BTreeSet<_>>();
+    let branch_ids = records
+        .iter()
+        .map(|(_, branch_id, _)| branch_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let active_controls = BranchHeadControlContext::new()
+        .reader(store)
+        .load_many(&branch_ids)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, control)| (branch_ids[index].clone(), control))
+        .collect::<BTreeMap<_, _>>();
+    let manifest_ids = records
+        .iter()
+        .map(|(_, branch_id, record)| (branch_id.clone(), record.generation))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let manifest_keys = manifest_ids
+        .iter()
+        .map(|(branch_id, generation)| {
+            crate::branch::encode_generation_key(branch_id, *generation)
+                .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let manifest_values = if manifest_keys.is_empty() {
+        Vec::new()
+    } else {
+        PointReadPlan::new(GENERATION_MANIFEST_SPACE, &manifest_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value
+    };
+    let manifests = manifest_ids
+        .into_iter()
+        .zip(manifest_values)
+        .map(|(identity, value)| -> Result<_, LixError> {
+            let manifest = match value {
+                None => None,
+                Some(StorageProjectedValue::FullValue(bytes)) => {
+                    Some(storage_codec::decode::<GenerationChunkManifest>(
+                        "generation chunk manifest",
+                        &bytes,
+                    )?)
+                }
+                Some(StorageProjectedValue::KeyOnly) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "generation manifest omitted its value",
+                    ));
+                }
+            };
+            Ok((identity, manifest))
+        })
+        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
     let mut stale_untracked_refs = BTreeSet::new();
     for (queue_key, branch_id, record) in records {
-        let active_control = BranchHeadControlContext::new()
-            .reader(store)
-            .load(&branch_id)
-            .await?;
+        let active_control = active_controls.get(&branch_id).copied().flatten();
         if record.full_generation {
             if active_control.is_some_and(|control| control.generation == record.generation) {
                 return Err(LixError::new(
@@ -471,25 +540,28 @@ where
                 ));
             }
         } else if active_control.is_none_or(|control| control.generation != record.generation) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "checkpoint reclamation for generation '{}' is not selected by the active generation of branch '{}'",
-                    record.generation, branch_id
-                ),
-            ));
+            if !full_generations.contains(&(branch_id.clone(), record.generation)) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "checkpoint reclamation for generation '{}' is not selected by the active generation of branch '{}'",
+                        record.generation, branch_id
+                    ),
+                ));
+            }
         }
-        let manifest_key = StorageKey(Bytes::from(crate::branch::encode_generation_key(
-            &branch_id,
-            record.generation,
-        )?));
-        let manifest = PointReadPlan::new(GENERATION_MANIFEST_SPACE, &[manifest_key])
-            .materialize(store, StorageGetOptions::default())
-            .await?
-            .value
-            .into_iter()
-            .next()
-            .flatten()
+        let manifest = manifests
+            .get(&(branch_id.clone(), record.generation))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "generation '{}' has a reclamation record but no authenticated manifest",
+                        record.generation
+                    ),
+                )
+            })?
+            .as_ref()
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -499,14 +571,6 @@ where
                     ),
                 )
             })?;
-        let StorageProjectedValue::FullValue(manifest_bytes) = manifest else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "generation manifest omitted its value",
-            ));
-        };
-        let manifest: GenerationChunkManifest =
-            storage_codec::decode("generation chunk manifest", &manifest_bytes)?;
         let expected_digest = crate::branch::generation_scope_digest(&branch_id, record.generation);
         if manifest.generation != record.generation
             || (record.full_generation && manifest.head_commit_id != record.head_commit_id)
@@ -521,11 +585,16 @@ where
             ));
         }
         if record.full_generation {
-            for space in GENERATION_RECLAIM_SPACES {
+            let spaces = if manifest.root_backed {
+                ROOT_BACKED_RECLAIM_SPACES.as_slice()
+            } else {
+                GENERATION_RECLAIM_SPACES.as_slice()
+            };
+            for space in spaces {
                 stage_delete_generation_prefix(
                     store,
                     writes,
-                    space,
+                    *space,
                     &branch_id,
                     record.generation,
                     &mut stale_untracked_refs,
@@ -1568,8 +1637,8 @@ mod tests {
         NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
     };
     use crate::live_state::{
-        CurrentStateDeltaRef, HOT_FILE_SPACE, TrackedHeadContext, WorkingDiffIndexCoverage,
-        generation_scope_prefix,
+        CurrentStateDeltaRef, HOT_FILE_SPACE, PACKED_CURRENT_BASE_SPACE, TrackedHeadContext,
+        WorkingDiffIndexCoverage, generation_scope_prefix,
     };
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
@@ -1683,6 +1752,15 @@ mod tests {
                 bytes: Bytes::from_static(b"marker"),
             },
         );
+        let mut packed_key = generation_scope_prefix(branch_id, generation);
+        packed_key.extend_from_slice(b"packed-row-outside-root-scope");
+        writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(packed_key.clone())),
+            StorageValue {
+                bytes: Bytes::from_static(b"packed-marker"),
+            },
+        );
         stage_generation_manifest(
             &mut writes,
             branch_id,
@@ -1691,6 +1769,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: None,
                 scope_digest: digest,
+                root_backed: true,
                 indexed_chunk_count: 1,
             },
         )
@@ -1748,6 +1827,21 @@ mod tests {
                 .flatten()
                 .is_none()
         );
+        assert!(
+            PointReadPlan::new(
+                PACKED_CURRENT_BASE_SPACE,
+                &[StorageKey(Bytes::from(packed_key))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("packed scope probe should be readable")
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some(),
+            "root-backed reclamation must not probe or delete packed rows"
+        );
     }
 
     #[tokio::test]
@@ -1785,6 +1879,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: None,
                 scope_digest: digest,
+                root_backed: false,
                 indexed_chunk_count: 0,
             },
         )
@@ -1861,6 +1956,7 @@ mod tests {
                 head_commit_id: advanced_head_commit_id,
                 checkpoint_commit_id: Some(checkpoint_commit_id),
                 scope_digest: digest,
+                root_backed: false,
                 indexed_chunk_count: 0,
             },
         )
@@ -1916,6 +2012,69 @@ mod tests {
             .is_some(),
             "checkpoint-only reclamation must retain the active manifest"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_generation_collects_checkpoint_rotation_records_after_delete() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "retired-after-checkpoint-branch";
+        let generation = CommitId::for_test_label("retired-after-checkpoint-generation");
+        let head_commit_id = CommitId::for_test_label("retired-after-checkpoint-head");
+        let old_checkpoint_commit_id = CommitId::for_test_label("retired-old-checkpoint");
+        let current_checkpoint_commit_id = CommitId::for_test_label("retired-current-checkpoint");
+        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let mut writes = storage.new_write_set();
+        stage_generation_manifest(
+            &mut writes,
+            branch_id,
+            GenerationChunkManifest {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: Some(current_checkpoint_commit_id),
+                scope_digest: digest,
+                root_backed: false,
+                indexed_chunk_count: 0,
+            },
+        )
+        .expect("retired manifest should stage");
+        stage_generation_reclamation(
+            &mut writes,
+            branch_id,
+            GenerationReclamation {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: Some(old_checkpoint_commit_id),
+                full_generation: false,
+                manifest_digest: digest,
+            },
+        )
+        .expect("old checkpoint reclamation should stage");
+        stage_generation_reclamation(
+            &mut writes,
+            branch_id,
+            GenerationReclamation {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: Some(current_checkpoint_commit_id),
+                full_generation: true,
+                manifest_digest: digest,
+            },
+        )
+        .expect("full generation reclamation should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("retired generation fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retired generation read should open");
+        let mut gc_writes = storage.new_write_set();
+        super::stage_collect_reclaimed_generations(&read, &mut gc_writes)
+            .await
+            .expect("retired partial and full records should collect together");
+        assert!(!gc_writes.is_empty());
     }
 
     #[tokio::test]

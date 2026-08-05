@@ -153,7 +153,7 @@ where
         },
     );
     let mut resume_after = None;
-    let mut reclaimed_branches = BTreeSet::<[u8; 16]>::new();
+    let mut records = Vec::new();
     loop {
         let page = plan
             .collect(
@@ -176,8 +176,6 @@ where
                     "plugin checkpoint reclamation key has an invalid generation token",
                 ));
             }
-            let branch_id = uuid::Uuid::from_bytes(key.branch_id);
-            let branch_bytes = branch_id.as_bytes();
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -192,52 +190,73 @@ where
                     "plugin checkpoint reclamation key/value generation mismatch",
                 ));
             }
-            let branch_id_string = branch_id.to_string();
-            let control = crate::branch::BranchHeadControlContext::new()
-                .reader(read)
-                .load(&branch_id_string)
-                .await?;
-            if control.is_some() {
-                // A branch may have been recreated before GC. Its new
-                // checkpoints share the branch prefix, so fail closed rather
-                // than deleting the recreated branch's active files.
-                continue;
-            }
-            if reclaimed_branches.insert(key.branch_id) {
-                let checkpoint_plan = ScanPlan::prefix(
-                    PLUGIN_CHECKPOINT_SPACE,
-                    StoragePrefix {
-                        bytes: Bytes::copy_from_slice(branch_bytes),
-                    },
-                );
-                let mut checkpoint_resume = None;
-                loop {
-                    let chunk = checkpoint_plan
-                        .collect(
-                            read,
-                            StorageScanOptions {
-                                projection: StorageCoreProjection::KeyOnly,
-                                resume_after: checkpoint_resume.clone(),
-                                ..StorageScanOptions::default()
-                            },
-                        )
-                        .await?
-                        .value;
-                    checkpoint_resume = chunk.entries.last().map(|item| item.key.clone());
-                    writes.delete_batch(
-                        PLUGIN_CHECKPOINT_SPACE,
-                        chunk.entries.into_iter().map(|item| item.key),
-                    );
-                    if !chunk.has_more || checkpoint_resume.is_none() {
-                        break;
-                    }
-                }
-            }
-            writes.delete(PLUGIN_CHECKPOINT_RECLAMATION_SPACE, entry.key);
+            records.push((entry.key, key));
         }
         if !page.has_more || resume_after.is_none() {
             break;
         }
+    }
+
+    let branch_ids = records
+        .iter()
+        .map(|(_, key)| uuid::Uuid::from_bytes(key.branch_id).to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let active_controls = crate::branch::BranchHeadControlContext::new()
+        .reader(read)
+        .load_many(&branch_ids)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, control)| (branch_ids[index].clone(), control))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut reclaimed_branches = BTreeSet::<[u8; 16]>::new();
+    for (queue_key, key) in records {
+        let branch_id = uuid::Uuid::from_bytes(key.branch_id);
+        let branch_bytes = branch_id.as_bytes();
+        let control = active_controls
+            .get(&branch_id.to_string())
+            .copied()
+            .flatten();
+        if control.is_some() {
+            // A branch may have been recreated before GC. Its new
+            // checkpoints share the branch prefix, so fail closed rather
+            // than deleting the recreated branch's active files.
+            continue;
+        }
+        if reclaimed_branches.insert(key.branch_id) {
+            let checkpoint_plan = ScanPlan::prefix(
+                PLUGIN_CHECKPOINT_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::copy_from_slice(branch_bytes),
+                },
+            );
+            let mut checkpoint_resume = None;
+            loop {
+                let chunk = checkpoint_plan
+                    .collect(
+                        read,
+                        StorageScanOptions {
+                            projection: StorageCoreProjection::KeyOnly,
+                            resume_after: checkpoint_resume.clone(),
+                            ..StorageScanOptions::default()
+                        },
+                    )
+                    .await?
+                    .value;
+                checkpoint_resume = chunk.entries.last().map(|item| item.key.clone());
+                writes.delete_batch(
+                    PLUGIN_CHECKPOINT_SPACE,
+                    chunk.entries.into_iter().map(|item| item.key),
+                );
+                if !chunk.has_more || checkpoint_resume.is_none() {
+                    break;
+                }
+            }
+        }
+        writes.delete(PLUGIN_CHECKPOINT_RECLAMATION_SPACE, queue_key);
     }
     Ok(())
 }
