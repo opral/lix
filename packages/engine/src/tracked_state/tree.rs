@@ -897,8 +897,15 @@ impl TrackedStateTree {
                 .await?
         {
             return self
-                .rebuild_from_sorted_mutations(
-                    store, writes, overlay, root_id, mutations, commit_id,
+                .apply_insert_frontier(
+                    store,
+                    writes,
+                    overlay,
+                    root_id,
+                    root_node,
+                    mutations,
+                    &mut decoded_frontier,
+                    commit_id,
                 )
                 .await;
         }
@@ -1046,6 +1053,102 @@ impl TrackedStateTree {
         };
         self.persist_built_tree(writes, overlay, built, commit_id)
             .await
+    }
+
+    async fn apply_insert_frontier(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        root_id: &TrackedStateRootId,
+        root_node: DecodedNode,
+        mutations: Vec<TrackedStateMutation>,
+        decoded_frontier: &mut HashMap<[u8; TRACKED_STATE_HASH_BYTES], DecodedNode>,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
+        let mut candidate_chunks = PendingChunkBatchBuilder::default();
+        let replacement = self
+            .apply_sparse_node(
+                store,
+                overlay,
+                *root_id.as_bytes(),
+                Some(root_node),
+                mutations,
+                0,
+                decoded_frontier,
+                &mut candidate_chunks,
+            )
+            .await?;
+        record_transient_batch(&candidate_chunks);
+        let leaf_summaries = self
+            .flatten_frontier_leaves(store, overlay, &candidate_chunks, replacement.summaries)
+            .await?;
+        let mut chunks = PendingChunkBatchBuilder::default();
+        for summary in &leaf_summaries {
+            if candidate_chunks.chunks.contains_key(&summary.child_hash) {
+                chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
+            }
+        }
+        let mut summaries = leaf_summaries;
+        let mut tree_height = 1usize;
+        while summaries.len() > 1 {
+            summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
+            tree_height += 1;
+        }
+        let root = summaries.pop().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state insert frontier produced no root",
+            )
+        })?;
+        let chunk_bytes = chunks.data.len();
+        self.persist_built_tree(
+            writes,
+            overlay,
+            BuiltTree {
+                root_id: TrackedStateRootId::new(root.child_hash),
+                chunks: chunks.finish(),
+                row_count: root.subtree_count as usize,
+                tree_height,
+                chunk_bytes,
+            },
+            commit_id,
+        )
+        .await
+    }
+
+    fn flatten_frontier_leaves<'a, S>(
+        &'a self,
+        store: &'a S,
+        overlay: &'a storage::TrackedStateChunkOverlay,
+        candidate_chunks: &'a PendingChunkBatchBuilder,
+        summaries: Vec<ChildSummary>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ChildSummary>, LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+    {
+        Box::pin(async move {
+            let mut pending = summaries.into_iter().rev().collect::<Vec<_>>();
+            let mut leaves = Vec::new();
+            while let Some(summary) = pending.pop() {
+                let node = if let Some(span) = candidate_chunks.chunks.get(&summary.child_hash) {
+                    let bytes = Bytes::copy_from_slice(
+                        &candidate_chunks.data[span.start..span.start + span.len],
+                    );
+                    decode_node(&bytes)?
+                } else {
+                    self.load_node_with_overlay(store, overlay, &summary.child_hash)
+                        .await?
+                };
+                match node {
+                    DecodedNode::Leaf(_) => leaves.push(summary),
+                    DecodedNode::Internal(internal) => {
+                        pending.extend(internal.children().iter().rev().cloned());
+                    }
+                }
+            }
+            Ok(leaves)
+        })
     }
 
     fn apply_sparse_node<'a, S>(
