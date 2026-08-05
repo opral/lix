@@ -8,7 +8,9 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use lix_engine::storage::Storage;
 use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::storage_bench::{RepositoryGcBenchResult, plan_repository_gc_for_bench};
+use lix_engine::storage_bench::{
+    RepositoryGcBenchResult, audit_repository_gc_standalone_for_bench, plan_repository_gc_for_bench,
+};
 use lix_engine::{CreateBranchOptions, Engine, Value};
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
@@ -288,9 +290,6 @@ where
     )
     .await
     .expect("delete repository-GC disposable branch");
-    main.create_checkpoint()
-        .await
-        .expect("checkpoint repository-GC main after branch deletion");
     SeedResult {
         elapsed: started.elapsed(),
         puts: commit_count.saturating_mul(changes_per_commit),
@@ -313,6 +312,14 @@ async fn measure<StorageImpl>(
     StorageImpl: Storage,
 {
     let adapter = StorageAdapter::new(storage);
+    let standalone_audit = audit_repository_gc_standalone_for_bench(&adapter)
+        .await
+        .expect("audit repository-GC standalone facts");
+    println!(
+        "repository_gc_standalone_audit,backend={backend},history_changes={history_changes},\
+         commit_width={commit_width},entries={}",
+        standalone_audit.join("|")
+    );
     for _ in 0..warmups {
         let result = plan_repository_gc_for_bench(&adapter)
             .await
@@ -334,7 +341,7 @@ async fn measure<StorageImpl>(
         results.push(result);
     }
     timings.sort_unstable();
-    let last = *results.last().expect("repository-GC samples are positive");
+    let last = results.last().expect("repository-GC samples are positive");
     let phase_percentiles = |select: fn(&RepositoryGcBenchResult) -> u64| {
         let mut values = results.iter().map(select).collect::<Vec<_>>();
         values.sort_unstable();
@@ -355,7 +362,7 @@ async fn measure<StorageImpl>(
     println!(
         "repository_gc_scale,phase=measure,backend={backend},\
          history_changes={history_changes},commit_width={commit_width},\
-         swept_commits={},live_commits={},swept_standalone_changes={},swept_payloads={},\
+         swept_commits={},live_commits={},swept_standalone_changes={},standalone_swept_ids={},swept_payloads={},\
          samples={samples},warmups={warmups},p50_ms={},p95_ms={},p99_ms={},\
          root_discovery_p50_us={},root_discovery_p95_us={},root_discovery_p99_us={},\
          changelog_p50_us={},changelog_p95_us={},changelog_p99_us={},\
@@ -370,6 +377,7 @@ async fn measure<StorageImpl>(
         last.swept_commits,
         last.live_commits,
         last.swept_standalone_changes,
+        last.standalone_swept_ids.join("|"),
         last.swept_payloads,
         millis(percentile(&timings, 50)),
         millis(percentile(&timings, 95)),

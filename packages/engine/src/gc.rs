@@ -524,6 +524,147 @@ async fn load_reachability_batches(
     Ok(batches)
 }
 
+/// Returns the exact standalone semantic facts and the authenticated reason
+/// currently known for each one. This is benchmark-only attribution: the
+/// ordinary collector never scans CHANGE_SPACE, and this helper is called
+/// outside the measured planner phase.
+pub(crate) async fn audit_repository_gc_standalone_refs<S>(
+    store: &S,
+) -> Result<Vec<String>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let controls = BranchHeadControlContext::new().reader(store).scan().await?;
+    let active_refs = controls
+        .iter()
+        .map(|(_, control)| control.ref_change_id)
+        .collect::<BTreeSet<_>>();
+    let (queue, _) = load_reachability_queue(store).await?;
+    let batches = load_reachability_batches(store, &queue).await?;
+    let mut active_root_ids = controls
+        .iter()
+        .flat_map(|(_, control)| {
+            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
+        })
+        .collect::<BTreeSet<_>>();
+    active_root_ids.extend(
+        load_recovery_refs(store)
+            .await?
+            .into_iter()
+            .map(|recovery| recovery.recovered_head_commit_id),
+    );
+    active_root_ids.extend(
+        batches
+            .iter()
+            .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
+    );
+    let mut active_dependency_ids = BTreeSet::new();
+    let mut pending = active_root_ids.iter().copied().collect::<Vec<_>>();
+    let mut replay_debt_ids = Vec::new();
+    let mut seen_manifests = BTreeSet::new();
+    while let Some(commit_id) = pending.pop() {
+        if !seen_manifests.insert(commit_id) {
+            continue;
+        }
+        let Some(manifest) =
+            crate::tracked_state::load_commit_state_manifest(store, commit_id).await?
+        else {
+            continue;
+        };
+        if let Some(source) = manifest.mutations.selected_source_commit_id() {
+            active_dependency_ids.insert(source);
+            pending.push(source);
+        }
+        if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+            if let Some(base) = root.serving_base_commit_id {
+                active_dependency_ids.insert(base);
+            }
+        }
+        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+            active_dependency_ids.extend(
+                snapshot_root
+                    .parent_roots
+                    .iter()
+                    .map(|parent| parent.commit_id),
+            );
+        }
+        if manifest.replay_debt.depth != 0 {
+            replay_debt_ids.push(commit_id);
+        }
+    }
+    if !replay_debt_ids.is_empty() {
+        let replay_nodes = CommitGraphContext::new()
+            .reader(store)
+            .load_nodes(&replay_debt_ids)
+            .await?;
+        for (_, node) in replay_nodes {
+            if let Some(node) = node {
+                active_dependency_ids.extend(node.parent_commit_ids);
+            }
+        }
+    }
+    let mut retired_refs = BTreeMap::new();
+    for (_, batch) in batches {
+        for delta in batch.deltas {
+            if let Some(control) = delta.old_control {
+                retired_refs.insert(control.ref_change_id, delta.old_root);
+            }
+        }
+    }
+    let mut reader = ChangelogContext::new().reader(store);
+    let mut entries = Vec::new();
+    let mut start_after = None::<String>;
+    loop {
+        let batch = reader
+            .scan_changes(ChangeScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1_024),
+            })
+            .await?;
+        for change in batch.entries {
+            let reason = if active_refs.contains(&change.change_id) {
+                "active_branch_ref"
+            } else if let Some(old_root) = retired_refs.get(&change.change_id) {
+                if let Some(root) = old_root {
+                    if active_root_ids.contains(root) {
+                        "retired_delta_old_control:active_root_pin"
+                    } else if active_dependency_ids.contains(root) {
+                        "retired_delta_old_control:history_dependency_pin"
+                    } else {
+                        "retired_delta_old_control:reclaimable"
+                    }
+                } else {
+                    "retired_delta_old_control:reclaimable"
+                }
+            } else {
+                "unclassified_no_frontier_delta"
+            };
+            if let Some(old_root) = retired_refs.get(&change.change_id) {
+                entries.push(format!(
+                    "{}:{reason}:old_root={}",
+                    change.change_id,
+                    old_root.map_or_else(|| "none".to_owned(), |root| root.to_string())
+                ));
+            } else if reason == "unclassified_no_frontier_delta" {
+                entries.push(format!(
+                    "{}:{reason}:schema={}:account={}:origin={}",
+                    change.change_id,
+                    change.schema_key,
+                    change.account_id,
+                    change.origin_key.as_deref().unwrap_or("none")
+                ));
+            } else {
+                entries.push(format!("{}:{reason}", change.change_id));
+            }
+        }
+        let Some(next) = batch.next_start_after else {
+            break;
+        };
+        start_after = Some(next.to_string());
+    }
+    Ok(entries)
+}
+
 pub(crate) async fn load_recovery_refs(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<CheckpointRecoveryRef>, LixError> {
@@ -748,6 +889,7 @@ fn validate_stored_recovery_ref(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcSweep {
     pub(crate) tracked_commit_roots: Vec<CommitId>,
+    pub(crate) standalone_changes: Vec<ChangeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -856,6 +998,7 @@ where
             },
             sweep: RepositoryGcSweep {
                 tracked_commit_roots: Vec::new(),
+                standalone_changes: Vec::new(),
             },
             profile: RepositoryGcProfile {
                 root_discovery_us: elapsed_micros(started),
@@ -984,6 +1127,7 @@ where
     let mut consumed_through = queue_head;
     let mut queue_open = true;
     let mut reclaimed_commits = Vec::new();
+    let mut reclaimed_standalone_changes = BTreeSet::new();
     for (sequence, batch) in batches {
         if queue_open && blocked_sequences.contains(&sequence) {
             queue_open = false;
@@ -1063,6 +1207,32 @@ where
                 &store, writes, old_root, &manifest,
             )
             .await?;
+            if let Some(control) = delta.old_control.as_ref() {
+                if !controls
+                    .iter()
+                    .any(|(_, active)| active.ref_change_id == control.ref_change_id)
+                {
+                    let key = StorageKey(Bytes::from(change_key(control.ref_change_id)));
+                    let existing = PointReadPlan::new(CHANGE_SPACE, std::slice::from_ref(&key))
+                        .materialize(&store, StorageGetOptions::default())
+                        .await?
+                        .value
+                        .into_iter()
+                        .next()
+                        .flatten();
+                    if existing.is_none() {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "retired branch control references missing standalone change '{}'",
+                                control.ref_change_id
+                            ),
+                        ));
+                    }
+                    writes.delete(CHANGE_SPACE, key);
+                    reclaimed_standalone_changes.insert(control.ref_change_id);
+                }
+            }
             reclaimed_commits.push(old_root);
         }
     }
@@ -1122,6 +1292,7 @@ where
         },
         sweep: RepositoryGcSweep {
             tracked_commit_roots: reclaimed_commits,
+            standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
         },
         profile: RepositoryGcProfile {
             root_discovery_us: elapsed_micros(started),
@@ -1253,6 +1424,7 @@ where
         changelog: changelog_plan,
         sweep: RepositoryGcSweep {
             tracked_commit_roots: swept_snapshot_authorities,
+            standalone_changes: Vec::new(),
         },
         profile: RepositoryGcProfile {
             root_discovery_us,
@@ -2416,6 +2588,156 @@ mod tests {
             .await
             .expect("live untracked value should remain readable after GC");
         assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value)]);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_retains_active_history_diff_undo_redo_and_reclaims_deleted_branch_refs()
+    {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        let schema = serde_json::json!({
+            "x-lix-key": "gc_history_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("history fixture schema should register");
+        let baseline = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .expect("history baseline should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("history baseline should have a commit id");
+        session
+            .execute(
+                "INSERT INTO gc_history_fixture (path, value) VALUES ('/row', lix_json('{\"v\":1}'))",
+                &[],
+            )
+            .await
+            .expect("history fixture first commit should publish");
+        session
+            .execute(
+                "UPDATE gc_history_fixture SET value = lix_json('{\"v\":2}') WHERE path = '/row'",
+                &[],
+            )
+            .await
+            .expect("history fixture second commit should publish");
+        let branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-000000000009".to_owned()),
+                name: "gc-history-dead".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("history fixture branch should create");
+        session
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch.id)],
+            )
+            .await
+            .expect("history fixture branch should delete");
+
+        let before_changes = {
+            let storage_adapter = StorageAdapter::new(storage.clone());
+            let read = storage_adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("history fixture pre-GC read should open");
+            super::scan_all_gc_standalone_changes(read)
+                .await
+                .expect("history fixture standalone scan should load")
+        };
+        let active_refs_before = {
+            let storage_adapter = StorageAdapter::new(storage.clone());
+            let read = storage_adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("history fixture control read should open");
+            BranchHeadControlContext::new()
+                .reader(read)
+                .scan()
+                .await
+                .expect("history fixture controls should load")
+                .into_iter()
+                .map(|(_, control)| control.ref_change_id)
+                .collect::<BTreeSet<_>>()
+        };
+        run_repository_gc(&storage).await;
+        let after_changes = {
+            let storage_adapter = StorageAdapter::new(storage.clone());
+            let read = storage_adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("history fixture post-GC read should open");
+            super::scan_all_gc_standalone_changes(read)
+                .await
+                .expect("history fixture standalone post-GC scan should load")
+        };
+        let reclaimed = before_changes
+            .keys()
+            .filter(|change_id| !after_changes.contains_key(change_id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !reclaimed.is_empty(),
+            "deleted branch refs should be reclaimed"
+        );
+        assert!(
+            reclaimed.is_disjoint(&active_refs_before),
+            "GC must not reclaim an active branch reference"
+        );
+        assert!(
+            reclaimed.iter().any(|change_id| {
+                before_changes
+                    .get(change_id)
+                    .is_some_and(|change| change.schema_key == "lix_branch_ref")
+            }),
+            "the retired branch's standalone reference must be reclaimed"
+        );
+        let after = after_changes.len();
+        let before = before_changes.len();
+        assert!(after < before, "deleted branch refs should be reclaimed");
+
+        let head = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .expect("history head should remain readable")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("history head should have a commit id");
+        let diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'gc_history_fixture'",
+                &[Value::Text(baseline), Value::Text(head)],
+            )
+            .await
+            .expect("active history diff should survive GC");
+        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
+        session.undo().await.expect("active undo should survive GC");
+        session.redo().await.expect("active redo should survive GC");
     }
 
     #[tokio::test]
