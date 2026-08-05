@@ -2702,17 +2702,19 @@ mod tests {
             .await
             .map_err(LixError::from)?
             .expect("summary atomicity fixture control");
+        let first_insert = EntityPk::single("first-new");
+        let second_insert = EntityPk::single("second-new");
         let first_update = untracked(
             "schema",
             Some(first_file_id),
-            &first_entity,
+            &first_insert,
             r#"{"v":2}"#,
             timestamp(),
         );
         let second_update = untracked(
             "schema",
             Some(second_file_id),
-            &second_entity,
+            &second_insert,
             r#"{"v":2}"#,
             timestamp(),
         );
@@ -2723,7 +2725,7 @@ mod tests {
             branch_id,
             control,
             &[first_update, second_update],
-            &[false, false],
+            &[true, true],
         )
         .await
         .expect_err("a missing later summary must fail closed");
