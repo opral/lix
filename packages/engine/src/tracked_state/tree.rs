@@ -1152,7 +1152,7 @@ impl TrackedStateTree {
                                         .await?
                                     }
                                 };
-                            if matches!(first_child, DecodedNode::Leaf(_)) {
+                            if matches!(&first_child, DecodedNode::Leaf(_)) {
                                 return self
                                     .apply_sparse_leaf_window(
                                         store,
@@ -1168,6 +1168,7 @@ impl TrackedStateTree {
                                     )
                                     .await;
                             }
+                            decoded_frontier.insert(children[first_group].child_hash, first_child);
                         }
                     }
                     let mut replacement_children = Vec::new();
