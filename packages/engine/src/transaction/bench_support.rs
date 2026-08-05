@@ -604,9 +604,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
             updated_at: timestamp,
             ref_change_id: *change_id,
             schema_presence_bloom: [0; 4],
-            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-            untracked_locator_generation: 0,
-            untracked_locator_count: 0,
         };
         control.note_schemas(rows.iter().map(|row| row.schema_key.as_str()));
         stage_branch_head_control(&mut writes, branch_id, control)

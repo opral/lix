@@ -794,6 +794,9 @@ where
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
     ) -> Result<Option<MaterializedLiveStateBatch>, LixError> {
+        if request.filter.untracked != Some(false) {
+            return Ok(None);
+        }
         if !matches!(request.filter.rows, LiveStateRowFilter::All)
             || request.filter.branch_ids.is_empty()
             || request.filter.schema_keys.is_empty()
@@ -1852,6 +1855,7 @@ mod tests {
                 schema_keys: vec![schema_key.to_string()],
                 entity_pks,
                 branch_ids: vec![branch_id.to_string()],
+                untracked: Some(false),
                 ..LiveStateFilter::default()
             },
             ..LiveStateScanRequest::default()
@@ -1996,6 +2000,7 @@ mod tests {
                     schema_keys: vec![schema_key.to_string()],
                     entity_pks: entity_pks.to_vec(),
                     branch_ids: vec![branch_id.to_string()],
+                    untracked: Some(false),
                     ..LiveStateFilter::default()
                 },
                 ..LiveStateScanRequest::default()
@@ -2390,7 +2395,7 @@ mod tests {
         )
         .await;
 
-        let request = finite_pk_scan_request(
+        let mut request = finite_pk_scan_request(
             GLOBAL_BRANCH_ID,
             "schema",
             vec![tracked_pk.clone(), untracked_pk.clone()],
@@ -2400,7 +2405,7 @@ mod tests {
                 .await
                 .expect("initial direct hot-state scan should execute")
                 .is_some(),
-            "the hot current state serves tracked-only rows directly"
+            "the hot current state serves explicit tracked-only rows directly"
         );
 
         let read = storage
@@ -2424,15 +2429,17 @@ mod tests {
         )
         .await;
 
-        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
-            .await
-            .expect("mixed hot-state scan should execute")
-            .expect("one hot index serves both retention modes");
-        assert_eq!(direct.len(), 2);
+        request.filter.untracked = None;
+        assert!(
+            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+                .await
+                .expect("mixed unfiltered hot-state scan should execute")
+                .is_none(),
+            "unfiltered scans must route through the generic tracked+untracked resolver"
+        );
         let rows = scan_rows_for_test(&live_state, &storage, &request)
             .await
             .expect("mixed normal scan should execute");
-        assert_eq!(rows, direct);
         assert_eq!(rows.len(), 2);
         let tracked = rows
             .iter()
@@ -2642,9 +2649,6 @@ mod tests {
                 created_at,
                 updated_at,
                 ref_change_id: ChangeId::for_test_label(&format!("test-branch-ref-{branch_id}")),
-                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-                untracked_locator_generation: 0,
-                untracked_locator_count: 0,
             };
             control.note_schemas(schema_keys.iter().map(String::as_str));
             let control = if branch_rows.is_empty() {
@@ -2693,7 +2697,7 @@ mod tests {
                     &branch_id,
                     control,
                     &deltas,
-                    &vec![false; deltas.len()],
+                    &vec![true; deltas.len()],
                 )
                 .await
                 .expect("test branch untracked rows should stage")
@@ -2755,7 +2759,7 @@ mod tests {
                 &branch_id,
                 control,
                 &deltas,
-                &vec![false; deltas.len()],
+                &vec![true; deltas.len()],
             )
             .await
             .expect("test untracked current state should stage");

@@ -205,9 +205,6 @@ mod tests {
                     "2026-01-01T00:00:00Z",
                 ),
                 ref_change_id: ChangeId::for_test_label("test-branch-ref-change"),
-                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-                untracked_locator_generation: 0,
-                untracked_locator_count: 0,
             },
         )?;
         storage

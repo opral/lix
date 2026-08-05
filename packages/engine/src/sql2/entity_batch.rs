@@ -483,6 +483,7 @@ mod tests {
     #[test]
     fn exact_primary_key_and_limit_bypass_columnar_scan() {
         let mut request = LiveStateScanRequest::default();
+        request.filter.untracked = Some(false);
         assert!(direct_entity_columnar_request(&request));
 
         request

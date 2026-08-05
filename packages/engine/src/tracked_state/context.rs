@@ -8753,9 +8753,6 @@ mod tests {
                 "2026-01-01T00:00:00Z",
             ),
             ref_change_id: ChangeId::for_test_label("certified-branch-ref"),
-            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-            untracked_locator_generation: 0,
-            untracked_locator_count: 0,
         };
         let controls = BTreeMap::from([(BRANCH_ID.to_owned(), control)]);
         let commit_created_at = BTreeMap::from([(commit_id, control.created_at)]);

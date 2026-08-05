@@ -50,16 +50,9 @@ pub(crate) use types::{
 };
 #[allow(unused_imports)]
 pub(crate) use untracked_state::{
-    UNTRACKED_FILE_LOCATOR_SPACE, UNTRACKED_ROW_SPACE, empty_locator_root_hash,
-    load_untracked_exact_batch, load_untracked_exact_owner_batch, rebuild_untracked_file_locator,
-    scan_untracked_batch, stage_delete_untracked_file_locator, stage_untracked_deltas,
-    stage_untracked_deltas_for_branch_deletion, stage_untracked_deltas_with_live_file_ids,
-    untracked_json_refs,
-};
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use untracked_state::{
-    UntrackedFileLocatorReadProfile, take_untracked_file_locator_read_profile,
+    UNTRACKED_ROW_SPACE, load_untracked_exact_batch, load_untracked_exact_owner_batch,
+    scan_untracked_batch, stage_untracked_deltas, stage_untracked_deltas_for_branch_deletion,
+    stage_untracked_deltas_with_deleted_file_ids, untracked_json_refs,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{

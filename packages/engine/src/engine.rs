@@ -792,6 +792,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predecessor_v60_locator_protocol_is_rejected_before_bundle_reads() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let adapter = StorageAdapter::new(storage.clone());
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"immutable-physical-commit-state.v60"[..],
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V60 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V60 repositories must fail closed before bundle rows are decoded");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
     async fn predecessor_v22_file_projection_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
@@ -1472,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_preserves_untracked_only_schema_presence() {
+    async fn checkpoint_preserves_untracked_only_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1506,7 +1530,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("constrained read should retain untracked schema presence");
+            .expect("constrained read should retain the authoritative untracked row");
         assert_eq!(row.rows().len(), 1);
         assert_eq!(
             row.rows()[0]

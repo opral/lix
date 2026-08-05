@@ -3006,10 +3006,9 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
-    /// Locator-bound controls produced while staging branch-local untracked
+    /// Control revisions produced while staging branch-local untracked
     /// mutations. Explicit branch-ref publications are finalized separately,
-    /// so they must consume this exact updated binding instead of retaining
-    /// the pre-mutation root metadata.
+    /// so they must consume this exact updated revision.
     untracked_controls: BTreeMap<String, BranchHeadControl>,
     tracked_snapshots: BTreeMap<CommitId, HotTrackedSnapshot>,
     deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
@@ -3137,7 +3136,6 @@ async fn build_lifecycle_tracked_snapshots(
     selected_payloads: &HashMap<SelectedChangeKey, crate::changelog::MaterializedChangePayload>,
     insert_selection: &PreparedInsertSelection,
     required: &BTreeSet<CommitId>,
-    new_live_file_ids_by_branch: &mut BTreeMap<String, BTreeSet<String>>,
     deleted_live_file_ids_by_branch: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<BTreeMap<CommitId, HotTrackedSnapshot>, LixError> {
     if required.is_empty() {
@@ -3231,20 +3229,15 @@ async fn build_lifecycle_tracked_snapshots(
         }
         if root.publish_head {
             let final_live_file_ids = live_file_descriptor_ids(&rows)?;
-            let newly_live_file_ids: BTreeSet<String> = final_live_file_ids
-                .difference(&parent_live_file_ids)
-                .cloned()
-                .collect();
             let deleted_live_file_ids: BTreeSet<String> = parent_live_file_ids
                 .difference(&final_live_file_ids)
                 .cloned()
                 .collect();
-            if !newly_live_file_ids.is_empty() {
-                new_live_file_ids_by_branch.insert(root.branch_id.clone(), newly_live_file_ids);
-            }
             if !deleted_live_file_ids.is_empty() {
                 deleted_live_file_ids_by_branch
-                    .insert(root.branch_id.clone(), deleted_live_file_ids);
+                    .entry(root.branch_id.clone())
+                    .or_default()
+                    .extend(deleted_live_file_ids);
             }
         }
         snapshots.insert(root.commit_id, rows);
@@ -3492,7 +3485,7 @@ async fn stage_tracked_head(
     // Descriptor rows are the tracked lifecycle authority even when a
     // replay/redo packet carries no selected changelog refs. Materialize
     // those roots so parent/final live-file sets can publish an
-    // absent-to-live locator anchor atomically with the descriptor row.
+    // retired untracked bundle variants atomically with the descriptor row.
     for root in tracked_roots.iter().filter(|root| root.publish_head) {
         if tracked_row_indices_by_commit
             .get(&root.commit_id)
@@ -3509,7 +3502,6 @@ async fn stage_tracked_head(
             lifecycle_ids.insert(root.commit_id);
         }
     }
-    let mut new_live_file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
     let mut deleted_live_file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
     let mut tracked_snapshots = build_lifecycle_tracked_snapshots(
         read,
@@ -3520,7 +3512,6 @@ async fn stage_tracked_head(
         selected_change_payloads,
         insert_selection,
         &lifecycle_ids,
-        &mut new_live_file_ids_by_branch,
         &mut deleted_live_file_ids_by_branch,
     )
     .instrument(tracing::debug_span!(
@@ -3554,19 +3545,15 @@ async fn stage_tracked_head(
         } else {
             BTreeSet::new()
         };
-        let newly_live_file_ids: BTreeSet<String> = target_live_file_ids
-            .difference(&previous_live_file_ids)
-            .cloned()
-            .collect();
         let deleted_live_file_ids: BTreeSet<String> = previous_live_file_ids
             .difference(&target_live_file_ids)
             .cloned()
             .collect();
-        if !newly_live_file_ids.is_empty() {
-            new_live_file_ids_by_branch.insert(branch_id.clone(), newly_live_file_ids);
-        }
         if !deleted_live_file_ids.is_empty() {
-            deleted_live_file_ids_by_branch.insert(branch_id.clone(), deleted_live_file_ids);
+            deleted_live_file_ids_by_branch
+                .entry(branch_id.clone())
+                .or_default()
+                .extend(deleted_live_file_ids);
         }
     }
     // Validate the complete tracked/untracked final lane before the first
@@ -3615,11 +3602,10 @@ async fn stage_tracked_head(
         })
         .map(|row| row.branch_id.as_str())
         .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
-        .chain(new_live_file_ids_by_branch.keys().map(String::as_str))
         .chain(deleted_live_file_ids_by_branch.keys().map(String::as_str))
         .collect::<BTreeSet<_>>();
-    let no_new_live_file_ids = BTreeSet::new();
     let mut untracked_controls = BTreeMap::new();
+    let empty_deleted_file_ids = BTreeSet::new();
     for branch_id in untracked_branches {
         let selected_rows = state_rows
             .iter()
@@ -3642,7 +3628,8 @@ async fn stage_tracked_head(
                 // are not present in `insert_selection` even when the logical
                 // file identity is newly created.  Preserve the insert origin
                 // as the lifecycle proof for the descriptor row; updates and
-                // deletes must continue to require an existing locator state.
+                // deletes must continue to require an existing untracked
+                // member state.
                 let fresh_file_descriptor = row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
                     && row.origin.is_some_and(|origin| {
                         origin.operation == TransactionWriteOperation::Insert
@@ -3685,9 +3672,6 @@ async fn stage_tracked_head(
                 updated_at: target.updated_at,
                 ref_change_id: target.ref_change_id,
                 schema_presence_bloom: [0; 4],
-                untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-                untracked_locator_generation: 0,
-                untracked_locator_count: 0,
             }
         };
         let updated_control = if explicit_branch_targets
@@ -3704,19 +3688,16 @@ async fn stage_tracked_head(
             )
             .await?
         } else {
-            crate::live_state::stage_untracked_deltas_with_live_file_ids(
+            crate::live_state::stage_untracked_deltas_with_deleted_file_ids(
                 read,
                 writes,
                 branch_id,
                 previous_control,
                 &deltas,
                 &known_absent,
-                new_live_file_ids_by_branch
-                    .get(branch_id)
-                    .unwrap_or(&no_new_live_file_ids),
                 deleted_live_file_ids_by_branch
                     .get(branch_id)
-                    .unwrap_or(&no_new_live_file_ids),
+                    .unwrap_or(&empty_deleted_file_ids),
             )
             .await?
         };
@@ -3931,21 +3912,7 @@ async fn stage_tracked_head(
                 .await?;
             let mut control =
                 normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
-            // Dedicated history-free rows survive generation rotation. Keep
-            // the predecessor bloom conservatively: stale positives are safe,
-            // while resetting it would hide untouched untracked schemas.
-            control.note_schemas(
-                schema_keys
-                    .iter()
-                    .map(String::as_str)
-                    .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
-            );
-            if let Some(untracked_control) = untracked_controls.get(&root.branch_id) {
-                control.untracked_locator_root = untracked_control.untracked_locator_root;
-                control.untracked_locator_generation =
-                    untracked_control.untracked_locator_generation;
-                control.untracked_locator_count = untracked_control.untracked_locator_count;
-            }
+            control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
@@ -4564,11 +4531,6 @@ async fn stage_tracked_head(
             generation,
             working_diff_checkpoint_commit_id,
         )?;
-        if let Some(untracked_control) = untracked_controls.get(&root.branch_id) {
-            control.untracked_locator_root = untracked_control.untracked_locator_root;
-            control.untracked_locator_generation = untracked_control.untracked_locator_generation;
-            control.untracked_locator_count = untracked_control.untracked_locator_count;
-        }
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
     }
@@ -4609,30 +4571,13 @@ async fn stage_tracked_head(
                     ),
                 )
             })?;
-        let mut deltas = state_rows
-            .iter()
-            .filter(|row| {
-                row.untracked
-                    && row.branch_id == branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-            })
-            .map(current_state_delta_from_state_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        deltas.extend(
-            engine_rows
-                .iter()
-                .filter(|row| row.branch_id == branch_id)
-                .map(current_state_delta_from_engine_row),
-        );
-        let mut control = control.next_current_state_revision()?;
-        control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
+        let control = control.next_current_state_revision()?;
         insert_direct_branch_control(&mut controls, branch_id, control)?;
     }
     // A tracked lifecycle replay can stage descriptor rows without publishing
     // a normal tracked root (undo/redo branch-ref packets are one example).
-    // The locator root was still written in this same transaction, so retain
-    // its exact control binding instead of dropping it and leaving a persisted
-    // root one generation ahead of branch control.
+    // Retain the exact untracked control revision instead of dropping it and
+    // leaving a persisted current-state revision ahead of branch control.
     for (branch_id, control) in &untracked_controls {
         if !rooted_branches.contains(branch_id.as_str())
             && !explicit_branches.contains(branch_id.as_str())
@@ -5087,13 +5032,6 @@ fn normal_branch_head_control(
         updated_at: root.ref_updated_at,
         ref_change_id: root.ref_change_id,
         schema_presence_bloom: previous.map_or([0; 4], |control| control.schema_presence_bloom),
-        untracked_locator_root: previous
-            .map_or(crate::live_state::empty_locator_root_hash(), |control| {
-                control.untracked_locator_root
-            }),
-        untracked_locator_generation: previous
-            .map_or(0, |control| control.untracked_locator_generation),
-        untracked_locator_count: previous.map_or(0, |control| control.untracked_locator_count),
     })
 }
 
@@ -5147,9 +5085,6 @@ async fn stage_root_backed_branch_publication(
         // Root reads answer schema presence directly. Keep the bloom
         // conservative until immutable roots carry schema summaries.
         schema_presence_bloom: [u64::MAX; 4],
-        untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-        untracked_locator_generation: 0,
-        untracked_locator_count: 0,
     };
     Ok(control)
 }
@@ -5208,10 +5143,6 @@ async fn stage_branch_head_control_publications(
                     ))
                     .await?;
                     if let Some(untracked_control) = untracked_controls.get(branch_id) {
-                        control.untracked_locator_root = untracked_control.untracked_locator_root;
-                        control.untracked_locator_generation =
-                            untracked_control.untracked_locator_generation;
-                        control.untracked_locator_count = untracked_control.untracked_locator_count;
                         control.current_state_revision = untracked_control.current_state_revision;
                     }
                     root_backed_branch_publications.insert(branch_id.clone());
@@ -5259,7 +5190,6 @@ async fn stage_branch_head_control_publications(
                             &mut coverage,
                         )
                         .await?;
-                    let locator_control = untracked_controls.get(branch_id).copied().or(existing);
                     let mut control = BranchHeadControl {
                         head_commit_id,
                         generation,
@@ -5283,15 +5213,6 @@ async fn stage_branch_head_control_publications(
                         schema_presence_bloom: existing
                             .expect("existing lifecycle publication was handled above")
                             .schema_presence_bloom,
-                        untracked_locator_root: locator_control
-                            .expect("existing lifecycle publication was handled above")
-                            .untracked_locator_root,
-                        untracked_locator_generation: locator_control
-                            .expect("existing lifecycle publication was handled above")
-                            .untracked_locator_generation,
-                        untracked_locator_count: locator_control
-                            .expect("existing lifecycle publication was handled above")
-                            .untracked_locator_count,
                     };
                     control.note_schemas(schema_keys.iter().map(String::as_str));
                     Some(control)
@@ -5334,14 +5255,6 @@ async fn stage_branch_head_control_publications(
             branch_id,
             observation.raw_token.clone(),
         )?);
-        if desired.is_none() {
-            if let Some(control) = observation.control {
-                crate::live_state::stage_delete_untracked_file_locator(
-                    read, writes, branch_id, control,
-                )
-                .await?;
-            }
-        }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
             None => stage_delete_branch_head_control(writes, branch_id)?,

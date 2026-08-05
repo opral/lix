@@ -121,7 +121,7 @@ pub(crate) struct DeferredFinalPutPage {
 /// This is the storage-native escape hatch for large certified batches. The
 /// ordinary write set remains the general representation; a deferred source
 /// is accepted only when its target spaces have no ordinary mutations.
-pub(crate) trait DeferredFinalPutSource: Send {
+pub(crate) trait DeferredFinalPutSource: Send + Sync {
     fn target_spaces(&self) -> &[StorageSpace];
     fn put_count(&self) -> u64;
     fn written_bytes(&self) -> u64;

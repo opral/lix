@@ -179,9 +179,6 @@ pub(crate) async fn seed_branch_head_with_rows(
             created_at: test_timestamp(),
             updated_at: test_timestamp(),
             ref_change_id: branch_ref_change_id,
-            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-            untracked_locator_generation: 0,
-            untracked_locator_count: 0,
         },
     )
     .expect("direct branch-head control should stage");

@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v10";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
 
@@ -56,16 +56,6 @@ pub(crate) struct BranchHeadControl {
     /// therefore skip an otherwise-empty schema range scan; a collision only
     /// falls back to the normal scan.
     pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
-    /// Hash of the canonical derived file-locator root record. The root is
-    /// bound to this branch control by the same exact-byte CAS as current
-    /// state, so a locator can never be trusted from an unrelated generation.
-    pub(crate) untracked_locator_root: [u8; 32],
-    /// Monotonic locator publication generation. It advances with every
-    /// untracked current-state publication, including mutations that do not
-    /// change file membership, and is checked against the root record.
-    pub(crate) untracked_locator_generation: u64,
-    /// Total number of derived file-locator members authenticated by the root.
-    pub(crate) untracked_locator_count: u64,
 }
 
 impl BranchHeadControl {
@@ -347,9 +337,6 @@ mod tests {
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("first-ref-change"),
-            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-            untracked_locator_generation: 0,
-            untracked_locator_count: 0,
         };
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
@@ -360,9 +347,6 @@ mod tests {
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("second-ref-change"),
-            untracked_locator_root: crate::live_state::empty_locator_root_hash(),
-            untracked_locator_generation: 0,
-            untracked_locator_count: 0,
         };
         let branch_a = "01920000-0000-7000-8000-0000000000a1".to_string();
         let branch_b = "01920000-0000-7000-8000-0000000000b1".to_string();
