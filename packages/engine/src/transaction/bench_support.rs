@@ -461,6 +461,12 @@ async fn seed_visible_schema_rows<StorageImpl>(
     StorageImpl: Storage + Clone,
 {
     let mut writes = StorageWriteSet::new();
+    // Repository initialization seeds the authenticated GC queue before any
+    // benchmark transaction opens. Keep this low-level fixture on that same
+    // public protocol; unlike unit tests, benchmark binaries are not built
+    // with `cfg(test)` and therefore cannot use the test-only repair hook.
+    crate::gc::stage_reachability_queue_seed(&mut writes)
+        .expect("benchmark GC reachability queue should seed");
     let mut schemas = crate::schema::seed_schema_definitions()
         .into_iter()
         .cloned()
