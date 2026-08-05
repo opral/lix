@@ -9108,7 +9108,7 @@ where
         let expected_ordered_identity_digest = rows.expected_ordered_identity_digest;
         let schema_key = rows.schema_key.clone();
         let branch_id = rows.branch_id.clone();
-        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
             rows.schema_plan_id,
             rows.schema_key,
             rows.branch_id,
@@ -9120,6 +9120,15 @@ where
             None,
             self.functions.call_timestamp(),
         )?;
+        // This path has already proved an exact, ordered complete-generation
+        // replacement.  Encode its canonical replacement parts while the
+        // typed journal is still the source of truth, so commit publication
+        // can consume preencoded parts instead of reconstructing a second
+        // million-row key/value arena through the generic replacement input
+        // path.  The encoder keeps only one bounded replacement part's key
+        // arena at a time; the journal's identity/snapshot arenas remain the
+        // single logical input retained for the transaction.
+        chunk.seal_replacement_parts(true, &mut self.mutation_journal_compressor)?;
         match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
             ImmutableMutationChunkStage::Staged => {
                 if !self.staged_writes.certify_complete_collection_replacement(
