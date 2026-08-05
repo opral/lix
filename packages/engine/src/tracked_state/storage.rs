@@ -84,6 +84,9 @@ pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
 // The durable direct-ChangeId address stride. Physical ordered parts may be
 // smaller, but their logical slots must remain stable at this width.
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
+// Scan pages are bounded by row count, not bytes. Keep authority hydration
+// bounded as well when a page contains large authenticated directories.
+const COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS: usize = 64;
 // Bound newly authored ordered parts tightly enough that point and small-batch
 // reads do not decompress an entire 512-row payload neighborhood. The 128-row
 // bound halves 1K segment puts versus 64-row parts while controlled RocksDB
@@ -9184,90 +9187,93 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 },
             )
             .await?;
-        let commit_ids = page
+        for entry_batch in page
             .value
             .entries
-            .iter()
-            .map(|entry| commit_id_from_delta_key(&entry.key))
-            .collect::<Result<Vec<_>, _>>()?;
-        let states = load_commit_state_manifests(store, &commit_ids).await?;
-        for (entry, (commit_id, state)) in page
-            .value
-            .entries
-            .iter()
-            .zip(commit_ids.into_iter().zip(states))
+            .chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS)
         {
-            if entry.key.0.len() != 16 {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_delta manifest key is not a 16-byte commit id",
-                ));
-            }
-            let StorageProjectedValue::FullValue(_) = &entry.value else {
-                unreachable!("full commit-delta scan returned a key-only row");
-            };
-            let state = state.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit-state scan lost its split authority",
-                )
-            })?;
-            if state.commit_id != commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit-state scan key and manifest commit disagree",
-                ));
-            }
-            let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
-            if let Some(parts) = manifest.columnar_parts.as_ref() {
-                emitted = emitted.saturating_add(
-                    visit_columnar_mutation_change_records(
-                        store,
-                        commit_id,
-                        parts,
-                        &manifest.account_id,
-                        &mut visit,
+            let commit_ids = entry_batch
+                .iter()
+                .map(|entry| commit_id_from_delta_key(&entry.key))
+                .collect::<Result<Vec<_>, _>>()?;
+            let states = load_commit_state_manifests(store, &commit_ids).await?;
+            for (entry, (commit_id, state)) in
+                entry_batch.iter().zip(commit_ids.into_iter().zip(states))
+            {
+                if entry.key.0.len() != 16 {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit_delta manifest key is not a 16-byte commit id",
+                    ));
+                }
+                let StorageProjectedValue::FullValue(_) = &entry.value else {
+                    unreachable!("full commit-delta scan returned a key-only row");
+                };
+                let state = state.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit-state scan lost its split authority",
                     )
-                    .await?,
-                );
-                continue;
-            }
-            let members =
-                load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[]).await?;
-            for member in members {
-                if member.authored {
-                    visit(member.change)?;
-                    emitted += 1;
-                } else if is_payload_free_selected_tombstone(&member) {
-                    // Cascade tombstones preserve identity history but do not
-                    // introduce another public changelog fact.
+                })?;
+                if state.commit_id != commit_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit-state scan key and manifest commit disagree",
+                    ));
+                }
+                let manifest =
+                    expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
+                if let Some(parts) = manifest.columnar_parts.as_ref() {
+                    emitted = emitted.saturating_add(
+                        visit_columnar_mutation_change_records(
+                            store,
+                            commit_id,
+                            parts,
+                            &manifest.account_id,
+                            &mut visit,
+                        )
+                        .await?,
+                    );
                     continue;
-                } else {
-                    let locator = load_canonical_change_locator(store, member.change.change_id)
-                        .await?
-                        .ok_or_else(|| {
-                            invalid_change_locator(
-                                member.change.change_id,
-                                "does not resolve to a canonical record",
-                            )
-                        })?;
-                    if locator.commit_id == member.value.commit_id
-                        && locator.segment_index == member.segment_index
-                        && u32::from(locator.ordinal) == member.ordinal
-                    {
+                }
+                let members =
+                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[])
+                        .await?;
+                for member in members {
+                    if member.authored {
                         visit(member.change)?;
                         emitted += 1;
+                    } else if is_payload_free_selected_tombstone(&member) {
+                        // Cascade tombstones preserve identity history but do
+                        // not introduce another public changelog fact.
                         continue;
-                    }
-                    let canonical = load_change_record_at_locator(store, locator).await?;
-                    if canonical != member.change {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "tracked_state change '{}' has conflicting authoritative packed payloads",
-                                member.change.change_id
-                            ),
-                        ));
+                    } else {
+                        let locator = load_canonical_change_locator(store, member.change.change_id)
+                            .await?
+                            .ok_or_else(|| {
+                                invalid_change_locator(
+                                    member.change.change_id,
+                                    "does not resolve to a canonical record",
+                                )
+                            })?;
+                        if locator.commit_id == member.value.commit_id
+                            && locator.segment_index == member.segment_index
+                            && u32::from(locator.ordinal) == member.ordinal
+                        {
+                            visit(member.change)?;
+                            emitted += 1;
+                            continue;
+                        }
+                        let canonical = load_change_record_at_locator(store, locator).await?;
+                        if canonical != member.change {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "tracked_state change '{}' has conflicting authoritative packed payloads",
+                                    member.change.change_id
+                                ),
+                            ));
+                        }
                     }
                 }
             }
