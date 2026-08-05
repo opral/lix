@@ -203,7 +203,8 @@ where
     let incremental_checkpoint_ms = millis(incremental_checkpoint_start.elapsed());
 
     let retention_ok = exercise_retention(&lix).await;
-    let (undo_ms, redo_ms, undo_redo_ok) = exercise_undo_redo(&lix).await;
+    let (undo_ms, redo_ms, undo_redo_ok, undo_redo_detail) =
+        exercise_undo_redo(&lix, counters.as_ref()).await;
     let (branch_ms, merge_preview_ms, merge_ms, branch_delete_ms, merge_ok, branch_details) =
         exercise_branches_and_merge(&lix, rows, shape, counters.as_ref()).await;
 
@@ -249,6 +250,7 @@ where
     S::flush_for_lifecycle(&storage).await;
     drop(storage);
 
+    let reopen_io_before = counters.as_ref().map(SlateDBIoCounters::snapshot);
     let reopen_start = Instant::now();
     let reopened_storage = S::open_for_lifecycle(&paths.database, counters.as_ref())
         .unwrap_or_else(|error| panic!("reopen {} lifecycle storage: {error}", S::NAME));
@@ -256,6 +258,8 @@ where
         .await
         .expect("reopen lifecycle Lix");
     let reopen_ms = millis(reopen_start.elapsed());
+    let reopen_io = io_delta_json(counters.as_ref(), reopen_io_before);
+    let restore_io_before = counters.as_ref().map(SlateDBIoCounters::snapshot);
     let restore_query_start = Instant::now();
     let restored_count = reopened
         .execute("SELECT count(*) AS count FROM lix_file", &[])
@@ -266,6 +270,7 @@ where
         .and_then(|row| row.get::<i64>("count").ok())
         .unwrap_or_default();
     let restore_query_ms = millis(restore_query_start.elapsed());
+    let restore_io = io_delta_json(counters.as_ref(), restore_io_before);
     assert_eq!(restored_count, rows as i64, "reopen did not restore files");
     reopened
         .close()
@@ -275,6 +280,7 @@ where
     S::flush_for_lifecycle(&reopened_storage).await;
     drop(reopened_storage);
 
+    let corruption_io_before = counters.as_ref().map(SlateDBIoCounters::snapshot);
     let corruption_start = Instant::now();
     let corruption_copy = paths.corruption_copy();
     copy_tree(&paths.database, &corruption_copy);
@@ -295,6 +301,7 @@ where
         },
     };
     let corruption_ms = millis(corruption_start.elapsed());
+    let corruption_io = io_delta_json(counters.as_ref(), corruption_io_before);
     assert!(
         corruption_error.is_some(),
         "{} accepted a corrupted physical fixture at {}",
@@ -321,7 +328,9 @@ where
             "checkpoint_full": full_checkpoint_ms,
             "checkpoint_incremental": incremental_checkpoint_ms,
             "undo": undo_ms,
+            "undo_io": undo_redo_detail["undo_io"],
             "redo": redo_ms,
+            "redo_io": undo_redo_detail["redo_io"],
             "branch_create_advance_switch": branch_ms,
             "branch_detail": branch_details,
             "merge_preview": merge_preview_ms,
@@ -329,8 +338,11 @@ where
             "branch_delete": branch_delete_ms,
             "retention_gc_workload": gc_workload_ms,
             "reopen_restore": reopen_ms,
+            "reopen_restore_io": reopen_io,
             "restore_query": restore_query_ms,
+            "restore_query_io": restore_io,
             "corruption_probe": corruption_ms,
+            "corruption_probe_io": corruption_io,
         },
         "correctness": {
             "retention": retention_ok,
@@ -440,7 +452,10 @@ where
         && rows[1].get::<bool>("lixcol_untracked").ok() == Some(true)
 }
 
-async fn exercise_undo_redo<S>(lix: &Lix<S>) -> (f64, f64, bool)
+async fn exercise_undo_redo<S>(
+    lix: &Lix<S>,
+    counters: Option<&SlateDBIoCounters>,
+) -> (f64, f64, bool, JsonValue)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -453,23 +468,35 @@ where
     )
     .await
     .expect("create undoable commit");
+    let undo_io_before = counters.map(SlateDBIoCounters::snapshot);
     let undo_start = Instant::now();
     lix.undo().await.expect("undo lifecycle commit");
     let undo_ms = millis(undo_start.elapsed());
+    let undo_io = io_delta_json(counters, undo_io_before);
     let after_undo = scalar_count(
         lix,
         "SELECT count(*) AS count FROM lix_key_value WHERE key = 'lifecycle-undo-key'",
     )
     .await;
+    let redo_io_before = counters.map(SlateDBIoCounters::snapshot);
     let redo_start = Instant::now();
     lix.redo().await.expect("redo lifecycle commit");
     let redo_ms = millis(redo_start.elapsed());
+    let redo_io = io_delta_json(counters, redo_io_before);
     let after_redo = scalar_count(
         lix,
         "SELECT count(*) AS count FROM lix_key_value WHERE key = 'lifecycle-undo-key'",
     )
     .await;
-    (undo_ms, redo_ms, after_undo == 0 && after_redo == 1)
+    (
+        undo_ms,
+        redo_ms,
+        after_undo == 0 && after_redo == 1,
+        json!({
+            "undo_io": undo_io,
+            "redo_io": redo_io,
+        }),
+    )
 }
 
 async fn exercise_branches_and_merge<S>(
