@@ -1,7 +1,18 @@
 use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+use std::alloc::GlobalAlloc;
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
@@ -15,13 +26,110 @@ use lix_engine::storage_adapter::{
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions,
 };
-use lix_engine::{Engine, SessionContext, Storage};
+use lix_engine::{Engine, SessionContext, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
+#[cfg(feature = "slatedb")]
+use lix_slatedb_storage::SlateDB;
 use lix_sqlite_storage::SQLite;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+struct CountingAllocator;
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+static PROFILE_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+static PROFILE_ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+static PROFILE_ALLOCATION_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        if !pointer.is_null() && PROFILE_ALLOCATION_ENABLED.load(Ordering::Relaxed) {
+            PROFILE_ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            PROFILE_ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(
+        &self,
+        pointer: *mut u8,
+        layout: std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let replacement = unsafe { mimalloc::MiMalloc.realloc(pointer, layout, new_size) };
+        if !replacement.is_null()
+            && new_size >= layout.size()
+            && PROFILE_ALLOCATION_ENABLED.load(Ordering::Relaxed)
+        {
+            PROFILE_ALLOCATED_BYTES.fetch_add((new_size - layout.size()) as u64, Ordering::Relaxed);
+            PROFILE_ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        replacement
+    }
+}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+fn reset_profile_allocations() {
+    PROFILE_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    PROFILE_ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    PROFILE_ALLOCATION_ENABLED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
+fn reset_profile_allocations() {}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+fn profile_allocations() -> (u64, u64) {
+    PROFILE_ALLOCATION_ENABLED.store(false, Ordering::Relaxed);
+    (
+        PROFILE_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        PROFILE_ALLOCATION_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
+fn profile_allocations() -> (u64, u64) {
+    (0, 0)
+}
 
 const SMOKE_ROWS: usize = 1_000;
 const REAL_WORKLOAD_ROWS: usize = 10_000;
@@ -335,26 +443,48 @@ where
 enum LixStorageProfile {
     SQLite,
     RocksDB,
+    #[cfg(feature = "slatedb")]
+    SlateDB,
 }
 
-const LIX_STORAGE_PROFILES: [LixStorageProfile; 2] =
-    [LixStorageProfile::SQLite, LixStorageProfile::RocksDB];
+#[cfg(not(feature = "slatedb"))]
+const LIX_STORAGE_PROFILES: &[LixStorageProfile] =
+    &[LixStorageProfile::SQLite, LixStorageProfile::RocksDB];
+#[cfg(feature = "slatedb")]
+const LIX_STORAGE_PROFILES: &[LixStorageProfile] = &[
+    LixStorageProfile::SQLite,
+    LixStorageProfile::RocksDB,
+    LixStorageProfile::SlateDB,
+];
 
 impl LixStorageProfile {
     fn name(self) -> &'static str {
         match self {
             Self::SQLite => "lix_sqlite",
             Self::RocksDB => "lix_rocksdb",
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB => "lix_slatedb",
         }
     }
 }
 
 fn untracked_state_crud_benches(c: &mut Criterion) {
+    if std::env::var_os("LIX_UNTRACKED_STATE_CRUD_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(false)
+            .try_init();
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("create tokio runtime for session execute benchmarks");
     let rows = fixture_rows();
+    if std::env::var_os("LIX_UNTRACKED_STATE_CRUD_PROFILE").is_some() {
+        profile_session_untracked_crud(&runtime, &rows);
+        return;
+    }
     maybe_print_io_report(&runtime, &rows);
 
     bench_raw_sqlite(c, &rows, SMOKE_ROWS, "smoke");
@@ -363,6 +493,127 @@ fn untracked_state_crud_benches(c: &mut Criterion) {
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_lix(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_session_execute_untracked_insert(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
+}
+
+fn profile_row_count(max_rows: usize) -> usize {
+    std::env::var("LIX_UNTRACKED_STATE_CRUD_PROFILE_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(REAL_WORKLOAD_ROWS)
+        .min(max_rows)
+}
+
+fn profile_sample_count() -> usize {
+    std::env::var("LIX_UNTRACKED_STATE_CRUD_PROFILE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(3)
+}
+
+fn profile_session_untracked_crud(runtime: &Runtime, all_rows: &[PointerRow]) {
+    let rows = &all_rows[..profile_row_count(all_rows.len())];
+    let sample_count = profile_sample_count();
+    println!(
+        "untracked_state_crud/profile rows={} samples={} slate_db={} benchmark_profile=sql_session",
+        rows.len(),
+        sample_count,
+        if cfg!(feature = "slatedb") {
+            "enabled"
+        } else {
+            "unavailable"
+        }
+    );
+    println!(
+        "| storage | operation | sample | wall_ms | alloc_bytes | alloc_calls | rss_before_bytes | rss_after_bytes | rows | certified_batches | physical_puts | physical_deletes | physical_written_bytes |"
+    );
+    println!(
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
+
+    let selected_storage = std::env::var("LIX_UNTRACKED_STATE_CRUD_PROFILE_STORAGE").ok();
+    let selected_operation = std::env::var("LIX_UNTRACKED_STATE_CRUD_PROFILE_OPERATION").ok();
+    let homogeneous = std::env::var_os("LIX_UNTRACKED_STATE_CRUD_PROFILE_HOMOGENEOUS").is_some();
+    for &profile in LIX_STORAGE_PROFILES {
+        if selected_storage
+            .as_deref()
+            .is_some_and(|name| name != profile.name())
+        {
+            continue;
+        }
+        for operation in ["insert", "update", "delete"] {
+            if selected_operation
+                .as_deref()
+                .is_some_and(|name| name != operation)
+            {
+                continue;
+            }
+            for sample in 0..sample_count {
+                let session = runtime.block_on(prepare_profile_session_empty(profile));
+                if operation != "insert" {
+                    runtime.block_on(session.insert_untracked_json_pointer_rows(rows));
+                }
+                let rss_before = process_resident_bytes();
+                let _ = lix_engine::storage_bench::
+                    take_certified_entity_insert_parameter_batch_executions();
+                let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
+                reset_profile_allocations();
+                let started = Instant::now();
+                let affected = match operation {
+                    "insert" => {
+                        if homogeneous {
+                            runtime.block_on(
+                                session.insert_untracked_json_pointer_rows_homogeneous(rows),
+                            );
+                        } else {
+                            runtime.block_on(session.insert_untracked_json_pointer_rows(rows));
+                        }
+                        rows.len()
+                    }
+                    "update" => {
+                        runtime.block_on(session.update_untracked_json_pointer_rows(rows));
+                        rows.len()
+                    }
+                    "delete" => runtime.block_on(session.delete_untracked_json_pointer_rows()),
+                    _ => unreachable!(),
+                };
+                let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let (alloc_bytes, alloc_calls) = profile_allocations();
+                let rss_after = process_resident_bytes();
+                let certified_batches = lix_engine::storage_bench::
+                    take_certified_entity_insert_parameter_batch_executions();
+                let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
+                println!(
+                    "| {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    profile.name(),
+                    operation,
+                    sample + 1,
+                    wall_ms,
+                    alloc_bytes,
+                    alloc_calls,
+                    rss_before,
+                    rss_after,
+                    affected,
+                    certified_batches,
+                    physical.puts,
+                    physical.deletes,
+                    physical.written_bytes,
+                );
+            }
+        }
+    }
+}
+
+fn process_resident_bytes() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(0, |kilobytes| kilobytes.saturating_mul(1024))
 }
 
 fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
@@ -391,7 +642,7 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
 
     for (label, row_count) in workloads {
         let rows = bench_rows(&all_rows[..row_count]);
-        for profile in LIX_STORAGE_PROFILES {
+        for &profile in LIX_STORAGE_PROFILES {
             for operation in [
                 "insert_all_rows",
                 "select_all_rows",
@@ -524,7 +775,7 @@ fn bench_lix(
     label: &str,
 ) {
     let rows = bench_rows(&all_rows[..row_count]);
-    for profile in LIX_STORAGE_PROFILES {
+    for &profile in LIX_STORAGE_PROFILES {
         let mut group =
             c.benchmark_group(format!("untracked_state_crud/{}/{label}", profile.name()));
         configure_group(&mut group, row_count);
@@ -648,7 +899,7 @@ fn bench_session_execute_untracked_insert(
     label: &str,
 ) {
     let rows = all_rows[..row_count].to_vec();
-    for profile in LIX_STORAGE_PROFILES {
+    for &profile in LIX_STORAGE_PROFILES {
         let mut group = c.benchmark_group(format!(
             "untracked_state_crud/session_execute_untracked/{}/{label}",
             profile.name()
@@ -683,6 +934,8 @@ async fn measure_lix_io(profile: LixStorageProfile, operation: &str, rows: &[Ben
     match profile {
         LixStorageProfile::SQLite => measure_lix_io_for_storage(sqlite(), operation, rows).await,
         LixStorageProfile::RocksDB => measure_lix_io_for_storage(rocksdb(), operation, rows).await,
+        #[cfg(feature = "slatedb")]
+        LixStorageProfile::SlateDB => measure_lix_io_for_storage(slatedb(), operation, rows).await,
     }
 }
 
@@ -872,17 +1125,23 @@ fn profile_storage(profile: LixStorageProfile) -> ProfileStorage {
     match profile {
         LixStorageProfile::SQLite => ProfileStorage::SQLite(StorageAdapter::new(sqlite())),
         LixStorageProfile::RocksDB => ProfileStorage::RocksDB(StorageAdapter::new(rocksdb())),
+        #[cfg(feature = "slatedb")]
+        LixStorageProfile::SlateDB => ProfileStorage::SlateDB(StorageAdapter::new(slatedb())),
     }
 }
 
 enum ProfileStorage {
     SQLite(StorageAdapter<TempStorage<SQLite>>),
     RocksDB(StorageAdapter<TempStorage<RocksDB>>),
+    #[cfg(feature = "slatedb")]
+    SlateDB(StorageAdapter<TempStorage<SlateDB>>),
 }
 
 enum ProfileSession {
     SQLite(SessionContext<TempStorage<SQLite>>),
     RocksDB(SessionContext<TempStorage<RocksDB>>),
+    #[cfg(feature = "slatedb")]
+    SlateDB(SessionContext<TempStorage<SlateDB>>),
 }
 
 async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSession {
@@ -890,6 +1149,10 @@ async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSes
         LixStorageProfile::SQLite => ProfileSession::SQLite(prepare_session_empty(sqlite()).await),
         LixStorageProfile::RocksDB => {
             ProfileSession::RocksDB(prepare_session_empty(rocksdb()).await)
+        }
+        #[cfg(feature = "slatedb")]
+        LixStorageProfile::SlateDB => {
+            ProfileSession::SlateDB(prepare_session_empty(slatedb()).await)
         }
     }
 }
@@ -937,7 +1200,12 @@ async fn insert_untracked_json_pointer_rows<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
+    let chunk_size = std::env::var("LIX_UNTRACKED_STATE_CRUD_PROFILE_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(SESSION_INSERT_CHUNK_SIZE);
+    for chunk in rows.chunks(chunk_size) {
         let sql = insert_untracked_json_pointer_sql(chunk);
         let affected = session
             .execute(&sql, &[])
@@ -948,11 +1216,72 @@ async fn insert_untracked_json_pointer_rows<StorageImpl>(
     }
 }
 
+async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
+    session: &SessionContext<StorageImpl>,
+    rows: &[PointerRow],
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let parameters = rows
+        .iter()
+        .map(|row| {
+            Arc::<[Value]>::from(vec![
+                Value::Text(row.path.clone()),
+                Value::Text(row.value_json.clone()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let results = session
+        .execute_homogeneous_write_batch(
+            Arc::<str>::from(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, lix_json($2), true)",
+            ),
+            Arc::from(parameters),
+        )
+        .await
+        .expect("homogeneous insert untracked json_pointer rows");
+    assert_eq!(results.len(), rows.len());
+    assert!(results.iter().all(|result| result.rows_affected() == 1));
+}
+
+async fn update_untracked_json_pointer_rows<StorageImpl>(
+    session: &SessionContext<StorageImpl>,
+    rows: &[PointerRow],
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let sql = update_untracked_json_pointer_sql(rows);
+    let affected = session
+        .execute(&sql, &[])
+        .await
+        .expect("update untracked json_pointer rows")
+        .rows_affected();
+    assert_eq!(affected as usize, rows.len());
+}
+
+async fn delete_untracked_json_pointer_rows<StorageImpl>(
+    session: &SessionContext<StorageImpl>,
+) -> usize
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute(
+            "DELETE FROM json_pointer WHERE lixcol_untracked = true",
+            &[],
+        )
+        .await
+        .expect("delete untracked json_pointer rows")
+        .rows_affected() as usize
+}
+
 impl ProfileStorage {
     async fn insert_all(&self, rows: &[BenchRow]) -> usize {
         match self {
             Self::SQLite(storage) => lix_insert_all(storage, rows).await,
             Self::RocksDB(storage) => lix_insert_all(storage, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_insert_all(storage, rows).await,
         }
     }
 
@@ -960,6 +1289,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_update_all(storage, rows).await,
             Self::RocksDB(storage) => lix_update_all(storage, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_update_all(storage, rows).await,
         }
     }
 
@@ -967,6 +1298,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_delete_one(storage, row).await,
             Self::RocksDB(storage) => lix_delete_one(storage, row).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_delete_one(storage, row).await,
         }
     }
 
@@ -974,6 +1307,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_delete_all(storage).await,
             Self::RocksDB(storage) => lix_delete_all(storage).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_delete_all(storage).await,
         }
     }
 
@@ -981,6 +1316,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_select_all(storage, expected_rows, projection).await,
             Self::RocksDB(storage) => lix_select_all(storage, expected_rows, projection).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_select_all(storage, expected_rows, projection).await,
         }
     }
 
@@ -988,6 +1325,8 @@ impl ProfileStorage {
         match self {
             Self::SQLite(storage) => lix_select_points(storage, rows).await,
             Self::RocksDB(storage) => lix_select_points(storage, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(storage) => lix_select_points(storage, rows).await,
         }
     }
 }
@@ -997,6 +1336,41 @@ impl ProfileSession {
         match self {
             Self::SQLite(session) => insert_untracked_json_pointer_rows(session, rows).await,
             Self::RocksDB(session) => insert_untracked_json_pointer_rows(session, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(session) => insert_untracked_json_pointer_rows(session, rows).await,
+        }
+    }
+
+    async fn insert_untracked_json_pointer_rows_homogeneous(&self, rows: &[PointerRow]) {
+        match self {
+            Self::SQLite(session) => {
+                insert_untracked_json_pointer_rows_homogeneous(session, rows).await;
+            }
+            Self::RocksDB(session) => {
+                insert_untracked_json_pointer_rows_homogeneous(session, rows).await;
+            }
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(session) => {
+                insert_untracked_json_pointer_rows_homogeneous(session, rows).await;
+            }
+        }
+    }
+
+    async fn update_untracked_json_pointer_rows(&self, rows: &[PointerRow]) {
+        match self {
+            Self::SQLite(session) => update_untracked_json_pointer_rows(session, rows).await,
+            Self::RocksDB(session) => update_untracked_json_pointer_rows(session, rows).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(session) => update_untracked_json_pointer_rows(session, rows).await,
+        }
+    }
+
+    async fn delete_untracked_json_pointer_rows(&self) -> usize {
+        match self {
+            Self::SQLite(session) => delete_untracked_json_pointer_rows(session).await,
+            Self::RocksDB(session) => delete_untracked_json_pointer_rows(session).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(session) => delete_untracked_json_pointer_rows(session).await,
         }
     }
 }
@@ -1011,6 +1385,13 @@ fn rocksdb() -> TempStorage<RocksDB> {
     let dir = TempDir::new().expect("create rocksdb storage tempdir");
     let path = dir.path().join("bench.rocksdb");
     TempStorage::new(RocksDB::open(path).expect("open rocksdb storage"), dir)
+}
+
+#[cfg(feature = "slatedb")]
+fn slatedb() -> TempStorage<SlateDB> {
+    let dir = TempDir::new().expect("create slatedb storage tempdir");
+    let path = dir.path().join("bench.slatedb");
+    TempStorage::new(SlateDB::open(path).expect("open slatedb storage"), dir)
 }
 
 fn configure_group(
@@ -1123,6 +1504,16 @@ fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
         );
     }
     sql
+}
+
+fn update_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
+    let value = rows
+        .first()
+        .map_or("{}", |row| row.updated_value_json.as_str());
+    format!(
+        "UPDATE json_pointer SET value = lix_json('{}') WHERE lixcol_untracked = true",
+        sql_string(value)
+    )
 }
 
 fn entity_pk(row: &PointerRow) -> String {
