@@ -7162,7 +7162,7 @@ mod tests {
         .expect("child root should write");
 
         // Preserve the authenticated base root header and root chunk, but
-        // remove one descendant. The first child replay attempt must discover
+        // remove its descendants. The first child replay attempt must discover
         // this typed Missing condition; the bounded retry rebuilds the parent
         // once and then replays the child.
         let read = storage
@@ -7179,16 +7179,22 @@ mod tests {
             .reachable_chunk_hashes_with_overlay(&read, &overlay, &base_root)
             .await
             .expect("base reachability should load");
-        let descendant = reachable
+        let descendants = reachable
             .into_iter()
-            .find(|hash| hash != base_root.as_bytes())
-            .expect("large base tree should have a descendant chunk");
+            .filter(|hash| hash != base_root.as_bytes())
+            .collect::<Vec<_>>();
+        assert!(
+            !descendants.is_empty(),
+            "large base tree should have descendant chunks"
+        );
         drop(read);
         let mut deletes = storage.new_write_set();
-        deletes.delete(
-            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
-            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&descendant)),
-        );
+        for descendant in descendants {
+            deletes.delete(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&descendant)),
+            );
+        }
         storage
             .commit_write_set(deletes, StorageWriteOptions::default())
             .await

@@ -3,6 +3,10 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonRef, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
+use crate::storage::{
+    GetManyRequest, GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanOptions, StorageError,
+    StorageSpace,
+};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageReadOptions,
@@ -26,6 +30,269 @@ pub fn reset_mutation_directory_read_accounting() {
 /// counters for the completed benchmark phase.
 pub fn snapshot_mutation_directory_read_accounting() -> MutationDirectoryReadAccounting {
     super::mutation_directory::snapshot_mutation_directory_read_accounting()
+}
+
+/// Feature-gated root-availability accounting exported to benchmark harnesses.
+/// The counters are absent from normal release builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchRootAvailabilityAccounting {
+    pub probes: u64,
+    pub root_chunk_reads: u64,
+    pub available: u64,
+    pub missing: u64,
+    pub corrupt: u64,
+    pub missing_descendant_retries: u64,
+    pub full_tree_scans: u64,
+    pub canonical_rebuilds: u64,
+}
+
+/// Resets root-availability counters for one benchmark phase.
+pub fn reset_root_availability_accounting() {
+    super::reset_root_availability_counters();
+}
+
+/// Snapshots root-availability counters for one completed benchmark phase.
+pub fn snapshot_root_availability_accounting() -> BenchRootAvailabilityAccounting {
+    let counters = super::root_availability_counters();
+    BenchRootAvailabilityAccounting {
+        probes: counters.probes,
+        root_chunk_reads: counters.root_chunk_reads,
+        available: counters.available,
+        missing: counters.missing,
+        corrupt: counters.corrupt,
+        missing_descendant_retries: counters.missing_descendant_retries,
+        full_tree_scans: counters.full_tree_scans,
+        canonical_rebuilds: counters.canonical_rebuilds,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchRootAvailabilityIo {
+    pub storage_get_calls: u64,
+    pub requested_keys: u64,
+    pub returned_value_bytes: u64,
+    pub storage_scan_calls: u64,
+    pub scanned_rows: u64,
+    pub scanned_value_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchRootAvailabilitySample {
+    pub plans: usize,
+    pub accounting: BenchRootAvailabilityAccounting,
+    pub io: BenchRootAvailabilityIo,
+}
+
+#[derive(Clone, Default)]
+struct BenchReadIo {
+    storage_get_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    requested_keys: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    returned_value_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    storage_scan_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    scanned_rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    scanned_value_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BenchReadIo {
+    fn snapshot(&self) -> BenchRootAvailabilityIo {
+        use std::sync::atomic::Ordering;
+        BenchRootAvailabilityIo {
+            storage_get_calls: self.storage_get_calls.load(Ordering::Relaxed),
+            requested_keys: self.requested_keys.load(Ordering::Relaxed),
+            returned_value_bytes: self.returned_value_bytes.load(Ordering::Relaxed),
+            storage_scan_calls: self.storage_scan_calls.load(Ordering::Relaxed),
+            scanned_rows: self.scanned_rows.load(Ordering::Relaxed),
+            scanned_value_bytes: self.scanned_value_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct BenchCountingRead<R> {
+    inner: R,
+    io: BenchReadIo,
+}
+
+impl<R> StorageAdapterRead for BenchCountingRead<R>
+where
+    R: StorageAdapterRead,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        use std::sync::atomic::Ordering;
+        let requested_keys = requests
+            .iter()
+            .map(|request| request.keys.len() as u64)
+            .sum::<u64>();
+        let io = self.io.clone();
+        async move {
+            io.storage_get_calls.fetch_add(1, Ordering::Relaxed);
+            io.requested_keys
+                .fetch_add(requested_keys, Ordering::Relaxed);
+            let result = self.inner.get_many(requests).await?;
+            let bytes = result
+                .values
+                .iter()
+                .filter_map(|value| match value {
+                    Some(ProjectedValue::FullValue(bytes)) => Some(bytes.len() as u64),
+                    _ => None,
+                })
+                .sum::<u64>();
+            io.returned_value_bytes.fetch_add(bytes, Ordering::Relaxed);
+            Ok(result)
+        }
+    }
+
+    fn scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+        use std::sync::atomic::Ordering;
+        let io = self.io.clone();
+        async move {
+            io.storage_scan_calls.fetch_add(1, Ordering::Relaxed);
+            let result = self.inner.scan(space, range, opts).await?;
+            io.scanned_rows
+                .fetch_add(result.entries.len() as u64, Ordering::Relaxed);
+            let bytes = result
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.value {
+                    ProjectedValue::FullValue(bytes) => Some(bytes.len() as u64),
+                    ProjectedValue::KeyOnly => None,
+                })
+                .sum::<u64>();
+            io.scanned_value_bytes.fetch_add(bytes, Ordering::Relaxed);
+            Ok(result)
+        }
+    }
+}
+
+/// Runs the authenticated root-availability probe against one coherent read.
+pub async fn probe_root_availability<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    commit_id: &str,
+    force_head: bool,
+) -> Result<BenchRootAvailabilitySample, crate::LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(crate::LixError::from)?,
+    );
+    let io = BenchReadIo::default();
+    let counted = BenchCountingRead {
+        inner: read,
+        io: io.clone(),
+    };
+    let plans = super::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+        &counted, commit_id, force_head,
+    )
+    .await?;
+    Ok(BenchRootAvailabilitySample {
+        plans: plans.len(),
+        accounting: snapshot_root_availability_accounting(),
+        io: io.snapshot(),
+    })
+}
+
+/// Repairs one commit root through the production bounded retry path and
+/// returns phase-scoped root and storage-read accounting.
+pub async fn rebuild_root_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    commit_id: &str,
+) -> Result<BenchRootAvailabilitySample, crate::LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(crate::LixError::from)?,
+    );
+    let io = BenchReadIo::default();
+    let counted = BenchCountingRead {
+        inner: read,
+        io: io.clone(),
+    };
+    let mut writes = storage.new_write_set();
+    let context = TrackedStateContext::new();
+    context
+        .root_rebuilder(&counted, &mut writes)
+        .rebuild_commit_root_at(commit_id)
+        .await?;
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .map_err(|error| {
+            crate::LixError::new(crate::LixError::CODE_INTERNAL_ERROR, error.to_string())
+        })?;
+    Ok(BenchRootAvailabilitySample {
+        plans: 0,
+        accounting: snapshot_root_availability_accounting(),
+        io: io.snapshot(),
+    })
+}
+
+/// Removes all non-root chunks reachable from one immutable root. This is a
+/// benchmark-only corruption fixture; the authenticated root header remains,
+/// so the next rebuild must discover a typed missing descendant.
+pub async fn remove_root_descendants_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    commit_id: &str,
+) -> Result<u64, crate::LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .map_err(crate::LixError::from)?,
+    );
+    let root = super::storage::load_root(&read, commit_id)
+        .await?
+        .ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("benchmark root '{commit_id}' is missing"),
+            )
+        })?;
+    let tree = super::tree::TrackedStateTree::new();
+    let overlay = super::storage::TrackedStateChunkOverlay::new();
+    let reachable = tree
+        .reachable_chunk_hashes_with_overlay(&read, &overlay, &root)
+        .await?;
+    let descendants = reachable
+        .into_iter()
+        .filter(|hash| hash != root.as_bytes())
+        .collect::<Vec<_>>();
+    let count = descendants.len() as u64;
+    let mut writes = storage.new_write_set();
+    for hash in descendants {
+        writes.delete(
+            super::storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(&hash)),
+        );
+    }
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .map_err(|error| {
+            crate::LixError::new(crate::LixError::CODE_INTERNAL_ERROR, error.to_string())
+        })?;
+    Ok(count)
 }
 
 fn stage_bench_commit_deltas(
