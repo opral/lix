@@ -837,6 +837,16 @@ async fn try_execute_direct_path_value_replacement_batch(
         primary_key_offsets.push((start, primary_key_arena.len()));
     }
     let parameter_identity_digest = *parameter_identity_hasher.finalize().as_bytes();
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_ownership(
+        crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
+        row_count,
+        primary_key_arena.len(),
+        0,
+        2,
+        0,
+        0,
+    );
     let active_branch_id = ctx.active_branch_id().to_owned();
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,

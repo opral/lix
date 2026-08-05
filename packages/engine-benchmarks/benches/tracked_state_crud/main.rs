@@ -35,6 +35,11 @@ static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
     not(target_family = "wasm"),
     not(feature = "system-allocation-profiler")
 ))]
+static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
 static ALLOCATION_ACCOUNTING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(
@@ -75,6 +80,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 fn record_allocation(bytes: usize) {
     if ALLOCATION_ACCOUNTING_ENABLED.load(Ordering::Relaxed) {
         ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -84,6 +90,7 @@ fn record_allocation(bytes: usize) {
 ))]
 fn reset_allocation_accounting() {
     ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    ALLOCATION_CALLS.store(0, Ordering::Relaxed);
     ALLOCATION_ACCOUNTING_ENABLED.store(
         std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ALLOCATION_BYTES").is_some(),
         Ordering::Relaxed,
@@ -98,8 +105,9 @@ fn print_allocation_accounting(phase: &str) {
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ALLOCATION_BYTES").is_some() {
         ALLOCATION_ACCOUNTING_ENABLED.store(false, Ordering::Relaxed);
         println!(
-            "tracked_state_crud allocation phase: {phase} allocated_bytes={}",
-            ALLOCATED_BYTES.load(Ordering::Relaxed)
+            "tracked_state_crud allocation phase: {phase} allocated_bytes={} allocation_calls={}",
+            ALLOCATED_BYTES.load(Ordering::Relaxed),
+            ALLOCATION_CALLS.load(Ordering::Relaxed),
         );
     }
 }
@@ -1035,6 +1043,11 @@ fn profile_sql_session_operation(
         };
         maybe_print_profile_rss_phase("after_seed");
         reset_allocation_accounting();
+        let ownership_accounting =
+            std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_OWNERSHIP_ACCOUNTING").is_some();
+        if ownership_accounting {
+            lix_engine::storage_bench::begin_crud_ownership_accounting();
+        }
         let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
             let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
@@ -1046,6 +1059,9 @@ fn profile_sql_session_operation(
         black_box(result);
         maybe_print_profile_rss_phase("after_operation");
         print_allocation_accounting("operation");
+        if ownership_accounting {
+            print_ownership_accounting(lix_engine::storage_bench::take_crud_ownership_accounting());
+        }
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
             let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
             let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
@@ -1104,6 +1120,11 @@ fn profile_sql_session_bound_updates(
         maybe_print_profile_rss_phase("after_seed");
         print_allocation_accounting("seed");
         reset_allocation_accounting();
+        let ownership_accounting =
+            std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_OWNERSHIP_ACCOUNTING").is_some();
+        if ownership_accounting {
+            lix_engine::storage_bench::begin_crud_ownership_accounting();
+        }
         let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
         let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
         let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
@@ -1120,6 +1141,9 @@ fn profile_sql_session_bound_updates(
         black_box(result);
         maybe_print_profile_rss_phase("after_update");
         print_allocation_accounting("update");
+        if ownership_accounting {
+            print_ownership_accounting(lix_engine::storage_bench::take_crud_ownership_accounting());
+        }
         let certificate =
             lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
@@ -1143,6 +1167,51 @@ fn profile_sql_session_bound_updates(
         read_many_pk_count,
         samples,
     );
+}
+
+fn print_ownership_accounting(accounting: lix_engine::storage_bench::CrudOwnershipAccounting) {
+    const NAMES: [&str; lix_engine::storage_bench::CRUD_OWNERSHIP_STAGE_COUNT] = [
+        "sql_bound",
+        "raw_batch",
+        "raw_transfer",
+        "prepared_batch",
+        "prepared_clone",
+        "replacement_input",
+        "replacement_part",
+        "authority",
+        "root_publication",
+        "write_set",
+        "adapter",
+        "mutation_journal",
+        "identity_encoding",
+        "normalization",
+        "journal_seal",
+    ];
+    for (stage, (name, metric)) in NAMES.into_iter().zip(accounting.stages).enumerate() {
+        if metric.rows == 0
+            && metric.key_bytes == 0
+            && metric.value_bytes == 0
+            && metric.vec_entries == 0
+            && metric.string_entries == 0
+            && metric.map_entries == 0
+        {
+            continue;
+        }
+        let transfer = accounting.transfers[stage];
+        println!(
+            "tracked_state_crud ownership: stage={name} rows={} key_bytes={} value_bytes={} vec_entries={} string_entries={} map_entries={} created_bytes={} cloned_bytes={} retained_bytes={} dropped_bytes={}",
+            metric.rows,
+            metric.key_bytes,
+            metric.value_bytes,
+            metric.vec_entries,
+            metric.string_entries,
+            metric.map_entries,
+            transfer.created_bytes,
+            transfer.cloned_bytes,
+            transfer.retained_bytes,
+            transfer.dropped_bytes,
+        );
+    }
 }
 
 async fn run_sql_session_operation(

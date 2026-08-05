@@ -624,6 +624,27 @@ impl TransactionMutationJournal {
         self.identity_offsets
             .push((start, self.identity_arena.len()));
     }
+
+    #[cfg(feature = "storage-benches")]
+    fn record_row_ownership(&self, identity_bytes: usize, snapshot_bytes: usize) {
+        crate::storage_bench::record_crud_ownership(
+            crate::storage_bench::CRUD_OWNERSHIP_MUTATION_JOURNAL,
+            1,
+            identity_bytes,
+            snapshot_bytes,
+            2,
+            0,
+            0,
+        );
+        let total = identity_bytes.saturating_add(snapshot_bytes);
+        crate::storage_bench::record_crud_ownership_transfer(
+            crate::storage_bench::CRUD_OWNERSHIP_MUTATION_JOURNAL,
+            total,
+            0,
+            total,
+            0,
+        );
+    }
 }
 
 /// One already-resolved tracked-state transition. The expected side is
@@ -1694,6 +1715,8 @@ where
         // transaction so deterministic preparation failures can still drain
         // prospective plugin actor documents before returning.
         let commit_storage = transaction.storage.clone();
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_write_set_arena(&writes);
         let prepared_commit = match commit_storage
             .prepare_write_set(writes, write_options)
             .instrument(tracing::debug_span!(
@@ -1712,6 +1735,16 @@ where
         };
         let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || async move {
             let (_commit, stats) = prepared_commit.commit().await?;
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_crud_ownership(
+                crate::storage_bench::CRUD_OWNERSHIP_ADAPTER,
+                stats.staged_puts.saturating_add(stats.staged_deletes) as usize,
+                0,
+                stats.written_bytes as usize,
+                stats.put_batches.saturating_add(stats.delete_batches) as usize,
+                stats.storage_calls as usize,
+                stats.touched_spaces as usize,
+            );
             Ok(stats)
         })
         .instrument(tracing::debug_span!(
@@ -6552,6 +6585,11 @@ where
         let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
         journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
+        #[cfg(feature = "storage-benches")]
+        journal.record_row_ownership(
+            primary_key.len(),
+            snapshot_offset.1.saturating_sub(snapshot_offset.0),
+        );
         let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
         debug_assert_eq!(*journal_timestamp, timestamp);
         Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
@@ -6689,6 +6727,11 @@ where
         )?;
         journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
+        #[cfg(feature = "storage-benches")]
+        journal.record_row_ownership(
+            primary_key.len(),
+            snapshot_offset.1.saturating_sub(snapshot_offset.0),
+        );
         let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
         debug_assert_eq!(*journal_timestamp, timestamp);
         Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
@@ -6914,10 +6957,35 @@ where
             return Ok(());
         }
         self.ensure_plugin_generation_read_guard().await;
+        let identity_arena_bytes = journal.identity_arena.len();
+        let snapshot_arena_bytes = journal.snapshot_arena.len();
+        let journal_rows = journal.len();
         #[cfg(feature = "storage-benches")]
         {
-            let row_count = journal.len();
-            crate::storage_bench::record_transaction_rows_staged(row_count);
+            crate::storage_bench::record_crud_ownership(
+                crate::storage_bench::CRUD_OWNERSHIP_IDENTITY_ENCODING,
+                journal_rows,
+                identity_arena_bytes,
+                snapshot_arena_bytes,
+                journal
+                    .identity_offsets
+                    .len()
+                    .saturating_add(journal.snapshot_offsets.len()),
+                0,
+                0,
+            );
+            let total = identity_arena_bytes.saturating_add(snapshot_arena_bytes);
+            crate::storage_bench::record_crud_ownership_transfer(
+                crate::storage_bench::CRUD_OWNERSHIP_IDENTITY_ENCODING,
+                0,
+                0,
+                total,
+                0,
+            );
+        }
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(journal_rows);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
         let timestamp = journal.timestamp.ok_or_else(|| {
@@ -6938,6 +7006,26 @@ where
             None,
             timestamp,
         )?;
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_crud_ownership(
+                crate::storage_bench::CRUD_OWNERSHIP_NORMALIZATION,
+                journal_rows,
+                identity_arena_bytes,
+                snapshot_arena_bytes,
+                journal_rows.saturating_mul(2),
+                0,
+                0,
+            );
+            let total = identity_arena_bytes.saturating_add(snapshot_arena_bytes);
+            crate::storage_bench::record_crud_ownership_transfer(
+                crate::storage_bench::CRUD_OWNERSHIP_NORMALIZATION,
+                0,
+                0,
+                total,
+                0,
+            );
+        }
         let eager_collection_is_bounded = match &self.prepared_mutation_membership {
             PreparedMutationMembership::Packed(membership) => {
                 usize::try_from(membership.complete_generation().0)

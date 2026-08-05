@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -66,6 +66,169 @@ static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Matched transaction ownership counters used by the CRUD profile.  These
+/// counters are deliberately disabled unless the profile enables them, so the
+/// common instrumentation does not perturb normal engine execution.
+pub const CRUD_OWNERSHIP_STAGE_COUNT: usize = 15;
+pub const CRUD_OWNERSHIP_METRIC_COUNT: usize = 6;
+pub const CRUD_OWNERSHIP_SQL_BOUND: usize = 0;
+pub const CRUD_OWNERSHIP_RAW_BATCH: usize = 1;
+pub const CRUD_OWNERSHIP_RAW_TRANSFER: usize = 2;
+pub const CRUD_OWNERSHIP_PREPARED_BATCH: usize = 3;
+pub const CRUD_OWNERSHIP_PREPARED_CLONE: usize = 4;
+pub const CRUD_OWNERSHIP_REPLACEMENT_INPUT: usize = 5;
+pub const CRUD_OWNERSHIP_REPLACEMENT_PART: usize = 6;
+pub const CRUD_OWNERSHIP_AUTHORITY: usize = 7;
+pub const CRUD_OWNERSHIP_ROOT_PUBLICATION: usize = 8;
+pub const CRUD_OWNERSHIP_WRITE_SET: usize = 9;
+pub const CRUD_OWNERSHIP_ADAPTER: usize = 10;
+pub const CRUD_OWNERSHIP_MUTATION_JOURNAL: usize = 11;
+pub const CRUD_OWNERSHIP_IDENTITY_ENCODING: usize = 12;
+pub const CRUD_OWNERSHIP_NORMALIZATION: usize = 13;
+pub const CRUD_OWNERSHIP_JOURNAL_SEAL: usize = 14;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudOwnershipMetric {
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    pub vec_entries: u64,
+    pub string_entries: u64,
+    pub map_entries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudOwnershipAccounting {
+    pub stages: [CrudOwnershipMetric; CRUD_OWNERSHIP_STAGE_COUNT],
+    pub transfers: [CrudOwnershipTransferMetric; CRUD_OWNERSHIP_STAGE_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudOwnershipTransferMetric {
+    pub created_bytes: u64,
+    pub cloned_bytes: u64,
+    pub retained_bytes: u64,
+    pub dropped_bytes: u64,
+}
+
+static CRUD_OWNERSHIP_ENABLED: AtomicBool = AtomicBool::new(false);
+static CRUD_OWNERSHIP_COUNTERS: [AtomicU64;
+    CRUD_OWNERSHIP_STAGE_COUNT * CRUD_OWNERSHIP_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CRUD_OWNERSHIP_STAGE_COUNT * CRUD_OWNERSHIP_METRIC_COUNT];
+static CRUD_OWNERSHIP_TRANSFER_COUNTERS: [AtomicU64; CRUD_OWNERSHIP_STAGE_COUNT * 4] =
+    [const { AtomicU64::new(0) }; CRUD_OWNERSHIP_STAGE_COUNT * 4];
+
+/// Starts a matched operation-local ownership measurement and clears any
+/// counters left by a prior profile operation.
+pub fn begin_crud_ownership_accounting() {
+    for counter in &CRUD_OWNERSHIP_COUNTERS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in &CRUD_OWNERSHIP_TRANSFER_COUNTERS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    CRUD_OWNERSHIP_ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn record_crud_ownership_transfer(
+    stage: usize,
+    created_bytes: usize,
+    cloned_bytes: usize,
+    retained_bytes: usize,
+    dropped_bytes: usize,
+) {
+    if !CRUD_OWNERSHIP_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    assert!(
+        stage < CRUD_OWNERSHIP_STAGE_COUNT,
+        "invalid ownership stage"
+    );
+    let values = [created_bytes, cloned_bytes, retained_bytes, dropped_bytes];
+    let start = stage * 4;
+    for (offset, value) in values.into_iter().enumerate() {
+        CRUD_OWNERSHIP_TRANSFER_COUNTERS[start + offset].fetch_add(value as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_crud_ownership(
+    stage: usize,
+    rows: usize,
+    key_bytes: usize,
+    value_bytes: usize,
+    vec_entries: usize,
+    string_entries: usize,
+    map_entries: usize,
+) {
+    if !CRUD_OWNERSHIP_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    assert!(
+        stage < CRUD_OWNERSHIP_STAGE_COUNT,
+        "invalid ownership stage"
+    );
+    let values = [
+        rows,
+        key_bytes,
+        value_bytes,
+        vec_entries,
+        string_entries,
+        map_entries,
+    ];
+    let start = stage * CRUD_OWNERSHIP_METRIC_COUNT;
+    for (offset, value) in values.into_iter().enumerate() {
+        CRUD_OWNERSHIP_COUNTERS[start + offset].fetch_add(value as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn take_crud_ownership_accounting() -> CrudOwnershipAccounting {
+    CRUD_OWNERSHIP_ENABLED.store(false, Ordering::Relaxed);
+    let mut stages = [CrudOwnershipMetric::default(); CRUD_OWNERSHIP_STAGE_COUNT];
+    let mut transfers = [CrudOwnershipTransferMetric::default(); CRUD_OWNERSHIP_STAGE_COUNT];
+    for (stage, metric) in stages.iter_mut().enumerate() {
+        let start = stage * CRUD_OWNERSHIP_METRIC_COUNT;
+        metric.rows = CRUD_OWNERSHIP_COUNTERS[start].swap(0, Ordering::Relaxed);
+        metric.key_bytes = CRUD_OWNERSHIP_COUNTERS[start + 1].swap(0, Ordering::Relaxed);
+        metric.value_bytes = CRUD_OWNERSHIP_COUNTERS[start + 2].swap(0, Ordering::Relaxed);
+        metric.vec_entries = CRUD_OWNERSHIP_COUNTERS[start + 3].swap(0, Ordering::Relaxed);
+        metric.string_entries = CRUD_OWNERSHIP_COUNTERS[start + 4].swap(0, Ordering::Relaxed);
+        metric.map_entries = CRUD_OWNERSHIP_COUNTERS[start + 5].swap(0, Ordering::Relaxed);
+        let transfer_start = stage * 4;
+        transfers[stage].created_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start].swap(0, Ordering::Relaxed);
+        transfers[stage].cloned_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 1].swap(0, Ordering::Relaxed);
+        transfers[stage].retained_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 2].swap(0, Ordering::Relaxed);
+        transfers[stage].dropped_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 3].swap(0, Ordering::Relaxed);
+    }
+    CrudOwnershipAccounting { stages, transfers }
+}
+
+pub(crate) fn record_crud_write_set_arena(writes: &StorageWriteSet) {
+    let stats = writes.arena_stats();
+    record_crud_ownership(
+        CRUD_OWNERSHIP_WRITE_SET,
+        stats
+            .put_descriptors
+            .saturating_add(stats.delete_descriptors),
+        stats
+            .key_inline_bytes
+            .saturating_add(stats.key_shared_bytes),
+        stats
+            .value_inline_bytes
+            .saturating_add(stats.value_shared_bytes),
+        stats
+            .put_descriptors
+            .saturating_add(stats.delete_descriptors),
+        stats
+            .key_shared_buffers
+            .saturating_add(stats.value_shared_buffers),
+        stats.spaces,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MediaStructuralAccounting {

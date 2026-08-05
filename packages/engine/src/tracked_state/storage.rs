@@ -4354,7 +4354,8 @@ pub(crate) fn stage_ordered_columnar_mutations(
 /// Parts own identity routing and JSON authority: small values are inline and
 /// large values remain content-addressed references into the JSON store.
 pub(crate) struct ReplacementPartInput<'a> {
-    key: Vec<u8>,
+    key_start: usize,
+    key_end: usize,
     commit_id: CommitId,
     created_at: crate::common::LixTimestamp,
     updated_at: crate::common::LixTimestamp,
@@ -4363,23 +4364,34 @@ pub(crate) struct ReplacementPartInput<'a> {
 }
 
 pub(crate) trait ReplacementPartInputRef<'a>: Copy {
-    fn into_replacement_part_input(self) -> Result<ReplacementPartInput<'a>, LixError>;
+    fn into_replacement_part_input(
+        self,
+        key_arena: &mut Vec<u8>,
+    ) -> Result<ReplacementPartInput<'a>, LixError>;
 }
 
 impl<'a> ReplacementPartInputRef<'a> for TrackedStateCommitDeltaRef<'a> {
-    fn into_replacement_part_input(self) -> Result<ReplacementPartInput<'a>, LixError> {
+    fn into_replacement_part_input(
+        self,
+        key_arena: &mut Vec<u8>,
+    ) -> Result<ReplacementPartInput<'a>, LixError> {
         if self.delta.deleted || !self.authored || self.origin_key.is_some() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state replacement member violates immutable replacement invariants",
             ));
         }
-        Ok(ReplacementPartInput {
-            key: encode_key_ref(TrackedStateKeyRef {
+        let key_range = encode_key_ref_into(
+            key_arena,
+            TrackedStateKeyRef {
                 schema_key: self.delta.schema_key,
                 file_id: self.delta.file_id,
                 entity_pk: self.delta.entity_pk,
-            }),
+            },
+        );
+        Ok(ReplacementPartInput {
+            key_start: key_range.start,
+            key_end: key_range.end,
             commit_id: self.delta.commit_id,
             created_at: self.delta.created_at,
             updated_at: self.delta.updated_at,
@@ -4390,13 +4402,19 @@ impl<'a> ReplacementPartInputRef<'a> for TrackedStateCommitDeltaRef<'a> {
 }
 
 impl<'a> ReplacementPartInputRef<'a> for TrackedStateSingleStringReplacementRef<'a> {
-    fn into_replacement_part_input(self) -> Result<ReplacementPartInput<'a>, LixError> {
-        let mut key = Vec::with_capacity(
-            self.schema_key.len() + self.file_id.map_or(0, str::len) + self.entity_pk.len() + 8,
+    fn into_replacement_part_input(
+        self,
+        key_arena: &mut Vec<u8>,
+    ) -> Result<ReplacementPartInput<'a>, LixError> {
+        let key_range = encode_single_string_key_ref_into(
+            key_arena,
+            self.schema_key,
+            self.file_id,
+            self.entity_pk,
         );
-        encode_single_string_key_ref_into(&mut key, self.schema_key, self.file_id, self.entity_pk);
         Ok(ReplacementPartInput {
-            key,
+            key_start: key_range.start,
+            key_end: key_range.end,
             commit_id: self.commit_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -4460,7 +4478,8 @@ where
     R: ReplacementPartInputRef<'a>,
 {
     struct BorrowedRow<'a> {
-        key: Vec<u8>,
+        key_start: usize,
+        key_end: usize,
         snapshot: crate::json_store::JsonSlotRef<'a>,
         metadata: crate::json_store::JsonSlotRef<'a>,
     }
@@ -4489,11 +4508,29 @@ where
         .and_then(|prefix| prefix.3.last())
         .map_or_else(Vec::new, |part| part.last_key().to_vec());
     let mut pending = Vec::with_capacity(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut key_arena = Vec::new();
     let mut parts = prefix.map_or_else(Vec::new, |prefix| prefix.3);
     parts.reserve(row_count.div_ceil(ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS));
     let mut compressor = None;
     for delta in deltas {
-        let delta = delta?.into_replacement_part_input()?;
+        let delta = delta?.into_replacement_part_input(&mut key_arena)?;
+        #[cfg(feature = "storage-benches")]
+        {
+            let json_bytes = |slot: crate::json_store::JsonSlotRef<'_>| match slot {
+                crate::json_store::JsonSlotRef::None => 0,
+                crate::json_store::JsonSlotRef::Ref(_) => 32,
+                crate::json_store::JsonSlotRef::Inline(value) => value.len(),
+            };
+            crate::storage_bench::record_crud_ownership(
+                crate::storage_bench::CRUD_OWNERSHIP_REPLACEMENT_INPUT,
+                1,
+                delta.key_end.saturating_sub(delta.key_start),
+                json_bytes(delta.snapshot) + json_bytes(delta.metadata),
+                1,
+                0,
+                0,
+            );
+        }
         if delta.created_at != generation.lifecycle_summary.uniform_created_at {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -4518,22 +4555,28 @@ where
                 "tracked_state replacement members have nonuniform owner or timestamp",
             ));
         }
-        let key = delta.key;
-        if !previous_key.is_empty() && previous_key >= key {
+        let key = &key_arena[delta.key_start..delta.key_end];
+        if !previous_key.is_empty() && previous_key.as_slice() >= key {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state replacement members are not in canonical identity order",
             ));
         }
         previous_key.clear();
-        previous_key.extend_from_slice(&key);
+        previous_key.extend_from_slice(key);
         pending.push(BorrowedRow {
-            key,
+            key_start: delta.key_start,
+            key_end: delta.key_end,
             snapshot: delta.snapshot,
             metadata: delta.metadata,
         });
         if pending.len() == ORDERED_COMMIT_DELTA_SEGMENT_MAX_ROWS {
-            encode_replacement_part_prefix(&mut pending, &mut parts, &mut compressor)?;
+            encode_replacement_part_prefix(
+                &mut pending,
+                &mut key_arena,
+                &mut parts,
+                &mut compressor,
+            )?;
         }
     }
     let commit_id = commit_id.expect("non-empty replacement has an owner");
@@ -4541,11 +4584,12 @@ where
     let uniform_updated_at = uniform_updated_at.expect("non-empty replacement has a timestamp");
 
     while !pending.is_empty() {
-        encode_replacement_part_prefix(&mut pending, &mut parts, &mut compressor)?;
+        encode_replacement_part_prefix(&mut pending, &mut key_arena, &mut parts, &mut compressor)?;
     }
 
     fn encode_replacement_part_prefix(
         pending: &mut Vec<BorrowedRow<'_>>,
+        key_arena: &mut Vec<u8>,
         parts: &mut Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
         compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
     ) -> Result<(), LixError> {
@@ -4555,7 +4599,7 @@ where
                 .iter()
                 .map(
                     |row| crate::tracked_state::replacement_part::ReplacementPartRowRef {
-                        encoded_key: &row.key,
+                        encoded_key: &key_arena[row.key_start..row.key_end],
                         snapshot: row.snapshot,
                         metadata: row.metadata,
                     },
@@ -4577,7 +4621,29 @@ where
             }
         };
         parts.push(encoded);
+        #[cfg(feature = "storage-benches")]
+        if let Some(part) = parts.last() {
+            crate::storage_bench::record_crud_ownership(
+                crate::storage_bench::CRUD_OWNERSHIP_REPLACEMENT_PART,
+                usize::from(part.row_count()),
+                part.first_key().len() + part.last_key().len(),
+                part.bytes().len(),
+                1,
+                0,
+                0,
+            );
+        }
+        let removed_key_end = pending[candidate_len - 1].key_end;
         pending.drain(..candidate_len);
+        if pending.is_empty() {
+            key_arena.clear();
+        } else {
+            key_arena.drain(..removed_key_end);
+            for row in pending {
+                row.key_start -= removed_key_end;
+                row.key_end -= removed_key_end;
+            }
+        }
         Ok(())
     }
 
@@ -4619,6 +4685,19 @@ pub(crate) fn stage_preencoded_ordered_addressable_replacement_parts(
             "tracked_state preencoded replacement parts are not a complete ordered row set",
         ));
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_ownership(
+        crate::storage_bench::CRUD_OWNERSHIP_AUTHORITY,
+        row_count,
+        parts
+            .iter()
+            .map(|part| part.first_key().len() + part.last_key().len())
+            .sum(),
+        parts.iter().map(|part| part.bytes().len()).sum(),
+        parts.len(),
+        0,
+        0,
+    );
     addressable_change_id(commit_id, 0, 0)?;
     let mut first_ordinal = 0u32;
     let directory_entries = parts
