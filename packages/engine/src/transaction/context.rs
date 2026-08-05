@@ -8963,9 +8963,11 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(0);
+            crate::storage_bench::record_transaction_untracked_rows(
+                row_count * usize::from(rows.untracked()),
+            );
         }
-        let domain = Domain::schema_catalog(branch_id, false);
+        let domain = Domain::schema_catalog(branch_id, rows.untracked());
         let prepared = if self
             .staged_writes
             .has_staged_schema_catalog_change(&domain)?
@@ -9026,9 +9028,12 @@ where
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(row_count);
-            crate::storage_bench::record_transaction_untracked_rows(0);
+            crate::storage_bench::record_transaction_untracked_rows(
+                row_count * usize::from(rows.untracked()),
+            );
         }
-        let domain = Domain::schema_catalog(rows.schema_scope_branch_id().to_string(), false);
+        let domain =
+            Domain::schema_catalog(rows.schema_scope_branch_id().to_string(), rows.untracked());
         let prepared = if self
             .staged_writes
             .has_staged_schema_catalog_change(&domain)?

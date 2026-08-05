@@ -561,6 +561,7 @@ pub(crate) struct CertifiedParameterBatch {
     snapshots: Vec<TransactionJson>,
     schema_key: SharedStr,
     branch_id: SharedStr,
+    untracked: bool,
     certificate: CertifiedRawWriteBatchPreparation,
     entity_columnar: Option<crate::sql2::EncodedEntityRowGroups>,
 }
@@ -571,6 +572,24 @@ impl CertifiedParameterBatch {
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        Self::new_with_lane(
+            entity_pks,
+            snapshots,
+            schema_key,
+            branch_id,
+            false,
+            certificate,
+        )
+    }
+
+    pub(crate) fn new_with_lane(
+        entity_pks: Vec<EntityPk>,
+        snapshots: Vec<TransactionJson>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if entity_pks.len() != snapshots.len() {
@@ -590,6 +609,7 @@ impl CertifiedParameterBatch {
             snapshots,
             schema_key,
             branch_id,
+            untracked,
             certificate,
             entity_columnar: None,
         })
@@ -615,12 +635,17 @@ impl CertifiedParameterBatch {
         self.schema_key.as_str()
     }
 
+    pub(crate) fn untracked(&self) -> bool {
+        self.untracked
+    }
+
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
         RawWriteBatch::from_certified_parameter_rows(
             self.entity_pks,
             self.snapshots,
             self.schema_key,
             self.branch_id,
+            self.untracked,
             self.certificate,
         )
     }
@@ -643,6 +668,7 @@ impl CertifiedParameterBatch {
             snapshots,
             schema_key,
             branch_id,
+            untracked,
             certificate,
             entity_columnar,
         } = self;
@@ -692,6 +718,7 @@ impl CertifiedParameterBatch {
                 timestamps,
                 commit_id: None,
                 branch_id: branch_id_ordinal,
+                untracked,
                 direct_change_ids: None,
                 entity_columnar,
             }),
@@ -848,6 +875,7 @@ impl RawWriteBatch {
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if entity_pks.len() != snapshots.len() {
@@ -895,7 +923,7 @@ impl RawWriteBatch {
             change_id: RAW_WRITE_NONE,
             commit_id: RAW_WRITE_NONE,
             branch_id: branch_id_ordinal,
-            flags: 0,
+            flags: if untracked { RAW_WRITE_UNTRACKED } else { 0 },
         };
         Ok(Self {
             slots: vec![slot; row_count],
@@ -1185,7 +1213,7 @@ impl RawWriteBatch {
                 || slot.updated_at != RAW_WRITE_NONE
                 || slot.change_id != RAW_WRITE_NONE
                 || slot.commit_id != RAW_WRITE_NONE
-                || slot.flags != 0
+                || slot.flags & !RAW_WRITE_UNTRACKED != 0
                 || metadata.is_some()
             {
                 return Err(LixError::new(
@@ -1229,7 +1257,7 @@ impl RawWriteBatch {
                 change_id: Some(ChangeId::default()),
                 addressable_change_id: true,
                 commit_id: None,
-                untracked: false,
+                untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
                 branch_id: slot.branch_id,
                 durable_predecessor: None,
             });
@@ -2715,6 +2743,7 @@ struct DenseCertifiedParameterSlots {
     timestamps: DenseParameterTimestamps,
     commit_id: Option<CommitId>,
     branch_id: u32,
+    untracked: bool,
     /// Absent until commit-delta publication assigns direct addresses. The
     /// compact segment map derives every UUID without a million-row column.
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
@@ -2996,7 +3025,7 @@ impl PreparedStateBatch {
                 )),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
-                untracked: false,
+                untracked: dense.untracked,
                 branch_id: &self.strings[dense.branch_id as usize],
                 durable_predecessor: None,
             });
