@@ -203,7 +203,7 @@ where
     let retention_ok = exercise_retention(&lix).await;
     let (undo_ms, redo_ms, undo_redo_ok) = exercise_undo_redo(&lix).await;
     let (branch_ms, merge_preview_ms, merge_ms, branch_delete_ms, merge_ok, branch_details) =
-        exercise_branches_and_merge(&lix, rows, shape).await;
+        exercise_branches_and_merge(&lix, rows, shape, counters.as_ref()).await;
 
     let gc_start = Instant::now();
     let gc_checkpoint_start = lix
@@ -474,6 +474,7 @@ async fn exercise_branches_and_merge<S>(
     lix: &Lix<S>,
     rows: usize,
     shape: MergeShape,
+    counters: Option<&SlateDBIoCounters>,
 ) -> (f64, f64, f64, f64, bool, JsonValue)
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -485,6 +486,7 @@ where
         .expect("read lifecycle main branch");
     let active_branch_ms = millis(active_branch_start.elapsed());
     let branch_start = Instant::now();
+    let create_io_before = counters.map(SlateDBIoCounters::snapshot);
     let branch_create_start = Instant::now();
     let branch = lix
         .create_branch(CreateBranchOptions {
@@ -495,6 +497,8 @@ where
         .await
         .expect("create lifecycle source branch");
     let branch_create_ms = millis(branch_create_start.elapsed());
+    let create_io = io_delta_json(counters, create_io_before);
+    let switch_to_source_io_before = counters.map(SlateDBIoCounters::snapshot);
     let switch_to_source_start = Instant::now();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: branch.id.clone(),
@@ -502,10 +506,14 @@ where
     .await
     .expect("switch to lifecycle source branch");
     let switch_to_source_ms = millis(switch_to_source_start.elapsed());
+    let switch_to_source_io = io_delta_json(counters, switch_to_source_io_before);
     let changes = merge_change_count(rows, shape);
+    let source_update_io_before = counters.map(SlateDBIoCounters::snapshot);
     let source_update_start = Instant::now();
     update_files(lix, rows / 2, changes, "source-merge").await;
     let source_update_ms = millis(source_update_start.elapsed());
+    let source_update_io = io_delta_json(counters, source_update_io_before);
+    let switch_to_target_io_before = counters.map(SlateDBIoCounters::snapshot);
     let switch_to_target_start = Instant::now();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: main_branch_id,
@@ -513,9 +521,12 @@ where
     .await
     .expect("switch to lifecycle target branch");
     let switch_to_target_ms = millis(switch_to_target_start.elapsed());
+    let switch_to_target_io = io_delta_json(counters, switch_to_target_io_before);
+    let target_update_io_before = counters.map(SlateDBIoCounters::snapshot);
     let target_update_start = Instant::now();
     update_files(lix, 1, changes, "target-merge").await;
     let target_update_ms = millis(target_update_start.elapsed());
+    let target_update_io = io_delta_json(counters, target_update_io_before);
     let branch_ms = millis(branch_start.elapsed());
 
     let preview_start = Instant::now();
@@ -555,10 +566,15 @@ where
         json!({
             "active_branch_id": active_branch_ms,
             "create": branch_create_ms,
+            "create_io": create_io,
             "switch_to_source": switch_to_source_ms,
+            "switch_to_source_io": switch_to_source_io,
             "source_update": source_update_ms,
+            "source_update_io": source_update_io,
             "switch_to_target": switch_to_target_ms,
+            "switch_to_target_io": switch_to_target_io,
             "target_update": target_update_ms,
+            "target_update_io": target_update_io,
         }),
     )
 }
@@ -625,17 +641,50 @@ fn snapshot_json(snapshot: SlateDBIoSnapshot) -> JsonValue {
         "deleted_objects": snapshot.deleted_objects,
         "copied_objects": snapshot.copied_objects,
         "immutable_locator_rows": snapshot.immutable_locator_rows,
+        "cache_filesystem_reads": snapshot.cache_filesystem_reads,
+        "cache_filesystem_writes": snapshot.cache_filesystem_writes,
+        "cache_filesystem_removes": snapshot.cache_filesystem_removes,
+        "writer_gate_acquisitions": snapshot.writer_gate_acquisitions,
+        "writer_gate_wait_nanos": snapshot.writer_gate_wait_nanos,
         "wal_read_objects": snapshot.wal.read_objects,
+        "wal_read_bytes": snapshot.wal.read_bytes,
         "wal_write_objects": snapshot.wal.write_objects,
+        "wal_write_bytes": snapshot.wal.write_bytes,
         "compacted_read_objects": snapshot.compacted.read_objects,
+        "compacted_read_bytes": snapshot.compacted.read_bytes,
         "compacted_write_objects": snapshot.compacted.write_objects,
+        "compacted_write_bytes": snapshot.compacted.write_bytes,
         "manifest_read_objects": snapshot.manifest.read_objects,
+        "manifest_read_bytes": snapshot.manifest.read_bytes,
         "manifest_write_objects": snapshot.manifest.write_objects,
+        "manifest_write_bytes": snapshot.manifest.write_bytes,
         "compaction_read_objects": snapshot.compactions.read_objects,
+        "compaction_read_bytes": snapshot.compactions.read_bytes,
         "compaction_write_objects": snapshot.compactions.write_objects,
+        "compaction_write_bytes": snapshot.compactions.write_bytes,
+        "other_read_objects": snapshot.other.read_objects,
+        "other_read_bytes": snapshot.other.read_bytes,
+        "other_write_objects": snapshot.other.write_objects,
+        "other_write_bytes": snapshot.other.write_bytes,
+        "main_read_requests": snapshot.main.read_requests,
+        "main_write_requests": snapshot.main.write_requests,
+        "reader_read_requests": snapshot.reader.read_requests,
+        "reader_write_requests": snapshot.reader.write_requests,
+        "compactor_read_requests": snapshot.compactor.read_requests,
+        "compactor_write_requests": snapshot.compactor.write_requests,
         "gc_read_requests": snapshot.gc.read_requests,
         "gc_write_requests": snapshot.gc.write_requests,
     })
+}
+
+fn io_delta_json(
+    counters: Option<&SlateDBIoCounters>,
+    before: Option<SlateDBIoSnapshot>,
+) -> JsonValue {
+    match (counters, before) {
+        (Some(counters), Some(before)) => snapshot_json(counters.snapshot().saturating_sub(before)),
+        _ => JsonValue::Null,
+    }
 }
 
 fn signed_delta(after: u64, before: u64) -> i64 {
