@@ -2454,13 +2454,6 @@ impl PublishedCommitStateTopology {
         self.header.current_state_scoped_ranges.as_deref()
     }
 
-    pub(crate) fn snapshot_root_id(&self) -> Option<TrackedStateRootId> {
-        self.header
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.root_id.clone())
-    }
-
     fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
         super::scoped_current_state::CommitStateTopologyRef {
             commit_id: self.header.commit_id,

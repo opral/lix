@@ -24,12 +24,17 @@ use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-/// Read model for resolving authoritative commit manifests into entity state
-/// at a head.
+/// Read model for resolving changelog commit facts at a head.
 ///
-/// The changelog commit plane is a compact serving projection. Every graph
-/// read validates it against the commit-state manifest before exposing
-/// topology.
+/// The commit graph owns semantic commit metadata. Physical tracked-state
+/// manifests are required by state/history payload readers, but GC may retire
+/// those manifests while retaining a changelog projection until the semantic
+/// commit itself becomes unreachable. Metadata reads must therefore not make
+/// the physical serving manifest a second membership authority.
+///
+/// The changelog commit plane is a compact serving projection. State/history
+/// payload readers validate physical commit-state authority before decoding
+/// tracked data; metadata topology does not require that physical projection.
 #[derive(Clone)]
 pub(crate) struct CommitGraphContext;
 
@@ -388,20 +393,14 @@ fn commit_graph_node_from_authority(
     authority_id: Option<CommitId>,
 ) -> Result<Option<CommitGraphNode>, LixError> {
     // Public graph membership belongs to the compact changelog projection.
-    // GC may retain an immutable manifest after removing that projection so
-    // selected payloads remain addressable for recovery.
+    // A physical manifest is an independent serving/replay authority. Its
+    // absence is handled by payload/state readers, not by metadata membership.
     let Some(record) = record else {
         return Ok(None);
     };
-    let Some(authority_id) = authority_id else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit_graph projection for commit '{commit_id}' has no commit-state authority"
-            ),
-        ));
-    };
-    if record.commit_id != authority_id {
+    if let Some(authority_id) = authority_id
+        && record.commit_id != authority_id
+    {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -690,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_node_rejects_projection_without_commit_state_authority() {
+    async fn load_node_serves_projection_without_commit_state_authority() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
@@ -719,12 +718,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let error = CommitGraphContext::new()
+        let node = CommitGraphContext::new()
             .reader(read)
             .load_node(&commit_id)
             .await
-            .expect_err("a changelog projection cannot replace missing authority");
-        assert!(error.message.contains("has no commit-state authority"));
+            .expect("commit metadata should remain readable")
+            .expect("changelog projection should produce a node");
+        assert_eq!(node.commit_id, commit_id);
     }
 
     #[tokio::test]

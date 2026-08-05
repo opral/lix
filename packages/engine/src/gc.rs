@@ -12,14 +12,12 @@ use bytes::Bytes;
 
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{
-    CHANGE_SPACE, ChangeId, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitId,
-    GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, change_key,
+    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeScanRequest,
+    ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, GcLiveSet, GcPlan, GcRepairSet,
+    GcRoot, GcSweepSet, change_key, commit_change_id_key, commit_key,
 };
 #[cfg(test)]
-use crate::changelog::{
-    COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeRecord, CommitScanRequest, commit_change_id_key,
-    commit_key,
-};
+use crate::changelog::{ChangeRecord, CommitScanRequest};
 use crate::commit_graph::CommitGraphContext;
 #[cfg(test)]
 use crate::json_store::JsonRef;
@@ -956,11 +954,12 @@ where
             std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
         })
         .collect::<BTreeSet<_>>();
-    active_roots.extend(
-        recovery_refs
-            .iter()
-            .map(|recovery| recovery.recovered_head_commit_id),
-    );
+    active_roots.extend(recovery_refs.iter().flat_map(|recovery| {
+        [
+            recovery.recovered_head_commit_id,
+            recovery.checkpoint_commit_id,
+        ]
+    }));
     if active_roots.is_empty() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1015,6 +1014,7 @@ where
     }
     let mut active_authority_ids = active_roots.clone();
     let mut active_dependency_ids = BTreeSet::new();
+    let mut active_semantic_dependency_ids = BTreeSet::new();
     let mut active_manifests = BTreeMap::new();
     let mut pending = active_roots.iter().copied().collect::<Vec<_>>();
     while let Some(commit_id) = pending.pop() {
@@ -1069,6 +1069,7 @@ where
         for (_, node) in replay_nodes.iter() {
             if let Some(node) = node {
                 active_dependency_ids.extend(node.parent_commit_ids.iter().copied());
+                active_semantic_dependency_ids.extend(node.parent_commit_ids.iter().copied());
             }
         }
     }
@@ -1146,13 +1147,22 @@ where
             let Some(old_root) = delta.old_root else {
                 continue;
             };
-            if !retirement_is_proven(
+            let physical_retirement = retirement_is_proven(
                 old_root,
                 delta.new_root,
                 &active_authority_ids,
                 &active_dependency_ids,
-            ) || replay_debt_ids.contains(&old_root)
-            {
+            ) && !replay_debt_ids.contains(&old_root);
+            let semantic_retirement = retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_roots,
+                &active_semantic_dependency_ids,
+            );
+            if semantic_retirement {
+                stage_delete_semantic_commit_projection(&store, writes, old_root).await?;
+            }
+            if !physical_retirement {
                 continue;
             }
             let manifest = crate::tracked_state::load_commit_state_manifest(&store, old_root)
@@ -2216,6 +2226,54 @@ fn retirement_is_proven(
     new_root != Some(old_root)
         && !active_authority_ids.contains(&old_root)
         && !active_dependency_ids.contains(&old_root)
+}
+
+/// Removes the semantic commit projection once its root interval is no longer
+/// reachable. Physical tracked-state authority may remain alive as a selected
+/// source or serving dependency, so this decision is intentionally separate
+/// from manifest/CAS retirement.
+async fn stage_delete_semantic_commit_projection<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let commit_ids = [commit_id];
+    let record = ChangelogContext::new()
+        .reader(store)
+        .load_commits(CommitLoadRequest {
+            commit_ids: &commit_ids,
+        })
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record);
+    let Some(record) = record else {
+        // A prior GC pass may already have removed the semantic projection
+        // while its physical authority remained pinned.
+        return Ok(());
+    };
+    if record.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit projection key for '{commit_id}' contains '{}'",
+                record.commit_id
+            ),
+        ));
+    }
+    writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
+    writes.delete(
+        COMMIT_CHANGE_ID_SPACE,
+        StorageKey(Bytes::from(commit_change_id_key(record.change_id))),
+    );
+    writes.delete(
+        CHANGE_SPACE,
+        StorageKey(Bytes::from(change_key(record.change_id))),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
