@@ -3503,9 +3503,7 @@ async fn stage_tracked_head(
                 row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
                     && row.snapshot.is_some()
                     && !insert_selection.contains(row_index)
-                    && !row
-                        .origin
-                        .is_some_and(|origin| origin.operation == TransactionWriteOperation::Insert)
+                    && row.origin.is_none()
             })
         {
             lifecycle_ids.insert(root.commit_id);
