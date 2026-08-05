@@ -12,7 +12,8 @@ pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
     BranchHeadControlReader, GENERATION_MANIFEST_SPACE, GENERATION_RECLAMATION_SPACE,
     GenerationChunkManifest, GenerationReclamation, branch_head_control_precondition,
-    decode_reclamation_key, encode_generation_key, generation_scope_digest,
+    decode_reclamation_key, encode_generation_key, generation_manifest_digest,
+    generation_scope_digest,
     stage_branch_head_control, stage_delete_branch_head_control, stage_generation_manifest,
     stage_generation_reclamation, untracked_identity_digest,
 };

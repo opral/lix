@@ -23,7 +23,10 @@ use crate::storage_codec;
 pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0033), BRANCH_HEAD_CONTROL_NAMESPACE);
-pub(crate) const GENERATION_MANIFEST_NAMESPACE: &str = "live_state.generation_manifest.v1";
+// The manifest carries the authenticated root-backed scope bit introduced by
+// the branch-GC protocol cut.  Keep it in a new namespace so bytes written by
+// the prior five-field manifest codec cannot be interpreted as this schema.
+pub(crate) const GENERATION_MANIFEST_NAMESPACE: &str = "live_state.generation_manifest.v2";
 pub(crate) const GENERATION_MANIFEST_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0035), GENERATION_MANIFEST_NAMESPACE);
 pub(crate) const GENERATION_RECLAMATION_NAMESPACE: &str = "live_state.generation_reclamation.v1";
@@ -162,6 +165,25 @@ pub(crate) fn generation_scope_digest(branch_id: &str, generation: CommitId) -> 
     let mut bytes = Vec::with_capacity(branch_id.len() + 16);
     bytes.extend_from_slice(branch_id.as_bytes());
     bytes.extend_from_slice(generation.as_uuid().as_bytes());
+    *blake3::hash(&bytes).as_bytes()
+}
+
+/// Authenticates the manifest's physical scope class in addition to its
+/// branch/generation identity.  Reclamation records retain the base scope
+/// digest above so retiring an older generation does not require recovering
+/// its manifest before publication; GC binds this digest to the decoded
+/// manifest and fails closed if the scope bit or digest is corrupted.
+pub(crate) fn generation_manifest_digest(
+    branch_id: &str,
+    generation: CommitId,
+    root_backed: bool,
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(branch_id.len() + 32);
+    bytes.extend_from_slice(b"generation-manifest-scope-v2\0");
+    bytes.extend_from_slice(branch_id.as_bytes());
+    bytes.push(0xff);
+    bytes.extend_from_slice(generation.as_uuid().as_bytes());
+    bytes.push(u8::from(root_backed));
     *blake3::hash(&bytes).as_bytes()
 }
 

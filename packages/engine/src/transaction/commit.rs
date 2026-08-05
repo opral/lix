@@ -10,9 +10,9 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
     BranchHeadControlObservation, BranchRefReader, GenerationChunkManifest, GenerationReclamation,
-    branch_head_control_precondition, generation_scope_digest, stage_branch_head_control,
-    stage_delete_branch_head_control, stage_generation_manifest, stage_generation_reclamation,
-    untracked_identity_digest as branch_untracked_identity_digest,
+    branch_head_control_precondition, generation_manifest_digest, generation_scope_digest,
+    stage_branch_head_control, stage_delete_branch_head_control, stage_generation_manifest,
+    stage_generation_reclamation, untracked_identity_digest as branch_untracked_identity_digest,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
@@ -4939,7 +4939,11 @@ async fn stage_branch_head_control_publications(
         match desired {
             Some(control) => {
                 control.validate_untracked_summary()?;
-                let manifest_digest = generation_scope_digest(branch_id, control.generation);
+                let manifest_scope_digest = generation_manifest_digest(
+                    branch_id,
+                    control.generation,
+                    root_backed_branch_publications.contains(branch_id),
+                );
                 stage_generation_manifest(
                     writes,
                     branch_id,
@@ -4947,7 +4951,7 @@ async fn stage_branch_head_control_publications(
                         generation: control.generation,
                         head_commit_id: control.head_commit_id,
                         checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
-                        scope_digest: manifest_digest,
+                        scope_digest: manifest_scope_digest,
                         root_backed: root_backed_branch_publications.contains(branch_id),
                         indexed_chunk_count: 0,
                     },

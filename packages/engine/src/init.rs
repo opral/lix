@@ -4,7 +4,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
     BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY, BranchHeadControl,
-    GenerationChunkManifest, generation_scope_digest, stage_branch_head_control,
+    GenerationChunkManifest, generation_manifest_digest, stage_branch_head_control,
     stage_generation_manifest, untracked_identity_digest,
 };
 use crate::changelog::{
@@ -55,7 +55,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v59";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v60";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -531,7 +531,11 @@ where
                     generation: control.generation,
                     head_commit_id: control.head_commit_id,
                     checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
-                    scope_digest: generation_scope_digest(&branch.branch_id, control.generation),
+                    scope_digest: generation_manifest_digest(
+                        &branch.branch_id,
+                        control.generation,
+                        false,
+                    ),
                     root_backed: false,
                     indexed_chunk_count: 0,
                 },

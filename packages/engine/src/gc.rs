@@ -571,13 +571,19 @@ where
                     ),
                 )
             })?;
-        let expected_digest = crate::branch::generation_scope_digest(&branch_id, record.generation);
+        let expected_record_digest =
+            crate::branch::generation_scope_digest(&branch_id, record.generation);
+        let expected_manifest_digest = crate::branch::generation_manifest_digest(
+            &branch_id,
+            record.generation,
+            manifest.root_backed,
+        );
         if manifest.generation != record.generation
             || (record.full_generation && manifest.head_commit_id != record.head_commit_id)
             || (record.full_generation
                 && manifest.checkpoint_commit_id != record.checkpoint_commit_id)
-            || record.manifest_digest != expected_digest
-            || manifest.scope_digest != record.manifest_digest
+            || record.manifest_digest != expected_record_digest
+            || manifest.scope_digest != expected_manifest_digest
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1740,7 +1746,9 @@ mod tests {
         let branch_id = "gc-branch";
         let generation = CommitId::for_test_label("retired-generation");
         let head_commit_id = CommitId::for_test_label("retired-head");
-        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let record_digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let manifest_digest =
+            crate::branch::generation_manifest_digest(branch_id, generation, true);
 
         let mut writes = storage.new_write_set();
         let mut retired_key = generation_scope_prefix(branch_id, generation);
@@ -1768,7 +1776,7 @@ mod tests {
                 generation,
                 head_commit_id,
                 checkpoint_commit_id: None,
-                scope_digest: digest,
+                scope_digest: manifest_digest,
                 root_backed: true,
                 indexed_chunk_count: 1,
             },
@@ -1782,7 +1790,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: None,
                 full_generation: true,
-                manifest_digest: digest,
+                manifest_digest: record_digest,
             },
         )
         .expect("generation reclamation should stage");
@@ -1850,7 +1858,9 @@ mod tests {
         let branch_id = "active-gc-branch";
         let generation = CommitId::for_test_label("active-generation");
         let head_commit_id = CommitId::for_test_label("active-head");
-        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let record_digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let manifest_digest =
+            crate::branch::generation_manifest_digest(branch_id, generation, false);
         let timestamp =
             LixTimestamp::expect_parse("active generation test timestamp", "2026-01-01T00:00:00Z");
         let mut writes = storage.new_write_set();
@@ -1878,7 +1888,7 @@ mod tests {
                 generation,
                 head_commit_id,
                 checkpoint_commit_id: None,
-                scope_digest: digest,
+                scope_digest: manifest_digest,
                 root_backed: false,
                 indexed_chunk_count: 0,
             },
@@ -1892,7 +1902,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: None,
                 full_generation: true,
-                manifest_digest: digest,
+                manifest_digest: record_digest,
             },
         )
         .expect("active reclamation should stage");
@@ -1915,6 +1925,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_reclamation_rejects_scope_bit_corruption() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "scope-corruption-branch";
+        let generation = CommitId::for_test_label("scope-corruption-generation");
+        let head_commit_id = CommitId::for_test_label("scope-corruption-head");
+        let record_digest = crate::branch::generation_scope_digest(branch_id, generation);
+        // Deliberately authenticate the manifest as non-root-backed, then
+        // flip only the scope bit. GC must not accept the narrower delete
+        // scope when the authenticated digest still names the old class.
+        let false_manifest_digest =
+            crate::branch::generation_manifest_digest(branch_id, generation, false);
+        let mut writes = storage.new_write_set();
+        stage_generation_manifest(
+            &mut writes,
+            branch_id,
+            GenerationChunkManifest {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: None,
+                scope_digest: false_manifest_digest,
+                root_backed: true,
+                indexed_chunk_count: 0,
+            },
+        )
+        .expect("corrupted generation manifest should stage");
+        stage_generation_reclamation(
+            &mut writes,
+            branch_id,
+            GenerationReclamation {
+                generation,
+                head_commit_id,
+                checkpoint_commit_id: None,
+                full_generation: true,
+                manifest_digest: record_digest,
+            },
+        )
+        .expect("reclamation record should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corruption fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corruption read should open");
+        let mut gc_writes = storage.new_write_set();
+        let error = super::stage_collect_reclaimed_generations(&read, &mut gc_writes)
+            .await
+            .expect_err("scope-bit corruption must fail closed");
+        assert!(error.to_string().contains("manifest binding mismatch"));
+        assert!(gc_writes.is_empty());
+    }
+
+    #[tokio::test]
     async fn checkpoint_reclamation_keeps_the_active_generation_manifest() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "partial-gc-branch";
@@ -1923,7 +1988,9 @@ mod tests {
         let advanced_head_commit_id = CommitId::for_test_label("partial-advanced-head");
         let checkpoint_commit_id = CommitId::for_test_label("partial-current-checkpoint");
         let old_checkpoint_commit_id = CommitId::for_test_label("partial-old-checkpoint");
-        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let record_digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let manifest_digest =
+            crate::branch::generation_manifest_digest(branch_id, generation, false);
         let timestamp =
             LixTimestamp::expect_parse("partial generation timestamp", "2026-01-01T00:00:00Z");
         let mut writes = storage.new_write_set();
@@ -1955,7 +2022,7 @@ mod tests {
                 generation,
                 head_commit_id: advanced_head_commit_id,
                 checkpoint_commit_id: Some(checkpoint_commit_id),
-                scope_digest: digest,
+                scope_digest: manifest_digest,
                 root_backed: false,
                 indexed_chunk_count: 0,
             },
@@ -1969,7 +2036,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: Some(old_checkpoint_commit_id),
                 full_generation: false,
-                manifest_digest: digest,
+                manifest_digest: record_digest,
             },
         )
         .expect("partial reclamation should stage");
@@ -2022,7 +2089,9 @@ mod tests {
         let head_commit_id = CommitId::for_test_label("retired-after-checkpoint-head");
         let old_checkpoint_commit_id = CommitId::for_test_label("retired-old-checkpoint");
         let current_checkpoint_commit_id = CommitId::for_test_label("retired-current-checkpoint");
-        let digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let record_digest = crate::branch::generation_scope_digest(branch_id, generation);
+        let manifest_digest =
+            crate::branch::generation_manifest_digest(branch_id, generation, false);
         let mut writes = storage.new_write_set();
         stage_generation_manifest(
             &mut writes,
@@ -2031,7 +2100,7 @@ mod tests {
                 generation,
                 head_commit_id,
                 checkpoint_commit_id: Some(current_checkpoint_commit_id),
-                scope_digest: digest,
+                scope_digest: manifest_digest,
                 root_backed: false,
                 indexed_chunk_count: 0,
             },
@@ -2045,7 +2114,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: Some(old_checkpoint_commit_id),
                 full_generation: false,
-                manifest_digest: digest,
+                manifest_digest: record_digest,
             },
         )
         .expect("old checkpoint reclamation should stage");
@@ -2057,7 +2126,7 @@ mod tests {
                 head_commit_id,
                 checkpoint_commit_id: Some(current_checkpoint_commit_id),
                 full_generation: true,
-                manifest_digest: digest,
+                manifest_digest: record_digest,
             },
         )
         .expect("full generation reclamation should stage");
