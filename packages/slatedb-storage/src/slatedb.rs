@@ -4601,16 +4601,12 @@ impl EncodedBounds {
 }
 
 fn upper_before_or_equal_lower(upper: &Bound<Vec<u8>>, lower: &Bound<Vec<u8>>) -> bool {
-    let (Some(upper), Some(lower)) = (bound_bytes(upper), bound_bytes(lower)) else {
-        return false;
-    };
-    upper <= lower
-}
-
-fn bound_bytes(bound: &Bound<Vec<u8>>) -> Option<&[u8]> {
-    match bound {
-        Bound::Included(value) | Bound::Excluded(value) => Some(value.as_slice()),
-        Bound::Unbounded => None,
+    match (upper, lower) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(upper), Bound::Included(lower)) => upper < lower,
+        (Bound::Included(upper), Bound::Excluded(lower))
+        | (Bound::Excluded(upper), Bound::Included(lower))
+        | (Bound::Excluded(upper), Bound::Excluded(lower)) => upper <= lower,
     }
 }
 
@@ -5103,6 +5099,23 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn multi_range_adjacency_respects_bound_inclusivity() {
+        let key = b"b".to_vec();
+        assert!(!upper_before_or_equal_lower(
+            &Bound::Included(key.clone()),
+            &Bound::Included(key.clone()),
+        ));
+        assert!(upper_before_or_equal_lower(
+            &Bound::Excluded(key.clone()),
+            &Bound::Included(key.clone()),
+        ));
+        assert!(upper_before_or_equal_lower(
+            &Bound::Included(key.clone()),
+            &Bound::Excluded(key.clone()),
+        ));
+    }
 
     tokio::task_local! {
         static CALLER_READ_MARKER: ();

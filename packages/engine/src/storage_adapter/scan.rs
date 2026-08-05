@@ -95,6 +95,13 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let buckets = read.scan_many(space, ranges, projection).await?;
+    if buckets.len() != ranges.len() {
+        return Err(StorageError::Corruption(format!(
+            "storage multi-range read returned {} buckets for {} ranges",
+            buckets.len(),
+            ranges.len()
+        )));
+    }
     #[cfg(feature = "storage-benches")]
     {
         let rows = buckets
@@ -153,5 +160,71 @@ fn scan_trace_stats(
         scan_resume_after: u64::from(opts.resume_after.is_some()),
         scan_limit_rows_total: opts.limit_rows as u64,
         scan_limit_rows_max: opts.limit_rows as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{GetManyRequest, GetManyResult, Key, ReadEntry, StorageRead};
+    use bytes::Bytes;
+    use std::future::Future;
+    use std::ops::Bound;
+
+    struct WrongBucketCount;
+
+    impl StorageAdapterRead for WrongBucketCount {
+        fn get_many(
+            &self,
+            _requests: &[GetManyRequest<'_>],
+        ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+            async { Ok(GetManyResult::new(Vec::new())) }
+        }
+
+        fn scan(
+            &self,
+            _space: StorageSpace,
+            _range: KeyRange,
+            _opts: ScanOptions,
+        ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+            async {
+                Ok(ScanChunk {
+                    entries: Vec::new(),
+                    has_more: false,
+                })
+            }
+        }
+
+        fn scan_many(
+            &self,
+            _space: StorageSpace,
+            _ranges: &[KeyRange],
+            _projection: CoreProjection,
+        ) -> impl Future<Output = Result<Vec<Vec<ReadEntry>>, StorageError>> + Send {
+            async { Ok(vec![Vec::new()]) }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_many_rejects_wrong_bucket_cardinality() {
+        let ranges = vec![
+            KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"a"))),
+                upper: Bound::Excluded(Key(Bytes::from_static(b"b"))),
+            },
+            KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"c"))),
+                upper: Bound::Excluded(Key(Bytes::from_static(b"d"))),
+            },
+        ];
+        let error = collect_many(
+            &WrongBucketCount,
+            StorageSpace::mutable(crate::storage::SpaceId(1), "test"),
+            &ranges,
+            CoreProjection::KeyOnly,
+        )
+        .await
+        .expect_err("wrong bucket count must fail closed");
+        assert!(matches!(error, StorageError::Corruption(message) if message.contains("buckets")));
     }
 }

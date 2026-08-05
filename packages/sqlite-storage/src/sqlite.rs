@@ -436,36 +436,88 @@ impl StorageRead for SQLiteRead {
         ranges: &[KeyRange],
         projection: CoreProjection,
     ) -> Result<Vec<Vec<ReadEntry>>, StorageError> {
-        let mut buckets = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let mut entries = Vec::new();
-            let mut resume_after = None;
-            loop {
-                let chunk = self
-                    .scan(
-                        space,
-                        range.clone(),
-                        ScanOptions {
-                            projection,
-                            limit_rows: crate::storage::MAX_SCAN_PAGE_ROWS,
-                            resume_after: resume_after.clone(),
-                        },
-                    )
-                    .await?;
-                let has_more = chunk.has_more;
-                let last = chunk.entries.last().map(|entry| entry.key.clone());
-                entries.extend(chunk.entries);
-                if !has_more {
-                    break;
-                }
-                let Some(last) = last else {
-                    return Err(StorageError::Corruption(
-                        "sqlite multi-range scan has_more page has no cursor".to_string(),
-                    ));
-                };
-                resume_after = Some(last);
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|error| {
+            StorageError::Io(format!("sqlite read connection poisoned: {error}"))
+        })?;
+        let conn = conn
+            .as_ref()
+            .ok_or_else(|| StorageError::Io("sqlite read is closed".to_string()))?;
+        if !space_table_exists(conn, space.id)? {
+            return Ok((0..ranges.len()).map(|_| Vec::new()).collect());
+        }
+
+        // Lower all ranges into one SQLite VM over the already-open read
+        // transaction. UNION ALL deliberately preserves duplicate/overlap
+        // semantics; the literal bucket ordinal restores request order after
+        // the single key-ordered result stream. There is no per-range scan
+        // future, cursor, or adapter round trip.
+        let table = space_table(space.id);
+        let columns = match projection {
+            CoreProjection::KeyOnly => "key",
+            CoreProjection::FullValue => "key, value",
+        };
+        let mut sql = String::from("SELECT bucket, key");
+        if projection == CoreProjection::FullValue {
+            sql.push_str(", value");
+        }
+        sql.push_str(" FROM (");
+        let mut binds = Vec::new();
+        for (index, range) in ranges.iter().enumerate() {
+            if index != 0 {
+                sql.push_str(" UNION ALL ");
             }
-            buckets.push(entries);
+            sql.push_str("SELECT ");
+            sql.push_str(&index.to_string());
+            sql.push_str(" AS bucket, ");
+            sql.push_str(columns);
+            sql.push_str(" FROM ");
+            sql.push_str(&table);
+            sql.push_str(" WHERE 1 = 1");
+            push_range_bounds(&mut sql, &mut binds, &range.lower, &range.upper);
+        }
+        sql.push_str(" ) ORDER BY bucket ASC, key ASC");
+        let mut statement = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+        for (index, bytes) in binds.iter().enumerate() {
+            statement
+                .raw_bind_parameter(index + 1, *bytes)
+                .map_err(sqlite_error)?;
+        }
+        let mut buckets = (0..ranges.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut rows = statement.raw_query();
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let bucket = row
+                .get::<_, i64>(0)
+                .map_err(sqlite_error)
+                .and_then(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        StorageError::Corruption("sqlite multi-range bucket is invalid".into())
+                    })
+                })?;
+            let entries = buckets.get_mut(bucket).ok_or_else(|| {
+                StorageError::Corruption("sqlite multi-range bucket is out of order".into())
+            })?;
+            let key = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "key")?;
+            let value = match projection {
+                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(
+                    blob_ref(row.get_ref(2).map_err(sqlite_error)?, "value")?,
+                )),
+            };
+            if entries
+                .last()
+                .is_some_and(|previous: &ReadEntry| previous.key.0.as_ref() >= key)
+            {
+                return Err(StorageError::Corruption(
+                    "sqlite multi-range bucket keys are not strictly increasing".into(),
+                ));
+            }
+            entries.push(ReadEntry {
+                key: Key(Bytes::copy_from_slice(key)),
+                value,
+            });
         }
         Ok(buckets)
     }
@@ -938,5 +990,69 @@ fn ignore_no_transaction(error: StorageError) -> Result<(), StorageError> {
     match error {
         StorageError::Io(message) if message.contains("no transaction") => Ok(()),
         other => Err(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lix_engine::storage::StoredValue;
+    use std::ops::Bound;
+
+    #[tokio::test]
+    async fn scan_many_uses_one_snapshot_query_and_preserves_duplicate_buckets() {
+        let directory = tempfile::tempdir().expect("sqlite test directory");
+        let storage = SQLite::open(directory.path().join("storage.sqlite")).expect("open");
+        let space = StorageSpace::mutable(SpaceId(7), "test.multi_range");
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin write");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: Key(Bytes::from_static(b"a")),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"one"),
+                            },
+                        },
+                        PutEntry {
+                            key: Key(Bytes::from_static(b"b")),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"two"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("put rows");
+        write.commit().await.expect("commit rows");
+
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin read");
+        let ranges = vec![
+            KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"a"))),
+                upper: Bound::Included(Key(Bytes::from_static(b"b"))),
+            },
+            KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"b"))),
+                upper: Bound::Included(Key(Bytes::from_static(b"b"))),
+            },
+        ];
+        let buckets = read
+            .scan_many(space, &ranges, CoreProjection::KeyOnly)
+            .await
+            .expect("multi-range read");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].len(), 2);
+        assert_eq!(buckets[1].len(), 1);
+        assert_eq!(buckets[1][0].key.0.as_ref(), b"b");
     }
 }

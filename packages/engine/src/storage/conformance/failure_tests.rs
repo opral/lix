@@ -408,21 +408,24 @@ impl StorageRead for BrokenRead {
     ) -> Result<Vec<Vec<crate::storage::ReadEntry>>, StorageError> {
         let mut buckets = Vec::with_capacity(ranges.len());
         for range in ranges {
-            let chunk = self
-                .scan(
-                    space,
-                    range.clone(),
-                    ScanOptions {
-                        projection,
-                        limit_rows: crate::storage::MAX_SCAN_PAGE_ROWS,
-                        resume_after: None,
-                    },
-                )
-                .await?;
+            let physical = broken_physical_range(space.id, range.clone());
+            let mut chunk = scan_from_map(
+                &self.snapshot,
+                self.mode,
+                physical,
+                &ScanOptions {
+                    projection,
+                    limit_rows: usize::MAX,
+                    resume_after: None,
+                },
+            );
             if chunk.has_more {
                 return Err(StorageError::Corruption(
                     "broken test scan_many did not consume its range".to_string(),
                 ));
+            }
+            for entry in &mut chunk.entries {
+                entry.key = crate::storage::Key(entry.key.0.slice(4..));
             }
             buckets.push(chunk.entries);
         }
