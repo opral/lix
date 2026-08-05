@@ -3076,12 +3076,14 @@ impl StorageRead for SlateDBRead {
                         .map(|range| physical_range(space.id, range))
                         .collect::<Result<Vec<_>, _>>()?;
                     let mut buckets = if visible_writes.is_empty() {
-                        // The common entity-prefix workload supplies
-                        // ascending, disjoint ranges. Traverse them with one
-                        // SlateDB iterator and seek between ranges; this
-                        // avoids one iterator/object-store planning round
-                        // trip per identity while preserving one coherent
-                        // snapshot and independent buckets.
+                        // Traverse all ranges with one SlateDB iterator and
+                        // activate matching buckets as keys advance. This
+                        // preserves one coherent snapshot and independent
+                        // duplicate buckets without an adapter future per
+                        // requested range. The iterator covers the physical
+                        // span between the minimum and maximum bounds; that
+                        // span is exposed as a qualification cost, not hidden
+                        // as a seek-count claim.
                         scan_snapshot_ranges_all(
                             Arc::clone(&snapshot),
                             &physical_ranges,
@@ -3143,13 +3145,11 @@ async fn scan_snapshot_ranges_all(
         .await
 }
 
-/// Merges publication overlays into one forward snapshot traversal for the
-/// normal ordered/disjoint range plan. The overlay is already a sorted map, so
-/// the base iterator and publication rows advance together without opening an
-/// iterator or issuing an adapter/backend scan per range. Overlapping or
-/// out-of-order ranges retain independent bucket semantics through the
-/// single-range merge helper; that is a contract-preserving exceptional shape,
-/// not a default implementation of `scan_many`.
+/// Merges publication overlays into one forward snapshot traversal. The
+/// overlay is already a sorted map, so base and publication rows advance
+/// together without opening an iterator or issuing an adapter/backend scan per
+/// range. Overlapping and out-of-order ranges are activated into independent
+/// buckets; no compatibility or per-range fallback exists.
 async fn scan_snapshot_ranges_with_writes(
     snapshot: Arc<DbSnapshot>,
     ranges: Vec<EncodedBounds>,
