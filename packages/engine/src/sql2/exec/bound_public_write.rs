@@ -4362,6 +4362,22 @@ fn certified_entity_insert_parameter_batch(
     let EntityInsertParameterBatch::Arrow(parameter_batch) = parameter_batch else {
         unreachable!("generic parameter fallback is only available for Arrow batches")
     };
+    // The tracked/untracked lane is part of the registered schema domain, not
+    // merely row payload. A parameterized batch can contain rows from both
+    // lanes; committing that batch would defer the domain error until the
+    // transaction boundary, where it no longer has a statement index. Keep
+    // the established sequential route for this shape so the failing row is
+    // validated and attributed before any batch staging occurs.
+    if values.rows.iter().any(|row| {
+        row.iter().zip(&layout.columns).any(|(expr, target)| {
+            matches!(
+                (expr, target),
+                (BoundExpr::Param(_), InsertColumnTarget::Untracked)
+            )
+        })
+    }) {
+        return Ok(None);
+    }
     certified_entity_insert_rows(
         ctx,
         plan,
