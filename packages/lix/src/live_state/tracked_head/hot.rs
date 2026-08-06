@@ -2846,6 +2846,7 @@ async fn packed_current_base_refs(
     Ok(refs)
 }
 
+#[cfg(test)]
 async fn stage_retire_packed_current_bases(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -6554,11 +6555,9 @@ where
         .await
     }
 
-    /// Publishes a checkpoint into the already-visible generation.
-    ///
-    /// The checkpoint selected refs are the complete dirty set for the
-    /// interval. Rewriting only those rows to `Clean` starts the next epoch
-    /// without copying every unchanged HOT row into a fresh generation.
+    /// Test-only legacy fixture helper. Production checkpoint publication
+    /// selects an immutable tracked-root generation directly.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_checkpoint_current_state(
         &mut self,
@@ -6589,9 +6588,6 @@ where
                 &BTreeMap::new(),
             )
             .await?;
-        // The checkpoint has now materialized the complete dirty set as HOT
-        // rows. Keeping the immutable packed inputs active would make every
-        // later read revisit checkpointed history within the same generation.
         stage_retire_packed_current_bases(self.store, self.writes, branch_id, generation).await?;
         Ok(generation)
     }

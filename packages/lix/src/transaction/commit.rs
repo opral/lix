@@ -4295,22 +4295,25 @@ async fn stage_tracked_head(
         let generation = if is_checkpoint_publication {
             let checkpoint_commit_id =
                 checkpoint_commit_id.expect("checkpoint publication has an epoch commit id");
+            // The checkpoint's tracked root is staged and authenticated before
+            // this current-state phase.  Keep that immutable root as the new
+            // tracked serving generation instead of reopening the parent HOT
+            // generation and rewriting every selected payload into it.  The
+            // branch control below atomically selects this generation; the
+            // independent untracked selector still receives any untracked
+            // deltas through the existing bounded path.
+            let generation =
+                lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
+            writer.stage_root_current_base(&root.branch_id, generation, root.commit_id);
             coverage = WorkingDiffIndexCoverage::default();
-            writer
-                .stage_checkpoint_current_state(
-                    &root.branch_id,
-                    parent_generation,
-                    root.commit_id,
-                    &deltas,
-                    &owned_absence_guards(&absence_guards),
-                    checkpoint_commit_id,
-                    &mut coverage,
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.materialization.tracked_head.stage_checkpoint"
-                ))
-                .await?
+            tracing::debug!(
+                target: "lix_perf",
+                checkpoint_commit_id = %checkpoint_commit_id,
+                tracked_generation = %generation,
+                root_commit_id = %root.commit_id,
+                "checkpoint selected immutable tracked-root generation"
+            );
+            generation
         } else if let Some(generation) = packed_generation {
             if !untracked_deltas.is_empty() {
                 writer
