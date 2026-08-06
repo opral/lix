@@ -1,37 +1,34 @@
-<svg viewBox="0 0 880 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lix embeds in your app and runs on a storage adapter: in memory, local filesystem, or S3 bucket" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
-  <rect x="0.75" y="0.75" width="878.5" height="248.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+<svg viewBox="0 0 880 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lix runs in your app on a storage adapter: in memory, local filesystem, or S3 bucket" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <rect x="0.75" y="0.75" width="878.5" height="198.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
 
   <!-- your app with lix embedded -->
-  <text x="440" y="46" font-size="10.5" letter-spacing="1.2" fill="#8A8F96" text-anchor="middle">LIX EMBEDS IN YOUR APP</text>
-  <rect x="330" y="58" width="220" height="52" rx="8" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
-  <text x="352" y="89" font-size="13" fill="#15171B">your app</text>
-  <rect x="466" y="68" width="52" height="32" rx="6" fill="rgba(7,182,213,0.14)" stroke="#07B6D5" stroke-width="1.5"/>
-  <text x="492" y="88" font-size="13" fill="#0891AC" text-anchor="middle">lix</text>
+  <rect x="330" y="30" width="220" height="52" rx="8" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <text x="352" y="61" font-size="13" fill="#15171B">your app</text>
+  <rect x="466" y="40" width="52" height="32" rx="6" fill="rgba(7,182,213,0.14)" stroke="#07B6D5" stroke-width="1.5"/>
+  <text x="492" y="60" font-size="13" fill="#0891AC" text-anchor="middle">lix</text>
 
   <!-- connector -->
-  <line x1="440" y1="110" x2="440" y2="150" stroke="#C9C7BF" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="440" y1="82" x2="440" y2="120" stroke="#C9C7BF" stroke-width="1.5" stroke-dasharray="4 4"/>
 
   <!-- in memory: chip icon -->
-  <rect x="110" y="150" width="200" height="50" rx="8" fill="#FFFFFF" stroke="#C9C7BF" stroke-width="1.5"/>
-  <rect x="162" y="167" width="16" height="14" rx="2" fill="none" stroke="#8A8F96" stroke-width="1.4"/>
-  <line x1="159" y1="170" x2="162" y2="170" stroke="#8A8F96" stroke-width="1.4"/>
-  <line x1="159" y1="174" x2="162" y2="174" stroke="#8A8F96" stroke-width="1.4"/>
-  <line x1="159" y1="178" x2="162" y2="178" stroke="#8A8F96" stroke-width="1.4"/>
-  <line x1="178" y1="170" x2="181" y2="170" stroke="#8A8F96" stroke-width="1.4"/>
-  <line x1="178" y1="174" x2="181" y2="174" stroke="#8A8F96" stroke-width="1.4"/>
-  <line x1="178" y1="178" x2="181" y2="178" stroke="#8A8F96" stroke-width="1.4"/>
-  <text x="190" y="180" font-size="13" fill="#6B7076">in memory</text>
+  <rect x="110" y="120" width="200" height="50" rx="8" fill="#FFFFFF" stroke="#C9C7BF" stroke-width="1.5"/>
+  <rect x="162" y="137" width="16" height="14" rx="2" fill="none" stroke="#8A8F96" stroke-width="1.4"/>
+  <line x1="159" y1="140" x2="162" y2="140" stroke="#8A8F96" stroke-width="1.4"/>
+  <line x1="159" y1="144" x2="162" y2="144" stroke="#8A8F96" stroke-width="1.4"/>
+  <line x1="159" y1="148" x2="162" y2="148" stroke="#8A8F96" stroke-width="1.4"/>
+  <line x1="178" y1="140" x2="181" y2="140" stroke="#8A8F96" stroke-width="1.4"/>
+  <line x1="178" y1="144" x2="181" y2="144" stroke="#8A8F96" stroke-width="1.4"/>
+  <line x1="178" y1="148" x2="181" y2="148" stroke="#8A8F96" stroke-width="1.4"/>
+  <text x="190" y="150" font-size="13" fill="#6B7076">in memory</text>
 
   <!-- local filesystem: folder icon -->
-  <rect x="340" y="150" width="200" height="50" rx="8" fill="rgba(7,182,213,0.08)" stroke="#07B6D5" stroke-width="1.5"/>
-  <path d="M364 170 a2 2 0 0 1 2 -2 h5 l2.5 3 h8.5 a2 2 0 0 1 2 2 v8 a2 2 0 0 1 -2 2 h-16 a2 2 0 0 1 -2 -2 Z" fill="none" stroke="#07B6D5" stroke-width="1.4" stroke-linejoin="round"/>
-  <text x="392" y="180" font-size="13" fill="#0891AC">local filesystem</text>
+  <rect x="340" y="120" width="200" height="50" rx="8" fill="rgba(7,182,213,0.08)" stroke="#07B6D5" stroke-width="1.5"/>
+  <path d="M364 140 a2 2 0 0 1 2 -2 h5 l2.5 3 h8.5 a2 2 0 0 1 2 2 v8 a2 2 0 0 1 -2 2 h-16 a2 2 0 0 1 -2 -2 Z" fill="none" stroke="#07B6D5" stroke-width="1.4" stroke-linejoin="round"/>
+  <text x="392" y="150" font-size="13" fill="#0891AC">local filesystem</text>
 
   <!-- S3 bucket: bucket icon -->
-  <rect x="570" y="150" width="200" height="50" rx="8" fill="#FFFFFF" stroke="#C9C7BF" stroke-width="1.5"/>
-  <ellipse cx="631" cy="168" rx="9" ry="3" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.4"/>
-  <path d="M622 168 L624.5 183 a2 2 0 0 0 2 1.7 h9 a2 2 0 0 0 2 -1.7 L640 168" fill="none" stroke="#8A8F96" stroke-width="1.4"/>
-  <text x="648" y="180" font-size="13" fill="#6B7076">S3 bucket</text>
-
-  <text x="440" y="228" font-size="10.5" letter-spacing="1.2" fill="#8A8F96" text-anchor="middle">PICK A STORAGE ADAPTER</text>
+  <rect x="570" y="120" width="200" height="50" rx="8" fill="#FFFFFF" stroke="#C9C7BF" stroke-width="1.5"/>
+  <ellipse cx="631" cy="138" rx="9" ry="3" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.4"/>
+  <path d="M622 138 L624.5 153 a2 2 0 0 0 2 1.7 h9 a2 2 0 0 0 2 -1.7 L640 138" fill="none" stroke="#8A8F96" stroke-width="1.4"/>
+  <text x="648" y="150" font-size="13" fill="#6B7076">S3 bucket</text>
 </svg>
