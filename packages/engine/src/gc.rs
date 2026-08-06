@@ -1145,6 +1145,25 @@ where
         }
         for delta in batch.deltas {
             validate_stored_root_reachability_delta(&delta)?;
+            // Branch checkpoint rows are derived serving state owned by the
+            // branch lifecycle, not by a tracked root.  Process the
+            // authenticated deletion signal before inspecting `old_root` so
+            // a branch deleted before its first rooted publication cannot
+            // strand its checkpoint prefix forever.  A recreated branch has
+            // a live control and therefore keeps the shared branch-id range.
+            if delta.new_control.is_none()
+                && !controls
+                    .iter()
+                    .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
+                && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
+            {
+                crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
+                    &store,
+                    writes,
+                    &delta.branch_id,
+                )
+                .await?;
+            }
             let Some(old_root) = delta.old_root else {
                 continue;
             };
@@ -1226,23 +1245,6 @@ where
                 &store, writes, old_root, &manifest,
             )
             .await?;
-            // Checkpoint rows are derived serving state owned by the branch,
-            // rather than by an individual historical commit.  Reclaim the
-            // branch UUID range only once that branch has no live control;
-            // an advanced branch may retire this old control while its newer
-            // control still needs the same checkpoint rows.
-            if !controls
-                .iter()
-                .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
-                && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
-            {
-                crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
-                    &store,
-                    writes,
-                    &delta.branch_id,
-                )
-                .await?;
-            }
             if let Some(control) = delta.old_control.as_ref() {
                 if !controls
                     .iter()
