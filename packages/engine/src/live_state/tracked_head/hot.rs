@@ -542,18 +542,21 @@ pub(crate) async fn stage_certified_entity_batches(
         let source_generations = observations
             .get(branch_id)
             .and_then(|observation| observation.control)
-            .map(|previous| BTreeSet::from([previous.generation]))
+            .map(|previous| {
+                BTreeSet::from([previous.tracked_generation, previous.untracked_generation])
+            })
             .unwrap_or_else(|| {
                 durable_controls
                     .iter()
                     .filter(|(_, candidate)| candidate.head_commit_id == control.head_commit_id)
-                    .map(|(_, candidate)| candidate.generation)
+                    .flat_map(|(_, candidate)| {
+                        [candidate.tracked_generation, candidate.untracked_generation]
+                    })
                     .collect()
             });
-        for source_generation in source_generations
-            .into_iter()
-            .filter(|generation| *generation != control.generation)
-        {
+        for source_generation in source_generations.into_iter().filter(|generation| {
+            *generation != control.tracked_generation && *generation != control.untracked_generation
+        }) {
             let previous_prefix = source_generation.as_uuid().as_bytes().to_vec();
             let manifests = ScanPlan::prefix(
                 CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
@@ -577,7 +580,7 @@ pub(crate) async fn stage_certified_entity_batches(
                 {
                     continue;
                 }
-                let mut key = control.generation.as_uuid().as_bytes().to_vec();
+                let mut key = control.tracked_generation.as_uuid().as_bytes().to_vec();
                 key.extend_from_slice(suffix);
                 let value = full_value_bytes(entry.value)?;
                 match inherited_manifests.entry(key) {
@@ -616,7 +619,7 @@ pub(crate) async fn stage_certified_entity_batches(
             .ok_or_else(|| head_value_error("certified entity batch has no commit timestamp"))?;
         for batch in file.batches {
             if batch.complete_file_state {
-                let mut manifest_prefix = control.generation.as_uuid().as_bytes().to_vec();
+                let mut manifest_prefix = control.tracked_generation.as_uuid().as_bytes().to_vec();
                 append_batch_text(&mut manifest_prefix, file.file_id)?;
                 manifest_prefix.extend_from_slice(&batch.format.to_le_bytes());
                 let prior_manifests = ScanPlan::prefix(
@@ -713,7 +716,7 @@ pub(crate) async fn stage_certified_entity_batches(
                     bytes: Bytes::from(value),
                 },
             );
-            let mut manifest_key = control.generation.as_uuid().as_bytes().to_vec();
+            let mut manifest_key = control.tracked_generation.as_uuid().as_bytes().to_vec();
             append_batch_text(&mut manifest_key, file.file_id)?;
             manifest_key.extend_from_slice(&batch.format.to_le_bytes());
             manifest_key.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
@@ -4122,13 +4125,61 @@ where
         control: BranchHeadControl,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_live_batch_for_generation(
-            branch_id,
-            control.generation,
-            control.working_diff_checkpoint_commit_id,
-            request,
-        )
-        .await
+        self.scan_live_batch_for_retention(branch_id, control, request, None)
+            .await
+    }
+
+    pub(crate) async fn scan_live_batch_for_retention(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        request: &TrackedStateScanRequest,
+        requested_untracked: Option<bool>,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        match requested_untracked {
+            Some(true) => {
+                self.scan_live_batch_for_generation(
+                    branch_id,
+                    control.untracked_generation,
+                    None,
+                    request,
+                )
+                .await
+            }
+            Some(false) => {
+                self.scan_live_batch_for_generation(
+                    branch_id,
+                    control.tracked_generation,
+                    control.working_diff_checkpoint_commit_id,
+                    request,
+                )
+                .await
+            }
+            None => {
+                let tracked = self
+                    .scan_live_batch_for_generation(
+                        branch_id,
+                        control.tracked_generation,
+                        control.working_diff_checkpoint_commit_id,
+                        request,
+                    )
+                    .await?;
+                if control.tracked_generation == control.untracked_generation {
+                    return Ok(tracked);
+                }
+                let untracked = self
+                    .scan_live_batch_for_generation(
+                        branch_id,
+                        control.untracked_generation,
+                        None,
+                        request,
+                    )
+                    .await?;
+                let mut rows = tracked.into_rows();
+                rows.extend(untracked.into_rows());
+                Ok(MaterializedLiveStateBatch::from_rows(rows))
+            }
+        }
     }
 
     pub(crate) async fn scan_live_rows(
@@ -4146,10 +4197,13 @@ where
         &self,
         controls: &[(String, BranchHeadControl)],
         request: &TrackedStateScanRequest,
+        requested_untracked: Option<bool>,
     ) -> Result<Vec<(String, MaterializedLiveStateBatch)>, LixError> {
         let mut rows = Vec::with_capacity(controls.len());
         for (branch_id, control) in controls {
-            let branch_rows = self.scan_live_batch(branch_id, *control, request).await?;
+            let branch_rows = self
+                .scan_live_batch_for_retention(branch_id, *control, request, requested_untracked)
+                .await?;
             rows.push((branch_id.clone(), branch_rows));
         }
         Ok(rows)
@@ -4161,7 +4215,7 @@ where
         control: BranchHeadControl,
         schema_key: &str,
     ) -> Result<bool, LixError> {
-        let mut prefix = hot_scope_prefix(branch_id, control.generation);
+        let mut prefix = hot_scope_prefix(branch_id, control.tracked_generation);
         write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
         let page = ScanPlan::prefix(
             HOT_ROW_SPACE,
@@ -4181,38 +4235,44 @@ where
         if !page.value.entries.is_empty() {
             return Ok(true);
         }
-        if packed_current_base_has_schema(&self.store, branch_id, control.generation, schema_key)
-            .await?
+        if packed_current_base_has_schema(
+            &self.store,
+            branch_id,
+            control.tracked_generation,
+            schema_key,
+        )
+        .await?
         {
             return Ok(true);
         }
-        let root = if load_root_current_base_commit(&self.store, branch_id, control.generation)
-            .await?
-            .is_some()
-        {
-            Box::pin(scan_root_current_base_rows(
-                &self.store,
-                branch_id,
-                control.generation,
-                control.working_diff_checkpoint_commit_id,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![schema_key.to_owned()],
-                        ..TrackedStateFilter::default()
+        let root =
+            if load_root_current_base_commit(&self.store, branch_id, control.tracked_generation)
+                .await?
+                .is_some()
+            {
+                Box::pin(scan_root_current_base_rows(
+                    &self.store,
+                    branch_id,
+                    control.tracked_generation,
+                    control.working_diff_checkpoint_commit_id,
+                    &TrackedStateScanRequest {
+                        filter: TrackedStateFilter {
+                            schema_keys: vec![schema_key.to_owned()],
+                            ..TrackedStateFilter::default()
+                        },
+                        read_columns: TrackedStateReadColumns {
+                            columns: vec!["change_id".to_owned()],
+                        },
+                        // Root collection-generation filtering happens after the
+                        // tracked-tree scan, so an early limit could select only
+                        // a retired row while a later live row still exists.
+                        limit: None,
                     },
-                    read_columns: TrackedStateReadColumns {
-                        columns: vec!["change_id".to_owned()],
-                    },
-                    // Root collection-generation filtering happens after the
-                    // tracked-tree scan, so an early limit could select only
-                    // a retired row while a later live row still exists.
-                    limit: None,
-                },
-            ))
-            .await?
-        } else {
-            MaterializedLiveStateBatch::default()
-        };
+                ))
+                .await?
+            } else {
+                MaterializedLiveStateBatch::default()
+            };
         if !root.is_empty() {
             return Ok(true);
         }
@@ -4226,7 +4286,7 @@ where
         let certified = scan_certified_entity_batch_rows(
             &self.store,
             branch_id,
-            control.generation,
+            control.tracked_generation,
             &TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![schema_key.to_owned()],
@@ -4260,7 +4320,7 @@ where
         }
         self.scan_entity_snapshots_for_generation(
             branch_id,
-            control.generation,
+            control.tracked_generation,
             control.working_diff_checkpoint_commit_id,
             schema_key,
             entity_pks,
@@ -4366,7 +4426,7 @@ where
         let rows = self
             .scan_live_batch_for_generation(
                 branch_id,
-                control.generation,
+                control.tracked_generation,
                 control.working_diff_checkpoint_commit_id,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
@@ -4435,7 +4495,7 @@ where
         let Some(entries) = hot_scan_entries(
             &self.store,
             branch_id,
-            control.generation,
+            control.tracked_generation,
             &filter,
             None,
             Some(ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
@@ -4505,20 +4565,20 @@ where
         let collection = load_hot_collection_control(
             &self.store,
             branch_id,
-            control.generation,
+            control.tracked_generation,
             crate::collection_generation::CollectionScopeRef {
                 schema_key,
                 file_id: None,
             },
         )
         .await?;
-        if collection.active_generation != control.generation {
+        if collection.active_generation != control.tracked_generation {
             return Ok(None);
         }
         let base_refs = packed_exclusive_schema_base_refs(
             &self.store,
             branch_id,
-            control.generation,
+            control.tracked_generation,
             schema_key,
         )
         .await?;
@@ -4526,7 +4586,7 @@ where
             return Ok(None);
         };
         let active_base_refs =
-            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
+            packed_current_base_refs(&self.store, branch_id, control.tracked_generation).await?;
         if !active_base_refs
             .iter()
             .any(|active| active.commit_id == base_ref.commit_id)
@@ -4561,14 +4621,14 @@ where
         let collection = load_hot_collection_control(
             &self.store,
             branch_id,
-            control.generation,
+            control.tracked_generation,
             crate::collection_generation::CollectionScopeRef {
                 schema_key,
                 file_id: None,
             },
         )
         .await?;
-        if collection.active_generation != control.generation
+        if collection.active_generation != control.tracked_generation
             || collection.ordered_identity_digest.is_none()
         {
             return Ok(None);
@@ -4576,7 +4636,7 @@ where
         let base_refs = packed_exclusive_schema_base_refs(
             &self.store,
             branch_id,
-            control.generation,
+            control.tracked_generation,
             schema_key,
         )
         .await?;
@@ -4584,7 +4644,7 @@ where
             return Ok(None);
         };
         let active_base_refs =
-            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
+            packed_current_base_refs(&self.store, branch_id, control.tracked_generation).await?;
         if !active_base_refs
             .iter()
             .any(|active| active.commit_id == base_ref.commit_id)
@@ -4615,7 +4675,7 @@ where
         Ok(Some(
             self.scan_live_batch_for_generation(
                 branch_id,
-                control.generation,
+                control.tracked_generation,
                 control.working_diff_checkpoint_commit_id,
                 request,
             )
@@ -4940,14 +5000,37 @@ where
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        Box::pin(self.load_projected_live_batch_for_generation_refs(
+        let tracked = Box::pin(self.load_projected_live_batch_for_generation_refs(
             branch_id,
-            control.generation,
+            control.tracked_generation,
             control.working_diff_checkpoint_commit_id,
             keys,
             projection,
         ))
-        .await
+        .await?;
+        if control.tracked_generation == control.untracked_generation {
+            return Ok(tracked);
+        }
+        let untracked = Box::pin(self.load_projected_live_batch_for_generation_refs(
+            branch_id,
+            control.untracked_generation,
+            None,
+            keys,
+            projection,
+        ))
+        .await?;
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+        let mut slots = Vec::with_capacity(keys.len());
+        for index in 0..keys.len() {
+            let row = tracked.row(index).or_else(|| untracked.row(index));
+            slots.push(row.map(|row| {
+                let ordinal = u32::try_from(builder.len())
+                    .expect("exact live-state row count exceeds u32 ordinals");
+                builder.push_ref(row, None);
+                ordinal
+            }));
+        }
+        MaterializedLiveStateExactBatch::new(builder.finish(), slots)
     }
 
     async fn load_projected_live_batch_for_generation_refs(
@@ -5201,7 +5284,7 @@ where
     ) -> Result<Vec<JsonRef>, LixError> {
         let mut refs = BTreeSet::new();
         for (branch_id, control) in controls {
-            let scope = hot_scope_prefix(branch_id, control.generation);
+            let scope = hot_scope_prefix(branch_id, control.untracked_generation);
             let plan = ScanPlan::prefix(
                 HOT_ROW_SPACE,
                 StoragePrefix {
@@ -5243,7 +5326,7 @@ where
             return Ok(None);
         };
         let generation = epoch.generation;
-        if generation != control.generation
+        if generation != control.tracked_generation
             || control.working_diff_checkpoint_commit_id != Some(epoch.checkpoint_commit_id)
         {
             return Ok(None);
@@ -6282,6 +6365,42 @@ where
             &BTreeMap::new(),
         )
         .await
+    }
+
+    /// Publishes a new branch-local untracked snapshot without touching the
+    /// tracked generation. The old untracked rows are copied as encoded
+    /// values, then the sorted untracked deltas are applied once before the
+    /// complete new generation is staged. The branch control swaps this
+    /// generation atomically with the transaction's other publication data.
+    pub(crate) async fn stage_untracked_generation(
+        &mut self,
+        branch_id: &str,
+        previous_generation: CommitId,
+        new_generation: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+    ) -> Result<CommitId, LixError> {
+        let sorted = sorted_lifecycle_hot_deltas(deltas, true)?;
+        let mut rows =
+            load_hot_untracked_generation(self.store, branch_id, previous_generation).await?;
+        let mut retired_untracked_json_refs = BTreeSet::new();
+        for delta in sorted {
+            apply_complete_hot_snapshot_delta(
+                &mut rows,
+                delta,
+                absence_guards,
+                &mut retired_untracked_json_refs,
+            )?;
+        }
+        stage_complete_collection_controls(self.writes, branch_id, new_generation, &rows)?;
+        stage_complete_hot_rows(self.writes, branch_id, new_generation, rows);
+        JsonStoreWriter::stage_untracked_reclaim_candidates(
+            self.writes,
+            retired_untracked_json_refs
+                .into_iter()
+                .map(JsonRef::from_hash_bytes),
+        );
+        Ok(new_generation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11316,7 +11435,8 @@ mod tests {
         };
         let control = BranchHeadControl {
             head_commit_id: generation,
-            generation,
+            tracked_generation: generation,
+            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -11681,7 +11801,8 @@ mod tests {
             .expect("open packed GC read");
         let active_branch_control = BranchHeadControl {
             head_commit_id: active_generation,
-            generation: active_generation,
+            tracked_generation: active_generation,
+            untracked_generation: active_generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -12232,7 +12353,8 @@ mod tests {
         let created_at = timestamp();
         let donor_control = BranchHeadControl {
             head_commit_id,
-            generation: donor_generation,
+            tracked_generation: donor_generation,
+            untracked_generation: donor_generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -12241,12 +12363,14 @@ mod tests {
             ref_change_id: ChangeId::for_test_label("certified-inherited-donor-ref"),
         };
         let empty_control = BranchHeadControl {
-            generation: CommitId::for_test_label("certified-inherited-empty"),
+            tracked_generation: CommitId::for_test_label("certified-inherited-empty"),
+            untracked_generation: CommitId::for_test_label("certified-inherited-empty"),
             ref_change_id: ChangeId::for_test_label("certified-inherited-empty-ref"),
             ..donor_control
         };
         let second_donor_control = BranchHeadControl {
-            generation: CommitId::for_test_label("certified-inherited-donor-two"),
+            tracked_generation: CommitId::for_test_label("certified-inherited-donor-two"),
+            untracked_generation: CommitId::for_test_label("certified-inherited-donor-two"),
             ref_change_id: ChangeId::for_test_label("certified-inherited-donor-two-ref"),
             ..donor_control
         };
@@ -12364,7 +12488,8 @@ mod tests {
             .expect("second donor certified manifests should commit");
 
         let created_control = BranchHeadControl {
-            generation: created_generation,
+            tracked_generation: created_generation,
+            untracked_generation: created_generation,
             ref_change_id: ChangeId::for_test_label("certified-inherited-created-ref"),
             ..donor_control
         };
@@ -13665,7 +13790,8 @@ mod tests {
             "active",
             BranchHeadControl {
                 head_commit_id: active_generation,
-                generation: active_generation,
+                tracked_generation: active_generation,
+                untracked_generation: active_generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: Some(active_checkpoint),
@@ -13691,7 +13817,8 @@ mod tests {
             "stale",
             BranchHeadControl {
                 head_commit_id: stale_generation,
-                generation: stale_generation,
+                tracked_generation: stale_generation,
+                untracked_generation: stale_generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: None,

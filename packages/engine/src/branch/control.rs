@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v8";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
 
@@ -27,9 +27,11 @@ const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
 
 /// The one mutable publication record for a branch.
 ///
-/// `generation` names one complete physical hot-state snapshot serving
-/// `head_commit_id`. Serial commits retain it; lifecycle publications create
-/// a fresh complete generation and publish it atomically with this control.
+/// `tracked_generation` and `untracked_generation` are independently owned
+/// authenticated serving snapshots. A tracked-root publication may repoint
+/// the former without rewinding branch-local untracked rows; an untracked-only
+/// publication may advance the latter without changing the tracked root. The
+/// pair is one atomic selector, not two authorities for either semantic plane.
 /// The optional checkpoint binds the sparse working-diff accelerator to that
 /// exact generation. `current_state_revision` advances for every in-place
 /// current-state mutation, including history-free untracked writes. It is
@@ -39,7 +41,8 @@ const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
 #[musli(packed)]
 pub(crate) struct BranchHeadControl {
     pub(crate) head_commit_id: CommitId,
-    pub(crate) generation: CommitId,
+    pub(crate) tracked_generation: CommitId,
+    pub(crate) untracked_generation: CommitId,
     pub(crate) current_state_revision: u64,
     #[musli(with = storage_codec::option)]
     pub(crate) working_diff_checkpoint_commit_id: Option<CommitId>,
@@ -329,7 +332,8 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let first = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("first-head"),
-            generation: CommitId::for_test_label("first-generation"),
+            tracked_generation: CommitId::for_test_label("first-generation"),
+            untracked_generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -339,7 +343,8 @@ mod tests {
         };
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
-            generation: CommitId::for_test_label("first-generation"),
+            tracked_generation: CommitId::for_test_label("first-generation"),
+            untracked_generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 1,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,

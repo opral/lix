@@ -8839,7 +8839,7 @@ where
         };
         let mut generation = TrackedHeadContext::new()
             .reader(read)
-            .collection_generation(branch_id, control.generation, scope)
+            .collection_generation(branch_id, control.untracked_generation, scope)
             .await?;
         let staged = self.staged_writes.staging_overlay()?;
         if StagedLiveStateRows::collection_replaced(
@@ -8872,7 +8872,7 @@ where
         };
         TrackedHeadContext::new()
             .reader(read)
-            .exact_collection_live_count(branch_id, control.generation, scope)
+            .exact_collection_live_count(branch_id, control.untracked_generation, scope)
             .await
             .map(Some)
     }

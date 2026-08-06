@@ -97,7 +97,7 @@ pub(crate) async fn stage_sequence(
         .writer(read, writes)
         .stage_current_state_with_working_diff(
             GLOBAL_BRANCH_ID,
-            Some(control.generation),
+            Some(control.tracked_generation),
             control.head_commit_id,
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
@@ -396,7 +396,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_current_state_with_working_diff(
                 GLOBAL_BRANCH_ID,
-                Some(control.generation),
+                Some(control.tracked_generation),
                 control.head_commit_id,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,

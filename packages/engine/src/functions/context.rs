@@ -359,7 +359,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_current_state_with_working_diff(
                 GLOBAL_BRANCH_ID,
-                Some(control.generation),
+                Some(control.tracked_generation),
                 control.head_commit_id,
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
