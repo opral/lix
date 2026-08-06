@@ -4119,16 +4119,6 @@ where
             .map_err(|_| head_value_error("hot collection live count exceeds u64"))
     }
 
-    pub(crate) async fn scan_live_batch(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        request: &TrackedStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_live_batch_for_retention(branch_id, control, request, None)
-            .await
-    }
-
     pub(crate) async fn scan_live_batch_for_retention(
         &self,
         branch_id: &str,
@@ -4138,11 +4128,12 @@ where
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         match requested_untracked {
             Some(true) => {
-                self.scan_live_batch_for_generation(
+                self.scan_live_batch_for_generation_with_visibility(
                     branch_id,
                     control.untracked_generation,
                     None,
                     request,
+                    false,
                 )
                 .await
             }
@@ -4191,17 +4182,6 @@ where
                 Ok(MaterializedLiveStateBatch::from_rows(rows))
             }
         }
-    }
-
-    pub(crate) async fn scan_live_rows(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.scan_live_batch(branch_id, control, request)
-            .await
-            .map(MaterializedLiveStateBatch::into_rows)
     }
 
     pub(crate) async fn scan_live_batches_for_controls(
@@ -4702,24 +4682,47 @@ where
         active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let collection_control = match request.filter.schema_keys.as_slice() {
-            [schema_key]
-                if schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY =>
-            {
-                Some(
-                    load_hot_collection_visibility_control(
-                        &self.store,
-                        branch_id,
-                        generation,
-                        crate::collection_generation::CollectionScopeRef {
-                            schema_key,
-                            file_id: None,
-                        },
+        self.scan_live_batch_for_generation_with_visibility(
+            branch_id,
+            generation,
+            active_checkpoint_commit_id,
+            request,
+            true,
+        )
+        .await
+    }
+
+    async fn scan_live_batch_for_generation_with_visibility(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        active_checkpoint_commit_id: Option<CommitId>,
+        request: &TrackedStateScanRequest,
+        apply_collection_visibility: bool,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        let collection_control = if apply_collection_visibility {
+            match request.filter.schema_keys.as_slice() {
+                [schema_key]
+                    if schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY =>
+                {
+                    Some(
+                        load_hot_collection_visibility_control(
+                            &self.store,
+                            branch_id,
+                            generation,
+                            crate::collection_generation::CollectionScopeRef {
+                                schema_key,
+                                file_id: None,
+                            },
+                        )
+                        .await?,
                     )
-                    .await?,
-                )
+                }
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
         let replaced_generation =
             collection_control.filter(|control| control.active_generation != generation);
@@ -5011,6 +5014,24 @@ where
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        self.load_projected_live_batch_refs_for_domain(
+            branch_id,
+            control,
+            keys,
+            projection,
+            LiveStateReadDomain::Combined,
+        )
+        .await
+    }
+
+    pub(crate) async fn load_projected_live_batch_refs_for_domain(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        keys: &[TrackedStateKeyRef<'_>],
+        projection: &ChangeRecordProjection,
+        domain: LiveStateReadDomain,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         let tracked = Box::pin(self.load_projected_live_batch_for_generation_refs(
             branch_id,
             control.tracked_generation,
@@ -5019,8 +5040,27 @@ where
             projection,
         ))
         .await?;
-        if control.tracked_generation == control.untracked_generation {
+        if matches!(domain, LiveStateReadDomain::Tracked) {
+            return tracked.filter(|row| !row.untracked());
+        }
+        if control.tracked_generation == control.untracked_generation
+            && matches!(domain, LiveStateReadDomain::Combined)
+        {
             return Ok(tracked);
+        }
+        if matches!(domain, LiveStateReadDomain::Untracked) {
+            let untracked = Box::pin(
+                self.load_projected_live_batch_for_generation_refs_with_visibility(
+                    branch_id,
+                    control.untracked_generation,
+                    None,
+                    keys,
+                    projection,
+                    false,
+                ),
+            )
+            .await?;
+            return untracked.filter(|row| row.untracked());
         }
         let untracked = Box::pin(self.load_projected_live_batch_for_generation_refs(
             branch_id,
@@ -5062,27 +5102,51 @@ where
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        self.load_projected_live_batch_for_generation_refs_with_visibility(
+            branch_id,
+            generation,
+            active_checkpoint_commit_id,
+            keys,
+            projection,
+            true,
+        )
+        .await
+    }
+
+    async fn load_projected_live_batch_for_generation_refs_with_visibility(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        active_checkpoint_commit_id: Option<CommitId>,
+        keys: &[TrackedStateKeyRef<'_>],
+        projection: &ChangeRecordProjection,
+        apply_collection_visibility: bool,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         if keys.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
-        let replaced_generation = keys
-            .first()
-            .filter(|first| keys.iter().all(|key| key.schema_key == first.schema_key))
-            .filter(|first| {
-                first.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+        let replaced_generation = apply_collection_visibility
+            .then(|| {
+                keys.first()
+                    .filter(|first| keys.iter().all(|key| key.schema_key == first.schema_key))
+                    .filter(|first| {
+                        first.schema_key
+                            != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    })
+                    .map(|first| async {
+                        load_hot_collection_visibility_control(
+                            &self.store,
+                            branch_id,
+                            generation,
+                            crate::collection_generation::CollectionScopeRef {
+                                schema_key: first.schema_key,
+                                file_id: None,
+                            },
+                        )
+                        .await
+                    })
             })
-            .map(|first| async {
-                load_hot_collection_visibility_control(
-                    &self.store,
-                    branch_id,
-                    generation,
-                    crate::collection_generation::CollectionScopeRef {
-                        schema_key: first.schema_key,
-                        file_id: None,
-                    },
-                )
-                .await
-            });
+            .flatten();
         let replaced_generation = match replaced_generation {
             Some(control) => {
                 let control = control.await?;

@@ -20,6 +20,7 @@ use crate::catalog::{
 };
 #[cfg(test)]
 use crate::changelog::{ChangeId, CommitId};
+use crate::common::NullableKeyFilter;
 use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
@@ -29,8 +30,9 @@ use crate::domain::{
 };
 use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
-    MaterializedLiveStateBatch, MaterializedLiveStateRowRef,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateReadDomain, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateRowRef,
 };
 use crate::plugin::PLUGIN_OWNER_KEY;
 #[cfg(test)]
@@ -233,7 +235,14 @@ async fn scan_committed_constraint_rows(
         ..Default::default()
     };
     let batch = live_state
-        .scan_constraint_batch(&request, !domain.untracked())
+        .scan_domain_batch(
+            &request,
+            if domain.untracked() {
+                LiveStateReadDomain::Untracked
+            } else {
+                LiveStateReadDomain::Tracked
+            },
+        )
         .await?;
     CommittedLiveStateRows::select(batch, |row| {
         domain.contains_ref(row)
@@ -248,32 +257,62 @@ async fn scan_committed_canonical_rows(
     schema_key: &str,
     entity_pks: Vec<EntityPk>,
 ) -> Result<CommittedLiveStateRows, LixError> {
-    let batch = live_state
-        .scan_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![schema_key.to_string()],
-                entity_pks: entity_pks.clone(),
-                branch_ids: vec![domain.branch_id().to_string()],
-                file_ids: domain.file_filters(),
-                include_tombstones: false,
-                ..Default::default()
-            },
-            projection: LiveStateProjection {
-                columns: vec![
-                    "schema_key".to_string(),
-                    "entity_pk".to_string(),
-                    "file_id".to_string(),
-                    "deleted".to_string(),
-                    "untracked".to_string(),
-                ],
-            },
-            ..Default::default()
+    let file_id = match domain.file_filters().as_slice() {
+        [] => None,
+        [NullableKeyFilter::Null] => None,
+        [NullableKeyFilter::Value(file_id)] => Some(file_id.clone()),
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "canonical identity validation requires one exact file scope",
+            ));
+        }
+    };
+    let requested_entity_pks = entity_pks.clone();
+    let rows = entity_pks
+        .into_iter()
+        .map(|entity_pk| LiveStateExactRowRequest {
+            schema_key: schema_key.to_string(),
+            branch_id: domain.branch_id().to_string(),
+            entity_pk,
+            file_id: file_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let projection = LiveStateProjection {
+        columns: vec![
+            "schema_key".to_string(),
+            "entity_pk".to_string(),
+            "file_id".to_string(),
+            "deleted".to_string(),
+            "untracked".to_string(),
+        ],
+    };
+    // Probe the two authenticated selectors independently. Each request is
+    // exactly K identities and therefore remains bounded by the directory
+    // point-read path; no schema or `All` expansion is permitted here.
+    let tracked = live_state
+        .load_exact_batch(&LiveStateExactBatchRequest {
+            rows: rows.clone(),
+            projection: projection.clone(),
+            untracked: Some(false),
+            include_tombstones: false,
         })
         .await?;
+    let untracked = live_state
+        .load_exact_batch(&LiveStateExactBatchRequest {
+            rows,
+            projection,
+            untracked: Some(true),
+            include_tombstones: false,
+        })
+        .await?;
+    let mut rows = tracked.into_present_batch().into_rows();
+    rows.extend(untracked.into_present_batch().into_rows());
+    let batch = MaterializedLiveStateBatch::from_rows(rows);
     CommittedLiveStateRows::select(batch, |row| {
         domain.contains_canonical_ref(row)
             && row.schema_key() == schema_key
-            && entity_pks.contains(row.entity_pk())
+            && requested_entity_pks.contains(row.entity_pk())
     })
 }
 
@@ -3557,7 +3596,7 @@ mod tests {
 
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::MaterializedLiveStateExactBatch::new(
                 MaterializedLiveStateBatch::default(),
@@ -3720,7 +3759,7 @@ mod tests {
     impl LiveStateReader for EmptyLiveStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -3901,7 +3940,7 @@ mod tests {
     impl LiveStateReader for StaticLiveStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -3929,7 +3968,7 @@ mod tests {
     impl LiveStateReader for OverlayingStaticLiveStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -3981,7 +4020,7 @@ mod tests {
     impl LiveStateReader for StrictEmptyLiveStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -4002,7 +4041,7 @@ mod tests {
     impl LiveStateReader for StrictStaticLiveStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -4030,7 +4069,7 @@ mod tests {
     impl LiveStateReader for CountingStaticLiveStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
+            request: &LiveStateExactBatchRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }

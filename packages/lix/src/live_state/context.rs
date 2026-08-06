@@ -14,10 +14,11 @@ use crate::filesystem::{
 };
 use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_batch,
+    LiveStateExactBatchRequest, LiveStateReadDomain, LiveStateReader, LiveStateRowFilter,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
+    resolve_visible_batch,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -43,11 +44,10 @@ type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
 /// Transaction-local branch publication controls.
 ///
-/// A transaction is fenced by the tracked mutation revision observed when it
-/// opens, so repeatedly loading the same immutable generation selector only
-/// adds storage round trips. Missing controls are cached as well: branch
-/// creation rotates that revision and therefore conflicts with the pinned
-/// transaction before commit.
+/// The selector map is retained only as bounded state for transaction-local
+/// metadata lanes. Selector reads always refresh from the caller's coherent
+/// storage snapshot before use, so a cache entry cannot outlive an automatic
+/// publication and select an older current-state generation.
 #[derive(Default)]
 pub(crate) struct BranchHeadControlCache {
     controls: StdMutex<std::collections::BTreeMap<String, Option<BranchHeadControl>>>,
@@ -813,13 +813,19 @@ where
         // publication filter. Apply it per generation before a finite PK
         // lookup so an absent global schema does not pay the complete hot,
         // packed, and certified point-read stack for every active-branch row.
-        controls.retain(|(_, control)| {
-            request
-                .filter
-                .schema_keys
-                .iter()
-                .any(|schema_key| control.may_have_schema(schema_key))
-        });
+        // The bloom summary belongs to the published tracked selector. An
+        // explicit current-only read must inspect the untracked selector even
+        // when the tracked summary has no bit for this schema; otherwise a
+        // durable runtime/ownership check is silently skipped.
+        if request.filter.untracked.is_none() {
+            controls.retain(|(_, control)| {
+                request
+                    .filter
+                    .schema_keys
+                    .iter()
+                    .any(|schema_key| control.may_have_schema(schema_key))
+            });
+        }
         if controls.is_empty() {
             return Ok(Some(MaterializedLiveStateBatch::default()));
         }
@@ -993,10 +999,26 @@ where
                             file_id: identity.file_id,
                         })
                         .collect::<Vec<_>>();
+                    let domain =
+                        request
+                            .untracked
+                            .map_or(LiveStateReadDomain::Combined, |untracked| {
+                                if untracked {
+                                    LiveStateReadDomain::Untracked
+                                } else {
+                                    LiveStateReadDomain::Tracked
+                                }
+                            });
                     let rows = self
                         .tracked_head
                         .reader(&self.store)
-                        .load_projected_live_batch_refs(branch_id, control, &keys, &projection)
+                        .load_projected_live_batch_refs_for_domain(
+                            branch_id,
+                            control,
+                            &keys,
+                            &projection,
+                            domain,
+                        )
                         .await?;
                     Ok::<_, LixError>((range, rows))
                 }
@@ -1210,7 +1232,11 @@ where
             self.scan_tracked_batch_with_schema_presence(request, true)
                 .await
         } else {
-            self.scan_batch_with_schema_presence(request, true).await
+            // A combined constraint read is also the explicit cross-domain
+            // identity/collision probe. Its tracked bloom cannot prove that
+            // the current-only selector is empty, so never short-circuit it.
+            self.scan_batch_with_schema_presence(request, request.filter.untracked.is_some())
+                .await
         }
     }
 
@@ -1414,6 +1440,9 @@ fn concat_live_state_batches(
 /// to the storage scan; only a negative result from every selected generation
 /// can skip it.
 fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateScanScope) -> bool {
+    if request.filter.untracked.is_some() {
+        return true;
+    }
     let [schema_key] = request.filter.schema_keys.as_slice() else {
         return true;
     };
@@ -1511,51 +1540,27 @@ async fn load_branch_head_controls(
             .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
             .collect());
     };
-    let missing = {
-        let controls = cache.controls.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "transaction branch-head control cache lock is poisoned",
-            )
-        })?;
-        branch_ids
-            .iter()
-            .filter(|branch_id| !controls.contains_key(*branch_id))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    let mut loaded_by_branch = std::collections::BTreeMap::new();
-    if !missing.is_empty() {
-        let loaded = reader.load_many(&missing).await?;
-        let mut controls = cache.controls.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "transaction branch-head control cache lock is poisoned",
-            )
-        })?;
-        for (branch_id, control) in missing.into_iter().zip(loaded) {
-            if controls.len() < TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
-                controls.entry(branch_id.clone()).or_insert(control);
-            }
-            loaded_by_branch.insert(branch_id, control);
-        }
-    }
-    let controls = cache.controls.lock().map_err(|_| {
+    // Read the finite selector set at the current storage snapshot every time.
+    // The cache can outlive an automatic publication; returning an entry from
+    // an older transaction would select a stale generation and hide current
+    // rows. The read handle still provides snapshot coherence for explicit
+    // transactions, while successive autocommit reads observe the new control.
+    let loaded = reader.load_many(branch_ids).await?;
+    let mut controls = cache.controls.lock().map_err(|_| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "transaction branch-head control cache lock is poisoned",
         )
     })?;
+    for (branch_id, control) in branch_ids.iter().cloned().zip(loaded.iter().copied()) {
+        if controls.len() < TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
+            controls.insert(branch_id, control);
+        }
+    }
     Ok(branch_ids
         .iter()
-        .filter_map(|branch_id| {
-            controls
-                .get(branch_id)
-                .copied()
-                .or_else(|| loaded_by_branch.get(branch_id).copied())
-                .flatten()
-                .map(|control| (branch_id.clone(), control))
-        })
+        .zip(loaded)
+        .filter_map(|(branch_id, control)| control.map(|control| (branch_id.clone(), control)))
         .collect())
 }
 
@@ -1859,7 +1864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_branch_head_control_cache_pins_loaded_generation() {
+    async fn transaction_branch_head_control_cache_refreshes_after_publication() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
         let entity_pk = EntityPk::single("cached-control-row");
@@ -1907,17 +1912,17 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open repeated branch-control read");
-        let pinned = load_branch_head_controls(&read, &[branch_id.to_string()], Some(&cache))
+        let refreshed = load_branch_head_controls(&read, &[branch_id.to_string()], Some(&cache))
             .await
-            .expect("cached branch control should load")[branch_id];
+            .expect("refreshed branch control should load")[branch_id];
         let uncached = load_branch_head_controls(&read, &[branch_id.to_string()], None)
             .await
             .expect("uncached branch control should load")[branch_id];
-        assert_eq!(pinned, first);
+        assert_eq!(refreshed, current);
         assert_eq!(uncached, current);
         assert_ne!(
-            pinned.current_state_revision,
-            uncached.current_state_revision
+            first.current_state_revision,
+            refreshed.current_state_revision
         );
 
         let full_cache = BranchHeadControlCache::default();

@@ -10,7 +10,7 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
     BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control,
+    stage_branch_head_control, stage_delete_branch_head_control, untracked_lifecycle_generation,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
@@ -3347,22 +3347,6 @@ fn lifecycle_generation(
     CommitId::new(uuid::Uuid::from_bytes(bytes))
 }
 
-fn untracked_lifecycle_generation(
-    branch_id: &str,
-    previous_generation: CommitId,
-    revision: u64,
-) -> CommitId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lix.live_state.untracked_generation.v1");
-    hasher.update(&(branch_id.len() as u64).to_be_bytes());
-    hasher.update(branch_id.as_bytes());
-    hasher.update(previous_generation.as_uuid().as_bytes());
-    hasher.update(&revision.to_be_bytes());
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    CommitId::new(uuid::Uuid::from_bytes(bytes))
-}
-
 fn next_current_state_revision(current: u64) -> Result<u64, LixError> {
     current.checked_add(1).ok_or_else(|| {
         LixError::new(
@@ -4667,10 +4651,20 @@ async fn reject_tracked_absence_guards_against_untracked(
             file_id: guard.file_id.map(str::to_owned),
         };
         if existing.contains(&key) {
-            return Err(lifecycle_duplicate_tracked_row_error(&key));
+            return Err(untracked_current_identity_collision_error(&key));
         }
     }
     Ok(())
+}
+
+fn untracked_current_identity_collision_error(key: &TrackedStateKey) -> LixError {
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
+            key.schema_key, key.entity_pk,
+        ),
+    )
 }
 
 fn packed_current_base_guards_match(
@@ -5521,7 +5515,7 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
             continue;
         }
         let mut untracked_identities = current_state
-            .scan_live_rows(
+            .scan_live_batch_for_retention(
                 branch_id,
                 existing,
                 &TrackedStateScanRequest {
@@ -5532,8 +5526,10 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
                     read_columns: TrackedStateReadColumns::default(),
                     limit: None,
                 },
+                Some(true),
             )
             .await?
+            .into_rows()
             .into_iter()
             .filter(|row| row.untracked)
             .map(|row| TrackedStateKey {

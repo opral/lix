@@ -109,6 +109,24 @@ impl BranchHeadControl {
     }
 }
 
+/// Derives the next immutable current-only generation from the previous
+/// selector and its monotonic publication revision.
+pub(crate) fn untracked_lifecycle_generation(
+    branch_id: &str,
+    previous_generation: CommitId,
+    revision: u64,
+) -> CommitId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lix.live_state.untracked_generation.v1");
+    hasher.update(&(branch_id.len() as u64).to_be_bytes());
+    hasher.update(branch_id.as_bytes());
+    hasher.update(previous_generation.as_uuid().as_bytes());
+    hasher.update(&revision.to_be_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    CommitId::new(uuid::Uuid::from_bytes(bytes))
+}
+
 /// One coherent point-read observation used for both generation selection and
 /// the final exact-byte CAS guard. Keeping the decoded control and original
 /// bytes together prevents a materializer from issuing a second control read

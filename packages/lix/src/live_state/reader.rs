@@ -6,6 +6,14 @@ use crate::live_state::MaterializedLiveStateBatchBuilder;
 use crate::live_state::{LiveStateExactBatchRequest, LiveStateScanRequest};
 use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateExactBatch};
 
+/// Selects the authenticated serving domain for an internal read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveStateReadDomain {
+    Combined,
+    Tracked,
+    Untracked,
+}
+
 /// Minimal engine read model for transaction planning and SQL providers.
 ///
 /// Engine only needs visible state-row reads here. Changelog freshness/catch-up
@@ -34,6 +42,29 @@ pub(crate) trait LiveStateReader: Send + Sync {
             self.scan_tracked_batch(request).await
         } else {
             self.scan_batch(request).await
+        }
+    }
+
+    /// Reads one explicit authenticated serving domain.  Ordinary visibility
+    /// callers use `Combined`; internal historical/entity validation and
+    /// current-only durable callers select their domain explicitly.
+    async fn scan_domain_batch(
+        &self,
+        request: &LiveStateScanRequest,
+        domain: LiveStateReadDomain,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        match domain {
+            LiveStateReadDomain::Combined => self.scan_constraint_batch(request, false).await,
+            LiveStateReadDomain::Tracked => {
+                let mut request = request.clone();
+                request.filter.untracked = Some(false);
+                self.scan_constraint_batch(&request, true).await
+            }
+            LiveStateReadDomain::Untracked => {
+                let mut request = request.clone();
+                request.filter.untracked = Some(true);
+                self.scan_constraint_batch(&request, false).await
+            }
         }
     }
 

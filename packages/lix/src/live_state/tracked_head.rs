@@ -9,6 +9,7 @@
 
 mod hot;
 
+pub(crate) use crate::live_state::LiveStateReadDomain;
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
@@ -4019,7 +4020,7 @@ mod tests {
             .expect("open control-gated file-id scan");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_live_rows(
+            .scan_live_batch_for_retention(
                 branch_id,
                 control,
                 &TrackedStateScanRequest {
@@ -4032,9 +4033,11 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("control-bound file-id scan should execute");
+        let rows = rows.into_rows();
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
