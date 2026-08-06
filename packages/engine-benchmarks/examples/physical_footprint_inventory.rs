@@ -672,24 +672,35 @@ where
             filesystem.metadata_bytes,
         )?;
     }
+    let semantic_commit_space = rows
+        .iter()
+        .find(|(space, _)| space.name == "changelog.commit")
+        .ok_or("semantic commit space is absent from inventory")?;
+    let semantic_commit_count = semantic_commit_space.1.rows;
+    let retained_history_entry_count = semantic_commit_count.saturating_sub(
+        full_mapped_by_space
+            .get(&semantic_commit_space.1.id)
+            .copied()
+            .unwrap_or_default()
+            .rows,
+    );
     writeln!(
         output,
-        "NORMALIZATION\trows={}\tsemantic_commits={}\tretained_history_entries={}\tlive_semantic_rows={}\tcanonical_value_bytes={}\tidentity_bytes={}\tschema_bytes={}\tsemantic_commits_source=gc_live_set\tretained_history_entries_source=gc_live_set\tsemantic_payload_source=decoded_tracked_live_entities\tsemantic_payload_is_orthogonal=true",
+        "NORMALIZATION\trows={}\tsemantic_commits={}\tretained_history_entries={}\tlive_semantic_rows={}\tcanonical_value_bytes={}\tidentity_bytes={}\tschema_bytes={}\tsemantic_commits_source=physical_changelog_commit_rows\tretained_history_entries_source=semantic_commits_minus_full_queue_proven_present_deletes\tsemantic_payload_source=decoded_tracked_live_entities\tsemantic_payload_is_orthogonal=true",
         total.rows,
-        gc.live_commits,
-        gc.live_commits,
+        semantic_commit_count,
+        retained_history_entry_count,
         semantic.live_semantic_rows,
         semantic.canonical_value_bytes,
         semantic.identity_bytes,
         semantic.schema_bytes,
     )?;
-    let semantic_commit_count = u64::try_from(gc.live_commits)?;
     writeln!(
         output,
         "NORMALIZED\tlogical_bytes_per_physical_row={}\tlogical_bytes_per_semantic_commit={}\tlogical_bytes_per_retained_history_entry={}\tlogical_bytes_per_live_semantic_row={}\tlogical_bytes_per_canonical_value_byte={}\tfilesystem_logical_bytes_per_live_semantic_row={}\tfilesystem_logical_bytes_per_semantic_commit={}\tfilesystem_allocated_bytes_per_semantic_commit={}\tfilesystem_logical_bytes_per_canonical_value_byte={}",
         ratio(total.logical_bytes(), total.rows),
         ratio(total.logical_bytes(), semantic_commit_count),
-        ratio(total.logical_bytes(), semantic_commit_count),
+        ratio(total.logical_bytes(), retained_history_entry_count),
         ratio(total.logical_bytes(), semantic.live_semantic_rows),
         ratio(total.logical_bytes(), semantic.canonical_value_bytes),
         ratio(filesystem.logical_bytes, semantic.live_semantic_rows),
