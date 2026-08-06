@@ -2751,6 +2751,23 @@ fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -
     request.limit.is_some_and(|limit| row_count >= limit)
 }
 
+/// Test-only content-addressed chunks for the GC sweep fixture. The empty
+/// leaf is a valid serving root; labelled leaves are valid hash-addressed
+/// chunks that are intentionally not referenced by that root.
+#[cfg(test)]
+pub(crate) fn test_gc_leaf_chunk(label: &[u8]) -> ([u8; TRACKED_STATE_HASH_BYTES], Bytes) {
+    let entries = if label.is_empty() {
+        Vec::new()
+    } else {
+        vec![EncodedLeafEntry {
+            key: Bytes::copy_from_slice(label),
+            value: Bytes::from_static(b"gc-fixture-value"),
+        }]
+    };
+    let bytes = Bytes::from(encode_leaf_node(&entries));
+    (hash_bytes(&bytes), bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
