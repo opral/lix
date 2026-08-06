@@ -1,5 +1,9 @@
 #![cfg_attr(not(feature = "storage-benches"), allow(dead_code, unused_imports))]
 
+use std::collections::BTreeSet;
+
+use crate::LixError;
+
 #[cfg(feature = "storage-benches")]
 mod bench_support;
 mod codec;
@@ -59,6 +63,7 @@ pub(crate) use row_materialization::{
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
+pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
 pub(crate) use storage::{
@@ -89,7 +94,7 @@ pub(crate) use storage::{
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-    TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator,
+    decode_change_locator,
 };
 #[cfg(all(test, not(feature = "storage-benches")))]
 pub(crate) use storage::{
@@ -107,16 +112,41 @@ pub(crate) use storage::{
     validate_current_state_scoped_range_serving_base_manifest,
 };
 #[cfg(test)]
+pub(crate) use tree::test_gc_leaf_chunk;
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
     TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
-    TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
+    TrackedStateCommitRootParent, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
+    TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest,
+    TrackedStateSingleStringReplacementRef,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
+
+/// Builds an authenticated content-addressed closure for a set of retained
+/// tracked-state roots. This is deliberately a read-only maintenance helper:
+/// the returned hashes are a rebuildable sweep inventory, never serving
+/// authority or a replacement for the immutable root metadata.
+pub(crate) async fn collect_reachable_tree_chunk_hashes<S>(
+    store: &S,
+    roots: &[TrackedStateRootId],
+) -> Result<BTreeSet<[u8; types::TRACKED_STATE_HASH_BYTES]>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead + ?Sized,
+{
+    let tree = tree::TrackedStateTree::new();
+    let overlay = storage::TrackedStateChunkOverlay::new();
+    let mut reachable = BTreeSet::new();
+    for root in roots {
+        reachable.extend(
+            tree.reachable_chunk_hashes_with_overlay(store, &overlay, root)
+                .await?,
+        );
+    }
+    Ok(reachable)
+}
 #[cfg(feature = "storage-benches")]
 pub mod bench {
     pub use super::bench_support::*;

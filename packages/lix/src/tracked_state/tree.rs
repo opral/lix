@@ -18,6 +18,8 @@ use std::{
 use bytes::Bytes;
 use lru::LruCache;
 
+#[cfg(test)]
+use crate::changelog::{ChangeId, CommitId};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
     ChildSummary, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, PendingChunk,
@@ -2749,6 +2751,33 @@ fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &Tracked
 
 fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -> bool {
     request.limit.is_some_and(|limit| row_count >= limit)
+}
+
+/// Test-only content-addressed chunks for the GC sweep fixture. The empty
+/// leaf is a valid serving root; labelled leaves are valid hash-addressed
+/// chunks that are intentionally not referenced by that root.
+#[cfg(test)]
+pub(crate) fn test_gc_leaf_chunk(label: &[u8]) -> ([u8; TRACKED_STATE_HASH_BYTES], Bytes) {
+    let entries = if label.is_empty() {
+        Vec::new()
+    } else {
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "GC fixture timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        vec![EncodedLeafEntry {
+            key: Bytes::copy_from_slice(label),
+            value: Bytes::from(encode_value_ref(TrackedStateIndexValueRef {
+                change_id: ChangeId::for_test_label("gc-fixture-change"),
+                commit_id: CommitId::for_test_label("gc-fixture-commit"),
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+            })),
+        }]
+    };
+    let bytes = Bytes::from(encode_leaf_node(&entries));
+    (hash_bytes(&bytes), bytes)
 }
 
 #[cfg(test)]
