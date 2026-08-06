@@ -402,7 +402,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             Open source · MIT
           </p>
           <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-            A version control system beyond code
+            A version control system for files and data that aren't code
           </h1>
           <div className="mt-4 flex max-w-[620px] flex-col gap-3">
             <p className="text-base leading-[1.6] text-ink-secondary">

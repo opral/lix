@@ -4,7 +4,7 @@ description: Lix is a version control system beyond code. Tools work with normal
 
 # What is Lix?
 
-Lix is a **version control system beyond code**. It combines files, a database, and version control in one system.
+Lix is a **version control system for files and data that aren't code**. It combines files, a database, and version control in one system.
 
 Tools and agents work with normal files. Apps query and update SQL rows. Lix tracks every change with branches, history, review, rollback, and merge.
 
