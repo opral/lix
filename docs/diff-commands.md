@@ -4,24 +4,61 @@ description: Select native Lix diffs with SQL and feed them atomically into reve
 
 # Diff commands
 
-Lix represents a diff as rows. `lix_working_diff` compares the active branch
-head with its latest checkpoint. `lix_diff` compares any two commits:
+Diff commands act on a chosen subset of changes: revert selected changes, apply
+changes from history, or checkpoint a subset of your work while the rest stays
+in progress. You select diffs with a SQL query and pipe the resulting
+`diff_id` rows into a command.
+
+## Complete example
+
+Revert every working change in one file:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix();
+
+// Inspect what would be reverted.
+const diffs = await lix.execute(
+  "SELECT diff_id, diff_type FROM lix_working_diff WHERE file_id = $1",
+  ["file_1"],
+);
+
+for (const row of diffs.rows) {
+  console.log(row.get("diff_type"), row.get("diff_id"));
+}
+
+// Revert them in one atomic statement.
+const reverted = await lix.execute(
+  `INSERT INTO lix_revert (diff_id)
+   SELECT diff_id FROM lix_working_diff WHERE file_id = $1
+   RETURNING commit_id`,
+  ["file_1"],
+);
+
+if (reverted.rows.length > 0) {
+  console.log("reverted in commit", reverted.rows[0].get("commit_id"));
+}
+
+await lix.close();
+```
+
+`result.rows` contains row objects. Read a column with `row.get("name")`.
+
+## Diff sources
+
+`lix_working_diff` compares the active branch head with its latest checkpoint.
+`lix_working_diff_by_branch` adds `lixcol_branch_id` for cross-branch
+inspection. Their columns are listed in the
+[checkpoint SQL surfaces table](./checkpoints.md#sql-surfaces).
+
+`lix_diff` compares any two commits. Both commit arguments are required:
 
 ```sql
 SELECT diff_id, entity_pk, schema_key, file_id, diff_type,
        before_change_id, after_change_id
 FROM lix_diff($1, $2);
 ```
-
-Both commit arguments are required.
-`lix_working_diff_by_branch` adds `lixcol_branch_id` for cross-branch
-inspection.
-
-`diff_id` is a deterministic, versioned, opaque encoding of the native
-before/after change pair. Its current textual form starts with `d1.`, but
-clients must not construct or decode it. The visible `before_change_id` and
-`after_change_id` columns remain available for joins to `lix_change` and for
-debugging.
 
 ## Commands
 
@@ -48,30 +85,32 @@ WHERE file_id <> $1;
 ```
 
 The source is a normal SQL query, so filters, joins, ordering, and limits stay
-inside the database. Applications may also retain a selection and submit it
-through DataFusion's `VALUES` relation:
+inside the database. To submit a `diff_id` your application already holds, use
+a parameterized `VALUES` relation:
 
 ```sql
 INSERT INTO lix_revert (diff_id)
-SELECT diff_id
-FROM VALUES ($1), ($2), ($3) AS selected(diff_id);
+SELECT diff_id FROM VALUES ($1) AS selected(diff_id);
 ```
 
-Direct `INSERT ... VALUES` remains intentionally rejected. Every command must
-use `INSERT ... SELECT`; the query may read a Lix relation, a `VALUES`
-relation, a CTE, or another valid query.
+Direct `INSERT ... VALUES` is intentionally rejected. Every command must be
+`INSERT ... SELECT`; the query may read a Lix relation, a `VALUES` relation, a
+CTE, or another valid query.
 
-An empty selection is a successful zero-row operation. It does not create a
-commit and does not require a preflight query.
+## Semantics
 
-Each statement is atomic. Revert and apply use strict compare-and-set
-semantics: every selected entity must still be on the side from which the
-command starts. If any entity has moved, the entire statement fails without
-changing the branch.
+Each statement is atomic: it either fully succeeds or changes nothing.
+
+Revert and apply check that every selected entity is still on the side the
+command starts from. If someone changed an entity after you selected its diff,
+the whole statement fails and nothing changes — re-query and retry.
+
+An empty selection succeeds, does nothing, and creates no commit. You do not
+need a preflight query.
 
 A partial checkpoint commits the selected state as a checkpoint and preserves
-the unselected working state in a child commit. Both commits and the branch-head
-move publish atomically. Checkpoint naming is not part of this API.
+the unselected working state in a child commit. Both commits and the
+branch-head move publish atomically. Checkpoint naming is not part of this API.
 
 Every command supports `RETURNING commit_id`:
 
@@ -83,9 +122,17 @@ WHERE file_id = $3
 RETURNING commit_id;
 ```
 
-For a non-empty selection, the affected-row count and returned-row count equal
-the number of consumed diffs. Every returned row contains the same
-engine-created commit ID. An empty selection returns zero rows.
+For a non-empty selection, every returned row carries the same engine-created
+commit ID, and both the affected-row count and the returned-row count equal
+the number of consumed diffs. An empty selection returns zero rows.
+
+## Note on `diff_id`
+
+Treat `diff_id` as opaque: select it, pipe it into a command. It is a
+deterministic, versioned encoding of the native before/after change pair (its
+current textual form starts with `d1.`), but clients must not construct or
+decode it. Use `before_change_id` and `after_change_id` for joins to
+`lix_change` and for debugging.
 
 These command names describe state transformations. They are not a session
 undo/redo stack.

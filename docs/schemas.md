@@ -35,6 +35,11 @@ INSERT INTO lix_registered_schema (value) VALUES (lix_json('{
 
 After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `UPDATE`, and `DELETE` against. A sibling table `acme_section_by_branch` exposes the same rows across all branches (see [Branches & Merging](./versions.md)).
 
+```sql
+INSERT INTO acme_section (id, title, body) VALUES ($1, $2, $3);
+SELECT id, title, body FROM acme_section WHERE id = $1;
+```
+
 ## The `x-lix-*` extensions
 
 | Field                | Purpose                                                                                                                                                                                                      |
@@ -44,7 +49,9 @@ After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `U
 | `x-lix-unique`       | Optional. Array of unique constraints, each itself an array of JSON Pointer paths.                                                                                                                           |
 | `x-lix-foreign-keys` | Optional. Array of foreign keys to other registered schemas. See [Foreign keys](#foreign-keys).                                                                                                              |
 
-Without `x-lix-primary-key` you'll get an error like `requires lixcol_entity_pk because the schema has no x-lix-primary-key`.
+Without `x-lix-primary-key` you'll get an error like `requires entity_pk because the schema has no x-lix-primary-key`.
+
+Primary-key properties must be listed in `required`, and each must be a non-null string or integer.
 
 Schema identity is `x-lix-key` alone. There is no version field. Evolution is governed by the [amendment rules](#schema-amendment-rules).
 
@@ -93,9 +100,7 @@ A registered schema's `x-lix-key` is the relation's durable identity. You can re
 
 ### Why amendments must be backward compatible
 
-Lix is a version-controlled repository. Changes retained by commits are immutable. Untracked current changes may be compacted when replaced, but committed historical rows cannot be rewritten. A Lix repository may hold years of committed changes spread across many versions and many authors' schemas, and all of it must remain readable.
-
-This makes retroactive schema migrations impossible. There is no point in time at which Lix could "convert all existing rows from the old shape to the new one"; the old rows are part of history, and history doesn't change.
+Lix is a version-controlled repository: changes retained by commits are immutable, and a repository may hold years of committed rows across many branches and many authors' schemas. There is no point in time at which Lix could rewrite old rows into a new shape, so retroactive migrations are impossible and the only safe direction of evolution is additive.
 
 ```
        schema grows forward (additive only) -------------->
@@ -108,10 +113,6 @@ time   --o------o------o---------o------o-------------->
                     +-- immutable; reading c1 must still
                        succeed after the v1 -> v2 amendment.
 ```
-
-The only safe direction of evolution is therefore additive: a schema can grow in ways that leave existing rows valid, but it cannot tighten, rename, or remove anything that already exists. This is what the rules below enforce.
-
-If a schema author truly needs a breaking change, they mint a new `x-lix-key` (e.g. `md_block_v2`), leave the old key's data untouched in history, and write any plugin-level migration code at their own pace. Old data stays valid under the old key; new data lives under the new key.
 
 ### What you can change
 
@@ -127,11 +128,11 @@ If a schema author truly needs a breaking change, they mint a new `x-lix-key` (e
 - **Constraints (`x-lix-primary-key`, `x-lix-unique`, `x-lix-foreign-keys`).** Frozen. You can reorder list elements cosmetically (Lix normalizes the comparison), but you can't add, remove, or modify a constraint. Primary-key column order is semantic and cannot be reordered.
 - **Top-level keywords** like `type`, `examples`, `patternProperties`. Frozen.
 - **Nested object schemas.** A property whose `type` is `object` is frozen as a unit: you cannot add subproperties to it. Recursive schema evolution is intentionally a later, explicit feature.
-- **`x-lix-version`.** Rejected if present on either side. The `schema_version` column you may see on current state SQL surfaces is engine metadata, not a schema authoring field.
+- **`x-lix-version`.** Rejected if present on either side.
 
 ### What to do when you really need a breaking change
 
-Mint a new `x-lix-key`. Ship `acme_section_v2` as a separate schema, write migration code in your plugin to move data from `acme_section` to `acme_section_v2`, and let the two coexist while consumers cut over. Foreign keys pointing at the old key keep working; new ones point at the new key. This is how protobuf, GraphQL, RDF, and OpenAPI all handle hard breaks: the new identity _is_ the version bump, and it cascades through references naturally.
+Mint a new `x-lix-key`. Ship `acme_section_v2` as a separate schema, leave the old key's data untouched in history, and write plugin-level migration code to move data at your own pace. The two keys coexist while consumers cut over: old data stays valid under the old key, new data lives under the new key, and foreign keys pointing at the old key keep working while new ones point at the new key. This is how protobuf, GraphQL, RDF, and OpenAPI all handle hard breaks: the new identity _is_ the version bump, and it cascades through references naturally.
 
 ## Prefix your schema keys
 
@@ -165,9 +166,10 @@ Those facts already belong to the change:
 
 - [`lix_change`](./history.md) records the change ID, timestamp, metadata, and
   origin key for workspace-wide activity.
-- `<schema>_history` records branch-reachable revisions and exposes the source
-  change and commit provenance through `lixcol_change_*` and `lixcol_commit_*`
-  columns.
+- `<schema>_history()` records branch-reachable revisions and exposes the
+  source change and commit provenance through `lixcol_change_id`,
+  `lixcol_change_created_at`, `lixcol_observed_commit_id`, and
+  `lixcol_commit_created_at`.
 - The current entity relation exposes `lixcol_created_at`,
   `lixcol_updated_at`, `lixcol_change_id`, and `lixcol_commit_id` for its
   current revision.
@@ -177,14 +179,6 @@ make the entity carry a second, mutable copy of the same facts. Add timestamp
 or metadata fields only when they are domain data with independent meaning,
 such as `due_at`, `published_at`, `external_system_updated_at`, or a business
 event's own payload.
-
-### Inspecting registered schemas
-
-```sql
-SELECT lixcol_entity_pk, value
-FROM lix_registered_schema
-ORDER BY lixcol_entity_pk;
-```
 
 ### Design for querying, not for merging
 

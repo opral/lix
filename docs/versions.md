@@ -66,10 +66,11 @@ const preview = await lix.mergeBranchPreview({
 //   sourceBranchId,
 //   changeStats: { total, added, modified, removed },
 //   conflicts: MergeConflict[],
+//   ...
 // }
 ```
 
-`mergeBranch()` always merges into the active branch. Switch to the target branch before previewing or merging.
+`mergeBranch()` always merges into the active branch. Switch to the target branch before previewing or merging. Merging a branch into itself throws an error.
 
 ```ts
 await lix.switchBranch({ branchId: main });
@@ -109,3 +110,5 @@ await lix.execute("DELETE FROM lix_branch WHERE id = $1", [draft.id]);
 ```
 
 Lix does not allow deleting the global branch or the active branch.
+
+`hidden` only marks a branch for UIs. It does not change what SQL queries can see.

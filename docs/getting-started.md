@@ -22,17 +22,6 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix();
 ```
 
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./workspace",
-    syncAllFiles: true,
-  }),
-});
-```
-
 ## Write a normal file
 
 Files are available through SQL and, with `LocalFilesystem`, on disk:
@@ -49,7 +38,7 @@ const file = await lix.execute(
 );
 ```
 
-Tools and agents can edit `notes/status.md` as a normal file. Lix imports those edits and tracks plugin-defined entities for supported formats. The SDK includes Markdown and CSV plugins.
+Tools and agents can edit `/notes/status.md` as a normal file. Lix imports those edits and tracks plugin-defined entities for supported formats. The SDK includes Markdown and CSV plugins.
 
 ## Register a schema
 
@@ -96,22 +85,13 @@ const row = result.rows[0]!;
 console.log(row.get("title"), row.get("done"));
 ```
 
-`execute()` returns `{ columns, rows, rowsAffected, notices }`.
-
-## Read result values
-
-Each row is a `Row`. Use `row.get(name)` or `row.toObject()` for plain
-JavaScript values. Use `row.value(name).toJS()` when you also need the value's
-SQL kind, and `row.value(name).asBytes()` for a defensive copy of binary data.
-
-Use `asBytes()` for byte content:
+`execute()` returns `{ columns, rows, rowsAffected, notices }`. Use `row.get(name)` or `row.toObject()` for plain JavaScript values, and `row.value(name).asBytes()` for file bytes:
 
 ```ts
-const file = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [
-  "/notes/status.md",
-]);
 const bytes = file.rows[0]!.value("content").asBytes();
 ```
+
+The full Row and Value surface is in the [JS API Reference](./js-api-reference.md).
 
 ## Isolate a change on a branch
 
@@ -142,7 +122,7 @@ if (preview.conflicts.length === 0) {
 }
 ```
 
-`mergeBranchPreview()` reports the same decision as `mergeBranch()` without changing state. It returns conflicts when both branches changed the same entity. See [Branches & Merging](./versions.md).
+`mergeBranchPreview()` reports the same decision as `mergeBranch()` without changing state. See [Branches & Merging](./versions.md).
 
 ## The loop
 
@@ -151,4 +131,4 @@ if (preview.conflicts.length === 0) {
 3. Write and read through generated tables.
 4. Create branches for isolated work.
 5. Preview, then merge or discard.
-6. Query [`lix_change`](./history.md) for audit and undo.
+6. Query [`lix_change`](./history.md) for audit.
