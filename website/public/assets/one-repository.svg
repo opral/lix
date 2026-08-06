@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 276" role="img" aria-label="Diagram: automation product, agents, analytics, and knowledge search all build on one Lix repository holding automations, skills, sales data, and contracts." font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <defs>
+    <marker id="rep-arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L7 4 L0 8 Z" fill="#8A8F96"></path></marker>
+  </defs>
+  <rect x="0.75" y="0.75" width="678.5" height="274.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+  <g transform="translate(20, 20)">
+    <text x="120" y="26" text-anchor="middle" font-size="12.5" font-weight="500" fill="#15171B">automation product</text>
+    <line x1="120" y1="38" x2="120" y2="60" stroke="#8A8F96" stroke-width="1.2"></line>
+    <text x="268" y="26" text-anchor="middle" font-size="12.5" font-weight="500" fill="#15171B">agents</text>
+    <line x1="268" y1="38" x2="268" y2="60" stroke="#8A8F96" stroke-width="1.2"></line>
+    <text x="396" y="26" text-anchor="middle" font-size="12.5" font-weight="500" fill="#15171B">analytics</text>
+    <line x1="396" y1="38" x2="396" y2="60" stroke="#8A8F96" stroke-width="1.2"></line>
+    <text x="524" y="26" text-anchor="middle" font-size="12.5" font-weight="500" fill="#15171B">knowledge search</text>
+    <line x1="524" y1="38" x2="524" y2="60" stroke="#8A8F96" stroke-width="1.2"></line>
+    <path d="M120 60 L120 72 L524 72 L524 60 M268 60 L268 72 M396 60 L396 72" fill="none" stroke="#8A8F96" stroke-width="1.2"></path>
+    <line x1="320" y1="72" x2="320" y2="96" stroke="#8A8F96" stroke-width="1.2" marker-end="url(#rep-arr)"></line>
+    <rect x="24" y="106" width="592" height="122" rx="10" fill="rgba(7,182,213,0.05)" stroke="#07B6D5" stroke-width="1.5"></rect>
+    <rect x="252" y="98" width="136" height="16" fill="#F7F6F1"></rect>
+    <text x="320" y="111" text-anchor="middle" font-size="12" font-weight="700" letter-spacing="1" fill="#0891AC">LIX REPOSITORY</text>
+    <g transform="translate(96, 172)">
+      <rect x="-64" y="-24" width="128" height="48" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
+      <text x="0" y="4" text-anchor="middle" font-size="11.5" fill="#3D4046">automations/</text>
+    </g>
+    <g transform="translate(245, 172)">
+      <rect x="-64" y="-24" width="128" height="48" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
+      <text x="0" y="4" text-anchor="middle" font-size="11.5" fill="#3D4046">skills/</text>
+    </g>
+    <g transform="translate(394, 172)">
+      <rect x="-64" y="-24" width="128" height="48" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
+      <text x="0" y="4" text-anchor="middle" font-size="11.5" fill="#3D4046">sales.xlsx</text>
+    </g>
+    <g transform="translate(543, 172)">
+      <rect x="-64" y="-24" width="128" height="48" rx="8" fill="#FFFFFF" stroke="#E6E4DD"></rect>
+      <text x="0" y="4" text-anchor="middle" font-size="11.5" fill="#3D4046">contracts/</text>
+    </g>
+  </g>
+</svg>

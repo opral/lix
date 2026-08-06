@@ -11,9 +11,9 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Code lives in version control. The documents, spreadsheets, and data a company runs on do not.
+Agents and tools work with files. Applications need a database. Teams need version control. Lix combines all three: normal files for tools, SQL rows for apps, and version control for every change.
 
-Lix is a version control system for files and data beyond code: one repository that combines files, a database, and version control.
+<img src="./website/public/assets/lix-triad.svg" alt="Lix is a filesystem, a database, and version control in one system" width="760" />
 
 - 📄 **Works with any file format.** Plugins map DOCX, CSV, Markdown, or your own format to versioned entities.
 - 🔍 **Semantic changes.** Review the clause, cell, or row that changed, not lines of bytes.
@@ -32,9 +32,9 @@ Lix is a version control system for files and data beyond code: one repository t
 
 <p>
   <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
-  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
-  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
-  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+  <a href="https://github.com/opral/lix/issues/373" title="The Python SDK is planned. Upvote the issue on GitHub."><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/371" title="The Rust SDK is planned. Upvote the issue on GitHub."><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
+  <a href="https://github.com/opral/lix/issues/370" title="The Go SDK is planned. Upvote the issue on GitHub."><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
 </p>
 
 ```bash
@@ -81,9 +81,9 @@ The SDK includes plugins for Markdown and CSV. Add a plugin for other formats, s
 
 ### Pluggable storage
 
-Lix embeds in your app and runs on storage adapters: in memory, on the local filesystem, or on an S3 bucket.
+Lix embeds in your product and runs on storage adapters: in memory, on the local filesystem, or on an S3 bucket.
 
-<img src="./website/public/assets/pluggable-storage.svg" alt="Lix embeds in your app and runs on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
+<img src="./website/public/assets/pluggable-storage.svg" alt="Lix embeds in your product and runs on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
 
 Existing VCS like Git assume a local POSIX filesystem, which makes them hard to embed and scale. See the [Persistence and Storage](https://lix.dev/docs/persistence) docs.
 
@@ -91,19 +91,7 @@ Existing VCS like Git assume a local POSIX filesystem, which makes them hard to 
 
 Git versions files but cannot query them. PostgreSQL and SQLite query rows but have no files and no history. Lix does both.
 
-```text
-                     database
-                         │
-   PostgreSQL / SQLite   │        ★ Lix
-   rows, no history      │     rows + files,
-                         │       versioned
-                         │
-   ──────────────────────┼──────────────────▶  version control
-                         │
-                         │          Git
-                         │    text files only
-                         │
-```
+<img src="./website/public/assets/comparison-quadrant.svg" alt="Quadrant chart: database capability on the vertical axis, version control on the horizontal axis. PostgreSQL and SQLite sit top left, Git bottom right, Lix top right." width="760" />
 
 | Capability                    | Git             | PostgreSQL / SQLite | Lix                 |
 | ----------------------------- | --------------- | ------------------- | ------------------- |
@@ -114,6 +102,28 @@ Git versions files but cannot query them. PostgreSQL and SQLite query rows but h
 | Pluggable storage             | No              | No                  | Yes                 |
 
 ### Prime use cases
+
+#### Automation repository for your customers
+
+LLMs let your product write automations for customers. Automations are code, so every customer needs a repository. Lix is simpler than git here: it embeds in your product, and your customers review and undo changes without branch, merge, or pull request vocabulary.
+
+```ts
+// One Lix repository per customer, hosted on your server (for example backed by S3).
+const lix = await openLix({
+  server: {
+    mode: "remote",
+    url: "https://lix.example.com/customers/acme",
+  },
+});
+
+// The agent writes an automation. Lix records the change, no commit needed.
+await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+  "/automations/booking.ts",
+  code,
+]);
+
+// Your UI shows the diff. The customer clicks accept or undo.
+```
 
 #### Give agents safe, isolated workspaces
 
@@ -133,21 +143,6 @@ if (preview.conflicts.length === 0) {
   await lix.mergeBranch({ sourceBranchId: task.id });
 }
 ```
-
-#### Put your company's files under agent operation
-
-Agents already know how to read and write files. Put contracts, pricing sheets, and order data in a repository, and agents can work on them without custom integrations.
-
-Lix records every change automatically. When an agent updates an orders CSV, reviewers see the row field that changed before the change merges:
-
-```diff
-order_id 1002 status:
-
-- pending
-+ shipped
-```
-
-Merge good changes, discard bad ones, and restore any earlier state of the company.
 
 #### Build file-based apps with SQL and version control
 
@@ -172,24 +167,9 @@ Update Lix files and rows in one ACID transaction. Lix records the history autom
 
 ## Where this is going
 
-The goal is one repository for everything a company produces. Code lives in git. Contracts, spreadsheets, app data, and agent output get the same foundation with Lix: one history, queryable with SQL, safe to branch and merge.
+The goal is one repository for everything a company produces. Contracts, spreadsheets, app data, agent output, and the automations non-engineers now write with LLMs get the same foundation: one history, queryable with SQL, safe to branch and merge.
 
-```text
- contracts.docx    pricing.xlsx      app data     agent output
-       │                │              │              │
-       └────────────────┴───────┬──────┴──────────────┘
-                                ▼
-┌─────────────────── ONE LIX REPOSITORY ───────────────────┐
-│                                                          │
-│  ┌──────────────┐     ┌──────────────┐     ┌────────────┐ │
-│  │  FILESYSTEM  │  ×  │   DATABASE   │  ×  │  VERSION   │ │
-│  │              │     │              │     │  CONTROL   │ │
-│  │ tools and    │     │ SQL queries  │     │review/merge│ │
-│  │ agents       │     │ transactions │     │ rollback   │ │
-│  └──────────────┘     └──────────────┘     └────────────┘ │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
+<img src="./website/public/assets/one-repository.svg" alt="Automation product, agents, analytics, and knowledge search all build on one Lix repository holding automations, skills, sales data, and contracts" width="760" />
 
 ## Learn more
 
