@@ -59,7 +59,8 @@ use crate::sql2::session::{
 };
 use crate::sql2::write_normalization::lix_file_content_type_lix_error;
 use crate::sql2::{
-    CachedReadPlan, SqlExecutionContext, SqlPlanningCache, SqlWriteExecutionContext,
+    CachedReadPlan, PhysicalReadPlanCacheKey, SqlExecutionContext, SqlPlanningCache,
+    SqlWriteExecutionContext,
 };
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
@@ -72,6 +73,10 @@ pub(crate) struct DataFusionLogicalPlan {
     pub(super) notices: Vec<LixNotice>,
     pub(super) json_predicate_params: BTreeSet<usize>,
     pub(super) expected_parameter_count: usize,
+    pub(super) physical_planning_cache: Option<(
+        std::sync::Arc<SqlPlanningCache<CatalogFingerprint>>,
+        PhysicalReadPlanCacheKey<CatalogFingerprint>,
+    )>,
 }
 
 pub(crate) struct SessionReadSqlResult {
@@ -245,6 +250,8 @@ async fn create_logical_plan_in_session_from_parsed(
             notices: Vec::new(),
             json_predicate_params: cached.json_predicate_params.clone(),
             expected_parameter_count: cached.expected_parameter_count,
+            physical_planning_cache: PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
+                .map(|key| (std::sync::Arc::clone(cache), key)),
         }));
     }
     bind_table_function_parameters(&mut statement, params)?;
@@ -254,10 +261,8 @@ async fn create_logical_plan_in_session_from_parsed(
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
 
-    if cacheable_statement
-        && !logical_plan_has_scalar_function(&plan)
-        && let Some((cache, catalog)) = &session.planning_environment
-    {
+    let physical_plan_cacheable = cacheable_statement && !logical_plan_has_scalar_function(&plan);
+    if physical_plan_cacheable && let Some((cache, catalog)) = &session.planning_environment {
         cache.remember_read_plan(
             sql,
             params,
@@ -270,12 +275,25 @@ async fn create_logical_plan_in_session_from_parsed(
         );
     }
 
+    let physical_planning_cache = if physical_plan_cacheable {
+        session
+            .planning_environment
+            .as_ref()
+            .and_then(|(cache, catalog)| {
+                PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
+                    .map(|key| (std::sync::Arc::clone(cache), key))
+            })
+    } else {
+        None
+    };
+
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session: session.session.clone(),
         plan,
         notices: Vec::new(),
         json_predicate_params,
         expected_parameter_count,
+        physical_planning_cache,
     }))
 }
 
@@ -427,6 +445,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
         notices: Vec::new(),
         json_predicate_params,
         expected_parameter_count,
+        physical_planning_cache: None,
     }))
 }
 
@@ -1119,6 +1138,7 @@ async fn execute_logical_plan(
         notices,
         json_predicate_params,
         expected_parameter_count,
+        physical_planning_cache,
     } = plan;
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
@@ -1141,7 +1161,7 @@ async fn execute_logical_plan(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_dataframe(dataframe)
+    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     // This is a benchmark-only causal ceiling probe. It keeps DataFusion's

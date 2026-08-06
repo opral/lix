@@ -776,6 +776,12 @@ impl TableProvider for SpecTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let physical_cache_key = PhysicalScanKey {
+            table: self.spec.table_name().into(),
+            projection: projection.cloned(),
+            filters: filters.iter().map(ToString::to_string).collect(),
+            limit,
+        };
         let planned = self
             .spec
             .plan_scan(projection, filters, limit, state.execution_props())
@@ -794,6 +800,7 @@ impl TableProvider for SpecTableProvider {
             planned,
             state.config().target_partitions(),
             statement_cache_key,
+            physical_cache_key,
         )))
     }
 
@@ -977,6 +984,14 @@ pub(crate) struct StatementScanKey {
     projection: Option<Vec<usize>>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PhysicalScanKey {
+    table: Arc<str>,
+    projection: Option<Vec<usize>>,
+    filters: Vec<String>,
+    limit: Option<usize>,
+}
+
 pub(crate) struct SpecScanExec {
     table: Arc<str>,
     schema: SchemaRef,
@@ -984,6 +999,7 @@ pub(crate) struct SpecScanExec {
     fragment_ranges: Arc<Vec<Range<usize>>>,
     properties: Arc<PlanProperties>,
     statement_cache_key: Option<StatementScanKey>,
+    physical_cache_key: PhysicalScanKey,
 }
 
 impl SpecScanExec {
@@ -992,6 +1008,7 @@ impl SpecScanExec {
         planned: PlannedScan,
         target_partitions: usize,
         statement_cache_key: Option<StatementScanKey>,
+        physical_cache_key: PhysicalScanKey,
     ) -> Self {
         // A declared ordering only proves that each source fragment is sorted,
         // not that adjacent fragments have non-overlapping value ranges.
@@ -1040,11 +1057,38 @@ impl SpecScanExec {
             fragment_ranges: Arc::new(fragment_ranges),
             properties: Arc::new(properties),
             statement_cache_key,
+            physical_cache_key,
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        table: Arc<str>,
+        planned: PlannedScan,
+        target_partitions: usize,
+        statement_cache_key: Option<StatementScanKey>,
+    ) -> Self {
+        let physical_cache_key = PhysicalScanKey {
+            table: Arc::clone(&table),
+            projection: None,
+            filters: Vec::new(),
+            limit: None,
+        };
+        Self::new(
+            table,
+            planned,
+            target_partitions,
+            statement_cache_key,
+            physical_cache_key,
+        )
     }
 
     pub(crate) fn statement_cache_key(&self) -> Option<&StatementScanKey> {
         self.statement_cache_key.as_ref()
+    }
+
+    pub(crate) fn physical_cache_key(&self) -> &PhysicalScanKey {
+        &self.physical_cache_key
     }
 }
 
@@ -1544,7 +1588,7 @@ mod scan_source_tests {
             )
             .await
             .expect("CTE should plan");
-        let batches = crate::sql2::runtime::collect_dataframe(dataframe)
+        let batches = crate::sql2::runtime::collect_dataframe(dataframe, None)
             .await
             .expect("CTE should execute");
         let values = batches
@@ -1575,7 +1619,7 @@ mod scan_source_tests {
             table: Arc::from("cache_test"),
             projection: None,
         };
-        Arc::new(SpecScanExec::new(
+        Arc::new(SpecScanExec::new_for_test(
             Arc::from("cache_test"),
             PlannedScan {
                 schema,
@@ -1827,7 +1871,7 @@ mod scan_source_tests {
                 stream::iter(batches),
             )))
         });
-        let exec = SpecScanExec::new(
+        let exec = SpecScanExec::new_for_test(
             Arc::from("stream_test"),
             PlannedScan {
                 schema: Arc::clone(&schema),
@@ -1866,7 +1910,7 @@ mod scan_source_tests {
                 )))
             },
         );
-        let exec = SpecScanExec::new(
+        let exec = SpecScanExec::new_for_test(
             Arc::from("schema_drift_test"),
             PlannedScan {
                 schema: planned_schema,
@@ -1904,7 +1948,7 @@ mod scan_source_tests {
                 )))
             },
         );
-        let exec = SpecScanExec::new(
+        let exec = SpecScanExec::new_for_test(
             Arc::from("statistics_test"),
             PlannedScan {
                 schema,
@@ -1950,7 +1994,7 @@ mod scan_source_tests {
                 )))
             },
         );
-        let exec = SpecScanExec::new(
+        let exec = SpecScanExec::new_for_test(
             Arc::from("source_statistics_test"),
             PlannedScan {
                 schema,
@@ -2002,7 +2046,7 @@ mod scan_source_tests {
                 )))
             },
         );
-        let exec = SpecScanExec::new(
+        let exec = SpecScanExec::new_for_test(
             Arc::from("grouped_test"),
             PlannedScan {
                 schema,
@@ -2061,7 +2105,7 @@ mod scan_source_tests {
                 )))
             }
         });
-        let exec = SpecScanExec::new(
+        let exec = SpecScanExec::new_for_test(
             Arc::from("ordered_test"),
             PlannedScan {
                 schema,
