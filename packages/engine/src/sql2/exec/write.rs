@@ -11,8 +11,8 @@ use datafusion::common::ScalarValue;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
+use crate::PreparedDmlParameterBatch;
 use crate::common::ExecuteStatementMetadata;
-use crate::session::PreparedDmlParameterBatch;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::BoundWriteTarget;

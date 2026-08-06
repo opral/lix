@@ -20,7 +20,6 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
-use crate::session::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -42,6 +41,7 @@ use crate::transaction::types::{
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
+use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
 use super::SqlWriteResult;
 

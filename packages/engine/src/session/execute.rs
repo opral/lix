@@ -32,10 +32,10 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
 use super::ExecuteIdempotency;
-use super::PreparedDmlParameterBatch;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
+use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 

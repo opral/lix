@@ -50,6 +50,7 @@ pub(crate) mod live_state;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 pub(crate) mod plugin;
+mod prepared_dml;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
@@ -89,12 +90,12 @@ pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use engine::{Engine, EngineOptions};
 pub use init::InitReceipt;
+pub use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use session::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, FILE_UPLOAD_PART_BYTES, FileRead,
-    FileUploadProgress, MutationIdentity, ObserveEvent, ObserveEvents, PreparedDmlParameterBatch,
-    PreparedDmlValueRef, RequestBlobSpliceProvenance, Row, RowRef, TryFromValue,
-    VerifiedRequestBlob,
+    FileUploadProgress, MutationIdentity, ObserveEvent, ObserveEvents, RequestBlobSpliceProvenance,
+    Row, RowRef, TryFromValue, VerifiedRequestBlob,
 };
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
