@@ -24,7 +24,8 @@ pub(crate) use commit_root_rebuild::{
     load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
 };
 pub(crate) use context::{
-    TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
+    TrackedStateContext, TrackedStateStoreReader, TrackedStateTransientRebuildState,
+    descriptor_dependency_cascade_file_ids,
 };
 #[cfg(test)]
 pub(crate) use current_state_data_part::decode_current_state_data_part_refs;

@@ -7194,6 +7194,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_root_reuse_fails_closed_on_missing_authoritative_root_chunk() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "rootless-child",
+            "base",
+            &[row_with_value(
+                "entity-a",
+                "change-child",
+                "rootless-child",
+                "child",
+            )],
+        )
+        .await;
+        delete_root_chunk_for_test(&storage, "base").await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("root reuse read should open");
+        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            "rootless-child",
+            true,
+        )
+        .await
+        .expect_err("missing authoritative root chunk must fail closed");
+
+        assert!(
+            error.message.contains("tree chunk is missing"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_root_reuse_fails_closed_on_hash_corrupt_authoritative_root_chunk() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "rootless-child",
+            "base",
+            &[row_with_value(
+                "entity-a",
+                "change-child",
+                "rootless-child",
+                "child",
+            )],
+        )
+        .await;
+        corrupt_root_chunk_for_test(&storage, "base").await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("root reuse read should open");
+        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            "rootless-child",
+            true,
+        )
+        .await
+        .expect_err("hash-corrupt authoritative root chunk must fail closed");
+
+        assert!(
+            error.message.contains("hash") || error.message.contains("digest"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_rebuild_rejects_stale_immutable_root_missing_inherited_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();

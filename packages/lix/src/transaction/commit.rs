@@ -39,8 +39,8 @@ use crate::tracked_state::{
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
-    encode_key_ref, load_commit_delta_change_records, load_commit_delta_replay_metadata,
-    stage_addressable_commit_deltas, stage_change_locators,
+    TrackedStateTransientRebuildState, encode_key_ref, load_commit_delta_change_records,
+    load_commit_delta_replay_metadata, stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::staging::{
@@ -5656,7 +5656,12 @@ async fn stage_tracked_roots(
     if root_fence_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let mut tracked_writer = tracked_state.writer(read, writes);
+    // Reconstruct only the bounded rootless suffix in a transient
+    // content-addressed overlay. Rootless ancestors have no immutable root
+    // pointer, so their intermediate chunks must not enter the durable write
+    // set. A rooted descendant promotes only transient chunks reachable from
+    // its final authenticated root.
+    let mut rebuild_state = TrackedStateTransientRebuildState::default();
     let mut staged_rebuild_plan_ids = BTreeSet::new();
     for parent_commit_id in durable_root_rebuild_parents {
         let plans = crate::tracked_state::load_rebuild_plans_to_nearest_available_root(
@@ -5667,11 +5672,21 @@ async fn stage_tracked_roots(
         .await?;
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
-                crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
+                let previously_known = rebuild_state.chunk_hashes();
+                let mut scratch_writes = StorageWriteSet::new();
+                let mut transient_writer = tracked_state.writer_with_rebuild_state(
+                    read,
+                    &mut scratch_writes,
+                    rebuild_state,
+                );
+                crate::tracked_state::stage_rebuild_plan_with_writer(&mut transient_writer, plan)
                     .await?;
+                rebuild_state = transient_writer.into_transient_rebuild_state();
+                rebuild_state.mark_new_chunks_transient(&previously_known);
             }
         }
     }
+    let mut tracked_writer = tracked_state.writer_with_rebuild_state(read, writes, rebuild_state);
     let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         if !root_fence_ids.contains(&root.commit_id) {
@@ -5749,7 +5764,7 @@ async fn stage_tracked_roots(
                 file_id: first_row.file_id.map(crate::common::SharedStr::as_str),
                 entity_pk: first_row.entity_pk,
             });
-            if tracked_writer
+            if let Some(report) = tracked_writer
                 .try_stage_bulk_parent_root_from_ordered_mutations(
                     &commit_id_text,
                     parent_commit_id_text.as_deref(),
@@ -5759,8 +5774,10 @@ async fn stage_tracked_roots(
                     OrderedStateRowMutations::new(state_row_indices, state_rows, insert_selection),
                 )
                 .await?
-                .is_some()
             {
+                tracked_writer
+                    .promote_reachable_transient_chunks(&report.root_id)
+                    .await?;
                 continue;
             }
         }
@@ -5804,7 +5821,7 @@ async fn stage_tracked_roots(
         // also preserves the one-mutation path for ordinary singleton writes.
         let commit_id_text = root.commit_id.to_string();
         let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
-        tracked_writer
+        let report = tracked_writer
             .stage_commit_root_with_absence_guards(
                 &commit_id_text,
                 parent_commit_id_text.as_deref(),
@@ -5812,6 +5829,9 @@ async fn stage_tracked_roots(
                 &absence_guards,
                 certified_replacement_markers,
             )
+            .await?;
+        tracked_writer
+            .promote_reachable_transient_chunks(&report.root_id)
             .await?;
     }
     Ok(tracked_writer

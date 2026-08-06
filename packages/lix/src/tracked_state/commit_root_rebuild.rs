@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 
 use crate::LixError;
 use crate::changelog::{
@@ -15,9 +13,7 @@ use crate::tracked_state::context::{
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
-use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
-};
+use crate::tracked_state::types::TrackedStateRootId;
 use crate::tracked_state::{
     TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateRootMutationRef, encode_key_ref,
 };
@@ -178,7 +174,7 @@ where
             ));
         }
         if !force_current
-            && load_available_root(store, &current_commit_id, &mut HashSet::new())
+            && load_available_root(store, &current_commit_id)
                 .await?
                 .is_some()
         {
@@ -196,84 +192,23 @@ where
     Ok(plans)
 }
 
-fn load_available_root<'a, S>(
-    store: &'a S,
-    commit_id: &'a str,
-    seen: &'a mut HashSet<String>,
-) -> Pin<Box<dyn Future<Output = Result<Option<TrackedStateRootId>, LixError>> + Send + 'a>>
-where
-    S: StorageAdapterRead + ?Sized + 'a,
-{
-    Box::pin(async move {
-        if !seen.insert(commit_id.to_string()) {
-            return Ok(None);
-        }
-        let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
-            seen.remove(commit_id);
-            return Ok(None);
-        };
-        if !commit_root_tree_is_readable(store, &metadata).await? {
-            seen.remove(commit_id);
-            return Ok(None);
-        }
-        if !commit_root_matches_canonical_rebuild(store, commit_id, &metadata, seen).await? {
-            seen.remove(commit_id);
-            return Ok(None);
-        }
-        seen.remove(commit_id);
-        Ok(Some(metadata.root_id))
-    })
-}
-
-async fn commit_root_tree_is_readable<S>(
-    store: &S,
-    metadata: &TrackedStateCommitRoot,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    match TrackedStateTree::new()
-        .scan(
-            store,
-            &metadata.root_id,
-            &TrackedStateTreeScanRequest::default(),
-        )
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-async fn commit_root_matches_canonical_rebuild<S>(
+async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
-    metadata: &TrackedStateCommitRoot,
-    seen: &mut HashSet<String>,
-) -> Result<bool, LixError>
+) -> Result<Option<TrackedStateRootId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plan = load_commit_root_rebuild_plan(store, commit_id).await?;
-    if let Some(parent_commit_id) = plan.parent_commit_id.as_ref() {
-        let parent_commit_id_text = parent_commit_id.to_string();
-        let Some(parent_root_id) = load_available_root(store, &parent_commit_id_text, seen).await?
-        else {
-            return Ok(false);
-        };
-        match metadata.parent_roots.first() {
-            Some(parent)
-                if parent.commit_id == *parent_commit_id && parent.root_id == parent_root_id => {}
-            _ => return Ok(false),
-        }
-    } else if !metadata.parent_roots.is_empty() {
-        return Ok(false);
-    }
-    let mut scratch_writes = StorageWriteSet::new();
-    let context = TrackedStateContext::new();
-    let mut writer = context.writer(store, &mut scratch_writes);
-    let report = stage_rebuild_plan_with_writer(&mut writer, &plan).await?;
-    Ok(report.root_id == metadata.root_id)
+    let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
+        return Ok(None);
+    };
+    // Immutable manifest/root metadata is the serving authority. Availability
+    // checks validate its bounded content-addressed closure; full canonical
+    // replay remains an explicit rebuild/integrity operation.
+    TrackedStateTree::new()
+        .validate_root_metadata(store, &metadata)
+        .await?;
+    Ok(Some(metadata.root_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
