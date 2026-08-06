@@ -71,7 +71,8 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     let plans =
-        load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
+        load_rebuild_plans_to_nearest_available_root_for_repair(rebuilder.store, commit_id, true)
+            .await?;
     let mut report = None;
     let context = TrackedStateContext::new();
     let mut state = TrackedStateTransientRebuildState::default();
@@ -179,6 +180,49 @@ where
                 .is_some()
         {
             break;
+        }
+        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
+        let parent_commit_id = plan.parent_commit_id;
+        plans.push(plan);
+        let Some(parent_commit_id) = parent_commit_id else {
+            break;
+        };
+        current_commit_id = parent_commit_id.to_string();
+        force_current = false;
+    }
+    Ok(plans)
+}
+
+/// Explicit recovery may use immutable changelog facts to replace a missing or
+/// corrupt serving root. Ordinary publication must use the strict function
+/// above and fail closed instead. Keeping this recovery-only discovery route
+/// separate prevents repair semantics from becoming a hot-path fallback.
+async fn load_rebuild_plans_to_nearest_available_root_for_repair<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut plans = Vec::new();
+    let mut current_commit_id = commit_id.to_string();
+    let mut force_current = force_head;
+    let mut seen_commit_ids = HashSet::new();
+    loop {
+        if !seen_commit_ids.insert(current_commit_id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot repair tracked_state commit_root for commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                ),
+            ));
+        }
+        if !force_current {
+            match load_available_root(store, &current_commit_id).await {
+                Ok(Some(_)) => break,
+                Ok(None) | Err(_) => {}
+            }
         }
         let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
         let parent_commit_id = plan.parent_commit_id;

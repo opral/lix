@@ -7284,6 +7284,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_rebuild_repairs_corrupt_rooted_ancestor_before_descendant() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-base", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "intermediate",
+            Some("base"),
+            &[row_with_value(
+                "entity-intermediate",
+                "change-intermediate",
+                "intermediate",
+                "intermediate",
+            )],
+        )
+        .await
+        .expect("intermediate root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "target",
+            Some("intermediate"),
+            &[row_with_value(
+                "entity-target",
+                "change-target",
+                "target",
+                "target",
+            )],
+        )
+        .await
+        .expect("target root should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("root authority read should open");
+        let expected_intermediate_root = storage::load_root(&read, "intermediate")
+            .await
+            .expect("intermediate root metadata should load")
+            .expect("intermediate root should exist");
+        let expected_target_root = storage::load_root(&read, "target")
+            .await
+            .expect("target root metadata should load")
+            .expect("target root should exist");
+        drop(read);
+        corrupt_root_chunk_for_test(&storage, "intermediate").await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("hot reuse read should open");
+        let hot_error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            "target",
+            true,
+        )
+        .await
+        .expect_err("ordinary reuse must fail closed on corrupt ancestor");
+        assert!(
+            hot_error.message.contains("hash") || hot_error.message.contains("digest"),
+            "unexpected hot reuse error: {hot_error:?}"
+        );
+        drop(read);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("repair read should open");
+        let mut writes = storage.new_write_set();
+        tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("target")
+            .await
+            .expect("explicit repair should rebuild through corrupt ancestor");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("repaired roots should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-repair read should open");
+        assert_eq!(
+            storage::load_root(&read, "intermediate")
+                .await
+                .expect("repaired intermediate root should load"),
+            Some(expected_intermediate_root)
+        );
+        assert_eq!(
+            storage::load_root(&read, "target")
+                .await
+                .expect("repaired target root should load"),
+            Some(expected_target_root)
+        );
+        let rows = tracked_state
+            .reader(read)
+            .scan_batch_at_commit("target", &test_schema_scan_request())
+            .await
+            .expect("repaired target should scan")
+            .into_rows();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
     async fn explicit_rebuild_rejects_stale_immutable_root_missing_inherited_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
