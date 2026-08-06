@@ -16,6 +16,8 @@ File plugins map parts of a file to rows. A row can represent a Markdown block, 
 
 Apps read and write these rows with SQL. Lix records their history. In filesystem mode, plugin changes are written back to normal files on disk.
 
+Diffs are semantic: review the clause, cell, or row that changed, not lines of bytes. See [Semantic Changes](./semantic-changes.md).
+
 The JavaScript SDK includes Markdown and CSV plugins. Other formats, including JSON, XLSX, DOCX, and PDF, need a plugin.
 
 ## What Lix provides
@@ -32,6 +34,10 @@ The JavaScript SDK includes Markdown and CSV plugins. Other formats, including J
 
 The same model also works for app data that does not come from a file. Register a schema and Lix creates a SQL table for it. Rows in that table get the same history and branch behavior as file entities.
 
+## Real-time collaboration
+
+People and agents share a repository and see changes live. Apps observe SQL queries with `lix.observe()` and receive updates when rows change. Clients connected to the same Lix server see each other's changes as they happen.
+
 ## Prime use cases
 
 ### Safe workspaces for agents
@@ -44,7 +50,9 @@ See [Lix for AI Agents](./lix-for-ai-agents.md).
 
 Build editors, knowledge bases, document workflows, and other file-based apps. Existing tools keep using files while your app uses SQL for queries and transactions. Lix adds history, rollback, branches, merging, and review.
 
-## Run Lix locally or remotely
+## Pluggable storage
+
+Lix has pluggable storage, which makes it easy to embed and scale: run it in memory, on the local filesystem, or against a server backed by S3. See [Persistence and Storage](./persistence.md).
 
 Run Lix inside your app, for example with `LocalFilesystem`:
 
@@ -68,6 +76,10 @@ const lix = await openLix({
 ```
 
 Remote clients use the same file, SQL, branch, and observation APIs supported by the server protocol.
+
+## Permissions (in development)
+
+Permissions are on the roadmap. They will live inside the repository: per file, per group, and versioned like any other change. A policy change can then be proposed, reviewed, and merged on a branch.
 
 ## Next
 
