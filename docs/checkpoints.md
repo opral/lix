@@ -8,92 +8,61 @@ Lix automatically commits tracked changes. A checkpoint marks one of those
 states as a user-meaningful restore point. The changes after the newest
 checkpoint are the branch's working diffs.
 
-Create a checkpoint with the Rust SDK:
+Create a checkpoint:
 
-```rust
-let checkpoint = lix.create_checkpoint().await?;
-println!("created checkpoint {}", checkpoint.commit_id);
+```ts
+const checkpoint = await lix.createCheckpoint();
+console.log("created checkpoint", checkpoint.commitId);
 ```
 
-`create_checkpoint()` checkpoints every working diff on the active branch and
+`createCheckpoint()` checkpoints every working diff on the active branch and
 returns the new checkpoint commit ID. It does not take a name or comment.
 
 ## Complete example
 
-The runnable
-[`checkpoints.rs`](https://github.com/opral/lix/blob/main/packages/rs-sdk/examples/checkpoints.rs)
-example writes a tracked row, inspects its working diff, creates a checkpoint,
-reads checkpoint history, and verifies that no working diffs remain:
+The following example writes a tracked row, inspects its working diff, creates
+a checkpoint, reads checkpoint history, and verifies that no working diffs
+remain:
 
-```rust
-use lix_sdk::{LixError, OpenLixOptions, Value, open_lix};
+```ts
+import { openLix } from "@lix-js/sdk";
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), LixError> {
-    let lix = open_lix(OpenLixOptions::default()).await?;
+const lix = await openLix();
 
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[
-            Value::Text("checkpoint-demo".to_string()),
-            Value::Text("draft".to_string()),
-        ],
-    )
-    .await?;
+await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+  "checkpoint-demo",
+  "draft",
+]);
 
-    let working = lix
-        .execute(
-            "SELECT entity_pk, schema_key, diff_type
-             FROM lix_working_diff",
-            &[],
-        )
-        .await?;
+const working = await lix.execute(
+  "SELECT entity_pk, schema_key, diff_type FROM lix_working_diff",
+);
 
-    for row in working.rows() {
-        let entity_pk = row.get::<serde_json::Value>("entity_pk")?;
-        let schema_key = row.get::<String>("schema_key")?;
-        let diff_type = row.get::<String>("diff_type")?;
-        println!("{diff_type} {schema_key} {entity_pk}");
-    }
-
-    let checkpoint = lix.create_checkpoint().await?;
-
-    let history = lix
-        .execute(
-            "SELECT commit_id, created_at, lixcol_depth
-             FROM lix_checkpoint
-             ORDER BY lixcol_depth",
-            &[],
-        )
-        .await?;
-    let newest_commit_id = history.rows()[0].get::<String>("commit_id")?;
-    let newest_depth = history.rows()[0].get::<i64>("lixcol_depth")?;
-    assert_eq!(newest_commit_id, checkpoint.commit_id);
-    assert_eq!(newest_depth, 0);
-
-    let remaining = lix
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff",
-            &[],
-        )
-        .await?;
-    assert_eq!(remaining.rows()[0].get::<i64>("count")?, 0);
-
-    lix.close().await?;
-    Ok(())
+for (const row of working.rows) {
+  console.log(row.get("diff_type"), row.get("schema_key"), row.get("entity_pk"));
 }
+
+const checkpoint = await lix.createCheckpoint();
+
+const history = await lix.execute(
+  "SELECT commit_id, created_at, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+);
+
+console.assert(history.rows[0].get("commit_id") === checkpoint.commitId);
+console.assert(history.rows[0].get("lixcol_depth") === 0);
+
+const remaining = await lix.execute(
+  "SELECT COUNT(*) AS count FROM lix_working_diff",
+);
+console.assert(remaining.rows[0].get("count") === 0);
+
+await lix.close();
 ```
 
-From the repository root, run it with:
+`result.rows` contains row objects. Read a column with `row.get("name")`.
 
-```sh
-cargo run -p lix_sdk --example checkpoints --no-default-features
-```
-
-`ExecuteResult::rows()` returns rows whose `get::<T>()` method checks and
-extracts the requested Rust type. Prefer typed extraction such as
-`get::<String>()`, `get::<i64>()`, and `get::<serde_json::Value>()` over
-matching raw `Value` variants at every call site.
+A runnable Rust version lives at
+[`checkpoints.rs`](https://github.com/opral/lix/blob/main/packages/rs-sdk/examples/checkpoints.rs).
 
 ## SQL surfaces
 
@@ -148,5 +117,5 @@ ORDER BY lixcol_branch_id, lixcol_depth;
 ```
 
 All eight relations are read-only. Create a checkpoint for every working diff
-through `lix.create_checkpoint().await?`, or checkpoint a SQL-selected subset
+through `lix.createCheckpoint()`, or checkpoint a SQL-selected subset
 through `lix_create_checkpoint`. See [Diff commands](./diff-commands.md).

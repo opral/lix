@@ -63,6 +63,8 @@ order_id 1002 status:
 
 Plugins define the entities of a file format. The Markdown plugin defines blocks. The CSV plugin defines records. Both ship with the JavaScript SDK. Other formats, such as JSON, XLSX, or DOCX, need a plugin.
 
+<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
+
 App data that does not come from a file uses the same model. Register a schema, and Lix tracks changes to its rows the same way.
 
 ## What change rows buy you
