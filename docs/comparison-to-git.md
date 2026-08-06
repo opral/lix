@@ -30,10 +30,19 @@ Git versions files but cannot query them. PostgreSQL and SQLite query rows but h
 | SQL and transactions          | No              | Yes                 | Yes              |
 | Branches and merging          | Yes             | No                  | Yes              |
 | Diffs by cell, clause, or row | Text lines only | No                  | Yes, via plugins |
+| Pluggable storage             | No              | No                  | Yes              |
 
 Use Git for source-code repositories and developer workflows. Use Lix when a product or agent must work with normal files while the app queries their contents and history with SQL.
 
 Git and Lix can work together. Keep source code in Git. Use Lix for the files and app data your product needs to query, review, merge, and roll back.
+
+## Pluggable storage
+
+Git assumes a local POSIX filesystem, which makes it hard to embed and scale. Lix embeds in your app and runs on storage adapters: in memory, on the local filesystem, or on an S3 bucket through a server.
+
+<img src="../website/public/assets/pluggable-storage.svg" alt="Lix embeds in your app and runs on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
+
+See [Persistence and Storage](./persistence.md).
 
 ## The unit of change
 

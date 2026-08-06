@@ -79,6 +79,14 @@ The file stays a normal file on disk. The rows are queryable with SQL. Lix track
 
 The SDK includes plugins for Markdown and CSV. Add a plugin for other formats, such as JSON, XLSX, DOCX, or PDF.
 
+### Pluggable storage
+
+Lix embeds in your app and runs on storage adapters: in memory, on the local filesystem, or on an S3 bucket.
+
+<img src="./website/public/assets/pluggable-storage.svg" alt="Lix embeds in your app and runs on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
+
+Existing VCS like Git assume a local POSIX filesystem, which makes them hard to embed and scale. See the [Persistence and Storage](https://lix.dev/docs/persistence) docs.
+
 ### Comparison
 
 Git versions files but cannot query them. PostgreSQL and SQLite query rows but have no files and no history. Lix does both.
@@ -103,6 +111,7 @@ Git versions files but cannot query them. PostgreSQL and SQLite query rows but h
 | SQL and transactions          | No              | Yes                 | Yes                 |
 | Branches and merging          | Yes             | No                  | Yes                 |
 | Diffs by cell, clause, or row | Text lines only | No                  | Yes, via plugins    |
+| Pluggable storage             | No              | No                  | Yes                 |
 
 ### Prime use cases
 
