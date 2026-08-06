@@ -1,16 +1,22 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::ScanArgs;
 use datafusion::common::{DataFusionError, internal_err};
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::source_as_provider;
 use datafusion::error::Result;
+use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -23,13 +29,24 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use std::time::Instant;
 use tokio::sync::OnceCell;
 
-use super::providers::{SpecScanExec, StatementScanKey};
+use crate::catalog::CatalogFingerprint;
+use crate::sql2::{PhysicalReadPlanCacheKey, SqlPlanningCache};
 
-pub(crate) async fn collect_dataframe(dataframe: DataFrame) -> Result<Vec<RecordBatch>> {
+use super::providers::{PhysicalScanKey, SpecScanExec, StatementScanKey};
+
+type PhysicalPlanningCache = (
+    Arc<SqlPlanningCache<CatalogFingerprint>>,
+    PhysicalReadPlanCacheKey<CatalogFingerprint>,
+);
+
+pub(crate) async fn collect_dataframe(
+    dataframe: DataFrame,
+    physical_planning_cache: Option<PhysicalPlanningCache>,
+) -> Result<Vec<RecordBatch>> {
     let task_ctx = Arc::new(dataframe.task_ctx());
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan = dataframe.create_physical_plan().await?;
+    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -49,6 +66,226 @@ pub(crate) async fn collect_dataframe(dataframe: DataFrame) -> Result<Vec<Record
         );
     }
     result
+}
+
+async fn create_or_rebind_physical_plan(
+    dataframe: DataFrame,
+    physical_planning_cache: Option<PhysicalPlanningCache>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some((cache, key)) = physical_planning_cache else {
+        return dataframe.create_physical_plan().await;
+    };
+    let Some(template) = cache.physical_read_plan(&key) else {
+        let plan = dataframe.create_physical_plan().await?;
+        if let Some(template) = detach_physical_plan_template(Arc::clone(&plan)) {
+            cache.remember_physical_read_plan(key, template);
+        }
+        return Ok(plan);
+    };
+
+    let (state, logical_plan) = dataframe.into_parts();
+    let optimized = state.optimize(&logical_plan)?;
+    if let Some(replacements) = plan_current_spec_scans(&optimized, &state).await?
+        && let Some(plan) = rebind_physical_plan_template(template, replacements)
+    {
+        return Ok(plan);
+    }
+
+    // Any provider, partitioning, ordering, schema, or operator-shape drift
+    // invalidates the detached template before execution. Fall back to the
+    // ordinary DataFusion planner for this statement and evict the stale entry.
+    cache.forget_physical_read_plan(&key);
+    state
+        .query_planner()
+        .create_physical_plan(&optimized, &state)
+        .await
+}
+
+fn collect_logical_table_scans(
+    plan: &LogicalPlan,
+    scans: &mut Vec<datafusion::logical_expr::TableScan>,
+) {
+    if let LogicalPlan::TableScan(scan) = plan {
+        scans.push(scan.clone());
+    }
+    for input in plan.inputs() {
+        collect_logical_table_scans(input, scans);
+    }
+}
+
+async fn plan_current_spec_scans(
+    logical_plan: &LogicalPlan,
+    state: &SessionState,
+) -> Result<Option<HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>>>> {
+    let mut logical_scans = Vec::new();
+    collect_logical_table_scans(logical_plan, &mut logical_scans);
+    let mut replacements: HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>> =
+        HashMap::new();
+    for scan in logical_scans {
+        let Ok(provider) = source_as_provider(&scan.source) else {
+            return Ok(None);
+        };
+        let filters = unnormalize_cols(scan.filters);
+        let args = ScanArgs::default()
+            .with_projection(scan.projection.as_deref())
+            .with_filters(Some(&filters))
+            .with_limit(scan.fetch);
+        let result = provider.scan_with_args(state, args).await?;
+        let plan = Arc::clone(result.plan());
+        let Some(spec_scan) = plan.as_any().downcast_ref::<SpecScanExec>() else {
+            return Ok(None);
+        };
+        replacements
+            .entry(spec_scan.physical_cache_key().clone())
+            .or_default()
+            .push_back(plan);
+    }
+    Ok(Some(replacements))
+}
+
+fn detach_physical_plan_template(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
+        return Some(Arc::new(DetachedSpecScanExec::new(scan)));
+    }
+    if !matches!(
+        plan.name(),
+        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
+    ) {
+        return None;
+    }
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| detach_physical_plan_template(Arc::clone(child)))
+        .collect::<Option<Vec<_>>>()?;
+    rebuild_template_node(plan, children)
+}
+
+fn rebind_physical_plan_template(
+    plan: Arc<dyn ExecutionPlan>,
+    mut replacements: HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>>,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let plan = rebind_physical_plan_template_inner(plan, &mut replacements)?;
+    replacements
+        .values()
+        .all(VecDeque::is_empty)
+        .then_some(plan)
+}
+
+fn rebind_physical_plan_template_inner(
+    plan: Arc<dyn ExecutionPlan>,
+    replacements: &mut HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>>,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if let Some(detached) = plan.as_any().downcast_ref::<DetachedSpecScanExec>() {
+        let replacement = replacements.get_mut(&detached.key)?.pop_front()?;
+        return (physical_plan_fingerprint(replacement.as_ref()) == detached.fingerprint)
+            .then_some(replacement);
+    }
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| rebind_physical_plan_template_inner(Arc::clone(child), replacements))
+        .collect::<Option<Vec<_>>>()?;
+    rebuild_template_node(plan, children)
+}
+
+fn rebuild_template_node(
+    plan: Arc<dyn ExecutionPlan>,
+    children: Vec<Arc<dyn ExecutionPlan>>,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        // `HashJoinExec::with_new_children` intentionally preserves its
+        // `OnceAsync` build table and dynamic-filter state. A reusable operator
+        // template must explicitly reset both or a later snapshot can observe
+        // rows from the first execution.
+        return join
+            .builder()
+            .with_new_children(children)
+            .ok()?
+            .reset_state()
+            .build_exec()
+            .ok();
+    }
+    plan.with_new_children(children).ok()
+}
+
+fn physical_plan_fingerprint(plan: &dyn ExecutionPlan) -> Arc<str> {
+    Arc::from(format!(
+        "schema={:?};properties={:?}",
+        plan.schema(),
+        plan.properties()
+    ))
+}
+
+struct DetachedSpecScanExec {
+    key: PhysicalScanKey,
+    fingerprint: Arc<str>,
+    properties: Arc<PlanProperties>,
+}
+
+impl DetachedSpecScanExec {
+    fn new(scan: &SpecScanExec) -> Self {
+        Self {
+            key: scan.physical_cache_key().clone(),
+            fingerprint: physical_plan_fingerprint(scan),
+            properties: Arc::clone(scan.properties()),
+        }
+    }
+}
+
+impl Debug for DetachedSpecScanExec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DetachedSpecScanExec")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for DetachedSpecScanExec {
+    fn fmt_as(
+        &self,
+        _t: DisplayFormatType,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(formatter, "DetachedSpecScanExec")
+    }
+}
+
+impl ExecutionPlan for DetachedSpecScanExec {
+    fn name(&self) -> &'static str {
+        "DetachedSpecScanExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!("DetachedSpecScanExec does not accept children");
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        internal_err!("detached physical scan template reached execution")
+    }
 }
 
 pub(crate) async fn collect_input_plan(
