@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.1 - 2026-08-06
+
+### Patch
+
+- Bounded first publication of columnar current state on long commit histories.
+
+  Lix now authenticates cumulative touched schema families in each commit-state manifest and carries that bounded absence authority across linear, merged, and selected-source lineages. Mutation scopes that cannot be bounded exactly still fail closed.
+- Reduced sparse current-state publication latency and serving-index allocation.
+
+  Lix now stores contiguous scoped-range leaves as shared scope runs and encodes immutable node fields through borrowed views, while retaining authenticated point reads, structural sharing, and opaque physical-part payloads.
+- Reduced current-state serving-index storage for large tracked repositories.
+
+  Lix now uses one authenticated scoped-range index for point reads, diffs, and sparse state sharing while preserving transactional history and branch semantics.
+
 ## 0.10.0 - 2026-08-03
 
 ### Minor
