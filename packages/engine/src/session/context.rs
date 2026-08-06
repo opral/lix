@@ -1069,6 +1069,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_write_waits_for_an_active_automatic_write() {
+        let session = open_session().await;
+        let first_write = session
+            .begin_session_write_lease()
+            .await
+            .expect("first automatic write lease should begin");
+        let mut second_write = Box::pin(session.begin_session_write_lease());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(
+            matches!(second_write.as_mut().poll(&mut cx), Poll::Pending),
+            "second automatic write should wait for the active automatic write"
+        );
+
+        drop(first_write);
+        let second_write = tokio::time::timeout(TEST_WAIT_TIMEOUT, second_write)
+            .await
+            .expect("second automatic write should resume after the first finishes")
+            .expect("second automatic write lease should begin");
+        drop(second_write);
+    }
+
+    #[tokio::test]
     async fn close_waits_for_session_read_blocked_in_storage_read() {
         let (session, gate) = open_blocking_read_session().await;
 

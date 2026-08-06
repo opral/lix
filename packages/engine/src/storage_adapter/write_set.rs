@@ -121,7 +121,7 @@ pub(crate) struct DeferredFinalPutPage {
 /// This is the storage-native escape hatch for large certified batches. The
 /// ordinary write set remains the general representation; a deferred source
 /// is accepted only when its target spaces have no ordinary mutations.
-pub(crate) trait DeferredFinalPutSource: Send {
+pub(crate) trait DeferredFinalPutSource: Send + Sync {
     fn target_spaces(&self) -> &[StorageSpace];
     fn put_count(&self) -> u64;
     fn written_bytes(&self) -> u64;
@@ -713,6 +713,20 @@ impl StorageWriteSet {
             stats.value_shared_capacity += group.value_arena.shared.capacity();
         }
         stats
+    }
+
+    /// Returns the number of point-delete descriptors staged in each logical
+    /// storage space.  This is benchmark/test observability only: production
+    /// planning continues to use the aggregate write-set counters and never
+    /// depends on this classification.
+    #[cfg(any(test, feature = "storage-benches"))]
+    pub fn delete_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
+        self.groups
+            .iter()
+            .filter_map(|group| {
+                (!group.deletes.is_empty()).then_some((group.space, group.deletes.len()))
+            })
+            .collect()
     }
 
     #[cfg(test)]

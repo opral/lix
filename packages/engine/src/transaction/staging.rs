@@ -391,29 +391,37 @@ impl ImmutableMutationJournalChunk {
             self.len()
                 .div_ceil(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS),
         );
+        #[cfg(feature = "storage-benches")]
+        let mut generated_key_bytes = 0usize;
         let mut first = 0usize;
         while first < self.len() {
             let max_candidate_len =
                 (self.len() - first).min(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS);
-            let mut keys = Vec::with_capacity(max_candidate_len);
+            let mut key_arena = Vec::new();
+            let mut key_offsets = Vec::with_capacity(max_candidate_len);
             for index in first..first + max_candidate_len {
-                let mut key = Vec::new();
+                let start = key_arena.len();
                 crate::tracked_state::encode_single_string_key_ref_into(
-                    &mut key,
+                    &mut key_arena,
                     self.schema_key(),
                     None,
                     self.identity(index),
                 );
-                keys.push(key);
+                #[cfg(feature = "storage-benches")]
+                {
+                    generated_key_bytes =
+                        generated_key_bytes.saturating_add(key_arena.len().saturating_sub(start));
+                }
+                key_offsets.push((start, key_arena.len()));
             }
             let mut candidate_len = max_candidate_len;
             let encoded = loop {
-                let rows = keys[..candidate_len]
+                let rows = key_offsets[..candidate_len]
                     .iter()
                     .enumerate()
                     .map(
-                        |(offset, key)| crate::tracked_state::ReplacementPartRowRef {
-                            encoded_key: key,
+                        |(offset, &(start, end))| crate::tracked_state::ReplacementPartRowRef {
+                            encoded_key: &key_arena[start..end],
                             snapshot: self.snapshot_slot(first + offset),
                             metadata: crate::json_store::JsonSlotRef::None,
                         },
@@ -446,6 +454,26 @@ impl ImmutableMutationJournalChunk {
             };
             first += candidate_len;
             parts.push(encoded);
+        }
+        #[cfg(feature = "storage-benches")]
+        {
+            let encoded_bytes = parts.iter().map(|part| part.bytes().len()).sum::<usize>();
+            crate::storage_bench::record_crud_ownership(
+                crate::storage_bench::CRUD_OWNERSHIP_JOURNAL_SEAL,
+                self.len(),
+                generated_key_bytes,
+                encoded_bytes,
+                parts.len(),
+                0,
+                0,
+            );
+            crate::storage_bench::record_crud_ownership_transfer(
+                crate::storage_bench::CRUD_OWNERSHIP_JOURNAL_SEAL,
+                generated_key_bytes.saturating_add(encoded_bytes),
+                0,
+                encoded_bytes,
+                generated_key_bytes,
+            );
         }
         self.sealed_replacement_parts = Some(parts.into());
         Ok(())

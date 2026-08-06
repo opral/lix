@@ -561,6 +561,7 @@ pub(crate) struct CertifiedParameterBatch {
     snapshots: Vec<TransactionJson>,
     schema_key: SharedStr,
     branch_id: SharedStr,
+    untracked: bool,
     certificate: CertifiedRawWriteBatchPreparation,
     entity_columnar: Option<crate::sql2::EncodedEntityRowGroups>,
 }
@@ -571,6 +572,24 @@ impl CertifiedParameterBatch {
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        Self::new_with_lane(
+            entity_pks,
+            snapshots,
+            schema_key,
+            branch_id,
+            false,
+            certificate,
+        )
+    }
+
+    pub(crate) fn new_with_lane(
+        entity_pks: Vec<EntityPk>,
+        snapshots: Vec<TransactionJson>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if entity_pks.len() != snapshots.len() {
@@ -590,6 +609,7 @@ impl CertifiedParameterBatch {
             snapshots,
             schema_key,
             branch_id,
+            untracked,
             certificate,
             entity_columnar: None,
         })
@@ -615,12 +635,17 @@ impl CertifiedParameterBatch {
         self.schema_key.as_str()
     }
 
+    pub(crate) fn untracked(&self) -> bool {
+        self.untracked
+    }
+
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
         RawWriteBatch::from_certified_parameter_rows(
             self.entity_pks,
             self.snapshots,
             self.schema_key,
             self.branch_id,
+            self.untracked,
             self.certificate,
         )
     }
@@ -643,6 +668,7 @@ impl CertifiedParameterBatch {
             snapshots,
             schema_key,
             branch_id,
+            untracked,
             certificate,
             entity_columnar,
         } = self;
@@ -692,6 +718,7 @@ impl CertifiedParameterBatch {
                 timestamps,
                 commit_id: None,
                 branch_id: branch_id_ordinal,
+                untracked,
                 direct_change_ids: None,
                 entity_columnar,
             }),
@@ -741,6 +768,74 @@ impl RawWriteRowRef<'_> {
     }
 }
 
+#[cfg(feature = "storage-benches")]
+fn record_raw_row_ownership(
+    entity_pk: Option<&EntityPk>,
+    schema_key: &SharedStr,
+    file_id: Option<&SharedStr>,
+    snapshot: Option<&TransactionJson>,
+    metadata: Option<&TransactionJson>,
+    created_at: Option<&SharedStr>,
+    updated_at: Option<&SharedStr>,
+    change_id: Option<&SharedStr>,
+    commit_id: Option<&SharedStr>,
+    branch_id: &SharedStr,
+) {
+    let key_bytes = entity_pk.map_or(0, EntityPk::estimated_heap_bytes)
+        + schema_key.len()
+        + file_id.map_or(0, |value| value.len())
+        + created_at.map_or(0, |value| value.len())
+        + updated_at.map_or(0, |value| value.len())
+        + change_id.map_or(0, |value| value.len())
+        + commit_id.map_or(0, |value| value.len())
+        + branch_id.len();
+    let value_bytes = snapshot.map_or(0, |value| value.normalized().len())
+        + metadata.map_or(0, |value| value.normalized().len());
+    crate::storage_bench::record_crud_ownership(
+        crate::storage_bench::CRUD_OWNERSHIP_RAW_BATCH,
+        1,
+        key_bytes,
+        value_bytes,
+        5,
+        1 + usize::from(file_id.is_some())
+            + usize::from(created_at.is_some())
+            + usize::from(updated_at.is_some())
+            + usize::from(change_id.is_some())
+            + usize::from(commit_id.is_some())
+            + 1,
+        2,
+    );
+}
+
+#[cfg(feature = "storage-benches")]
+fn record_prepared_row_ownership(
+    entity_pk: &EntityPk,
+    schema_key: &SharedStr,
+    file_id: Option<&SharedStr>,
+    snapshot: Option<&StageJson>,
+    metadata: Option<&StageJson>,
+    origin_key: Option<&SharedStr>,
+    branch_id: &SharedStr,
+    stage: usize,
+) {
+    let key_bytes = entity_pk.estimated_heap_bytes()
+        + schema_key.len()
+        + file_id.map_or(0, |value| value.len())
+        + origin_key.map_or(0, |value| value.len())
+        + branch_id.len();
+    let value_bytes = snapshot.map_or(0, |value| value.normalized().len())
+        + metadata.map_or(0, |value| value.normalized().len());
+    crate::storage_bench::record_crud_ownership(
+        stage,
+        1,
+        key_bytes,
+        value_bytes,
+        6,
+        2 + usize::from(file_id.is_some()) + usize::from(origin_key.is_some()),
+        2,
+    );
+}
+
 pub(crate) struct RawWriteRows<'a> {
     batch: &'a RawWriteBatch,
     range: std::ops::Range<usize>,
@@ -780,6 +875,7 @@ impl RawWriteBatch {
         snapshots: Vec<TransactionJson>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        untracked: bool,
         certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if entity_pks.len() != snapshots.len() {
@@ -795,6 +891,24 @@ impl RawWriteBatch {
                 "certified parameter row count exceeds u32",
             ));
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_ownership(
+            crate::storage_bench::CRUD_OWNERSHIP_RAW_BATCH,
+            row_count,
+            entity_pks
+                .iter()
+                .map(EntityPk::estimated_heap_bytes)
+                .sum::<usize>()
+                + schema_key.len()
+                + branch_id.len(),
+            snapshots
+                .iter()
+                .map(|value| value.normalized().len())
+                .sum::<usize>(),
+            row_count.saturating_mul(5),
+            2,
+            2,
+        );
         let (strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
             (vec![schema_key], 0, 0)
         } else {
@@ -809,7 +923,7 @@ impl RawWriteBatch {
             change_id: RAW_WRITE_NONE,
             commit_id: RAW_WRITE_NONE,
             branch_id: branch_id_ordinal,
-            flags: 0,
+            flags: if untracked { RAW_WRITE_UNTRACKED } else { 0 },
         };
         Ok(Self {
             slots: vec![slot; row_count],
@@ -925,6 +1039,19 @@ impl RawWriteBatch {
         untracked: bool,
         branch_id: SharedStr,
     ) {
+        #[cfg(feature = "storage-benches")]
+        record_raw_row_ownership(
+            entity_pk.as_ref(),
+            &schema_key,
+            file_id.as_ref(),
+            snapshot.as_ref(),
+            metadata.as_ref(),
+            created_at.as_ref(),
+            updated_at.as_ref(),
+            change_id.as_ref(),
+            commit_id.as_ref(),
+            &branch_id,
+        );
         self.certified_preparation = None;
         assert!(
             self.slots.len() < RAW_WRITE_NONE as usize,
@@ -959,6 +1086,16 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_ownership(
+            crate::storage_bench::CRUD_OWNERSHIP_RAW_TRANSFER,
+            other.len(),
+            0,
+            0,
+            other.len().saturating_mul(5),
+            0,
+            0,
+        );
         self.certified_preparation = None;
         self.reserve(other.len());
         for index in 0..other.len() {
@@ -1076,7 +1213,7 @@ impl RawWriteBatch {
                 || slot.updated_at != RAW_WRITE_NONE
                 || slot.change_id != RAW_WRITE_NONE
                 || slot.commit_id != RAW_WRITE_NONE
-                || slot.flags != 0
+                || slot.flags & !RAW_WRITE_UNTRACKED != 0
                 || metadata.is_some()
             {
                 return Err(LixError::new(
@@ -1120,7 +1257,7 @@ impl RawWriteBatch {
                 change_id: Some(ChangeId::default()),
                 addressable_change_id: true,
                 commit_id: None,
-                untracked: false,
+                untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
                 branch_id: slot.branch_id,
                 durable_predecessor: None,
             });
@@ -2606,6 +2743,7 @@ struct DenseCertifiedParameterSlots {
     timestamps: DenseParameterTimestamps,
     commit_id: Option<CommitId>,
     branch_id: u32,
+    untracked: bool,
     /// Absent until commit-delta publication assigns direct addresses. The
     /// compact segment map derives every UUID without a million-row column.
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
@@ -2740,6 +2878,37 @@ impl PreparedStateBatch {
             .map_or_else(|| self.slots.len(), |dense| dense.len)
     }
 
+    #[cfg(feature = "storage-benches")]
+    pub(crate) fn record_ownership(&self, stage: usize) {
+        let mut key_bytes = 0usize;
+        let mut value_bytes = 0usize;
+        let mut string_entries = 0usize;
+        for row in self.iter() {
+            key_bytes = key_bytes
+                .saturating_add(row.entity_pk.estimated_heap_bytes())
+                .saturating_add(row.schema_key.len())
+                .saturating_add(row.file_id.map_or(0, |value| value.len()))
+                .saturating_add(row.origin_key.map_or(0, |value| value.len()))
+                .saturating_add(row.branch_id.len());
+            value_bytes = value_bytes
+                .saturating_add(row.snapshot.map_or(0, |value| value.normalized().len()))
+                .saturating_add(row.metadata.map_or(0, |value| value.normalized().len()));
+            string_entries = string_entries
+                .saturating_add(2)
+                .saturating_add(usize::from(row.file_id.is_some()))
+                .saturating_add(usize::from(row.origin_key.is_some()));
+        }
+        crate::storage_bench::record_crud_ownership(
+            stage,
+            self.len(),
+            key_bytes,
+            value_bytes,
+            self.len().saturating_mul(6),
+            string_entries,
+            self.len().saturating_mul(2),
+        );
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -2856,7 +3025,7 @@ impl PreparedStateBatch {
                 )),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
-                untracked: false,
+                untracked: dense.untracked,
                 branch_id: &self.strings[dense.branch_id as usize],
                 durable_predecessor: None,
             });
@@ -2988,6 +3157,17 @@ impl PreparedStateBatch {
         untracked: bool,
         branch_id: SharedStr,
     ) {
+        #[cfg(feature = "storage-benches")]
+        record_prepared_row_ownership(
+            &entity_pk,
+            &schema_key,
+            file_id.as_ref(),
+            snapshot.as_ref(),
+            metadata.as_ref(),
+            origin_key,
+            &branch_id,
+            crate::storage_bench::CRUD_OWNERSHIP_PREPARED_BATCH,
+        );
         self.expand_dense_certified_parameter();
         let entity_pk = self.push_entity_pk(entity_pk);
         let schema_key = self.intern_string(schema_key);
@@ -3146,6 +3326,16 @@ impl PreparedStateBatch {
 
     /// Appends another batch without materializing row-owned intermediates.
     pub(crate) fn append(&mut self, mut other: Self) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_ownership(
+            crate::storage_bench::CRUD_OWNERSHIP_PREPARED_CLONE,
+            other.len(),
+            0,
+            0,
+            other.len().saturating_mul(6),
+            0,
+            0,
+        );
         if other.is_empty() {
             return;
         }
@@ -3604,6 +3794,17 @@ impl PreparedStateBatch {
     }
 
     fn push_borrowed_row(&mut self, row: PreparedStateRowRef<'_>) {
+        #[cfg(feature = "storage-benches")]
+        record_prepared_row_ownership(
+            row.entity_pk,
+            row.schema_key,
+            row.file_id,
+            row.snapshot,
+            row.metadata,
+            row.origin_key,
+            row.branch_id,
+            crate::storage_bench::CRUD_OWNERSHIP_PREPARED_CLONE,
+        );
         self.push_parts_with_change_addressability(
             row.schema_plan_id,
             row.facts,

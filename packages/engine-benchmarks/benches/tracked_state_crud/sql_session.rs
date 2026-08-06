@@ -677,8 +677,7 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
-        let _ =
-            lix_engine::storage_bench::take_certified_entity_insert_parameter_batch_executions();
+        let before = lix_engine::storage_bench::certified_entity_insert_parameter_batch_counters();
         let affected = self
             .session
             .execute_homogeneous_write_batch(
@@ -691,10 +690,16 @@ where
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
+        let after = lix_engine::storage_bench::certified_entity_insert_parameter_batch_counters();
         assert_eq!(
-            lix_engine::storage_bench::take_certified_entity_insert_parameter_batch_executions(),
+            after.certifications.saturating_sub(before.certifications),
             1,
-            "tracked-state CRUD insert benchmark must execute one certified parameter batch"
+            "tracked-state CRUD insert benchmark must certify one parameter batch per fixture"
+        );
+        assert_eq!(
+            after.executions.saturating_sub(before.executions),
+            1,
+            "tracked-state CRUD insert benchmark must physically execute one certified parameter batch per fixture"
         );
         affected as usize
     }

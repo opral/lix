@@ -141,6 +141,7 @@ pub(crate) fn row_label(row_count: usize) -> &'static str {
     match row_count {
         SMOKE_ROWS => "1k",
         REAL_WORKLOAD_ROWS => "10k",
+        100_000 => "100k",
         1_000_000 => "1m",
         _ => "custom",
     }

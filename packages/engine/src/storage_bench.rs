@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -24,13 +24,7 @@ fn stage_bench_commit_deltas(
         writes,
         &crate::tracked_state::CommitStateManifest {
             commit_id,
-            generation: 0,
-            parent_commit_ids: Vec::new(),
-            commit_change_id: crate::changelog::ChangeId::for_test_label(&format!(
-                "{commit_id}:bench-commit"
-            )),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: crate::tracked_state::CommitStateReplayDebt {
                 depth: 1,
                 rows: u64::from(mutations.member_count),
@@ -51,6 +45,7 @@ static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +67,169 @@ static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Matched transaction ownership counters used by the CRUD profile.  These
+/// counters are deliberately disabled unless the profile enables them, so the
+/// common instrumentation does not perturb normal engine execution.
+pub const CRUD_OWNERSHIP_STAGE_COUNT: usize = 15;
+pub const CRUD_OWNERSHIP_METRIC_COUNT: usize = 6;
+pub const CRUD_OWNERSHIP_SQL_BOUND: usize = 0;
+pub const CRUD_OWNERSHIP_RAW_BATCH: usize = 1;
+pub const CRUD_OWNERSHIP_RAW_TRANSFER: usize = 2;
+pub const CRUD_OWNERSHIP_PREPARED_BATCH: usize = 3;
+pub const CRUD_OWNERSHIP_PREPARED_CLONE: usize = 4;
+pub const CRUD_OWNERSHIP_REPLACEMENT_INPUT: usize = 5;
+pub const CRUD_OWNERSHIP_REPLACEMENT_PART: usize = 6;
+pub const CRUD_OWNERSHIP_AUTHORITY: usize = 7;
+pub const CRUD_OWNERSHIP_ROOT_PUBLICATION: usize = 8;
+pub const CRUD_OWNERSHIP_WRITE_SET: usize = 9;
+pub const CRUD_OWNERSHIP_ADAPTER: usize = 10;
+pub const CRUD_OWNERSHIP_MUTATION_JOURNAL: usize = 11;
+pub const CRUD_OWNERSHIP_IDENTITY_ENCODING: usize = 12;
+pub const CRUD_OWNERSHIP_NORMALIZATION: usize = 13;
+pub const CRUD_OWNERSHIP_JOURNAL_SEAL: usize = 14;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudOwnershipMetric {
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    pub vec_entries: u64,
+    pub string_entries: u64,
+    pub map_entries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudOwnershipAccounting {
+    pub stages: [CrudOwnershipMetric; CRUD_OWNERSHIP_STAGE_COUNT],
+    pub transfers: [CrudOwnershipTransferMetric; CRUD_OWNERSHIP_STAGE_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudOwnershipTransferMetric {
+    pub created_bytes: u64,
+    pub cloned_bytes: u64,
+    pub retained_bytes: u64,
+    pub dropped_bytes: u64,
+}
+
+static CRUD_OWNERSHIP_ENABLED: AtomicBool = AtomicBool::new(false);
+static CRUD_OWNERSHIP_COUNTERS: [AtomicU64;
+    CRUD_OWNERSHIP_STAGE_COUNT * CRUD_OWNERSHIP_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CRUD_OWNERSHIP_STAGE_COUNT * CRUD_OWNERSHIP_METRIC_COUNT];
+static CRUD_OWNERSHIP_TRANSFER_COUNTERS: [AtomicU64; CRUD_OWNERSHIP_STAGE_COUNT * 4] =
+    [const { AtomicU64::new(0) }; CRUD_OWNERSHIP_STAGE_COUNT * 4];
+
+/// Starts a matched operation-local ownership measurement and clears any
+/// counters left by a prior profile operation.
+pub fn begin_crud_ownership_accounting() {
+    for counter in &CRUD_OWNERSHIP_COUNTERS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in &CRUD_OWNERSHIP_TRANSFER_COUNTERS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    CRUD_OWNERSHIP_ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn record_crud_ownership_transfer(
+    stage: usize,
+    created_bytes: usize,
+    cloned_bytes: usize,
+    retained_bytes: usize,
+    dropped_bytes: usize,
+) {
+    if !CRUD_OWNERSHIP_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    assert!(
+        stage < CRUD_OWNERSHIP_STAGE_COUNT,
+        "invalid ownership stage"
+    );
+    let values = [created_bytes, cloned_bytes, retained_bytes, dropped_bytes];
+    let start = stage * 4;
+    for (offset, value) in values.into_iter().enumerate() {
+        CRUD_OWNERSHIP_TRANSFER_COUNTERS[start + offset].fetch_add(value as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_crud_ownership(
+    stage: usize,
+    rows: usize,
+    key_bytes: usize,
+    value_bytes: usize,
+    vec_entries: usize,
+    string_entries: usize,
+    map_entries: usize,
+) {
+    if !CRUD_OWNERSHIP_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    assert!(
+        stage < CRUD_OWNERSHIP_STAGE_COUNT,
+        "invalid ownership stage"
+    );
+    let values = [
+        rows,
+        key_bytes,
+        value_bytes,
+        vec_entries,
+        string_entries,
+        map_entries,
+    ];
+    let start = stage * CRUD_OWNERSHIP_METRIC_COUNT;
+    for (offset, value) in values.into_iter().enumerate() {
+        CRUD_OWNERSHIP_COUNTERS[start + offset].fetch_add(value as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn take_crud_ownership_accounting() -> CrudOwnershipAccounting {
+    CRUD_OWNERSHIP_ENABLED.store(false, Ordering::Relaxed);
+    let mut stages = [CrudOwnershipMetric::default(); CRUD_OWNERSHIP_STAGE_COUNT];
+    let mut transfers = [CrudOwnershipTransferMetric::default(); CRUD_OWNERSHIP_STAGE_COUNT];
+    for (stage, metric) in stages.iter_mut().enumerate() {
+        let start = stage * CRUD_OWNERSHIP_METRIC_COUNT;
+        metric.rows = CRUD_OWNERSHIP_COUNTERS[start].swap(0, Ordering::Relaxed);
+        metric.key_bytes = CRUD_OWNERSHIP_COUNTERS[start + 1].swap(0, Ordering::Relaxed);
+        metric.value_bytes = CRUD_OWNERSHIP_COUNTERS[start + 2].swap(0, Ordering::Relaxed);
+        metric.vec_entries = CRUD_OWNERSHIP_COUNTERS[start + 3].swap(0, Ordering::Relaxed);
+        metric.string_entries = CRUD_OWNERSHIP_COUNTERS[start + 4].swap(0, Ordering::Relaxed);
+        metric.map_entries = CRUD_OWNERSHIP_COUNTERS[start + 5].swap(0, Ordering::Relaxed);
+        let transfer_start = stage * 4;
+        transfers[stage].created_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start].swap(0, Ordering::Relaxed);
+        transfers[stage].cloned_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 1].swap(0, Ordering::Relaxed);
+        transfers[stage].retained_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 2].swap(0, Ordering::Relaxed);
+        transfers[stage].dropped_bytes =
+            CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 3].swap(0, Ordering::Relaxed);
+    }
+    CrudOwnershipAccounting { stages, transfers }
+}
+
+pub(crate) fn record_crud_write_set_arena(writes: &StorageWriteSet) {
+    let stats = writes.arena_stats();
+    record_crud_ownership(
+        CRUD_OWNERSHIP_WRITE_SET,
+        stats
+            .put_descriptors
+            .saturating_add(stats.delete_descriptors),
+        stats
+            .key_inline_bytes
+            .saturating_add(stats.key_shared_bytes),
+        stats
+            .value_inline_bytes
+            .saturating_add(stats.value_shared_bytes),
+        stats
+            .put_descriptors
+            .saturating_add(stats.delete_descriptors),
+        stats
+            .key_shared_buffers
+            .saturating_add(stats.value_shared_buffers),
+        stats.spaces,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MediaStructuralAccounting {
@@ -104,11 +262,40 @@ pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
     }
 }
 
+pub(crate) fn record_certified_entity_insert_parameter_batch_certification() {
+    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertifiedEntityInsertParameterBatchCounters {
+    pub certifications: u64,
+    pub executions: u64,
+}
+
+/// Reads the cumulative certified parameter-batch INSERT phase counters
+/// without resetting them. Callers measuring one fixture/sample must subtract
+/// a pre-operation snapshot from a post-operation snapshot.
+pub fn certified_entity_insert_parameter_batch_counters()
+-> CertifiedEntityInsertParameterBatchCounters {
+    CertifiedEntityInsertParameterBatchCounters {
+        certifications: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS
+            .load(Ordering::Relaxed),
+        executions: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
+    }
+}
+
+/// Returns and resets the number of certified parameter-batch INSERT routes
+/// selected by the planner, before any physical staging occurs.
+pub fn take_certified_entity_insert_parameter_batch_certifications() -> u64 {
+    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.swap(0, Ordering::Relaxed)
+}
+
 pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Returns and resets the number of certified parameter-batch INSERT routes.
+/// Returns and resets the number of certified parameter-batch INSERT routes
+/// that reached physical staging/execution.
 ///
 /// Benchmark fixtures use this as a route certificate so a schema change
 /// cannot silently turn the measured bulk INSERT back into sequential writes.
@@ -429,14 +616,24 @@ where
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryGcBenchResult {
     pub live_commits: usize,
     pub swept_commits: usize,
     pub swept_standalone_changes: usize,
+    pub standalone_swept_ids: Vec<String>,
     pub swept_payloads: usize,
     pub staged_puts: u64,
     pub staged_deletes: u64,
+    /// Point-delete descriptors grouped by logical storage-space id.  This
+    /// makes GC benchmark expectations resilient to additions of a new
+    /// derived projection while still proving each authority lane explicitly.
+    pub delete_counts_by_space: Vec<(u32, usize)>,
+    pub deleted_commit_state_manifests: usize,
+    pub deleted_mutation_inventories: usize,
+    pub deleted_semantic_commit_projections: usize,
+    pub deleted_semantic_change_rows: usize,
+    pub deleted_semantic_reverse_index_rows: usize,
     pub staged_written_bytes: u64,
     pub delete_descriptors: usize,
     pub delete_descriptor_capacity: usize,
@@ -470,13 +667,61 @@ where
     let plan = crate::gc::stage_repository_gc(read, &mut writes).await?;
     let stats = writes.stats();
     let arena = writes.arena_stats();
+    let mut delete_counts_by_space: Vec<(u32, usize)> = writes
+        .delete_counts_by_space()
+        .into_iter()
+        .map(|(space, count)| (space.id.0, count))
+        .collect();
+    delete_counts_by_space.sort_unstable_by_key(|(space_id, _)| *space_id);
+    let delete_count = |space_id| {
+        delete_counts_by_space
+            .iter()
+            .find_map(|(candidate, count)| (*candidate == space_id).then_some(*count))
+            .unwrap_or_default()
+    };
+    let deleted_commit_state_manifests = delete_count(
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+            .id
+            .0,
+    );
+    let deleted_mutation_inventories = delete_count(
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
+            .id
+            .0,
+    );
+    let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
+    let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
+    let deleted_semantic_reverse_index_rows =
+        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
-        swept_commits: plan.changelog.sweep.commits.len(),
-        swept_standalone_changes: plan.changelog.sweep.changes.len(),
+        swept_commits: plan
+            .changelog
+            .sweep
+            .commits
+            .len()
+            .saturating_add(plan.sweep.tracked_commit_roots.len()),
+        swept_standalone_changes: plan
+            .changelog
+            .sweep
+            .changes
+            .len()
+            .saturating_add(plan.sweep.standalone_changes.len()),
+        standalone_swept_ids: plan
+            .sweep
+            .standalone_changes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         swept_payloads: plan.changelog.sweep.json_payloads.len(),
         staged_puts: stats.staged_puts,
         staged_deletes: stats.staged_deletes,
+        delete_counts_by_space,
+        deleted_commit_state_manifests,
+        deleted_mutation_inventories,
+        deleted_semantic_commit_projections,
+        deleted_semantic_change_rows,
+        deleted_semantic_reverse_index_rows,
         staged_written_bytes: stats.written_bytes,
         delete_descriptors: arena.delete_descriptors,
         delete_descriptor_capacity: arena.delete_descriptor_capacity,
@@ -490,6 +735,21 @@ where
         tracked_root_stage_us: plan.profile.tracked_root_stage_us,
         total_us: plan.profile.total_us,
     })
+}
+
+/// Audits standalone semantic facts for the GC benchmark without adding the
+/// scan to the measured planner phase. The exact IDs and their authenticated
+/// control reason make the old-vs-frontier sweep discrepancy explicit.
+pub async fn audit_repository_gc_standalone_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<Vec<String>, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    crate::gc::audit_repository_gc_standalone_refs(&read).await
 }
 
 /// Scans public commit facts through the two checkpoint-history strategies.
@@ -667,7 +927,7 @@ pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
     JSON_STORE_STAGE_BYTES.fetch_add(hash.len() as u64, Ordering::Relaxed);
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageLayoutAccounting {
     pub space_id: u32,
     pub space: &'static str,
@@ -747,6 +1007,7 @@ where
         std::collections::BTreeMap::<crate::changelog::CommitId, (u64, u64)>::new();
     for space in [
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     ] {
         for entry in scan_layout_entries(read, space).await {
@@ -1477,6 +1738,8 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
@@ -1602,6 +1865,7 @@ mod tests {
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageKey, StorageValue, StorageWriteOptions,
     };
+    use crate::{CreateBranchOptions, Value};
 
     #[tokio::test]
     async fn checkpoint_commit_scan_baseline_matches_materialized_records_across_pages() {
@@ -1718,27 +1982,146 @@ mod tests {
         Engine::initialize(storage.clone())
             .await
             .expect("initialize engine");
-        let append = append_ordered_commits(100, 10).expect("build unreachable commit fixture");
-        stage_append_once(storage.clone(), &append)
+        let engine = Engine::new(storage.clone())
             .await
-            .expect("stage unreachable commit fixture");
+            .expect("open benchmark engine");
+        let main = engine
+            .open_workspace_session()
+            .await
+            .expect("open benchmark main session");
+        let schema = serde_json::json!({
+            "x-lix-key": "repository_gc_benchmark_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": "integer" }
+            },
+            "additionalProperties": false
+        });
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (lix_json($1), false, false)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("register benchmark schema");
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-000000000010".to_owned()),
+                name: "repository-gc-benchmark-unreachable".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create benchmark branch");
+        let branch_session = engine
+            .open_session(branch.id.clone())
+            .await
+            .expect("open benchmark branch session");
+        for commit_index in 0..10 {
+            let mut transaction = branch_session
+                .begin_transaction()
+                .await
+                .expect("begin benchmark transaction");
+            for row_index in 0..10 {
+                let row = commit_index * 10 + row_index;
+                transaction
+                    .execute(
+                        "INSERT INTO repository_gc_benchmark_fixture (path, value) \
+                         VALUES ($1, $2)",
+                        &[
+                            Value::Text(format!("/row/{row:08}")),
+                            Value::Integer(row as i64),
+                        ],
+                    )
+                    .await
+                    .expect("stage benchmark row");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("publish benchmark commit");
+        }
+        main.execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch.id)],
+        )
+        .await
+        .expect("delete benchmark branch");
         let adapter = StorageAdapter::new(storage);
+
+        let before_layout = super::layout_accounting(
+            &adapter
+                .begin_read(crate::ReadOptions::default())
+                .await
+                .expect("begin pre-GC inventory read"),
+        )
+        .await;
 
         let first = plan_repository_gc_for_bench(&adapter)
             .await
             .expect("plan repository gc");
+        let after_first_layout = super::layout_accounting(
+            &adapter
+                .begin_read(crate::ReadOptions::default())
+                .await
+                .expect("begin post-first-plan inventory read"),
+        )
+        .await;
         let second = plan_repository_gc_for_bench(&adapter)
             .await
             .expect("repeat repository gc plan");
+        let after_second_layout = super::layout_accounting(
+            &adapter
+                .begin_read(crate::ReadOptions::default())
+                .await
+                .expect("begin post-second-plan inventory read"),
+        )
+        .await;
 
         assert_eq!(first.swept_commits, 10);
-        // Each unreachable commit removes its changelog projection and the
-        // unified commit-state authority. The hard cut retired the separate
-        // tracked-root record.
-        assert_eq!(first.staged_deletes, 20);
-        assert_eq!(first.key_shared_buffers, 2);
-        assert_eq!(first.key_shared_bytes, 20 * 16);
+        assert_eq!(first.swept_standalone_changes, 10);
+        assert_eq!(first.deleted_commit_state_manifests, 10);
+        assert_eq!(first.deleted_mutation_inventories, 10);
+        assert_eq!(first.deleted_semantic_commit_projections, 11);
+        assert_eq!(first.deleted_semantic_change_rows, 21);
+        assert_eq!(first.deleted_semantic_reverse_index_rows, 11);
+        assert_eq!(
+            first.delete_counts_by_space,
+            vec![
+                (
+                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                        .id
+                        .0,
+                    10,
+                ), // commit-state manifest authority
+                (
+                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
+                        .id
+                        .0,
+                    10,
+                ), // mutation inventory authority
+                (crate::changelog::COMMIT_SPACE.id.0, 11), // semantic commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 21), // semantic change facts
+                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 11), // commit -> change reverse index
+            ]
+        );
+        assert_eq!(
+            first
+                .delete_counts_by_space
+                .iter()
+                .map(|(_, count)| *count as u64)
+                .sum::<u64>(),
+            first.staged_deletes
+        );
+        assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
+        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize);
+        assert_eq!(first.key_shared_bytes, first.staged_deletes as usize * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
+        assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
         assert_eq!(second.staged_deletes, first.staged_deletes);
+        assert_eq!(before_layout, after_first_layout);
+        assert_eq!(after_first_layout, after_second_layout);
     }
 }

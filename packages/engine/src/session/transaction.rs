@@ -371,7 +371,9 @@ impl SessionTransactionManager {
             let notified = self.inner.state_changed.notified();
             let wait_for_session_operation = {
                 let mut state = self.lock_state();
-                if state.is_session_operation_in_progress() {
+                if state.is_session_operation_in_progress()
+                    || state.is_automatic_transaction_in_progress()
+                {
                     true
                 } else {
                     state.begin_write_lease(TransactionOwner::Automatic)?;

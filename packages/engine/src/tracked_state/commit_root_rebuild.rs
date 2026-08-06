@@ -10,7 +10,8 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::context::{
-    TrackedStateContext, TrackedStateRootRebuilder, TrackedStateWriteReport, TrackedStateWriter,
+    TrackedStateContext, TrackedStateRootRebuilder, TrackedStateTransientRebuildState,
+    TrackedStateWriteReport, TrackedStateWriter,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
@@ -42,7 +43,7 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     let typed_commit_id = CommitId::parse_lix(commit_id, "commit-root rebuild authority")?;
-    storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
+    let manifest = storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
         .await?
         .ok_or_else(|| {
             LixError::new(
@@ -52,13 +53,65 @@ where
                 ),
             )
         })?;
+    if manifest.snapshot_root.is_none() {
+        // Rootless commits are intentionally bounded-replay layouts. Build and
+        // audit the canonical state transiently, but do not persist chunks that
+        // immutable authority cannot address.
+        let mut scratch_writes = StorageWriteSet::new();
+        let mut scratch_rebuilder = TrackedStateRootRebuilder {
+            store: rebuilder.store,
+            writes: &mut scratch_writes,
+        };
+        return rebuild_commit_root_at_inner(&mut scratch_rebuilder, commit_id).await;
+    }
+    rebuild_commit_root_at_inner(rebuilder, commit_id).await
+}
+
+async fn rebuild_commit_root_at_inner<S>(
+    rebuilder: &mut TrackedStateRootRebuilder<'_, S>,
+    commit_id: &str,
+) -> Result<TrackedStateWriteReport, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
     let plans =
         load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
     let mut report = None;
     let context = TrackedStateContext::new();
-    let mut writer = context.writer(rebuilder.store, rebuilder.writes);
+    let mut state = TrackedStateTransientRebuildState::default();
     for plan in plans.iter().rev() {
-        report = Some(stage_rebuild_plan_with_writer(&mut writer, plan).await?);
+        let manifest = storage::load_commit_state_manifest(rebuilder.store, plan.commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot rebuild tracked_state root for commit '{}' without its commit-state manifest",
+                        plan.commit_id
+                    ),
+                )
+            })?;
+        if manifest.snapshot_root.is_some() {
+            let mut writer =
+                context.writer_with_rebuild_state(rebuilder.store, rebuilder.writes, state);
+            let rooted_report = stage_rebuild_plan_with_writer(&mut writer, plan).await?;
+            writer
+                .promote_reachable_transient_chunks(&rooted_report.root_id)
+                .await?;
+            report = Some(rooted_report);
+            state = writer.into_transient_rebuild_state();
+        } else {
+            // Rootless intermediates may feed a rooted descendant through the
+            // in-memory content-addressed overlay, but their chunks have no
+            // immutable root pointer and must never enter the durable write set.
+            let previously_known = state.chunk_hashes();
+            let mut scratch_writes = StorageWriteSet::new();
+            let mut writer =
+                context.writer_with_rebuild_state(rebuilder.store, &mut scratch_writes, state);
+            report = Some(stage_rebuild_plan_with_writer(&mut writer, plan).await?);
+            state = writer.into_transient_rebuild_state();
+            state.mark_new_chunks_transient(&previously_known);
+        }
     }
     let report = report.ok_or_else(|| {
         LixError::new(
@@ -68,6 +121,7 @@ where
             ),
         )
     })?;
+    let writer = context.writer_with_rebuild_state(rebuilder.store, rebuilder.writes, state);
     writer
         .validate_staged_commit_root_against_changelog(commit_id)
         .await?;
@@ -85,14 +139,19 @@ where
                     ),
                 )
             })?;
-        // The rebuilt tree is an optional immutable accelerator. Preserve
-        // replay debt: it remains the physical-policy authority projected by
-        // the changelog, while readers may serve through this equivalent root.
-        storage::stage_commit_state_snapshot_root_update(
-            rebuilder.writes,
-            &manifest,
-            Some(snapshot_root),
-        )?;
+        if let Some(expected) = manifest.snapshot_root.as_ref()
+            && !expected.has_same_authoritative_layout(&snapshot_root)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "rebuilt tracked_state root for commit '{}' disagrees with immutable commit authority: expected {expected:?}, rebuilt {snapshot_root:?}",
+                    snapshot_root.commit_id,
+                ),
+            ));
+        }
+        // Root metadata is immutable authority. Rebuilds restore its
+        // content-addressed chunks; rootless commits remain replay-only.
     }
     Ok(report)
 }
@@ -149,8 +208,7 @@ where
         if !seen.insert(commit_id.to_string()) {
             return Ok(None);
         }
-        let Some(metadata) = storage::load_authoritative_commit_root(store, commit_id).await?
-        else {
+        let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
             seen.remove(commit_id);
             return Ok(None);
         };

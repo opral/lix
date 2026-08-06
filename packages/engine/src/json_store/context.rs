@@ -4,9 +4,12 @@ use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, ScanPlan, StorageAdapterRead,
-    StorageCoreProjection, StorageKey, StoragePrefix, StorageScanOptions, StorageSpace,
+    BufferRange, EncodedMutationBatch, EncodedPut, StorageAdapterRead, StorageSpace,
     StorageSpaceId, StorageWriteSet,
+};
+#[cfg(test)]
+use crate::storage_adapter::{
+    ScanPlan, StorageCoreProjection, StorageKey, StoragePrefix, StorageScanOptions,
 };
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -33,6 +36,7 @@ const JSON_REF_BYTES: usize = 32;
 /// Malformed keys are retained as `None` so GC can reclaim the derived record
 /// without treating a corrupt hint as a reason to touch an arbitrary JSON
 /// payload.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct UntrackedJsonReclaimCandidate {
     pub(crate) key: StorageKey,
@@ -74,6 +78,7 @@ impl JsonStoreContext {
     /// longer have an owner. This is deliberately a key-only, paged scan: the
     /// hint value carries no data and the caller already holds the complete
     /// logical root set from the same pinned read.
+    #[cfg(test)]
     pub(crate) async fn scan_untracked_reclaim_candidates(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -269,6 +274,7 @@ impl JsonStoreWriter {
 
     /// Removes only candidate hints whose payload was proved dead (or whose
     /// key was malformed) from the same pinned GC view.
+    #[cfg(test)]
     pub(crate) fn stage_delete_untracked_reclaim_candidates<I>(
         writes: &mut StorageWriteSet,
         keys: I,

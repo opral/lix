@@ -929,6 +929,26 @@ impl TrackedStateContext {
         TrackedStateWriter {
             chunk_overlay: storage::TrackedStateChunkOverlay::new(),
             staged_roots: BTreeMap::new(),
+            transient_chunk_hashes: HashSet::new(),
+            tree: self.tree.clone(),
+            store,
+            writes,
+        }
+    }
+
+    pub(crate) fn writer_with_rebuild_state<'a, S>(
+        &'a self,
+        store: &'a S,
+        writes: &'a mut StorageWriteSet,
+        state: TrackedStateTransientRebuildState,
+    ) -> TrackedStateWriter<'a, S>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        TrackedStateWriter {
+            chunk_overlay: state.chunk_overlay,
+            staged_roots: state.staged_roots,
+            transient_chunk_hashes: state.transient_chunk_hashes,
             tree: self.tree.clone(),
             store,
             writes,
@@ -937,8 +957,9 @@ impl TrackedStateContext {
 
     /// Creates an explicit tracked-state commit-root rebuilder.
     ///
-    /// Normal commits stage commit roots directly. This rebuilder reconstructs
-    /// a missing root from changelog facts as an explicit maintenance path.
+    /// Normal rooted commits publish immutable root metadata directly. This
+    /// rebuilder restores the addressed chunks from changelog facts; rootless
+    /// commits are reconstructed only for a transient correctness audit.
     pub(crate) fn root_rebuilder<'a, S>(
         &'a self,
         store: &'a S,
@@ -969,7 +990,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
     /// in one snapshot, so resolving neighbouring observed revisions never
     /// reloads the same changelog records.
     point_replay_commits: HashMap<CommitId, PointReplayCommit>,
-    /// Shares decoded immutable manifests between rootless topology discovery
+    /// Shares decoded immutable manifests between rootless layout discovery
     /// and the later delta scan in this storage snapshot.
     commit_delta_point_cache: storage::CommitDeltaPointReadCache,
 }
@@ -1493,6 +1514,38 @@ where
         )
     }
 
+    async fn load_commit_delta_values_for_encoded_queries(
+        &self,
+        state: &storage::AuthenticatedReplayCommitStateManifest,
+        encoded_keys: Vec<Bytes>,
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let request_count = encoded_keys.len();
+        let mut ordered = encoded_keys.into_iter().enumerate().collect::<Vec<_>>();
+        ordered.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let mut canonical = Vec::with_capacity(ordered.len());
+        let mut canonical_ordinal_by_request = vec![0usize; request_count];
+        for (request_index, encoded_key) in ordered {
+            if canonical
+                .last()
+                .is_none_or(|previous: &Bytes| previous != &encoded_key)
+            {
+                canonical.push(encoded_key);
+            }
+            canonical_ordinal_by_request[request_index] = canonical.len() - 1;
+        }
+        let values = storage::load_commit_delta_values_encoded_from_replay_manifest(
+            &self.store,
+            state,
+            &canonical,
+            &self.commit_delta_point_cache,
+        )
+        .await?;
+        Ok(canonical_ordinal_by_request
+            .into_iter()
+            .map(|ordinal| values[ordinal].clone())
+            .collect())
+    }
+
     async fn validate_tree_diff_batch_against_delta_index(
         &self,
         batch: &TrackedStateTreeDiffBatch,
@@ -1503,6 +1556,7 @@ where
             by_commit.entry(row.commit_id()).or_default().push(row);
         }
         for (commit_id, commit_rows) in by_commit {
+            let state = storage::load_point_replay_commit_state(&self.store, commit_id).await?;
             let mut encoded_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
             for row in &commit_rows {
@@ -1512,13 +1566,13 @@ where
                     entity_pk: row.entity_pk(),
                 });
             }
-            let loaded = storage::load_commit_delta_values_encoded_with_cache(
-                &self.store,
-                commit_id,
-                &encoded_keys.finish(),
-                Some(&self.commit_delta_point_cache),
-            )
-            .await?;
+            let loaded = match state.as_ref() {
+                Some(state) => {
+                    self.load_commit_delta_values_for_encoded_queries(state, encoded_keys.finish())
+                        .await?
+                }
+                None => vec![None; commit_rows.len()],
+            };
             let mut fallback_rows = Vec::new();
             let mut fallback_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
@@ -1536,13 +1590,13 @@ where
                     fallback_rows.push(index);
                 }
             }
-            let fallback_values = storage::load_commit_delta_values_encoded_with_cache(
-                &self.store,
-                commit_id,
-                &fallback_keys.finish(),
-                Some(&self.commit_delta_point_cache),
-            )
-            .await?;
+            let fallback_values = match state.as_ref() {
+                Some(state) => {
+                    self.load_commit_delta_values_for_encoded_queries(state, fallback_keys.finish())
+                        .await?
+                }
+                None => vec![None; fallback_rows.len()],
+            };
             let mut fallbacks = vec![None; commit_rows.len()];
             for (index, value) in fallback_rows.into_iter().zip(fallback_values) {
                 fallbacks[index] = value;
@@ -1636,7 +1690,7 @@ where
             }
 
             let current_metadata =
-                storage::load_authoritative_commit_root(&self.store, &current_commit_id).await?;
+                storage::load_snapshot_commit_root(&self.store, &current_commit_id).await?;
             let (parent_commit_id, parent_value, current_is_rootless) = if let Some(metadata) =
                 current_metadata
             {
@@ -1817,7 +1871,7 @@ where
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
             )));
         };
-        let manifest = storage::load_commit_state_manifest(&self.store, commit_id_typed)
+        let topology = storage::load_published_commit_state_topology(&self.store, commit_id_typed)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -1827,7 +1881,7 @@ where
                     ),
                 )
             })?;
-        if manifest.mutations.member_count == 0 {
+        if topology.mutation_member_count() == 0 {
             cache
                 .commit_delta_winners
                 .insert(commit_id.to_string(), HashMap::new());
@@ -1867,7 +1921,9 @@ where
         if let Some(metadata) = cache.commit_root_metadata.get(commit_id) {
             return Ok(metadata.clone());
         }
-        let metadata = storage::load_authoritative_commit_root(&self.store, commit_id)
+        self.load_cached_changelog_first_parent(commit_id, cache)
+            .await?;
+        let metadata = storage::load_snapshot_commit_root(&self.store, commit_id)
             .await?
             .ok_or_else(|| missing_commit_root_error(commit_id))?;
         cache
@@ -1884,21 +1940,11 @@ where
         if let Some(root_id) = cache.commit_roots.get(commit_id) {
             return Ok(root_id.clone());
         }
-        let typed_commit_id = CommitId::parse_lix(
-            commit_id,
-            "tracked-state optional authoritative root lookup",
-        )?;
-        let manifest = storage::load_commit_state_manifest(&self.store, typed_commit_id)
+        self.load_cached_changelog_first_parent(commit_id, cache)
+            .await?;
+        let root_id = storage::load_snapshot_commit_root(&self.store, commit_id)
             .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state commit_state_manifest is missing for commit '{commit_id}'"
-                    ),
-                )
-            })?;
-        let root_id = manifest.snapshot_root.map(|root| root.root_id);
+            .map(|root| root.root_id);
         cache
             .commit_roots
             .insert(commit_id.to_string(), root_id.clone());
@@ -1965,9 +2011,7 @@ where
         change_created_at: crate::common::LixTimestamp,
     ) -> Result<(), LixError> {
         let mut expected_created_at = change_created_at;
-        if let Some(metadata) =
-            storage::load_authoritative_commit_root(&self.store, commit_id).await?
-        {
+        if let Some(metadata) = storage::load_snapshot_commit_root(&self.store, commit_id).await? {
             if let Some(parent) = metadata.parent_roots.first() {
                 let parent_value = self
                     .tree
@@ -1982,9 +2026,14 @@ where
             }
         } else {
             let typed_commit_id = CommitId::parse_lix(commit_id, "diff row owner commit_id")?;
-            storage::load_commit_state_manifest(&self.store, typed_commit_id)
-                .await?
-                .ok_or_else(|| missing_commit_root_error(commit_id))?;
+            let authority_ids = storage::load_commit_state_authority_ids(
+                &self.store,
+                std::slice::from_ref(&typed_commit_id),
+            )
+            .await?;
+            if authority_ids.into_iter().next().flatten().is_none() {
+                return Err(missing_commit_root_error(commit_id));
+            }
             if let Some(parent_commit_id) = self
                 .load_cached_changelog_first_parent(
                     commit_id,
@@ -2074,7 +2123,7 @@ where
     ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
         let row_commit_id = row.commit_id.to_string();
         let Some(metadata) =
-            storage::load_authoritative_commit_root(&self.store, &row_commit_id).await?
+            storage::load_snapshot_commit_root(&self.store, &row_commit_id).await?
         else {
             return Ok(None);
         };
@@ -2634,19 +2683,19 @@ where
             "tracked-state current-state diff right commit_id",
         )?;
         let Some(left_state) =
-            storage::load_published_commit_state_manifest(&self.store, left_commit_id).await?
+            storage::load_published_commit_state_topology(&self.store, left_commit_id).await?
         else {
             return Ok(None);
         };
         let Some(right_state) =
-            storage::load_published_commit_state_manifest(&self.store, right_commit_id).await?
+            storage::load_published_commit_state_topology(&self.store, right_commit_id).await?
         else {
             return Ok(None);
         };
-        let Some(left_root) = left_state.current_state_scoped_ranges.as_ref() else {
+        let Some(left_root) = left_state.current_state_scoped_ranges() else {
             return Ok(None);
         };
-        let Some(right_root) = right_state.current_state_scoped_ranges.as_ref() else {
+        let Some(right_root) = right_state.current_state_scoped_ranges() else {
             return Ok(None);
         };
         let prefix = super::current_state_envelope::current_state_scope_prefix(&scope)?;
@@ -3165,6 +3214,28 @@ where
             key_file_id_ordinals.push(file_id_ordinal);
         }
         let file_ids = file_id_dictionary.into_file_ids();
+        let mut file_id_order = (0..file_ids.len()).collect::<Vec<_>>();
+        file_id_order.sort_unstable_by(|left, right| {
+            file_ids[*left].as_str().cmp(file_ids[*right].as_str())
+        });
+        let mut canonical_ordinal_by_original = vec![0u32; file_ids.len()];
+        let mut canonical_file_ids = Vec::with_capacity(file_ids.len());
+        for original_ordinal in file_id_order {
+            canonical_ordinal_by_original[original_ordinal] =
+                u32::try_from(canonical_file_ids.len()).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state batch replay file dictionary exceeds u32",
+                    )
+                })?;
+            canonical_file_ids.push(file_ids[original_ordinal].clone());
+        }
+        for ordinal in &mut key_file_id_ordinals {
+            if *ordinal != u32::MAX {
+                *ordinal = canonical_ordinal_by_original[*ordinal as usize];
+            }
+        }
+        let file_ids = canonical_file_ids;
 
         // Encode each file descriptor key once for the whole replay. Every
         // commit selects shared slices from this arena instead of rebuilding
@@ -3197,18 +3268,18 @@ where
         let mut cascades = vec![None; file_ids.len()];
         for &current_commit_id in interval.commits().iter().rev() {
             let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
-            let deltas = storage::load_commit_delta_values_encoded_with_cache(
+            let deltas = storage::load_commit_delta_values_encoded_from_replay_manifest(
                 &self.store,
-                current_commit_id,
+                &replay_commit.state_manifest,
                 keys,
-                Some(&self.commit_delta_point_cache),
+                &self.commit_delta_point_cache,
             )
             .await?;
-            let descriptor_deltas = storage::load_commit_delta_values_encoded_with_cache(
+            let descriptor_deltas = storage::load_commit_delta_values_encoded_from_replay_manifest(
                 &self.store,
-                current_commit_id,
+                &replay_commit.state_manifest,
                 &descriptor_keys,
-                Some(&self.commit_delta_point_cache),
+                &self.commit_delta_point_cache,
             )
             .await?;
             for (file_id_ordinal, value) in descriptor_deltas.into_iter().enumerate() {
@@ -3467,36 +3538,11 @@ where
                     ),
                 )
             })?;
-        if manifest.generation != record.generation
-            || manifest.parent_commit_ids != record.parent_commit_ids
-            || manifest.commit_change_id != record.change_id
-            || manifest.account_id != record.account_id
-            || manifest.created_at != record.created_at
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state commit_state_manifest disagrees with the topology projection for commit '{commit_id}'"
-                ),
-            ));
-        }
+        let rootless = manifest.replay_debt.depth > 0;
         let root_id = manifest
             .snapshot_root
             .as_ref()
             .map(|root| root.root_id.clone());
-        let rootless = manifest.replay_debt.depth > 0;
-        if rootless != record.tracked_state_rootless
-            || manifest.replay_debt.depth != record.tracked_state_rootless_depth
-            || manifest.replay_debt.rows != record.tracked_state_rootless_rows
-            || manifest.replay_debt.bytes != record.tracked_state_rootless_bytes
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state commit_state_manifest disagrees with the replay projection for commit '{commit_id}'"
-                ),
-            ));
-        }
         let replacement_generation = if rootless && manifest.mutations.member_count != 0 {
             storage::seed_commit_delta_point_cache_from_replay_manifest(
                 &manifest,
@@ -3507,7 +3553,7 @@ where
             None
         };
         let replay_commit = PointReplayCommit {
-            parent_commit_id: manifest.parent_commit_ids.first().copied(),
+            parent_commit_id: record.parent_commit_ids.first().copied(),
             root_id,
             rootless,
             replacement_generation,
@@ -3538,17 +3584,22 @@ where
         if missing.is_empty() {
             return Ok(output);
         }
-        let missing_keys = missing
-            .iter()
-            .map(|(_, key)| key.clone())
-            .collect::<Vec<_>>();
-        let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(missing_keys.len());
-        for key in &missing_keys {
-            encoded_keys.push(TrackedStateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
+        missing.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(missing.len());
+        let mut query_ordinals = Vec::with_capacity(missing.len());
+        let mut previous_key = None::<&TrackedStateKey>;
+        let mut unique_key_count = 0usize;
+        for (_, key) in &missing {
+            if previous_key != Some(key) {
+                encoded_keys.push(TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                });
+                previous_key = Some(key);
+                unique_key_count += 1;
+            }
+            query_ordinals.push(unique_key_count - 1);
         }
         let replay_commit = self.load_point_replay_commit(commit_id).await?;
         let values = storage::load_commit_delta_values_encoded_from_replay_manifest(
@@ -3558,7 +3609,8 @@ where
             &self.commit_delta_point_cache,
         )
         .await?;
-        for ((index, key), value) in missing.into_iter().zip(values) {
+        for ((index, key), query_ordinal) in missing.into_iter().zip(query_ordinals) {
+            let value = values[query_ordinal].clone();
             self.commit_delta_value_cache
                 .insert((commit_id, key), value.clone());
             output[index] = value;
@@ -3576,11 +3628,24 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
     ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
-        storage::scan_commit_delta_values_with_cache(
+        let replay_commit = self.load_point_replay_commit(commit_id).await?;
+        let source_manifest = match replay_commit
+            .state_manifest
+            .mutations
+            .selected_source_commit_id()
+        {
+            Some(source_commit_id) => Some(
+                self.load_point_replay_commit(source_commit_id)
+                    .await?
+                    .state_manifest,
+            ),
+            None => None,
+        };
+        storage::scan_commit_delta_values_from_authenticated_states(
             &self.store,
-            commit_id,
+            &replay_commit.state_manifest,
+            source_manifest.as_deref(),
             schema_keys,
-            Some(&self.commit_delta_point_cache),
         )
         .await
     }
@@ -3718,9 +3783,36 @@ fn exact_current_state_scope(
 pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     chunk_overlay: storage::TrackedStateChunkOverlay,
     staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
+    transient_chunk_hashes: HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
     tree: TrackedStateTree,
     store: &'a S,
     writes: &'a mut StorageWriteSet,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TrackedStateTransientRebuildState {
+    chunk_overlay: storage::TrackedStateChunkOverlay,
+    staged_roots: BTreeMap<String, TrackedStateCommitRoot>,
+    transient_chunk_hashes: HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
+}
+
+impl TrackedStateTransientRebuildState {
+    pub(crate) fn chunk_hashes(
+        &self,
+    ) -> HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]> {
+        self.chunk_overlay.chunk_hashes().collect()
+    }
+
+    pub(crate) fn mark_new_chunks_transient(
+        &mut self,
+        previously_known: &HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]>,
+    ) {
+        self.transient_chunk_hashes.extend(
+            self.chunk_overlay
+                .chunk_hashes()
+                .filter(|hash| !previously_known.contains(hash)),
+        );
+    }
 }
 
 /// Explicit commit-root rebuilder created by `TrackedStateContext`.
@@ -3745,6 +3837,38 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    pub(crate) fn into_transient_rebuild_state(self) -> TrackedStateTransientRebuildState {
+        TrackedStateTransientRebuildState {
+            chunk_overlay: self.chunk_overlay,
+            staged_roots: self.staged_roots,
+            transient_chunk_hashes: self.transient_chunk_hashes,
+        }
+    }
+
+    pub(crate) async fn promote_reachable_transient_chunks(
+        &mut self,
+        root_id: &TrackedStateRootId,
+    ) -> Result<(), LixError> {
+        if self.transient_chunk_hashes.is_empty() {
+            return Ok(());
+        }
+        let reachable = self
+            .tree
+            .reachable_chunk_hashes_with_overlay(self.store, &self.chunk_overlay, root_id)
+            .await?;
+        let promoted = self
+            .transient_chunk_hashes
+            .intersection(&reachable)
+            .copied()
+            .collect::<Vec<_>>();
+        self.chunk_overlay
+            .stage_selected_chunks(self.writes, promoted.iter().copied())?;
+        for hash in promoted {
+            self.transient_chunk_hashes.remove(&hash);
+        }
+        Ok(())
+    }
+
     pub(crate) fn staged_commit_roots(&self) -> impl Iterator<Item = &TrackedStateCommitRoot> {
         self.staged_roots.values()
     }
@@ -3766,9 +3890,9 @@ where
                     format!("tracked-state staged root for commit '{commit_id}' is missing"),
                 )
             })?;
-        let mut staged_manifests = Vec::with_capacity(self.staged_roots.len());
+        let mut staged_commit_states = Vec::with_capacity(self.staged_roots.len());
         for metadata in self.staged_roots.values() {
-            let mut manifest = storage::load_commit_state_manifest(self.store, metadata.commit_id)
+            let manifest = storage::load_commit_state_manifest(self.store, metadata.commit_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
@@ -3779,13 +3903,12 @@ where
                         ),
                     )
                 })?;
-            manifest.snapshot_root = Some(metadata.clone());
-            staged_manifests.push(manifest);
+            staged_commit_states.push((manifest, metadata.clone()));
         }
-        let read = storage::TrackedStateStagedRead::with_commit_state_manifests(
+        let read = storage::TrackedStateStagedRead::with_commit_state_roots(
             self.store,
             &self.chunk_overlay,
-            staged_manifests,
+            staged_commit_states,
         )?;
         TrackedStateContext::new()
             .reader(read)
@@ -3834,8 +3957,7 @@ where
                 let metadata = match self.staged_roots.get(parent_commit_id) {
                     Some(metadata) => Some(metadata.clone()),
                     None => {
-                        storage::load_authoritative_commit_root(self.store, parent_commit_id)
-                            .await?
+                        storage::load_snapshot_commit_root(self.store, parent_commit_id).await?
                     }
                 };
                 let Some(metadata) = metadata else {
@@ -4073,7 +4195,6 @@ where
         let mut mutation_batch = TrackedStateMutationBatchBuilder::with_row_capacity(
             cascade_mutations.len().saturating_add(deltas.len()),
         );
-        let has_cascade_mutations = !cascade_mutations.is_empty();
         for (key, value) in cascade_mutations {
             mutation_batch.push_encoded(&key, &value);
         }
@@ -4117,35 +4238,17 @@ where
         }
         let mutations = mutation_batch.finish();
         let changed_rows = mutations.len();
-        let sparse_existing_batch = base_root.is_some()
-            && !has_cascade_mutations
-            && parent_values.iter().all(Option::is_some)
-            && mutations.len() > 1;
-        let result = if sparse_existing_batch {
-            self.tree
-                .apply_point_mutations_with_overlay(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    base_root
-                        .as_ref()
-                        .expect("sparse batch requires parent root"),
-                    mutations,
-                    Some(commit_id),
-                )
-                .await?
-        } else {
-            self.tree
-                .apply_mutations_with_overlay(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    base_root.as_ref(),
-                    mutations,
-                    Some(commit_id),
-                )
-                .await?
-        };
+        let result = self
+            .tree
+            .apply_mutations_with_overlay(
+                self.store,
+                self.writes,
+                &mut self.chunk_overlay,
+                base_root.as_ref(),
+                mutations,
+                Some(commit_id),
+            )
+            .await?;
         let metadata = TrackedStateCommitRoot {
             commit_id: typed_commit_id,
             root_id: result.root_id.clone(),
@@ -4231,7 +4334,7 @@ where
         let parent_metadata = match parent_commit_id {
             Some(parent_commit_id) => Some(match self.staged_roots.get(parent_commit_id) {
                 Some(metadata) => metadata.clone(),
-                None => storage::load_authoritative_commit_root(self.store, parent_commit_id)
+                None => storage::load_snapshot_commit_root(self.store, parent_commit_id)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(
@@ -4471,7 +4574,7 @@ fn missing_commit_root_error(commit_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!(
-            "tracked_state commit_root is missing for commit '{commit_id}'; run explicit commit_root rebuild before historical reads"
+            "tracked_state rooted commit authority is missing snapshot metadata for commit '{commit_id}'"
         ),
     )
 }
@@ -4814,6 +4917,7 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
     use std::time::Instant;
 
     use super::*;
@@ -4963,33 +5067,16 @@ mod tests {
         writes: &mut StorageWriteSet,
         snapshot_root: TrackedStateCommitRoot,
     ) -> Result<(), LixError> {
-        let parent_commit_ids = snapshot_root
-            .parent_roots
-            .iter()
-            .map(|parent| parent.commit_id)
-            .collect::<Vec<_>>();
-        storage::stage_commit_state_manifest(
-            writes,
-            &crate::tracked_state::CommitStateManifest {
-                commit_id: snapshot_root.commit_id,
-                generation: u64::from(!parent_commit_ids.is_empty()),
-                parent_commit_ids,
-                commit_change_id: ChangeId::for_test_label(&format!(
-                    "{}:snapshot-authority",
-                    snapshot_root.commit_id
-                )),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: crate::common::LixTimestamp::expect_parse(
-                    "snapshot authority created_at",
-                    "1970-01-01T00:00:00.000Z",
-                ),
-                replay_debt: Default::default(),
-                mutations: Default::default(),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: Some(snapshot_root),
-            },
-        )
+        let manifest = crate::tracked_state::CommitStateManifest {
+            commit_id: snapshot_root.commit_id,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            replay_debt: Default::default(),
+            mutations: Default::default(),
+            touched_scope_filter: Default::default(),
+            current_state_scoped_ranges: None,
+            snapshot_root: Some(Box::new(snapshot_root)),
+        };
+        storage::stage_commit_state_manifest(writes, &manifest)
     }
 
     fn change_id(label: &str) -> String {
@@ -5043,6 +5130,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_commit_root_rejects_physically_retained_semantically_missing_parent() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("parent read should open");
+            let mut writes = storage.new_write_set();
+            let mut writer = tracked_state.writer(&read, &mut writes);
+            let parent_row = row("entity-parent", "change-parent", "retained-parent");
+            writer
+                .stage_commit_root(
+                    "retained-parent",
+                    None,
+                    [delta_from_materialized_row(&parent_row)],
+                )
+                .await
+                .expect("physical parent root should stage");
+            let parent_root = writer
+                .staged_commit_roots()
+                .find(|root| root.commit_id == CommitId::for_test_label("retained-parent"))
+                .cloned()
+                .expect("physical parent root metadata should stage");
+            drop(writer);
+            stage_snapshot_authority_for_test(&mut writes, parent_root)
+                .expect("physical parent manifest should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("physical parent state should commit");
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("child read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        let error = writer
+            .stage_commit_root("child", Some("retained-parent"), [])
+            .await
+            .expect_err("physical retention must not authorize a missing semantic parent");
+        assert!(error.message.contains("parent root"), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn stage_commit_root_writes_commit_root_metadata() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
@@ -5080,7 +5214,7 @@ mod tests {
             .await
             .expect("child root should load")
             .expect("child root should exist");
-        let metadata = storage::load_authoritative_commit_root(&read, "child")
+        let metadata = storage::load_snapshot_commit_root(&read, "child")
             .await
             .expect("metadata should load")
             .expect("metadata should exist");
@@ -5766,34 +5900,15 @@ mod tests {
         };
         assert_eq!(report.changed_rows, child_rows.len());
 
-        {
-            let read = generic_storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("generic parent read should open");
-            let mut writes = generic_storage.new_write_set();
-            let mut writer = tracked_state.writer(&read, &mut writes);
-            writer
-                .stage_commit_root(
-                    &parent_commit_id,
-                    None,
-                    parent_rows.iter().map(delta_from_materialized_row),
-                )
-                .await
-                .expect("generic parent root should stage");
-            let parent_root = writer
-                .staged_commit_roots()
-                .find(|root| root.commit_id == parent_commit_id)
-                .cloned()
-                .expect("generic parent metadata should stage");
-            drop(writer);
-            stage_snapshot_authority_for_test(&mut writes, parent_root)
-                .expect("generic parent authority should stage");
-            generic_storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("generic parent root should commit");
-        }
+        write_root_for_test(
+            &generic_storage,
+            &tracked_state,
+            &parent_commit_id,
+            None,
+            &parent_rows,
+        )
+        .await
+        .expect("generic parent commit and root should write");
         {
             let read = generic_storage
                 .begin_read(StorageReadOptions::default())
@@ -5827,18 +5942,26 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("bulk result read should open");
-        let bulk_root = storage::load_root(&bulk_read, &child_commit_id)
-            .await
-            .expect("bulk root should load")
-            .expect("bulk child root should exist");
+        let bulk_root = storage::load_manifest_snapshot_commit_root(
+            &bulk_read,
+            CommitId::parse_lix(&child_commit_id, "bulk child fixture").expect("test commit id"),
+        )
+        .await
+        .expect("bulk root should load")
+        .expect("bulk child root should exist")
+        .root_id;
         let generic_read = generic_storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("generic result read should open");
-        let generic_root = storage::load_root(&generic_read, &child_commit_id)
-            .await
-            .expect("generic root should load")
-            .expect("generic child root should exist");
+        let generic_root = storage::load_manifest_snapshot_commit_root(
+            &generic_read,
+            CommitId::parse_lix(&child_commit_id, "generic child fixture").expect("test commit id"),
+        )
+        .await
+        .expect("generic root should load")
+        .expect("generic child root should exist")
+        .root_id;
         assert_eq!(bulk_root, generic_root, "dense merge must be canonical");
 
         let entry = TrackedStateTree::new()
@@ -6456,7 +6579,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let parent_metadata = storage::load_authoritative_commit_root(&read, "parent")
+        let parent_metadata = storage::load_snapshot_commit_root(&read, "parent")
             .await
             .expect("parent metadata should load")
             .expect("parent metadata should exist");
@@ -6487,10 +6610,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should reopen");
-        let child_metadata = storage::load_authoritative_commit_root(&read, "empty-child")
-            .await
-            .expect("child metadata should load")
-            .expect("child metadata should exist");
+        let child_metadata = storage::load_manifest_snapshot_commit_root(
+            &read,
+            CommitId::for_test_label("empty-child"),
+        )
+        .await
+        .expect("child metadata should load")
+        .expect("child metadata should exist");
 
         assert_eq!(child_metadata.root_id, parent_metadata.root_id);
         assert_eq!(child_metadata.changed_key_count, 0);
@@ -6810,7 +6936,7 @@ mod tests {
                     commit_root_key(commit_id),
                 );
                 writes.delete(
-                    storage::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+                    storage::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
                     commit_root_key(commit_id),
                 );
             }
@@ -6873,39 +6999,35 @@ mod tests {
             let mut writes = storage.new_write_set();
             let commit_a = CommitId::for_test_label("commit-a");
             let commit_b = CommitId::for_test_label("commit-b");
-            let mut manifest = storage::load_commit_state_manifest(&read, commit_a)
+            let published = storage::load_published_commit_state_manifest(&read, commit_a)
                 .await
                 .expect("commit-a authority should load")
                 .expect("commit-a authority should exist");
-            manifest.generation = 2;
-            manifest.parent_commit_ids = vec![commit_b];
-            manifest
-                .snapshot_root
-                .as_mut()
-                .expect("commit-a should have a snapshot root")
-                .parent_roots = vec![TrackedStateCommitRootParent {
+            let mut snapshot_root = storage::load_snapshot_commit_root(&read, "commit-a")
+                .await
+                .expect("commit-a root should load")
+                .expect("commit-a root should exist");
+            snapshot_root.parent_roots = vec![TrackedStateCommitRootParent {
                 commit_id: commit_b,
                 root_id: storage::load_root(&read, "commit-b")
                     .await
                     .expect("commit-b root should load")
                     .expect("commit-b root should exist"),
             }];
-            storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
-                .expect("corrupt cycle authority should stage");
+            let mut corrupt = (*published).clone();
+            corrupt.snapshot_root = Some(Box::new(snapshot_root));
+            storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &corrupt)
+                .expect("corrupt cycle root should stage");
             writes.put(
                 crate::changelog::COMMIT_SPACE,
                 crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
-                    format_version: 1,
+                    format_version: 2,
                     commit_id: commit_a,
-                    generation: manifest.generation,
+                    generation: 2,
                     parent_commit_ids: vec![commit_b],
-                    tracked_state_rootless: false,
-                    tracked_state_rootless_depth: 0,
-                    tracked_state_rootless_rows: 0,
-                    tracked_state_rootless_bytes: 0,
                     change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
@@ -7072,7 +7194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_rebuild_repairs_stale_root_missing_inherited_row() {
+    async fn explicit_rebuild_rejects_stale_immutable_root_missing_inherited_row() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let inherited = row_with_value("entity-a", "change-base", "base", "base");
@@ -7102,49 +7224,15 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        tracked_state
+        let error = tracked_state
             .root_rebuilder(&read, &mut writes)
             .rebuild_commit_root_at("child")
             .await
-            .expect("stale child root should repair");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repaired root should commit");
-
-        let authority_read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("authority read should open");
-        let repaired_authority =
-            storage::load_commit_state_manifest(&authority_read, CommitId::for_test_label("child"))
-                .await
-                .expect("repaired authority should load")
-                .expect("child authority should exist");
-        let repaired_root = storage::load_authoritative_commit_root(&authority_read, "child")
-            .await
-            .expect("repaired root should load")
-            .expect("repaired root should exist");
-        assert_eq!(repaired_authority.snapshot_root, Some(repaired_root));
-        assert_eq!(repaired_authority.replay_debt, Default::default());
-        drop(authority_read);
-
-        let rows = tracked_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .scan_batch_at_commit("child", &test_schema_scan_request())
-            .await
-            .expect("repaired child root should scan")
-            .into_rows();
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.change_id.to_string())
-                .collect::<Vec<_>>(),
-            vec![change_id("change-base"), change_id("change-child")]
+            .expect_err("rebuild must not rewrite stale immutable root authority");
+        assert!(
+            error
+                .message
+                .contains("disagrees with immutable commit authority")
         );
     }
 
@@ -7687,26 +7775,24 @@ mod tests {
         .await
         .expect("root should write");
 
-        // Violate the GC contract: delete the owning packed commit delta while
-        // a live tree row still references its change id.
+        // Corrupt immutable authority so its snapshot still exposes the live
+        // row while its canonical mutation inventory no longer owns the
+        // referenced change id.
         let commit_id = CommitId::for_test_label("commit-1");
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("inventory read should open");
-        let inventory = storage::scan_commit_delta_inventory(&read)
+            .expect("authority read should open");
+        let published = storage::load_commit_state_manifest(&read, commit_id)
             .await
-            .expect("packed inventory should load");
+            .expect("authority should load")
+            .expect("authority should exist");
+        let mut corrupt = published.clone();
+        corrupt.mutations = Default::default();
+        drop(read);
         let mut writes = storage.new_write_set();
-        storage::stage_delete_commit_delta_inventory_entry(
-            &mut writes,
-            commit_id,
-            inventory
-                .commits
-                .get(&commit_id)
-                .expect("fixture commit should have packed authority"),
-        )
-        .expect("packed authority deletion should stage");
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &corrupt)
+            .expect("corrupt authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -7723,7 +7809,7 @@ mod tests {
             .await
             .expect_err("materialization must reject missing packed authority");
         assert!(
-            error.message.contains("commit_state_manifest is missing"),
+            error.message.contains("missing from owning commit"),
             "unexpected error: {error}"
         );
     }
@@ -8091,6 +8177,250 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("rootless commit should commit");
+    }
+
+    #[tokio::test]
+    async fn explicit_rebuild_audits_rootless_commit_without_publishing_unreachable_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "rootless",
+            "base",
+            &[row_with_value(
+                "entity-a",
+                "rootless-a",
+                "rootless",
+                "updated",
+            )],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        let report = tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("rootless")
+            .await
+            .expect("rootless state should pass transient rebuild audit");
+
+        assert_eq!(report.commit_id, CommitId::for_test_label("rootless"));
+        assert_eq!(writes.stats().staged_puts, 0);
+        assert_eq!(writes.stats().staged_deletes, 0);
+        assert_eq!(writes.stats().written_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn rooted_rebuild_promotes_only_reachable_chunks_from_rootless_ancestor() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-base", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        let rootless_rows = (0..300)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:04}"),
+                    &format!("rootless-{index:04}"),
+                    "rootless",
+                    "rootless",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, "rootless", "base", &rootless_rows).await;
+        write_rootless_commit_for_test(
+            &storage,
+            "child",
+            "rootless",
+            &[row_with_value(
+                "entity-0150",
+                "child-0150",
+                "child",
+                "child",
+            )],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fixture rebuild read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            "child",
+            true,
+        )
+        .await
+        .expect("fixture plans should load");
+        let mut fixture_writes = storage.new_write_set();
+        let mut fixture_writer = tracked_state.writer(&read, &mut fixture_writes);
+        for plan in plans.iter().rev() {
+            crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                &mut fixture_writer,
+                plan,
+            )
+            .await
+            .expect("fixture root should stage");
+        }
+        let child_commit_id = CommitId::for_test_label("child");
+        let child_snapshot_root = fixture_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == child_commit_id)
+            .cloned()
+            .expect("fixture child root should exist");
+        drop(fixture_writer);
+        let mut child_manifest = storage::load_commit_state_manifest(&read, child_commit_id)
+            .await
+            .expect("child manifest should load")
+            .expect("child manifest should exist");
+        child_manifest.replay_debt = crate::tracked_state::CommitStateReplayDebt::default();
+        child_manifest.snapshot_root = Some(Box::new(child_snapshot_root));
+        storage::stage_resealed_commit_state_manifest_for_test(
+            &mut fixture_writes,
+            &child_manifest,
+        )
+        .expect("rooted child authority should reseal");
+        drop(read);
+        storage
+            .commit_write_set(fixture_writes, StorageWriteOptions::default())
+            .await
+            .expect("rooted child fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reachability read should open");
+        let base_root = storage::load_root(&read, "base")
+            .await
+            .expect("base root should load")
+            .expect("base root should exist");
+        let child_root = storage::load_root(&read, "child")
+            .await
+            .expect("child root should load")
+            .expect("child root should exist");
+        let empty_overlay = storage::TrackedStateChunkOverlay::new();
+        let tree = TrackedStateTree::new();
+        let base_reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &empty_overlay, &base_root)
+            .await
+            .expect("base reachability should load");
+        let child_reachable = tree
+            .reachable_chunk_hashes_with_overlay(&read, &empty_overlay, &child_root)
+            .await
+            .expect("child reachability should load");
+        drop(read);
+
+        let all_chunks = stored_tree_chunk_hashes_for_test(&storage).await;
+        let mut deletes = storage.new_write_set();
+        for hash in all_chunks.difference(&base_reachable) {
+            deletes.delete(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash)),
+            );
+        }
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("child-only chunks should delete");
+        let before = stored_tree_chunk_hashes_for_test(&storage).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuild read should open");
+        let mut writes = storage.new_write_set();
+        tracked_state
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_commit_root_at("child")
+            .await
+            .expect("rooted descendant should rebuild through rootless authority");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("reachable rebuilt chunks should commit");
+
+        let after = stored_tree_chunk_hashes_for_test(&storage).await;
+        let added = after.difference(&before).copied().collect::<HashSet<_>>();
+        let expected = child_reachable
+            .difference(&before)
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(added, expected);
+        let rows = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("verification read should open"),
+            )
+            .scan_batch_at_commit("child", &test_schema_scan_request())
+            .await
+            .expect("rebuilt child should scan");
+        assert_eq!(rows.len(), 301);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.entity_pk() == &EntityPk::single("entity-0150"))
+                .and_then(|row| row.snapshot_content())
+                .map(AsRef::as_ref),
+            Some("{\"value\":\"child\"}")
+        );
+    }
+
+    async fn stored_tree_chunk_hashes_for_test(
+        storage: &StorageAdapter,
+    ) -> HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("chunk inventory read should open");
+        let chunk = crate::storage_adapter::ScanPlan::range(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        )
+        .collect(
+            &read,
+            crate::storage_adapter::StorageScanOptions {
+                projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
+                limit_rows: usize::MAX,
+                resume_after: None,
+            },
+        )
+        .await
+        .expect("chunk inventory should scan")
+        .value;
+        assert!(!chunk.has_more, "test chunk inventory must fit one page");
+        chunk
+            .entries
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .key
+                    .0
+                    .as_ref()
+                    .try_into()
+                    .expect("tracked-state chunk keys are fixed hashes")
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -9070,12 +9400,15 @@ mod tests {
             .await
             .expect("commit-state authority should load")
             .expect("root fixture should publish commit-state authority");
-        stale_root.parent_roots = published
-            .snapshot_root
-            .as_ref()
-            .map(|root| root.parent_roots.clone())
-            .unwrap_or_default();
-        storage::stage_commit_state_snapshot_root_update(&mut writes, &published, Some(stale_root))
+        stale_root.parent_roots =
+            storage::load_snapshot_commit_root(&read, &typed_commit_id.to_string())
+                .await
+                .expect("published root should load")
+                .map(|root| root.parent_roots)
+                .unwrap_or_default();
+        let mut stale = (*published).clone();
+        stale.snapshot_root = Some(Box::new(stale_root));
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &stale)
             .expect("stale authority should encode");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

@@ -280,11 +280,12 @@ async fn try_execute_entity_insert_batch(
         None
     };
     let layout = InsertRowLayout::from_values(&spec, values)?;
-    if layout
-        .columns
-        .iter()
-        .any(|target| !matches!(target, InsertColumnTarget::Visible { .. }))
-    {
+    if layout.columns.iter().any(|target| {
+        !matches!(
+            target,
+            InsertColumnTarget::Visible { .. } | InsertColumnTarget::Untracked
+        )
+    }) {
         return Ok(None);
     }
     let certification_span = tracing::debug_span!(
@@ -837,6 +838,16 @@ async fn try_execute_direct_path_value_replacement_batch(
         primary_key_offsets.push((start, primary_key_arena.len()));
     }
     let parameter_identity_digest = *parameter_identity_hasher.finalize().as_bytes();
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_ownership(
+        crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
+        row_count,
+        primary_key_arena.len(),
+        0,
+        2,
+        0,
+        0,
+    );
     let active_branch_id = ctx.active_branch_id().to_owned();
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,
@@ -4337,6 +4348,8 @@ fn certified_entity_insert_parameter_batch(
     if let Some(rows) =
         certified_direct_parameter_insert_batch(ctx, plan, spec, layout, row, parameter_batch)?
     {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_certified_entity_insert_parameter_batch_certification();
         return Ok(Some(if use_typed_certified_insert(rows.len()) {
             CertifiedEntityInsertParameterBatch::Typed(rows)
         } else {
@@ -4349,6 +4362,22 @@ fn certified_entity_insert_parameter_batch(
     let EntityInsertParameterBatch::Arrow(parameter_batch) = parameter_batch else {
         unreachable!("generic parameter fallback is only available for Arrow batches")
     };
+    // The tracked/untracked lane is part of the registered schema domain, not
+    // merely row payload. A parameterized batch can contain rows from both
+    // lanes; committing that batch would defer the domain error until the
+    // transaction boundary, where it no longer has a statement index. Keep
+    // the established sequential route for this shape so the failing row is
+    // validated and attributed before any batch staging occurs.
+    if values.rows.iter().any(|row| {
+        row.iter().zip(&layout.columns).any(|(expr, target)| {
+            matches!(
+                (expr, target),
+                (BoundExpr::Param(_), InsertColumnTarget::Untracked)
+            )
+        })
+    }) {
+        return Ok(None);
+    }
     certified_entity_insert_rows(
         ctx,
         plan,
@@ -4873,11 +4902,15 @@ fn certified_direct_path_value_insert_batch(
     parameter_batch: EntityInsertParameterBatch<'_>,
     schema_plan_id: SchemaPlanId,
 ) -> Result<Option<CertifiedParameterInsertBatch>, LixError> {
-    if !spec.certifies_path_value_replacement || row.len() != 2 || layout.columns.len() != 2 {
+    if !spec.certifies_path_value_replacement
+        || !(row.len() == 2 || row.len() == 3)
+        || layout.columns.len() != row.len()
+    {
         return Ok(None);
     }
     let mut path_param_index = None;
     let mut value_param_index = None;
+    let mut untracked = false;
     for (expr, target) in row.iter().zip(&layout.columns) {
         match (expr, target) {
             (
@@ -4900,6 +4933,9 @@ fn certified_direct_path_value_insert_batch(
                     return Ok(None);
                 };
                 value_param_index = Some(param.index.saturating_sub(1));
+            }
+            (BoundExpr::Literal(BoundLiteral::Bool(true)), InsertColumnTarget::Untracked) => {
+                untracked = true;
             }
             _ => return Ok(None),
         }
@@ -4975,7 +5011,7 @@ fn certified_direct_path_value_insert_batch(
         snapshot_offsets.push((snapshot_start, normalized.len()));
     }
 
-    let entity_columnar = if use_typed_certified_insert(row_count) {
+    let entity_columnar = if !untracked && use_typed_certified_insert(row_count) {
         let path_values = StringArray::from_iter(path_offsets.iter().map(|&(start, end)| {
             Some(
                 std::str::from_utf8(&path_arena[start..end])
@@ -5020,11 +5056,12 @@ fn certified_direct_path_value_insert_batch(
         .collect::<Vec<_>>();
     let snapshots =
         TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-    let mut rows = CertifiedParameterInsertBatch::new(
+    let mut rows = CertifiedParameterInsertBatch::new_with_lane(
         entity_pks,
         snapshots,
         layout.schema_key.as_str().into(),
         ctx.active_branch_id().into(),
+        untracked,
         CertifiedRawWriteBatchPreparation {
             schema_plan_id,
             facts: PreparedRowFacts {

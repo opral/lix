@@ -24,12 +24,17 @@ use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-/// Read model for resolving authoritative commit manifests into entity state
-/// at a head.
+/// Read model for resolving changelog commit facts at a head.
 ///
-/// The changelog commit plane is a compact serving projection. Every graph
-/// read validates it against the commit-state manifest before exposing
-/// topology.
+/// The commit graph owns semantic commit metadata. Physical tracked-state
+/// manifests are required by state/history payload readers, but GC may retire
+/// those manifests while retaining a changelog projection until the semantic
+/// commit itself becomes unreachable. Metadata reads must therefore not make
+/// the physical serving manifest a second membership authority.
+///
+/// The changelog commit plane is a compact serving projection. State/history
+/// payload readers validate physical commit-state authority before decoding
+/// tracked data; metadata topology does not require that physical projection.
 #[derive(Clone)]
 pub(crate) struct CommitGraphContext;
 
@@ -106,11 +111,11 @@ where
                     commit_ids: &uncached_ids,
                 })
                 .await?;
-            let manifests =
-                crate::tracked_state::load_commit_state_manifests(&self.store, &uncached_ids)
+            let authority_ids =
+                crate::tracked_state::load_commit_state_authority_ids(&self.store, &uncached_ids)
                     .await?;
-            for ((commit_id, record), manifest) in batch.into_iter().zip(manifests) {
-                let node = commit_graph_node_from_authority(*commit_id, record, manifest)?;
+            for ((commit_id, record), authority_id) in batch.into_iter().zip(authority_ids) {
+                let node = commit_graph_node_from_authority(*commit_id, record, authority_id)?;
                 self.node_cache.insert(*commit_id, node);
             }
         }
@@ -141,11 +146,12 @@ where
                 .iter()
                 .map(|record| record.commit_id)
                 .collect::<Vec<_>>();
-            let manifests =
-                crate::tracked_state::load_commit_state_manifests(&self.store, &commit_ids).await?;
-            for (record, manifest) in scan.entries.into_iter().zip(manifests) {
+            let authority_ids =
+                crate::tracked_state::load_commit_state_authority_ids(&self.store, &commit_ids)
+                    .await?;
+            for (record, authority_id) in scan.entries.into_iter().zip(authority_ids) {
                 let commit_id = record.commit_id;
-                let node = commit_graph_node_from_authority(commit_id, Some(record), manifest)?
+                let node = commit_graph_node_from_authority(commit_id, Some(record), authority_id)?
                     .expect("scanned commit projection produces a graph node");
                 self.node_cache.insert(node.commit_id, Some(node.clone()));
                 commits.push(node);
@@ -384,33 +390,16 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
 fn commit_graph_node_from_authority(
     commit_id: CommitId,
     record: Option<CommitRecord>,
-    manifest: Option<crate::tracked_state::CommitStateManifest>,
+    authority_id: Option<CommitId>,
 ) -> Result<Option<CommitGraphNode>, LixError> {
     // Public graph membership belongs to the compact changelog projection.
-    // GC may retain an immutable manifest after removing that projection so
-    // selected payloads remain addressable for recovery.
+    // A physical manifest is an independent serving/replay authority. Its
+    // absence is handled by payload/state readers, not by metadata membership.
     let Some(record) = record else {
         return Ok(None);
     };
-    let Some(manifest) = manifest else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit_graph projection for commit '{commit_id}' has no commit-state authority"
-            ),
-        ));
-    };
-    let manifest_rootless = manifest.replay_debt.depth > 0;
-    if record.commit_id != manifest.commit_id
-        || record.generation != manifest.generation
-        || record.parent_commit_ids != manifest.parent_commit_ids
-        || record.change_id != manifest.commit_change_id
-        || record.account_id != manifest.account_id
-        || record.created_at != manifest.created_at
-        || record.tracked_state_rootless != manifest_rootless
-        || record.tracked_state_rootless_depth != manifest.replay_debt.depth
-        || record.tracked_state_rootless_rows != manifest.replay_debt.rows
-        || record.tracked_state_rootless_bytes != manifest.replay_debt.bytes
+    if let Some(authority_id) = authority_id
+        && record.commit_id != authority_id
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -420,12 +409,12 @@ fn commit_graph_node_from_authority(
         ));
     }
     Ok(Some(CommitGraphNode {
-        commit_id: manifest.commit_id,
-        change_id: manifest.commit_change_id,
-        account_id: manifest.account_id,
-        generation: manifest.generation,
-        parent_commit_ids: manifest.parent_commit_ids,
-        created_at: manifest.created_at,
+        commit_id: record.commit_id,
+        change_id: record.change_id,
+        account_id: record.account_id,
+        generation: record.generation,
+        parent_commit_ids: record.parent_commit_ids,
+        created_at: record.created_at,
     }))
 }
 
@@ -660,11 +649,7 @@ mod tests {
             &mut writes,
             &CommitStateManifest {
                 commit_id,
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                commit_change_id: change_id("retained-payload-authority-change"),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: ts("2026-01-01T00:00:00Z"),
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
                     rows: 0,
@@ -704,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_node_rejects_projection_without_commit_state_authority() {
+    async fn load_node_serves_projection_without_commit_state_authority() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
@@ -724,12 +709,6 @@ mod tests {
                 commit_id.as_uuid().as_bytes(),
             )),
         );
-        writes.delete(
-            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
-            StorageKey(bytes::Bytes::copy_from_slice(
-                commit_id.as_uuid().as_bytes(),
-            )),
-        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -739,56 +718,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let error = CommitGraphContext::new()
+        let node = CommitGraphContext::new()
             .reader(read)
             .load_node(&commit_id)
             .await
-            .expect_err("a changelog projection cannot replace missing authority");
-        assert!(error.message.contains("has no commit-state authority"));
-    }
-
-    #[tokio::test]
-    async fn load_node_rejects_changelog_projection_drift() {
-        let storage = StorageAdapter::new(Memory::new());
-        append_changes(
-            &storage,
-            &[commit_change(
-                "drift-authority-change",
-                "drift-authority",
-                &[],
-                &[],
-            )],
-        )
-        .await;
-        let commit_id = commit_id("drift-authority");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("authority read should open");
-        let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
-            .await
-            .expect("authority should load")
-            .expect("authority should exist");
-        drop(read);
-        manifest.commit_change_id = change_id("different-authority-change");
-        let mut writes = storage.new_write_set();
-        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
-            .expect("drifted but structurally valid authority should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("drifted authority should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = CommitGraphContext::new()
-            .reader(read)
-            .load_node(&commit_id)
-            .await
-            .expect_err("projection drift must fail closed");
-        assert!(error.message.contains("projection disagrees"));
+            .expect("commit metadata should remain readable")
+            .expect("changelog projection should produce a node");
+        assert_eq!(node.commit_id, commit_id);
     }
 
     #[tokio::test]
@@ -997,14 +933,10 @@ mod tests {
             .stage_append(ChangelogAppend {
                 changes: Vec::new(),
                 commits: vec![CommitRecord {
-                    format_version: 1,
+                    format_version: 2,
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
-                    tracked_state_rootless: true,
-                    tracked_state_rootless_depth: 1,
-                    tracked_state_rootless_rows: 3,
-                    tracked_state_rootless_bytes: 0,
                     change_id: change_id("selected-tombstone-commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
@@ -1071,11 +1003,7 @@ mod tests {
             &mut writes,
             &CommitStateManifest {
                 commit_id,
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                commit_change_id: change_id("selected-tombstone-commit-change"),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
                     rows: 3,
@@ -1504,16 +1432,10 @@ mod tests {
             }
 
             append.commits.push(CommitRecord {
-                format_version: 1,
+                format_version: 2,
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: u16::try_from(generation + 1)
-                    .expect("test commit generation should fit replay depth"),
-                tracked_state_rootless_rows: u64::try_from(members.len())
-                    .expect("test member count should fit u64"),
-                tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
@@ -1576,15 +1498,12 @@ mod tests {
             writes,
             &CommitStateManifest {
                 commit_id: record.commit_id,
-                generation: record.generation,
-                parent_commit_ids: record.parent_commit_ids.clone(),
-                commit_change_id: record.change_id,
-                account_id: record.account_id.clone(),
-                created_at: record.created_at,
+                change_account_id: record.account_id.clone(),
                 replay_debt: CommitStateReplayDebt {
-                    depth: record.tracked_state_rootless_depth,
-                    rows: record.tracked_state_rootless_rows,
-                    bytes: record.tracked_state_rootless_bytes,
+                    depth: u16::try_from(record.generation + 1)
+                        .expect("test generation should fit replay depth"),
+                    rows: u64::from(mutations.member_count),
+                    bytes: 0,
                 },
                 mutations,
                 touched_scope_filter: Default::default(),
@@ -1598,14 +1517,10 @@ mod tests {
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
         let change_id = format!("{commit_id}-change");
         append.commits.push(CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: true,
-            tracked_state_rootless_depth: 1,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),

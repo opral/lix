@@ -60,10 +60,12 @@ use tracing::Instrument as _;
 type RowIndex = usize;
 
 // Below this size, per-row HOT writes are cheaper and keep repeated ordinary
-// INSERT transactions at one point-addressable current-state lookup. Packed
-// bases are reserved for bulk publication where avoiding row write
-// amplification dominates the cost of retaining one immutable manifest.
-const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
+// INSERT transactions at one point-addressable current-state lookup. At 1K,
+// measured HOT publication still emitted one backend put per row, while the
+// immutable packed base removes that amplification without entering the
+// single-row path. Keep the crossover at a power-of-two boundary below that
+// representative bulk size while leaving ordinary point writes unchanged.
+const PACKED_CURRENT_BASE_MIN_ROWS: usize = 512;
 
 // Complete replacements retain an authoritative partition generation.
 // Ordinary non-empty ordered commits start bounded rootless intervals
@@ -243,6 +245,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
+    #[cfg(test)]
+    let seeded_reachability_queue =
+        crate::gc::ensure_reachability_queue_for_test(&*read, &mut writes).await?;
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
@@ -276,6 +281,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             )
         });
     let mut state_rows = prepared_writes.state_rows;
+    #[cfg(feature = "storage-benches")]
+    state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_AUTHORITY);
     // Explicit branch publications are the final commit-planning consumer of
     // decoded JSON. Project them into one typed batch map before dropping the
     // shared parsed column; every later materialization stage consumes this
@@ -755,6 +762,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
     let mut root_backed_branch_publications = BTreeSet::new();
+    let mut root_reachability_deltas = Vec::new();
     let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
@@ -768,6 +776,27 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
+        &mut root_reachability_deltas,
+    )
+    .await?;
+    #[cfg(test)]
+    if seeded_reachability_queue {
+        // The seed and first publication share this test-only bootstrap write
+        // set; the production initializer always commits the queue before any
+        // branch publication, so no delta can be lost in live repositories.
+        root_reachability_deltas.clear();
+    }
+    let checkpoint_roots = prepared_writes
+        .checkpoint_publications
+        .iter()
+        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
+        .collect::<Vec<_>>();
+    crate::gc::stage_reachability_delta_batch(
+        read,
+        &mut writes,
+        &root_reachability_deltas,
+        &checkpoint_roots,
+        &mut preconditions,
     )
     .await?;
     if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
@@ -802,6 +831,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &root_backed_branch_publications,
     )
     .await?;
+    #[cfg(feature = "storage-benches")]
+    state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_ROOT_PUBLICATION);
     if !staged_hot_heads.deferred_fresh_hot_plans.is_empty() {
         if staged_hot_heads.deferred_fresh_hot_plans.len() != 1 {
             return Err(LixError::new(
@@ -1022,6 +1053,7 @@ fn index_prepared_rows(rows: &PreparedStateBatch) -> Result<PreparedRowIndex, Li
 #[derive(Clone, Debug)]
 struct StagedChangelogCommit {
     record: CommitRecord,
+    replay_debt: CommitStateReplayDebt,
     change_count: usize,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
 }
@@ -1130,7 +1162,7 @@ async fn stage_changelog_commits(
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     external_parent_manifests: &mut BTreeMap<
         CommitId,
-        crate::tracked_state::PublishedCommitStateManifest,
+        crate::tracked_state::PublishedCommitStateTopology,
     >,
     active_account_id: &str,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
@@ -1170,7 +1202,7 @@ async fn stage_changelog_commits(
             )
         })?;
         let published =
-            crate::tracked_state::load_published_commit_state_manifest(read, *commit_id)
+            crate::tracked_state::load_published_commit_state_topology(read, *commit_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
@@ -1178,21 +1210,10 @@ async fn stage_changelog_commits(
                         format!("commit '{commit_id}' has no commit-state authority"),
                     )
                 })?;
-        let manifest = &*published;
-        // Replay debt is the durable layout authority. A rootless commit may
-        // later gain an immutable snapshot accelerator without changing its
-        // changelog topology projection.
-        let manifest_rootless = manifest.replay_debt.depth > 0;
-        if manifest.generation != record.generation
-            || manifest.parent_commit_ids != record.parent_commit_ids
-            || manifest.commit_change_id != record.change_id
-            || manifest.account_id != record.account_id
-            || manifest.created_at != record.created_at
-            || manifest_rootless != record.tracked_state_rootless
-            || manifest.replay_debt.depth != record.tracked_state_rootless_depth
-            || manifest.replay_debt.rows != record.tracked_state_rootless_rows
-            || manifest.replay_debt.bytes != record.tracked_state_rootless_bytes
-        {
+        // Replay debt is physical layout policy. Rootless commits remain
+        // bounded-replay layouts; rooted commits publish their canonical
+        // snapshot metadata inside immutable physical authority.
+        if published.commit_id() != record.commit_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -1200,10 +1221,11 @@ async fn stage_changelog_commits(
                 ),
             ));
         }
-        generations.insert(*commit_id, manifest.generation);
-        rootless_depths.insert(*commit_id, manifest.replay_debt.depth);
-        rootless_rows.insert(*commit_id, manifest.replay_debt.rows);
-        rootless_bytes.insert(*commit_id, manifest.replay_debt.bytes);
+        generations.insert(*commit_id, record.generation);
+        let replay_debt = published.replay_debt();
+        rootless_depths.insert(*commit_id, replay_debt.depth);
+        rootless_rows.insert(*commit_id, replay_debt.rows);
+        rootless_bytes.insert(*commit_id, replay_debt.bytes);
         external_parent_manifests.insert(*commit_id, published);
     }
     let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
@@ -1423,14 +1445,10 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 1,
+            format_version: 2,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            tracked_state_rootless: rootless_commit_ids.contains(&commit_row.commit_id),
-            tracked_state_rootless_depth: rootless_depths[&commit_row.commit_id],
-            tracked_state_rootless_rows: rootless_rows[&commit_row.commit_id],
-            tracked_state_rootless_bytes: rootless_bytes[&commit_row.commit_id],
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
@@ -1448,6 +1466,11 @@ async fn stage_changelog_commits(
             commit_row.commit_id,
             StagedChangelogCommit {
                 record,
+                replay_debt: CommitStateReplayDebt {
+                    depth: rootless_depths[&commit_row.commit_id],
+                    rows: rootless_rows[&commit_row.commit_id],
+                    bytes: rootless_bytes[&commit_row.commit_id],
+                },
                 change_count,
                 selected_change_batches: commit_row.selected_change_batches.clone(),
             },
@@ -2626,7 +2649,19 @@ async fn certify_complete_replacement_generations(
                         ),
                     )
                 })?;
-            if !record.tracked_state_rootless {
+            let manifest = crate::tracked_state::load_published_commit_state_topology(
+                read, commit_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "replacement generation parent '{commit_id}' has no physical authority"
+                    ),
+                )
+            })?;
+            if manifest.replay_debt().depth == 0 {
                 break Some(commit_id);
             }
             let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
@@ -2738,7 +2773,17 @@ async fn certify_ordered_journal_replacement_generations(
                         ),
                     )
                 })?;
-            if !record.tracked_state_rootless {
+            let manifest = crate::tracked_state::load_published_commit_state_topology(
+                read, commit_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("immutable replacement parent '{commit_id}' has no physical authority"),
+                )
+            })?;
+            if manifest.replay_debt().depth == 0 {
                 break Some(commit_id);
             }
             let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
@@ -3951,13 +3996,10 @@ async fn stage_tracked_head(
             .iter()
             .map(|delta| delta.schema_key)
             .collect::<BTreeSet<_>>();
-        let packed_guards_match = tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
-            && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
-        let can_publish_packed_current_base = !is_checkpoint_publication
+        let packed_current_base_candidate = !is_checkpoint_publication
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
             && staged.selected_change_batches.is_empty()
-            && packed_guards_match
             && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
             && tracked_deltas.iter().all(|delta| {
                 !delta.untracked
@@ -3971,9 +4013,120 @@ async fn stage_tracked_head(
             && untracked_deltas
                 .iter()
                 .all(|delta| !packed_schema_keys.contains(delta.schema_key));
+        // Identity sorting is useful only for a route that can actually
+        // publish a packed base. Keep ordinary point/small-batch commits on
+        // their allocation-free short circuit.
+        let packed_guards_match = packed_current_base_candidate
+            && !absence_guards.is_empty()
+            && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
+        let mut deltas = tracked_deltas.clone();
+        deltas.extend_from_slice(&untracked_deltas);
+        // Every absence guard above is derived from one of these exact
+        // transaction deltas. The fresh-file certificate likewise proves its
+        // complete file-scoped namespace absent. The branch-control CAS
+        // protects both proofs through publication.
+        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
+            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
+        let mut writer = tracked_head.writer(read, writes);
+        let exact_delete_candidate = !is_checkpoint_publication
+            && certified_fresh_plugin_file_id.is_none()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
+            && staged.selected_change_batches.is_empty()
+            && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && untracked_deltas.is_empty()
+            && tracked_deltas.iter().all(|delta| {
+                !delta.untracked
+                    && delta.deleted
+                    && delta.file_id.is_none()
+                    && delta.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && delta.commit_id == Some(root.commit_id)
+                    && delta.change_id.is_some()
+            });
+        let delete_generation = if exact_delete_candidate {
+            writer
+                .try_stage_exact_collection_delete_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.parent_commit_id.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "exact collection deletion lacks parent commit authority",
+                        )
+                    })?,
+                    root.commit_id,
+                    &tracked_deltas,
+                    working_diff_capture_checkpoint_commit_id,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_exact_collection_delete"
+                ))
+                .await?
+        } else {
+            None
+        };
+        let replacement_generation = if delete_generation.is_none()
+            && packed_current_base_candidate
+            && absence_guards.is_empty()
+            && untracked_deltas.is_empty()
+        {
+            writer
+                .try_stage_exact_collection_replacement_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.parent_commit_id.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "exact collection replacement lacks parent commit authority",
+                        )
+                    })?,
+                    root.commit_id,
+                    &tracked_deltas,
+                    entity_columnar_write_sets,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_exact_collection_replacement"
+                ))
+                .await?
+        } else {
+            None
+        };
+        let packed_generation = if delete_generation.is_none()
+            && replacement_generation.is_none()
+            && packed_current_base_candidate
+            && (packed_guards_match || absence_guards.is_empty())
+        {
+            writer
+                .try_stage_packed_insert_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &tracked_deltas,
+                    &absence_guards,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_packed_current_base"
+                ))
+                .await?
+        } else {
+            None
+        };
+        let packed_generation = delete_generation
+            .or(replacement_generation)
+            .or(packed_generation);
+        let can_publish_packed_current_base = packed_generation.is_some();
         tracing::debug!(
             target: "lix_perf",
             can_publish_packed_current_base,
+            packed_current_base_candidate,
+            exact_delete_candidate,
             tracked_delta_count = tracked_deltas.len(),
             packed_min_rows = PACKED_CURRENT_BASE_MIN_ROWS,
             untracked_delta_count = untracked_deltas.len(),
@@ -3986,15 +4139,6 @@ async fn stage_tracked_head(
             durable_predecessor_count = durable_predecessors.len(),
             "packed current-base route decision"
         );
-        let mut deltas = tracked_deltas.clone();
-        deltas.extend_from_slice(&untracked_deltas);
-        // Every absence guard above is derived from one of these exact
-        // transaction deltas. The fresh-file certificate likewise proves its
-        // complete file-scoped namespace absent. The branch-control CAS
-        // protects both proofs through publication.
-        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
-            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
-        let mut writer = tracked_head.writer(read, writes);
         let generation = if is_checkpoint_publication {
             let checkpoint_commit_id =
                 checkpoint_commit_id.expect("checkpoint publication has an epoch commit id");
@@ -4014,22 +4158,7 @@ async fn stage_tracked_head(
                     "lix.perf.materialization.tracked_head.stage_checkpoint"
                 ))
                 .await?
-        } else if can_publish_packed_current_base {
-            let generation = writer
-                .stage_packed_insert_current_base(
-                    &root.branch_id,
-                    parent_generation,
-                    root.commit_id,
-                    &tracked_deltas,
-                    &absence_guards,
-                    working_diff_capture_checkpoint_commit_id,
-                    &mut coverage,
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.materialization.tracked_head.stage_packed_current_base"
-                ))
-                .await?;
+        } else if let Some(generation) = packed_generation {
             if !untracked_deltas.is_empty() {
                 writer
                     .stage_current_state_with_working_diff(
@@ -4637,6 +4766,7 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
+    root_reachability_deltas: &mut Vec<crate::gc::RootReachabilityDelta>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     let mut publications = normal_controls
@@ -4805,6 +4935,21 @@ async fn stage_branch_head_control_publications(
             branch_id,
             observation.raw_token.clone(),
         )?);
+        let old_root = observation.control.map(|control| control.head_commit_id);
+        let new_root = desired.as_ref().map(|control| control.head_commit_id);
+        if old_root != new_root {
+            root_reachability_deltas.push(crate::gc::RootReachabilityDelta {
+                branch_id: branch_id.clone(),
+                old_root,
+                new_root,
+                old_control: observation.control,
+                new_control: *desired,
+                old_control_digest: crate::gc::root_control_digest_for_control(
+                    observation.control.as_ref(),
+                )?,
+                new_control_digest: crate::gc::root_control_digest_for_control(desired.as_ref())?,
+            });
+        }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
             None => stage_delete_branch_head_control(writes, branch_id)?,
@@ -5376,7 +5521,7 @@ fn stage_commit_state_manifests<'a, S>(
     snapshot_roots: &'a BTreeMap<CommitId, TrackedStateCommitRoot>,
     external_parent_manifests: &'a BTreeMap<
         CommitId,
-        crate::tracked_state::PublishedCommitStateManifest,
+        crate::tracked_state::PublishedCommitStateTopology,
     >,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
@@ -5451,7 +5596,7 @@ where
                     )
                     .await?
                 } else {
-                    crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
+                    crate::tracked_state::stage_current_state_scoped_ranges_from_published_topology_parent(
                         read,
                         writes,
                         external_parent,
@@ -5471,7 +5616,7 @@ where
                             .map(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged)
                             .or_else(|| {
                                 external_parent_manifests.get(parent_id).map(
-                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology,
                                 )
                             })
                             .ok_or_else(|| {
@@ -5491,7 +5636,7 @@ where
                     && !external_parent_manifests.contains_key(&source_id)
                 {
                     Some(
-                        crate::tracked_state::load_published_commit_state_manifest(read, source_id)
+                        crate::tracked_state::load_published_commit_state_topology(read, source_id)
                             .await?
                             .ok_or_else(|| {
                                 LixError::new(
@@ -5513,12 +5658,12 @@ where
                             .map(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged)
                             .or_else(|| {
                                 external_parent_manifests.get(&source_id).map(
-                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology,
                                 )
                             })
                             .or_else(|| {
                                 loaded_selected_source.as_ref().map(
-                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::PublishedTopology,
                                 )
                             })
                             .ok_or_else(|| {
@@ -5554,24 +5699,16 @@ where
             }
             let manifest = CommitStateManifest {
                 commit_id: record.commit_id,
-                generation: record.generation,
-                parent_commit_ids: record.parent_commit_ids.clone(),
-                commit_change_id: record.change_id,
-                account_id: record.account_id.clone(),
-                created_at: record.created_at,
+                change_account_id: record.account_id.clone(),
                 replay_debt: if rootless {
-                    CommitStateReplayDebt {
-                        depth: record.tracked_state_rootless_depth,
-                        rows: record.tracked_state_rootless_rows,
-                        bytes: record.tracked_state_rootless_bytes,
-                    }
+                    staged.replay_debt
                 } else {
                     CommitStateReplayDebt::default()
                 },
                 mutations,
                 touched_scope_filter,
                 current_state_scoped_ranges,
-                snapshot_root,
+                snapshot_root: snapshot_root.map(Box::new),
             };
             let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
                 crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
@@ -6408,7 +6545,7 @@ mod tests {
     );
     const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
-        "tracked_state.commit_state_manifest.v4",
+        "tracked_state.commit_state_manifest.v7",
     );
     // V11 has no tracked-head marker space. Keep the retired v10 ID here only
     // as a negative test sentinel: normal serving and staging must never read
@@ -6763,11 +6900,7 @@ mod tests {
             &mut writes,
             &CommitStateManifest {
                 commit_id,
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                commit_change_id: change_id("mixed-certified-commit"),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: timestamp,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
                     rows: 2,
@@ -6902,11 +7035,16 @@ mod tests {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
-        assert!(!record.tracked_state_rootless);
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("membership read should open");
+        let physical_state =
+            crate::tracked_state::load_commit_state_manifest(&membership_read, record.commit_id)
+                .await
+                .expect("physical state should load")
+                .expect("physical state should exist");
+        assert_eq!(physical_state.replay_debt, CommitStateReplayDebt::default());
         let change_ids =
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
@@ -8724,23 +8862,30 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(commits[0].generation, 0);
         assert_eq!(commits[1].generation, 1);
-        assert!(
-            commits.iter().all(|record| record.tracked_state_rootless),
-            "a staged child must inherit its first parent's rootless interval"
-        );
+        let authority_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("physical authority read should open");
+        let states =
+            crate::tracked_state::load_commit_state_manifests(&authority_read, &commit_ids)
+                .await
+                .expect("physical states should load")
+                .into_iter()
+                .map(|state| state.expect("physical state"))
+                .collect::<Vec<_>>();
         assert_eq!(
-            commits
+            states
                 .iter()
-                .map(|record| record.tracked_state_rootless_depth)
+                .map(|state| state.replay_debt.depth)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(commits[0].tracked_state_rootless_bytes > 0);
-        assert!(commits[1].tracked_state_rootless_bytes > commits[0].tracked_state_rootless_bytes);
+        assert!(states[0].replay_debt.bytes > 0);
+        assert!(states[1].replay_debt.bytes > states[0].replay_debt.bytes);
         assert_eq!(
-            commits
+            states
                 .iter()
-                .map(|record| record.tracked_state_rootless_rows)
+                .map(|state| state.replay_debt.rows)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
@@ -8818,12 +8963,11 @@ mod tests {
         assert!(rootless_commit_ids.is_empty());
         assert!(durable_root_rebuild_parents.is_empty());
         assert_eq!(staged_root_rebuild_commits.len(), commit_count - 1);
-        assert!(staged.values().all(|commit| {
-            !commit.record.tracked_state_rootless
-                && commit.record.tracked_state_rootless_depth == 0
-                && commit.record.tracked_state_rootless_rows == 0
-                && commit.record.tracked_state_rootless_bytes == 0
-        }));
+        assert!(
+            staged
+                .values()
+                .all(|commit| commit.replay_debt == Default::default())
+        );
     }
 
     #[tokio::test]

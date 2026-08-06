@@ -1,6 +1,7 @@
 use crate::LixError;
 use crate::gc::{
-    RepositoryGcPlan, load_checkpoint_gc_state, stage_checkpoint_gc_state, stage_repository_gc,
+    RepositoryGcPlan, load_checkpoint_gc_state, stage_checkpoint_gc_state,
+    stage_repository_gc_with_preconditions,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, Storage, StorageReadOptions, StorageWriteOptions,
@@ -32,14 +33,22 @@ where
             return Ok(None);
         }
         let mut writes = self.storage.new_write_set();
-        let plan = stage_repository_gc(read, &mut writes).await?;
+        let mut preconditions = Vec::new();
+        let plan =
+            stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions).await?;
         gc_state.mark_collected();
         stage_checkpoint_gc_state(&mut writes, &gc_state)?;
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
         let prepared_commit = self
             .storage
-            .prepare_write_set(writes, StorageWriteOptions::default())
+            .prepare_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
             .await?;
         let stats = commit_at_boundary(Some(&commit_boundary), || async move {
             let (_, stats) = prepared_commit.commit().await?;

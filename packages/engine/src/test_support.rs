@@ -538,32 +538,21 @@ fn stage_test_commit_state_manifest(
     mutations: CommitStateMutationInventory,
     snapshot_root: Option<TrackedStateCommitRoot>,
 ) -> Result<(), crate::LixError> {
-    let record = &staged.record;
     let replay_debt = if snapshot_root.is_some() {
         CommitStateReplayDebt::default()
     } else {
-        CommitStateReplayDebt {
-            depth: record.tracked_state_rootless_depth,
-            rows: record.tracked_state_rootless_rows,
-            bytes: record.tracked_state_rootless_bytes,
-        }
+        staged.replay_debt
     };
-    crate::tracked_state::stage_commit_state_manifest(
-        writes,
-        &CommitStateManifest {
-            commit_id: record.commit_id,
-            generation: record.generation,
-            parent_commit_ids: record.parent_commit_ids.clone(),
-            commit_change_id: record.change_id,
-            account_id: record.account_id.clone(),
-            created_at: record.created_at,
-            replay_debt,
-            mutations,
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root,
-        },
-    )
+    let manifest = CommitStateManifest {
+        commit_id: staged.record.commit_id,
+        change_account_id: staged.record.account_id.clone(),
+        replay_debt,
+        mutations,
+        touched_scope_filter: Default::default(),
+        current_state_scoped_ranges: None,
+        snapshot_root: snapshot_root.map(Box::new),
+    };
+    crate::tracked_state::stage_commit_state_manifest(writes, &manifest)
 }
 
 #[cfg(test)]
@@ -673,23 +662,22 @@ async fn stage_test_changelog_commit(
             commit_ids: &typed_parent_ids,
         })
         .await?;
+    let parent_manifests =
+        crate::tracked_state::load_commit_state_manifests(&*read, &typed_parent_ids).await?;
+    let first_parent_debt = parent_manifests
+        .first()
+        .and_then(Option::as_ref)
+        .map_or(CommitStateReplayDebt::default(), |manifest| {
+            manifest.replay_debt
+        });
     let tracked_state_rootless_depth = if tracked_state_rootless {
-        parent_records
-            .iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .map_or(1, |record| {
-                record.tracked_state_rootless_depth.saturating_add(1)
-            })
+        first_parent_debt.depth.saturating_add(1)
     } else {
         0
     };
     let tracked_state_rootless_rows = if tracked_state_rootless {
-        parent_records
-            .iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .map_or(0, |record| record.tracked_state_rootless_rows)
+        first_parent_debt
+            .rows
             .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX))
     } else {
         0
@@ -730,14 +718,10 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
-        format_version: 1,
+        format_version: 2,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,
-        tracked_state_rootless,
-        tracked_state_rootless_depth,
-        tracked_state_rootless_rows,
-        tracked_state_rootless_bytes,
         change_id: typed_commit_change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
@@ -748,12 +732,18 @@ async fn stage_test_changelog_commit(
     change_commit_ids.sort_by_key(|(row_index, _)| *row_index);
     Ok(TestStagedChangelogCommit {
         record,
+        replay_debt: CommitStateReplayDebt {
+            depth: tracked_state_rootless_depth,
+            rows: tracked_state_rootless_rows,
+            bytes: tracked_state_rootless_bytes,
+        },
         change_commit_ids,
     })
 }
 
 struct TestStagedChangelogCommit {
     record: CommitRecord,
+    replay_debt: CommitStateReplayDebt,
     change_commit_ids: Vec<(usize, CommitId)>,
 }
 
