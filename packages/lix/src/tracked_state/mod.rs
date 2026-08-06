@@ -21,7 +21,8 @@ mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
-    load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
+    CommitRootRebuildDelta, CommitRootRebuildPlan, load_rebuild_plan_frontier,
+    stage_rebuild_plan_with_writer,
 };
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, TrackedStateTransientRebuildState,

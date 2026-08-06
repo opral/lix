@@ -7224,9 +7224,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("root reuse read should open");
-        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plan_frontier(
             &read,
-            "rootless-child",
+            &[CommitId::for_test_label("rootless-child")],
             true,
         )
         .await
@@ -7269,9 +7269,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("root reuse read should open");
-        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+        let error = crate::tracked_state::commit_root_rebuild::load_rebuild_plan_frontier(
             &read,
-            "rootless-child",
+            &[CommitId::for_test_label("rootless-child")],
             true,
         )
         .await
@@ -7344,9 +7344,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("hot reuse read should open");
-        let hot_error = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+        let hot_error = crate::tracked_state::commit_root_rebuild::load_rebuild_plan_frontier(
             &read,
-            "target",
+            &[CommitId::for_test_label("target")],
             true,
         )
         .await
@@ -8466,9 +8466,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("fixture rebuild read should open");
-        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plan_frontier(
             &read,
-            "child",
+            &[CommitId::for_test_label("child")],
             true,
         )
         .await
