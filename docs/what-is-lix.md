@@ -10,17 +10,21 @@ Lix is an embeddable library, not a CLI. Tools and agents work with normal files
 
 Unlike Git, Lix tracks the entities inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 
+## Prime use cases
+
+### Safe workspaces for agents
+
+Give each agent task its own branch. The agent can edit files and SQL rows without changing the main branch. Preview the result, then merge or discard it.
+
+See [Lix for AI Agents](./lix-for-ai-agents.md).
+
+### File-based apps with SQL and version control
+
+Build editors, knowledge bases, document workflows, and other file-based apps. Existing tools keep using files while your app uses SQL for queries and transactions. Lix adds history, rollback, branches, merging, and review.
+
 ## What Lix provides
 
-```text
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│    FILESYSTEM    │     │     DATABASE     │     │  VERSION CONTROL │
-│                  │  ×  │                  │  ×  │                  │
-│ normal files for │     │ SQL queries,     │     │ branches, review │
-│ existing tools   │     │ schemas, and     │     │ history, merge,  │
-│ and agents       │     │ ACID transactions│     │ and rollback     │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-```
+<img src="../website/public/assets/filesystem-database-version-control.svg" alt="Lix combines a filesystem, a database, and version control" width="760" />
 
 ## Files become queryable rows
 
@@ -36,18 +40,6 @@ The JavaScript SDK includes Markdown and CSV plugins. Other formats, including J
 
 App data does not have to come from a file. Register a schema, and Lix creates a SQL table with the same history and branches.
 
-## Prime use cases
-
-### Safe workspaces for agents
-
-Give each agent task its own branch. The agent can edit files and SQL rows without changing the main branch. Preview the result, then merge or discard it.
-
-See [Lix for AI Agents](./lix-for-ai-agents.md).
-
-### File-based apps with SQL and version control
-
-Build editors, knowledge bases, document workflows, and other file-based apps. Existing tools keep using files while your app uses SQL for queries and transactions. Lix adds history, rollback, branches, merging, and review.
-
 ## Pluggable storage
 
 Storage is pluggable. Run Lix in memory, on the local filesystem, or against a server backed by S3. This makes Lix easy to embed and scale. See [Persistence and Storage](./persistence.md).
@@ -58,7 +50,7 @@ Storage is pluggable. Run Lix in memory, on the local filesystem, or against a s
 
 Lix supports local and remote repositories with the same API.
 
-Run Lix inside your app, for example with `LocalFilesystem`:
+Run Lix on top of a local filesystem:
 
 ```ts
 import { LocalFilesystem, openLix } from "@lix-js/sdk";

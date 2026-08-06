@@ -1,0 +1,36 @@
+<svg viewBox="0 0 880 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lix combines a filesystem, a database, and version control" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <rect x="0.75" y="0.75" width="878.5" height="218.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+
+  <!-- filesystem -->
+  <rect x="40" y="36" width="232" height="148" rx="8" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <path d="M145 60 a2 2 0 0 1 2 -2 h6 l2.5 3 h9.5 a2 2 0 0 1 2 2 v9 a2 2 0 0 1 -2 2 h-18 a2 2 0 0 1 -2 -2 Z" fill="none" stroke="#8A8F96" stroke-width="1.5" stroke-linejoin="round"/>
+  <line x1="151" y1="68.5" x2="161" y2="68.5" stroke="#07B6D5" stroke-width="1.5" stroke-linecap="round"/>
+  <text x="156" y="103" font-size="12" letter-spacing="1.2" fill="#15171B" text-anchor="middle">FILESYSTEM</text>
+  <text x="156" y="127" font-size="12" fill="#6B7076" text-anchor="middle">normal files for</text>
+  <text x="156" y="145" font-size="12" fill="#6B7076" text-anchor="middle">tools and agents</text>
+
+  <text x="298" y="115" font-size="15" fill="#8A8F96" text-anchor="middle">×</text>
+
+  <!-- database -->
+  <rect x="324" y="36" width="232" height="148" rx="8" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <ellipse cx="440" cy="58" rx="9" ry="3" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <path d="M431 58 V73 C431 74.7 435 76 440 76 C445 76 449 74.7 449 73 V58" fill="none" stroke="#8A8F96" stroke-width="1.5"/>
+  <path d="M431 65.5 C431 67.2 435 68.5 440 68.5 C445 68.5 449 67.2 449 65.5" fill="none" stroke="#C9C7BF" stroke-width="1.5"/>
+  <line x1="436" y1="72" x2="444" y2="72" stroke="#07B6D5" stroke-width="1.5" stroke-linecap="round"/>
+  <text x="440" y="103" font-size="12" letter-spacing="1.2" fill="#15171B" text-anchor="middle">DATABASE</text>
+  <text x="440" y="127" font-size="12" fill="#6B7076" text-anchor="middle">SQL, schemas, and</text>
+  <text x="440" y="145" font-size="12" fill="#6B7076" text-anchor="middle">ACID transactions</text>
+
+  <text x="582" y="115" font-size="15" fill="#8A8F96" text-anchor="middle">×</text>
+
+  <!-- version control -->
+  <rect x="608" y="36" width="232" height="148" rx="8" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <line x1="708" y1="74" x2="740" y2="74" stroke="#C9C7BF" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M714 74 C718 74 718 58 724 58 C730 58 730 74 734 74" fill="none" stroke="#07B6D5" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="710" cy="74" r="2.2" fill="#8A8F96"/>
+  <circle cx="724" cy="58" r="2.2" fill="#07B6D5"/>
+  <circle cx="738" cy="74" r="2.2" fill="#8A8F96"/>
+  <text x="724" y="103" font-size="12" letter-spacing="1.2" fill="#15171B" text-anchor="middle">VERSION CONTROL</text>
+  <text x="724" y="127" font-size="12" fill="#6B7076" text-anchor="middle">branches, history,</text>
+  <text x="724" y="145" font-size="12" fill="#6B7076" text-anchor="middle">review, rollback</text>
+</svg>
