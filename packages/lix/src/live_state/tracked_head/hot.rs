@@ -5420,6 +5420,7 @@ where
             &self.store,
             branch_id,
             epoch.checkpoint_commit_id,
+            control.head_commit_id,
             generation,
             epoch.coverage,
             &request.filter,
@@ -9368,6 +9369,50 @@ fn packed_working_diff_version(
     }
 }
 
+/// Returns whether every packed base is covered by an authenticated commit
+/// mutation certificate. The certificate is only a route admission proof;
+/// the immutable tracked-state roots remain the sole row/value authority.
+async fn packed_bases_are_source_certified(
+    store: &(impl StorageAdapterRead + ?Sized),
+    packed_refs: &[PackedCurrentBaseRef],
+) -> Result<bool, LixError> {
+    if packed_refs.is_empty() {
+        return Ok(false);
+    }
+    for base_ref in packed_refs {
+        let Some(certificate) = crate::tracked_state::load_commit_delta_selection_certificate(
+            store,
+            base_ref.commit_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        if certificate.member_count == 0
+            || (certificate.direct_segment_row_counts.is_empty()
+                && certificate.selected_source_commit_id.is_none())
+        {
+            return Ok(false);
+        }
+        if let Some(source_commit_id) = certificate.selected_source_commit_id {
+            let Some(source) = crate::tracked_state::load_commit_delta_selection_certificate(
+                store,
+                source_commit_id,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            if source.selected_source_commit_id.is_some() {
+                return Err(head_value_error(
+                    "selected-source mutation authority cannot alias another source",
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -9375,6 +9420,7 @@ async fn hot_working_diff_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     checkpoint_commit_id: CommitId,
+    head_commit_id: CommitId,
     generation: CommitId,
     expected_coverage: WorkingDiffIndexCoverage,
     filter: &TrackedStateFilter,
@@ -9384,6 +9430,24 @@ async fn hot_working_diff_entries(
         .into_iter()
         .filter(|base| base.checkpoint_commit_id == Some(checkpoint_commit_id))
         .collect::<Vec<_>>();
+    if packed_bases_are_source_certified(store, &packed_refs).await? {
+        let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+        let diff = reader
+            .diff_commits(
+                &checkpoint_commit_id.to_string(),
+                &head_commit_id.to_string(),
+                &TrackedStateDiffRequest {
+                    filter: filter.clone(),
+                    retain_payloads: true,
+                },
+            )
+            .await?;
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_source_certified_scan_elision(diff.entries.len());
+        return Ok(Some(diff.entries));
+    }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_checkpoint_source_scan_fallback();
     if packed_refs.is_empty() && !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
         return hot_working_diff_entries_for_finite_filter(
             store,

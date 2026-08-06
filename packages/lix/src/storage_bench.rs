@@ -63,6 +63,9 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINT_SOURCE_CERTIFIED_SCAN_ELISIONS: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINT_SOURCE_CERTIFIED_ROWS: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINT_SOURCE_SCAN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -206,6 +209,42 @@ pub fn take_crud_ownership_accounting() -> CrudOwnershipAccounting {
             CRUD_OWNERSHIP_TRANSFER_COUNTERS[transfer_start + 3].swap(0, Ordering::Relaxed);
     }
     CrudOwnershipAccounting { stages, transfers }
+}
+
+/// Operation-scoped accounting for the authenticated checkpoint source
+/// certificate.  The storage adapter benchmark owns backend get/scan/byte
+/// accounting; these counters identify whether a skipped mutation-directory
+/// expansion was replaced by a bounded certificate read rather than hidden
+/// point/scan work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointSourceScanAccounting {
+    pub certified_scan_elisions: u64,
+    pub certified_rows: u64,
+    pub source_scan_fallbacks: u64,
+}
+
+pub fn begin_checkpoint_source_scan_accounting() {
+    CHECKPOINT_SOURCE_CERTIFIED_SCAN_ELISIONS.store(0, Ordering::Relaxed);
+    CHECKPOINT_SOURCE_CERTIFIED_ROWS.store(0, Ordering::Relaxed);
+    CHECKPOINT_SOURCE_SCAN_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn record_checkpoint_source_certified_scan_elision(rows: usize) {
+    CHECKPOINT_SOURCE_CERTIFIED_SCAN_ELISIONS.fetch_add(1, Ordering::Relaxed);
+    CHECKPOINT_SOURCE_CERTIFIED_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_checkpoint_source_scan_fallback() {
+    CHECKPOINT_SOURCE_SCAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_checkpoint_source_scan_accounting() -> CheckpointSourceScanAccounting {
+    CheckpointSourceScanAccounting {
+        certified_scan_elisions: CHECKPOINT_SOURCE_CERTIFIED_SCAN_ELISIONS
+            .swap(0, Ordering::Relaxed),
+        certified_rows: CHECKPOINT_SOURCE_CERTIFIED_ROWS.swap(0, Ordering::Relaxed),
+        source_scan_fallbacks: CHECKPOINT_SOURCE_SCAN_FALLBACKS.swap(0, Ordering::Relaxed),
+    }
 }
 
 pub(crate) fn record_crud_write_set_arena(writes: &StorageWriteSet) {
