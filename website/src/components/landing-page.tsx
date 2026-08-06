@@ -249,9 +249,84 @@ const whatYouGet = [
     ),
   },
   {
+    title: "Real-time collaboration",
+    description:
+      "Companies work live, not in pull requests. People and agents share a repository and see changes as they happen.",
+    icon: (
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <rect
+          x="18"
+          y="10"
+          width="44"
+          height="36"
+          rx="4"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <line
+          x1="26"
+          y1="20"
+          x2="54"
+          y2="20"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+        <line
+          x1="26"
+          y1="28"
+          x2="46"
+          y2="28"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+        <path d="M32 34 L32 42 L38 38.5 Z" fill="#07B6D5" />
+        <path d="M50 24 L50 32 L56 28.5 Z" fill="#8A8F96" />
+      </svg>
+    ),
+  },
+  {
+    title: "Checkpoints instead of commits",
+    description:
+      "Non-developers expect automatic saving, not commits. Lix records every change; a checkpoint marks a state you want to return to.",
+    icon: (
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <line
+          x1="12"
+          y1="34"
+          x2="68"
+          y2="34"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+        <circle cx="20" cy="34" r="2.5" fill="#C9C7BF" />
+        <circle cx="32" cy="34" r="2.5" fill="#C9C7BF" />
+        <circle cx="44" cy="34" r="2.5" fill="#C9C7BF" />
+        <circle cx="56" cy="34" r="3.5" fill="#07B6D5" />
+        <line
+          x1="56"
+          y1="30"
+          x2="56"
+          y2="16"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+        <path
+          d="M56 16 L66 19 L56 22 Z"
+          fill="rgba(7,182,213,0.14)"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+          strokeLinejoin="round"
+        />
+      </svg>
+    ),
+  },
+  {
     title: "Pluggable storage",
     description:
-      "Git assumes a local disk. Lix embeds in your app and runs on storage adapters: in memory, on the filesystem, or on object storage such as S3.",
+      "Lix runs on pluggable storage: in memory, on the local filesystem, or on S3. Git assumes a POSIX computer.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
@@ -302,81 +377,6 @@ const whatYouGet = [
           fill="none"
           stroke="#C9C7BF"
           strokeWidth="1.5"
-        />
-      </svg>
-    ),
-  },
-  {
-    title: "Real-time collaboration",
-    description:
-      "Companies work live, not in pull requests. People and agents share a repository and see changes as they happen.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="18"
-          y="10"
-          width="44"
-          height="36"
-          rx="4"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <line
-          x1="26"
-          y1="20"
-          x2="54"
-          y2="20"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <line
-          x1="26"
-          y1="28"
-          x2="46"
-          y2="28"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <path d="M32 34 L32 42 L38 38.5 Z" fill="#07B6D5" />
-        <path d="M50 24 L50 32 L56 28.5 Z" fill="#8A8F96" />
-      </svg>
-    ),
-  },
-  {
-    title: "Checkpoints instead of commits",
-    description:
-      "People and agents do not write commit messages. Lix records every change automatically; a checkpoint marks a state you want to return to.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <line
-          x1="12"
-          y1="34"
-          x2="68"
-          y2="34"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <circle cx="20" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="32" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="44" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="56" cy="34" r="3.5" fill="#07B6D5" />
-        <line
-          x1="56"
-          y1="30"
-          x2="56"
-          y2="16"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <path
-          d="M56 16 L66 19 L56 22 Z"
-          fill="rgba(7,182,213,0.14)"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-          strokeLinejoin="round"
         />
       </svg>
     ),
