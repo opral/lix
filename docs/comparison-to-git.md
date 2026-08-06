@@ -11,7 +11,7 @@ Keep your code in Git. Use Lix for the documents and app data your product needs
 ## When to use which
 
 - **Use Git** for source code repositories and developer workflows.
-- **Use Lix** when your app or agent must version files and data: diff a CSV row, merge branches of app data, restore an earlier state.
+- **Use Lix** when non-developers and agents change files and data: documents, spreadsheets, and app records. Lix is designed for their workflows: real-time collaboration, automatic change tracking, review, and restore — no commits, no CLI.
 - **Use both.** Code lives in a Git repository. Your product's files and data live in a Lix repository. They do not conflict.
 
 ## What Lix adds over Git

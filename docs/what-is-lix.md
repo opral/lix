@@ -54,6 +54,8 @@ Build editors, knowledge bases, document workflows, and other file-based apps. E
 
 Lix has pluggable storage, which makes it easy to embed and scale: run it in memory, on the local filesystem, or against a server backed by S3. See [Persistence and Storage](./persistence.md).
 
+<img src="../website/public/assets/pluggable-storage.svg" alt="Lix runs in your app on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
+
 Run Lix inside your app, for example with `LocalFilesystem`:
 
 ```ts
