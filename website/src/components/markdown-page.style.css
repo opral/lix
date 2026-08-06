@@ -424,6 +424,16 @@
 .markdown-wc-body .mwc-lang-tab svg {
   display: block;
   flex-shrink: 0;
+  filter: grayscale(1);
+  opacity: 0.55;
+  transition:
+    filter 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.markdown-wc-body .mwc-lang-tab:hover svg {
+  filter: none;
+  opacity: 1;
 }
 
 .markdown-wc-body a.mwc-lang-tab:hover {
