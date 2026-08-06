@@ -356,6 +356,21 @@ where
         self.session.execute_batch(statements).await
     }
 
+    /// Executes one prepared DML statement shape for a rectangular parameter
+    /// page in one atomic transaction. The SQL is planned once and each
+    /// parameter row produces one result in input order. This is the public
+    /// bulk-write contract used by generated/transport callers; unsupported
+    /// shapes fail closed rather than degrading to per-row SQL execution.
+    pub async fn execute_prepared_dml_batch(
+        &self,
+        sql: Arc<str>,
+        parameter_rows: Arc<[Arc<[Value]>]>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session
+            .execute_prepared_dml_batch(sql, parameter_rows)
+            .await
+    }
+
     pub async fn execute_batch_with_options(
         &self,
         statements: &[ExecuteBatchStatement],

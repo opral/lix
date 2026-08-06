@@ -1232,7 +1232,7 @@ async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
         })
         .collect::<Vec<_>>();
     let results = session
-        .execute_homogeneous_write_batch(
+        .execute_prepared_dml_batch(
             Arc::<str>::from(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, lix_json($2), true)",
             ),

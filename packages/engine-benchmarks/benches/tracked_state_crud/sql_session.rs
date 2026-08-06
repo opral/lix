@@ -162,6 +162,7 @@ enum FixtureShape {
 enum UpdateWorkload {
     Transaction(Vec<String>),
     ExecuteBatch(Vec<ExecuteBatchStatement>),
+    PreparedDml(SharedParameterBatch),
 }
 
 impl UntrackedFixture {
@@ -684,7 +685,7 @@ where
             lix_engine::storage_bench::take_certified_entity_insert_parameter_batch_executions();
         let affected = self
             .session
-            .execute_homogeneous_write_batch(
+            .execute_prepared_dml_batch(
                 Arc::from(BOUND_INSERT_ALL_SQL),
                 Arc::clone(&self.bound_insert_all_batch),
             )
@@ -759,7 +760,7 @@ where
         }
         let affected = self
             .session
-            .execute_homogeneous_write_batch(
+            .execute_prepared_dml_batch(
                 Arc::from(BOUND_SEED_JSON_SQL),
                 Arc::clone(&self.bound_seed_json_batch),
             )
@@ -850,7 +851,7 @@ where
         ] {
             let affected = self
                 .session
-                .execute_homogeneous_write_batch(Arc::from(sql), parameter_rows.into())
+                .execute_prepared_dml_batch(Arc::from(sql), parameter_rows.into())
                 .await
                 .unwrap_or_else(|error| {
                     panic!("execute typed OLAP mutation batch '{sql}': {error:?}")
@@ -1020,16 +1021,41 @@ where
         let expected_rows = match &self.update_all_workload {
             UpdateWorkload::Transaction(statements) => statements.len(),
             UpdateWorkload::ExecuteBatch(_) => self.row_count,
+            UpdateWorkload::PreparedDml(rows) => rows.len(),
         };
-        let affected = match &self.update_all_workload {
-            UpdateWorkload::Transaction(statements) => {
-                Box::pin(execute_many_in_transaction(&self.session, statements)).await
-            }
+        let affected: u64 = match &self.update_all_workload {
+            UpdateWorkload::Transaction(statements) => self
+                .session
+                .execute_batch(
+                    &statements
+                        .iter()
+                        .map(|sql| ExecuteBatchStatement {
+                            sql: sql.clone(),
+                            params: Vec::new(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .expect("execute tracked-state CRUD scalar SQL batch")
+                .into_iter()
+                .map(|result| result.rows_affected())
+                .sum(),
             UpdateWorkload::ExecuteBatch(statements) => self
                 .session
                 .execute_batch(statements)
                 .await
                 .expect("execute tracked-state CRUD SQL batch")
+                .into_iter()
+                .map(|result| result.rows_affected())
+                .sum(),
+            UpdateWorkload::PreparedDml(parameter_rows) => self
+                .session
+                .execute_prepared_dml_batch(
+                    Arc::from(BOUND_UPDATE_ALL_SQL),
+                    Arc::clone(parameter_rows),
+                )
+                .await
+                .expect("execute tracked-state CRUD prepared DML batch")
                 .into_iter()
                 .map(|result| result.rows_affected())
                 .sum(),
@@ -1056,7 +1082,7 @@ where
         };
         let results = self
             .session
-            .execute_homogeneous_write_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows)
+            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows)
             .await
             .expect("execute tracked-state CRUD bound update batch");
         let affected = results
@@ -1086,7 +1112,7 @@ where
         };
         let results = self
             .session
-            .execute_homogeneous_write_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows.into())
+            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows.into())
             .await
             .expect("execute spread tracked-state CRUD bound update batch");
         let affected = results
@@ -1589,16 +1615,36 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
                             rows.len()
                         )
                     })
-                })
-                .unwrap_or(rows.len());
-            assert!(
-                (1..=rows.len()).contains(&scalar_rows),
-                "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
-                rows.len()
-            );
-            UpdateWorkload::Transaction(rows[..scalar_rows].iter().map(update_row_sql).collect())
+                });
+            if let Some(scalar_rows) = scalar_rows {
+                assert!(
+                    (1..=rows.len()).contains(&scalar_rows),
+                    "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
+                    rows.len()
+                );
+                UpdateWorkload::Transaction(
+                    rows[..scalar_rows].iter().map(update_row_sql).collect(),
+                )
+            } else {
+                UpdateWorkload::PreparedDml(prepared_update_rows(rows))
+            }
         }
     }
+}
+
+fn prepared_update_rows(rows: &[WorkloadRow]) -> SharedParameterBatch {
+    rows.iter()
+        .map(|row| {
+            Arc::<[Value]>::from(
+                vec![
+                    Value::Text(row.updated_value_json.clone()),
+                    Value::Text(row.path.clone()),
+                ]
+                .into_boxed_slice(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 fn parameterized_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
@@ -1767,32 +1813,6 @@ where
         .execute(sql, &[])
         .await
         .expect("execute tracked-state crud SQL")
-}
-
-async fn execute_many_in_transaction<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
-    statements: &[String],
-) -> u64
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let mut transaction = session
-        .begin_transaction()
-        .await
-        .expect("begin tracked-state CRUD transaction");
-    let mut affected = 0;
-    for sql in statements {
-        affected += transaction
-            .execute(sql, &[])
-            .await
-            .expect("execute tracked-state CRUD transaction SQL")
-            .rows_affected();
-    }
-    transaction
-        .commit()
-        .await
-        .expect("commit tracked-state CRUD transaction");
-    affected
 }
 
 fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {

@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use zip::write::SimpleFileOptions;
@@ -622,6 +623,30 @@ fn execute_statements_as_transaction<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    // Git replay commonly emits one prepared write shape for a whole commit
+    // chunk. Keep that shape and its parameter rows owned once so the engine
+    // can plan it once and lower the complete page into the canonical
+    // mutation arena. Mixed-shape commits retain execute_batch's sequential
+    // statement semantics.
+    if let Some(first) = statements.first()
+        && statements.iter().all(|statement| {
+            statement.sql == first.sql && statement.params.len() == first.params.len()
+        })
+    {
+        let sql = Arc::<str>::from(first.sql.as_str());
+        let parameter_rows = statements
+            .iter()
+            .map(|statement| Arc::<[Value]>::from(statement.params.clone().into_boxed_slice()))
+            .collect::<Vec<_>>();
+        let prepared_rows = Arc::<[Arc<[Value]>]>::from(parameter_rows.into_boxed_slice());
+        db::block_on(lix.execute_prepared_dml_batch(sql, prepared_rows)).map_err(|error| {
+            CliError::msg(format!(
+                "failed at commit {commit_sha} while executing prepared replay batch: {error}"
+            ))
+        })?;
+        return Ok(());
+    }
+
     let batch = statements
         .iter()
         .map(|statement| ExecuteBatchStatement {
