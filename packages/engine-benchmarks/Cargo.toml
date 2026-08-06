@@ -34,6 +34,7 @@ lix_storage_sqlite = { workspace = true, optional = true }
 object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
 slatedb = { version = "0.14.1", default-features = false, features = ["moka", "zstd"], optional = true }
 ulid = { version = "1.2.1", optional = true }
+uuid = "1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 duckdb = { version = "=1.10505.0", features = ["bundled"], optional = true }
 tpchgen = { version = "=3.0.0", optional = true }

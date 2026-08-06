@@ -19,10 +19,12 @@ use lix::storage_adapter::{
     StorageReadOptions, StorageScanOptions, StorageSpace, StorageSpaceId,
 };
 use lix::storage_bench::{
-    current_image_cas_oracle_accounting, layout_space_catalog, plan_repository_gc_for_bench,
+    CommitGraphBenchMode, current_image_cas_oracle_accounting, layout_space_catalog,
+    plan_repository_gc_for_bench, read_commit_graph_for_bench,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Category {
@@ -235,13 +237,37 @@ where
         .iter()
         .find(|(space, _)| space.name.starts_with("branch.head_control"))
         .map_or(0, |(_, accounting)| accounting.rows);
+    let branch_space = inventory_spaces()
+        .into_iter()
+        .find(|space| space.name.starts_with("branch.head_control"))
+        .ok_or("branch control space is absent from inventory catalog")?;
+    let branch_values = scan_full_values(&read, branch_space).await?;
+    if branch_values.len() != branch_rows as usize {
+        return Err("branch control scan disagrees with space row count".into());
+    }
+    let mut current_head_transitive_commits = 0_u64;
+    for value in branch_values {
+        let bytes: [u8; 16] = value
+            .get(..16)
+            .ok_or("branch control value is shorter than a commit id")?
+            .try_into()
+            .map_err(|_| "branch control head commit id has invalid width")?;
+        let commit_id = Uuid::from_bytes(bytes).to_string();
+        let graph =
+            read_commit_graph_for_bench(&storage, &commit_id, CommitGraphBenchMode::ReachableNodes)
+                .await?;
+        current_head_transitive_commits = current_head_transitive_commits
+            .checked_add(graph.nodes as u64)
+            .ok_or("current-head commit count overflow")?;
+    }
     let reachability_started = Instant::now();
     let gc = plan_repository_gc_for_bench(&storage).await?;
     let reachability_ms = reachability_started.elapsed().as_millis();
     writeln!(
         output,
-        "REACHABILITY\tcurrent_head_root_rows={}\tcurrent_head_transitive_commits=unavailable_public_bench_api\tretained_history_union_commits={}\tswept_commits={}\tswept_payloads={}\tgc_planner_writes_staged={}\tgc_planner_is_read_only=true",
+        "REACHABILITY\tcurrent_head_root_rows={}\tcurrent_head_transitive_commits={}\tretained_history_union_commits={}\tswept_commits={}\tswept_payloads={}\tgc_planner_writes_staged={}\tgc_planner_is_read_only=true",
         branch_rows,
+        current_head_transitive_commits,
         gc.live_commits,
         gc.swept_commits,
         gc.swept_payloads,
@@ -341,6 +367,54 @@ where
         inventory_ms, reachability_ms, cas_oracle_ms
     )?;
     Ok(())
+}
+
+async fn scan_full_values<R>(read: &R, space: StorageSpace) -> Result<Vec<Vec<u8>>, Box<dyn Error>>
+where
+    R: StorageAdapterRead,
+{
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut values = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        let last = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let lix::storage_adapter::StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(format!("space {} returned a key-only value", space.name).into());
+            };
+            values.push(value.to_vec());
+        }
+        if !page.value.has_more {
+            return Ok(values);
+        }
+        let Some(last) = last else {
+            return Err(
+                format!("space {} returned has_more with an empty page", space.name).into(),
+            );
+        };
+        if resume_after
+            .as_ref()
+            .is_some_and(|previous| last <= *previous)
+        {
+            return Err(format!("space {} returned a non-advancing cursor", space.name).into());
+        }
+        resume_after = Some(last);
+    }
 }
 
 fn inventory_spaces() -> Vec<StorageSpace> {

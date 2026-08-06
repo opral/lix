@@ -3490,6 +3490,7 @@ dependencies = [
  "tpchgen",
  "tracing-subscriber",
  "ulid",
+ "uuid",
  "xxhash-rust",
  "zstd",
 ]
