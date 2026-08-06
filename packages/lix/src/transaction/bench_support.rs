@@ -386,7 +386,7 @@ where
         .writer(&read, &mut writes)
         .stage_current_state_with_working_diff(
             GLOBAL_BRANCH_ID,
-            Some(control.generation),
+            Some(control.tracked_generation),
             control.head_commit_id,
             &[CurrentStateDeltaRef {
                 schema_key: "lix_key_value",
@@ -604,7 +604,8 @@ async fn seed_visible_schema_rows<StorageImpl>(
     for (branch_id, _, _, change_id) in &branch_refs {
         let mut control = BranchHeadControl {
             head_commit_id: commit_id,
-            generation: commit_id,
+            tracked_generation: commit_id,
+            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,

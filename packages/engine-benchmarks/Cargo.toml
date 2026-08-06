@@ -177,6 +177,12 @@ path = "benches/undo_redo.rs"
 harness = false
 
 [[bench]]
+name = "undo_redo_storage"
+path = "benches/undo_redo_storage.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "entity_default_values"
 path = "benches/entity_default_values.rs"
 harness = false

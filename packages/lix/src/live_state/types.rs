@@ -649,6 +649,28 @@ impl MaterializedLiveStateExactBatch {
             .map(|ordinal| self.batch.row(ordinal as usize))
     }
 
+    pub(crate) fn filter(
+        &self,
+        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
+    ) -> Result<Self, crate::LixError> {
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(self.len());
+        let mut slots = Vec::with_capacity(self.len());
+        for index in 0..self.len() {
+            let Some(row) = self.row(index).filter(|row| keep(*row)) else {
+                slots.push(None);
+                continue;
+            };
+            let ordinal = u32::try_from(builder.push_ref(row, None)).map_err(|_| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "exact live-state result exceeds u32 rows",
+                )
+            })?;
+            slots.push(Some(ordinal));
+        }
+        Self::new(builder.finish(), slots)
+    }
+
     /// Consumes an aligned exact result into one compact owner containing only
     /// present rows in request order.
     ///

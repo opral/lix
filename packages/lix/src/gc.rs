@@ -2399,7 +2399,8 @@ mod tests {
             LixTimestamp::expect_parse("reachability delta test timestamp", "2026-01-01T00:00:00Z");
         let old_control = BranchHeadControl {
             head_commit_id: old_root,
-            generation: old_root,
+            tracked_generation: old_root,
+            untracked_generation: old_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -2409,7 +2410,8 @@ mod tests {
         };
         let new_control = BranchHeadControl {
             head_commit_id: new_root,
-            generation: new_root,
+            tracked_generation: new_root,
+            untracked_generation: new_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -3614,7 +3616,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_current_state_with_working_diff(
                 GLOBAL_BRANCH_ID,
-                Some(control.generation),
+                Some(control.tracked_generation),
                 control.head_commit_id,
                 &[CurrentStateDeltaRef {
                     schema_key: "gc_untracked_owner",

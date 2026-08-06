@@ -5,6 +5,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
     BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
+    untracked_lifecycle_generation,
 };
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
@@ -13,9 +14,11 @@ use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
-use crate::live_state::{CurrentStateDeltaRef, MaterializedLiveStateRow, TrackedHeadContext};
+use crate::live_state::{
+    CurrentStateDeltaRef, LiveStateReadDomain, MaterializedLiveStateRow, TrackedHeadContext,
+};
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::tracked_state::TrackedStateKey;
+use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 pub(crate) const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -92,13 +95,20 @@ pub(crate) async fn stage_sequence(
         [NormalizedJsonRef::from(&snapshot)],
     )?;
     let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
-    let mut working_diff_coverage = crate::live_state::WorkingDiffIndexCoverage::default();
+    let next_revision = control
+        .next_current_state_revision()?
+        .current_state_revision;
+    let next_generation = untracked_lifecycle_generation(
+        GLOBAL_BRANCH_ID,
+        control.untracked_generation,
+        next_revision,
+    );
     TrackedHeadContext::new()
         .writer(read, writes)
-        .stage_current_state_with_working_diff(
+        .stage_untracked_generation(
             GLOBAL_BRANCH_ID,
-            Some(control.generation),
-            control.head_commit_id,
+            control.untracked_generation,
+            next_generation,
             &[CurrentStateDeltaRef {
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
@@ -114,20 +124,16 @@ pub(crate) async fn stage_sequence(
                 columnar_base_coordinate: None,
             }],
             &std::collections::BTreeSet::new(),
-            None,
-            None,
-            None,
-            &mut working_diff_coverage,
         )
         .await?;
     // The hot-state mutation is fenced by an actual control-byte
     // change. Merely restaging the old control would let two writers both
     // satisfy the same CAS after the first write, losing one group update.
-    stage_branch_head_control(
-        writes,
-        GLOBAL_BRANCH_ID,
-        control.next_current_state_revision()?,
-    )?;
+    let mut next_control = control;
+    next_control.untracked_generation = next_generation;
+    next_control.current_state_revision = next_revision;
+    next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
+    stage_branch_head_control(writes, GLOBAL_BRANCH_ID, next_control)?;
     branch_head_control_precondition(GLOBAL_BRANCH_ID, observation.raw_token)
 }
 
@@ -152,13 +158,26 @@ async fn load_key_value_row(
         metadata: false,
     };
     let reader = TrackedHeadContext::new().reader(read);
+    let key_refs = keys
+        .iter()
+        .map(|key| TrackedStateKeyRef {
+            schema_key: key.schema_key.as_str(),
+            entity_pk: &key.entity_pk,
+            file_id: key.file_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
     let rows = reader
-        .load_projected_live_rows(GLOBAL_BRANCH_ID, control, &keys, &projection)
+        .load_projected_live_batch_refs_for_domain(
+            GLOBAL_BRANCH_ID,
+            control,
+            &key_refs,
+            &projection,
+            LiveStateReadDomain::Untracked,
+        )
         .await?;
     Ok(rows
-        .into_iter()
-        .next()
-        .flatten()
+        .row(0)
+        .map(|row| row.to_owned())
         .filter(|row| row.untracked && !row.deleted))
 }
 
@@ -396,7 +415,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_current_state_with_working_diff(
                 GLOBAL_BRANCH_ID,
-                Some(control.generation),
+                Some(control.tracked_generation),
                 control.head_commit_id,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,

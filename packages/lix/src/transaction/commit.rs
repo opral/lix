@@ -10,7 +10,7 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
     BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control,
+    stage_branch_head_control, stage_delete_branch_head_control, untracked_lifecycle_generation,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
@@ -1053,6 +1053,7 @@ struct StagedChangelogCommit {
     replay_debt: CommitStateReplayDebt,
     change_count: usize,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+    current_state_base_commit_id: Option<CommitId>,
 }
 
 struct StagedCommitDeltaIndex {
@@ -1470,6 +1471,7 @@ async fn stage_changelog_commits(
                 },
                 change_count,
                 selected_change_batches: commit_row.selected_change_batches.clone(),
+                current_state_base_commit_id: commit_row.current_state_base_commit_id,
             },
         );
     }
@@ -3345,6 +3347,15 @@ fn lifecycle_generation(
     CommitId::new(uuid::Uuid::from_bytes(bytes))
 }
 
+fn next_current_state_revision(current: u64) -> Result<u64, LixError> {
+    current.checked_add(1).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "branch current-state revision overflowed",
+        )
+    })
+}
+
 /// Stages the hot serving plane.  Serial normal commits mutate their current
 /// generation; every lifecycle discontinuity publishes a complete fresh
 /// generation before its branch control is made visible.
@@ -3575,12 +3586,44 @@ async fn stage_tracked_head(
                     certified_fresh_plugin_file_id,
                 )
             };
+        if let Some(control) = parent_control
+            .filter(|control| control.tracked_generation != control.untracked_generation)
+        {
+            let split_generation_guards = state_row_indices
+                .iter()
+                .filter_map(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    (row.branch_id.as_str() == root.branch_id
+                        && !row.untracked
+                        && row.snapshot.is_some())
+                    .then_some(TrackedStateKeyRef {
+                        schema_key: row.schema_key,
+                        file_id: row.file_id.map(crate::common::SharedStr::as_str),
+                        entity_pk: row.entity_pk,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let guards_to_check = if split_generation_guards.is_empty() {
+                &absence_guards
+            } else {
+                &split_generation_guards
+            };
+            if !guards_to_check.is_empty() {
+                reject_tracked_absence_guards_against_untracked(
+                    read,
+                    &root.branch_id,
+                    control,
+                    guards_to_check,
+                )
+                .await?;
+            }
+        }
         let parent_generation = match (root.parent_commit_id, parent_control) {
-            (_, Some(control)) if is_checkpoint_publication => Some(control.generation),
+            (_, Some(control)) if is_checkpoint_publication => Some(control.tracked_generation),
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id =>
             {
-                Some(control.generation)
+                Some(control.tracked_generation)
             }
             _ => None,
         };
@@ -3597,6 +3640,95 @@ async fn stage_tracked_head(
             .await?;
         }
 
+        if let Some(base_commit_id) = staged.current_state_base_commit_id {
+            if is_checkpoint_publication
+                || selected_materialization.is_some()
+                || !staged.selected_change_batches.is_empty()
+                || !untracked_deltas.is_empty()
+                || !engine_rows.is_empty()
+                || !explicit_branch_targets.is_empty()
+                || certified_fresh_plugin_file_id.is_some()
+                || host_certified_live_increments.contains_key(&root.branch_id)
+                || state_row_indices.is_empty()
+                || state_row_indices.iter().any(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    row.global
+                        || row.untracked
+                        || row.branch_id.as_str() != root.branch_id
+                        || row.commit_id != Some(root.commit_id)
+                })
+                || !state_row_indices.iter().any(|&row_index| {
+                    state_rows.row(row_index).schema_key
+                        != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                })
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified current-state base overlaps an unsupported publication shape",
+                ));
+            }
+            let generation =
+                lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
+            let mut coverage = WorkingDiffIndexCoverage::default();
+            let mut writer = tracked_head.writer(read, writes);
+            writer.stage_root_current_base(&root.branch_id, generation, base_commit_id);
+            let overlay_deltas = state_row_indices
+                .iter()
+                .filter_map(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    (row.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY)
+                        .then(|| current_state_delta_from_state_row(row))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !overlay_deltas.is_empty() {
+                writer
+                    .stage_current_state_with_certified_predecessors(
+                        &root.branch_id,
+                        Some(generation),
+                        root.commit_id,
+                        &overlay_deltas,
+                        &[],
+                        &BTreeSet::new(),
+                        None,
+                        None,
+                        None,
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_transition_base_overlay"
+                    ))
+                    .await?;
+            }
+            let mut control = normal_branch_head_control(root, parent_control, generation, None)?;
+            if let Some(parent) = parent_control
+                .filter(|parent| parent.tracked_generation == parent.untracked_generation)
+            {
+                let next_untracked_generation = untracked_lifecycle_generation(
+                    &root.branch_id,
+                    parent.untracked_generation,
+                    control.current_state_revision,
+                );
+                writer
+                    .stage_untracked_generation(
+                        &root.branch_id,
+                        parent.untracked_generation,
+                        next_untracked_generation,
+                        &[],
+                        &BTreeSet::new(),
+                    )
+                    .await?;
+                control.untracked_generation = next_untracked_generation;
+            }
+            control.note_schemas(
+                state_row_indices
+                    .iter()
+                    .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
+            );
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
+
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
             let generation =
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
@@ -3608,9 +3740,9 @@ async fn stage_tracked_head(
                     &root.branch_id,
                     generation,
                     final_tracked,
-                    parent_control.map(|control| control.generation),
+                    parent_control.map(|control| control.tracked_generation),
                     &[],
-                    &untracked_deltas,
+                    &[],
                     &owned_absence_guards,
                     checkpoint_commit_id,
                     &mut coverage,
@@ -3618,6 +3750,30 @@ async fn stage_tracked_head(
                 .await?;
             let mut control =
                 normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
+            if !untracked_deltas.is_empty() {
+                let previous_untracked_generation = parent_control
+                    .map(|parent| parent.untracked_generation)
+                    .unwrap_or(generation);
+                let next_revision = parent_control.map_or(Ok(0), |parent| {
+                    next_current_state_revision(parent.current_state_revision)
+                })?;
+                let next_untracked_generation = untracked_lifecycle_generation(
+                    &root.branch_id,
+                    previous_untracked_generation,
+                    next_revision,
+                );
+                tracked_head
+                    .writer(read, writes)
+                    .stage_untracked_generation(
+                        &root.branch_id,
+                        previous_untracked_generation,
+                        next_untracked_generation,
+                        &untracked_deltas,
+                        &BTreeSet::new(),
+                    )
+                    .await?;
+                control.untracked_generation = next_untracked_generation;
+            }
             control.reset_schema_presence();
             control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
@@ -3925,12 +4081,13 @@ async fn stage_tracked_head(
                 .iter()
                 .filter(|&&row_index| {
                     let row = state_rows.row(row_index);
-                    !host_certified_batch_owns_live_row(
-                        row,
-                        &root.branch_id,
-                        root.commit_id,
-                        host_certified_file_schemas,
-                    )
+                    !row.untracked
+                        && !host_certified_batch_owns_live_row(
+                            row,
+                            &root.branch_id,
+                            root.commit_id,
+                            host_certified_file_schemas,
+                        )
                 })
                 .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
                 .collect::<Result<Vec<_>, _>>()?
@@ -4016,8 +4173,7 @@ async fn stage_tracked_head(
         let packed_guards_match = packed_current_base_candidate
             && !absence_guards.is_empty()
             && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
-        let mut deltas = tracked_deltas.clone();
-        deltas.extend_from_slice(&untracked_deltas);
+        let deltas = tracked_deltas.clone();
         // Every absence guard above is derived from one of these exact
         // transaction deltas. The fresh-file certificate likewise proves its
         // complete file-scoped namespace absent. The branch-control CAS
@@ -4251,7 +4407,36 @@ async fn stage_tracked_head(
             generation,
             working_diff_checkpoint_commit_id,
         )?;
-        control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
+        if !untracked_deltas.is_empty() {
+            let previous_untracked_generation = parent_control
+                .map(|parent| parent.untracked_generation)
+                .unwrap_or(parent_generation);
+            let next_revision = parent_control.map_or(Ok(0), |parent| {
+                next_current_state_revision(parent.current_state_revision)
+            })?;
+            let next_untracked_generation = untracked_lifecycle_generation(
+                &root.branch_id,
+                previous_untracked_generation,
+                next_revision,
+            );
+            tracked_head
+                .writer(read, writes)
+                .stage_untracked_generation(
+                    &root.branch_id,
+                    previous_untracked_generation,
+                    next_untracked_generation,
+                    &untracked_deltas,
+                    &BTreeSet::new(),
+                )
+                .await?;
+            control.untracked_generation = next_untracked_generation;
+        }
+        control.note_schemas(
+            deltas
+                .iter()
+                .map(|delta| delta.schema_key)
+                .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
+        );
         insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
     }
 
@@ -4276,7 +4461,7 @@ async fn stage_tracked_head(
             .collect::<BTreeSet<_>>()
     };
     for branch_id in current_only_branches {
-        let control = observations
+        let mut control = observations
             .get(branch_id)
             .and_then(|observation| observation.control)
             .ok_or_else(|| {
@@ -4304,40 +4489,37 @@ async fn stage_tracked_head(
         );
         let absence_guards =
             tracked_head_absence_guards(state_rows, insert_selection, branch_id, None);
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        let mut writer = tracked_head.writer(read, writes);
-        if absence_guards.is_empty() {
-            let no_absence_guards = BTreeSet::new();
-            writer
-                .stage_current_state_with_working_diff(
-                    branch_id,
-                    Some(control.generation),
-                    control.head_commit_id,
-                    &deltas,
-                    &no_absence_guards,
-                    None,
-                    None,
-                    None,
-                    &mut coverage,
+        let owned_absence_guards = absence_guards
+            .iter()
+            .map(|guard| TrackedStateKey {
+                schema_key: guard.schema_key.to_owned(),
+                entity_pk: guard.entity_pk.clone(),
+                file_id: guard.file_id.map(str::to_owned),
+            })
+            .collect::<BTreeSet<_>>();
+        let next_revision = control
+            .current_state_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "branch current-state revision overflowed",
                 )
-                .await?;
-        } else {
-            writer
-                .stage_validated_insert_current_state_with_working_diff(
-                    branch_id,
-                    Some(control.generation),
-                    control.head_commit_id,
-                    &deltas,
-                    &absence_guards,
-                    None,
-                    None,
-                    None,
-                    &mut coverage,
-                    None,
-                )
-                .await?;
-        }
-        let mut control = control.next_current_state_revision()?;
+            })?;
+        let next_generation =
+            untracked_lifecycle_generation(branch_id, control.untracked_generation, next_revision);
+        tracked_head
+            .writer(read, writes)
+            .stage_untracked_generation(
+                branch_id,
+                control.untracked_generation,
+                next_generation,
+                &deltas,
+                &owned_absence_guards,
+            )
+            .await?;
+        control.untracked_generation = next_generation;
+        control.current_state_revision = next_revision;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
     }
@@ -4400,6 +4582,89 @@ fn owned_absence_guards(guards: &[TrackedStateKeyRef<'_>]) -> BTreeSet<TrackedSt
             entity_pk: guard.entity_pk.clone(),
         })
         .collect()
+}
+
+/// A tracked INSERT must also observe the branch-local untracked generation.
+/// The tracked writer intentionally reads only its authenticated tracked root;
+/// when the selectors diverge, validate the correlated INSERT identities
+/// against the untracked generation before publishing the tracked root.
+async fn reject_tracked_absence_guards_against_untracked(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    control: BranchHeadControl,
+    guards: &[TrackedStateKeyRef<'_>],
+) -> Result<(), LixError> {
+    let schema_keys = guards
+        .iter()
+        .map(|guard| guard.schema_key.to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let entity_pks = guards
+        .iter()
+        .map(|guard| guard.entity_pk.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let file_ids = guards
+        .iter()
+        .map(|guard| guard.file_id.map(str::to_owned))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|file_id| match file_id {
+            Some(file_id) => NullableKeyFilter::Value(file_id),
+            None => NullableKeyFilter::Null,
+        })
+        .collect();
+    let rows = TrackedHeadContext::new()
+        .reader(read)
+        .scan_live_batch_for_retention(
+            branch_id,
+            control,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys,
+                    entity_pks,
+                    file_ids,
+                    include_tombstones: true,
+                },
+                read_columns: TrackedStateReadColumns::default(),
+                limit: None,
+            },
+            Some(true),
+        )
+        .await?
+        .into_rows();
+    let existing = rows
+        .into_iter()
+        .filter(|row| row.untracked && !row.deleted)
+        .map(|row| TrackedStateKey {
+            schema_key: row.schema_key,
+            entity_pk: row.entity_pk,
+            file_id: row.file_id,
+        })
+        .collect::<BTreeSet<_>>();
+    for guard in guards {
+        let key = TrackedStateKey {
+            schema_key: guard.schema_key.to_owned(),
+            entity_pk: guard.entity_pk.clone(),
+            file_id: guard.file_id.map(str::to_owned),
+        };
+        if existing.contains(&key) {
+            return Err(untracked_current_identity_collision_error(&key));
+        }
+    }
+    Ok(())
+}
+
+fn untracked_current_identity_collision_error(key: &TrackedStateKey) -> LixError {
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
+            key.schema_key, key.entity_pk,
+        ),
+    )
 }
 
 fn packed_current_base_guards_match(
@@ -4606,14 +4871,14 @@ async fn stage_checkpoint_working_diff_epochs(
             .and_then(|observation| observation.control)
             && let Some(previous_checkpoint) = previous.working_diff_checkpoint_commit_id
             && (previous_checkpoint != recovery.checkpoint_commit_id
-                || previous.generation != control.generation)
+                || previous.tracked_generation != control.tracked_generation)
         {
             stage_delete_tracked_working_diff_epoch(
                 read,
                 writes,
                 &recovery.branch_id,
                 previous_checkpoint,
-                previous.generation,
+                previous.tracked_generation,
             )
             .await?;
         }
@@ -4622,7 +4887,7 @@ async fn stage_checkpoint_working_diff_epochs(
             &recovery.branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: recovery.checkpoint_commit_id,
-                generation: control.generation,
+                generation: control.tracked_generation,
                 coverage: WorkingDiffIndexCoverage::default(),
             },
         )?;
@@ -4636,6 +4901,9 @@ fn normal_branch_head_control(
     generation: CommitId,
     working_diff_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<BranchHeadControl, LixError> {
+    let untracked_generation = previous
+        .map(|control| control.untracked_generation)
+        .unwrap_or(generation);
     let current_state_revision = match previous {
         Some(control) => control
             .current_state_revision
@@ -4650,7 +4918,8 @@ fn normal_branch_head_control(
     };
     Ok(BranchHeadControl {
         head_commit_id: root.commit_id,
-        generation,
+        tracked_generation: generation,
+        untracked_generation,
         current_state_revision,
         working_diff_checkpoint_commit_id,
         created_at: previous.map_or(root.ref_updated_at, |control| control.created_at),
@@ -4691,6 +4960,7 @@ async fn stage_root_backed_branch_publication(
     branch_id: &str,
     head_commit_id: CommitId,
     target: &ExplicitBranchHeadTarget,
+    previous_control: Option<BranchHeadControl>,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
 ) -> Result<BranchHeadControl, LixError> {
@@ -4703,8 +4973,12 @@ async fn stage_root_backed_branch_publication(
     );
     let mut control = BranchHeadControl {
         head_commit_id,
-        generation,
-        current_state_revision: 0,
+        tracked_generation: generation,
+        untracked_generation: previous_control
+            .map(|control| control.untracked_generation)
+            .unwrap_or(generation),
+        current_state_revision: previous_control
+            .map_or(0, |control| control.current_state_revision),
         working_diff_checkpoint_commit_id: None,
         created_at: target.created_at,
         updated_at: target.updated_at,
@@ -4729,22 +5003,24 @@ async fn stage_root_backed_branch_publication(
         )
         .collect::<Result<Vec<_>, _>>()?;
     if !untracked_deltas.is_empty() {
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        let (_, schemas) = tracked_head
+        let next_generation = untracked_lifecycle_generation(
+            branch_id,
+            control.untracked_generation,
+            next_current_state_revision(control.current_state_revision)?,
+        );
+        tracked_head
             .writer(read, writes)
-            .stage_complete_current_state_with_working_diff(
+            .stage_untracked_generation(
                 branch_id,
-                generation,
-                HotTrackedSnapshot::default(),
-                None,
-                &[],
+                control.untracked_generation,
+                next_generation,
                 &untracked_deltas,
                 &BTreeSet::new(),
-                None,
-                &mut coverage,
             )
             .await?;
-        control.note_schemas(schemas.iter().map(String::as_str));
+        control.untracked_generation = next_generation;
+        control.current_state_revision =
+            next_current_state_revision(control.current_state_revision)?;
     }
     Ok(control)
 }
@@ -4801,6 +5077,7 @@ async fn stage_branch_head_control_publications(
                         branch_id,
                         head_commit_id,
                         target,
+                        existing,
                         state_rows,
                         engine_rows,
                     ))
@@ -4859,9 +5136,9 @@ async fn stage_branch_head_control_publications(
                             &branch_id,
                             generation,
                             tracked,
-                            existing.map(|control| control.generation),
+                            existing.map(|control| control.tracked_generation),
                             &[],
-                            &untracked_deltas,
+                            &[],
                             &absence_guards,
                             None,
                             &mut coverage,
@@ -4869,7 +5146,10 @@ async fn stage_branch_head_control_publications(
                         .await?;
                     let mut control = BranchHeadControl {
                         head_commit_id,
-                        generation,
+                        tracked_generation: generation,
+                        untracked_generation: existing
+                            .expect("existing lifecycle publication was handled above")
+                            .untracked_generation,
                         current_state_revision: match existing {
                             Some(control) => control
                                 .current_state_revision
@@ -4891,7 +5171,32 @@ async fn stage_branch_head_control_publications(
                             .expect("existing lifecycle publication was handled above")
                             .schema_presence_bloom,
                     };
-                    control.note_schemas(schema_keys.iter().map(String::as_str));
+                    if !untracked_deltas.is_empty() {
+                        let previous_untracked_generation = control.untracked_generation;
+                        let next_revision = control.current_state_revision;
+                        let next_untracked_generation = untracked_lifecycle_generation(
+                            &branch_id,
+                            previous_untracked_generation,
+                            next_revision,
+                        );
+                        tracked_head
+                            .writer(read, writes)
+                            .stage_untracked_generation(
+                                &branch_id,
+                                previous_untracked_generation,
+                                next_untracked_generation,
+                                &untracked_deltas,
+                                &absence_guards,
+                            )
+                            .await?;
+                        control.untracked_generation = next_untracked_generation;
+                    }
+                    control.note_schemas(
+                        schema_keys
+                            .iter()
+                            .map(String::as_str)
+                            .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
+                    );
                     Some(control)
                 }
             }
@@ -5210,7 +5515,7 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
             continue;
         }
         let mut untracked_identities = current_state
-            .scan_live_rows(
+            .scan_live_batch_for_retention(
                 branch_id,
                 existing,
                 &TrackedStateScanRequest {
@@ -5221,8 +5526,10 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
                     read_columns: TrackedStateReadColumns::default(),
                     limit: None,
                 },
+                Some(true),
             )
             .await?
+            .into_rows()
             .into_iter()
             .filter(|row| row.untracked)
             .map(|row| TrackedStateKey {
@@ -5888,6 +6195,7 @@ struct FinalizedCommitRow {
     created_at: LixTimestamp,
     change_id: ChangeId,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+    current_state_base_commit_id: Option<CommitId>,
 }
 
 struct PendingTrackedRoot {
@@ -5916,6 +6224,7 @@ async fn finalize_commit_rows(
         let created_at = change_refs.created_at;
         let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
+        let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
         commit_rows.push(FinalizedCommitRow {
             commit_id,
@@ -5923,6 +6232,7 @@ async fn finalize_commit_rows(
             created_at,
             change_id: commit_change_id,
             selected_change_batches,
+            current_state_base_commit_id,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id: intermediate.branch_id,
@@ -5943,6 +6253,7 @@ async fn finalize_commit_rows(
         let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
+        let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
         let parent_commit_ids =
             if let Some(parent) = first_commit_parent_override_by_branch.get(&branch_id) {
@@ -5975,6 +6286,7 @@ async fn finalize_commit_rows(
             created_at: timestamp,
             change_id: commit_change_id,
             selected_change_batches,
+            current_state_base_commit_id,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id,
@@ -6862,6 +7174,7 @@ mod tests {
             created_at: timestamp,
             change_id: change_id("mixed-certified-commit"),
             selected_change_batches: Vec::new(),
+            current_state_base_commit_id: None,
         }];
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -8935,6 +9248,7 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:01Z"),
                 change_id: ChangeId::for_test_label("child-commit-change"),
                 selected_change_batches: Vec::new(),
+                current_state_base_commit_id: None,
             },
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
@@ -8942,6 +9256,7 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: ChangeId::for_test_label("parent-commit-change"),
                 selected_change_batches: Vec::new(),
+                current_state_base_commit_id: None,
             },
         ];
         let mut rootless_commit_ids = BTreeSet::from([CommitId::for_test_label("parent-commit")]);
@@ -9079,6 +9394,7 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
                 selected_change_batches: Vec::new(),
+                current_state_base_commit_id: None,
             })
             .collect::<Vec<_>>();
         let row_indices = commit_ids

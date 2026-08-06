@@ -9,6 +9,7 @@
 
 mod hot;
 
+pub(crate) use crate::live_state::LiveStateReadDomain;
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
@@ -499,7 +500,12 @@ fn active_current_state_generations(
 ) -> BTreeSet<(String, CommitId)> {
     controls
         .iter()
-        .map(|(branch_id, control)| (branch_id.clone(), control.generation))
+        .flat_map(|(branch_id, control)| {
+            [
+                (branch_id.clone(), control.tracked_generation),
+                (branch_id.clone(), control.untracked_generation),
+            ]
+        })
         .collect()
 }
 
@@ -678,7 +684,8 @@ fn stage_test_current_control(
         branch_id,
         BranchHeadControl {
             head_commit_id,
-            generation,
+            tracked_generation: generation,
+            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id,
@@ -839,7 +846,7 @@ where
                 writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
                 continue;
             };
-            let valid = epoch.generation == control.generation
+            let valid = epoch.generation == control.tracked_generation
                 && control.working_diff_checkpoint_commit_id == Some(epoch.checkpoint_commit_id);
             if !valid || active.contains_key(&key.branch_id) {
                 writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
@@ -2288,7 +2295,8 @@ mod tests {
     ) -> BranchHeadControl {
         BranchHeadControl {
             head_commit_id,
-            generation,
+            tracked_generation: generation,
+            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -3059,7 +3067,8 @@ mod tests {
         let entity_pk = EntityPk::single("row");
         let control = |head_commit_id, generation, checkpoint_commit_id| BranchHeadControl {
             head_commit_id,
-            generation,
+            tracked_generation: generation,
+            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
@@ -3530,7 +3539,8 @@ mod tests {
         let head = CommitId::for_test_label("head");
         let control = BranchHeadControl {
             head_commit_id: head,
-            generation,
+            tracked_generation: generation,
+            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -3707,7 +3717,8 @@ mod tests {
         let head = CommitId::for_test_label("head");
         let control = BranchHeadControl {
             head_commit_id: head,
-            generation,
+            tracked_generation: generation,
+            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -3774,7 +3785,8 @@ mod tests {
         let head = CommitId::for_test_label("head");
         let control = BranchHeadControl {
             head_commit_id: head,
-            generation: head,
+            tracked_generation: head,
+            untracked_generation: head,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -4008,7 +4020,7 @@ mod tests {
             .expect("open control-gated file-id scan");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_live_rows(
+            .scan_live_batch_for_retention(
                 branch_id,
                 control,
                 &TrackedStateScanRequest {
@@ -4021,9 +4033,11 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("control-bound file-id scan should execute");
+        let rows = rows.into_rows();
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
@@ -5101,7 +5115,8 @@ mod tests {
         };
         let active_control = BranchHeadControl {
             head_commit_id: active_generation,
-            generation: active_generation,
+            tracked_generation: active_generation,
+            untracked_generation: active_generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,

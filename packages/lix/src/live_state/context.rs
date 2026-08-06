@@ -14,10 +14,11 @@ use crate::filesystem::{
 };
 use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_batch,
+    LiveStateExactBatchRequest, LiveStateReadDomain, LiveStateReader, LiveStateRowFilter,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
+    resolve_visible_batch,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -442,7 +443,7 @@ where
         };
         self.tracked_head
             .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
-            .prepare_packed_identity_membership(branch_id, control.generation, schema_key)
+            .prepare_packed_identity_membership(branch_id, control.tracked_generation, schema_key)
             .await
     }
 
@@ -464,7 +465,7 @@ where
         let point_key = match (request.filter.entity_pks.as_slice(), request.limit) {
             ([entity_pk], None | Some(1..)) => Some(EntityPointSnapshotCacheKey {
                 branch_id: requested_branch_id.clone(),
-                generation: requested_control.generation,
+                generation: requested_control.tracked_generation,
                 current_state_revision: requested_control.current_state_revision,
                 schema_key: schema_key.clone(),
                 entity_pk: entity_pk.clone(),
@@ -558,7 +559,7 @@ where
         };
         let key = EntityColumnarLayoutCacheKey {
             branch_id: branch_id.clone(),
-            generation: control.generation,
+            generation: control.tracked_generation,
             current_state_revision: control.current_state_revision,
             schema_key: schema_key.clone(),
         };
@@ -657,6 +658,13 @@ where
         let Some(requested_control) = scope.branch_heads.get(requested_branch_id).copied() else {
             return Ok(None);
         };
+        // The direct immutable-base projection covers one serving generation.
+        // A split selector must use the merged tracked/untracked visibility
+        // path so branch-local untracked rows remain visible after a tracked
+        // root swap or an untracked-only generation advance.
+        if requested_control.tracked_generation != requested_control.untracked_generation {
+            return Ok(None);
+        }
         let tracked_head = self.tracked_head.reader(&self.store);
         if requested_branch_id != GLOBAL_BRANCH_ID
             && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
@@ -806,13 +814,19 @@ where
         // publication filter. Apply it per generation before a finite PK
         // lookup so an absent global schema does not pay the complete hot,
         // packed, and certified point-read stack for every active-branch row.
-        controls.retain(|(_, control)| {
-            request
-                .filter
-                .schema_keys
-                .iter()
-                .any(|schema_key| control.may_have_schema(schema_key))
-        });
+        // The bloom summary belongs to the published tracked selector. An
+        // explicit current-only read must inspect the untracked selector even
+        // when the tracked summary has no bit for this schema; otherwise a
+        // durable runtime/ownership check is silently skipped.
+        if request.filter.untracked.is_none() {
+            controls.retain(|(_, control)| {
+                request
+                    .filter
+                    .schema_keys
+                    .iter()
+                    .any(|schema_key| control.may_have_schema(schema_key))
+            });
+        }
         if controls.is_empty() {
             return Ok(Some(MaterializedLiveStateBatch::default()));
         }
@@ -825,7 +839,7 @@ where
             },
         );
         let rows_by_branch = tracked_head
-            .scan_live_batches_for_controls(&controls, &tracked_request)
+            .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
             .await?;
         let rows = concat_live_state_batches(
             rows_by_branch
@@ -986,10 +1000,26 @@ where
                             file_id: identity.file_id,
                         })
                         .collect::<Vec<_>>();
+                    let domain =
+                        request
+                            .untracked
+                            .map_or(LiveStateReadDomain::Combined, |untracked| {
+                                if untracked {
+                                    LiveStateReadDomain::Untracked
+                                } else {
+                                    LiveStateReadDomain::Tracked
+                                }
+                            });
                     let rows = self
                         .tracked_head
                         .reader(&self.store)
-                        .load_projected_live_batch_refs(branch_id, control, &keys, &projection)
+                        .load_projected_live_batch_refs_for_domain(
+                            branch_id,
+                            control,
+                            &keys,
+                            &projection,
+                            domain,
+                        )
                         .await?;
                     Ok::<_, LixError>((range, rows))
                 }
@@ -1168,7 +1198,12 @@ where
                     let rows = self
                         .tracked_head
                         .reader(store)
-                        .scan_live_batch(&branch_id, control, &tracked_request)
+                        .scan_live_batch_for_retention(
+                            &branch_id,
+                            control,
+                            &tracked_request,
+                            request.filter.untracked,
+                        )
                         .await?;
                     Ok::<_, LixError>(HotBranchRows {
                         branch_id: branch_id.clone(),
@@ -1198,7 +1233,11 @@ where
             self.scan_tracked_batch_with_schema_presence(request, true)
                 .await
         } else {
-            self.scan_batch_with_schema_presence(request, true).await
+            // A combined constraint read is also the explicit cross-domain
+            // identity/collision probe. Its tracked bloom cannot prove that
+            // the current-only selector is empty, so never short-circuit it.
+            self.scan_batch_with_schema_presence(request, request.filter.untracked.is_some())
+                .await
         }
     }
 
@@ -1232,7 +1271,7 @@ where
         };
         self.tracked_head
             .reader(&self.store)
-            .collection_generation(branch_id, control.generation, scope)
+            .collection_generation(branch_id, control.untracked_generation, scope)
             .await
             .map(Some)
     }
@@ -1402,6 +1441,9 @@ fn concat_live_state_batches(
 /// to the storage scan; only a negative result from every selected generation
 /// can skip it.
 fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateScanScope) -> bool {
+    if request.filter.untracked.is_some() {
+        return true;
+    }
     let [schema_key] = request.filter.schema_keys.as_slice() else {
         return true;
     };
@@ -2646,7 +2688,8 @@ mod tests {
                 .expect("test current-state generation should stage");
             let mut control = BranchHeadControl {
                 head_commit_id,
-                generation,
+                tracked_generation: generation,
+                untracked_generation: generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [0; 4],
                 working_diff_checkpoint_commit_id: None,
@@ -2711,7 +2754,7 @@ mod tests {
                 .writer(&read, &mut writes)
                 .stage_current_state_with_working_diff(
                     &branch_id,
-                    Some(control.generation),
+                    Some(control.tracked_generation),
                     control.head_commit_id,
                     &deltas,
                     &std::collections::BTreeSet::new(),

@@ -18,10 +18,10 @@ pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
 };
 pub(crate) use entity_decoded_column_cache::EntityDecodedColumnCache;
-#[allow(unused_imports)]
-pub(crate) use reader::LiveStateReader;
 #[cfg(test)]
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
+#[allow(unused_imports)]
+pub(crate) use reader::{LiveStateReadDomain, LiveStateReader};
 #[cfg(test)]
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[cfg(test)]
