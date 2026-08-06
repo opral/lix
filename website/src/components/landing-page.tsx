@@ -326,7 +326,7 @@ const whatYouGet = [
   {
     title: "Pluggable storage",
     description:
-      "Lix runs on pluggable storage: in memory, on the local filesystem, or on S3. Git assumes a POSIX filesystem, which makes it hard to embed and scale.",
+      "An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale. Git assumes a POSIX filesystem.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
