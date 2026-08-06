@@ -1,24 +1,14 @@
 ---
-description: Lix is a version control system beyond code. Tools work with normal files, apps use SQL, and Lix tracks every change.
+description: Lix is a version control system for files and data beyond code. Tools work with normal files, apps use SQL, and Lix tracks every change.
 ---
 
 # What is Lix?
 
 Lix is a **version control system for files and data beyond code**. It combines files, a database, and version control in one system.
 
-Tools and agents work with normal files. Apps query and update SQL rows. Lix tracks every change with branches, history, review, rollback, and merge.
+Lix is an embeddable library, not a CLI. Tools and agents work with normal files. Apps query and update SQL rows. Lix tracks every change with branches, history, review, rollback, and merge.
 
-## Files become queryable rows
-
-File plugins map parts of a file to rows. A row can represent a Markdown block, CSV record, spreadsheet cell, JSON property, document clause, or another entity defined by a plugin.
-
-<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
-
-Apps read and write these rows with SQL. Lix records their history. In filesystem mode, plugin changes are written back to normal files on disk.
-
-Diffs are semantic: review the clause, cell, or row that changed, not lines of bytes. See [Semantic Changes](./semantic-changes.md).
-
-The JavaScript SDK includes Markdown and CSV plugins. Other formats, including JSON, XLSX, DOCX, and PDF, need a plugin.
+Unlike Git, Lix tracks the entities inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 
 ## What Lix provides
 
@@ -32,11 +22,19 @@ The JavaScript SDK includes Markdown and CSV plugins. Other formats, including J
 └──────────────────┘     └──────────────────┘     └──────────────────┘
 ```
 
-The same model also works for app data that does not come from a file. Register a schema and Lix creates a SQL table for it. Rows in that table get the same history and branch behavior as file entities.
+## Files become queryable rows
 
-## Real-time collaboration
+File plugins map parts of a file to rows. A row can represent a Markdown block, CSV record, spreadsheet cell, JSON property, or document clause.
 
-People and agents share a repository and see changes live. Apps observe SQL queries with `lix.observe()` and receive updates when rows change. Clients connected to the same Lix server see each other's changes as they happen.
+<img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
+
+Apps read and write these rows with SQL. Lix records their history and writes changes back to normal files on disk.
+
+Diffs are semantic: review the clause, cell, or row that changed, not lines of text. See [Semantic Changes](./semantic-changes.md).
+
+The JavaScript SDK includes Markdown and CSV plugins. Other formats, including JSON, XLSX, DOCX, and PDF, need a plugin.
+
+App data does not have to come from a file. Register a schema, and Lix creates a SQL table with the same history and branches.
 
 ## Prime use cases
 
@@ -52,9 +50,13 @@ Build editors, knowledge bases, document workflows, and other file-based apps. E
 
 ## Pluggable storage
 
-Lix has pluggable storage, which makes it easy to embed and scale: run it in memory, on the local filesystem, or against a server backed by S3. See [Persistence and Storage](./persistence.md).
+Storage is pluggable. Run Lix in memory, on the local filesystem, or against a server backed by S3. This makes Lix easy to embed and scale. See [Persistence and Storage](./persistence.md).
 
 <img src="../website/public/assets/pluggable-storage.svg" alt="Lix runs in your app on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
+
+## Local and remote
+
+Lix supports local and remote repositories with the same API.
 
 Run Lix inside your app, for example with `LocalFilesystem`:
 
@@ -77,7 +79,7 @@ const lix = await openLix({
 });
 ```
 
-Remote clients use the same file, SQL, branch, and observation APIs supported by the server protocol.
+Remote clients get the same API: files, SQL, branches, and live queries. Clients on the same server see each other's changes live with `lix.observe()`.
 
 ## Permissions (in development)
 
