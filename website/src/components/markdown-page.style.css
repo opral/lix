@@ -410,12 +410,20 @@
 }
 
 .markdown-wc-body .mwc-lang-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 9px 2px 7px;
   font-size: 12.5px;
   line-height: 1;
   color: var(--vp-c-text-2);
   text-decoration: none;
   border-bottom: 2px solid transparent;
+}
+
+.markdown-wc-body .mwc-lang-tab svg {
+  display: block;
+  flex-shrink: 0;
 }
 
 .markdown-wc-body a.mwc-lang-tab:hover {
