@@ -388,78 +388,31 @@ const whatYouGet = [
       "Finance, legal, and contractors need different access, but Git is all or nothing. Lix models permissions per file and group inside the repository.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="12"
-          y="16"
-          width="16"
-          height="24"
-          rx="2"
-          fill="#FFFFFF"
-          stroke="#C9C7BF"
+        <path
+          d="M31 26 v-6 a9 9 0 0 1 18 0 v6"
+          fill="none"
+          stroke="#8A8F96"
           strokeWidth="1.5"
-        />
-        <line
-          x1="16"
-          y1="23"
-          x2="24"
-          y2="23"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
         />
         <rect
-          x="52"
-          y="16"
-          width="16"
-          height="24"
-          rx="2"
-          fill="#FFFFFF"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <line
-          x1="56"
-          y1="23"
-          x2="64"
-          y2="23"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <rect
-          x="32"
-          y="16"
-          width="16"
-          height="24"
-          rx="2"
+          x="26"
+          y="26"
+          width="28"
+          height="22"
+          rx="4"
           fill="#FFFFFF"
           stroke="#8A8F96"
           strokeWidth="1.5"
         />
+        <circle cx="40" cy="35" r="3" fill="#07B6D5" />
         <line
-          x1="36"
-          y1="23"
-          x2="44"
-          y2="23"
-          stroke="#C9C7BF"
+          x1="40"
+          y1="37"
+          x2="40"
+          y2="42"
+          stroke="#07B6D5"
           strokeWidth="1.5"
           strokeLinecap="round"
-        />
-        <path
-          d="M37.5 32 v-2.2 a2.5 2.5 0 0 1 5 0 V32"
-          fill="none"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="35.5"
-          y="32"
-          width="9"
-          height="7"
-          rx="1.5"
-          fill="rgba(7,182,213,0.14)"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
         />
       </svg>
     ),
