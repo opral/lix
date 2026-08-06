@@ -7355,7 +7355,7 @@ mod tests {
     #[tokio::test]
     async fn rootless_branch_delete_defers_checkpoint_cleanup_through_gc_and_reopen() {
         let backend = Memory::new();
-        crate::Engine::initialize(backend.clone())
+        crate::engine::Engine::initialize(backend.clone())
             .await
             .expect("rootless checkpoint repository should initialize");
         let storage = StorageAdapter::new(backend.clone());
@@ -7470,7 +7470,7 @@ mod tests {
             .await
             .expect("authenticated rootless GC should commit");
 
-        let reopened = crate::Engine::new(backend.clone())
+        let reopened = crate::engine::Engine::new(backend.clone())
             .await
             .expect("repository should reopen after rootless GC");
         let session = reopened
