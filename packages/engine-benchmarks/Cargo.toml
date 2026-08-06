@@ -218,6 +218,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "branch_checkpoint_retirement"
+path = "benches/branch_checkpoint_retirement.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "fixed_live_history_scale"
 path = "benches/fixed_live_history_scale.rs"
 harness = false
