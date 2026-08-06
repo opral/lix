@@ -1837,6 +1837,39 @@ impl TrackedStateTree {
     }
 }
 
+/// Builds a minimal structurally valid leaf chunk for GC reachability tests.
+/// The helper is test-only and deliberately bypasses publication metadata; it
+/// never participates in production serving or authority.
+#[cfg(test)]
+pub(crate) fn test_leaf_root_chunk(label: &[u8]) -> (TrackedStateRootId, [u8; 32], Bytes) {
+    let label = String::from_utf8_lossy(label);
+    let key = TrackedStateKey {
+        schema_key: "gc_tree_chunk_fixture".to_string(),
+        file_id: None,
+        entity_pk: crate::entity_pk::EntityPk::single(label.as_ref()),
+    };
+    let value = TrackedStateIndexValue {
+        change_id: crate::changelog::ChangeId::for_test_label("gc-tree-chunk-change"),
+        commit_id: crate::changelog::CommitId::for_test_label("gc-tree-chunk-commit"),
+        deleted: false,
+        created_at: crate::common::LixTimestamp::expect_parse(
+            "GC tree fixture created_at",
+            "2026-01-01T00:00:00Z",
+        ),
+        updated_at: crate::common::LixTimestamp::expect_parse(
+            "GC tree fixture updated_at",
+            "2026-01-01T00:00:00Z",
+        ),
+    };
+    let entry = EncodedLeafEntry {
+        key: Bytes::from(encode_key(&key)),
+        value: Bytes::from(crate::tracked_state::codec::encode_value(&value)),
+    };
+    let bytes = Bytes::from(encode_leaf_node(&[entry]));
+    let hash = hash_bytes(&bytes);
+    (TrackedStateRootId::new(hash), hash, bytes)
+}
+
 #[derive(Debug)]
 struct BuiltTree {
     root_id: TrackedStateRootId,

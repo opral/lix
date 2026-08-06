@@ -1107,6 +1107,28 @@ where
         );
     }
 
+    // Tree chunks are content-addressed and may be shared by multiple
+    // retained commit roots. Build the authenticated live chunk set once
+    // from every root pointer carried by the active manifests, including
+    // their parent-root pins. This is a reachability proof, never a second
+    // authority or a current-head-only shortcut.
+    let active_tree_roots = active_manifests
+        .values()
+        .flat_map(|manifest| {
+            manifest.snapshot_root.iter().flat_map(|root| {
+                std::iter::once(root.root_id.clone()).chain(
+                    root.parent_roots
+                        .iter()
+                        .map(|parent| parent.root_id.clone()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let active_tree_chunks =
+        crate::tracked_state::collect_reachable_tree_chunk_hashes(&store, &active_tree_roots)
+            .await?;
+    let mut staged_tree_chunk_deletes = BTreeSet::new();
+
     // A delta is a candidate until every active history/checkpoint/replay
     // dependency releases the old root.  Never consume a batch containing a
     // blocked candidate: dropping that signal would make the root permanently
@@ -1244,6 +1266,23 @@ where
                     }
                 }
             }
+            if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+                let retired_tree_roots = std::iter::once(snapshot_root.root_id.clone()).chain(
+                    snapshot_root
+                        .parent_roots
+                        .iter()
+                        .map(|parent| parent.root_id.clone()),
+                );
+                let retired_tree_roots = retired_tree_roots.collect::<Vec<_>>();
+                stage_retired_tree_chunk_deletes(
+                    &store,
+                    writes,
+                    &active_tree_chunks,
+                    &retired_tree_roots,
+                    &mut staged_tree_chunk_deletes,
+                )
+                .await?;
+            }
             crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
                 &store, writes, old_root, &manifest,
             )
@@ -1342,6 +1381,44 @@ where
             total_us: elapsed_micros(started),
         },
     })
+}
+
+/// Stages only tree chunks proven reachable from a physically retired root and
+/// absent from every active/retained root. Root traversal authenticates every
+/// node before any delete is staged; a missing or hash-corrupt chunk therefore
+/// fails closed with no partial tree-chunk mutation from this helper.
+async fn stage_retired_tree_chunk_deletes<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    active_tree_chunks: &BTreeSet<[u8; 32]>,
+    retired_roots: &[crate::tracked_state::TrackedStateRootId],
+    staged_tree_chunk_deletes: &mut BTreeSet<[u8; 32]>,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    // Authenticate every retired root before touching the caller's write set.
+    // A later missing/corrupt root must not leave deletes staged from an
+    // earlier root in the same ordinary-GC attempt.
+    let mut retired_tree_chunks = BTreeSet::new();
+    for root in retired_roots {
+        retired_tree_chunks.extend(
+            crate::tracked_state::collect_reachable_tree_chunk_hashes(
+                store,
+                std::slice::from_ref(root),
+            )
+            .await?,
+        );
+    }
+    for chunk in retired_tree_chunks.difference(active_tree_chunks) {
+        if staged_tree_chunk_deletes.insert(*chunk) {
+            writes.delete(
+                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                StorageKey(Bytes::copy_from_slice(chunk)),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Every authenticated active scoped-range descriptor must have its native
@@ -2471,6 +2548,75 @@ mod tests {
         assert_eq!(batches[0].1.deltas[0].old_root, Some(old_root));
     }
 
+    #[tokio::test]
+    async fn ordinary_gc_consumes_only_ordered_authenticated_queue_prefix() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("queue seed should commit");
+
+        // Publish one more batch than the contract permits. Each append is a
+        // queue-key CAS, so a torn append cannot expose a later sequence.
+        for sequence in 0..=super::GC_REACHABILITY_BATCH_LIMIT {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("queue append read should open");
+            let mut writes = storage.new_write_set();
+            let mut preconditions = Vec::new();
+            stage_reachability_delta_batch(
+                &read,
+                &mut writes,
+                &[],
+                &[CommitId::for_test_label(&format!(
+                    "queue-prefix-{sequence}"
+                ))],
+                &mut preconditions,
+            )
+            .await
+            .expect("queue append should stage");
+            drop(read);
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("queue append should commit atomically");
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("queue prefix read should open");
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("queue should remain authenticated");
+        let batches = load_reachability_batches(&read, &queue)
+            .await
+            .expect("GC should load a bounded queue prefix");
+        assert_eq!(
+            batches.len(),
+            super::GC_REACHABILITY_BATCH_LIMIT,
+            "ordinary GC must not inspect or retire a later queue batch"
+        );
+        assert_eq!(batches.first().map(|(sequence, _)| *sequence), Some(1));
+        assert_eq!(
+            batches.last().map(|(sequence, _)| *sequence),
+            Some(super::GC_REACHABILITY_BATCH_LIMIT as u64)
+        );
+        assert_eq!(
+            queue.tail_sequence,
+            (super::GC_REACHABILITY_BATCH_LIMIT + 1) as u64
+        );
+    }
+
     #[test]
     fn retirement_requires_history_and_pin_dependency_closure() {
         let old = CommitId::for_test_label("history-old");
@@ -2585,6 +2731,196 @@ mod tests {
             assert!(loaded.value[0].is_some(), "shared live node must survive");
             assert!(loaded.value[1].is_none(), "unreachable node must be swept");
         }
+    }
+
+    #[tokio::test]
+    async fn ordinary_gc_tree_chunks_use_retained_root_closure_and_fail_closed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let (active_root, active_hash, active_bytes) =
+            crate::tracked_state::test_leaf_root_chunk(b"active-shared");
+        let (history_root, history_hash, history_bytes) =
+            crate::tracked_state::test_leaf_root_chunk(b"retained-history");
+        let (retired_root, retired_hash, retired_bytes) =
+            crate::tracked_state::test_leaf_root_chunk(b"retiring-only");
+        let mut writes = storage.new_write_set();
+        for (hash, bytes) in [
+            (active_hash, active_bytes),
+            (history_hash, history_bytes),
+            (retired_hash, retired_bytes),
+        ] {
+            writes.put(
+                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                StorageKey(Bytes::copy_from_slice(&hash)),
+                StorageValue { bytes },
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tree fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("tree fixture read should open");
+        let active_chunks = crate::tracked_state::collect_reachable_tree_chunk_hashes(
+            &read,
+            &[active_root.clone(), history_root.clone()],
+        )
+        .await
+        .expect("active and retained roots should authenticate");
+        assert!(active_chunks.contains(&active_hash));
+        assert!(active_chunks.contains(&history_hash));
+        assert!(!active_chunks.contains(&retired_hash));
+
+        let mut sweep = storage.new_write_set();
+        let mut staged = BTreeSet::new();
+        super::stage_retired_tree_chunk_deletes(
+            &read,
+            &mut sweep,
+            &active_chunks,
+            &[active_root, history_root, retired_root],
+            &mut staged,
+        )
+        .await
+        .expect("retired tree root should stage only unreachable chunks");
+        assert_eq!(staged, BTreeSet::from([retired_hash]));
+        drop(read);
+        storage
+            .commit_write_set(sweep, StorageWriteOptions::default())
+            .await
+            .expect("retired chunk delete should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-sweep read should open");
+        let keys = [
+            StorageKey(Bytes::copy_from_slice(&active_hash)),
+            StorageKey(Bytes::copy_from_slice(&history_hash)),
+            StorageKey(Bytes::copy_from_slice(&retired_hash)),
+        ];
+        let values =
+            PointReadPlan::new(crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE, &keys)
+                .materialize(&read, StorageGetOptions::default())
+                .await
+                .expect("post-sweep chunks should read");
+        assert!(values.value[0].is_some(), "active chunk must survive");
+        assert!(
+            values.value[1].is_some(),
+            "retained-history-only chunk must survive"
+        );
+        assert!(
+            values.value[2].is_none(),
+            "retiring-only chunk must be deleted"
+        );
+        drop(read);
+
+        // Deleting an already-absent content-addressed row is idempotent and
+        // must not turn an ordinary GC retry into a write failure.
+        let mut absent_delete = storage.new_write_set();
+        absent_delete.delete(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            StorageKey(Bytes::from_static(b"absent-tree-chunk")),
+        );
+        storage
+            .commit_write_set(absent_delete, StorageWriteOptions::default())
+            .await
+            .expect("absent tree-chunk delete should be a no-op");
+
+        // Missing and hash-corrupt roots are not interpreted as empty. The
+        // traversal fails before this helper can stage any delete.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing-root read should open");
+        let (missing_root, _, _) = crate::tracked_state::test_leaf_root_chunk(b"missing");
+        let mut missing_writes = storage.new_write_set();
+        let error = super::stage_retired_tree_chunk_deletes(
+            &read,
+            &mut missing_writes,
+            &BTreeSet::new(),
+            std::slice::from_ref(&missing_root),
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("missing root must fail closed");
+        assert!(error.message.contains("missing"));
+        assert!(
+            missing_writes.is_empty(),
+            "missing root must stage zero writes"
+        );
+        drop(read);
+
+        // Authentication is all-or-nothing across a root batch as well: a
+        // valid root followed by a missing root cannot leave the valid
+        // root's deletes staged for a later retry.
+        let (valid_root, valid_hash, valid_bytes) =
+            crate::tracked_state::test_leaf_root_chunk(b"valid-before-missing");
+        let mut valid_seed = storage.new_write_set();
+        valid_seed.put(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(&valid_hash)),
+            StorageValue { bytes: valid_bytes },
+        );
+        storage
+            .commit_write_set(valid_seed, StorageWriteOptions::default())
+            .await
+            .expect("valid root fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed-root read should open");
+        let mut mixed_writes = storage.new_write_set();
+        let error = super::stage_retired_tree_chunk_deletes(
+            &read,
+            &mut mixed_writes,
+            &BTreeSet::new(),
+            &[valid_root, missing_root],
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("a later missing root must fail the whole root batch");
+        assert!(error.message.contains("missing"));
+        assert!(
+            mixed_writes.is_empty(),
+            "mixed valid/missing roots must stage zero writes"
+        );
+        drop(read);
+
+        let (corrupt_root, corrupt_hash, _) =
+            crate::tracked_state::test_leaf_root_chunk(b"corrupt");
+        let mut corrupt_seed = storage.new_write_set();
+        corrupt_seed.put(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(&corrupt_hash)),
+            StorageValue {
+                bytes: Bytes::from_static(b"corrupt-tree-bytes"),
+            },
+        );
+        storage
+            .commit_write_set(corrupt_seed, StorageWriteOptions::default())
+            .await
+            .expect("corrupt fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt fixture read should open");
+        let mut corrupt_writes = storage.new_write_set();
+        let error = super::stage_retired_tree_chunk_deletes(
+            &read,
+            &mut corrupt_writes,
+            &BTreeSet::new(),
+            &[corrupt_root],
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("hash-corrupt root must fail closed");
+        assert!(error.message.contains("hash mismatch"));
+        assert!(
+            corrupt_writes.is_empty(),
+            "corruption must stage zero writes"
+        );
     }
 
     #[tokio::test]
