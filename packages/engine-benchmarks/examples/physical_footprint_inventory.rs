@@ -355,14 +355,7 @@ where
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    let absent_by_space = delete_mapping
-        .absent_idempotent
-        .iter()
-        .copied()
-        .collect::<BTreeMap<_, _>>();
     let mut planned_deleted_rows = 0_u64;
-    let mut planned_present_rows = 0_u64;
-    let mut planned_noop_rows = 0_u64;
     for (space_id, count) in &gc.delete_counts_by_space {
         let Some((space, accounting)) = rows.iter().find(|(_, value)| value.id == *space_id) else {
             return Err(format!("GC planned deletion in unknown space id {space_id:#x}").into());
@@ -427,10 +420,26 @@ where
                 .saturating_sub(mapped.value_bytes);
         }
     }
+    for (space_id, absent) in &delete_mapping.absent_idempotent {
+        if *absent == 0 {
+            continue;
+        }
+        let space = inventory_spaces()
+            .into_iter()
+            .find(|candidate| candidate.id.0 == *space_id)
+            .ok_or_else(|| format!("GC absent delete space {space_id:#x} is not cataloged"))?;
+        writeln!(
+            output,
+            "DELETE_ACCOUNTING\tspace={}\tclassification=absent_idempotent_noop\trows={}\tkey_bytes=0\tvalue_bytes=0\tlogical_bytes=0\tphysical_row_present=false",
+            space.name, absent,
+        )?;
+    }
     writeln!(
         output,
-        "RETENTION_SUMMARY\tplanned_unreachable_or_superseded_rows={}\tplanned_key_bytes={}\tplanned_value_bytes={}\tplanned_logical_bytes={}\tretained_history_only_rows={}\tretained_history_only_key_bytes={}\tretained_history_only_value_bytes={}\tretained_history_only_logical_bytes={}\thistorical_only_content_is_not_labeled_obsolete=true\tdelete_mapping_exact=true\tmissing_or_duplicate_mapping_fail_closed=true",
+        "RETENTION_SUMMARY\tplanned_delete_intents={}\tplanned_present_unreachable_or_superseded_rows={}\tplanned_absent_idempotent_noop_rows={}\tplanned_key_bytes={}\tplanned_value_bytes={}\tplanned_logical_bytes={}\tretained_history_only_rows={}\tretained_history_only_key_bytes={}\tretained_history_only_value_bytes={}\tretained_history_only_logical_bytes={}\thistorical_only_content_is_not_labeled_obsolete=true\tpresent_delete_mapping_exact=true\tduplicate_mapping_fail_closed=true",
         planned_deleted_rows,
+        planned_present_rows,
+        planned_noop_rows,
         planned_delete_totals.key_bytes,
         planned_delete_totals.value_bytes,
         planned_delete_totals.logical_bytes(),
