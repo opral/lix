@@ -14,25 +14,9 @@ import type {
 	LixSnapshotStorage,
 	LocalFilesystemOptions,
 	OpenLixOptions,
-	SQLiteOptions,
 } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
-
-export class SQLite {
-	readonly path: string;
-
-	constructor(options: SQLiteOptions) {
-		if (
-			!options ||
-			typeof options.path !== "string" ||
-			options.path.length === 0
-		) {
-			throw new TypeError("SQLite requires a non-empty path");
-		}
-		this.path = options.path;
-	}
-}
 
 const openLocalFilesystems = new WeakMap<LocalFilesystem, LixBinding | null>();
 
@@ -166,18 +150,6 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			),
 		);
 	}
-	if (options.storage instanceof SQLite) {
-		return new Lix(
-			await openLixWorkerBinding(
-				{
-					kind: "sqlite",
-					path: options.storage.path,
-				},
-				undefined,
-				options.telemetry,
-			),
-		);
-	}
 	if (options.storage instanceof LocalFilesystem) {
 		const storage = options.storage;
 		if (openLocalFilesystems.has(storage)) {
@@ -219,7 +191,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		}
 	}
 	throw new TypeError(
-		"openLix() requires storage to be SQLite, LocalFilesystem, or a Lix snapshot storage adapter",
+		"openLix() requires storage to be LocalFilesystem or a Lix snapshot storage adapter",
 	);
 }
 

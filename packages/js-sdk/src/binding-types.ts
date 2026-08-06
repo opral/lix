@@ -91,7 +91,6 @@ export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
 export type LixStorageConfig =
 	| { kind: "memory"; snapshot?: Uint8Array }
-	| { kind: "sqlite"; path: string }
 	| {
 			kind: "localFilesystem";
 			path: string;

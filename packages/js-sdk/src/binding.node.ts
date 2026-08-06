@@ -12,10 +12,6 @@ type NativeAddon = {
 		openMemory(
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
-		openSQLite(
-			path: string,
-			telemetry?: (spanJson: string) => void,
-		): Promise<LixBinding>;
 		openLocalFilesystem(
 			path: string,
 			lixDir: string | undefined,
@@ -85,11 +81,6 @@ export function openLixBinding(
 			}
 			if (nativeTelemetry) return addon.Lix.openMemory(nativeTelemetry);
 			return addon.Lix.openMemory();
-		case "sqlite":
-			if (nativeTelemetry) {
-				return addon.Lix.openSQLite(storage.path, nativeTelemetry);
-			}
-			return addon.Lix.openSQLite(storage.path);
 		case "localFilesystem":
 			if (nativeTelemetry) {
 				return addon.Lix.openLocalFilesystem(

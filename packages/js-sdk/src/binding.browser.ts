@@ -19,9 +19,7 @@ export async function openLixBinding(
 	telemetry?: TelemetryDispatch,
 ): Promise<LixBinding> {
 	if (storage.kind !== "memory") {
-		throw new Error(
-			`${storage.kind === "localFilesystem" ? "LocalFilesystem" : "SQLite"} is only available in Node.js`,
-		);
+		throw new Error("LocalFilesystem is only available in Node.js");
 	}
 	await initializeWasm();
 	return openMemoryFromSnapshot(

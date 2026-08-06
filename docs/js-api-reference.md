@@ -4,7 +4,7 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-The main exports of `@lix-js/sdk` are `openLix`, `LocalFilesystem`, and `SQLite`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
+The main JavaScript SDK exports are `openLix()` and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -20,11 +20,11 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option    | Type                                              | Description                                                                      |
-| --------- | ------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `storage`   | `LocalFilesystem \| SQLite \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
-| `server`    | `RemoteLixServerOptions`                          | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
-| `telemetry` | `LixTelemetryOptions`                             | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only. |
+| Option      | Type                                     | Description                                                                      |
+| ----------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
+| `storage`   | `LocalFilesystem \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
+| `server`    | `RemoteLixServerOptions`                 | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
+| `telemetry` | `LixTelemetryOptions`                    | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only. |
 
 Connect to a remote server:
 
@@ -89,18 +89,6 @@ instance.
 
 ```ts
 await storage.syncDiskToLix();
-```
-
-Use `SQLite` when a single `.lix` SQLite file is the application document
-itself, for example when defining a new file format and using Lix as the
-application file format:
-
-```ts
-import { openLix, SQLite } from "@lix-js/sdk";
-
-const lix = await openLix({
-  storage: new SQLite({ path: "app.lix" }),
-});
 ```
 
 ## Lix instance
