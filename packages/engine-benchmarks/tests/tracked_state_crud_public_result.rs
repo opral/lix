@@ -214,6 +214,32 @@ async fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
     }
 }
 
+#[tokio::test]
+async fn certified_insert_counter_deltas_are_isolated_across_sequential_fixtures() {
+    let _counter_guard = CERTIFIED_INSERT_COUNTER_TEST_LOCK.lock().await;
+    let rows = [WorkloadRow {
+        path: "/sequential".to_string(),
+        value_json: r#"{"enabled":true}"#.to_string(),
+        updated_value_json: r#"{"enabled":false}"#.to_string(),
+    }];
+
+    let sqlite = sql_session::empty_fixture_with_read_many_pk_count(
+        storage::StorageProfile::SQLite,
+        &rows,
+        1,
+    )
+    .await;
+    assert_eq!(sqlite.insert_all().await, 1);
+
+    let slatedb = sql_session::empty_fixture_with_read_many_pk_count(
+        storage::StorageProfile::SlateDB,
+        &rows,
+        1,
+    )
+    .await;
+    assert_eq!(slatedb.insert_all().await, 1);
+}
+
 /// Regression for the automatic-write future retaining SlateDB's large
 /// adapter-specific open and commit futures on Tokio's default test stack.
 #[cfg(feature = "slatedb")]
