@@ -5914,120 +5914,38 @@ async fn load_physical_direct_change_records(
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("direct coordinate references a missing immutable part")
         })?;
-        let (bounds, direct_row_count) = match &run.entry {
+        let super::mutation_directory::MutationDirectoryPartRun {
+            entry_index,
+            entry,
+            selector_span,
+        } = run;
+        let (bounds, direct_row_count) = match entry {
             super::mutation_directory::MutationDirectoryEntry::Bounded {
                 part,
                 direct_row_count,
             } => (
                 CommitDeltaSegmentBounds {
-                    first_key: part.first_key.clone(),
-                    last_key: part.last_key.clone(),
-                    replacement_part: part.replacement_part.clone(),
+                    first_key: part.first_key,
+                    last_key: part.last_key,
+                    replacement_part: part.replacement_part,
                 },
-                *direct_row_count,
+                direct_row_count,
             ),
             super::mutation_directory::MutationDirectoryEntry::CompactReplacement {
                 content_digest,
                 direct_row_count,
             } => {
-                let generation =
-                    state
-                        .mutations
-                        .replacement_generation
-                        .as_ref()
-                        .ok_or_else(|| {
-                            replacement_payload_error("compact part omitted its generation")
-                        })?;
-                let lifecycle = state.mutations.lifecycle_summary.as_ref().ok_or_else(|| {
-                    replacement_payload_error("compact part omitted lifecycle metadata")
-                })?;
-                let authority = state.mutations.replacement_parts.as_ref().ok_or_else(|| {
-                    replacement_payload_error("compact part omitted payload authority")
-                })?;
-                if generation.owner_commit_id != *state.commit_id.as_uuid().as_bytes()
-                    || generation.integrity_digest
-                        != replacement_generation_integrity_digest(generation, lifecycle, authority)
-                {
-                    return Err(replacement_payload_error(
-                        "compact part generation authority is invalid",
-                    ));
-                }
-                let decoded = crate::tracked_state::replacement_part::decode_replacement_part(
+                hydrate_compact_replacement_direct_run(
+                    state,
+                    entry_index,
+                    selector_span,
                     content_digest,
+                    direct_row_count,
                     &bytes,
+                    coordinates,
+                    locators,
+                    &mut output,
                 )?;
-                if decoded.len() != usize::from(*direct_row_count) {
-                    return Err(replacement_payload_error(
-                        "compact immutable part row count disagrees with directory authority",
-                    ));
-                }
-                #[cfg(any(test, feature = "storage-benches"))]
-                super::mutation_directory::record_direct_part_decoded(
-                    decoded.len(),
-                    bytes.len(),
-                    decoded.len(),
-                );
-                for output_index in run.selector_span.clone() {
-                    let coordinate = coordinates[output_index];
-                    let locator = locators[output_index];
-                    if coordinate.part_index != run.entry_index
-                        || coordinate.local_row != locator.ordinal
-                    {
-                        return Err(replacement_payload_error(
-                            "direct-coordinate run disagrees with its physical locator",
-                        ));
-                    }
-                    let packed = run
-                        .entry_index
-                        .checked_mul(
-                            u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                                .expect("replacement row bound fits u32"),
-                        )
-                        .and_then(|base| base.checked_add(u32::from(locator.ordinal)))
-                        .and_then(|address| address.checked_add(1))
-                        .ok_or_else(|| {
-                            replacement_payload_error("replacement address overflows")
-                        })?;
-                    if locator.change_id != change_id_from_packed_address(state.commit_id, packed) {
-                        return Err(replacement_payload_error(
-                            "compact locator change id disagrees with its physical address",
-                        ));
-                    }
-                    let encoded_key =
-                        decoded.key(usize::from(locator.ordinal))?.ok_or_else(|| {
-                            replacement_payload_error("replacement part omitted a key")
-                        })?;
-                    let key = decode_key(encoded_key)?;
-                    let snapshot = owned_scoped_json_slot(
-                        decoded
-                            .snapshot(usize::from(locator.ordinal))?
-                            .ok_or_else(|| {
-                                replacement_payload_error("replacement part omitted a snapshot")
-                            })?,
-                    );
-                    let metadata = owned_scoped_json_slot(
-                        decoded
-                            .metadata(usize::from(locator.ordinal))?
-                            .ok_or_else(|| {
-                                replacement_payload_error("replacement part omitted metadata")
-                            })?,
-                    );
-                    output.push((
-                        output_index,
-                        crate::changelog::ChangeRecord {
-                            account_id: state.change_account_id.clone(),
-                            format_version: 2,
-                            change_id: locator.change_id,
-                            schema_key: key.schema_key,
-                            entity_pk: key.entity_pk,
-                            file_id: key.file_id,
-                            snapshot,
-                            metadata,
-                            created_at: lifecycle.uniform_created_at,
-                            origin_key: None,
-                        },
-                    ));
-                }
                 continue;
             }
             super::mutation_directory::MutationDirectoryEntry::DirectAddress { .. } => {
@@ -6048,10 +5966,10 @@ async fn load_physical_direct_change_records(
             bytes.len(),
             leaf.resident_bytes() + payloads.resident_bytes(),
         );
-        for output_index in run.selector_span {
+        for output_index in selector_span {
             let coordinate = coordinates[output_index];
             let locator = locators[output_index];
-            if coordinate.part_index != run.entry_index || coordinate.local_row != locator.ordinal {
+            if coordinate.part_index != entry_index || coordinate.local_row != locator.ordinal {
                 return Err(replacement_payload_error(
                     "direct-coordinate run disagrees with its physical locator",
                 ));
@@ -6069,6 +5987,108 @@ async fn load_physical_direct_change_records(
         }
     }
     Ok(output)
+}
+
+#[inline(never)]
+fn hydrate_compact_replacement_direct_run(
+    state: &AuthenticatedReplayCommitStateManifest,
+    entry_index: u32,
+    selector_span: Range<usize>,
+    content_digest: [u8; 32],
+    direct_row_count: u16,
+    bytes: &[u8],
+    coordinates: &[super::mutation_directory::MutationDirectoryDirectCoordinate],
+    locators: &[CommitDeltaChangeLocator],
+    output: &mut Vec<(usize, crate::changelog::ChangeRecord)>,
+) -> Result<(), LixError> {
+    let generation = state
+        .mutations
+        .replacement_generation
+        .as_ref()
+        .ok_or_else(|| replacement_payload_error("compact part omitted its generation"))?;
+    let lifecycle = state
+        .mutations
+        .lifecycle_summary
+        .as_ref()
+        .ok_or_else(|| replacement_payload_error("compact part omitted lifecycle metadata"))?;
+    let authority = state
+        .mutations
+        .replacement_parts
+        .as_ref()
+        .ok_or_else(|| replacement_payload_error("compact part omitted payload authority"))?;
+    if generation.owner_commit_id != *state.commit_id.as_uuid().as_bytes()
+        || generation.integrity_digest
+            != replacement_generation_integrity_digest(generation, lifecycle, authority)
+    {
+        return Err(replacement_payload_error(
+            "compact part generation authority is invalid",
+        ));
+    }
+    let decoded =
+        crate::tracked_state::replacement_part::decode_replacement_part(&content_digest, bytes)?;
+    if decoded.len() != usize::from(direct_row_count) {
+        return Err(replacement_payload_error(
+            "compact immutable part row count disagrees with directory authority",
+        ));
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    super::mutation_directory::record_direct_part_decoded(
+        decoded.len(),
+        bytes.len(),
+        decoded.len(),
+    );
+    for output_index in selector_span {
+        let coordinate = coordinates[output_index];
+        let locator = locators[output_index];
+        if coordinate.part_index != entry_index || coordinate.local_row != locator.ordinal {
+            return Err(replacement_payload_error(
+                "direct-coordinate run disagrees with its physical locator",
+            ));
+        }
+        let packed = entry_index
+            .checked_mul(
+                u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                    .expect("replacement row bound fits u32"),
+            )
+            .and_then(|base| base.checked_add(u32::from(locator.ordinal)))
+            .and_then(|address| address.checked_add(1))
+            .ok_or_else(|| replacement_payload_error("replacement address overflows"))?;
+        if locator.change_id != change_id_from_packed_address(state.commit_id, packed) {
+            return Err(replacement_payload_error(
+                "compact locator change id disagrees with its physical address",
+            ));
+        }
+        let encoded_key = decoded
+            .key(usize::from(locator.ordinal))?
+            .ok_or_else(|| replacement_payload_error("replacement part omitted a key"))?;
+        let key = decode_key(encoded_key)?;
+        let snapshot = owned_scoped_json_slot(
+            decoded
+                .snapshot(usize::from(locator.ordinal))?
+                .ok_or_else(|| replacement_payload_error("replacement part omitted a snapshot"))?,
+        );
+        let metadata = owned_scoped_json_slot(
+            decoded
+                .metadata(usize::from(locator.ordinal))?
+                .ok_or_else(|| replacement_payload_error("replacement part omitted metadata"))?,
+        );
+        output.push((
+            output_index,
+            crate::changelog::ChangeRecord {
+                account_id: state.change_account_id.clone(),
+                format_version: 2,
+                change_id: locator.change_id,
+                schema_key: key.schema_key,
+                entity_pk: key.entity_pk,
+                file_id: key.file_id,
+                snapshot,
+                metadata,
+                created_at: lifecycle.uniform_created_at,
+                origin_key: None,
+            },
+        ));
+    }
+    Ok(())
 }
 
 async fn load_change_records_by_ids(
