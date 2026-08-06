@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 
 use crate::LixError;
 use crate::changelog::{
@@ -15,9 +13,7 @@ use crate::tracked_state::context::{
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
-use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
-};
+use crate::tracked_state::types::TrackedStateRootId;
 use crate::tracked_state::{
     TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateRootMutationRef, encode_key_ref,
 };
@@ -75,7 +71,8 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     let plans =
-        load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
+        load_rebuild_plans_to_nearest_available_root_for_repair(rebuilder.store, commit_id, true)
+            .await?;
     let mut report = None;
     let context = TrackedStateContext::new();
     let mut state = TrackedStateTransientRebuildState::default();
@@ -178,7 +175,7 @@ where
             ));
         }
         if !force_current
-            && load_available_root(store, &current_commit_id, &mut HashSet::new())
+            && load_available_root(store, &current_commit_id)
                 .await?
                 .is_some()
         {
@@ -196,84 +193,124 @@ where
     Ok(plans)
 }
 
-fn load_available_root<'a, S>(
-    store: &'a S,
-    commit_id: &'a str,
-    seen: &'a mut HashSet<String>,
-) -> Pin<Box<dyn Future<Output = Result<Option<TrackedStateRootId>, LixError>> + Send + 'a>>
-where
-    S: StorageAdapterRead + ?Sized + 'a,
-{
-    Box::pin(async move {
-        if !seen.insert(commit_id.to_string()) {
-            return Ok(None);
-        }
-        let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
-            seen.remove(commit_id);
-            return Ok(None);
-        };
-        if !commit_root_tree_is_readable(store, &metadata).await? {
-            seen.remove(commit_id);
-            return Ok(None);
-        }
-        if !commit_root_matches_canonical_rebuild(store, commit_id, &metadata, seen).await? {
-            seen.remove(commit_id);
-            return Ok(None);
-        }
-        seen.remove(commit_id);
-        Ok(Some(metadata.root_id))
-    })
-}
-
-async fn commit_root_tree_is_readable<S>(
-    store: &S,
-    metadata: &TrackedStateCommitRoot,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    match TrackedStateTree::new()
-        .scan(
-            store,
-            &metadata.root_id,
-            &TrackedStateTreeScanRequest::default(),
-        )
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-async fn commit_root_matches_canonical_rebuild<S>(
+/// Explicit recovery may use immutable changelog facts to replace a missing or
+/// corrupt serving root. Ordinary publication must use the strict function
+/// above and fail closed instead. Keeping this recovery-only discovery route
+/// separate prevents repair semantics from becoming a hot-path fallback.
+async fn load_rebuild_plans_to_nearest_available_root_for_repair<S>(
     store: &S,
     commit_id: &str,
-    metadata: &TrackedStateCommitRoot,
-    seen: &mut HashSet<String>,
-) -> Result<bool, LixError>
+    force_head: bool,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plan = load_commit_root_rebuild_plan(store, commit_id).await?;
-    if let Some(parent_commit_id) = plan.parent_commit_id.as_ref() {
-        let parent_commit_id_text = parent_commit_id.to_string();
-        let Some(parent_root_id) = load_available_root(store, &parent_commit_id_text, seen).await?
-        else {
-            return Ok(false);
-        };
-        match metadata.parent_roots.first() {
-            Some(parent)
-                if parent.commit_id == *parent_commit_id && parent.root_id == parent_root_id => {}
-            _ => return Ok(false),
+    let mut plans = Vec::new();
+    let mut current_commit_id = commit_id.to_string();
+    let mut force_current = force_head;
+    let mut seen_commit_ids = HashSet::new();
+    loop {
+        if !seen_commit_ids.insert(current_commit_id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot repair tracked_state commit_root for commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                ),
+            ));
         }
-    } else if !metadata.parent_roots.is_empty() {
-        return Ok(false);
+        if !force_current {
+            match load_available_root(store, &current_commit_id).await {
+                Ok(Some(_)) => {
+                    // Repair discovery is allowed to walk the immutable
+                    // changelog beyond an available serving root.  Validate
+                    // that boundary before using it as the replay base so a
+                    // corrupt first-parent cycle cannot be converted into an
+                    // authority-mismatch error (or silently terminate
+                    // recovery).  This is recovery-only; ordinary hot-path
+                    // root reuse remains bounded by `load_available_root`.
+                    validate_first_parent_acyclic_for_repair(store, &current_commit_id).await?;
+                    break;
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
+        let parent_commit_id = plan.parent_commit_id;
+        plans.push(plan);
+        let Some(parent_commit_id) = parent_commit_id else {
+            break;
+        };
+        current_commit_id = parent_commit_id.to_string();
+        force_current = false;
     }
-    let mut scratch_writes = StorageWriteSet::new();
-    let context = TrackedStateContext::new();
-    let mut writer = context.writer(store, &mut scratch_writes);
-    let report = stage_rebuild_plan_with_writer(&mut writer, &plan).await?;
-    Ok(report.root_id == metadata.root_id)
+    Ok(plans)
+}
+
+/// Checks the immutable first-parent chain at the explicit-repair boundary.
+///
+/// Unlike ordinary publication, recovery may spend O(history depth) proving
+/// that a serving root is a safe replay base.  This prevents a malformed
+/// changelog cycle hidden behind an otherwise valid root from being reported
+/// as a misleading root mismatch or from terminating repair early.
+async fn validate_first_parent_acyclic_for_repair<S>(
+    store: &S,
+    start_commit_id: &str,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut seen_commit_ids = HashSet::new();
+    let mut current_commit_id = CommitId::parse_lix(
+        start_commit_id,
+        "explicit commit-root repair first-parent validation",
+    )?;
+    loop {
+        if !seen_commit_ids.insert(current_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot repair tracked_state commit_root for commit '{start_commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                ),
+            ));
+        }
+        let mut reader = ChangelogContext::new().reader(store);
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: std::slice::from_ref(&current_commit_id),
+            })
+            .await?;
+        let Some(commit) = batch.into_iter().next().and_then(|(_, value)| value) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot repair tracked_state commit_root for unknown commit '{current_commit_id}'"
+                ),
+            ));
+        };
+        let Some(parent_commit_id) = first_parent_commit_id(&commit) else {
+            return Ok(());
+        };
+        current_commit_id = parent_commit_id;
+    }
+}
+
+async fn load_available_root<S>(
+    store: &S,
+    commit_id: &str,
+) -> Result<Option<TrackedStateRootId>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
+        return Ok(None);
+    };
+    // Immutable manifest/root metadata is the serving authority. Availability
+    // checks validate its bounded content-addressed closure; full canonical
+    // replay remains an explicit rebuild/integrity operation.
+    TrackedStateTree::new()
+        .validate_root_metadata(store, &metadata)
+        .await?;
+    Ok(Some(metadata.root_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

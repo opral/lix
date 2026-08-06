@@ -34,9 +34,9 @@ use crate::tracked_state::types::TrackedStateMutation;
 #[cfg(test)]
 use crate::tracked_state::types::TrackedStateTreeDiffEntry;
 use crate::tracked_state::types::{
-    TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateDeltaRef,
-    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateMutationBatch, TrackedStateRootId, TrackedStateRootMutationRef,
+    TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateCommitRoot,
+    TrackedStateDeltaRef, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
+    TrackedStateKeyRef, TrackedStateMutationBatch, TrackedStateRootId, TrackedStateRootMutationRef,
     TrackedStateTreeScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
@@ -118,6 +118,65 @@ impl TrackedStateTree {
         commit_id: &str,
     ) -> Result<Option<TrackedStateRootId>, LixError> {
         storage::load_root(store, commit_id).await
+    }
+
+    /// Validates the bounded serving closure authenticated by immutable root
+    /// metadata.
+    ///
+    /// Ordinary publication needs to know that the authoritative root node is
+    /// present, content-addressed, and has the advertised shape. It must not
+    /// rescan every row or canonically replay every ancestor merely to reuse an
+    /// immutable root. Descendants are hash-verified when a point/frontier
+    /// traversal actually touches them; the left spine is sufficient to prove
+    /// the advertised height without making availability depend on tree size.
+    pub(crate) async fn validate_root_metadata(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        metadata: &TrackedStateCommitRoot,
+    ) -> Result<(), LixError> {
+        let mut hash = *metadata.root_id.as_bytes();
+        let mut height = 1_u32;
+        let root = self.load_node(store, &hash).await?;
+        let row_count = u64::try_from(decoded_node_row_count(&root)).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state root row count exceeds u64",
+            )
+        })?;
+        if row_count != metadata.row_count_estimate {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state root node count disagrees with immutable root metadata",
+            ));
+        }
+
+        let mut node = root;
+        while let DecodedNode::Internal(internal) = node {
+            hash = internal
+                .children()
+                .first()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state internal root node has no children",
+                    )
+                })?
+                .child_hash;
+            height = height.checked_add(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state root height exceeds u32",
+                )
+            })?;
+            node = self.load_node(store, &hash).await?;
+        }
+        if height != metadata.tree_height {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state root height disagrees with immutable root metadata",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
