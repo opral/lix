@@ -249,6 +249,64 @@ const whatYouGet = [
     ),
   },
   {
+    title: "Pluggable storage",
+    description:
+      "Git assumes a local disk. Lix embeds in your app and runs on storage adapters: in memory, on the filesystem, or on object storage such as S3.",
+    icon: (
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <rect
+          x="32"
+          y="8"
+          width="16"
+          height="14"
+          rx="3"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <line
+          x1="40"
+          y1="22"
+          x2="40"
+          y2="32"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeDasharray="3 3"
+        />
+        <rect
+          x="14"
+          y="34"
+          width="16"
+          height="14"
+          rx="3"
+          fill="none"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+        <rect
+          x="32"
+          y="34"
+          width="16"
+          height="14"
+          rx="3"
+          fill="rgba(7,182,213,0.14)"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+        <rect
+          x="50"
+          y="34"
+          width="16"
+          height="14"
+          rx="3"
+          fill="none"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+      </svg>
+    ),
+  },
+  {
     title: "Real-time collaboration",
     description:
       "Companies work live, not in pull requests. People and agents share a repository and see changes as they happen.",
@@ -399,7 +457,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             What you get
           </h2>
           <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
-            Putting more than code into a repository needs five things a code
+            Putting more than code into a repository needs six things a code
             VCS never had:
           </p>
           <div className="mt-5">
