@@ -4502,6 +4502,13 @@ where
         .map_or_else(Vec::new, |part| part.last_key().to_vec());
     let mut pending = Vec::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut key_arena = Vec::new();
+    // Keep consumed key bytes in place while the pending prefix is being
+    // split into target-sized parts.  The old implementation drained and
+    // rebased every remaining row after each part, turning a large
+    // replacement into repeated copies of the same bounded key window.
+    // Offsets stay absolute until the small live window warrants one
+    // compaction, so the encoder still receives the exact same key bytes.
+    let mut key_arena_base = 0usize;
     let mut parts = prefix.map_or_else(Vec::new, |prefix| prefix.3);
     parts.reserve(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
     let mut compressor = None;
@@ -4567,6 +4574,7 @@ where
             encode_replacement_part_prefix(
                 &mut pending,
                 &mut key_arena,
+                &mut key_arena_base,
                 &mut parts,
                 &mut compressor,
             )?;
@@ -4577,29 +4585,44 @@ where
     let uniform_updated_at = uniform_updated_at.expect("non-empty replacement has a timestamp");
 
     while !pending.is_empty() {
-        encode_replacement_part_prefix(&mut pending, &mut key_arena, &mut parts, &mut compressor)?;
+        encode_replacement_part_prefix(
+            &mut pending,
+            &mut key_arena,
+            &mut key_arena_base,
+            &mut parts,
+            &mut compressor,
+        )?;
     }
 
     fn encode_replacement_part_prefix(
         pending: &mut Vec<BorrowedRow<'_>>,
         key_arena: &mut Vec<u8>,
+        key_arena_base: &mut usize,
         parts: &mut Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
         compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
     ) -> Result<(), LixError> {
         let mut candidate_len = pending.len().min(COMMIT_DELTA_SEGMENT_MAX_ROWS);
         let encoded = loop {
-            let refs = pending[..candidate_len]
-                .iter()
-                .map(
-                    |row| crate::tracked_state::replacement_part::ReplacementPartRowRef {
-                        encoded_key: &key_arena[row.key_start..row.key_end],
-                        snapshot: row.snapshot,
-                        metadata: row.metadata,
-                    },
-                )
-                .collect::<Vec<_>>();
+            // A replacement part is bounded to 512 rows.  Keep the borrowed
+            // row projection on the stack instead of allocating a temporary
+            // Vec for every size-probe/part.  Only the initialized prefix is
+            // handed to the encoder, so the sentinel entries are inert.
+            let mut refs = [crate::tracked_state::replacement_part::ReplacementPartRowRef {
+                encoded_key: &[],
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+            };
+                crate::tracked_state::replacement_part::REPLACEMENT_PART_MAX_ROWS];
+            for (index, row) in pending[..candidate_len].iter().enumerate() {
+                refs[index] = crate::tracked_state::replacement_part::ReplacementPartRowRef {
+                    encoded_key: &key_arena[row.key_start..row.key_end],
+                    snapshot: row.snapshot,
+                    metadata: row.metadata,
+                };
+            }
             match crate::tracked_state::replacement_part::encode_replacement_part_with_compressor(
-                &refs, compressor,
+                &refs[..candidate_len],
+                compressor,
             ) {
                 Ok(encoded)
                     if encoded.bytes().len()
@@ -4630,11 +4653,21 @@ where
         pending.drain(..candidate_len);
         if pending.is_empty() {
             key_arena.clear();
+            *key_arena_base = 0;
         } else {
-            key_arena.drain(..removed_key_end);
-            for row in pending {
-                row.key_start -= removed_key_end;
-                row.key_end -= removed_key_end;
+            *key_arena_base = removed_key_end;
+            let live_bytes = key_arena.len().saturating_sub(*key_arena_base);
+            // Compact only when the stale prefix is at least as large as the
+            // live window.  This bounds retained scratch space while avoiding
+            // the old per-part drain/rebase copy loop.
+            if *key_arena_base >= live_bytes {
+                key_arena.copy_within(*key_arena_base.., 0);
+                key_arena.truncate(live_bytes);
+                for row in pending {
+                    row.key_start -= *key_arena_base;
+                    row.key_end -= *key_arena_base;
+                }
+                *key_arena_base = 0;
             }
         }
         Ok(())

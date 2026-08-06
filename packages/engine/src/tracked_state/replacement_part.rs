@@ -510,16 +510,22 @@ pub(crate) fn encode_replacement_part_with_compressor(
             .map_err(|error| {
                 replacement_part_error(format!("replacement part compression failed: {error}"))
             })?;
-        let mut physical = Vec::with_capacity(12 + compressed.len());
-        physical.extend_from_slice(REPLACEMENT_PART_COMPRESSED_MAGIC);
-        physical.extend_from_slice(
-            &u32::try_from(encoded.len())
-                .expect("decoded replacement part is bounded below u32")
-                .to_be_bytes(),
-        );
-        physical.extend_from_slice(&compressed);
-        if physical.len() < encoded.len() {
-            encoded = physical;
+        // Reuse the decoded buffer for the physical frame.  The compressor
+        // necessarily returns one bounded scratch Vec, but allocating a
+        // second output Vec here made the decoded and compressed payloads
+        // coexist with an additional copy on every part.
+        let physical_len = 12usize.saturating_add(compressed.len());
+        if physical_len < encoded.len() {
+            let decoded_len = encoded.len();
+            encoded.clear();
+            encoded.reserve(physical_len);
+            encoded.extend_from_slice(REPLACEMENT_PART_COMPRESSED_MAGIC);
+            encoded.extend_from_slice(
+                &u32::try_from(decoded_len)
+                    .expect("decoded replacement part is bounded below u32")
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(&compressed);
         }
     }
     if encoded.len() > REPLACEMENT_PART_MAX_BYTES {
