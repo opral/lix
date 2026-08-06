@@ -1084,14 +1084,18 @@ fn profile_sql_session_operation(
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROUTE_ACCOUNTING").is_some() {
         let accounting =
             lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
+        let borrowed = lix_engine::storage_bench::take_crud_borrowed_delta_accounting();
         println!(
-            "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
+            "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} borrowed_delta_batches={} borrowed_delta_requested_keys={} borrowed_owned_key_clone_allocations={} borrowed_owned_key_clone_bytes={}",
             accounting.attempts,
             accounting.hits,
             accounting.errors,
             accounting.sealed_manifest_loads,
             accounting.replay_manifest_loads,
-            accounting.ordered_delta_fallbacks,
+            borrowed.batches,
+            borrowed.requested_keys,
+            borrowed.owned_key_clone_allocations,
+            borrowed.owned_key_clone_bytes,
         );
     }
 }

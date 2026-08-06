@@ -39,7 +39,7 @@ use crate::tracked_state::{
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
-    encode_key_ref, load_commit_delta_change_records, load_commit_delta_replay_metadata,
+    encode_key_ref, load_borrowed_commit_delta_change_records, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
@@ -1952,57 +1952,78 @@ async fn load_selected_change_records(
     }
 
     let mut records = HashMap::new();
-    for (source_commit_id, change_refs) in by_source_commit {
-        let keys = change_refs
-            .iter()
-            .map(|change_ref| TrackedStateKey {
-                schema_key: change_ref.schema_key().to_owned(),
-                file_id: change_ref.file_id().map(str::to_owned),
-                entity_pk: change_ref.entity_pk().clone(),
-            })
-            .collect::<Vec<_>>();
-        let loaded = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
-        for (change_ref, record) in change_refs.into_iter().zip(loaded) {
-            let Some(record) = record else {
-                return Err(LixError::new(
+    for (source_commit_id, mut change_refs) in by_source_commit {
+        change_refs.sort_unstable_by(|left, right| {
+            (left.schema_key(), left.file_id(), left.entity_pk()).cmp(&(
+                right.schema_key(),
+                right.file_id(),
+                right.entity_pk(),
+            ))
+        });
+        let mut keys = Vec::with_capacity(change_refs.len());
+        let mut first_refs = Vec::with_capacity(change_refs.len());
+        for (ref_index, change_ref) in change_refs.iter().enumerate() {
+            let key = TrackedStateKeyRef {
+                schema_key: change_ref.schema_key(),
+                file_id: change_ref.file_id(),
+                entity_pk: change_ref.entity_pk(),
+            };
+            if keys.last().is_none_or(|previous| previous != &key) {
+                keys.push(key);
+                first_refs.push(ref_index);
+            }
+        }
+        let mut loaded =
+            load_borrowed_commit_delta_change_records(read, source_commit_id, &keys).await?;
+        for (key_index, &first_ref) in first_refs.iter().enumerate() {
+            let end_ref = first_refs
+                .get(key_index + 1)
+                .copied()
+                .unwrap_or(change_refs.len());
+            let record = loaded[key_index].take().ok_or_else(|| {
+                LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
                         "selected change '{}' for ({:?}, {:?}, {:?}) has no authoritative payload at source commit '{}'",
-                        change_ref.change_id,
-                        change_ref.schema_key(),
-                        change_ref.file_id(),
-                        change_ref.entity_pk(),
+                        change_refs[first_ref].change_id,
+                        change_refs[first_ref].schema_key(),
+                        change_refs[first_ref].file_id(),
+                        change_refs[first_ref].entity_pk(),
                         source_commit_id
                     ),
-                ));
-            };
-            if record.change_id != change_ref.change_id
-                || record.schema_key != change_ref.schema_key()
-                || record.file_id.as_deref() != change_ref.file_id()
-                || record.entity_pk != *change_ref.entity_pk()
-                || record.snapshot.is_none() != change_ref.deleted
-                || record.created_at != change_ref.updated_at
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "selected change '{}' does not match its authoritative source payload",
-                        change_ref.change_id
-                    ),
-                ));
+                )
+            })?;
+            for change_ref in &change_refs[first_ref..end_ref] {
+                if record.change_id != change_ref.change_id
+                    || record.schema_key != change_ref.schema_key()
+                    || record.file_id.as_deref() != change_ref.file_id()
+                    || record.entity_pk != *change_ref.entity_pk()
+                    || record.snapshot.is_none() != change_ref.deleted
+                    || record.created_at != change_ref.updated_at
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "selected change '{}' does not match its authoritative source payload",
+                            change_ref.change_id
+                        ),
+                    ));
+                }
             }
-            let key = selected_change_key(change_ref);
-            if let Some(existing) = records.insert(key, record.clone())
-                && existing != record
+            let key = selected_change_key(change_refs[first_ref]);
+            if records
+                .get(&key)
+                .is_some_and(|existing| existing != &record)
             {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
                         "selected change '{}' resolves to conflicting source payloads",
-                        change_ref.change_id
+                        change_refs[first_ref].change_id
                     ),
                 ));
             }
+            records.insert(key, record);
         }
     }
     Ok(records)

@@ -7419,26 +7419,22 @@ async fn load_columnar_owned_entries(
     Ok(output)
 }
 
-/// Loads authoritative change records for exact identities in one physical
-/// commit delta. This is the payload counterpart to
-/// [`load_commit_delta_values`]: callers already know the owning commit from
-/// the endpoint index value, so no global changelog or delta-space scan is
-/// necessary.
-pub(crate) async fn load_commit_delta_change_records(
+/// Loads authoritative change records for a strict sorted-unique borrowed
+/// identity batch in one physical commit delta. Callers already know the
+/// owning commit from the endpoint index value, so no global changelog or
+/// delta-space scan is necessary and no per-request key ownership is created.
+pub(crate) async fn load_borrowed_commit_delta_change_records(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
-    keys: &[TrackedStateKey],
+    keys: &[TrackedStateKeyRef<'_>],
 ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
-    let requests = keys
-        .iter()
-        .cloned()
-        .map(|key| (commit_id, key))
-        .collect::<Vec<_>>();
-    Ok(load_owned_commit_delta_entries(store, &requests)
-        .await?
-        .into_iter()
-        .map(|entry| entry.map(|entry| entry.change_record))
-        .collect())
+    Ok(
+        load_borrowed_commit_delta_entries(store, commit_id, keys, None)
+            .await?
+            .into_iter()
+            .map(|entry| entry.map(|entry| entry.change_record))
+            .collect(),
+    )
 }
 
 /// Loads every tracked member of one physical commit delta.
@@ -8021,12 +8017,13 @@ pub(crate) async fn load_owned_commit_delta_entries(
     Ok(output)
 }
 
-/// Loads one ordered exact-key batch without first owning a second copy of
-/// every identity. Dense current-state reads have this shape and normally
-/// resolve every key from the physical owner. A local negative is final unless
-/// the same authenticated authority names a selected source; only that case
-/// enters the source-overlay loader.
-pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
+/// Loads one strict sorted-unique borrowed exact-key batch without owning a
+/// second copy of every identity. Dense current-state reads have this shape
+/// and normally resolve every key from the physical owner. A local negative is
+/// final unless the same authenticated authority names a selected source; only
+/// that case enters the source-overlay loader. Unordered or duplicate input is
+/// rejected so callers cannot silently re-enter the owned request path.
+pub(crate) async fn load_borrowed_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
@@ -8035,44 +8032,70 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let strictly_ordered = keys.windows(2).all(|pair| {
-        (pair[0].schema_key, pair[0].file_id, pair[0].entity_pk)
-            < (pair[1].schema_key, pair[1].file_id, pair[1].entity_pk)
-    });
-    let local_cache = CommitDeltaPointReadCache::default();
-    let point_cache = point_cache.unwrap_or(&local_cache);
-    if strictly_ordered {
-        let output = load_local_owned_commit_delta_entries_one_ordered(
-            store,
-            commit_id,
-            keys,
-            Some(point_cache),
-        )
-        .await?;
-        if output.iter().all(Option::is_some)
-            || point_cache
-                .authority(commit_id)?
-                .is_none_or(|state| state.mutations.selected_source_commit_id().is_none())
-        {
-            return Ok(output);
-        }
+    if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(replacement_payload_error(
+            "borrowed commit-delta payload routing requires strict sorted-unique keys",
+        ));
     }
     #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_crud_ordered_delta_fallback();
-    let requests = keys
-        .iter()
-        .map(|key| {
-            (
-                commit_id,
-                TrackedStateKey {
-                    schema_key: key.schema_key.to_owned(),
-                    file_id: key.file_id.map(str::to_owned),
-                    entity_pk: key.entity_pk.clone(),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    load_owned_commit_delta_entries(store, &requests).await
+    crate::storage_bench::record_crud_borrowed_delta_batch(keys.len());
+    let local_cache = CommitDeltaPointReadCache::default();
+    let point_cache = point_cache.unwrap_or(&local_cache);
+    let mut output = load_local_owned_commit_delta_entries_one_ordered(
+        store,
+        commit_id,
+        keys,
+        Some(point_cache),
+    )
+    .await?;
+    if output.iter().all(Option::is_some) {
+        return Ok(output);
+    }
+    let Some(state) = point_cache.authority(commit_id)? else {
+        return Ok(output);
+    };
+    let Some(source_commit_id) = state.mutations.selected_source_commit_id() else {
+        return Ok(output);
+    };
+    let source = match point_cache.authority(source_commit_id)? {
+        Some(source) => source,
+        None => {
+            let source = Arc::new(
+                load_point_replay_commit_state(store, source_commit_id)
+                    .await?
+                    .ok_or_else(|| {
+                        replacement_payload_error(&format!(
+                            "selected-source commit '{}' references missing authority '{}'",
+                            commit_id, source_commit_id
+                        ))
+                    })?,
+            );
+            point_cache.remember_authority(Arc::clone(&source))?;
+            source
+        }
+    };
+    if source.mutations.selected_source_commit_id().is_some() {
+        return Err(replacement_payload_error(
+            "selected-source mutation authority cannot alias another source",
+        ));
+    }
+    let selected = load_local_owned_commit_delta_entries_one_ordered(
+        store,
+        source_commit_id,
+        keys,
+        Some(point_cache),
+    )
+    .await?;
+    for (local, selected) in output.iter_mut().zip(selected) {
+        if local.is_none()
+            && let Some(mut selected) = selected
+        {
+            selected.value.commit_id = commit_id;
+            selected.selected_ref = true;
+            *local = Some(selected);
+        }
+    }
+    Ok(output)
 }
 
 async fn load_local_owned_commit_delta_entries(
@@ -12594,15 +12617,68 @@ mod tests {
         decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
         decode_stored_commit_state_authority, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
-        encode_commit_state_manifest, key, load_change_record_by_id, load_commit_delta_change_ids,
-        load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-        load_commit_delta_values_encoded, load_commit_state_manifest,
-        load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
-        scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
-        stage_change_locators, stage_commit_state_manifest,
-        stage_delete_commit_delta_inventory_entry,
+        encode_commit_state_manifest, key, load_borrowed_commit_delta_change_records,
+        load_change_record_by_id, load_commit_delta_change_ids,
+        load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
+        load_commit_state_manifest, load_owned_commit_delta_entries,
+        scan_change_records_from_commit_deltas, scan_commit_delta_inventory,
+        scan_commit_delta_members, scan_commit_delta_values, stage_change_locators,
+        stage_commit_state_manifest, stage_delete_commit_delta_inventory_entry,
         stage_fragmented_scoped_current_state_descriptor, value,
     };
+
+    #[tokio::test]
+    async fn borrowed_payload_route_rejects_unsorted_and_duplicate_keys() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("borrowed route read should open");
+        let first = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("first"),
+        };
+        let second = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("second"),
+        };
+        let first_ref = TrackedStateKeyRef {
+            schema_key: &first.schema_key,
+            file_id: first.file_id.as_deref(),
+            entity_pk: &first.entity_pk,
+        };
+        let second_ref = TrackedStateKeyRef {
+            schema_key: &second.schema_key,
+            file_id: second.file_id.as_deref(),
+            entity_pk: &second.entity_pk,
+        };
+        let unsorted = match super::load_borrowed_commit_delta_entries(
+            &read,
+            CommitId::for_test_label("borrowed-unsorted"),
+            &[second_ref, first_ref],
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("unsorted borrowed input must fail closed"),
+            Err(error) => error,
+        };
+        assert!(unsorted.to_string().contains("strict sorted-unique keys"));
+        let duplicate = match super::load_borrowed_commit_delta_entries(
+            &read,
+            CommitId::for_test_label("borrowed-duplicate"),
+            &[first_ref, first_ref],
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("duplicate borrowed input must fail closed"),
+            Err(error) => error,
+        };
+        assert!(duplicate.to_string().contains("strict sorted-unique keys"));
+    }
 
     #[test]
     fn columnar_identity_lookup_does_not_assume_json_text_order() {
@@ -13670,14 +13746,10 @@ mod tests {
                 entity_pk: &fixtures[index].entity_pk,
             })
             .collect::<Vec<_>>();
-        let routed = super::load_owned_commit_delta_entries_one_ordered_ref(
-            &routed_read,
-            commit_id,
-            &routed_keys,
-            None,
-        )
-        .await
-        .expect("hierarchical point routes should load");
+        let routed =
+            super::load_borrowed_commit_delta_entries(&routed_read, commit_id, &routed_keys, None)
+                .await
+                .expect("hierarchical point routes should load");
         for (&index, entry) in routed_indices.iter().zip(routed) {
             assert_eq!(
                 entry.expect("routed mutation should exist").value.change_id,
@@ -15764,7 +15836,15 @@ mod tests {
             .iter()
             .map(CommitDeltaFixture::key)
             .collect::<Vec<_>>();
-        let records = load_commit_delta_change_records(&read, commit_id, &keys)
+        let key_refs = keys
+            .iter()
+            .map(|key| TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
+            .collect::<Vec<_>>();
+        let records = load_borrowed_commit_delta_change_records(&read, commit_id, &key_refs)
             .await
             .expect("indexed change-record points should load");
         assert_eq!(

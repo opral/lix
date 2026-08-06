@@ -15,6 +15,7 @@ use crate::tracked_state::{
 };
 
 pub use super::mutation_directory::MutationDirectoryReadAccounting;
+pub use crate::storage_bench::CrudBorrowedDeltaAccounting;
 
 /// Resets the feature-gated authenticated mutation-directory counters for one
 /// benchmark phase. Production builds do not compile this module.
@@ -26,6 +27,17 @@ pub fn reset_mutation_directory_read_accounting() {
 /// counters for the completed benchmark phase.
 pub fn snapshot_mutation_directory_read_accounting() -> MutationDirectoryReadAccounting {
     super::mutation_directory::snapshot_mutation_directory_read_accounting()
+}
+
+/// Resets the borrowed payload-hydration counters for one benchmark phase.
+pub fn reset_borrowed_delta_accounting() {
+    let _ = crate::storage_bench::take_crud_borrowed_delta_accounting();
+}
+
+/// Snapshots borrowed payload-hydration work. Migrated routes must report
+/// positive batches/keys and zero owned-key clone allocations/bytes.
+pub fn snapshot_borrowed_delta_accounting() -> CrudBorrowedDeltaAccounting {
+    crate::storage_bench::take_crud_borrowed_delta_accounting()
 }
 
 fn stage_bench_commit_deltas(

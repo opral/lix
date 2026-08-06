@@ -62,7 +62,10 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
-static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static CRUD_BORROWED_DELTA_BATCHES: AtomicU64 = AtomicU64::new(0);
+static CRUD_BORROWED_DELTA_REQUESTED_KEYS: AtomicU64 = AtomicU64::new(0);
+static CRUD_BORROWED_DELTA_OWNED_KEY_CLONE_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static CRUD_BORROWED_DELTA_OWNED_KEY_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -398,7 +401,14 @@ pub struct CrudCurrentStateScopedRangeAccounting {
     pub errors: u64,
     pub sealed_manifest_loads: u64,
     pub replay_manifest_loads: u64,
-    pub ordered_delta_fallbacks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudBorrowedDeltaAccounting {
+    pub batches: u64,
+    pub requested_keys: u64,
+    pub owned_key_clone_allocations: u64,
+    pub owned_key_clone_bytes: u64,
 }
 
 pub(crate) fn record_crud_current_state_scoped_range_attempt() {
@@ -421,8 +431,9 @@ pub(crate) fn record_crud_replay_manifest_load() {
     CRUD_REPLAY_MANIFEST_LOADS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_crud_ordered_delta_fallback() {
-    CRUD_ORDERED_DELTA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_crud_borrowed_delta_batch(requested_keys: usize) {
+    CRUD_BORROWED_DELTA_BATCHES.fetch_add(1, Ordering::Relaxed);
+    CRUD_BORROWED_DELTA_REQUESTED_KEYS.fetch_add(requested_keys as u64, Ordering::Relaxed);
 }
 
 pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScopedRangeAccounting {
@@ -432,7 +443,16 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         errors: CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.swap(0, Ordering::Relaxed),
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
-        ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
+    }
+}
+
+pub fn take_crud_borrowed_delta_accounting() -> CrudBorrowedDeltaAccounting {
+    CrudBorrowedDeltaAccounting {
+        batches: CRUD_BORROWED_DELTA_BATCHES.swap(0, Ordering::Relaxed),
+        requested_keys: CRUD_BORROWED_DELTA_REQUESTED_KEYS.swap(0, Ordering::Relaxed),
+        owned_key_clone_allocations: CRUD_BORROWED_DELTA_OWNED_KEY_CLONE_ALLOCATIONS
+            .swap(0, Ordering::Relaxed),
+        owned_key_clone_bytes: CRUD_BORROWED_DELTA_OWNED_KEY_CLONE_BYTES.swap(0, Ordering::Relaxed),
     }
 }
 

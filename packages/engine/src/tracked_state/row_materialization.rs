@@ -623,49 +623,64 @@ async fn materialize_index_payloads<'a, S>(
 where
     S: StorageAdapterRead,
 {
-    let mut by_commit = BTreeMap::<CommitId, Vec<(TrackedStateKey, ChangeId, LixTimestamp)>>::new();
+    let mut by_commit =
+        BTreeMap::<CommitId, Vec<(TrackedStateKeyRef<'a>, ChangeId, LixTimestamp)>>::new();
     for (key, value) in entries.filter(|(_, value)| !value.deleted) {
         by_commit.entry(value.commit_id).or_default().push((
-            TrackedStateKey {
-                schema_key: key.schema_key.to_owned(),
-                file_id: key.file_id.map(str::to_owned),
-                entity_pk: key.entity_pk.clone(),
-            },
+            key,
             value.change_id,
             value.updated_at,
         ));
     }
 
     let mut records = Vec::new();
-    for (commit_id, expected) in by_commit {
-        let keys = expected
-            .iter()
-            .map(|(key, _, _)| key.clone())
-            .collect::<Vec<_>>();
-        let loaded =
-            super::storage::load_commit_delta_change_records(store, commit_id, &keys).await?;
-        for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
-            let record = record.ok_or_else(|| {
+    for (commit_id, mut expected) in by_commit {
+        expected.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut unique_keys = Vec::with_capacity(expected.len());
+        for (key, _, _) in &expected {
+            if unique_keys.last().is_none_or(|previous| previous != key) {
+                unique_keys.push(*key);
+            }
+        }
+        let mut loaded = super::storage::load_borrowed_commit_delta_change_records(
+            store,
+            commit_id,
+            &unique_keys,
+        )
+        .await?;
+        let mut expected_index = 0;
+        for (unique_index, unique_key) in unique_keys.iter().enumerate() {
+            let group_start = expected_index;
+            while expected_index < expected.len() && expected[expected_index].0 == *unique_key {
+                expected_index += 1;
+            }
+            let group_end = expected_index;
+            let record = loaded[unique_index].take().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "tracked-state row references change '{change_id}' that is missing from owning commit '{commit_id}'"
+                        "tracked-state row references a payload missing from owning commit '{commit_id}'"
                     ),
                 )
             })?;
-            if record.change_id != change_id
-                || record.schema_key != key.schema_key
-                || record.file_id != key.file_id
-                || record.entity_pk != key.entity_pk
-                || record.snapshot.is_none()
-                || record.created_at != updated_at
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked-state row '{change_id}' does not match its authoritative payload in commit '{commit_id}'"
-                    ),
-                ));
+            for (key, change_id, updated_at) in &expected[group_start..group_end] {
+                if record.change_id != *change_id
+                    || record.schema_key != key.schema_key
+                    || record.file_id.as_deref() != key.file_id
+                    || record.entity_pk != *key.entity_pk
+                    || record.snapshot.is_none()
+                    || record.created_at != *updated_at
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked-state row '{change_id}' does not match its authoritative payload in commit '{commit_id}'"
+                        ),
+                    ));
+                }
+            }
+            for _ in group_start..group_end.saturating_sub(1) {
+                records.push(record.clone());
             }
             records.push(record);
         }

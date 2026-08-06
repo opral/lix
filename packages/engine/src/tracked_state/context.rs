@@ -2304,10 +2304,10 @@ where
                     identity.entity_pk.as_single_string_owned(),
                     *change_id,
                     value.commit_id,
-                    TrackedStateKey {
-                        schema_key: identity.schema_key.clone(),
-                        file_id: identity.file_id.clone(),
-                        entity_pk: identity.entity_pk.clone(),
+                    TrackedStateKeyRef {
+                        schema_key: &identity.schema_key,
+                        file_id: identity.file_id.as_deref(),
+                        entity_pk: &identity.entity_pk,
                     },
                 ))
             })
@@ -2317,23 +2317,32 @@ where
         }
         candidates.sort_by_key(|(_, change_id, _, _)| *change_id);
         let mut changes = vec![None; candidates.len()];
-        let mut by_owner = BTreeMap::<CommitId, Vec<(usize, TrackedStateKey)>>::new();
+        let mut by_owner = BTreeMap::<CommitId, Vec<(usize, TrackedStateKeyRef<'_>)>>::new();
         for (index, (_, _, owner_commit_id, key)) in candidates.iter().enumerate() {
             by_owner
                 .entry(*owner_commit_id)
                 .or_default()
-                .push((index, key.clone()));
+                .push((index, *key));
         }
-        for (owner_commit_id, requests) in by_owner {
-            let keys = requests
-                .iter()
-                .map(|(_, key)| key.clone())
-                .collect::<Vec<_>>();
-            let loaded =
-                storage::load_commit_delta_change_records(&self.store, owner_commit_id, &keys)
-                    .await?;
-            for ((index, _), change) in requests.into_iter().zip(loaded) {
-                changes[index] = change;
+        for (owner_commit_id, mut requests) in by_owner {
+            requests.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+            let mut keys = Vec::with_capacity(requests.len());
+            for (_, key) in &requests {
+                if keys.last().is_none_or(|previous| previous != key) {
+                    keys.push(*key);
+                }
+            }
+            let loaded = storage::load_borrowed_commit_delta_change_records(
+                &self.store,
+                owner_commit_id,
+                &keys,
+            )
+            .await?;
+            for (index, key) in requests {
+                let loaded_index = keys
+                    .binary_search(&key)
+                    .expect("cascade key was included in the canonical owner batch");
+                changes[index] = loaded[loaded_index].clone();
             }
         }
         let mut cascades = HashMap::new();
@@ -2387,62 +2396,95 @@ where
         }
         let mut records = HashMap::<ChangeId, ChangeRecord>::new();
         for (commit_id, commit_rows) in by_commit {
-            let keys = commit_rows
-                .iter()
-                .map(|row| TrackedStateKey {
-                    schema_key: row.schema_key().to_owned(),
-                    file_id: row.file_id().map(str::to_owned),
-                    entity_pk: row.entity_pk().clone(),
-                })
-                .collect::<Vec<_>>();
-            let mut loaded =
-                storage::load_commit_delta_change_records(&self.store, commit_id, &keys).await?;
-            let fallback_rows = commit_rows
-                .iter()
-                .zip(&loaded)
-                .filter_map(|(row, record)| {
-                    (record.is_none() && row.deleted)
-                        .then(|| row.file_id())
-                        .flatten()
-                        .map(cascade_payload_key)
-                })
-                .collect::<Vec<_>>();
-            if !fallback_rows.is_empty() {
-                let fallbacks = storage::load_commit_delta_change_records(
-                    &self.store,
-                    commit_id,
-                    &fallback_rows,
-                )
-                .await?;
-                let mut fallbacks = fallbacks.into_iter();
-                for (row, record) in commit_rows.iter().zip(&mut loaded) {
-                    if record.is_none() && row.deleted && row.file_id().is_some() {
-                        *record = fallbacks
-                            .next()
-                            .expect("one fallback was loaded per missing file-scoped tombstone");
-                    }
+            let mut ordered_rows = commit_rows;
+            ordered_rows.sort_unstable_by(|left, right| {
+                left.identity.as_key_ref().cmp(&right.identity.as_key_ref())
+            });
+            let mut keys = Vec::with_capacity(ordered_rows.len());
+            let mut first_rows = Vec::with_capacity(ordered_rows.len());
+            for (row_index, row) in ordered_rows.iter().enumerate() {
+                let key = row.identity.as_key_ref();
+                if keys.last().is_none_or(|previous| previous != &key) {
+                    keys.push(key);
+                    first_rows.push(row_index);
                 }
             }
-            for (row, record) in commit_rows.into_iter().zip(loaded) {
-                let record = record.ok_or_else(|| {
+            let mut loaded_unique =
+                storage::load_borrowed_commit_delta_change_records(&self.store, commit_id, &keys)
+                    .await?;
+            let mut fallback_requests = first_rows
+                .iter()
+                .enumerate()
+                .filter_map(|(key_index, &row_index)| {
+                    (loaded_unique[key_index].is_none() && ordered_rows[row_index].deleted)
+                        .then(|| ordered_rows[row_index].file_id())
+                        .flatten()
+                        .map(|file_id| (key_index, cascade_payload_key(file_id)))
+                })
+                .collect::<Vec<_>>();
+            if !fallback_requests.is_empty() {
+                fallback_requests.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+                let mut fallback_keys = Vec::with_capacity(fallback_requests.len());
+                for (_, key) in &fallback_requests {
+                    let key_ref = TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    };
+                    if fallback_keys
+                        .last()
+                        .is_none_or(|previous| previous != &key_ref)
+                    {
+                        fallback_keys.push(key_ref);
+                    }
+                }
+                let fallback_unique = storage::load_borrowed_commit_delta_change_records(
+                    &self.store,
+                    commit_id,
+                    &fallback_keys,
+                )
+                .await?;
+                for (key_index, key) in &fallback_requests {
+                    let key_ref = TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    };
+                    let fallback_index = fallback_keys
+                        .binary_search(&key_ref)
+                        .expect("cascade key was included in the canonical owner batch");
+                    loaded_unique[*key_index] = fallback_unique[fallback_index].clone();
+                }
+            }
+            let mut row_index = 0;
+            for (key_index, &first_row) in first_rows.iter().enumerate() {
+                debug_assert_eq!(row_index, first_row);
+                let row_end = first_rows
+                    .get(key_index + 1)
+                    .copied()
+                    .unwrap_or(ordered_rows.len());
+                let record = loaded_unique[key_index].take().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!(
                             "tracked-state endpoint row '{}' has no authoritative payload in commit '{}'",
-                            row.change_id, commit_id
+                            ordered_rows[first_row].change_id, commit_id
                         ),
                     )
                 })?;
-                if record.change_id != row.change_id {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked-state endpoint row '{}' resolves to payload '{}'",
-                            row.change_id, record.change_id
-                        ),
-                    ));
+                for row in &ordered_rows[first_row..row_end] {
+                    if record.change_id != row.change_id {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked-state endpoint row '{}' resolves to payload '{}'",
+                                row.change_id, record.change_id
+                            ),
+                        ));
+                    }
                 }
                 records.insert(record.change_id, record);
+                row_index = row_end;
             }
         }
         for row in rows {
@@ -2463,64 +2505,123 @@ where
         }
         let mut records = HashMap::<ChangeId, ChangeRecord>::new();
         for (commit_id, commit_rows) in by_commit {
-            let keys = commit_rows
-                .iter()
-                .map(|row| TrackedStateKey {
-                    schema_key: row.schema_key().to_owned(),
-                    file_id: row.file_id().map(str::to_owned),
-                    entity_pk: row.entity_pk().clone(),
-                })
-                .collect::<Vec<_>>();
-            let mut loaded =
-                storage::load_commit_delta_change_records(&self.store, commit_id, &keys).await?;
-            let fallback_rows = commit_rows
-                .iter()
-                .zip(&loaded)
-                .filter_map(|(row, record)| {
-                    (record.is_none() && row.deleted())
-                        .then(|| row.file_id())
-                        .flatten()
-                        .map(cascade_payload_key)
-                })
-                .collect::<Vec<_>>();
-            if !fallback_rows.is_empty() {
-                let fallbacks = storage::load_commit_delta_change_records(
-                    &self.store,
-                    commit_id,
-                    &fallback_rows,
-                )
-                .await?;
-                let mut fallbacks = fallbacks.into_iter();
-                for (row, record) in commit_rows.iter().zip(&mut loaded) {
-                    if record.is_none() && row.deleted() && row.file_id().is_some() {
-                        *record = fallbacks
-                            .next()
-                            .expect("one fallback was loaded per missing file-scoped tombstone");
-                    }
+            let mut ordered_rows = commit_rows;
+            ordered_rows.sort_unstable_by(|left, right| {
+                let left_key = TrackedStateKeyRef {
+                    schema_key: left.schema_key(),
+                    file_id: left.file_id(),
+                    entity_pk: left.entity_pk(),
+                };
+                let right_key = TrackedStateKeyRef {
+                    schema_key: right.schema_key(),
+                    file_id: right.file_id(),
+                    entity_pk: right.entity_pk(),
+                };
+                left_key.cmp(&right_key)
+            });
+            let mut keys = Vec::with_capacity(ordered_rows.len());
+            let mut first_rows = Vec::with_capacity(ordered_rows.len());
+            for (row_index, row) in ordered_rows.iter().enumerate() {
+                let key = TrackedStateKeyRef {
+                    schema_key: row.schema_key(),
+                    file_id: row.file_id(),
+                    entity_pk: row.entity_pk(),
+                };
+                if keys.last().is_none_or(|previous| previous != &key) {
+                    keys.push(key);
+                    first_rows.push(row_index);
                 }
             }
-            for (row, record) in commit_rows.into_iter().zip(loaded) {
-                let record = record.ok_or_else(|| {
+            let mut loaded_unique =
+                storage::load_borrowed_commit_delta_change_records(&self.store, commit_id, &keys)
+                    .await?;
+            let mut fallback_requests = first_rows
+                .iter()
+                .enumerate()
+                .filter_map(|(key_index, &row_index)| {
+                    (loaded_unique[key_index].is_none() && ordered_rows[row_index].deleted())
+                        .then(|| ordered_rows[row_index].file_id())
+                        .flatten()
+                        .map(|file_id| (key_index, cascade_payload_key(file_id)))
+                })
+                .collect::<Vec<_>>();
+            if !fallback_requests.is_empty() {
+                fallback_requests.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+                let mut fallback_keys = Vec::with_capacity(fallback_requests.len());
+                for (_, key) in &fallback_requests {
+                    let key_ref = TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    };
+                    if fallback_keys
+                        .last()
+                        .is_none_or(|previous| previous != &key_ref)
+                    {
+                        fallback_keys.push(key_ref);
+                    }
+                }
+                let fallback_unique = storage::load_borrowed_commit_delta_change_records(
+                    &self.store,
+                    commit_id,
+                    &fallback_keys,
+                )
+                .await?;
+                for (key_index, key) in &fallback_requests {
+                    let key_ref = TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    };
+                    let fallback_index = fallback_keys
+                        .binary_search(&key_ref)
+                        .expect("tree cascade key was included in the canonical owner batch");
+                    loaded_unique[*key_index] = fallback_unique[fallback_index].clone();
+                }
+            }
+            let mut row_index = 0;
+            for (key_index, &first_row) in first_rows.iter().enumerate() {
+                debug_assert_eq!(row_index, first_row);
+                let row_end = first_rows
+                    .get(key_index + 1)
+                    .copied()
+                    .unwrap_or(ordered_rows.len());
+                let record = loaded_unique[key_index].take().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!(
                             "tracked-state diff row '{}' has no authoritative payload in commit '{}'",
-                            row.change_id(),
+                            ordered_rows[first_row].change_id(),
                             commit_id
                         ),
                     )
                 })?;
-                if let Some(existing) = records.insert(record.change_id, record.clone())
-                    && existing != record
+                for row in &ordered_rows[first_row..row_end] {
+                    if record.change_id != row.change_id() {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked-state diff row '{}' resolves to payload '{}'",
+                                row.change_id(),
+                                record.change_id
+                            ),
+                        ));
+                    }
+                }
+                if records
+                    .get(&record.change_id)
+                    .is_some_and(|existing| existing != &record)
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!(
                             "tracked-state diff change '{}' resolves to conflicting packed payloads",
-                            row.change_id()
+                            ordered_rows[first_row].change_id()
                         ),
                     ));
                 }
+                records.insert(record.change_id, record);
+                row_index = row_end;
             }
         }
         for row in rows.iter().copied() {

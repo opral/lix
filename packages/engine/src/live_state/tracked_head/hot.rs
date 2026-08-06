@@ -3791,20 +3791,16 @@ async fn load_packed_current_base_exact_entries(
         return Ok((0..keys.len()).map(|_| None).collect());
     }
     if let [base_ref] = base_refs.as_slice() {
-        return Ok(
-            crate::tracked_state::load_owned_commit_delta_entries_one_ordered_ref(
-                store,
-                base_ref.commit_id,
-                keys,
-                transaction_cache.map(|cache| &cache.commit_delta_points),
-            )
-            .await?
-            .into_iter()
-            .map(|entry| {
-                entry.map(|entry| (entry.value, entry.change_record, entry.base_coordinate))
-            })
-            .collect(),
-        );
+        return Ok(crate::tracked_state::load_borrowed_commit_delta_entries(
+            store,
+            base_ref.commit_id,
+            keys,
+            transaction_cache.map(|cache| &cache.commit_delta_points),
+        )
+        .await?
+        .into_iter()
+        .map(|entry| entry.map(|entry| (entry.value, entry.change_record, entry.base_coordinate)))
+        .collect());
     }
     let owned_keys = keys
         .iter()
