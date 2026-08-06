@@ -4167,6 +4167,16 @@ where
                 if control.tracked_generation == control.untracked_generation {
                     return Ok(tracked);
                 }
+                // A split branch control has two independent serving roots:
+                // the tracked selector owns only tracked rows and the
+                // untracked selector owns only current-only rows.  Older
+                // generations can contain a complete pre-split snapshot, so
+                // concatenating both roots without applying the domain
+                // boundary would resurrect tracked rows from the untracked
+                // root after checkout/merge.  Filter at the selector
+                // boundary, before visibility resolution, rather than
+                // relying on row-level callers to repair a mixed authority.
+                let tracked = tracked.filter(|row| !row.untracked(), None);
                 let untracked = self
                     .scan_live_batch_for_generation(
                         branch_id,
@@ -4175,6 +4185,7 @@ where
                         request,
                     )
                     .await?;
+                let untracked = untracked.filter(|row| row.untracked(), None);
                 let mut rows = tracked.into_rows();
                 rows.extend(untracked.into_rows());
                 Ok(MaterializedLiveStateBatch::from_rows(rows))
@@ -5022,7 +5033,17 @@ where
         let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
         let mut slots = Vec::with_capacity(keys.len());
         for index in 0..keys.len() {
-            let row = tracked.row(index).or_else(|| untracked.row(index));
+            // The two branch-control selectors are independent authority
+            // domains. Older generations can still contain a complete
+            // snapshot, so an exact lookup must not let an untracked row from
+            // the tracked selector mask the current-only generation (or let a
+            // tracked row from the current-only selector leak into a tracked
+            // read). Enforce the domain boundary at this shared exact-read
+            // primitive before resolving precedence.
+            let row = tracked
+                .row(index)
+                .filter(|row| !row.untracked())
+                .or_else(|| untracked.row(index).filter(|row| row.untracked()));
             slots.push(row.map(|row| {
                 let ordinal = u32::try_from(builder.len())
                     .expect("exact live-state row count exceeds u32 ordinals");
