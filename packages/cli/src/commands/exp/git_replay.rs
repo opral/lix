@@ -207,7 +207,8 @@ struct ReplayCommitProfile {
     inserts: usize,
     updates: usize,
     deletes: usize,
-    statement_count: usize,
+    logical_statement_count: usize,
+    physical_execution_groups: usize,
     sql_chars: usize,
     blob_bytes: usize,
     marker_only: bool,
@@ -455,7 +456,7 @@ where
         let build_sql_ms = duration_to_ms(build_sql_started.elapsed());
         phase_totals.build_sql_ms += build_sql_ms;
 
-        let statement_count = statements.len();
+        let logical_statement_count = statements.len();
         let sql_chars = total_statement_sql_chars(&statements);
         let blob_bytes = prepared_blob_bytes(&prepared);
         let inserts = prepared.inserts.len();
@@ -467,7 +468,8 @@ where
         }
         lix.reset_plugin_transition_counters();
         let execute_started = Instant::now();
-        execute_statements_as_transaction(&lix, &statements, commit_sha)?;
+        let physical_execution_groups =
+            execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
         let plugin_counters = lix.plugin_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
@@ -495,7 +497,8 @@ where
             inserts,
             updates,
             deletes,
-            statement_count,
+            logical_statement_count,
+            physical_execution_groups,
             sql_chars,
             blob_bytes,
             marker_only: prepared.deletes.is_empty()
@@ -622,7 +625,7 @@ fn execute_statements_as_transaction<StorageImpl>(
     lix: &Lix<StorageImpl>,
     statements: &[SqlStatement],
     commit_sha: &str,
-) -> Result<(), CliError>
+) -> Result<usize, CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -636,6 +639,7 @@ where
         ))
     })?;
     let mut index = 0;
+    let mut physical_execution_groups = 0usize;
     while index < statements.len() {
         let statement = &statements[index];
         let mut end = index + 1;
@@ -665,6 +669,7 @@ where
                     "failed at commit {commit_sha} while executing prepared replay batch: {error}"
                 ))
             })?;
+            physical_execution_groups += 1;
         } else {
             for statement in &statements[index..end] {
                 db::block_on(transaction.execute(&statement.sql, &statement.params)).map_err(
@@ -674,6 +679,7 @@ where
                         ))
                     },
                 )?;
+                physical_execution_groups += 1;
             }
         }
         index = end;
@@ -684,7 +690,7 @@ where
         ))
     })?;
 
-    Ok(())
+    Ok(physical_execution_groups)
 }
 
 fn is_prepared_replay_shape(sql: &str) -> bool {
@@ -2593,8 +2599,10 @@ mod tests {
                 first_parent: None,
             }),
         ];
-        execute_statements_as_transaction(&lix, &statements, "commit-1")
-            .expect("ordinary replay transaction should commit");
+        let physical_execution_groups =
+            execute_statements_as_transaction(&lix, &statements, "commit-1")
+                .expect("ordinary replay transaction should commit");
+        assert_eq!(physical_execution_groups, 2);
         let after = PreparedDmlParameterBatch::take_execution_counters();
         assert_eq!(
             (after.0 - before.0, after.1 - before.1),
@@ -3533,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn rocksdb_replay_bounds_text_actor_lifecycle_across_hundred_commits() {
+    fn rocksdb_replay_reports_physical_groups_for_text_actor_lifecycle_across_hundred_commits() {
         const TEXT_FILES: usize = 17;
 
         let fixture = unique_temp_dir();
@@ -3645,10 +3653,17 @@ mod tests {
         );
         assert_eq!(
             commits[0]
-                .get("statement_count")
+                .get("logical_statement_count")
+                .and_then(serde_json::Value::as_u64),
+            Some((TEXT_FILES + 1) as u64),
+            "logical descriptors include each file row and the replay marker"
+        );
+        assert_eq!(
+            commits[0]
+                .get("physical_execution_groups")
                 .and_then(serde_json::Value::as_u64),
             Some(2),
-            "bulk inserts and the replay marker must share one atomic batch"
+            "bulk inserts and the replay marker must use one prepared page plus one marker group"
         );
         assert_eq!(
             commits[1]
@@ -3658,10 +3673,17 @@ mod tests {
         );
         assert_eq!(
             commits[1]
-                .get("statement_count")
+                .get("logical_statement_count")
+                .and_then(serde_json::Value::as_u64),
+            Some((TEXT_FILES + 1) as u64),
+            "logical descriptors include each file row and the replay marker"
+        );
+        assert_eq!(
+            commits[1]
+                .get("physical_execution_groups")
                 .and_then(serde_json::Value::as_u64),
             Some(2),
-            "bulk updates and the replay marker must share one atomic batch"
+            "bulk updates and the replay marker must use one prepared page plus one marker group"
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
