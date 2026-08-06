@@ -379,14 +379,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &deleted_checkpoint_files,
     )
     .await?;
-    for branch_id in &deleted_checkpoint_branches {
-        crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
-            &*read,
-            &mut writes,
-            branch_id,
-        )
-        .await?;
-    }
+    // Branch-owned plugin checkpoints are derived serving state.  Branch
+    // deletion publishes the authenticated lifecycle/control retirement here;
+    // the GC reachability consumer reclaims the UUID range after the retired
+    // root is proven unreachable.  Avoid scanning the entire checkpoint range
+    // in the foreground write transaction.
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
@@ -4937,7 +4934,12 @@ async fn stage_branch_head_control_publications(
         )?);
         let old_root = observation.control.map(|control| control.head_commit_id);
         let new_root = desired.as_ref().map(|control| control.head_commit_id);
-        if old_root != new_root {
+        // An explicit deletion is a lifecycle transition even when this
+        // pinned observation has no rooted control.  Publishing the
+        // authenticated None -> None delta gives deferred consumers a durable
+        // branch-retirement signal for checkpoints staged before the branch
+        // ever acquired a tracked root.
+        if old_root != new_root || desired.is_none() {
             root_reachability_deltas.push(crate::gc::RootReachabilityDelta {
                 branch_id: branch_id.clone(),
                 old_root,
@@ -7347,6 +7349,157 @@ mod tests {
                 .expect("branch control should load")
                 .is_none(),
             "branch deletion must remove its current-state control"
+        );
+    }
+
+    #[tokio::test]
+    async fn rootless_branch_delete_defers_checkpoint_cleanup_through_gc_and_reopen() {
+        let backend = Memory::new();
+        crate::Engine::initialize(backend.clone())
+            .await
+            .expect("rootless checkpoint repository should initialize");
+        let storage = StorageAdapter::new(backend.clone());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let branch_id = "01960000-0000-7000-8000-000000000004";
+        let file_id = "01960000-0000-7000-8000-000000000005";
+        let generation = crate::binary_cas::BlobId::from_content(b"rootless-generation");
+        let semantic_root = "01960000-0000-7000-8000-000000000006";
+        let blob_hash = crate::binary_cas::BlobId::from_content(b"rootless-file");
+
+        // Model a checkpoint staged before this branch ever acquires a
+        // tracked root. The derived row is not itself lifecycle authority.
+        let mut checkpoint_writes = storage.new_write_set();
+        crate::transaction::plugin_checkpoint::stage_current_plugin_checkpoint(
+            &mut checkpoint_writes,
+            branch_id,
+            file_id,
+            &generation.to_hex(),
+            semantic_root,
+            blob_hash,
+            b"runtime",
+            b"authority",
+        )
+        .expect("rootless checkpoint should stage");
+        storage
+            .commit_write_set(checkpoint_writes, StorageWriteOptions::default())
+            .await
+            .expect("rootless checkpoint should persist");
+
+        let mut branch_ref_delete = untracked_global_row("delete-rootless-branch-ref");
+        branch_ref_delete.entity_pk = EntityPk::single(branch_id);
+        branch_ref_delete.schema_key = BRANCH_REF_SCHEMA_KEY.into();
+        branch_ref_delete.snapshot = None;
+        let mut delete_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rootless branch delete read should open");
+        let (delete_writes, delete_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut delete_read,
+            PreparedWriteSet {
+                insert_selection: PreparedInsertSelection::new(),
+                state_rows: prepared_rows![branch_ref_delete],
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
+                file_content_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("rootless branch deletion should publish a lifecycle signal");
+        drop(delete_read);
+        storage
+            .commit_write_set(
+                delete_writes,
+                StorageWriteOptions {
+                    preconditions: delete_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("rootless branch deletion should commit");
+
+        let retained_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retained checkpoint read should open");
+        assert!(
+            crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
+                &retained_read,
+                branch_id,
+                file_id,
+                &generation.to_hex(),
+                semantic_root,
+                blob_hash,
+            )
+            .await
+            .expect("retained rootless checkpoint should load")
+            .is_some(),
+            "foreground branch deletion must leave checkpoint reclamation to GC"
+        );
+        drop(retained_read);
+
+        let gc_read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rootless GC read should open"),
+        );
+        let mut gc_writes = storage.new_write_set();
+        let mut gc_preconditions = Vec::new();
+        crate::gc::stage_repository_gc_with_preconditions(
+            gc_read,
+            &mut gc_writes,
+            &mut gc_preconditions,
+        )
+        .await
+        .expect("authenticated rootless GC should stage");
+        storage
+            .commit_write_set(
+                gc_writes,
+                StorageWriteOptions {
+                    preconditions: gc_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("authenticated rootless GC should commit");
+
+        let reopened = crate::Engine::new(backend.clone())
+            .await
+            .expect("repository should reopen after rootless GC");
+        let session = reopened
+            .open_workspace_session()
+            .await
+            .expect("workspace should reopen after rootless GC");
+        let main = session
+            .execute("SELECT id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .expect("live main branch should survive rootless GC");
+        assert_eq!(main.rows().len(), 1);
+
+        let reopened_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-reopen checkpoint read should open");
+        assert!(
+            crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
+                &reopened_read,
+                branch_id,
+                file_id,
+                &generation.to_hex(),
+                semantic_root,
+                blob_hash,
+            )
+            .await
+            .expect("post-GC rootless checkpoint lookup should succeed")
+            .is_none(),
+            "authenticated GC must reclaim the rootless branch checkpoint prefix"
         );
     }
 

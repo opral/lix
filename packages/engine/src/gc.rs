@@ -1135,6 +1135,7 @@ where
     let mut queue_open = true;
     let mut reclaimed_commits = Vec::new();
     let mut reclaimed_standalone_changes = BTreeSet::new();
+    let mut reclaimed_checkpoint_branches = BTreeSet::new();
     for (sequence, batch) in batches {
         if queue_open && blocked_sequences.contains(&sequence) {
             queue_open = false;
@@ -1144,6 +1145,25 @@ where
         }
         for delta in batch.deltas {
             validate_stored_root_reachability_delta(&delta)?;
+            // Branch checkpoint rows are derived serving state owned by the
+            // branch lifecycle, not by a tracked root.  Process the
+            // authenticated deletion signal before inspecting `old_root` so
+            // a branch deleted before its first rooted publication cannot
+            // strand its checkpoint prefix forever.  A recreated branch has
+            // a live control and therefore keeps the shared branch-id range.
+            if delta.new_control.is_none()
+                && !controls
+                    .iter()
+                    .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
+                && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
+            {
+                crate::transaction::stage_delete_branch_plugin_checkpoints(
+                    &store,
+                    writes,
+                    &delta.branch_id,
+                )
+                .await?;
+            }
             let Some(old_root) = delta.old_root else {
                 continue;
             };
