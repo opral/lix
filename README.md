@@ -21,7 +21,7 @@ Lix is a version control system for work beyond code: any file format, SQL over 
 - 👥 **Real-time collaboration.** People and agents share a repository and see changes live.
 - 🏁 **Checkpoints instead of commits.** Lix records every change automatically; a checkpoint marks a state you want to return to.
 - 🔌 **Pluggable storage.** Lix runs in memory, on the local filesystem, or on S3. Git assumes a POSIX filesystem, which makes it hard to embed and scale.
-- 🔐 **Permissions (soon).** Finance, legal, and contractors need different access, but Git is all or nothing. Lix models permissions per file and group inside the repository.
+- 🔐 **Permissions (soon).** Finance, legal, and contractors need different access. Lix models permissions per file and group inside the repository.
 
 ## Try a demo app
 

@@ -385,7 +385,7 @@ const whatYouGet = [
     title: "Permissions",
     badge: "soon",
     description:
-      "Finance, legal, and contractors need different access, but Git is all or nothing. Lix models permissions per file and group inside the repository.",
+      "Finance, legal, and contractors need different access. Lix models permissions per file and group inside the repository.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <path
