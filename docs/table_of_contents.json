@@ -3,7 +3,7 @@
     { "path": "./what-is-lix.md", "label": "What is Lix?" },
     { "path": "./getting-started.md", "label": "Getting Started" },
     { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },
-    { "path": "./comparison-to-git.md", "label": "How Lix Fits" }
+    { "path": "./comparison-to-git.md", "label": "Comparison to Git" }
   ],
   "Concepts": [
     { "path": "./schemas.md", "label": "Schemas" },
@@ -15,8 +15,7 @@
     { "path": "./surfaces.md", "label": "SQL Surfaces" }
   ],
   "Guides": [
-    { "path": "./persistence.md", "label": "Persistence" },
-    { "path": "./storage.md", "label": "Storage" }
+    { "path": "./persistence.md", "label": "Persistence and Storage" }
   ],
   "Reference": [
     { "path": "./js-api-reference.md", "label": "JavaScript API" },

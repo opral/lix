@@ -45,9 +45,9 @@ function CopyInstallButton({
 
 const whatYouGet = [
   {
-    title: "Keep normal files",
+    title: "Works with any file format",
     description:
-      "Existing tools and agents can keep reading and writing files on disk.",
+      "Companies produce DOCX, XLSX, and CAD, not just text. Plugins map any format to versioned entities.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
@@ -111,9 +111,9 @@ const whatYouGet = [
     ),
   },
   {
-    title: "Query everything with SQL",
+    title: "Semantic changes",
     description:
-      "Query file content, app data, and change history without rereading whole files.",
+      "A spreadsheet diff is a cell, not a byte blob. Review the clause, cell, or row that changed.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
@@ -210,180 +210,116 @@ const whatYouGet = [
     ),
   },
   {
-    title: "Track semantic changes",
+    title: "SQL and transactions",
     description:
-      "Review the paragraph, CSV record, property, or app row that changed.",
+      "File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <line
-          x1="16"
-          y1="14"
-          x2="64"
-          y2="14"
+        <ellipse
+          cx="40"
+          cy="15"
+          rx="19"
+          ry="6"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <path
+          d="M21 15 V41 C21 44.3 29.5 47 40 47 C50.5 47 59 44.3 59 41 V15"
+          fill="none"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <path
+          d="M21 28 C21 31.3 29.5 34 40 34 C50.5 34 59 31.3 59 28"
+          fill="none"
           stroke="#C9C7BF"
-          strokeWidth="2"
-          strokeLinecap="round"
+          strokeWidth="1.5"
         />
         <line
-          x1="16"
-          y1="24"
-          x2="52"
-          y2="24"
-          stroke="#C9C7BF"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
-        <line
-          x1="16"
-          y1="34"
-          x2="30"
-          y2="34"
-          stroke="#C9C7BF"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
-        <line
-          x1="35"
-          y1="34"
-          x2="52"
-          y2="34"
+          x1="33"
+          y1="40"
+          x2="47"
+          y2="40"
           stroke="#07B6D5"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
-        <line
-          x1="57"
-          y1="34"
-          x2="64"
-          y2="34"
-          stroke="#C9C7BF"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
-        <line
-          x1="16"
-          y1="44"
-          x2="58"
-          y2="44"
-          stroke="#C9C7BF"
-          strokeWidth="2"
+          strokeWidth="1.5"
           strokeLinecap="round"
         />
       </svg>
     ),
   },
   {
-    title: "Branch and merge safely",
+    title: "Real-time collaboration",
     description:
-      "Give every user or agent an isolated repository, then review and merge its work.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <path
-          d="M14 40 H66"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
-        <path
-          d="M26 40 C32 40 32 18 40 18 H46 C56 18 54 40 60 40"
-          fill="none"
-          stroke="#07B6D5"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
-        <circle cx="14" cy="40" r="3.5" fill="#8A8F96" />
-        <circle cx="43" cy="18" r="3.5" fill="#07B6D5" />
-        <circle cx="66" cy="40" r="3.5" fill="#8A8F96" />
-      </svg>
-    ),
-  },
-  {
-    title: "Use ACID transactions",
-    description:
-      "Update files and rows together while Lix records their history.",
+      "Companies work live, not in pull requests. People and agents share a repository and see changes as they happen.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
-          x="12"
+          x="18"
           y="10"
-          width="56"
+          width="44"
           height="36"
-          rx="6"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeDasharray="4 4"
-        />
-        <rect
-          x="20"
-          y="19"
-          width="18"
-          height="18"
-          rx="3"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="44"
-          y="19"
-          width="18"
-          height="18"
-          rx="3"
+          rx="4"
           fill="#FFFFFF"
           stroke="#8A8F96"
           strokeWidth="1.5"
         />
         <line
-          x1="38"
-          y1="28"
-          x2="44"
-          y2="28"
-          stroke="#07B6D5"
-          strokeWidth="2"
+          x1="26"
+          y1="20"
+          x2="54"
+          y2="20"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
           strokeLinecap="round"
         />
+        <line
+          x1="26"
+          y1="28"
+          x2="46"
+          y2="28"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+        <path d="M32 34 L32 42 L38 38.5 Z" fill="#07B6D5" />
+        <path d="M50 24 L50 32 L56 28.5 Z" fill="#8A8F96" />
       </svg>
     ),
   },
   {
-    title: "Run locally or remotely",
+    title: "Checkpoints instead of commits",
     description:
-      "Embed Lix in an app or connect to a shared repository through the server protocol.",
+      "People and agents do not write commit messages. Lix records every change automatically; a checkpoint marks a state you want to return to.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="12"
-          y="20"
-          width="16"
-          height="16"
-          rx="3"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="52"
-          y="20"
-          width="16"
-          height="16"
-          rx="3"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
         <line
-          x1="28"
-          y1="28"
-          x2="52"
-          y2="28"
+          x1="12"
+          y1="34"
+          x2="68"
+          y2="34"
           stroke="#C9C7BF"
           strokeWidth="1.5"
-          strokeDasharray="3 4"
-          strokeLinecap="round"
         />
-        <circle cx="40" cy="28" r="3" fill="#07B6D5" />
+        <circle cx="20" cy="34" r="2.5" fill="#C9C7BF" />
+        <circle cx="32" cy="34" r="2.5" fill="#C9C7BF" />
+        <circle cx="44" cy="34" r="2.5" fill="#C9C7BF" />
+        <circle cx="56" cy="34" r="3.5" fill="#07B6D5" />
+        <line
+          x1="56"
+          y1="30"
+          x2="56"
+          y2="16"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+        <path
+          d="M56 16 L66 19 L56 22 Z"
+          fill="rgba(7,182,213,0.14)"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+          strokeLinejoin="round"
+        />
       </svg>
     ),
   },
@@ -408,7 +344,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             Open source · MIT
           </p>
           <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-            Database, filesystem and version control in one system
+            A version control system beyond code
           </h1>
           <div className="mt-4 flex max-w-[620px] flex-col gap-3">
             <p className="text-base leading-[1.6] text-ink-secondary">
@@ -462,6 +398,10 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
           <h2 className="mb-1 text-[22px] font-bold tracking-[-0.02em]">
             What you get
           </h2>
+          <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
+            Putting more than code into a repository needs five things a code
+            VCS never had:
+          </p>
           <div className="mt-5">
             {whatYouGet.map((item, index) => (
               <div
@@ -494,8 +434,16 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                   href="https://github.com/opral/lix"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="font-mono text-xs text-ink-muted transition-colors hover:text-cyan-deep"
+                  className="flex items-center gap-1.5 font-mono text-xs text-ink-muted transition-colors hover:text-cyan-deep"
                 >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                    className="h-3.5 w-3.5"
+                    aria-hidden="true"
+                  >
+                    <path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.21.68-.47v-1.69c-2.78.6-3.37-1.34-3.37-1.34a2.64 2.64 0 00-1.1-1.46c-.9-.62.07-.6.07-.6a2.08 2.08 0 011.52 1 2.1 2.1 0 002.87.82 2.11 2.11 0 01.63-1.32c-2.22-.25-4.56-1.11-4.56-4.95a3.88 3.88 0 011-2.7 3.6 3.6 0 01.1-2.67s.84-.27 2.75 1a9.5 9.5 0 015 0c1.91-1.29 2.75-1 2.75-1a3.6 3.6 0 01.1 2.67 3.87 3.87 0 011 2.7c0 3.85-2.34 4.7-4.57 4.95a2.37 2.37 0 01.68 1.84v2.72c0 .27.18.57.69.47A10 10 0 0012 2z" />
+                  </svg>
                   view on GitHub →
                 </a>
               </div>

@@ -266,6 +266,24 @@ pub(crate) fn record_certified_entity_insert_parameter_batch_certification() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertifiedEntityInsertParameterBatchCounters {
+    pub certifications: u64,
+    pub executions: u64,
+}
+
+/// Reads the cumulative certified parameter-batch INSERT phase counters
+/// without resetting them. Callers measuring one fixture/sample must subtract
+/// a pre-operation snapshot from a post-operation snapshot.
+pub fn certified_entity_insert_parameter_batch_counters()
+-> CertifiedEntityInsertParameterBatchCounters {
+    CertifiedEntityInsertParameterBatchCounters {
+        certifications: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS
+            .load(Ordering::Relaxed),
+        executions: CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
+    }
+}
+
 /// Returns and resets the number of certified parameter-batch INSERT routes
 /// selected by the planner, before any physical staging occurs.
 pub fn take_certified_entity_insert_parameter_batch_certifications() -> u64 {
