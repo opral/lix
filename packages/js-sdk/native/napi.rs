@@ -6,9 +6,9 @@ use lix_sdk::{
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, RedoReceipt, SQLite,
-    SQLiteOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
-    TelemetrySink, UndoReceipt, Value, open_lix, open_lix_with_telemetry,
+    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, RedoReceipt,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, TelemetrySink, UndoReceipt,
+    Value, open_lix, open_lix_with_telemetry,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
@@ -48,19 +48,16 @@ pub struct NativeLix {
 
 enum NativeLixInner {
     Memory(RsLix<Memory>),
-    SQLite(RsLix<SQLite>),
     LocalFilesystem(RsLix<LocalFilesystem>, LocalFilesystem),
 }
 
 enum NativeLixTransactionInner {
     Memory(RsLixTransaction<Memory>),
-    SQLite(RsLixTransaction<SQLite>),
     LocalFilesystem(RsLixTransaction<LocalFilesystem>),
 }
 
 enum NativeObserveEventsInner {
     Memory(RsObserveEvents<Memory>),
-    SQLite(RsObserveEvents<SQLite>),
     LocalFilesystem(RsObserveEvents<LocalFilesystem>),
 }
 
@@ -579,7 +576,6 @@ impl NativeLixInner {
     ) -> std::result::Result<RsExecuteResult, LixError> {
         match self {
             Self::Memory(lix) => lix.execute_with_options(sql, params, options).await,
-            Self::SQLite(lix) => lix.execute_with_options(sql, params, options).await,
             Self::LocalFilesystem(lix, _) => lix.execute_with_options(sql, params, options).await,
         }
     }
@@ -591,7 +587,6 @@ impl NativeLixInner {
     ) -> std::result::Result<Vec<RsExecuteResult>, LixError> {
         match self {
             Self::Memory(lix) => lix.execute_batch_with_options(statements, options).await,
-            Self::SQLite(lix) => lix.execute_batch_with_options(statements, options).await,
             Self::LocalFilesystem(lix, _) => {
                 lix.execute_batch_with_options(statements, options).await
             }
@@ -601,9 +596,6 @@ impl NativeLixInner {
     async fn begin_transaction(&self) -> std::result::Result<NativeLixTransactionInner, LixError> {
         match self {
             Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
-                lix.begin_transaction().await?,
-            )),
-            Self::SQLite(lix) => Ok(NativeLixTransactionInner::SQLite(
                 lix.begin_transaction().await?,
             )),
             Self::LocalFilesystem(lix, _) => Ok(NativeLixTransactionInner::LocalFilesystem(
@@ -619,7 +611,6 @@ impl NativeLixInner {
     ) -> std::result::Result<NativeObserveEventsInner, LixError> {
         match self {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
-            Self::SQLite(lix) => Ok(NativeObserveEventsInner::SQLite(lix.observe(sql, params)?)),
             Self::LocalFilesystem(lix, _) => Ok(NativeObserveEventsInner::LocalFilesystem(
                 lix.observe(sql, params)?,
             )),
@@ -629,7 +620,6 @@ impl NativeLixInner {
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
-            Self::SQLite(lix) => lix.active_branch_id().await,
             Self::LocalFilesystem(lix, _) => lix.active_branch_id().await,
         }
     }
@@ -637,7 +627,6 @@ impl NativeLixInner {
     fn active_account_id(&self) -> &str {
         match self {
             Self::Memory(lix) => lix.active_account_id(),
-            Self::SQLite(lix) => lix.active_account_id(),
             Self::LocalFilesystem(lix, _) => lix.active_account_id(),
         }
     }
@@ -648,7 +637,6 @@ impl NativeLixInner {
     ) -> std::result::Result<CreateBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
-            Self::SQLite(lix) => lix.create_branch(options).await,
             Self::LocalFilesystem(lix, _) => lix.create_branch(options).await,
         }
     }
@@ -656,7 +644,6 @@ impl NativeLixInner {
     async fn create_checkpoint(&self) -> std::result::Result<CreateCheckpointReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_checkpoint().await,
-            Self::SQLite(lix) => lix.create_checkpoint().await,
             Self::LocalFilesystem(lix, _) => lix.create_checkpoint().await,
         }
     }
@@ -664,7 +651,6 @@ impl NativeLixInner {
     async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.undo().await,
-            Self::SQLite(lix) => lix.undo().await,
             Self::LocalFilesystem(lix, _) => lix.undo().await,
         }
     }
@@ -672,7 +658,6 @@ impl NativeLixInner {
     async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.redo().await,
-            Self::SQLite(lix) => lix.redo().await,
             Self::LocalFilesystem(lix, _) => lix.redo().await,
         }
     }
@@ -683,7 +668,6 @@ impl NativeLixInner {
     ) -> std::result::Result<SwitchBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
-            Self::SQLite(lix) => lix.switch_branch(options).await,
             Self::LocalFilesystem(lix, _) => lix.switch_branch(options).await,
         }
     }
@@ -694,7 +678,7 @@ impl NativeLixInner {
     ) -> std::result::Result<(), LixError> {
         match self {
             Self::LocalFilesystem(_, storage) => storage.import_paths(paths).await,
-            Self::Memory(_) | Self::SQLite(_) => Err(LixError::new(
+            Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "importFilesystemPaths requires a filesystem storage",
             )),
@@ -707,7 +691,6 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchPreview, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
-            Self::SQLite(lix) => lix.merge_branch_preview(options).await,
             Self::LocalFilesystem(lix, _) => lix.merge_branch_preview(options).await,
         }
     }
@@ -718,7 +701,6 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
-            Self::SQLite(lix) => lix.merge_branch(options).await,
             Self::LocalFilesystem(lix, _) => lix.merge_branch(options).await,
         }
     }
@@ -726,7 +708,7 @@ impl NativeLixInner {
     async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::LocalFilesystem(_, storage) => storage.sync_disk_to_lix().await,
-            Self::Memory(_) | Self::SQLite(_) => Err(LixError::new(
+            Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "syncDiskToLix requires a filesystem storage",
             )),
@@ -736,7 +718,6 @@ impl NativeLixInner {
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(lix) => lix.close().await,
-            Self::SQLite(lix) => lix.close().await,
             Self::LocalFilesystem(lix, _) => lix.close().await,
         }
     }
@@ -754,10 +735,6 @@ impl NativeLixTransactionInner {
                 Box::pin(transaction.execute_with_options(sql.to_owned(), params.to_vec(), options))
                     .await
             }
-            Self::SQLite(transaction) => {
-                Box::pin(transaction.execute_with_options(sql.to_owned(), params.to_vec(), options))
-                    .await
-            }
             Self::LocalFilesystem(transaction) => {
                 Box::pin(transaction.execute_with_options(sql.to_owned(), params.to_vec(), options))
                     .await
@@ -768,7 +745,6 @@ impl NativeLixTransactionInner {
     async fn commit(self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(transaction) => transaction.commit().await,
-            Self::SQLite(transaction) => transaction.commit().await,
             Self::LocalFilesystem(transaction) => transaction.commit().await,
         }
     }
@@ -776,7 +752,6 @@ impl NativeLixTransactionInner {
     async fn rollback(self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(transaction) => transaction.rollback().await,
-            Self::SQLite(transaction) => transaction.rollback().await,
             Self::LocalFilesystem(transaction) => transaction.rollback().await,
         }
     }
@@ -786,7 +761,6 @@ impl NativeObserveEventsInner {
     async fn next(&mut self) -> std::result::Result<Option<RsObserveEvent>, LixError> {
         match self {
             Self::Memory(events) => events.next().await,
-            Self::SQLite(events) => events.next().await,
             Self::LocalFilesystem(events) => events.next().await,
         }
     }
@@ -794,7 +768,6 @@ impl NativeObserveEventsInner {
     fn close(&mut self) {
         match self {
             Self::Memory(events) => events.close(),
-            Self::SQLite(events) => events.close(),
             Self::LocalFilesystem(events) => events.close(),
         }
     }
@@ -810,12 +783,6 @@ pub struct OpenLocalFilesystemTask {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
-    telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
-}
-
-#[expect(missing_debug_implementations)]
-pub struct OpenSQLiteTask {
-    path: String,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
 
@@ -850,22 +817,6 @@ impl Task for OpenMemoryTask {
     }
 }
 
-impl Task for OpenSQLiteTask {
-    type Output = std::result::Result<NativeLix, LixError>;
-    type JsValue = NativeLix;
-
-    fn compute(&mut self) -> Result<Self::Output> {
-        Ok(open_sqlite_native(
-            std::mem::take(&mut self.path),
-            self.telemetry_dispatch.take(),
-        ))
-    }
-
-    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        output.map_err(|error| lix_error_to_napi_error(&env, error))
-    }
-}
-
 fn telemetry_sink(dispatch: SharedJsTelemetryDispatch) -> Arc<dyn TelemetrySink> {
     Arc::new(CallbackTelemetrySink::new(move |span| {
         let Ok(json) = serde_json::to_string(&crate::telemetry::TelemetrySpanDto::from(span))
@@ -889,23 +840,6 @@ fn open_memory_native(
         None => rt.block_on(open_lix(options))?,
     };
     NativeLix::new(NativeLixInner::Memory(lix))
-}
-
-fn open_sqlite_native(
-    path: String,
-    telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
-) -> std::result::Result<NativeLix, LixError> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let storage = SQLite::new(SQLiteOptions { path: path.into() })?;
-    let options = RsOpenLixOptions::new(storage);
-    let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
-        None => rt.block_on(open_lix(options))?,
-    };
-    NativeLix::new(NativeLixInner::SQLite(lix))
 }
 
 fn open_local_filesystem_native(
@@ -936,17 +870,6 @@ impl NativeLix {
         telemetry_dispatch: Option<Function<'_, String, ()>>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
         Ok(AsyncTask::new(OpenMemoryTask {
-            telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
-        }))
-    }
-
-    #[napi(js_name = "openSQLite")]
-    pub fn open_sqlite(
-        path: String,
-        telemetry_dispatch: Option<Function<'_, String, ()>>,
-    ) -> Result<AsyncTask<OpenSQLiteTask>> {
-        Ok(AsyncTask::new(OpenSQLiteTask {
-            path,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
         }))
     }

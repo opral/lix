@@ -4,7 +4,6 @@ export {
 	LixTransaction,
 	ObserveEvents,
 	openLix,
-	SQLite,
 } from "./open-lix.js";
 export {
 	bundledPluginArchives,
@@ -41,7 +40,6 @@ export type {
 	RemoteLixServerOptions,
 	UndoReceipt,
 	SqlParam,
-	SQLiteOptions,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 } from "./types.js";

@@ -61,8 +61,8 @@ where
 /// Opens a Lix workspace session.
 ///
 /// `OpenLixOptions::default()` opens a fresh in-memory storage. Pass a
-/// concrete storage in `OpenLixOptions<StorageImpl>` to open SQLite or custom storage implementations
-/// with the same runtime configuration path.
+/// concrete storage in `OpenLixOptions<StorageImpl>` to open a custom storage
+/// implementation with the same runtime configuration path.
 pub async fn open_lix<StorageImpl>(
     options: OpenLixOptions<StorageImpl>,
 ) -> Result<Lix<StorageImpl>, LixError>

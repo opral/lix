@@ -23,15 +23,12 @@ lix_plugin_layout = { workspace = true }
 lix_local_filesystem = { workspace = true, optional = true }
 lix_rocksdb_storage = { workspace = true, optional = true }
 lix_slatedb_storage = { workspace = true, optional = true }
-lix_sqlite_storage = { workspace = true, optional = true }
 
 async-trait = "0.1"
 blake3 = { version = "1", optional = true }
 bytes = "1"
 lru = { version = "0.18", optional = true }
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde_json = "1"
-tempfile = { version = "3", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 uuid = { version = "1", features = ["std"] }
@@ -71,28 +68,6 @@ default_wasm_runtime = [
   "dep:wasmtime-wasi",
 ]
 local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
-sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
-
-[[example]]
-name = "create_sqlite_fixture"
-path = "tests/fixtures/create_sqlite_fixture.rs"
-required-features = ["sqlite"]
-
-[[example]]
-name = "write_sqlite_key_value"
-path = "tests/fixtures/write_sqlite_key_value.rs"
-required-features = ["sqlite"]
-
-[[example]]
-name = "verify_sqlite_key_value"
-path = "tests/fixtures/verify_sqlite_key_value.rs"
-required-features = ["sqlite"]
-
-[[bench]]
-name = "profile_merge_10k"
-path = "benches/profile_merge_10k.rs"
-harness = false
-required-features = ["sqlite"]
 
 [[bench]]
 name = "profile_checkpoint_scale"
@@ -110,9 +85,3 @@ required-features = ["slatedb_benches"]
 name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
 required-features = ["local_filesystem"]
-
-[[bench]]
-name = "sqlite"
-path = "benches/sqlite.rs"
-harness = false
-required-features = ["sqlite"]

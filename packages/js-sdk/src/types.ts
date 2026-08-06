@@ -1,7 +1,3 @@
-export type SQLiteOptions = {
-	path: string;
-};
-
 export type LocalFilesystemOptions = {
 	path: string;
 	lixDir?: string;
@@ -48,7 +44,6 @@ export interface LixSnapshotStorage {
 export type OpenLixOptions =
 	| {
 			storage?:
-				| import("./open-lix.js").SQLite
 				| import("./open-lix.js").LocalFilesystem
 				| LixSnapshotStorage;
 			server?: never;

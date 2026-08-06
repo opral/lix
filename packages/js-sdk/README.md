@@ -88,7 +88,7 @@ server switch into a rejected operation. Explicit `lix.clientState.set()` and
 Rust transaction has already committed, `get()` continues to expose that live
 session value; a later successful snapshot save can make it durable.
 
-Filesystem sync and SQLite persistence use native Node.js dependencies:
+Filesystem sync uses native Node.js dependencies:
 
 ```ts
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
@@ -175,11 +175,10 @@ try {
 - `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
 - Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
 - Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
-- Use `new SQLite({ path })` when a single SQLite-backed `.lix` file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
 - In browsers, local mode and remote mode with client storage load the Rust
   engine as WebAssembly. Supplying a snapshot storage adapter persists that
   local Lix; in remote mode, the local engine contains only client state.
-- `LocalFilesystem` and `SQLite` are Node.js-only. Constructing them is safe in
+- `LocalFilesystem` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
 - The package uses conditional ESM imports internally: Node.js resolves the

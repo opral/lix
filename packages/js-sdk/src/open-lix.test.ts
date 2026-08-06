@@ -17,7 +17,6 @@ import {
 	bundledPluginArchives,
 	LocalFilesystem,
 	openLix,
-	SQLite,
 	Value,
 	type ExecuteResult,
 	type Lix,
@@ -32,6 +31,11 @@ const CONFLICT_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000403";
 registerMemoryStorageContract({
 	name: "Node native",
 	loadSdk: async () => await import("./index.js"),
+});
+
+test("SQLite is not part of the JavaScript SDK export surface", async () => {
+	const sdk = await import("./index.js");
+	expect("SQLite" in sdk).toBe(false);
 });
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
@@ -264,24 +268,6 @@ test("execute and executeBatch expose registered-entity RETURNING postimages", a
 	await lix.close();
 });
 
-test("committed writes survive close and reopen", async () => {
-	const path = tempLixPath();
-	const first = await openLix({ storage: new SQLite({ path }) });
-
-	await registerCrmTaskSchema(first);
-	await first.execute(
-		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
-		["persistent-task", "Persist before close", false],
-	);
-	await first.close();
-
-	const second = await openLix({ storage: new SQLite({ path }) });
-	expect(await taskTitle(second, "persistent-task")).toBe(
-		"Persist before close",
-	);
-	await second.close();
-});
-
 test("a closed handle stays closed after its worker is reused", async () => {
 	const first = await openLix();
 	await first.close();
@@ -337,10 +323,6 @@ test("observe remains usable after next rejects", async () => {
 });
 
 test.each([
-	[
-		"sqlite",
-		() => openLix({ storage: new SQLite({ path: tempLixPath() }) }),
-	],
 	[
 		"fs",
 		() =>
@@ -1568,10 +1550,15 @@ test("execute rejects invalid runtime arguments before native call", async () =>
 	};
 
 	await expect(
-		openLix({ storage: { path: tempLixPath() } } as never),
+		openLix({ storage: { path: tempFsDir() } } as never),
 	).rejects.toThrow(/openLix\(\) requires/);
 	await expect(
-		openLix({ backend: new SQLite({ path: tempLixPath() }) } as never),
+		openLix({
+			backend: new LocalFilesystem({
+				path: tempFsDir(),
+				syncAllFiles: true,
+			}),
+		} as never),
 	).rejects.toThrow(/option 'backend' was removed; use 'storage'/);
 	await expect(openLix(null as never)).rejects.toThrow(
 		/options must be an object/,
@@ -2117,15 +2104,6 @@ async function waitFor<T>(
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	} while (Date.now() - started < ms);
 	expect(latest).toBe(expected);
-}
-
-function tempLixPath(): string {
-	const dir = join(tmpdir(), "lix-js-sdk-tests");
-	mkdirSync(dir, { recursive: true });
-	return join(
-		dir,
-		`lix-test-${Date.now()}-${Math.random().toString(16).slice(2)}.lix`,
-	);
 }
 
 function tempFsDir(): string {

@@ -15,8 +15,6 @@ pub use default_wasm_runtime::runtime as default_wasm_runtime;
 #[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
 mod filesystem;
 mod lix;
-#[cfg(feature = "sqlite")]
-mod sqlite;
 
 pub use client_state::ClientState;
 #[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
@@ -55,5 +53,3 @@ pub use lix_engine::{
     Value, ValueSemantics, VerifiedRequestBlob, WireValue, WriteOptions, WriteStats,
     parse_sql_script, run_storage_conformance, validate_lix_path_segment,
 };
-#[cfg(feature = "sqlite")]
-pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};
