@@ -5515,29 +5515,8 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
             continue;
         }
         let mut untracked_identities = current_state
-            .scan_live_batch_for_retention(
-                branch_id,
-                existing,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        include_tombstones: true,
-                        ..TrackedStateFilter::default()
-                    },
-                    read_columns: TrackedStateReadColumns::default(),
-                    limit: None,
-                },
-                Some(true),
-            )
-            .await?
-            .into_rows()
-            .into_iter()
-            .filter(|row| row.untracked)
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key,
-                entity_pk: row.entity_pk,
-                file_id: row.file_id,
-            })
-            .collect();
+            .untracked_identities(branch_id, existing.untracked_generation)
+            .await?;
         apply_pending_untracked_identities(
             &mut untracked_identities,
             branch_id,

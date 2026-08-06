@@ -4184,6 +4184,60 @@ where
         }
     }
 
+    /// Collects branch-local current-only identities without expanding the
+    /// tracked root, packed base, or certified entity payloads.  Destructive
+    /// branch lifecycle validation only needs these identities; the tracked
+    /// selector is a separate authority and must not be materialized merely
+    /// to answer that predicate.
+    ///
+    /// Values are still decoded as they are encountered so malformed rows
+    /// fail closed exactly like the ordinary current-state scan.  The scan is
+    /// page-bounded and retains only decoded untracked identities.
+    pub(crate) async fn untracked_identities(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> Result<BTreeSet<TrackedStateKey>, LixError> {
+        let scope = hot_scope_prefix(branch_id, generation);
+        let plan = ScanPlan::prefix(
+            HOT_ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(scope.clone()),
+            },
+        );
+        let mut resume_after = None;
+        let mut identities = BTreeSet::new();
+        loop {
+            let page = plan
+                .collect(
+                    &self.store,
+                    StorageScanOptions {
+                        resume_after: resume_after.clone(),
+                        ..StorageScanOptions::default()
+                    },
+                )
+                .await?
+                .value;
+            let has_more = page.has_more;
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+            for entry in page.entries {
+                let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                let value = full_value_bytes(entry.value)?;
+                if decode_head_value(value.as_ref())?.untracked {
+                    let identity = identity.into_row_identity();
+                    identities.insert(TrackedStateKey {
+                        schema_key: identity.schema_key,
+                        entity_pk: identity.entity_pk,
+                        file_id: identity.file_id,
+                    });
+                }
+            }
+            if !has_more || resume_after.is_none() {
+                return Ok(identities);
+            }
+        }
+    }
+
     pub(crate) async fn scan_live_batches_for_controls(
         &self,
         controls: &[(String, BranchHeadControl)],
