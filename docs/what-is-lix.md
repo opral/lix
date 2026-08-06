@@ -10,11 +10,15 @@ Lix is an embeddable library, not a CLI. Tools and agents work with normal files
 
 Unlike Git, Lix tracks the entities inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 
+<img src="../website/public/assets/filesystem-database-version-control.svg" alt="Lix combines a filesystem, a database, and version control" width="760" />
+
 ## Prime use cases
 
 ### Safe workspaces for agents
 
 Give each agent task its own branch. The agent can edit files and SQL rows without changing the main branch. Preview the result, then merge or discard it.
+
+<img src="../website/public/assets/agent-branch.svg" alt="An agent works on its own branch while main stays stable; the branch is merged or discarded" width="760" />
 
 See [Lix for AI Agents](./lix-for-ai-agents.md).
 
@@ -22,9 +26,7 @@ See [Lix for AI Agents](./lix-for-ai-agents.md).
 
 Build editors, knowledge bases, document workflows, and other file-based apps. Existing tools keep using files while your app uses SQL for queries and transactions. Lix adds history, rollback, branches, merging, and review.
 
-## What Lix provides
-
-<img src="../website/public/assets/filesystem-database-version-control.svg" alt="Lix combines a filesystem, a database, and version control" width="760" />
+<img src="../website/public/assets/app-and-tools-on-lix.svg" alt="Your app uses SQL and existing tools use files; both work on the same Lix repository" width="760" />
 
 ## Files become queryable rows
 
