@@ -13,9 +13,10 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | A version control system beyond code";
+    const title =
+      "Lix | A version control system for files and data beyond code";
     const description =
-      "A version control system beyond code. Lix versions any file format, queryable with SQL, with review for every change.";
+      "Lix is a version control system for files and data beyond code: normal files for tools, SQL rows for apps, and version control for every change.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

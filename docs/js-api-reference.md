@@ -4,7 +4,7 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-The JavaScript SDK exports `openLix()`, `SQLite`, and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
+The main exports of `@lix-js/sdk` are `openLix`, `LocalFilesystem`, and `SQLite`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -22,8 +22,9 @@ Options:
 
 | Option    | Type                                              | Description                                                                      |
 | --------- | ------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `storage` | `LocalFilesystem \| SQLite \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
-| `server`  | `RemoteLixServerOptions`                          | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
+| `storage`   | `LocalFilesystem \| SQLite \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
+| `server`    | `RemoteLixServerOptions`                          | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
+| `telemetry` | `LixTelemetryOptions`                             | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only. |
 
 Connect to a remote server:
 
@@ -82,6 +83,14 @@ const lix = await openLix({ storage });
 await storage.importPaths(["notes/today.md"]);
 ```
 
+Call `storage.syncDiskToLix()` to run one manual sync pass that imports pending
+disk changes into Lix. It returns `Promise<void>` and requires an open Lix
+instance.
+
+```ts
+await storage.syncDiskToLix();
+```
+
 Use `SQLite` when a single `.lix` SQLite file is the application document
 itself, for example when defining a new file format and using Lix as the
 application file format:
@@ -99,19 +108,31 @@ const lix = await openLix({
 ### execute()
 
 ```ts
-const result = await lix.execute(sql, params?);
+const result = await lix.execute(sql, params?, options?);
 ```
 
 Executes one DataFusion SQL statement against the active Lix session.
 
 Parameters:
 
-| Parameter | Type                             | Description                                                        |
-| --------- | -------------------------------- | ------------------------------------------------------------------ |
-| `sql`     | `string`                         | One SQL statement. Use DataFusion SQL, not SQLite SQL.             |
-| `params`  | `ReadonlyArray<LixRuntimeValue>` | Optional positional parameters addressed as `$1`, `$2`, and so on. |
+| Parameter | Type                     | Description                                                        |
+| --------- | ------------------------ | ------------------------------------------------------------------ |
+| `sql`     | `string`                 | One SQL statement. Use DataFusion SQL, not SQLite SQL.             |
+| `params`  | `SqlParam[]`             | Optional positional parameters addressed as `$1`, `$2`, and so on. |
+| `options` | `ExecuteOptions`         | Optional execution options. See below.                             |
 
-`LixRuntimeValue` accepts JSON values, `Uint8Array`, `ArrayBuffer`, or a `Value`.
+`SqlParam` accepts JSON values, `Uint8Array`, or a `Value`:
+
+```ts
+type SqlParam = JsonValue | Uint8Array | Value;
+```
+
+`ExecuteOptions`:
+
+| Option           | Type     | Description                                                                                                                                       |
+| ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `originKey`      | `string` | Optional origin label for the mutation.                                                                                                            |
+| `idempotencyKey` | `string` | Stable identity for one logical remote SQL mutation. This is the retry story: supply the same key when retrying after a lost response, and the server applies the mutation only once. Remote Lix generates one per call when omitted. Sent as `Idempotency-Key`, not SQL options. |
 
 Result:
 
@@ -120,7 +141,7 @@ type ExecuteResult = {
   columns: string[];
   rows: Row[];
   rowsAffected: number;
-  notices: LixNotice[];
+  notices: { code: string; message: string; hint?: string }[];
 };
 ```
 
@@ -143,6 +164,41 @@ const path = result.rows[0]?.get("path");
 const content = result.rows[0]?.value("content").asBytes();
 ```
 
+### executeBatch()
+
+```ts
+const results = await lix.executeBatch(statements, options?);
+```
+
+Executes multiple statements in one call. `statements` is a non-empty array of
+`{ sql, params? }` objects. `options` accepts the same `originKey` and
+`idempotencyKey` as `execute()`. Returns one `ExecuteResult` per statement.
+
+```ts
+const results = await lix.executeBatch([
+  { sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/a.txt", bytes] },
+  { sql: "SELECT count(*) AS n FROM lix_file" },
+]);
+```
+
+### observe()
+
+```ts
+const events = lix.observe(sql, params?);
+```
+
+Observes a SQL query. Returns an `ObserveEvents` handle. Call `next()` to await
+the next result; it resolves with `{ sequence, mutationSequence, result }` for
+the initial result and after each change, or `undefined` after the observation
+is closed. Call `close()` to stop observing.
+
+```ts
+const events = lix.observe("SELECT path FROM lix_file");
+const event = await events.next();
+console.log(event?.result.rows.length);
+events.close();
+```
+
 ### beginTransaction()
 
 ```ts
@@ -154,7 +210,7 @@ Starts a transaction. While it is open, execute statements on the transaction ha
 ```ts
 const tx = await lix.beginTransaction();
 try {
-  await tx.execute("INSERT INTO lix_file (path, content) VALUES (?, ?)", [
+  await tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
     "/hello.txt",
     new TextEncoder().encode("hello"),
   ]);
@@ -172,6 +228,66 @@ const branchId = await lix.activeBranchId();
 ```
 
 Returns the id of the branch the Lix instance is currently reading and writing.
+
+### activeAccountId()
+
+```ts
+const accountId = await lix.activeAccountId();
+```
+
+Returns the id of the active account.
+
+### subscribeActiveBranch()
+
+```ts
+const unsubscribe = lix.subscribeActiveBranch(listener);
+```
+
+Subscribes to successful branch switches made through this Lix handle. The
+`listener` is a function with no arguments. Returns an unsubscribe function.
+
+### createCheckpoint()
+
+```ts
+const checkpoint = await lix.createCheckpoint();
+```
+
+Creates a checkpoint from the pending working changes on the active branch. See
+[Checkpoints](./checkpoints.md).
+
+Result:
+
+```ts
+type CreateCheckpointReceipt = {
+  commitId: string;
+};
+```
+
+### undo() / redo()
+
+```ts
+const undone = await lix.undo();
+const redone = await lix.redo();
+```
+
+`undo()` reverts the latest change on the active branch by committing an
+inverse commit. `redo()` replays the last undone change.
+
+Results:
+
+```ts
+type UndoReceipt = {
+  branchId: string;
+  targetCommitId: string;
+  inverseCommitId: string;
+};
+
+type RedoReceipt = {
+  branchId: string;
+  targetCommitId: string;
+  replayCommitId: string;
+};
+```
 
 ### createBranch()
 
@@ -278,7 +394,7 @@ type MergeChangeStats = {
 type MergeConflict = {
   kind: "sameEntityChanged";
   schemaKey: string;
-  entityPk: string[];
+  entityPk: unknown;
   fileId: string | null;
   target: MergeConflictSide;
   source: MergeConflictSide;
@@ -293,15 +409,19 @@ await lix.close();
 
 Closes the Lix handle and its storage resources.
 
+### clientState
+
+`lix.clientState` stores private client-local JSON state with `get`, `set`, `delete`, and `subscribe`; it is available when the storage supports client state, for example a `LixSnapshotStorage` in remote mode.
+
 ## Transaction
 
 Transactions expose:
 
-| Method                  | Description                                                 |
-| ----------------------- | ----------------------------------------------------------- |
-| `execute(sql, params?)` | Execute SQL inside the transaction.                         |
-| `commit()`              | Commit the transaction and close the transaction handle.    |
-| `rollback()`            | Roll back the transaction and close the transaction handle. |
+| Method                            | Description                                                    |
+| --------------------------------- | -------------------------------------------------------------- |
+| `execute(sql, params?, options?)` | Execute SQL inside the transaction. Same `ExecuteOptions` as `lix.execute()`. |
+| `commit()`                        | Commit the transaction and close the transaction handle.       |
+| `rollback()`                      | Roll back the transaction and close the transaction handle.    |
 
 ## Row
 
@@ -340,4 +460,4 @@ Constructors:
 | `Value.text(value)`    | Create a text value.                                                           |
 | `Value.json(value)`    | Create a JSON value.                                                           |
 | `Value.blob(value)`    | Create a blob value from `Uint8Array`.                                         |
-| `Value.from(raw)`      | Convert a JS value, `LixValue`, `Uint8Array`, or `ArrayBuffer` into a `Value`. |
+| `Value.from(raw)`      | Convert a JSON-compatible JS value, `Uint8Array`, or `Value` into a `Value`.   |

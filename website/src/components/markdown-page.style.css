@@ -391,6 +391,62 @@
   position: relative;
 }
 
+/* SDK language tabs above JavaScript code blocks */
+.markdown-wc-body .mwc-lang-tabs {
+  display: flex;
+  gap: 18px;
+  margin: 16px 0 0;
+  padding: 0 18px;
+  background-color: #fdfcfa;
+  border: 1px solid #edebe4;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+}
+
+.markdown-wc-body .mwc-lang-tabs + pre {
+  margin-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.markdown-wc-body .mwc-lang-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 2px 7px;
+  font-size: 12.5px;
+  line-height: 1;
+  color: var(--vp-c-text-2);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+}
+
+.markdown-wc-body .mwc-lang-tab svg {
+  display: block;
+  flex-shrink: 0;
+  filter: grayscale(1);
+  opacity: 0.55;
+  transition:
+    filter 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.markdown-wc-body .mwc-lang-tab:hover svg,
+.markdown-wc-body .mwc-lang-tab-active svg {
+  filter: none;
+  opacity: 1;
+}
+
+.markdown-wc-body a.mwc-lang-tab:hover {
+  color: var(--vp-c-brand-1);
+}
+
+.markdown-wc-body .mwc-lang-tab-active {
+  color: var(--vp-c-text-1);
+  font-weight: 600;
+  border-bottom-color: currentColor;
+}
+
 /* Copy button for code blocks */
 .markdown-wc-body pre {
   position: relative;

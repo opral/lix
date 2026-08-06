@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">A version control system beyond code</h3>
+<h3 align="center">A version control system for files and data beyond code</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -13,13 +13,14 @@
 
 Code lives in version control. The documents, spreadsheets, and data a company runs on do not.
 
-Lix is a version control system for work beyond code: any file format, SQL over content and history, and review for every change.
+Lix is a version control system for files and data beyond code: one repository that combines files, a database, and version control.
 
 - 📄 **Works with any file format.** Plugins map DOCX, CSV, Markdown, or your own format to versioned entities.
 - 🔍 **Semantic changes.** Review the clause, cell, or row that changed, not lines of bytes.
 - 🗄️ **SQL and transactions.** Query file content, app data, and history; update files and rows in one ACID transaction.
 - 👥 **Real-time collaboration.** People and agents share a repository and see changes live.
-- 🏁 **Checkpoints instead of commits.** Lix records every change automatically; a checkpoint marks a state you want to return to.
+- 🔌 **Pluggable storage.** An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale, in contrast to existing VCS like Git that assume a local POSIX filesystem.
+- 🔐 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
 
 ## Try a demo app
 
@@ -78,6 +79,14 @@ The file stays a normal file on disk. The rows are queryable with SQL. Lix track
 
 The SDK includes plugins for Markdown and CSV. Add a plugin for other formats, such as JSON, XLSX, DOCX, or PDF.
 
+### Pluggable storage
+
+Lix embeds in your app and runs on storage adapters: in memory, on the local filesystem, or on an S3 bucket.
+
+<img src="./website/public/assets/pluggable-storage.svg" alt="Lix embeds in your app and runs on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
+
+Existing VCS like Git assume a local POSIX filesystem, which makes them hard to embed and scale. See the [Persistence and Storage](https://lix.dev/docs/persistence) docs.
+
 ### Comparison
 
 Git versions files but cannot query them. PostgreSQL and SQLite query rows but have no files and no history. Lix does both.
@@ -102,6 +111,7 @@ Git versions files but cannot query them. PostgreSQL and SQLite query rows but h
 | SQL and transactions          | No              | Yes                 | Yes                 |
 | Branches and merging          | Yes             | No                  | Yes                 |
 | Diffs by cell, clause, or row | Text lines only | No                  | Yes, via plugins    |
+| Pluggable storage             | No              | No                  | Yes                 |
 
 ### Prime use cases
 

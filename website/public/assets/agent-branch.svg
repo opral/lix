@@ -1,0 +1,18 @@
+<svg viewBox="0 0 880 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An agent works on its own branch while main stays stable, then the branch merges back" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace">
+  <rect x="0.75" y="0.75" width="878.5" height="208.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
+
+  <!-- main rail -->
+  <line x1="60" y1="140" x2="820" y2="140" stroke="#8A8F96" stroke-width="1.5"/>
+  <circle cx="160" cy="140" r="4" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <circle cx="320" cy="140" r="4" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <circle cx="740" cy="140" r="4" fill="#FFFFFF" stroke="#8A8F96" stroke-width="1.5"/>
+  <text x="62" y="172" font-size="10.5" letter-spacing="1.2" fill="#15171B">MAIN</text>
+  <text x="62" y="190" font-size="12" fill="#6B7076">stays stable</text>
+
+  <!-- agent branch -->
+  <path d="M320 140 C360 140 360 88 400 88 H600 C640 88 640 140 676 140" fill="none" stroke="#07B6D5" stroke-width="1.5"/>
+  <path d="M670 133.5 L680 140 L670 146.5" fill="none" stroke="#07B6D5" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+  <text x="500" y="48" font-size="10.5" letter-spacing="1.2" fill="#0891AC" text-anchor="middle">AGENT BRANCH</text>
+  <text x="500" y="66" font-size="12" fill="#6B7076" text-anchor="middle">edits files and SQL rows</text>
+  <text x="668" y="118" font-size="10.5" letter-spacing="1.2" fill="#0891AC">MERGE</text>
+</svg>

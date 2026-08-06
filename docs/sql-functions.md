@@ -10,6 +10,7 @@ Lix's DataFusion-backed engine registers a small set of scalar functions for use
 
 | Function | Returns | Use for |
 | :-- | :-- | :-- |
+| `lix_active_account_id()` | text | Reading the current SQL session's active account id. |
 | `lix_active_branch_id()` | text | Reading the current SQL session's active branch id. |
 | `lix_active_branch_commit_id()` | text | Reading the active branch head pinned for this SQL statement. |
 | `lix_json(text)` | JSON | Parse a JSON string parameter into a JSON-typed value. |
@@ -21,6 +22,10 @@ Lix's DataFusion-backed engine registers a small set of scalar functions for use
 All functions are scalar; call them anywhere a SQL expression is allowed.
 
 ## Branch & history
+
+### `lix_active_account_id()`
+
+Returns the active account id of the current SQL session. Each session has its own active account, so concurrent sessions on the same Lix can act as different accounts.
 
 ### `lix_active_branch_id()`
 
@@ -42,25 +47,7 @@ WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
-For time travel, pass a commit id as the function argument. For an arbitrary
-branch, resolve the commit id with one query and bind it into the history
-function:
-
-```ts
-const { rows } = await lix.execute(
-  "SELECT commit_id FROM lix_branch WHERE id = $1",
-  [branchId],
-);
-const commitId = rows[0].get("commit_id") as string;
-
-await lix.execute(
-  `SELECT lixcol_depth, title
-     FROM acme_task_history($1)
-    WHERE id = $2
-    ORDER BY lixcol_depth`,
-  [commitId, "t1"],
-);
-```
+For time travel and querying other branches, see [History](./history.md).
 
 ## JSON
 
@@ -102,7 +89,7 @@ Both return `NULL` if the path is missing or the underlying value is `null`.
 
 ### `lix_uuid_v7()`
 
-Generates a fresh RFC 9562 UUIDv7 string. Useful in `INSERT` defaults and CEL `default` expressions in JSON Schema:
+Generates a fresh RFC 9562 UUIDv7 string. Useful in `INSERT` defaults and CEL `x-lix-default` expressions in JSON Schema:
 
 ```sql
 INSERT INTO task (id, title, done)
@@ -119,24 +106,7 @@ INSERT INTO event (id, occurred_at) VALUES (lix_uuid_v7(), lix_timestamp());
 
 ## Text & bytes
 
-Lix accepts the canonical public cast names advertised by
-`information_schema.columns`: `TEXT`, `BYTEA`, `BIGINT`,
-`DOUBLE PRECISION`, and `BOOLEAN`. The same spellings work in `SELECT` and in
-bound `INSERT`/`UPDATE` expressions. Bound writes use those canonical names and
-retire the ambiguous binary spelling `BINARY` in favor of `BYTEA`.
-
-Read expressions retain DataFusion's wider SQL cast dialect, including types
-such as `DATE`, `INTEGER`, `DECIMAL`, and `TIMESTAMP`; the public column types
-above describe Lix surfaces rather than limiting query expressions.
-
-Use `TEXT` and `BYTEA` to convert between UTF-8 text and bytes:
-
-```sql
-SELECT CAST(content AS TEXT) FROM lix_file WHERE path = '/notes/readme.md';
-
-INSERT INTO lix_file (path, content)
-VALUES ('/notes/hello.txt', CAST('hello world' AS BYTEA));
-```
+For the column types Lix accepts in `CAST` expressions (for example `TEXT` and `BYTEA`), see [the executable column contract](./surfaces.md#the-executable-column-contract).
 
 ## Notes
 

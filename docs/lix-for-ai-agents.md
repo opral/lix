@@ -14,7 +14,7 @@ Agents can work through normal files with `LocalFilesystem`, through SQL, or thr
 2. Switch the agent to that branch.
 3. Let the agent edit files or SQL rows.
 4. Switch back to main and preview the merge.
-5. Merge, request changes, or discard the branch.
+5. Merge, iterate on the branch, or discard it.
 
 ```ts
 const main = await lix.activeBranchId();
@@ -23,10 +23,17 @@ const task = await lix.createBranch({ name: "Agent task 123" });
 await lix.switchBranch({ branchId: task.id });
 
 // Run the agent. Its file and SQL writes are isolated to `task`.
+// For example, the agent marks a task as done:
+await lix.execute("UPDATE acme_task SET status = $1 WHERE id = $2", [
+  "done",
+  "T-1",
+]);
 
 await lix.switchBranch({ branchId: main });
 
 const preview = await lix.mergeBranchPreview({ sourceBranchId: task.id });
+// preview.changeStats is the one-line review summary:
+// { total, added, modified, removed }
 if (preview.conflicts.length === 0) {
   await lix.mergeBranch({ sourceBranchId: task.id });
 }
@@ -66,14 +73,16 @@ const lix = await openLix({
 
 ## Inspect the work
 
-Query typed history for each app or plugin schema:
+To review the agent's work before the merge, read the task branch with the `_by_branch` table. Here `acme_task` is an example registered schema; every registered schema gets the same table set:
 
 ```sql
-SELECT id, title, status, lixcol_depth,
-       lixcol_observed_commit_id, lixcol_is_deleted
-FROM acme_task_history()
-ORDER BY lixcol_depth, id;
+SELECT id, title, status
+FROM acme_task_by_branch
+WHERE lixcol_branch_id = $1
+ORDER BY id;
 ```
+
+Pass the task branch id as `$1`. Note that `<schema>_history()` anchors to the active branch head, so run from main it does not show the agent's unmerged work.
 
 Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole workspace. It is not limited to the active branch.
 

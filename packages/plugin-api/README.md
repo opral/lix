@@ -65,5 +65,5 @@ use blob durability. Do not declare `materialization`, `runtime`, or
 `api_version`; the host validates the component and durable registry against
 `lix:plugin@1.0.0`.
 
-See [the experiment and profiling contract](../../docs/universal-plugin-api.md)
+See [the experiment and profiling contract](../../rfcs/universal-plugin-api.md)
 for the wire shape, correctness gates, and cross-format measurement matrix.

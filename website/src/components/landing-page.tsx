@@ -6,6 +6,68 @@ import { Header } from "./header";
 
 const INSTALL_COMMAND = "npm install @lix-js/sdk";
 
+const JsLogo = ({ className = "" }) => (
+  <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+    <rect width="24" height="24" rx="3" fill="#F7DF1E" />
+    <text
+      x="12"
+      y="17"
+      textAnchor="middle"
+      fontSize="11"
+      fontWeight="bold"
+      fill="#000"
+      fontFamily="sans-serif"
+    >
+      JS
+    </text>
+  </svg>
+);
+
+const PythonLogo = ({ className = "" }) => (
+  <svg viewBox="16 16 32 32" className={className} aria-hidden="true">
+    <path
+      fill="#387EB8"
+      d="M31.885 16c-8.124 0-7.617 3.523-7.617 3.523l.01 3.65h7.752v1.095H21.197S16 23.678 16 31.876c0 8.196 4.537 7.906 4.537 7.906h2.708v-3.804s-.146-4.537 4.465-4.537h7.688s4.32.07 4.32-4.175v-7.019S40.374 16 31.885 16zm-4.275 2.454a1.394 1.394 0 1 1 0 2.79 1.393 1.393 0 0 1-1.395-1.395c0-.771.624-1.395 1.395-1.395z"
+    />
+    <path
+      fill="#FFC331"
+      d="M32.115 47.833c8.124 0 7.617-3.523 7.617-3.523l-.01-3.65H31.97v-1.095h10.832S48 40.155 48 31.958c0-8.197-4.537-7.906-4.537-7.906h-2.708v3.803s.146 4.537-4.465 4.537h-7.688s-4.32-.07-4.32 4.175v7.019s-.656 4.247 7.833 4.247zm4.275-2.454a1.393 1.393 0 0 1-1.395-1.395 1.394 1.394 0 1 1 1.395 1.395z"
+    />
+  </svg>
+);
+
+const RustLogo = ({ className = "" }) => (
+  <svg viewBox="0 0 224 224" className={className} aria-hidden="true">
+    <path
+      fill="#CE422B"
+      d="M218.46 109.358l-9.062-5.614c-.076-.882-.162-1.762-.258-2.642l7.803-7.265a3.107 3.107 0 00.933-2.89 3.093 3.093 0 00-1.967-2.312l-9.97-3.715c-.25-.863-.512-1.72-.781-2.58l6.214-8.628a3.114 3.114 0 00-.592-4.263 3.134 3.134 0 00-1.431-.637l-10.507-1.709a80.869 80.869 0 00-1.263-2.353l4.417-9.7a3.12 3.12 0 00-.243-3.035 3.106 3.106 0 00-2.705-1.385l-10.671.372a85.152 85.152 0 00-1.685-2.044l2.456-10.381a3.125 3.125 0 00-3.762-3.763l-10.384 2.456a88.996 88.996 0 00-2.047-1.684l.373-10.671a3.11 3.11 0 00-1.385-2.704 3.127 3.127 0 00-3.034-.246l-9.681 4.417c-.782-.429-1.567-.854-2.353-1.265l-1.713-10.506a3.098 3.098 0 00-1.887-2.373 3.108 3.108 0 00-3.014.35l-8.628 6.213c-.85-.27-1.703-.53-2.56-.778l-3.716-9.97a3.111 3.111 0 00-2.311-1.97 3.134 3.134 0 00-2.89.933l-7.266 7.802a93.746 93.746 0 00-2.643-.258l-5.614-9.082A3.125 3.125 0 00111.97 4c-1.09 0-2.085.56-2.642 1.478l-5.615 9.081a93.32 93.32 0 00-2.642.259l-7.266-7.802a3.13 3.13 0 00-2.89-.933 3.106 3.106 0 00-2.312 1.97l-3.715 9.97c-.857.247-1.71.506-2.56.778L73.7 12.588a3.101 3.101 0 00-3.014-.35A3.127 3.127 0 0068.8 14.61l-1.713 10.506c-.79.41-1.575.832-2.353 1.265l-9.681-4.417a3.125 3.125 0 00-4.42 2.95l.372 10.67c-.69.553-1.373 1.115-2.048 1.685l-10.383-2.456a3.143 3.143 0 00-2.93.832 3.124 3.124 0 00-.833 2.93l2.436 10.383a93.897 93.897 0 00-1.68 2.043l-10.672-.372a3.138 3.138 0 00-2.704 1.385 3.126 3.126 0 00-.246 3.035l4.418 9.7c-.43.779-.855 1.563-1.266 2.353l-10.507 1.71a3.097 3.097 0 00-2.373 1.886 3.117 3.117 0 00.35 3.013l6.214 8.628a89.12 89.12 0 00-.78 2.58l-9.97 3.715a3.117 3.117 0 00-1.035 5.202l7.803 7.265c-.098.879-.184 1.76-.258 2.642l-9.062 5.614A3.122 3.122 0 004 112.021c0 1.092.56 2.084 1.478 2.642l9.062 5.614c.074.882.16 1.762.258 2.642l-7.803 7.265a3.117 3.117 0 001.034 5.201l9.97 3.716a110 110 0 00.78 2.58l-6.212 8.627a3.112 3.112 0 00.6 4.27c.419.33.916.547 1.443.63l10.507 1.709c.407.792.83 1.576 1.265 2.353l-4.417 9.68a3.126 3.126 0 002.95 4.42l10.65-.374c.553.69 1.115 1.372 1.685 2.047l-2.435 10.383a3.09 3.09 0 00.831 2.91 3.117 3.117 0 002.931.83l10.384-2.436a82.268 82.268 0 002.047 1.68l-.371 10.671a3.11 3.11 0 001.385 2.704 3.125 3.125 0 003.034.241l9.681-4.416c.779.432 1.563.854 2.353 1.265l1.713 10.505a3.147 3.147 0 001.887 2.395 3.111 3.111 0 003.014-.349l8.628-6.213c.853.271 1.71.535 2.58.783l3.716 9.969a3.112 3.112 0 002.312 1.967 3.112 3.112 0 002.89-.933l7.266-7.802c.877.101 1.761.186 2.642.264l5.615 9.061a3.12 3.12 0 002.642 1.478 3.165 3.165 0 002.663-1.478l5.614-9.061c.884-.078 1.765-.163 2.643-.264l7.265 7.802a3.106 3.106 0 002.89.933 3.105 3.105 0 002.312-1.967l3.716-9.969c.863-.248 1.719-.512 2.58-.783l8.629 6.213a3.12 3.12 0 004.9-2.045l1.713-10.506c.793-.411 1.577-.838 2.353-1.265l9.681 4.416a3.13 3.13 0 003.035-.241 3.126 3.126 0 001.385-2.704l-.372-10.671a81.794 81.794 0 002.046-1.68l10.383 2.436a3.123 3.123 0 003.763-3.74l-2.436-10.382a84.588 84.588 0 001.68-2.048l10.672.374a3.104 3.104 0 002.704-1.385 3.118 3.118 0 00.244-3.035l-4.417-9.68c.43-.779.852-1.563 1.263-2.353l10.507-1.709a3.08 3.08 0 002.373-1.886 3.11 3.11 0 00-.35-3.014l-6.214-8.627c.272-.857.532-1.717.781-2.58l9.97-3.716a3.109 3.109 0 001.967-2.311 3.107 3.107 0 00-.933-2.89l-7.803-7.265c.096-.88.182-1.761.258-2.642l9.062-5.614a3.11 3.11 0 001.478-2.642 3.157 3.157 0 00-1.476-2.663h-.064zm-60.687 75.337c-3.468-.747-5.656-4.169-4.913-7.637a6.412 6.412 0 017.617-4.933c3.468.741 5.676 4.169 4.933 7.637a6.414 6.414 0 01-7.617 4.933h-.02zm-3.076-20.847c-3.158-.677-6.275 1.334-6.936 4.5l-3.22 15.026c-9.929 4.5-21.055 7.018-32.614 7.018-11.89 0-23.12-2.622-33.234-7.328l-3.22-15.026c-.677-3.158-3.778-5.18-6.936-4.499l-13.273 2.848a80.222 80.222 0 01-6.853-8.091h64.61c.731 0 1.218-.132 1.218-.797v-22.91c0-.665-.487-.797-1.218-.797H94.133v-14.469h20.415c1.864 0 9.97.533 12.551 10.898.811 3.179 2.601 13.54 3.818 16.863 1.214 3.715 6.152 11.146 11.415 11.146h32.202c.365 0 .755-.041 1.166-.116a80.56 80.56 0 01-7.307 8.587l-13.583-2.911-.113.058zm-89.38 20.537a6.407 6.407 0 01-7.617-4.933c-.74-3.467 1.462-6.894 4.934-7.637a6.417 6.417 0 017.617 4.933c.74 3.468-1.464 6.894-4.934 7.637zm-24.564-99.28a6.438 6.438 0 01-3.261 8.484c-3.241 1.438-7.019-.025-8.464-3.261-1.445-3.237.025-7.039 3.262-8.483a6.416 6.416 0 018.463 3.26zM33.22 102.94l13.83-6.15c2.952-1.311 4.294-4.769 2.972-7.72l-2.848-6.44H58.36v50.362h-22.5a79.158 79.158 0 01-3.014-21.672c0-2.869.155-5.697.452-8.483l-.08.103zm60.687-4.892v-14.86h26.629c1.376 0 9.722 1.59 9.722 7.822 0 5.18-6.399 7.038-11.663 7.038h-24.77.082zm96.811 13.375c0 1.973-.072 3.922-.216 5.862h-8.113c-.811 0-1.137.532-1.137 1.327v3.715c0 8.752-4.934 10.671-9.268 11.146-4.129.464-8.691-1.726-9.248-4.252-2.436-13.684-6.482-16.595-12.881-21.672 7.948-5.036 16.204-12.487 16.204-22.498 0-10.753-7.369-17.523-12.385-20.847-7.059-4.644-14.862-5.572-16.968-5.572H52.899c11.374-12.673 26.835-21.673 44.174-24.975l9.887 10.361a5.849 5.849 0 008.278.19l11.064-10.568c23.119 4.314 42.729 18.721 54.082 38.598l-7.576 17.09c-1.306 2.951.027 6.419 2.973 7.72l14.573 6.48c.255 2.607.383 5.224.384 7.843l-.021.052zM106.912 24.94a6.398 6.398 0 019.062.209 6.437 6.437 0 01-.213 9.082 6.396 6.396 0 01-9.062-.21 6.436 6.436 0 01.213-9.083v.002zm75.137 60.476a6.402 6.402 0 018.463-3.26 6.425 6.425 0 013.261 8.482 6.402 6.402 0 01-8.463 3.261 6.425 6.425 0 01-3.261-8.483z"
+    />
+  </svg>
+);
+
+const GoLogo = ({ className = "" }) => (
+  <svg viewBox="0 0 207 78" className={className} aria-hidden="true">
+    <g fill="#00ADD8" fillRule="evenodd">
+      <path d="m16.2 24.1c-.4 0-.5-.2-.3-.5l2.1-2.7c.2-.3.7-.5 1.1-.5h35.7c.4 0 .5.3.3.6l-1.7 2.6c-.2.3-.7.6-1 .6z" />
+      <path d="m1.1 33.3c-.4 0-.5-.2-.3-.5l2.1-2.7c.2-.3.7-.5 1.1-.5h45.6c.4 0 .6.3.5.6l-.8 2.4c-.1.4-.5.6-.9.6z" />
+      <path d="m25.3 42.5c-.4 0-.5-.3-.3-.6l1.4-2.5c.2-.3.6-.6 1-.6h20c.4 0 .6.3.6.7l-.2 2.4c0 .4-.4.7-.7.7z" />
+      <g transform="translate(55)">
+        <path d="m74.1 22.3c-6.3 1.6-10.6 2.8-16.8 4.4-1.5.4-1.6.5-2.9-1-1.5-1.7-2.6-2.8-4.7-3.8-6.3-3.1-12.4-2.2-18.1 1.5-6.8 4.4-10.3 10.9-10.2 19 .1 8 5.6 14.6 13.5 15.7 6.8.9 12.5-1.5 17-6.6.9-1.1 1.7-2.3 2.7-3.7-3.6 0-8.1 0-19.3 0-2.1 0-2.6-1.3-1.9-3 1.3-3.1 3.7-8.3 5.1-10.9.3-.6 1-1.6 2.5-1.6h36.4c-.2 2.7-.2 5.4-.6 8.1-1.1 7.2-3.8 13.8-8.2 19.6-7.2 9.5-16.6 15.4-28.5 17-9.8 1.3-18.9-.6-26.9-6.6-7.4-5.6-11.6-13-12.7-22.2-1.3-10.9 1.9-20.7 8.5-29.3 7.1-9.3 16.5-15.2 28-17.3 9.4-1.7 18.4-.6 26.5 4.9 5.3 3.5 9.1 8.3 11.6 14.1.6.9.2 1.4-1 1.7z" />
+        <path
+          d="m107.2 77.6c-9.1-.2-17.4-2.8-24.4-8.8-5.9-5.1-9.6-11.6-10.8-19.3-1.8-11.3 1.3-21.3 8.1-30.2 7.3-9.6 16.1-14.6 28-16.7 10.2-1.8 19.8-.8 28.5 5.1 7.9 5.4 12.8 12.7 14.1 22.3 1.7 13.5-2.2 24.5-11.5 33.9-6.6 6.7-14.7 10.9-24 12.8-2.7.5-5.4.6-8 .9zm23.8-40.4c-.1-1.3-.1-2.3-.3-3.3-1.8-9.9-10.9-15.5-20.4-13.3-9.3 2.1-15.3 8-17.5 17.4-1.8 7.8 2 15.7 9.2 18.9 5.5 2.4 11 2.1 16.3-.6 7.9-4.1 12.2-10.5 12.7-19.1z"
+          fillRule="nonzero"
+        />
+      </g>
+    </g>
+  </svg>
+);
+
+const sdkLanguages = [
+  { label: "Python", href: "https://github.com/opral/lix/issues/373", Logo: PythonLogo },
+  { label: "Rust", href: "https://github.com/opral/lix/issues/371", Logo: RustLogo },
+  { label: "Go", href: "https://github.com/opral/lix/issues/370", Logo: GoLogo },
+];
+
 /**
  * Copyable `npm install` command button.
  *
@@ -288,37 +350,95 @@ const whatYouGet = [
     ),
   },
   {
-    title: "Checkpoints instead of commits",
+    title: "Pluggable storage",
     description:
-      "People and agents do not write commit messages. Lix records every change automatically; a checkpoint marks a state you want to return to.",
+      "An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale, in contrast to existing VCS like Git that assume a local POSIX filesystem.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <rect
+          x="32"
+          y="8"
+          width="16"
+          height="14"
+          rx="3"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
         <line
-          x1="12"
-          y1="34"
-          x2="68"
-          y2="34"
+          x1="40"
+          y1="22"
+          x2="40"
+          y2="32"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeDasharray="3 3"
+        />
+        <rect
+          x="14"
+          y="34"
+          width="16"
+          height="14"
+          rx="3"
+          fill="none"
           stroke="#C9C7BF"
           strokeWidth="1.5"
         />
-        <circle cx="20" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="32" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="44" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="56" cy="34" r="3.5" fill="#07B6D5" />
-        <line
-          x1="56"
-          y1="30"
-          x2="56"
-          y2="16"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <path
-          d="M56 16 L66 19 L56 22 Z"
+        <rect
+          x="32"
+          y="34"
+          width="16"
+          height="14"
+          rx="3"
           fill="rgba(7,182,213,0.14)"
           stroke="#07B6D5"
           strokeWidth="1.5"
-          strokeLinejoin="round"
+        />
+        <rect
+          x="50"
+          y="34"
+          width="16"
+          height="14"
+          rx="3"
+          fill="none"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+      </svg>
+    ),
+  },
+  {
+    title: "Permissions",
+    badge: "soon",
+    description:
+      "Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.",
+    icon: (
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <path
+          d="M31 26 v-6 a9 9 0 0 1 18 0 v6"
+          fill="none"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <rect
+          x="26"
+          y="26"
+          width="28"
+          height="22"
+          rx="4"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <circle cx="40" cy="35" r="3" fill="#07B6D5" />
+        <line
+          x1="40"
+          y1="37"
+          x2="40"
+          y2="42"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+          strokeLinecap="round"
         />
       </svg>
     ),
@@ -344,19 +464,33 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             Open source · MIT
           </p>
           <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-            A version control system beyond code
+            A version control system for files and data beyond code
           </h1>
-          <div className="mt-4 flex max-w-[620px] flex-col gap-3">
-            <p className="text-base leading-[1.6] text-ink-secondary">
-              Agents and tools work with files. Applications need a database.
-              Teams need version control.
-            </p>
-            <p className="text-base leading-[1.6] text-ink-secondary">
-              Lix combines all three: normal files for tools, SQL rows for apps,
-              and version control for every change.
-            </p>
+          <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
+            Agents and tools work with files. Applications need a database.
+            Teams need version control. Lix combines all three: normal files
+            for tools, SQL rows for apps, and version control for every change.
+          </p>
+          <div className="mt-6 flex flex-wrap items-center gap-5">
+            <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
+              <JsLogo className="h-3.5 w-3.5" />
+              JavaScript
+            </span>
+            {sdkLanguages.map(({ label, href, Logo }) => (
+              <a
+                key={label}
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`The ${label} SDK is planned. Upvote the issue on GitHub.`}
+                className="flex items-center gap-1.5 border-b-2 border-transparent pb-0.5 text-[13px] text-ink-muted transition-colors hover:text-cyan-deep"
+              >
+                <Logo className="h-3.5 w-3.5" />
+                {label}
+              </a>
+            ))}
           </div>
-          <div className="mt-6 flex flex-wrap items-center gap-3">
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <CopyInstallButton background="white" />
             <a
               href="/docs/what-is-lix"
@@ -399,7 +533,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             What you get
           </h2>
           <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
-            Putting more than code into a repository needs five things a code
+            Putting more than code into a repository needs six things a code
             VCS never had:
           </p>
           <div className="mt-5">
@@ -411,8 +545,13 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 }`}
               >
                 {item.icon}
-                <span className="text-[15px] font-semibold tracking-[-0.01em]">
+                <span className="flex flex-wrap items-center gap-2 text-[15px] font-semibold tracking-[-0.01em]">
                   {item.title}
+                  {"badge" in item && (
+                    <span className="rounded border border-line-strong px-1.5 py-0.5 font-mono text-[10px] font-normal uppercase tracking-[0.08em] text-ink-muted">
+                      {item.badge}
+                    </span>
+                  )}
                 </span>
                 <span className="text-[15px] leading-[1.6] text-ink-secondary">
                   {item.description}

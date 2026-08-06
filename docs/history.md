@@ -4,21 +4,41 @@ description: Query typed history for branch-reachable entity states and lix_chan
 
 # Change History
 
+Typed history answers what an entity looked like across the commits reachable
+from the current head. The common query needs no arguments:
+
+```sql
+SELECT title, done, lixcol_depth, lixcol_is_deleted
+FROM acme_task_history()
+WHERE id = 't1'
+ORDER BY lixcol_depth;
+```
+
+| title | done | lixcol_depth | lixcol_is_deleted |
+| :-- | :-- | --: | :-- |
+| Ship v2 | true | 0 | false |
+| Ship v2 | false | 1 | false |
+| NULL | NULL | 2 | true |
+
+`lixcol_depth` `0` is the state at the head; higher depths walk back through
+reachable commits. The `lixcol_is_deleted` row is a tombstone: the task was
+deleted at that revision and recreated later, so its state columns are `NULL`.
+
 Lix exposes two history concepts. Choose the surface that matches the scope of
 the question:
 
 | Surface | What it answers |
 | :-- | :-- |
-| `<schema>_history`, `lix_file_history`, `lix_directory_history` | Which logical revisions are reachable from a commit? |
+| `<schema>_history()`, `lix_file_history()`, `lix_directory_history()` | Which logical revisions are reachable from a commit? |
 | `lix_change` | Which retained changes exist anywhere in this workspace? |
 
 Typed history is exposed through table-valued functions. It is schema-specific
-and commit-reachability scoped.
-`lix_change` is heterogeneous and workspace-wide. A change on an unmerged
-sibling branch can therefore appear in `lix_change` without appearing in
-history read from the active branch.
+and commit-reachability scoped. `lix_change` is heterogeneous and
+workspace-wide. A change on an unmerged sibling branch can appear in
+`lix_change` without appearing in history read from the active branch.
 
-For the full surface grid, see [SQL Surfaces](./surfaces.md).
+For the full surface grid, insert policies, and the
+`information_schema` contract, see [SQL Surfaces](./surfaces.md).
 
 ## Typed entity history
 
@@ -27,31 +47,16 @@ and one history function:
 `acme_task` for the active branch, `acme_task_by_branch` for explicit branch
 scope, and `acme_task_history()` for branch-reachable history.
 
-History starts at the active branch head pinned for the statement or coherent
-read batch, so the common query needs no anchor predicate:
-
-```sql
-SELECT
-  id,
-  title,
-  lixcol_depth,
-  lixcol_observed_commit_id,
-  lixcol_commit_created_at,
-  lixcol_is_deleted
-FROM acme_task_history()
-WHERE id = $1
-ORDER BY lixcol_depth;
-```
-
-The user columns are the same typed columns exposed by the base relation.
-Entity history adds these system columns:
+History starts at the active branch head. The user columns are the same typed
+columns exposed by the base relation. Entity history adds these system
+columns:
 
 | Column | What it is |
 | :-- | :-- |
 | `lixcol_entity_pk` | JSON array of primary-key values in `x-lix-primary-key` order. |
 | `lixcol_schema_key` | The registered schema key. |
 | `lixcol_file_id` | The owning file, or `NULL`. |
-| `lixcol_snapshot_content` | JSON snapshot at this revision, or `NULL` for a tombstone. |
+| `lixcol_snapshot_content` | JSON snapshot at this revision. `NULL` for a tombstone: a deletion produces a change with no snapshot. |
 | `lixcol_metadata` | JSON change metadata. |
 | `lixcol_change_id` | The `lix_change.id` that produced this state. |
 | `lixcol_change_created_at` | When that source change was created. |
@@ -59,11 +64,11 @@ Entity history adds these system columns:
 | `lixcol_observed_commit_id` | The commit where this state was observed. |
 | `lixcol_commit_created_at` | When that commit was created. It never falls back to the change timestamp. |
 | `lixcol_depth` | `0` is the revision at the anchor; higher values walk back through reachable history. |
-| `lixcol_is_deleted` | `true` when the revision is a tombstone. |
+| `lixcol_is_deleted` | `true` when the revision is a tombstone. The row keeps the entity identity — every declared primary-key root, including nested JSON roots — and the history metadata, while the nullable state columns are `NULL`. |
 
-The anchor belongs to the relation, not to each result row. Call the function
-without an argument to use the pinned active head, or pass a commit id for
-time travel:
+The commit argument sets the starting point for the whole query. Call the
+function without an argument to start at the active head, or pass a commit id
+for time travel:
 
 ```sql
 SELECT id, title, lixcol_depth
@@ -103,7 +108,7 @@ ORDER BY lixcol_depth;
 
 ## File and directory history
 
-`lix_file_history` and `lix_directory_history` expose logical filesystem
+`lix_file_history()` and `lix_directory_history()` expose logical filesystem
 history. Their storage descriptors are not public SQL relations.
 
 Both follow the same active-head and explicit-anchor convention:
@@ -142,8 +147,8 @@ provenance retains the relevant ancestor tombstones.
 
 ## Workspace activity with `lix_change`
 
-`lix_change` contains retained tracked changes across branches plus the latest
-compactable untracked change for each current identity.
+`lix_change` contains every retained change across branches, without proving
+branch reachability. Ordinary untracked writes do not create change rows.
 
 | Column | What it is |
 | :-- | :-- |
@@ -152,7 +157,9 @@ compactable untracked change for each current identity.
 | `schema_key` | Changed schema (`x-lix-key`). |
 | `file_id` | Owning file, or `NULL`. |
 | `metadata` | JSON change metadata. |
-| `snapshot_content` | Snapshot after the change, or `NULL` for deletion. |
+| `snapshot_content` | Snapshot after the change, or `NULL` for a deletion. |
+| `account_id` | Account that authored the change. |
+| `origin_key` | Optional origin key attached to the change. |
 | `created_at` | Change timestamp. |
 
 `entity_pk` is an ordered JSON array even for a singleton key. Use numeric path
@@ -169,9 +176,3 @@ ORDER BY created_at, id;
 
 The `(created_at, id)` ordering is deterministic for repeated result sets. It
 is a presentation order, not a causal order between changes.
-
-## Tombstones
-
-A deletion produces a change with `snapshot_content = NULL`. Typed history
-retains the entity identity and history metadata while its nullable state
-columns represent the tombstone.
