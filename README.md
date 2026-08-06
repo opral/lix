@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">A version control system for files and data that aren't code</h3>
+<h3 align="center">A version control system for files and data beyond code</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -13,7 +13,7 @@
 
 Code lives in version control. The documents, spreadsheets, and data a company runs on do not.
 
-Lix is a version control system for files and data that aren't code: one repository that combines files, a database, and version control.
+Lix is a version control system for files and data beyond code: one repository that combines files, a database, and version control.
 
 - 📄 **Works with any file format.** Plugins map DOCX, CSV, Markdown, or your own format to versioned entities.
 - 🔍 **Semantic changes.** Review the clause, cell, or row that changed, not lines of bytes.

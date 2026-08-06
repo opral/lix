@@ -14,9 +14,9 @@ export const Route = createFileRoute("/")({
   },
   head: () => {
     const title =
-      "Lix | A version control system for files and data that aren't code";
+      "Lix | A version control system for files and data beyond code";
     const description =
-      "Lix is a version control system for files and data that aren't code: normal files for tools, SQL rows for apps, and version control for every change.";
+      "Lix is a version control system for files and data beyond code: normal files for tools, SQL rows for apps, and version control for every change.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
