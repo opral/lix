@@ -112,8 +112,12 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD15";
 // commit independently from semantic graph ancestry.
 // Version 10 splits the authority header from a separately keyed mutation
 // catalog and authenticates a content-addressed hierarchical part directory.
+// Version 11 keeps that catalog row-addressable but stores its packed value in
+// one bounded zstd frame. LXMI1 is deliberately rejected: there is no
+// compatibility reader or raw-value fallback beneath this density cut.
 const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS10";
-const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI1";
+const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI2";
+const COMMIT_STATE_MUTATION_INVENTORY_MAX_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -11952,11 +11956,33 @@ fn encode_commit_state_manifest(
         stored_commit_mutation_inventory(&manifest.mutations)?;
     let inventory_payload =
         storage_codec::encode("tracked_state commit mutation inventory", &stored_inventory)?;
+    let compressed_inventory = crate::compression::compress_zstd_level_1(&inventory_payload)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state commit mutation inventory compression failed: {error}"),
+            )
+        })?;
+    if compressed_inventory.is_empty()
+        || inventory_payload.len() > COMMIT_STATE_MUTATION_INVENTORY_MAX_UNCOMPRESSED_BYTES
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit mutation inventory exceeds its compressed-frame bound",
+        ));
+    }
     let mut mutation_inventory = Vec::with_capacity(
-        COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC.len() + inventory_payload.len(),
+        COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC.len()
+            + size_of::<u32>()
+            + compressed_inventory.len(),
     );
     mutation_inventory.extend_from_slice(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC);
-    mutation_inventory.extend_from_slice(&inventory_payload);
+    mutation_inventory.extend_from_slice(
+        &u32::try_from(inventory_payload.len())
+            .expect("mutation inventory bound fits u32")
+            .to_be_bytes(),
+    );
+    mutation_inventory.extend_from_slice(&compressed_inventory);
     let header = StoredCommitStateManifest {
         commit_id: manifest.commit_id,
         change_account_id: manifest.change_account_id.clone(),
@@ -12097,7 +12123,7 @@ fn decode_stored_commit_state_authority(
             "tracked_state commit mutation inventory disagrees with its authority digest",
         ));
     }
-    let Some(inventory_payload) =
+    let Some(inventory_frame) =
         mutation_inventory.strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC)
     else {
         return Err(LixError::new(
@@ -12105,8 +12131,46 @@ fn decode_stored_commit_state_authority(
             "tracked_state commit mutation inventory has an unsupported format; recreate the repository",
         ));
     };
-    let stored_inventory: StoredCommitMutationInventory =
-        storage_codec::decode("tracked_state commit mutation inventory", inventory_payload)?;
+    let (uncompressed_len, compressed_inventory) = inventory_frame
+        .split_at_checked(size_of::<u32>())
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit mutation inventory has a truncated frame length",
+            )
+        })?;
+    let uncompressed_len = usize::try_from(u32::from_be_bytes(
+        uncompressed_len.try_into().expect("fixed frame length"),
+    ))
+    .expect("u32 fits usize");
+    if uncompressed_len == 0
+        || uncompressed_len > COMMIT_STATE_MUTATION_INVENTORY_MAX_UNCOMPRESSED_BYTES
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit mutation inventory has an invalid uncompressed length",
+        ));
+    }
+    let inventory_payload = crate::compression::decompress_zstd(
+        compressed_inventory,
+        uncompressed_len,
+    )
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state commit mutation inventory decompression failed: {error}"),
+        )
+    })?;
+    if inventory_payload.len() != uncompressed_len {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit mutation inventory frame length disagrees with decoded bytes",
+        ));
+    }
+    let stored_inventory: StoredCommitMutationInventory = storage_codec::decode(
+        "tracked_state commit mutation inventory",
+        &inventory_payload,
+    )?;
     if stored.mutation_member_count != stored_inventory.member_count
         || stored.mutation_directory_root != stored_inventory.directory_root
     {
@@ -16932,6 +16996,34 @@ mod tests {
         let decoded =
             decode_encoded_commit_state_manifest(&encoded).expect("manifest should round trip");
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn commit_state_manifest_codec_rejects_corrupt_inventory_frame() {
+        let expected = commit_state_manifest_fixture();
+        let encoded = encode_commit_state_manifest(&expected).expect("manifest should encode");
+        let mut tampered_inventory = encoded.mutation_inventory.clone();
+        tampered_inventory
+            .truncate(super::COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC.len() + size_of::<u32>());
+
+        let mut stored: super::StoredCommitStateManifest = storage_codec::decode(
+            "tracked_state commit_state_manifest",
+            encoded
+                .header
+                .strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC)
+                .expect("encoded header has current magic"),
+        )
+        .expect("stored header should decode");
+        stored.mutation_inventory_digest = *blake3::hash(&tampered_inventory).as_bytes();
+        let mut tampered_header = COMMIT_STATE_MANIFEST_FORMAT_MAGIC.to_vec();
+        tampered_header.extend_from_slice(
+            &storage_codec::encode("tracked_state commit_state_manifest", &stored)
+                .expect("tampered header should encode"),
+        );
+
+        let error = decode_stored_commit_state_authority(&tampered_header, &tampered_inventory)
+            .expect_err("truncated inventory frame must fail closed");
+        assert!(error.message.contains("decompression"));
     }
 
     #[test]
