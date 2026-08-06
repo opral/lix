@@ -6,7 +6,7 @@
 //! with a preserved large fixture.  The command never seeds, compacts,
 //! deletes, or rewrites the supplied path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
@@ -19,8 +19,9 @@ use lix::storage_adapter::{
     StorageReadOptions, StorageScanOptions, StorageSpace, StorageSpaceId,
 };
 use lix::storage_bench::{
-    CommitGraphBenchMode, current_image_cas_oracle_accounting, layout_space_catalog,
-    plan_repository_gc_for_bench, read_commit_graph_for_bench,
+    CommitGraphBenchMode, content_authority_accounting_for_bench,
+    current_image_cas_oracle_accounting, layout_space_catalog, plan_repository_gc_for_bench,
+    read_commit_graph_for_bench, semantic_payload_accounting_for_bench,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -101,6 +102,30 @@ struct FilesystemTotals {
     metadata_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DeleteAccounting {
+    rows: u64,
+    key_bytes: u64,
+    value_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct DeleteMapping {
+    present: Vec<(u32, DeleteAccounting)>,
+    absent_idempotent: Vec<(u32, u64)>,
+}
+
+impl DeleteAccounting {
+    fn logical_bytes(self) -> u64 {
+        self.key_bytes.saturating_add(self.value_bytes)
+    }
+    fn add(&mut self, other: Self) {
+        self.rows = self.rows.saturating_add(other.rows);
+        self.key_bytes = self.key_bytes.saturating_add(other.key_bytes);
+        self.value_bytes = self.value_bytes.saturating_add(other.value_bytes);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -116,12 +141,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let backend = backend.to_string_lossy();
     let mut output = String::new();
-    writeln!(output, "INVENTORY_FORMAT\tphysical_footprint_inventory.v1")?;
+    writeln!(output, "INVENTORY_FORMAT\tphysical_footprint_inventory.v2")?;
     writeln!(output, "BACKEND\t{backend}")?;
     writeln!(output, "PATH\t{}", path.display())?;
     writeln!(
         output,
-        "READ_ONLY\ttrue\twrites=0\tcompaction=0\tdeletions=0\treseed=0"
+        "READ_ONLY\tlogical_writes=0\tcompaction_requested=0\tdeletions=0\treseed=0\tadapter_open_may_update_backend_metadata=true\tpreserved_source_requires_snapshot_or_reflink_copy=true"
     )?;
     match backend.as_ref() {
         "rocksdb" => run_backend(RocksDB::open(&path)?, &path, &mut output).await?,
@@ -201,14 +226,56 @@ where
     }
     writeln!(output, "ACCOUNTING_CHECK\tcategory_totals_equal_total=true")?;
 
-    // Binary CAS rows are keyed by a content digest.  Their row count is the
-    // unique-digest count; owner/reference accounting is deliberately kept
-    // separate so fanout is never mistaken for duplicated content.
-    let unique_digests = rows
-        .iter()
-        .filter(|(space, _)| space.name.starts_with("binary_cas."))
-        .map(|(_, accounting)| accounting.rows)
-        .sum::<u64>();
+    let semantic = semantic_payload_accounting_for_bench(&read).await?;
+    if semantic.live_semantic_rows != semantic.covered_live_rows
+        || semantic.covered_live_rows != semantic.decoded_rows
+    {
+        return Err("semantic payload coverage failed: live tracked rows were not decoded".into());
+    }
+    writeln!(
+        output,
+        "SEMANTIC_PAYLOAD\tlive_semantic_rows={}\tdecoded_rows={}\tcanonical_value_bytes={}\tidentity_bytes={}\tschema_bytes={}\tcovered_live_rows={}\tscanned_rows={}\tderived_projection_rows_excluded={}\tcoverage=visible_stored_tracked_entities_untracked_false\torthogonal_to_physical_categories=true",
+        semantic.live_semantic_rows,
+        semantic.decoded_rows,
+        semantic.canonical_value_bytes,
+        semantic.identity_bytes,
+        semantic.schema_bytes,
+        semantic.covered_live_rows,
+        semantic.scanned_rows,
+        semantic.derived_projection_rows_excluded,
+    )?;
+
+    let content = content_authority_accounting_for_bench(&read, &inventory_spaces()).await?;
+    let mut content_unique_rows = 0_u64;
+    let mut content_unique_bytes = 0_u64;
+    for entry in &content {
+        content_unique_rows = content_unique_rows.saturating_add(entry.unique_content_digest_rows);
+        content_unique_bytes = content_unique_bytes.saturating_add(entry.unique_content_bytes);
+        writeln!(
+            output,
+            "CONTENT_AUTHORITY\tauthority={}\tdigest_codec={}\treference_count={}\treference_bytes={}\tunique_content_digest_rows={}\treference_fanout={}/{}\tunique_content_bytes={}\tduplicated_reference_bytes={}",
+            entry.authority,
+            entry.digest_codec,
+            entry.reference_count,
+            entry.reference_bytes,
+            entry.unique_content_digest_rows,
+            entry.reference_count,
+            entry.unique_content_digest_rows,
+            entry.unique_content_bytes,
+            entry.duplicated_reference_bytes,
+        )?;
+    }
+    if content_unique_rows == 0 || content_unique_bytes == 0 {
+        return Err("content authority accounting found no decoded digest-backed content".into());
+    }
+    writeln!(
+        output,
+        "CONTENT_SUMMARY\tunique_content_digest_rows={}\tunique_content_bytes={}\tcontent_reference_fanout_is_separate=true",
+        content_unique_rows, content_unique_bytes,
+    )?;
+
+    // Keep the legacy summary label, but source it from the decoded
+    // key/digest accounting above rather than counting only binary-CAS rows.
     let fanout_rows = rows
         .iter()
         .filter(|(space, _)| {
@@ -225,7 +292,7 @@ where
     writeln!(
         output,
         "DIGESTS\tunique_content_digest_rows={}\treference_fanout_rows={}\tcontent_and_fanout_are_separate=true",
-        unique_digests, fanout_rows
+        content_unique_rows, fanout_rows
     )?;
 
     // The production GC planner is read-only here: it drops its write set
@@ -273,29 +340,98 @@ where
         gc.swept_payloads,
         gc.staged_puts + gc.staged_deletes
     )?;
+    let delete_mapping = match map_gc_delete_entries(&read, &gc, &rows).await {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            writeln!(
+                output,
+                "DELETE_MAPPING_FAILURE\tstatus=fail_closed\terror={error}\taccounting_check=false"
+            )?;
+            print!("{output}");
+            return Err(error);
+        }
+    };
+    let mapped_by_space = delete_mapping
+        .present
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
     let mut planned_deleted_rows = 0_u64;
     for (space_id, count) in &gc.delete_counts_by_space {
         let Some((space, accounting)) = rows.iter().find(|(_, value)| value.id == *space_id) else {
             return Err(format!("GC planned deletion in unknown space id {space_id:#x}").into());
         };
         let count = *count as u64;
-        if count > accounting.rows {
-            return Err(format!("GC delete count exceeds rows for {}", space.name).into());
+        let mapped = mapped_by_space.get(space_id).copied().unwrap_or_default();
+        if mapped.rows != count
+            || mapped.rows > accounting.rows
+            || mapped.key_bytes > accounting.key_bytes
+            || mapped.value_bytes > accounting.value_bytes
+        {
+            return Err(format!(
+                "GC delete mapping does not exactly cover {}: planned={}, mapped={}, inventory_rows={}",
+                space.name, count, mapped.rows, accounting.rows
+            )
+            .into());
         }
         planned_deleted_rows = planned_deleted_rows.saturating_add(count);
         writeln!(
             output,
-            "RETENTION\tspace={}\tall_rows={}\tunion_retained_rows={}\tplanned_unreachable_or_superseded_rows={}\tunreachable_bytes=unavailable_without_delete-key_payload_map",
+            "RETENTION\tspace={}\tall_rows={}\tunion_retained_rows={}\tplanned_delete_intents={}\tplanned_unreachable_or_superseded_rows={}\tplanned_key_bytes={}\tplanned_value_bytes={}\tplanned_logical_bytes={}\tmapping=exact_key_to_one_inventory_row",
             space.name,
             accounting.rows,
-            accounting.rows - count,
+            accounting.rows.saturating_sub(mapped.rows),
             count,
+            mapped.rows,
+            mapped.key_bytes,
+            mapped.value_bytes,
+            mapped.logical_bytes(),
         )?;
+    }
+    if planned_deleted_rows != gc.staged_deletes {
+        return Err("GC planned delete identities do not reconcile with staged deletes".into());
+    }
+    let mut planned_delete_totals = DeleteAccounting::default();
+    let mut retained_history_only = category_totals
+        .get(&Category::RetainedHistoryAuthority)
+        .copied()
+        .unwrap_or_default();
+    for (space_id, mapped) in &delete_mapping.present {
+        let space = inventory_spaces()
+            .into_iter()
+            .find(|candidate| candidate.id.0 == *space_id)
+            .ok_or_else(|| format!("GC mapped delete space {space_id:#x} is not cataloged"))?;
+        planned_delete_totals.add(*mapped);
+        writeln!(
+            output,
+            "DELETE_ACCOUNTING\tspace={}\tclassification=unreachable_or_superseded\trows={}\tkey_bytes={}\tvalue_bytes={}\tlogical_bytes={}\tmapping=exact_key_to_one_inventory_row",
+            space.name,
+            mapped.rows,
+            mapped.key_bytes,
+            mapped.value_bytes,
+            mapped.logical_bytes(),
+        )?;
+        if classify(space.name) == Category::RetainedHistoryAuthority {
+            retained_history_only.rows = retained_history_only.rows.saturating_sub(mapped.rows);
+            retained_history_only.key_bytes = retained_history_only
+                .key_bytes
+                .saturating_sub(mapped.key_bytes);
+            retained_history_only.value_bytes = retained_history_only
+                .value_bytes
+                .saturating_sub(mapped.value_bytes);
+        }
     }
     writeln!(
         output,
-        "RETENTION_SUMMARY\tplanned_unreachable_or_superseded_rows={}\thistorical_only_content_is_not_labeled_obsolete=true",
-        planned_deleted_rows
+        "RETENTION_SUMMARY\tplanned_unreachable_or_superseded_rows={}\tplanned_key_bytes={}\tplanned_value_bytes={}\tplanned_logical_bytes={}\tretained_history_only_rows={}\tretained_history_only_key_bytes={}\tretained_history_only_value_bytes={}\tretained_history_only_logical_bytes={}\thistorical_only_content_is_not_labeled_obsolete=true\tdelete_mapping_exact=true\tmissing_or_duplicate_mapping_fail_closed=true",
+        planned_deleted_rows,
+        planned_delete_totals.key_bytes,
+        planned_delete_totals.value_bytes,
+        planned_delete_totals.logical_bytes(),
+        retained_history_only.rows,
+        retained_history_only.key_bytes,
+        retained_history_only.value_bytes,
+        retained_history_only.logical_bytes(),
     )?;
 
     // This oracle is exact for the binary-CAS current-image subset.  It is
@@ -332,7 +468,7 @@ where
     if backend_name == "rocksdb" {
         writeln!(
             output,
-            "BACKEND_PROPERTIES\tbackend=rocksdb\tsst_by_level=unavailable_without_native_property_handle\tlive_data_bytes={}\ttotal_sst_bytes={}\tsst_files={}\twal_bytes={}\tmetadata_bytes={}\tpending_compaction=unavailable_without_native_property_handle",
+            "BACKEND_PROPERTIES\tbackend=rocksdb\tsst_by_level=unavailable_without_native_property_handle\tnative_live_data_bytes=unavailable_without_native_property_handle\tlogical_inventory_bytes={}\ttotal_sst_bytes={}\tsst_files={}\twal_bytes={}\tmetadata_bytes={}\tpending_compaction=unavailable_without_native_property_handle",
             total.logical_bytes(),
             filesystem.sst_bytes,
             filesystem.sst_files,
@@ -351,15 +487,28 @@ where
     }
     writeln!(
         output,
-        "NORMALIZATION\trows={}\tsemantic_commits={}\tretained_history_entries={}\tlive_logical_payload_bytes={}\tsemantic_commits_source=gc_live_set\tretained_history_entries_source=gc_live_set\tlive_logical_payload_bytes_source=user_logical_value_categories",
+        "NORMALIZATION\trows={}\tsemantic_commits={}\tretained_history_entries={}\tlive_semantic_rows={}\tcanonical_value_bytes={}\tidentity_bytes={}\tschema_bytes={}\tsemantic_commits_source=gc_live_set\tretained_history_entries_source=gc_live_set\tsemantic_payload_source=decoded_tracked_live_entities\tsemantic_payload_is_orthogonal=true",
         total.rows,
         gc.live_commits,
         gc.live_commits,
-        category_totals
-            .get(&Category::UserLogicalValue)
-            .copied()
-            .unwrap_or_default()
-            .value_bytes,
+        semantic.live_semantic_rows,
+        semantic.canonical_value_bytes,
+        semantic.identity_bytes,
+        semantic.schema_bytes,
+    )?;
+    let semantic_commit_count = u64::try_from(gc.live_commits)?;
+    writeln!(
+        output,
+        "NORMALIZED\tlogical_bytes_per_physical_row={}\tlogical_bytes_per_semantic_commit={}\tlogical_bytes_per_retained_history_entry={}\tlogical_bytes_per_live_semantic_row={}\tlogical_bytes_per_canonical_value_byte={}\tfilesystem_logical_bytes_per_live_semantic_row={}\tfilesystem_logical_bytes_per_semantic_commit={}\tfilesystem_allocated_bytes_per_semantic_commit={}\tfilesystem_logical_bytes_per_canonical_value_byte={}",
+        ratio(total.logical_bytes(), total.rows),
+        ratio(total.logical_bytes(), semantic_commit_count),
+        ratio(total.logical_bytes(), semantic_commit_count),
+        ratio(total.logical_bytes(), semantic.live_semantic_rows),
+        ratio(total.logical_bytes(), semantic.canonical_value_bytes),
+        ratio(filesystem.logical_bytes, semantic.live_semantic_rows),
+        ratio(filesystem.logical_bytes, semantic_commit_count),
+        ratio(filesystem.allocated_bytes, semantic_commit_count),
+        ratio(filesystem.logical_bytes, semantic.canonical_value_bytes),
     )?;
     writeln!(
         output,
@@ -367,6 +516,14 @@ where
         inventory_ms, reachability_ms, cas_oracle_ms
     )?;
     Ok(())
+}
+
+fn ratio(numerator: u64, denominator: u64) -> String {
+    if denominator == 0 {
+        "unavailable".to_owned()
+    } else {
+        format!("{:.6}", numerator as f64 / denominator as f64)
+    }
 }
 
 async fn scan_full_values<R>(read: &R, space: StorageSpace) -> Result<Vec<Vec<u8>>, Box<dyn Error>>
@@ -415,6 +572,116 @@ where
         }
         resume_after = Some(last);
     }
+}
+
+async fn scan_entries<R>(
+    read: &R,
+    space: StorageSpace,
+) -> Result<Vec<lix::storage_adapter::StorageReadEntry>, Box<dyn Error>>
+where
+    R: StorageAdapterRead,
+{
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut entries = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        let last = page.value.entries.last().map(|entry| entry.key.clone());
+        entries.extend(page.value.entries);
+        if !page.value.has_more {
+            return Ok(entries);
+        }
+        let Some(last) = last else {
+            return Err(
+                format!("space {} returned has_more with an empty page", space.name).into(),
+            );
+        };
+        if resume_after
+            .as_ref()
+            .is_some_and(|previous| last <= *previous)
+        {
+            return Err(format!("space {} returned a non-advancing cursor", space.name).into());
+        }
+        resume_after = Some(last);
+    }
+}
+
+async fn map_gc_delete_entries<R>(
+    read: &R,
+    gc: &lix::storage_bench::RepositoryGcBenchResult,
+    rows: &[(StorageSpace, SpaceAccounting)],
+) -> Result<DeleteMapping, Box<dyn Error>>
+where
+    R: StorageAdapterRead,
+{
+    let mut seen_spaces = BTreeSet::new();
+    let mut mapped = DeleteMapping {
+        present: Vec::with_capacity(gc.delete_entries_by_space.len()),
+    };
+    for (space_id, keys) in &gc.delete_entries_by_space {
+        if !seen_spaces.insert(*space_id) {
+            return Err(format!("GC delete mapping repeats storage space {space_id:#x}").into());
+        }
+        let (space, inventory) = rows
+            .iter()
+            .find(|(_, accounting)| accounting.id == *space_id)
+            .ok_or_else(|| format!("GC planned deletion in unknown space id {space_id:#x}"))?;
+        let expected = keys.iter().cloned().collect::<BTreeSet<_>>();
+        if expected.len() != keys.len() {
+            return Err(format!("GC planned duplicate delete key in {}", space.name).into());
+        }
+        let mut found = BTreeSet::new();
+        let mut accounting = DeleteAccounting::default();
+        for entry in scan_entries(read, *space).await? {
+            let key = entry.key.0.to_vec();
+            if !expected.contains(&key) {
+                continue;
+            }
+            if !found.insert(key.clone()) {
+                return Err(format!("GC delete key appears twice in {}", space.name).into());
+            }
+            let value = match entry.value {
+                lix::storage_adapter::StorageProjectedValue::FullValue(value) => value,
+                lix::storage_adapter::StorageProjectedValue::KeyOnly => {
+                    return Err(
+                        format!("GC delete mapping saw key-only value in {}", space.name).into(),
+                    );
+                }
+            };
+            accounting.rows = accounting.rows.saturating_add(1);
+            accounting.key_bytes = accounting
+                .key_bytes
+                .saturating_add(4_u64.saturating_add(key.len() as u64));
+            accounting.value_bytes = accounting.value_bytes.saturating_add(value.len() as u64);
+        }
+        if accounting.rows != found.len() as u64 || found.len() != expected.len() {
+            return Err(format!(
+                "GC delete mapping missing {} rows in {} (expected={}, found={}, inventory had {})",
+                expected.len().saturating_sub(found.len()),
+                space.name,
+                expected.len(),
+                found.len(),
+                inventory.rows,
+            )
+            .into());
+        }
+        mapped.present.push((*space_id, accounting));
+    }
+    Ok(mapped)
 }
 
 fn inventory_spaces() -> Vec<StorageSpace> {
@@ -544,7 +811,15 @@ fn classify(name: &str) -> Category {
 }
 
 fn unique_digest_count(name: &str, accounting: SpaceAccounting) -> u64 {
-    if name.starts_with("binary_cas.") {
+    if name.starts_with("binary_cas.")
+        || matches!(
+            name,
+            "tracked_state.tree_chunk"
+                | "tracked_state.commit_mutation_directory_node.v1"
+                | "tracked_state.current_state_data_part.v1"
+                | "tracked_state.current_state_data_part_refs.v1"
+        )
+    {
         accounting.rows
     } else {
         0
@@ -585,14 +860,16 @@ where
                 .key_bytes
                 .checked_add(entry.key.0.len() as u64 + 4)
                 .ok_or("key byte count overflow")?;
+            let lix::storage_adapter::StorageProjectedValue::FullValue(value) = &entry.value else {
+                return Err(format!(
+                    "space {} returned a key-only row for a full-value inventory",
+                    space.name
+                )
+                .into());
+            };
             result.value_bytes = result
                 .value_bytes
-                .checked_add(match &entry.value {
-                    lix::storage_adapter::StorageProjectedValue::FullValue(value) => {
-                        value.len() as u64
-                    }
-                    lix::storage_adapter::StorageProjectedValue::KeyOnly => 0,
-                })
+                .checked_add(value.len() as u64)
                 .ok_or("value byte count overflow")?;
         }
         if !has_more {

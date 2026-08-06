@@ -729,6 +729,32 @@ impl StorageWriteSet {
             .collect()
     }
 
+    /// Returns the exact logical point-delete keys staged in each space.
+    ///
+    /// This is benchmark/test observability only.  The production write path
+    /// continues to consume the canonical arena ranges directly; exposing
+    /// cloned keys here lets a read-only inventory reconcile a GC plan with
+    /// the independently scanned rows without changing publication or
+    /// deletion semantics.
+    #[cfg(any(test, feature = "storage-benches"))]
+    pub fn delete_entries_by_space(&self) -> Vec<(StorageSpace, Vec<Bytes>)> {
+        self.groups
+            .iter()
+            .filter_map(|group| {
+                (!group.deletes.is_empty()).then(|| {
+                    (
+                        group.space,
+                        group
+                            .deletes
+                            .iter()
+                            .map(|range| Bytes::copy_from_slice(group.key_bytes(*range)))
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
         self.group_index

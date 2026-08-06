@@ -629,6 +629,11 @@ pub struct RepositoryGcBenchResult {
     /// makes GC benchmark expectations resilient to additions of a new
     /// derived projection while still proving each authority lane explicitly.
     pub delete_counts_by_space: Vec<(u32, usize)>,
+    /// Exact logical point-delete keys grouped by storage-space id.  This is
+    /// benchmark-only observability used to reconcile a planned sweep against
+    /// the independent physical inventory; the production planner never
+    /// consumes this clone.
+    pub delete_entries_by_space: Vec<(u32, Vec<Vec<u8>>)>,
     pub deleted_commit_state_manifests: usize,
     pub deleted_mutation_inventories: usize,
     pub deleted_semantic_commit_projections: usize,
@@ -802,6 +807,17 @@ where
         .map(|(space, count)| (space.id.0, count))
         .collect();
     delete_counts_by_space.sort_unstable_by_key(|(space_id, _)| *space_id);
+    let mut delete_entries_by_space: Vec<(u32, Vec<Vec<u8>>)> = writes
+        .delete_entries_by_space()
+        .into_iter()
+        .map(|(space, keys)| {
+            (
+                space.id.0,
+                keys.into_iter().map(|key| key.to_vec()).collect(),
+            )
+        })
+        .collect();
+    delete_entries_by_space.sort_unstable_by_key(|(space_id, _)| *space_id);
     let delete_count = |space_id| {
         delete_counts_by_space
             .iter()
@@ -846,6 +862,7 @@ where
         staged_puts: stats.staged_puts,
         staged_deletes: stats.staged_deletes,
         delete_counts_by_space,
+        delete_entries_by_space,
         deleted_commit_state_manifests,
         deleted_mutation_inventories,
         deleted_semantic_commit_projections,
@@ -1079,6 +1096,271 @@ pub struct StorageLayoutAccounting {
     pub rows: u64,
     pub key_bytes: u64,
     pub value_bytes: u64,
+}
+
+/// Orthogonal semantic payload accounting for the currently visible tracked
+/// entities.  These bytes are decoded/re-encoded logical values and are not
+/// part of the disjoint physical-space totals above: they are a denominator
+/// for footprint normalization only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SemanticPayloadBenchAccounting {
+    pub scanned_rows: u64,
+    pub derived_projection_rows_excluded: u64,
+    pub live_semantic_rows: u64,
+    pub decoded_rows: u64,
+    pub canonical_value_bytes: u64,
+    pub identity_bytes: u64,
+    pub schema_bytes: u64,
+    pub covered_live_rows: u64,
+}
+
+/// Decodes the visible tracked live-state rows through the production reader
+/// and reports an orthogonal semantic payload measure.  The filter is
+/// explicitly `untracked = Some(false)` so untracked/current HOT rows cannot
+/// silently enter this denominator.  A malformed live snapshot is an
+/// accounting error rather than an omitted row.
+pub async fn semantic_payload_accounting_for_bench<R>(
+    read: &R,
+) -> Result<SemanticPayloadBenchAccounting, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let live_state = crate::live_state::LiveStateContext::new(
+        crate::tracked_state::TrackedStateContext::new(),
+        crate::commit_graph::CommitGraphContext::new(),
+    );
+    let rows = live_state
+        .reader(read)
+        .scan_batch(&crate::live_state::LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                untracked: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let mut accounting = SemanticPayloadBenchAccounting {
+        scanned_rows: rows.len() as u64,
+        ..Default::default()
+    };
+    for row in rows.iter() {
+        // These schemas are registered derived providers backed by commit-graph
+        // projections, not stored tracked entities.  The broad visibility scan
+        // intentionally returns them, so exclude them from the independent
+        // live-entity payload denominator and report the exclusion explicitly.
+        if matches!(row.schema_key(), "lix_commit" | "lix_commit_edge") {
+            accounting.derived_projection_rows_excluded = accounting
+                .derived_projection_rows_excluded
+                .saturating_add(1);
+            continue;
+        }
+        if row.deleted() {
+            continue;
+        }
+        accounting.live_semantic_rows = accounting.live_semantic_rows.saturating_add(1);
+        let snapshot = row.snapshot_content().ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "live tracked entity is missing semantic snapshot content",
+            )
+        })?;
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("live tracked entity snapshot is not valid JSON: {error}"),
+                )
+            })?;
+        let canonical = crate::entity_pk::canonical_json_text(&value).map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("semantic JSON canonicalization failed: {error}"),
+            )
+        })?;
+        accounting.decoded_rows = accounting.decoded_rows.saturating_add(1);
+        accounting.canonical_value_bytes = accounting
+            .canonical_value_bytes
+            .saturating_add(canonical.len() as u64);
+        let identity =
+            crate::storage_codec::encode("benchmark semantic entity identity", row.entity_pk())
+                .map_err(|error| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        format!("semantic identity encoding failed: {error}"),
+                    )
+                })?;
+        accounting.identity_bytes = accounting
+            .identity_bytes
+            .saturating_add(identity.len() as u64);
+        accounting.schema_bytes = accounting
+            .schema_bytes
+            .saturating_add(row.schema_key().len() as u64);
+        accounting.covered_live_rows = accounting.covered_live_rows.saturating_add(1);
+    }
+    Ok(accounting)
+}
+
+/// Content-addressed authority accounting keyed by the physical digest codec
+/// used by each serving plane.  Reference fanout is reported separately from
+/// unique payload bytes; a conflicting value for one digest is corruption and
+/// fails the inventory rather than being silently deduplicated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentAuthorityBenchAccounting {
+    pub authority: String,
+    pub digest_codec: String,
+    pub reference_count: u64,
+    /// Encoded digest/reference-key bytes, excluding the content value.
+    pub reference_bytes: u64,
+    pub unique_content_digest_rows: u64,
+    pub unique_content_bytes: u64,
+    /// Encoded reference-key bytes beyond the first reference to a digest.
+    pub duplicated_reference_bytes: u64,
+}
+
+pub async fn content_authority_accounting_for_bench<R>(
+    read: &R,
+    spaces: &[crate::storage_adapter::StorageSpace],
+) -> Result<Vec<ContentAuthorityBenchAccounting>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let mut output = Vec::new();
+    for space in spaces {
+        let (digest_codec, digest_offset) = match space.name {
+            "tracked_state.tree_chunk"
+            | "tracked_state.commit_mutation_directory_node.v1"
+            | "tracked_state.current_state_data_part.v1"
+            | "tracked_state.current_state_data_part_refs.v1"
+            | "binary_cas.manifest"
+            | "binary_cas.manifest_chunk"
+            | "binary_cas.chunk"
+            | "binary_cas.chunk_presence" => ("32-byte digest key", Some(0usize)),
+            "tracked_state.commit_delta_segment.v6" => (
+                "UUID+segment+(optional)32-byte replacement digest",
+                Some(20usize),
+            ),
+            "entity.columnar_row_group_manifest.v1" | "entity.columnar_row_group_column.v1" => {
+                ("row-group set/page key (not content-addressed)", None)
+            }
+            _ => continue,
+        };
+        let mut by_digest = std::collections::BTreeMap::<[u8; 32], u64>::new();
+        let mut references = 0_u64;
+        let mut reference_bytes = 0_u64;
+        let mut duplicated_reference_bytes = 0_u64;
+        let mut non_digest_rows = 0_u64;
+        let plan = ScanPlan::prefix(
+            *space,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        );
+        let mut resume_after = None;
+        loop {
+            let page = plan
+                .collect(
+                    read,
+                    StorageScanOptions {
+                        projection: StorageCoreProjection::FullValue,
+                        resume_after: resume_after.clone(),
+                        ..StorageScanOptions::default()
+                    },
+                )
+                .await?;
+            let mut previous = resume_after.as_ref();
+            for entry in &page.value.entries {
+                if previous.is_some_and(|key| &entry.key <= key) {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "content authority {} scan is not strictly ordered",
+                            space.name
+                        ),
+                    ));
+                }
+                previous = Some(&entry.key);
+            }
+            let last = page.value.entries.last().map(|entry| entry.key.clone());
+            for entry in page.value.entries {
+                references = references.saturating_add(1);
+                let value = match entry.value {
+                    StorageProjectedValue::FullValue(value) => value,
+                    StorageProjectedValue::KeyOnly => {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_INTERNAL_ERROR,
+                            format!("content authority {} returned a key-only row", space.name),
+                        ));
+                    }
+                };
+                let encoded_reference_bytes = 4_u64.saturating_add(entry.key.0.len() as u64);
+                reference_bytes = reference_bytes.saturating_add(encoded_reference_bytes);
+                let digest = digest_offset.and_then(|offset| {
+                    let bytes = entry.key.0.as_ref();
+                    if space.name == "tracked_state.commit_delta_segment.v6" {
+                        (bytes.len() >= offset + 32).then(|| {
+                            bytes[bytes.len() - 32..]
+                                .try_into()
+                                .expect("fixed digest suffix width")
+                        })
+                    } else {
+                        (bytes.len() == 32).then(|| {
+                            bytes[offset..offset + 32]
+                                .try_into()
+                                .expect("fixed digest key width")
+                        })
+                    }
+                });
+                let Some(digest) = digest else {
+                    non_digest_rows = non_digest_rows.saturating_add(1);
+                    continue;
+                };
+                if let Some(previous) = by_digest.insert(digest, value.len() as u64) {
+                    if previous != value.len() as u64 {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "content digest key has conflicting payload lengths in {}",
+                                space.name
+                            ),
+                        ));
+                    }
+                    duplicated_reference_bytes =
+                        duplicated_reference_bytes.saturating_add(encoded_reference_bytes);
+                }
+            }
+            if !page.value.has_more {
+                break;
+            }
+            let Some(last) = last else {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("content authority {} has_more page is empty", space.name),
+                ));
+            };
+            if resume_after.as_ref().is_some_and(|cursor| last <= *cursor) {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("content authority {} cursor did not advance", space.name),
+                ));
+            }
+            resume_after = Some(last);
+        }
+        let unique_content_bytes = by_digest.values().copied().sum::<u64>();
+        output.push(ContentAuthorityBenchAccounting {
+            authority: space.name.to_owned(),
+            digest_codec: digest_codec.to_owned(),
+            reference_count: references,
+            reference_bytes,
+            unique_content_digest_rows: by_digest.len() as u64,
+            unique_content_bytes,
+            duplicated_reference_bytes: if non_digest_rows == 0 {
+                duplicated_reference_bytes
+            } else {
+                0
+            },
+        });
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2260,11 +2542,23 @@ mod tests {
                 .sum::<u64>(),
             first.staged_deletes
         );
+        assert_eq!(
+            first
+                .delete_entries_by_space
+                .iter()
+                .map(|(_, keys)| keys.len() as u64)
+                .sum::<u64>(),
+            first.staged_deletes
+        );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize);
         assert_eq!(first.key_shared_bytes, first.staged_deletes as usize * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
+        assert_eq!(
+            second.delete_entries_by_space,
+            first.delete_entries_by_space
+        );
         assert_eq!(second.staged_deletes, first.staged_deletes);
         assert_eq!(before_layout, after_first_layout);
         assert_eq!(after_first_layout, after_second_layout);
