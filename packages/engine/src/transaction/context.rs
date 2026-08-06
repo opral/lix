@@ -550,6 +550,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// validation or staging step rejects those buffers, this transaction can
     /// no longer provide statement atomicity and must remain rollback-only.
     mutation_journal_terminal_error: Option<LixError>,
+    /// Immutable logical state certified by the internal undo/redo transition
+    /// as the complete derived current-state base. Any later non-marker write
+    /// clears this proof before commit.
+    certified_current_state_base_commit_id: Option<CommitId>,
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
@@ -666,6 +670,7 @@ struct TypedStateTransitionTarget {
 /// write has been staged in an explicit SQL transaction.
 pub(crate) struct SqlStatementCheckpoint {
     staged_writes: TransactionWriteBufferCheckpoint,
+    certified_current_state_base_commit_id: Option<CommitId>,
     filesystem_path_index_epoch: usize,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     trust_filesystem_planner: bool,
@@ -1490,6 +1495,7 @@ where
                 mutation_journal_sealed_rows: 0,
                 mutation_journal_seal_prefix_open: true,
                 mutation_journal_terminal_error: None,
+                certified_current_state_base_commit_id: None,
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
@@ -1527,7 +1533,7 @@ where
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let mut transaction = self;
-        let prepared_writes = match transaction.staged_writes.drain() {
+        let mut prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 transaction
@@ -1536,6 +1542,26 @@ where
                 return Err(error);
             }
         };
+        if let Some(base_commit_id) = transaction.certified_current_state_base_commit_id.take() {
+            let Some(change_refs) = prepared_writes
+                .commit_change_refs_by_branch
+                .get_mut(&transaction.active_branch_id)
+            else {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified current-state base has no staged semantic commit",
+                ));
+            };
+            if let Err(error) = change_refs.certify_current_state_base(base_commit_id) {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        }
         transaction
             .commit_prepared(runtime_functions, prepared_writes)
             .await
@@ -1893,6 +1919,7 @@ where
     ) -> Result<SqlStatementCheckpoint, LixError> {
         Ok(SqlStatementCheckpoint {
             staged_writes: self.staged_writes.checkpoint()?,
+            certified_current_state_base_commit_id: self.certified_current_state_base_commit_id,
             filesystem_path_index_epoch: self.filesystem_path_index_epoch.load(Ordering::SeqCst),
             pending_file_view_mutations: self.pending_file_view_mutations.clone(),
             trust_filesystem_planner: self.trust_filesystem_planner,
@@ -1907,11 +1934,13 @@ where
     ) -> Result<(), LixError> {
         let SqlStatementCheckpoint {
             staged_writes,
+            certified_current_state_base_commit_id,
             filesystem_path_index_epoch,
             pending_file_view_mutations,
             trust_filesystem_planner,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
+        self.certified_current_state_base_commit_id = certified_current_state_base_commit_id;
         self.filesystem_path_index_epoch
             .store(filesystem_path_index_epoch, Ordering::SeqCst);
         // The cache is derived from the discarded post-image. Evict it rather
@@ -2097,6 +2126,20 @@ where
         write: TransactionWrite,
         statement_indices: Option<Vec<u32>>,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        if self.certified_current_state_base_commit_id.is_some() {
+            let preserves_transition_base = match &write {
+                TransactionWrite::Rows { rows, .. } => rows.iter().all(|row| {
+                    !row.global
+                        && !row.untracked
+                        && row.branch_id.as_str() == self.active_branch_id
+                        && row.schema_key.as_str() == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                }),
+                TransactionWrite::RowsWithFileContent { .. } => false,
+            };
+            if !preserves_transition_base {
+                self.certified_current_state_base_commit_id = None;
+            }
+        }
         if let Some(statement_indices) = &statement_indices {
             debug_assert_eq!(statement_indices.len(), transaction_write_row_count(&write));
         }
@@ -7552,6 +7595,7 @@ where
             rows,
         })
         .await?;
+        self.certified_current_state_base_commit_id = Some(desired_commit_id);
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected,
             commit_id: self

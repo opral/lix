@@ -1056,6 +1056,7 @@ struct StagedChangelogCommit {
     replay_debt: CommitStateReplayDebt,
     change_count: usize,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+    current_state_base_commit_id: Option<CommitId>,
 }
 
 struct StagedCommitDeltaIndex {
@@ -1473,6 +1474,7 @@ async fn stage_changelog_commits(
                 },
                 change_count,
                 selected_change_batches: commit_row.selected_change_batches.clone(),
+                current_state_base_commit_id: commit_row.current_state_base_commit_id,
             },
         );
     }
@@ -3655,6 +3657,95 @@ async fn stage_tracked_head(
                 engine_rows,
             )
             .await?;
+        }
+
+        if let Some(base_commit_id) = staged.current_state_base_commit_id {
+            if is_checkpoint_publication
+                || selected_materialization.is_some()
+                || !staged.selected_change_batches.is_empty()
+                || !untracked_deltas.is_empty()
+                || !engine_rows.is_empty()
+                || !explicit_branch_targets.is_empty()
+                || certified_fresh_plugin_file_id.is_some()
+                || host_certified_live_increments.contains_key(&root.branch_id)
+                || state_row_indices.is_empty()
+                || state_row_indices.iter().any(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    row.global
+                        || row.untracked
+                        || row.branch_id.as_str() != root.branch_id
+                        || row.commit_id != Some(root.commit_id)
+                })
+                || !state_row_indices.iter().any(|&row_index| {
+                    state_rows.row(row_index).schema_key
+                        != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                })
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified current-state base overlaps an unsupported publication shape",
+                ));
+            }
+            let generation =
+                lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
+            let mut coverage = WorkingDiffIndexCoverage::default();
+            let mut writer = tracked_head.writer(read, writes);
+            writer.stage_root_current_base(&root.branch_id, generation, base_commit_id);
+            let overlay_deltas = state_row_indices
+                .iter()
+                .filter_map(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    (row.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY)
+                        .then(|| current_state_delta_from_state_row(row))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !overlay_deltas.is_empty() {
+                writer
+                    .stage_current_state_with_certified_predecessors(
+                        &root.branch_id,
+                        Some(generation),
+                        root.commit_id,
+                        &overlay_deltas,
+                        &[],
+                        &BTreeSet::new(),
+                        None,
+                        None,
+                        None,
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_transition_base_overlay"
+                    ))
+                    .await?;
+            }
+            let mut control = normal_branch_head_control(root, parent_control, generation, None)?;
+            if let Some(parent) = parent_control
+                .filter(|parent| parent.tracked_generation == parent.untracked_generation)
+            {
+                let next_untracked_generation = untracked_lifecycle_generation(
+                    &root.branch_id,
+                    parent.untracked_generation,
+                    control.current_state_revision,
+                );
+                writer
+                    .stage_untracked_generation(
+                        &root.branch_id,
+                        parent.untracked_generation,
+                        next_untracked_generation,
+                        &[],
+                        &BTreeSet::new(),
+                    )
+                    .await?;
+                control.untracked_generation = next_untracked_generation;
+            }
+            control.note_schemas(
+                state_row_indices
+                    .iter()
+                    .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
+            );
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
         }
 
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
@@ -6106,6 +6197,7 @@ struct FinalizedCommitRow {
     created_at: LixTimestamp,
     change_id: ChangeId,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+    current_state_base_commit_id: Option<CommitId>,
 }
 
 struct PendingTrackedRoot {
@@ -6134,6 +6226,7 @@ async fn finalize_commit_rows(
         let created_at = change_refs.created_at;
         let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
+        let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
         commit_rows.push(FinalizedCommitRow {
             commit_id,
@@ -6141,6 +6234,7 @@ async fn finalize_commit_rows(
             created_at,
             change_id: commit_change_id,
             selected_change_batches,
+            current_state_base_commit_id,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id: intermediate.branch_id,
@@ -6161,6 +6255,7 @@ async fn finalize_commit_rows(
         let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
+        let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
         let parent_commit_ids =
             if let Some(parent) = first_commit_parent_override_by_branch.get(&branch_id) {
@@ -6193,6 +6288,7 @@ async fn finalize_commit_rows(
             created_at: timestamp,
             change_id: commit_change_id,
             selected_change_batches,
+            current_state_base_commit_id,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id,
@@ -7080,6 +7176,7 @@ mod tests {
             created_at: timestamp,
             change_id: change_id("mixed-certified-commit"),
             selected_change_batches: Vec::new(),
+            current_state_base_commit_id: None,
         }];
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -9002,6 +9099,7 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:01Z"),
                 change_id: ChangeId::for_test_label("child-commit-change"),
                 selected_change_batches: Vec::new(),
+                current_state_base_commit_id: None,
             },
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
@@ -9009,6 +9107,7 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: ChangeId::for_test_label("parent-commit-change"),
                 selected_change_batches: Vec::new(),
+                current_state_base_commit_id: None,
             },
         ];
         let mut rootless_commit_ids = BTreeSet::from([CommitId::for_test_label("parent-commit")]);
@@ -9146,6 +9245,7 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
                 selected_change_batches: Vec::new(),
+                current_state_base_commit_id: None,
             })
             .collect::<Vec<_>>();
         let row_indices = commit_ids
