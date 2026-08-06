@@ -1778,6 +1778,14 @@ impl TrackedStateTree {
     }
 }
 
+#[cfg(feature = "storage-benches")]
+pub(crate) fn decoded_tree_chunk_child_references_for_bench(bytes: &[u8]) -> Result<u64, LixError> {
+    Ok(match decode_node(bytes)? {
+        DecodedNode::Leaf(_) => 0,
+        DecodedNode::Internal(internal) => internal.children().len() as u64,
+    })
+}
+
 #[derive(Debug)]
 struct BuiltTree {
     root_id: TrackedStateRootId,

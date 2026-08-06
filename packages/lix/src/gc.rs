@@ -482,13 +482,14 @@ pub(crate) async fn stage_reachability_delta_batch(
 async fn load_reachability_batches(
     store: &(impl StorageAdapterRead + ?Sized),
     queue: &StoredReachabilityQueue,
+    batch_limit: usize,
 ) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError> {
     if queue.head_sequence == 0 {
         return Ok(Vec::new());
     }
     let end = queue
         .head_sequence
-        .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
+        .saturating_add(u64::try_from(batch_limit).unwrap_or(u64::MAX))
         .min(queue.tail_sequence.saturating_add(1));
     let keys = (queue.head_sequence..end)
         .map(reachability_sequence_key)
@@ -546,7 +547,7 @@ where
         .map(|(_, control)| control.ref_change_id)
         .collect::<BTreeSet<_>>();
     let (queue, _) = load_reachability_queue(store).await?;
-    let batches = load_reachability_batches(store, &queue).await?;
+    let batches = load_reachability_batches(store, &queue, GC_REACHABILITY_BATCH_LIMIT).await?;
     let mut active_root_ids = controls
         .iter()
         .flat_map(|(_, control)| {
@@ -945,6 +946,37 @@ pub(crate) async fn stage_repository_gc_with_preconditions<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    stage_repository_gc_with_preconditions_and_limit(
+        store,
+        writes,
+        preconditions,
+        GC_REACHABILITY_BATCH_LIMIT,
+    )
+    .await
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn stage_repository_gc_full_queue_for_bench<S>(
+    store: S,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<RepositoryGcPlan, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    stage_repository_gc_with_preconditions_and_limit(store, writes, preconditions, usize::MAX).await
+}
+
+async fn stage_repository_gc_with_preconditions_and_limit<S>(
+    store: S,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    batch_limit: usize,
+) -> Result<RepositoryGcPlan, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    debug_assert!(batch_limit > 0);
     let started = Instant::now();
     let controls = BranchHeadControlContext::new()
         .reader(store.clone())
@@ -971,7 +1003,7 @@ where
     }
 
     let (queue, raw_queue) = load_reachability_queue(&store).await?;
-    let batches = load_reachability_batches(&store, &queue).await?;
+    let batches = load_reachability_batches(&store, &queue, batch_limit).await?;
     // Checkpoint pins carried by the authenticated batches are folded into
     // the same active-root set before any retirement candidate is evaluated.
     // Recovery refs normally provide the same roots; retaining both proofs
@@ -1280,7 +1312,7 @@ where
 
     if consumed_through > queue_head {
         consumed_through = consumed_through
-            .min(queue_head.saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64))
+            .min(queue_head.saturating_add(u64::try_from(batch_limit).unwrap_or(u64::MAX)))
             .min(next_queue.tail_sequence.saturating_add(1));
         for sequence in next_queue.head_sequence..consumed_through {
             writes.delete(
@@ -2463,7 +2495,7 @@ mod tests {
         let (queue, _) = load_reachability_queue(&read)
             .await
             .expect("queue should decode");
-        let batches = load_reachability_batches(&read, &queue)
+        let batches = load_reachability_batches(&read, &queue, super::GC_REACHABILITY_BATCH_LIMIT)
             .await
             .expect("delta should decode");
         assert_eq!(batches.len(), 1);

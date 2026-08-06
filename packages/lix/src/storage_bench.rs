@@ -5,9 +5,9 @@ use bytes::Bytes;
 use crate::storage::{ReadOptions, WriteOptions};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
-    StorageProjectedValue, StorageScanOptions, StorageWriteOptions, StorageWriteSet,
-    StorageWriteSetError,
+    PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection,
+    StorageGetOptions, StoragePrefix, StorageProjectedValue, StorageScanOptions,
+    StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
 };
 
 fn stage_bench_commit_deltas(
@@ -634,6 +634,11 @@ pub struct RepositoryGcBenchResult {
     /// the independent physical inventory; the production planner never
     /// consumes this clone.
     pub delete_entries_by_space: Vec<(u32, Vec<Vec<u8>>)>,
+    pub planned_present_delete_rows: u64,
+    pub planned_present_delete_key_bytes: u64,
+    pub planned_present_delete_value_bytes: u64,
+    pub planned_absent_idempotent_delete_rows: u64,
+    pub delete_presence_accounting_us: u64,
     pub deleted_commit_state_manifests: usize,
     pub deleted_mutation_inventories: usize,
     pub deleted_semantic_commit_projections: usize,
@@ -798,7 +803,45 @@ where
         storage.begin_read(ReadOptions::default()).await?,
     );
     let mut writes = storage.new_write_set();
-    let plan = crate::gc::stage_repository_gc(read, &mut writes).await?;
+    let plan = crate::gc::stage_repository_gc(read.clone(), &mut writes).await?;
+    let mut result = repository_gc_bench_result(&plan, &writes)?;
+    apply_repository_gc_delete_presence(&read, &writes, &mut result).await?;
+    Ok(result)
+}
+
+/// Plans the union of individually proven retirement candidates across the
+/// complete authenticated queue without committing the staged write set.
+///
+/// Production GC remains bounded by its incremental batch limit. Queue rows
+/// behind a blocked prefix remain retained metadata; this oracle only expands
+/// candidate attribution and never claims that the queue is consumable in one
+/// production transaction.
+pub async fn plan_repository_gc_full_queue_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<RepositoryGcBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    let mut writes = storage.new_write_set();
+    let mut preconditions = Vec::new();
+    let plan = crate::gc::stage_repository_gc_full_queue_for_bench(
+        read.clone(),
+        &mut writes,
+        &mut preconditions,
+    )
+    .await?;
+    let mut result = repository_gc_bench_result(&plan, &writes)?;
+    apply_repository_gc_delete_presence(&read, &writes, &mut result).await?;
+    Ok(result)
+}
+
+fn repository_gc_bench_result(
+    plan: &crate::gc::RepositoryGcPlan,
+    writes: &StorageWriteSet,
+) -> Result<RepositoryGcBenchResult, crate::LixError> {
     let stats = writes.stats();
     let arena = writes.arena_stats();
     let mut delete_counts_by_space: Vec<(u32, usize)> = writes
@@ -863,6 +906,11 @@ where
         staged_deletes: stats.staged_deletes,
         delete_counts_by_space,
         delete_entries_by_space,
+        planned_present_delete_rows: 0,
+        planned_present_delete_key_bytes: 0,
+        planned_present_delete_value_bytes: 0,
+        planned_absent_idempotent_delete_rows: 0,
+        delete_presence_accounting_us: 0,
         deleted_commit_state_manifests,
         deleted_mutation_inventories,
         deleted_semantic_commit_projections,
@@ -881,6 +929,86 @@ where
         tracked_root_stage_us: plan.profile.tracked_root_stage_us,
         total_us: plan.profile.total_us,
     })
+}
+
+async fn apply_repository_gc_delete_presence<R>(
+    read: &R,
+    writes: &StorageWriteSet,
+    result: &mut RepositoryGcBenchResult,
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let started = std::time::Instant::now();
+    for (space, raw_keys) in writes.delete_entries_by_space() {
+        let unique = raw_keys
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != raw_keys.len() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "repository-GC write set repeats a delete key in {}",
+                    space.name
+                ),
+            ));
+        }
+        let keys = raw_keys
+            .into_iter()
+            .map(crate::storage_adapter::StorageKey)
+            .collect::<Vec<_>>();
+        let values = PointReadPlan::from_unique_keys(space, keys.clone())
+            .collect(
+                read,
+                StorageGetOptions {
+                    projection: StorageCoreProjection::FullValue,
+                },
+            )
+            .await?
+            .value
+            .unique_values;
+        for (key, value) in keys.iter().zip(values) {
+            match value {
+                Some(StorageProjectedValue::FullValue(value)) => {
+                    result.planned_present_delete_rows =
+                        result.planned_present_delete_rows.saturating_add(1);
+                    result.planned_present_delete_key_bytes = result
+                        .planned_present_delete_key_bytes
+                        .saturating_add(4_u64.saturating_add(key.0.len() as u64));
+                    result.planned_present_delete_value_bytes = result
+                        .planned_present_delete_value_bytes
+                        .saturating_add(value.len() as u64);
+                }
+                Some(StorageProjectedValue::KeyOnly) => {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "repository-GC exact delete accounting received key-only data in {}",
+                            space.name
+                        ),
+                    ));
+                }
+                None => {
+                    result.planned_absent_idempotent_delete_rows = result
+                        .planned_absent_idempotent_delete_rows
+                        .saturating_add(1);
+                }
+            }
+        }
+    }
+    if result
+        .planned_present_delete_rows
+        .saturating_add(result.planned_absent_idempotent_delete_rows)
+        != result.staged_deletes
+    {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "repository-GC present/absent delete accounting does not reconcile",
+        ));
+    }
+    result.delete_presence_accounting_us = started.elapsed().as_micros() as u64;
+    Ok(())
 }
 
 /// Audits standalone semantic facts for the GC benchmark without adding the
@@ -1215,6 +1343,225 @@ pub struct ContentAuthorityBenchAccounting {
     pub unique_content_bytes: u64,
     /// Encoded reference-key bytes beyond the first reference to a digest.
     pub duplicated_reference_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackedTreeChunkReachabilityBenchAccounting {
+    pub stored_unique_chunks: u64,
+    pub stored_logical_bytes: u64,
+    pub current_head_reachable_chunks: u64,
+    pub current_head_reachable_logical_bytes: u64,
+    pub retained_history_reachable_chunks: u64,
+    pub retained_history_reachable_logical_bytes: u64,
+    pub unreachable_rebuildable_chunks: u64,
+    pub unreachable_rebuildable_logical_bytes: u64,
+    pub current_snapshot_roots: u64,
+    pub retained_snapshot_roots: u64,
+    pub stored_reference_count: u64,
+    pub stored_reference_bytes: u64,
+    pub duplicated_reference_bytes: u64,
+    pub current_reference_count: u64,
+    pub retained_reference_count: u64,
+}
+
+/// Resolves the tracked snapshot-tree serving projection by actual content
+/// hashes. Current reachability walks semantic ancestors of the supplied live
+/// heads; retained reachability walks every physical manifest not present in
+/// the independently proven full-queue retirement union.
+pub async fn tracked_tree_chunk_reachability_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    current_head_commit_ids: &[String],
+    retired_manifest_keys: &[Vec<u8>],
+) -> Result<TrackedTreeChunkReachabilityBenchAccounting, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    let current_heads = current_head_commit_ids
+        .iter()
+        .map(|commit_id| {
+            crate::changelog::CommitId::parse_lix(commit_id, "inventory current branch head")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut current_commit_ids = std::collections::BTreeSet::new();
+    let mut graph = crate::commit_graph::CommitGraphContext::new().reader(read.clone());
+    for head in &current_heads {
+        current_commit_ids.extend(
+            graph
+                .reachable_nodes(head)
+                .await?
+                .iter()
+                .map(|node| node.commit.commit_id),
+        );
+    }
+
+    let retired_manifest_keys = retired_manifest_keys
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let manifest_entries = scan_layout_entries(
+        &read,
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+    )
+    .await;
+    let mut manifest_ids = Vec::with_capacity(manifest_entries.len());
+    for entry in manifest_entries {
+        let raw_key = entry.key.0.as_ref();
+        let commit_bytes: [u8; 16] = raw_key.try_into().map_err(|_| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tracked-state manifest key has invalid commit-id width",
+            )
+        })?;
+        manifest_ids.push((
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(commit_bytes)),
+            retired_manifest_keys.contains(raw_key),
+        ));
+    }
+    let all_commit_ids = manifest_ids
+        .iter()
+        .map(|(commit_id, _)| *commit_id)
+        .collect::<Vec<_>>();
+    let retained_manifest_ids = manifest_ids
+        .iter()
+        .filter_map(|(commit_id, retired)| (!retired).then_some(*commit_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    if current_heads
+        .iter()
+        .any(|head| !retained_manifest_ids.contains(head))
+    {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "current branch head is absent from retained tracked-state manifests",
+        ));
+    }
+    let manifests =
+        crate::tracked_state::load_commit_state_manifests(&read, &all_commit_ids).await?;
+    let tree = crate::tracked_state::TrackedStateTree::new();
+    let overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+    let mut current_hashes = std::collections::BTreeSet::new();
+    let mut retained_hashes = std::collections::BTreeSet::new();
+    let mut current_snapshot_roots = 0_u64;
+    let mut retained_snapshot_roots = 0_u64;
+    let mut stored_root_references = 0_u64;
+    for ((commit_id, retired), manifest) in manifest_ids.into_iter().zip(manifests) {
+        let manifest = manifest.ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("inventoried manifest '{commit_id}' disappeared"),
+            )
+        })?;
+        let Some(root) = manifest.snapshot_root.as_ref() else {
+            continue;
+        };
+        stored_root_references = stored_root_references.saturating_add(1);
+        if retired {
+            continue;
+        }
+        retained_snapshot_roots = retained_snapshot_roots.saturating_add(1);
+        let hashes = tree
+            .reachable_chunk_hashes_with_overlay(&read, &overlay, &root.root_id)
+            .await?;
+        retained_hashes.extend(hashes.iter().copied());
+        if current_commit_ids.contains(&commit_id) {
+            current_snapshot_roots = current_snapshot_roots.saturating_add(1);
+            current_hashes.extend(hashes);
+        }
+    }
+    if !current_hashes.is_subset(&retained_hashes) {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            "current tracked tree chunks are not a subset of retained history",
+        ));
+    }
+
+    let chunk_entries =
+        scan_layout_entries(&read, crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE).await;
+    let mut stored = std::collections::BTreeMap::<[u8; 32], (u64, u64)>::new();
+    for entry in chunk_entries {
+        let hash: [u8; 32] = entry.key.0.as_ref().try_into().map_err(|_| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tracked-state tree chunk key has invalid digest width",
+            )
+        })?;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tracked-state tree chunk inventory returned key-only data",
+            ));
+        };
+        if blake3::hash(&value).as_bytes() != &hash {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tracked-state tree chunk content digest mismatch",
+            ));
+        }
+        let bytes = 4_u64
+            .saturating_add(entry.key.0.len() as u64)
+            .saturating_add(value.len() as u64);
+        let child_references =
+            crate::tracked_state::decoded_tree_chunk_child_references_for_bench(&value)?;
+        if stored.insert(hash, (bytes, child_references)).is_some() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tracked-state tree chunk digest appears more than once",
+            ));
+        }
+    }
+    for hash in &retained_hashes {
+        if !stored.contains_key(hash) {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "retained tracked tree references a missing chunk",
+            ));
+        }
+    }
+    let sum = |hashes: &std::collections::BTreeSet<[u8; 32]>| {
+        hashes
+            .iter()
+            .filter_map(|hash| stored.get(hash))
+            .map(|(bytes, _)| *bytes)
+            .sum::<u64>()
+    };
+    let references = |hashes: &std::collections::BTreeSet<[u8; 32]>| {
+        hashes
+            .iter()
+            .filter_map(|hash| stored.get(hash))
+            .map(|(_, child_references)| *child_references)
+            .sum::<u64>()
+    };
+    let stored_logical_bytes = stored.values().map(|(bytes, _)| *bytes).sum::<u64>();
+    let stored_child_references = stored
+        .values()
+        .map(|(_, child_references)| *child_references)
+        .sum::<u64>();
+    let stored_reference_count = stored_root_references.saturating_add(stored_child_references);
+    let retained_history_reachable_logical_bytes = sum(&retained_hashes);
+    let current_head_reachable_logical_bytes = sum(&current_hashes);
+    Ok(TrackedTreeChunkReachabilityBenchAccounting {
+        stored_unique_chunks: stored.len() as u64,
+        stored_logical_bytes,
+        current_head_reachable_chunks: current_hashes.len() as u64,
+        current_head_reachable_logical_bytes,
+        retained_history_reachable_chunks: retained_hashes.len() as u64,
+        retained_history_reachable_logical_bytes,
+        unreachable_rebuildable_chunks: stored.len().saturating_sub(retained_hashes.len()) as u64,
+        unreachable_rebuildable_logical_bytes: stored_logical_bytes
+            .saturating_sub(retained_history_reachable_logical_bytes),
+        current_snapshot_roots,
+        retained_snapshot_roots,
+        stored_reference_count,
+        stored_reference_bytes: stored_reference_count.saturating_mul(32),
+        duplicated_reference_bytes: stored_reference_count
+            .saturating_sub(stored.len() as u64)
+            .saturating_mul(32),
+        current_reference_count: current_snapshot_roots.saturating_add(references(&current_hashes)),
+        retained_reference_count: retained_snapshot_roots
+            .saturating_add(references(&retained_hashes)),
+    })
 }
 
 pub async fn content_authority_accounting_for_bench<R>(
@@ -2285,7 +2632,8 @@ where
 mod tests {
     use super::{
         CheckpointCommitScanBenchMode, binary_manifest_layout_accounting,
-        plan_repository_gc_for_bench, scan_checkpoint_commits_for_bench,
+        plan_repository_gc_for_bench, plan_repository_gc_full_queue_for_bench,
+        scan_checkpoint_commits_for_bench,
     };
     use crate::changelog::bench::{append_ordered_commits, stage_append_once};
     use crate::engine::Engine;
@@ -2499,6 +2847,9 @@ mod tests {
         let second = plan_repository_gc_for_bench(&adapter)
             .await
             .expect("repeat repository gc plan");
+        let full = plan_repository_gc_full_queue_for_bench(&adapter)
+            .await
+            .expect("plan full repository gc candidate union");
         let after_second_layout = super::layout_accounting(
             &adapter
                 .begin_read(crate::storage::ReadOptions::default())
@@ -2560,6 +2911,15 @@ mod tests {
             first.delete_entries_by_space
         );
         assert_eq!(second.staged_deletes, first.staged_deletes);
+        assert_eq!(full.delete_entries_by_space, first.delete_entries_by_space);
+        assert_eq!(
+            first.planned_present_delete_rows + first.planned_absent_idempotent_delete_rows,
+            first.staged_deletes
+        );
+        assert_eq!(
+            full.planned_present_delete_rows + full.planned_absent_idempotent_delete_rows,
+            full.staged_deletes
+        );
         assert_eq!(before_layout, after_first_layout);
         assert_eq!(after_first_layout, after_second_layout);
     }

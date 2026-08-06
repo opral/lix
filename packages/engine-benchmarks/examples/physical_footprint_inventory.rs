@@ -21,7 +21,8 @@ use lix::storage_adapter::{
 use lix::storage_bench::{
     CommitGraphBenchMode, content_authority_accounting_for_bench,
     current_image_cas_oracle_accounting, layout_space_catalog, plan_repository_gc_for_bench,
-    read_commit_graph_for_bench, semantic_payload_accounting_for_bench,
+    plan_repository_gc_full_queue_for_bench, read_commit_graph_for_bench,
+    semantic_payload_accounting_for_bench, tracked_tree_chunk_reachability_for_bench,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -253,7 +254,7 @@ where
         content_unique_bytes = content_unique_bytes.saturating_add(entry.unique_content_bytes);
         writeln!(
             output,
-            "CONTENT_AUTHORITY\tauthority={}\tdigest_codec={}\treference_count={}\treference_bytes={}\tunique_content_digest_rows={}\treference_fanout={}/{}\tunique_content_bytes={}\tduplicated_reference_bytes={}",
+            "CONTENT_AUTHORITY\tauthority={}\tdigest_codec={}\tstorage_reference_rows={}\tstorage_reference_key_bytes={}\tunique_content_digest_rows={}\tstorage_key_fanout={}/{}\tunique_content_bytes={}\tduplicated_storage_reference_bytes={}",
             entry.authority,
             entry.digest_codec,
             entry.reference_count,
@@ -297,9 +298,10 @@ where
 
     // The production GC planner is read-only here: it drops its write set
     // rather than committing it.  Its live set is the authenticated union of
-    // branch/recovery roots and retained semantic history.  The branch-control
-    // row count is the exact number of current-head roots; the planner's live
-    // commit count is the exact retained-history union count.
+    // branch/recovery roots and their serving dependencies. The branch-control
+    // row count is the exact number of current-head roots. Queued retirement
+    // work is deliberately not mislabeled as retained history: only a full GC
+    // sweep on a disposable copy can establish that pre/post classification.
     let branch_rows = rows
         .iter()
         .find(|(space, _)| space.name.starts_with("branch.head_control"))
@@ -313,6 +315,7 @@ where
         return Err("branch control scan disagrees with space row count".into());
     }
     let mut current_head_transitive_commits = 0_u64;
+    let mut current_head_commit_ids = Vec::with_capacity(branch_values.len());
     for value in branch_values {
         let bytes: [u8; 16] = value
             .get(..16)
@@ -320,6 +323,7 @@ where
             .try_into()
             .map_err(|_| "branch control head commit id has invalid width")?;
         let commit_id = Uuid::from_bytes(bytes).to_string();
+        current_head_commit_ids.push(commit_id.clone());
         let graph =
             read_commit_graph_for_bench(&storage, &commit_id, CommitGraphBenchMode::ReachableNodes)
                 .await?;
@@ -332,7 +336,7 @@ where
     let reachability_ms = reachability_started.elapsed().as_millis();
     writeln!(
         output,
-        "REACHABILITY\tcurrent_head_root_rows={}\tcurrent_head_transitive_commits={}\tretained_history_union_commits={}\tswept_commits={}\tswept_payloads={}\tgc_planner_writes_staged={}\tgc_planner_is_read_only=true",
+        "REACHABILITY\tcurrent_head_root_rows={}\tcurrent_head_transitive_commits={}\tactive_authority_commits={}\tswept_commits_in_current_incremental_plan={}\tswept_payloads_in_current_incremental_plan={}\tgc_planner_writes_staged={}\tgc_planner_is_read_only=true\tfull_queue_candidate_union_reported_separately=true",
         branch_rows,
         current_head_transitive_commits,
         gc.live_commits,
@@ -407,11 +411,13 @@ where
     }
     if planned_deleted_rows != gc.staged_deletes
         || planned_present_rows.saturating_add(planned_noop_rows) != planned_deleted_rows
+        || planned_present_rows != gc.planned_present_delete_rows
+        || planned_noop_rows != gc.planned_absent_idempotent_delete_rows
     {
         return Err("GC planned/present/no-op delete identity does not reconcile".into());
     }
     let mut planned_delete_totals = DeleteAccounting::default();
-    let mut retained_history_only = category_totals
+    let mut retained_history_not_in_current_plan = category_totals
         .get(&Category::RetainedHistoryAuthority)
         .copied()
         .unwrap_or_default();
@@ -431,14 +437,21 @@ where
             mapped.logical_bytes(),
         )?;
         if classify(space.name) == Category::RetainedHistoryAuthority {
-            retained_history_only.rows = retained_history_only.rows.saturating_sub(mapped.rows);
-            retained_history_only.key_bytes = retained_history_only
+            retained_history_not_in_current_plan.rows = retained_history_not_in_current_plan
+                .rows
+                .saturating_sub(mapped.rows);
+            retained_history_not_in_current_plan.key_bytes = retained_history_not_in_current_plan
                 .key_bytes
                 .saturating_sub(mapped.key_bytes);
-            retained_history_only.value_bytes = retained_history_only
+            retained_history_not_in_current_plan.value_bytes = retained_history_not_in_current_plan
                 .value_bytes
                 .saturating_sub(mapped.value_bytes);
         }
+    }
+    if planned_delete_totals.key_bytes != gc.planned_present_delete_key_bytes
+        || planned_delete_totals.value_bytes != gc.planned_present_delete_value_bytes
+    {
+        return Err("GC exact-get and inventory-scan byte accounting disagree".into());
     }
     for (space_id, absent) in &delete_mapping.absent_idempotent {
         if *absent == 0 {
@@ -456,18 +469,157 @@ where
     }
     writeln!(
         output,
-        "RETENTION_SUMMARY\tplanned_delete_intents={}\tplanned_present_unreachable_or_superseded_rows={}\tplanned_absent_idempotent_noop_rows={}\tplanned_key_bytes={}\tplanned_value_bytes={}\tplanned_logical_bytes={}\tretained_history_only_rows={}\tretained_history_only_key_bytes={}\tretained_history_only_value_bytes={}\tretained_history_only_logical_bytes={}\thistorical_only_content_is_not_labeled_obsolete=true\tpresent_delete_mapping_exact=true\tduplicate_mapping_fail_closed=true",
+        "RETENTION_SUMMARY\tplanned_delete_intents={}\tplanned_present_unreachable_or_superseded_rows={}\tplanned_absent_idempotent_noop_rows={}\tplanned_key_bytes={}\tplanned_value_bytes={}\tplanned_logical_bytes={}\tretained_history_category_not_in_current_plan_rows={}\tretained_history_category_not_in_current_plan_key_bytes={}\tretained_history_category_not_in_current_plan_value_bytes={}\tretained_history_category_not_in_current_plan_logical_bytes={}\thistorical_only_content_is_not_labeled_obsolete=true\tqueued_unreachable_is_not_labeled_retained=true\tpresent_delete_mapping_exact=true\tduplicate_mapping_fail_closed=true",
         planned_deleted_rows,
         planned_present_rows,
         planned_noop_rows,
         planned_delete_totals.key_bytes,
         planned_delete_totals.value_bytes,
         planned_delete_totals.logical_bytes(),
-        retained_history_only.rows,
-        retained_history_only.key_bytes,
-        retained_history_only.value_bytes,
-        retained_history_only.logical_bytes(),
+        retained_history_not_in_current_plan.rows,
+        retained_history_not_in_current_plan.key_bytes,
+        retained_history_not_in_current_plan.value_bytes,
+        retained_history_not_in_current_plan.logical_bytes(),
     )?;
+
+    let full_gc_started = Instant::now();
+    let full_gc = plan_repository_gc_full_queue_for_bench(&storage).await?;
+    let full_delete_mapping = map_gc_delete_entries(&read, &full_gc, &rows).await?;
+    let full_mapped_by_space = full_delete_mapping
+        .present
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    let full_absent_by_space = full_delete_mapping
+        .absent_idempotent
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    let mut full_delete_intents = 0_u64;
+    let mut full_present_rows = 0_u64;
+    let mut full_absent_rows = 0_u64;
+    let mut full_present_bytes = DeleteAccounting::default();
+    let mut retained_history_after_full_candidate_union = category_totals
+        .get(&Category::RetainedHistoryAuthority)
+        .copied()
+        .unwrap_or_default();
+    for (space_id, count) in &full_gc.delete_counts_by_space {
+        let (space, inventory) = rows
+            .iter()
+            .find(|(_, accounting)| accounting.id == *space_id)
+            .ok_or_else(|| format!("full GC planned deletion in unknown space id {space_id:#x}"))?;
+        let mapped = full_mapped_by_space
+            .get(space_id)
+            .copied()
+            .unwrap_or_default();
+        let absent = full_absent_by_space
+            .get(space_id)
+            .copied()
+            .unwrap_or_default();
+        if mapped.rows > inventory.rows || mapped.rows.saturating_add(absent) != *count as u64 {
+            return Err(format!(
+                "full GC delete mapping does not reconcile for {}",
+                space.name
+            )
+            .into());
+        }
+        full_delete_intents = full_delete_intents.saturating_add(*count as u64);
+        full_present_rows = full_present_rows.saturating_add(mapped.rows);
+        full_absent_rows = full_absent_rows.saturating_add(absent);
+        full_present_bytes.add(mapped);
+        if classify(space.name) == Category::RetainedHistoryAuthority {
+            retained_history_after_full_candidate_union.rows =
+                retained_history_after_full_candidate_union
+                    .rows
+                    .saturating_sub(mapped.rows);
+            retained_history_after_full_candidate_union.key_bytes =
+                retained_history_after_full_candidate_union
+                    .key_bytes
+                    .saturating_sub(mapped.key_bytes);
+            retained_history_after_full_candidate_union.value_bytes =
+                retained_history_after_full_candidate_union
+                    .value_bytes
+                    .saturating_sub(mapped.value_bytes);
+        }
+        writeln!(
+            output,
+            "FULL_GC_CANDIDATE\tspace={}\tall_rows={}\tpresent_individually_proven_rows={}\tabsent_idempotent_noop_rows={}\tkey_bytes={}\tvalue_bytes={}\tlogical_bytes={}",
+            space.name,
+            inventory.rows,
+            mapped.rows,
+            absent,
+            mapped.key_bytes,
+            mapped.value_bytes,
+            mapped.logical_bytes(),
+        )?;
+    }
+    if full_present_rows != full_gc.planned_present_delete_rows
+        || full_absent_rows != full_gc.planned_absent_idempotent_delete_rows
+        || full_present_bytes.key_bytes != full_gc.planned_present_delete_key_bytes
+        || full_present_bytes.value_bytes != full_gc.planned_present_delete_value_bytes
+        || full_present_rows.saturating_add(full_absent_rows) != full_delete_intents
+    {
+        return Err("full GC candidate accounting does not reconcile".into());
+    }
+    writeln!(
+        output,
+        "FULL_RETENTION_SUMMARY\tfull_queue_delete_intents={}\tpresent_individually_proven_unreachable_or_superseded_rows={}\tabsent_idempotent_noop_rows={}\tpresent_key_bytes={}\tpresent_value_bytes={}\tpresent_logical_bytes={}\tperfect_elimination_ceiling_fraction={}\tretained_history_authority_rows={}\tretained_history_authority_key_bytes={}\tretained_history_authority_value_bytes={}\tretained_history_authority_logical_bytes={}\tswept_commit_candidates={}\tfull_queue_plan_us={}\tdelete_presence_accounting_us={}\tread_only=true\tqueue_ordered_commit_not_claimed=true\tblocked_prefix_metadata_remains_retained=true",
+        full_delete_intents,
+        full_present_rows,
+        full_absent_rows,
+        full_present_bytes.key_bytes,
+        full_present_bytes.value_bytes,
+        full_present_bytes.logical_bytes(),
+        ratio(full_present_bytes.logical_bytes(), total.logical_bytes()),
+        retained_history_after_full_candidate_union.rows,
+        retained_history_after_full_candidate_union.key_bytes,
+        retained_history_after_full_candidate_union.value_bytes,
+        retained_history_after_full_candidate_union.logical_bytes(),
+        full_gc.swept_commits,
+        full_gc.total_us,
+        full_gc.delete_presence_accounting_us,
+    )?;
+    let retired_manifest_keys = full_gc
+        .delete_entries_by_space
+        .iter()
+        .find_map(|(space_id, keys)| {
+            (*space_id
+                == layout_space_catalog().into_iter().find_map(|(id, name)| {
+                    (name == "tracked_state.commit_state_manifest.v7").then_some(id)
+                })?)
+            .then_some(keys.as_slice())
+        })
+        .unwrap_or(&[]);
+    let tree_chunks = tracked_tree_chunk_reachability_for_bench(
+        &storage,
+        &current_head_commit_ids,
+        retired_manifest_keys,
+    )
+    .await?;
+    writeln!(
+        output,
+        "TREE_CHUNK_REACHABILITY\tstored_unique_chunks={}\tstored_logical_bytes={}\tstored_reference_count={}\tstored_reference_bytes={}\tduplicated_reference_bytes={}\tcurrent_snapshot_roots={}\tcurrent_head_reachable_chunks={}\tcurrent_head_reachable_logical_bytes={}\tcurrent_reference_count={}\tretained_snapshot_roots={}\tall_retained_history_reachable_chunks={}\tall_retained_history_reachable_logical_bytes={}\tretained_reference_count={}\tgenuinely_unreachable_rebuildable_chunks={}\tgenuinely_unreachable_rebuildable_logical_bytes={}\tunreachable_perfect_elimination_ceiling_fraction={}\tcontent_hashes_validated=true\tcurrent_subset_of_retained=true",
+        tree_chunks.stored_unique_chunks,
+        tree_chunks.stored_logical_bytes,
+        tree_chunks.stored_reference_count,
+        tree_chunks.stored_reference_bytes,
+        tree_chunks.duplicated_reference_bytes,
+        tree_chunks.current_snapshot_roots,
+        tree_chunks.current_head_reachable_chunks,
+        tree_chunks.current_head_reachable_logical_bytes,
+        tree_chunks.current_reference_count,
+        tree_chunks.retained_snapshot_roots,
+        tree_chunks.retained_history_reachable_chunks,
+        tree_chunks.retained_history_reachable_logical_bytes,
+        tree_chunks.retained_reference_count,
+        tree_chunks.unreachable_rebuildable_chunks,
+        tree_chunks.unreachable_rebuildable_logical_bytes,
+        ratio(
+            tree_chunks.unreachable_rebuildable_logical_bytes,
+            total.logical_bytes()
+        ),
+    )?;
+    let full_gc_ms = full_gc_started.elapsed().as_millis();
 
     // This oracle is exact for the binary-CAS current-image subset.  It is
     // intentionally reported separately from the full retained-history set;
@@ -547,8 +699,8 @@ where
     )?;
     writeln!(
         output,
-        "TIMING\tread_inventory_ms={}\treachability_ms={}\tcas_oracle_ms={}\tproduction_cut_claimed=false",
-        inventory_ms, reachability_ms, cas_oracle_ms
+        "TIMING\tread_inventory_ms={}\treachability_ms={}\tfull_queue_gc_oracle_ms={}\tcas_oracle_ms={}\tproduction_cut_claimed=false",
+        inventory_ms, reachability_ms, full_gc_ms, cas_oracle_ms
     )?;
     Ok(())
 }
@@ -815,14 +967,15 @@ fn classify(name: &str) -> Category {
         || name.starts_with("live_state.packed_current")
         || name.starts_with("live_state.root_current")
         || name.starts_with("tracked_state.scoped_range")
+        || name.starts_with("tracked_state.current_state_data_part")
     {
         return Category::CurrentAuthority;
     }
     if name.starts_with("tracked_state.commit_")
-        || name.starts_with("tracked_state.tree_chunk")
         || name.starts_with("tracked_state.change_locator")
         || name.starts_with("changelog.")
         || name.starts_with("binary_cas.manifest")
+        || name.starts_with("entity.columnar_row_group")
     {
         return Category::RetainedHistoryAuthority;
     }
@@ -836,8 +989,7 @@ fn classify(name: &str) -> Category {
         return Category::GraphManifestDirectoryControl;
     }
     if name.starts_with("plugin.")
-        || name.starts_with("entity.columnar")
-        || name.starts_with("tracked_state.current_state_data_part")
+        || name.starts_with("tracked_state.tree_chunk")
         || name.starts_with("live_state.hot_file")
         || name.starts_with("live_state.hot_diff")
         || name.starts_with("live_state.certified_entity_batch")

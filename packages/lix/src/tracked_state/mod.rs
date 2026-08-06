@@ -57,6 +57,8 @@ pub(crate) use row_materialization::{
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
+#[cfg(feature = "storage-benches")]
+pub(crate) use storage::TrackedStateChunkOverlay;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
 pub(crate) use storage::{
@@ -104,6 +106,8 @@ pub(crate) use storage::{
     stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
     validate_current_state_scoped_range_serving_base_manifest,
 };
+#[cfg(feature = "storage-benches")]
+pub(crate) use tree::{TrackedStateTree, decoded_tree_chunk_child_references_for_bench};
 #[cfg(test)]
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
