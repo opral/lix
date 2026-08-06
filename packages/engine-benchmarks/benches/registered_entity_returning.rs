@@ -6,12 +6,12 @@
 //! are rotated on every round to avoid a fixed run-order advantage.
 //!
 //! ```text
-//! LIX_RETURNING_PROFILE=1 cargo bench -p lix_engine_benchmarks \
+//! LIX_RETURNING_PROFILE=1 cargo bench -p lix_benchmarks \
 //!   --no-default-features --bench registered_entity_returning
 //!
 //! LIX_RETURNING_PROFILE=1 LIX_RETURNING_PROFILE_ROWS=10000 \
 //! LIX_RETURNING_PROFILE_ROUNDS=15 LIX_RETURNING_PROFILE_OPERATIONS=insert \
-//!   cargo bench -p lix_engine_benchmarks --no-default-features \
+//!   cargo bench -p lix_benchmarks --no-default-features \
 //!   --bench registered_entity_returning
 //! ```
 //!
@@ -32,8 +32,9 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix_engine::storage::Memory;
-use lix_engine::{Engine, ExecuteResult, SessionContext};
+use lix::ExecuteResult;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Memory;
 
 const DEFAULT_ROWS: usize = 1_000;
 const DEFAULT_ROUNDS: usize = 11;
@@ -259,7 +260,7 @@ fn main() {
 fn print_usage() {
     println!(
         "registered_entity_returning is opt-in; run \
-         LIX_RETURNING_PROFILE=1 cargo bench -p lix_engine_benchmarks \
+         LIX_RETURNING_PROFILE=1 cargo bench -p lix_benchmarks \
          --no-default-features --bench registered_entity_returning"
     );
 }

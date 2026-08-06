@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use lix_engine::storage_adapter::{
+use lix::storage::{Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, Storage};
+use lix::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions, StorageWriteSetStats,
 };
-use lix_engine::{Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, Storage};
 
 use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};

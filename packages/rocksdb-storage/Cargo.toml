@@ -1,6 +1,6 @@
 [package]
-name = "lix_rocksdb_storage"
-version.workspace = true
+name = "lix-storage-rocksdb"
+version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -22,7 +22,7 @@ name = "storage"
 path = "tests/storage/main.rs"
 
 [dependencies]
-lix_engine = { workspace = true }
+lix = { workspace = true }
 
 bytes = "1"
 blake3 = "1"

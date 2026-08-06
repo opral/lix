@@ -6,13 +6,15 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
-use lix_engine::storage::{
+use lix::storage::conformance::{
+    StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
+};
+use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
     ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, StoredValue, WriteOptions,
 };
-use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance};
-use lix_slatedb_storage::{
+use lix_storage_slatedb::{
     SlateDB, SlateDBCacheOptions, SlateDBFactory, SlateDBObjectStoreOptions,
 };
 use object_store::memory::InMemory;

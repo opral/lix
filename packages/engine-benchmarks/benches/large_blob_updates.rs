@@ -6,14 +6,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lix_engine::storage_adapter::{StorageAdapter, StorageSpace};
-use lix_engine::storage_bench::{binary_cas_write_accounting, reset_binary_cas_write_accounting};
-use lix_engine::{
-    CoreProjection, Engine, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions,
-    ScanOptions, SessionContext, SpaceId, Storage, StorageRead, StoredValue, Value, WriteOptions,
+use lix::Value;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::{
+    CoreProjection, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions, ScanOptions,
+    SpaceId, Storage, StorageRead, StoredValue, WriteOptions,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix::storage_adapter::{StorageAdapter, StorageSpace};
+use lix::storage_bench::{binary_cas_write_accounting, reset_binary_cas_write_accounting};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
 
 const SIZES: &[usize] = &[1 << 20, 4 << 20, 10 << 20];
@@ -376,7 +378,7 @@ where
             let payload_space = StorageSpace::mutable(SpaceId(0x0005_0003), "bench.raw_payload");
             let mut offset = 0usize;
             while offset < self.workload.size {
-                let len = (self.workload.size - offset).min(lix_engine::FILE_UPLOAD_PART_BYTES);
+                let len = (self.workload.size - offset).min(lix::FILE_UPLOAD_PART_BYTES);
                 let data = Bytes::from(deterministic_bytes(len, prepared.version ^ offset as u64));
                 let mut writes = adapter.new_write_set();
                 for (part_index, chunk) in data.chunks(1024 * 1024).enumerate() {
@@ -408,7 +410,7 @@ where
             let upload_id = format!("large-blob-bench-{}", prepared.version);
             let mut offset = 0usize;
             while offset < self.workload.size {
-                let len = (self.workload.size - offset).min(lix_engine::FILE_UPLOAD_PART_BYTES);
+                let len = (self.workload.size - offset).min(lix::FILE_UPLOAD_PART_BYTES);
                 let data = deterministic_bytes(len, prepared.version ^ offset as u64);
                 let progress = self
                     .session

@@ -1,8 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use lix_sdk::{
-    CreateBranchOptions, MergeBranchOptions, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
-};
+use lix::storage::Storage;
+use lix::{CreateBranchOptions, MergeBranchOptions, SwitchBranchOptions, Value, open_lix};
 use std::io::{Cursor, Write};
 use std::path::Path;
 
@@ -18,9 +17,7 @@ struct GitTextLine {
 
 #[tokio::test]
 async fn git_text_same_line_branch_conflict_uses_static_canonical_resolver() {
-    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
-        .await
-        .expect("workspace should open");
+    let lix = open_lix().await.expect("workspace should open");
     install_plugin(&lix, &build_plugin_archive())
         .await
         .expect("Git text plugin should install");
@@ -79,8 +76,9 @@ async fn git_text_same_line_branch_conflict_uses_static_canonical_resolver() {
 
 #[tokio::test]
 async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
-    let storage = lix_sdk::Memory::new();
-    let lix = open_lix(OpenLixOptions::new(storage.clone()))
+    let storage = lix::Memory::new();
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("workspace should open");
     install_plugin(&lix, &build_plugin_archive())
@@ -146,7 +144,8 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     let history_head = active_branch_head(&lix).await;
 
     lix.close().await.expect("workspace should close");
-    let reopened = open_lix(OpenLixOptions::new(storage.clone()))
+    let reopened = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("workspace should reopen");
     assert_history_file(&reopened, &history_head, &text_file_id, &git_text).await;
@@ -211,7 +210,8 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
         .close()
         .await
         .expect("reopened workspace should close");
-    let raw_reopened = open_lix(OpenLixOptions::new(storage))
+    let raw_reopened = open_lix()
+        .with_storage(storage)
         .await
         .expect("workspace should reopen with the raw successor");
     assert_history_file(
@@ -236,9 +236,7 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
 async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row() {
     const MIB: usize = 1024 * 1024;
 
-    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
-        .await
-        .expect("workspace should open");
+    let lix = open_lix().await.expect("workspace should open");
     install_plugin(&lix, &build_plugin_archive())
         .await
         .expect("Git text plugin should install");
@@ -291,11 +289,11 @@ async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row
 }
 
 async fn install_plugin<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
+    lix: &lix::Lix<StorageImpl>,
     archive: &[u8],
-) -> Result<(), lix_sdk::LixError>
+) -> Result<(), lix::LixError>
 where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     write_file(
         lix,
@@ -306,12 +304,12 @@ where
 }
 
 async fn write_file<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
+    lix: &lix::Lix<StorageImpl>,
     path: &str,
     data: &[u8],
-) -> Result<(), lix_sdk::LixError>
+) -> Result<(), lix::LixError>
 where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
@@ -325,9 +323,9 @@ where
     Ok(())
 }
 
-async fn read_file<StorageImpl>(lix: &lix_sdk::Lix<StorageImpl>, path: &str) -> Option<Vec<u8>>
+async fn read_file<StorageImpl>(lix: &lix::Lix<StorageImpl>, path: &str) -> Option<Vec<u8>>
 where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
@@ -342,9 +340,9 @@ where
     })
 }
 
-async fn file_id_at_path<StorageImpl>(lix: &lix_sdk::Lix<StorageImpl>, path: &str) -> String
+async fn file_id_at_path<StorageImpl>(lix: &lix::Lix<StorageImpl>, path: &str) -> String
 where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
@@ -359,9 +357,9 @@ where
         .expect("file id should be text")
 }
 
-async fn active_branch_head<StorageImpl>(lix: &lix_sdk::Lix<StorageImpl>) -> String
+async fn active_branch_head<StorageImpl>(lix: &lix::Lix<StorageImpl>) -> String
 where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
         .await
@@ -372,12 +370,12 @@ where
 }
 
 async fn assert_history_file<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
+    lix: &lix::Lix<StorageImpl>,
     as_of_commit_id: &str,
     file_id: &str,
     expected: &[u8],
 ) where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
@@ -403,12 +401,9 @@ async fn assert_history_file<StorageImpl>(
     );
 }
 
-async fn git_text_rows<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
-    file_id: &str,
-) -> Vec<GitTextLine>
+async fn git_text_rows<StorageImpl>(lix: &lix::Lix<StorageImpl>, file_id: &str) -> Vec<GitTextLine>
 where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
         .execute(
@@ -455,11 +450,11 @@ fn render_rows(rows: &[GitTextLine]) -> Vec<u8> {
 }
 
 async fn assert_plugin_owned<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
+    lix: &lix::Lix<StorageImpl>,
     file_id: &str,
     expected: bool,
 ) where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let owners = lix
         .execute(
@@ -473,20 +468,18 @@ async fn assert_plugin_owned<StorageImpl>(
 }
 
 async fn assert_semantic_rows<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
+    lix: &lix::Lix<StorageImpl>,
     file_id: &str,
     expected: &[u8],
 ) where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     assert_eq!(render_rows(&git_text_rows(lix, file_id).await), expected);
 }
 
-async fn assert_raw_blob_materialization<StorageImpl>(
-    lix: &lix_sdk::Lix<StorageImpl>,
-    file_id: &str,
-) where
-    StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
+async fn assert_raw_blob_materialization<StorageImpl>(lix: &lix::Lix<StorageImpl>, file_id: &str)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     assert!(
         git_text_rows(lix, file_id).await.is_empty(),

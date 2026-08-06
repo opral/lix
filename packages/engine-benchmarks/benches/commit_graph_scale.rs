@@ -1,8 +1,8 @@
 use std::time::Instant;
 
-use lix_engine::changelog::bench::{append_ordered_linear_commits, stage_append_once};
-use lix_engine::storage_adapter::{Memory, StorageAdapter};
-use lix_engine::storage_bench::{
+use lix::changelog::bench::{append_ordered_linear_commits, stage_append_once};
+use lix::storage_adapter::{Memory, StorageAdapter};
+use lix::storage_bench::{
     CommitGraphBenchMode, read_commit_graph_for_bench, seed_commit_graph_members_for_bench,
 };
 

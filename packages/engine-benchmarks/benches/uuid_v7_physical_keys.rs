@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lix_engine::storage::Storage;
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::transaction::bench::{BenchTransactionFixture, BenchTransactionRow};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix::storage::Storage;
+use lix::storage_adapter::StorageAdapter;
+use lix::transaction::bench::{BenchTransactionFixture, BenchTransactionRow};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use serde_json::json;
 use tempfile::TempDir;
 

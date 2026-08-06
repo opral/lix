@@ -11,14 +11,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::{Buf, Bytes};
-use lix_engine::storage::immutable::validate_immutable_batch;
-use lix_engine::storage::{
+use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
+use lix::storage::immutable::validate_immutable_batch;
+use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
     ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
-use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rocksdb::Snapshot;
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,

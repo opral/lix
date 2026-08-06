@@ -1,6 +1,6 @@
 [package]
-name = "lix_slatedb_storage"
-version.workspace = true
+name = "lix-storage-slatedb"
+version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -17,7 +17,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-lix_engine = { workspace = true }
+lix = { workspace = true }
 
 async-trait = "0.1"
 bytes = "1"

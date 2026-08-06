@@ -17,17 +17,17 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
-use lix_engine::storage::immutable::{
+use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
+use lix::storage::immutable::{
     ImmutableSegment, ImmutableSegmentWriter, ImmutableValueLocator, decode_immutable_locator,
     decode_immutable_value, encode_immutable_locator,
 };
-use lix_engine::storage::{
+use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
     ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
-use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
@@ -4725,7 +4725,7 @@ mod tests {
         StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
-    use lix_engine::storage::{
+    use lix::storage::{
         GetOptions, ProjectedValue, PutEntry, ReadOptions, Storage, StorageRead, StorageWrite,
         StoredValue, WriteOptions,
     };

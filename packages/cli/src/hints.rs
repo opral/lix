@@ -1,5 +1,5 @@
 use crate::error::CliError;
-use lix_sdk::{ExecuteResult, Value};
+use lix::{ExecuteResult, Value};
 
 #[derive(Debug)]
 pub struct CommandOutput {
@@ -77,7 +77,7 @@ pub fn render_hints(hints: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lix_sdk::LixError;
+    use lix::LixError;
 
     #[test]
     fn hint_from_error_returns_empty_for_non_lix_variants() {

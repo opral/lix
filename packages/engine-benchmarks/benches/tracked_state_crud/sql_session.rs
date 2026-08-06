@@ -1,10 +1,9 @@
 use std::sync::Arc;
 use std::{fmt::Write as _, ops::Range};
 
-use lix_engine::{
-    Engine, ExecuteBatchStatement, ExecuteResult, PreparedDmlParameterBatch, SessionContext,
-    Storage, Value,
-};
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::{ExecuteBatchStatement, ExecuteResult, PreparedDmlParameterBatch, Value};
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
@@ -681,7 +680,7 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
-        let before = lix_engine::storage_bench::certified_entity_insert_parameter_batch_counters();
+        let before = lix::storage_bench::certified_entity_insert_parameter_batch_counters();
         let affected = self
             .session
             .execute_prepared_dml_batch(
@@ -694,7 +693,7 @@ where
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
-        let after = lix_engine::storage_bench::certified_entity_insert_parameter_batch_counters();
+        let after = lix::storage_bench::certified_entity_insert_parameter_batch_counters();
         assert_eq!(
             after.certifications.saturating_sub(before.certifications),
             1,

@@ -1,6 +1,6 @@
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
-use lix_engine::{ExecuteResult, Value};
+use lix::{ExecuteResult, Value};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Cell {

@@ -1,9 +1,11 @@
 use std::fmt::Write as _;
 
-use lix_engine::{Engine, ExecuteResult, SessionContext, SqlReadProfile, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::{ExecuteResult, SqlReadProfile, Value};
+use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
-use lix_slatedb_storage::SlateDB;
+use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
 
 use crate::data;

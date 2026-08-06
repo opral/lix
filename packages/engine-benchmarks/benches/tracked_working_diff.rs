@@ -9,9 +9,9 @@
 //! working set.
 //!
 //! ```text
-//! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
+//! cargo bench -p lix_benchmarks --features storage-benches --bench tracked_working_diff -- \
 //!   setup rocksdb /tmp/lix-working-diff-repeated repeated 10000 1000 10
-//! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
+//! cargo bench -p lix_benchmarks --features storage-benches --bench tracked_working_diff -- \
 //!   measure rocksdb /tmp/lix-working-diff-repeated 11
 //! ```
 //!
@@ -30,15 +30,17 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::storage_bench::diff_tracked_commits_for_bench;
-use lix_engine::tracked_state::bench::seed_packed_history;
-use lix_engine::{
-    CreateBranchOptions, Engine, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, Storage, Value,
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::storage_adapter::StorageAdapter;
+use lix::storage_bench::diff_tracked_commits_for_bench;
+use lix::tracked_state::bench::seed_packed_history;
+use lix::{
+    CreateBranchOptions, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, Value,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 const DEFAULT_ROW_COUNT: usize = 10_000;
 const DEFAULT_COMMIT_COUNT: usize = 1_000;
@@ -812,7 +814,7 @@ where
     (changes, settle_ms)
 }
 
-async fn register_schema<StorageImpl>(session: &lix_engine::SessionContext<StorageImpl>)
+async fn register_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -839,7 +841,7 @@ where
     assert_eq!(affected, 1);
 }
 
-async fn seed_rows<StorageImpl>(session: &lix_engine::SessionContext<StorageImpl>, row_count: usize)
+async fn seed_rows<StorageImpl>(session: &SessionContext<StorageImpl>, row_count: usize)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -876,7 +878,7 @@ where
 }
 
 async fn update_commit<StorageImpl>(
-    session: &lix_engine::SessionContext<StorageImpl>,
+    session: &SessionContext<StorageImpl>,
     shape: Shape,
     row_count: usize,
     commit_index: usize,
@@ -910,7 +912,7 @@ async fn update_commit<StorageImpl>(
 }
 
 async fn update_commit_range<StorageImpl>(
-    session: &lix_engine::SessionContext<StorageImpl>,
+    session: &SessionContext<StorageImpl>,
     row_offset: usize,
     commit_index: usize,
     changes_per_commit: usize,
@@ -941,9 +943,7 @@ async fn update_commit_range<StorageImpl>(
 }
 
 #[inline(never)]
-async fn profile_working_diff_query<StorageImpl>(
-    session: &lix_engine::SessionContext<StorageImpl>,
-) -> usize
+async fn profile_working_diff_query<StorageImpl>(session: &SessionContext<StorageImpl>) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -954,7 +954,7 @@ where
         .len()
 }
 
-async fn working_diff_count<StorageImpl>(session: &lix_engine::SessionContext<StorageImpl>) -> usize
+async fn working_diff_count<StorageImpl>(session: &SessionContext<StorageImpl>) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {

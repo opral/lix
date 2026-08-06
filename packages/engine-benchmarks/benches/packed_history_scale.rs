@@ -2,15 +2,15 @@ use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lix_engine::storage::Storage;
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::tracked_state::bench::{
+use lix::storage::Storage;
+use lix::storage_adapter::StorageAdapter;
+use lix::tracked_state::bench::{
     BenchLayoutAccounting, BenchPackedHistoryOptions, BenchPackedHistoryPayload,
     BenchPackedHistoryShape, load_packed_change, packed_history_layout, scan_packed_history,
     seed_packed_history_with_options,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const DEFAULT_CHANGES: &[usize] = &[100_000];
 const DEFAULT_COMMIT_WIDTHS: &[usize] = &[1, 10, 100, 10_000];

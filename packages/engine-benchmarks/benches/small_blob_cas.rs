@@ -3,18 +3,18 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use lix_engine::storage::{
+use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, Precondition, ProjectedValue, PutBatch,
     PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageSpace, StorageWrite,
     StoredValue, WriteOptions,
 };
-use lix_engine::storage_adapter::{StorageAdapter, StorageAdapterRead};
-use lix_engine::storage_bench::{
+use lix::storage_adapter::{StorageAdapter, StorageAdapterRead};
+use lix::storage_bench::{
     binary_cas_write_accounting, layout_accounting, read_binary_cas_for_bench,
     reset_binary_cas_write_accounting, write_binary_cas_for_bench,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
 
 const BACKENDS: &[Backend] = &[Backend::Rocks, Backend::Slate];
@@ -669,14 +669,14 @@ struct Layout {
     presence_rows: u64,
 }
 
-fn rows(spaces: &[lix_engine::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
+fn rows(spaces: &[lix::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
     spaces
         .iter()
         .find(|space| space.space == name)
         .map_or(0, |space| space.rows)
 }
 
-fn value_bytes(spaces: &[lix_engine::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
+fn value_bytes(spaces: &[lix::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
     spaces
         .iter()
         .find(|space| space.space == name)

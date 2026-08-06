@@ -9,10 +9,12 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use futures_util::stream::{self, BoxStream};
-use lix_engine::storage_bench::{MediaStructuralAccounting, take_media_structural_accounting};
-use lix_engine::{Engine, FILE_UPLOAD_PART_BYTES, SessionContext, Storage};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{
+use lix::FILE_UPLOAD_PART_BYTES;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::storage_bench::{MediaStructuralAccounting, take_media_structural_accounting};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{
     SlateDB, SlateDBCacheOptions, SlateDBIoCounters, SlateDBIoSnapshot, SlateDBObjectStoreOptions,
 };
 use object_store::local::LocalFileSystem;

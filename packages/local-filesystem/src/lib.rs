@@ -1,10 +1,14 @@
-//! Compatibility exports for filesystem persistence.
+//! Filesystem-backed Lix storage and synchronization.
 //!
-//! `lix_sdk::LocalFilesystem` uses the shared RocksDB storage adapter so all
-//! RocksDB behavior and optimizations have one implementation.
+//! This adapter uses the RocksDB storage adapter for Lix metadata while keeping
+//! a working directory synchronized with the workspace session.
 
-#[cfg(feature = "rocksdb")]
-pub use lix_rocksdb_storage::{
+mod filesystem;
+
+pub use filesystem::{
+    LocalFilesystem, LocalFilesystemOpenOptions, LocalFilesystemRead, LocalFilesystemWrite,
+};
+pub use lix_storage_rocksdb::{
     RocksDB as RocksDBFilesystem, RocksDBRead as RocksDBFilesystemRead,
     RocksDBWrite as RocksDBFilesystemWrite,
 };

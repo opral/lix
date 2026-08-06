@@ -85,7 +85,7 @@ Always `await lix.close()` in scripts and tests. Long-lived servers can hold one
 
 The engine runs on any ordered transactional key-value store. A storage implementation only provides ordered byte-key persistence, coherent read views, and atomic writes. It does not parse Lix SQL and does not interpret engine concepts such as branches or changes.
 
-Implement three asynchronous traits from `lix_engine`: `Storage`, `StorageRead`, and `StorageWrite`. An implementation must guarantee:
+Implement three asynchronous traits from `lix::storage`: `Storage`, `StorageRead`, and `StorageWrite`. An implementation must guarantee:
 
 1. **Space isolation.** Keys in different spaces never collide.
 2. **Coherent read views.** A read handle observes one coherent view for its lifetime.
@@ -96,7 +96,7 @@ Implement three asynchronous traits from `lix_engine`: `Storage`, `StorageRead`,
 Validate an implementation with the public conformance suite:
 
 ```rust
-use lix_engine::run_storage_conformance;
+use lix::storage::conformance::run_storage_conformance;
 
 let report = run_storage_conformance(&factory).await;
 report.assert_no_failures();

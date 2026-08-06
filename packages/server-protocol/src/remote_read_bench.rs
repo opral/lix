@@ -28,8 +28,8 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use lix_sdk::{Blob, ExecuteBatchStatement, Lix, ObserveEvents, OpenLixOptions, Value, open_lix};
-use lix_slatedb_storage::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
+use lix::{Blob, ExecuteBatchStatement, Lix, ObserveEvents, Value, open_lix};
+use lix_storage_slatedb::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
@@ -413,7 +413,8 @@ impl Seed {
     async fn create() -> Self {
         let store = Arc::new(AccountedObjectStore::new(Arc::new(InMemory::new())));
         let storage = open_storage(&store, WORKSPACE_PATH, None);
-        let lix = open_lix(OpenLixOptions::new(storage.clone()))
+        let lix = open_lix()
+            .with_storage(storage.clone())
             .await
             .expect("open benchmark seed");
         let mut files = (0..FILE_COUNT)
@@ -525,7 +526,8 @@ impl OpenFixture {
     async fn open(store: &Arc<AccountedObjectStore>, database_path: &str, cache: TempDir) -> Self {
         let storage = open_storage(store, database_path, Some(&cache));
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open benchmark Lix"),
         );
