@@ -242,7 +242,7 @@ async fn create_logical_plan_in_session_from_parsed(
     }))
 }
 
-fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
+pub(crate) fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
     plan.transform_up(|node| {
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
@@ -255,7 +255,7 @@ fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
     .map_err(datafusion_error_to_lix_error)
 }
 
-async fn rebind_cached_read_plan(
+pub(crate) async fn rebind_cached_read_plan(
     session: &SessionContext,
     plan: LogicalPlan,
 ) -> Result<LogicalPlan, LixError> {
@@ -1086,6 +1086,15 @@ async fn execute_logical_plan(
     debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
+    let mut logical_plan_is_optimized = false;
+    let plan = if let Some((cache, key)) = &physical_planning_cache
+        && let Some(optimized) = cache.optimized_read_plan(key)
+    {
+        logical_plan_is_optimized = true;
+        rebind_cached_read_plan(&session, optimized.as_ref().clone()).await?
+    } else {
+        plan
+    };
     let mut dataframe = session
         .execute_logical_plan(plan)
         .await
@@ -1104,9 +1113,13 @@ async fn execute_logical_plan(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
+    let batches = crate::sql2::runtime::collect_dataframe(
+        dataframe,
+        physical_planning_cache,
+        logical_plan_is_optimized,
+    )
+    .await
+    .map_err(datafusion_error_to_lix_error)?;
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
     let mut result = query_result_from_batches(&result_fields, &batches)?;

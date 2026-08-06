@@ -96,6 +96,7 @@ pub(crate) struct SqlPlanningCache<CatalogKey> {
     public_catalogs: Mutex<LruCache<CatalogKey, Arc<PublicCatalog>>>,
     write_plans: Mutex<LruCache<WritePlanCacheKey<CatalogKey>, Arc<LogicalWritePlan>>>,
     read_plans: Mutex<LruCache<ReadPlanCacheKey<CatalogKey>, Arc<CachedReadPlan>>>,
+    optimized_read_plans: Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<LogicalPlan>>>,
     physical_read_plans:
         Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<dyn ExecutionPlan>>>,
 }
@@ -221,6 +222,27 @@ where
         lock_or_recover(&self.physical_read_plans).get(key).cloned()
     }
 
+    pub(crate) fn optimized_read_plan(
+        &self,
+        key: &PhysicalReadPlanCacheKey<CatalogKey>,
+    ) -> Option<Arc<LogicalPlan>> {
+        lock_or_recover(&self.optimized_read_plans)
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn remember_optimized_read_plan(
+        &self,
+        key: PhysicalReadPlanCacheKey<CatalogKey>,
+        plan: LogicalPlan,
+    ) {
+        lock_or_recover(&self.optimized_read_plans).put(key, Arc::new(plan));
+    }
+
+    pub(crate) fn forget_optimized_read_plan(&self, key: &PhysicalReadPlanCacheKey<CatalogKey>) {
+        lock_or_recover(&self.optimized_read_plans).pop(key);
+    }
+
     pub(crate) fn remember_physical_read_plan(
         &self,
         key: PhysicalReadPlanCacheKey<CatalogKey>,
@@ -231,6 +253,7 @@ where
 
     pub(crate) fn forget_physical_read_plan(&self, key: &PhysicalReadPlanCacheKey<CatalogKey>) {
         lock_or_recover(&self.physical_read_plans).pop(key);
+        self.forget_optimized_read_plan(key);
     }
 
     #[cfg(test)]
@@ -455,6 +478,7 @@ where
             public_catalogs: Mutex::new(LruCache::new(non_zero(public_catalog_capacity))),
             write_plans: Mutex::new(LruCache::new(non_zero(write_plan_capacity))),
             read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
+            optimized_read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
             physical_read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
         }
     }

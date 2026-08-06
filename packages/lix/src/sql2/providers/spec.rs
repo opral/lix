@@ -1588,7 +1588,7 @@ mod scan_source_tests {
             )
             .await
             .expect("CTE should plan");
-        let batches = crate::sql2::runtime::collect_dataframe(dataframe, None)
+        let batches = crate::sql2::runtime::collect_dataframe(dataframe, None, false)
             .await
             .expect("CTE should execute");
         let values = batches

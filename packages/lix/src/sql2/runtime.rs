@@ -24,12 +24,14 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion::prelude::SessionContext;
 use futures_util::{StreamExt, TryStreamExt, stream};
 #[cfg(feature = "storage-benches")]
 use std::time::Instant;
 use tokio::sync::OnceCell;
 
 use crate::catalog::CatalogFingerprint;
+use crate::sql2::exec::datafusion::{detach_cached_read_plan, rebind_cached_read_plan};
 use crate::sql2::{PhysicalReadPlanCacheKey, SqlPlanningCache};
 
 use super::providers::{PhysicalScanKey, SpecScanExec, StatementScanKey};
@@ -42,11 +44,17 @@ type PhysicalPlanningCache = (
 pub(crate) async fn collect_dataframe(
     dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
+    logical_plan_is_optimized: bool,
 ) -> Result<Vec<RecordBatch>> {
     let task_ctx = Arc::new(dataframe.task_ctx());
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(
+        dataframe,
+        physical_planning_cache,
+        logical_plan_is_optimized,
+    )
+    .await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -71,20 +79,51 @@ pub(crate) async fn collect_dataframe(
 async fn create_or_rebind_physical_plan(
     dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
+    logical_plan_is_optimized: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some((cache, key)) = physical_planning_cache else {
+        if logical_plan_is_optimized {
+            let (state, logical_plan) = dataframe.into_parts();
+            return state
+                .query_planner()
+                .create_physical_plan(&logical_plan, &state)
+                .await;
+        }
         return dataframe.create_physical_plan().await;
     };
     let Some(template) = cache.physical_read_plan(&key) else {
-        let plan = dataframe.create_physical_plan().await?;
+        let (state, logical_plan) = dataframe.into_parts();
+        let optimized = if logical_plan_is_optimized {
+            logical_plan
+        } else {
+            state.optimize(&logical_plan)?
+        };
+        let plan = state
+            .query_planner()
+            .create_physical_plan(&optimized, &state)
+            .await?;
         if let Some(template) = detach_physical_plan_template(Arc::clone(&plan)) {
-            cache.remember_physical_read_plan(key, template);
+            cache.remember_physical_read_plan(key.clone(), template);
+            if !logical_plan_is_optimized {
+                let detached = detach_cached_read_plan(optimized)
+                    .map_err(|error| DataFusionError::Plan(error.to_string()))?;
+                cache.remember_optimized_read_plan(key, detached);
+            }
         }
         return Ok(plan);
     };
 
     let (state, logical_plan) = dataframe.into_parts();
-    let optimized = state.optimize(&logical_plan)?;
+    let optimized = if logical_plan_is_optimized {
+        logical_plan
+    } else if let Some(cached) = cache.optimized_read_plan(&key) {
+        let session = SessionContext::new_with_state(state.clone());
+        rebind_cached_read_plan(&session, cached.as_ref().clone())
+            .await
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?
+    } else {
+        state.optimize(&logical_plan)?
+    };
     if let Some(replacements) = plan_current_spec_scans(&optimized, &state).await?
         && let Some(plan) = rebind_physical_plan_template(template, replacements)
     {
