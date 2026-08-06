@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -9,6 +10,7 @@ use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -27,9 +29,7 @@ use crate::tracked_state::{
 };
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
-};
+use super::history_util::{ObservedTrackedStateRows, entity_pk_json_array};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
@@ -53,6 +53,39 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
+
+/// Runtime work counters for the authenticated observed-state batch reader.
+/// These are intentionally at the actual request boundary so qualification can
+/// distinguish one bounded batch from repeated per-commit scans.
+static OBSERVED_STATE_BATCH_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_STATE_COMMIT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_STATE_REGISTRIES_REUSED: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_STATE_RAW_BATCHES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FileHistoryReadCounters {
+    pub(crate) observed_state_batch_requests: u64,
+    pub(crate) observed_state_commit_requests: u64,
+    pub(crate) observed_state_registries_reused: u64,
+    pub(crate) observed_state_raw_batches_dropped: u64,
+}
+
+pub(crate) fn reset_file_history_read_counters() {
+    OBSERVED_STATE_BATCH_REQUESTS.store(0, Ordering::Relaxed);
+    OBSERVED_STATE_COMMIT_REQUESTS.store(0, Ordering::Relaxed);
+    OBSERVED_STATE_REGISTRIES_REUSED.store(0, Ordering::Relaxed);
+    OBSERVED_STATE_RAW_BATCHES_DROPPED.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn file_history_read_counters() -> FileHistoryReadCounters {
+    FileHistoryReadCounters {
+        observed_state_batch_requests: OBSERVED_STATE_BATCH_REQUESTS.load(Ordering::Relaxed),
+        observed_state_commit_requests: OBSERVED_STATE_COMMIT_REQUESTS.load(Ordering::Relaxed),
+        observed_state_registries_reused: OBSERVED_STATE_REGISTRIES_REUSED.load(Ordering::Relaxed),
+        observed_state_raw_batches_dropped: OBSERVED_STATE_RAW_BATCHES_DROPPED
+            .load(Ordering::Relaxed),
+    }
+}
 
 pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
@@ -274,9 +307,7 @@ struct FileHistoryOutputRow {
 
 impl FileHistoryOutputRow {
     fn descriptor(&self) -> &FileHistoryObservedDescriptorRecord {
-        let descriptor = &self.observed_state.descriptors[self.descriptor_ordinal as usize];
-        let _ = self.observed_state.rows.row(descriptor.row);
-        descriptor
+        &self.observed_state.descriptors[self.descriptor_ordinal as usize]
     }
 }
 
@@ -292,9 +323,7 @@ struct PreparedFileHistoryRow {
 
 impl PreparedFileHistoryRow {
     fn descriptor(&self) -> &FileHistoryObservedDescriptorRecord {
-        let descriptor = &self.observed_state.descriptors[self.descriptor_ordinal as usize];
-        let _ = self.observed_state.rows.row(descriptor.row);
-        descriptor
+        &self.observed_state.descriptors[self.descriptor_ordinal as usize]
     }
 }
 
@@ -486,7 +515,6 @@ struct FileHistoryObservedDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
 }
 
 #[derive(Debug, Clone)]
@@ -494,7 +522,6 @@ struct FileHistoryObservedDirectoryRecord {
     id: String,
     parent_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
 }
 
 impl DirectoryPathRecord for FileHistoryObservedDirectoryRecord {
@@ -515,19 +542,16 @@ impl DirectoryPathRecord for FileHistoryObservedDirectoryRecord {
 struct FileHistoryObservedBlobRecord {
     file_id: String,
     blob_hash: Option<String>,
-    row: ObservedTrackedStateOrdinal,
 }
 
 #[derive(Debug, Clone)]
 struct FileHistoryObservedPluginOwnerRecord {
     file_id: String,
     owner: Option<PluginFileOwner>,
-    row: ObservedTrackedStateOrdinal,
 }
 
 #[derive(Debug)]
 struct FileHistoryObservedState {
-    rows: ObservedTrackedStateRows,
     descriptors: Vec<FileHistoryObservedDescriptorRecord>,
     directories: Vec<FileHistoryObservedDirectoryRecord>,
     blobs: Vec<FileHistoryObservedBlobRecord>,
@@ -544,16 +568,12 @@ impl FileHistoryDirectoryIndex {
     fn from_state(state: &FileHistoryObservedState) -> Self {
         let mut file_ids_by_directory = BTreeMap::<String, BTreeSet<String>>::new();
         for descriptor in &state.descriptors {
-            let _ = state.rows.row(descriptor.row);
             if let Some(directory_id) = &descriptor.directory_id {
                 file_ids_by_directory
                     .entry(directory_id.clone())
                     .or_default()
                     .insert(descriptor.id.clone());
             }
-        }
-        for directory in &state.directories {
-            let _ = state.rows.row(directory.row);
         }
         Self {
             tree: HistoryDirectoryTree::from_records(&state.directories),
@@ -713,8 +733,13 @@ where
         })
         .collect::<Vec<_>>();
     observed_commit_ids.extend(direct_parent_commit_ids);
-    let observed_states =
-        load_file_history_observed_states(query_source, observed_commit_ids, lookup_ids).await?;
+    let observed_states = load_file_history_observed_states(
+        query_source,
+        observed_commit_ids,
+        lookup_ids,
+        &plugin_discovery.registries_by_commit,
+    )
+    .await?;
     let filesystem_events = file_history_events(
         &filesystem_context.event_descriptors,
         &filesystem_context.event_directories,
@@ -853,10 +878,7 @@ fn prepare_file_history_rows(
             .blobs
             .iter()
             .find(|blob| blob.file_id == event.file_id)
-            .and_then(|blob| {
-                let _ = state.rows.row(blob.row);
-                blob.blob_hash.clone()
-            });
+            .and_then(|blob| blob.blob_hash.clone());
         prepared.push(PreparedFileHistoryRow {
             id,
             path,
@@ -994,6 +1016,7 @@ async fn load_file_history_observed_states<S>(
     query_source: SqlHistoryQuerySource<S>,
     observed_commit_ids: BTreeSet<String>,
     lookup_ids: Option<&FileHistoryLookupIds>,
+    registries_by_commit: &BTreeMap<String, PluginRegistry>,
 ) -> Result<BTreeMap<String, Arc<FileHistoryObservedState>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -1002,26 +1025,72 @@ where
     // DAG, an equal-depth row may belong to a sibling and must not shape this
     // revision. Commit roots are the canonical state as of each observed
     // commit, so use them directly instead of inferring ancestry from depth.
-    let mut reader = TrackedStateContext::new().reader(query_source.store);
-    let mut states = BTreeMap::new();
-    for observed_commit_id in observed_commit_ids {
-        let state =
-            load_file_history_observed_state(&mut reader, &observed_commit_id, lookup_ids).await?;
-        states.insert(observed_commit_id, Arc::new(state));
-    }
-    Ok(states)
+    OBSERVED_STATE_BATCH_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let requests =
+        authenticated_observed_state_requests(observed_commit_ids, registries_by_commit)?;
+    // Requests share one authenticated registry map and are issued through a
+    // bounded stream. Each task owns only its commit-root reader; parsing
+    // immediately projects descriptors/directories/blobs/owners and drops the
+    // raw materialized batch before the state enters the result map.
+    let store = query_source.store;
+    let lookup_ids = lookup_ids.cloned();
+    let loaded = stream::iter(requests)
+        .map(|(observed_commit_id, plugin_registry)| {
+            let store = store.clone();
+            let lookup_ids = lookup_ids.clone();
+            async move {
+                let mut reader = TrackedStateContext::new().reader(store);
+                let state = load_file_history_observed_state(
+                    &mut reader,
+                    &observed_commit_id,
+                    lookup_ids.as_ref(),
+                    plugin_registry,
+                )
+                .await?;
+                Ok::<_, LixError>((observed_commit_id, Arc::new(state)))
+            }
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(loaded.into_iter().collect())
+}
+
+fn authenticated_observed_state_requests(
+    observed_commit_ids: BTreeSet<String>,
+    registries_by_commit: &BTreeMap<String, PluginRegistry>,
+) -> Result<Vec<(String, PluginRegistry)>, LixError> {
+    observed_commit_ids
+        .into_iter()
+        .map(|observed_commit_id| {
+            let plugin_registry = registries_by_commit
+                .get(&observed_commit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "lix_file_history observed commit '{observed_commit_id}' has no authenticated plugin registry"
+                        ),
+                    )
+                })?;
+            OBSERVED_STATE_COMMIT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            OBSERVED_STATE_REGISTRIES_REUSED.fetch_add(1, Ordering::Relaxed);
+            Ok((observed_commit_id, plugin_registry))
+        })
+        .collect()
 }
 
 async fn load_file_history_observed_state<S>(
     reader: &mut TrackedStateStoreReader<S>,
     observed_commit_id: &str,
     lookup_ids: Option<&FileHistoryLookupIds>,
+    plugin_registry: PluginRegistry,
 ) -> Result<FileHistoryObservedState, LixError>
 where
     S: StorageAdapterRead,
 {
     let observed_commit: SharedStr = observed_commit_id.into();
-    let plugin_registry = load_plugin_registry_at_observed_commit(reader, &observed_commit).await?;
     let plugin_owner_rows = load_file_history_plugin_owner_rows_at_observed_commit(
         reader,
         &observed_commit,
@@ -1047,8 +1116,8 @@ where
     let directories = parse_file_history_observed_directories(&rows)?;
     let blobs = parse_file_history_observed_blobs(&rows)?;
     let plugin_owners = parse_file_history_observed_plugin_owners(&rows)?;
+    OBSERVED_STATE_RAW_BATCHES_DROPPED.fetch_add(1, Ordering::Relaxed);
     Ok(FileHistoryObservedState {
-        rows,
         descriptors,
         directories,
         blobs,
@@ -1733,10 +1802,7 @@ fn live_file_history_plugin_owner<'a>(
         .plugin_owners
         .iter()
         .find(|record| record.file_id == file_id)
-        .and_then(|record| {
-            let _ = state.rows.row(record.row);
-            record.owner.as_ref()
-        })
+        .and_then(|record| record.owner.as_ref())
 }
 
 fn file_history_owner_schema_keys<'a>(
@@ -1964,7 +2030,6 @@ fn parse_file_history_observed_descriptors(
                     id: row.entity_pk().as_single_string_owned()?,
                     directory_id: None,
                     name: None,
-                    row: observed.ordinal(),
                 });
             };
             let snapshot: FileDescriptorSnapshot =
@@ -1978,7 +2043,6 @@ fn parse_file_history_observed_descriptors(
                 id: snapshot.id,
                 directory_id: snapshot.directory_id,
                 name: Some(snapshot.name),
-                row: observed.ordinal(),
             })
         })
         .collect()
@@ -1996,7 +2060,6 @@ fn parse_file_history_observed_directories(
                     id: row.entity_pk().as_single_string_owned()?,
                     parent_id: None,
                     name: None,
-                    row: observed.ordinal(),
                 });
             };
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
@@ -2010,7 +2073,6 @@ fn parse_file_history_observed_directories(
                 id: snapshot.id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
-                row: observed.ordinal(),
             })
         })
         .collect()
@@ -2034,7 +2096,6 @@ fn parse_file_history_observed_blobs(
                 return Ok(FileHistoryObservedBlobRecord {
                     file_id: fallback_file_id(),
                     blob_hash: None,
-                    row: observed.ordinal(),
                 });
             };
             let snapshot: BlobRefSnapshot =
@@ -2047,7 +2108,6 @@ fn parse_file_history_observed_blobs(
             Ok(FileHistoryObservedBlobRecord {
                 file_id: row.file_id().map(str::to_owned).unwrap_or(snapshot.id),
                 blob_hash: Some(snapshot.blob_hash),
-                row: observed.ordinal(),
             })
         })
         .collect()
@@ -2088,7 +2148,6 @@ fn parse_file_history_observed_plugin_owners(
             Ok(FileHistoryObservedPluginOwnerRecord {
                 file_id,
                 owner,
-                row: observed.ordinal(),
             })
         })
         .collect()
@@ -2262,12 +2321,14 @@ mod tests {
         FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryDirectoryIndex,
         FileHistoryDirectoryRecord, FileHistoryFilesystemContext, FileHistoryLookupIds,
         FileHistoryObservedState, FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord,
-        FileHistoryPublicPredicate, HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
+        FileHistoryPublicPredicate, FileHistoryReadCounters, HistoryRoute, PluginRegistry,
+        PreparedFileHistoryRow, authenticated_observed_state_requests,
         file_history_descriptor_blob_route, file_history_event_from_entry, file_history_events,
-        file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
-        parse_file_history_observed_blobs, parse_file_history_observed_descriptors,
-        parse_file_history_observed_directories, parse_file_history_observed_plugin_owners,
-        prepare_file_history_rows, sorted_grouped_file_history_events,
+        file_history_plugin_events, file_history_read_counters, load_file_history_blob_bytes,
+        load_file_history_entry_sets, parse_file_history_observed_blobs,
+        parse_file_history_observed_descriptors, parse_file_history_observed_directories,
+        parse_file_history_observed_plugin_owners, prepare_file_history_rows,
+        reset_file_history_read_counters, sorted_grouped_file_history_events,
     };
 
     fn history_entry(file_id: &str, depth: u32, snapshot_content: Option<String>) -> HistoryEntry {
@@ -2406,7 +2467,6 @@ mod tests {
             plugin_owners: parse_file_history_observed_plugin_owners(&rows)
                 .expect("test plugin owners"),
             plugin_registry,
-            rows,
         }
     }
 
@@ -2439,28 +2499,45 @@ mod tests {
     }
 
     #[test]
-    fn ten_thousand_observed_rows_retain_one_batch_and_one_commit_buffer() {
+    fn ten_thousand_observed_rows_drop_materialized_batch_after_projection() {
         const ROW_COUNT: usize = 10_000;
         let entries = (0..ROW_COUNT)
             .map(|index| history_entry(&format!("01920000-0000-7000-8000-{index:012x}"), 0, None));
         let state = observed_state_from_entries(entries, PluginRegistry::empty());
 
         assert_eq!(state.descriptors.len(), ROW_COUNT);
-        assert_eq!(state.rows.iter().len(), ROW_COUNT);
-        assert_eq!(state.rows.retained_batch_count(), 1);
-        let commit_buffers = state.rows.observed_commit_buffer_identities();
-        assert_eq!(commit_buffers.len(), 1);
-        let first_commit_ptr = state
-            .rows
-            .iter()
-            .next()
-            .expect("non-empty observed batch")
-            .observed_commit_id()
-            .as_ptr();
-        assert!(state.rows.iter().all(|row| {
-            row.observed_commit_id().as_ptr() == first_commit_ptr
-                && row.observed_commit_id() == "commit-0"
-        }));
+    }
+
+    #[test]
+    fn observed_state_batch_counters_are_resettable() {
+        reset_file_history_read_counters();
+        assert_eq!(
+            file_history_read_counters(),
+            FileHistoryReadCounters::default()
+        );
+    }
+
+    #[test]
+    fn observed_state_batch_reuses_authenticated_registries_and_rejects_missing() {
+        reset_file_history_read_counters();
+        let mut registries = BTreeMap::new();
+        registries.insert("commit-a".to_string(), PluginRegistry::empty());
+        let requests = authenticated_observed_state_requests(
+            BTreeSet::from(["commit-a".to_string()]),
+            &registries,
+        )
+        .expect("authenticated registry should be reused");
+        assert_eq!(requests.len(), 1);
+        let counters = file_history_read_counters();
+        assert_eq!(counters.observed_state_commit_requests, 1);
+        assert_eq!(counters.observed_state_registries_reused, 1);
+
+        let error = authenticated_observed_state_requests(
+            BTreeSet::from(["missing".to_string()]),
+            &registries,
+        )
+        .expect_err("missing authenticated registry must fail closed");
+        assert!(error.message.contains("no authenticated plugin registry"));
     }
 
     fn plugin_owner_record(
