@@ -355,7 +355,14 @@ where
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
+    let absent_by_space = delete_mapping
+        .absent_idempotent
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
     let mut planned_deleted_rows = 0_u64;
+    let mut planned_present_rows = 0_u64;
+    let mut planned_noop_rows = 0_u64;
     for (space_id, count) in &gc.delete_counts_by_space {
         let Some((space, accounting)) = rows.iter().find(|(_, value)| value.id == *space_id) else {
             return Err(format!("GC planned deletion in unknown space id {space_id:#x}").into());
