@@ -1,7 +1,7 @@
 //! Manual benchmark for warmed exact `lix_file` reads through the public session API.
 //!
 //! Run with:
-//! `cargo test -p lix_engine_benchmarks --release --test exact_file_read_benchmark -- --ignored --nocapture`
+//! `cargo test -p lix_benchmarks --release --test exact_file_read_benchmark -- --ignored --nocapture`
 //!
 //! Set `LIX_EXACT_FILE_READ_BENCH_FILE_COUNT=10000` to verify that a
 //! `WHERE id = $1` read remains a point lookup as the file corpus grows.
@@ -10,10 +10,12 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix_engine::{Engine, Memory, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
+use lix::integration::Engine;
+use lix::storage::Storage;
+use lix::{Memory, Value};
+use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
-use lix_slatedb_storage::SlateDB;
+use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
 
 const WARMUPS: usize = 30;

@@ -648,7 +648,7 @@ fn profile_hot_sql_session_operations(
         rows,
         read_many_pk_count,
     ));
-    let _ = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
+    let _ = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
     if sql_session::selected_olap_read_shape().is_some() {
         // Full semantic validation is intentionally outside the samples. This
         // keeps Rust-vs-JavaScript assertion work out of the engine ratio while
@@ -717,7 +717,7 @@ fn profile_hot_sql_session_operations(
         );
     }
     if matches!(operation, TransactionBenchOp::ReadOneByPk) {
-        let cache = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
+        let cache = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
         println!(
             "tracked_state_crud point cache accounting: hits={} misses={}",
             cache.hits, cache.misses
@@ -1046,12 +1046,12 @@ fn profile_sql_session_operation(
         let ownership_accounting =
             std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_OWNERSHIP_ACCOUNTING").is_some();
         if ownership_accounting {
-            lix_engine::storage_bench::begin_crud_ownership_accounting();
+            lix::storage_bench::begin_crud_ownership_accounting();
         }
-        let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
+        let _ = lix::storage_bench::take_crud_current_state_scoped_range_accounting();
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
-            let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
-            let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+            let _ = lix::storage_bench::take_crud_physical_write_accounting();
+            let _ = lix::storage_bench::take_crud_commit_state_manifest_bytes();
         }
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
@@ -1060,11 +1060,11 @@ fn profile_sql_session_operation(
         maybe_print_profile_rss_phase("after_operation");
         print_allocation_accounting("operation");
         if ownership_accounting {
-            print_ownership_accounting(lix_engine::storage_bench::take_crud_ownership_accounting());
+            print_ownership_accounting(lix::storage_bench::take_crud_ownership_accounting());
         }
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
-            let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
-            let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+            let physical = lix::storage_bench::take_crud_physical_write_accounting();
+            let manifest_bytes = lix::storage_bench::take_crud_commit_state_manifest_bytes();
             println!(
                 "tracked_state_crud write accounting: staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={}",
                 physical.puts, physical.deletes, physical.written_bytes, manifest_bytes,
@@ -1082,8 +1082,7 @@ fn profile_sql_session_operation(
     };
     print_profile_samples(&profile_layer, operation, read_many_pk_count, samples);
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROUTE_ACCOUNTING").is_some() {
-        let accounting =
-            lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
+        let accounting = lix::storage_bench::take_crud_current_state_scoped_range_accounting();
         println!(
             "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
             accounting.attempts,
@@ -1123,12 +1122,12 @@ fn profile_sql_session_bound_updates(
         let ownership_accounting =
             std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_OWNERSHIP_ACCOUNTING").is_some();
         if ownership_accounting {
-            lix_engine::storage_bench::begin_crud_ownership_accounting();
+            lix::storage_bench::begin_crud_ownership_accounting();
         }
-        let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
-        let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-        let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
-        let _ = lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
+        let _ = lix::storage_bench::take_crud_physical_write_accounting();
+        let _ = lix::storage_bench::take_crud_commit_state_manifest_bytes();
+        let _ = lix::storage_bench::take_crud_current_state_scoped_range_fallbacks();
+        let _ = lix::storage_bench::take_certified_entity_update_value_batch_accounting();
         let start = Instant::now();
         let result = if spread {
             runtime.block_on(fixture.update_spread_bound_rows(bound_update_row_count))
@@ -1142,14 +1141,13 @@ fn profile_sql_session_bound_updates(
         maybe_print_profile_rss_phase("after_update");
         print_allocation_accounting("update");
         if ownership_accounting {
-            print_ownership_accounting(lix_engine::storage_bench::take_crud_ownership_accounting());
+            print_ownership_accounting(lix::storage_bench::take_crud_ownership_accounting());
         }
-        let certificate =
-            lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
-        let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
-        let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+        let certificate = lix::storage_bench::take_certified_entity_update_value_batch_accounting();
+        let physical = lix::storage_bench::take_crud_physical_write_accounting();
+        let manifest_bytes = lix::storage_bench::take_crud_commit_state_manifest_bytes();
         let scoped_range_fallbacks =
-            lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
+            lix::storage_bench::take_crud_current_state_scoped_range_fallbacks();
         println!(
             "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={manifest_bytes} current_state_scoped_range_fallbacks={scoped_range_fallbacks}",
             certificate.attempts,
@@ -1169,8 +1167,8 @@ fn profile_sql_session_bound_updates(
     );
 }
 
-fn print_ownership_accounting(accounting: lix_engine::storage_bench::CrudOwnershipAccounting) {
-    const NAMES: [&str; lix_engine::storage_bench::CRUD_OWNERSHIP_STAGE_COUNT] = [
+fn print_ownership_accounting(accounting: lix::storage_bench::CrudOwnershipAccounting) {
+    const NAMES: [&str; lix::storage_bench::CRUD_OWNERSHIP_STAGE_COUNT] = [
         "sql_bound",
         "raw_batch",
         "raw_transfer",

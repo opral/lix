@@ -12,11 +12,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use lix::ObserveEvents;
+use lix::storage::Storage;
+use lix::{Lix, LixTransaction, Memory, Value, open_lix};
 use lix_collaboration_test_support::{
     CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
 };
-use lix_engine::ObserveEvents;
-use lix_sdk::{Lix, LixTransaction, Memory, OpenLixOptions, Storage, Value, open_lix};
 
 const DEFAULT_CLIENTS: usize = 100;
 const WAVE_SIZE: usize = 5;
@@ -181,9 +182,7 @@ struct LocalCapacityBackend {
 
 impl LocalCapacityBackend {
     async fn open(format: DocumentFormat, clients: usize, operations: usize) -> Self {
-        let root = open_lix(OpenLixOptions::default())
-            .await
-            .expect("capacity workspace should open");
+        let root = open_lix().await.expect("capacity workspace should open");
         install_plugin(&root, format.plugin_key(), &format.plugin_archive()).await;
         let path = format!("/collaboration-capacity.{}", format.extension());
         write_file(&root, &path, &format.base_document(operations + 1)).await;
@@ -405,9 +404,7 @@ async fn abandoned_transactions_and_sessions_release_resources() {
         "soak needs a warmup and at least one measured round"
     );
 
-    let lix = open_lix(OpenLixOptions::default())
-        .await
-        .expect("soak workspace should open");
+    let lix = open_lix().await.expect("soak workspace should open");
     install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
     let path = "/abandoned-transaction-soak.json";
     let base = br#"{"value":"base"}

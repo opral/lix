@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lix_engine::{Blob, Engine, ExecuteBatchStatement, Memory};
+use lix::integration::{Engine, SessionContext};
+use lix::{Blob, ExecuteBatchStatement, Memory};
 
 fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
     runtime.block_on(async move {
@@ -220,10 +221,7 @@ fn seeded_descriptor_unrelated_width_storage(
     })
 }
 
-fn open_session(
-    runtime: &tokio::runtime::Runtime,
-    storage: Memory,
-) -> lix_engine::SessionContext<Memory> {
+fn open_session(runtime: &tokio::runtime::Runtime, storage: Memory) -> SessionContext<Memory> {
     runtime.block_on(async move {
         Engine::new(storage)
             .await

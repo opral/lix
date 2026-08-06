@@ -3,7 +3,8 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lix_sdk::{ExecuteBatchStatement, Lix, OpenLixOptions, Storage, Value, open_lix};
+use lix::storage::Storage;
+use lix::{ExecuteBatchStatement, Lix, Value, open_lix};
 
 const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown";
 
@@ -64,7 +65,7 @@ async fn atomic_plugin_import_scaling_is_format_independent() {
 async fn sequential_batches_survive_observation_cache_eviction() {
     const DOCUMENTS: usize = 17;
 
-    let lix = open_lix(OpenLixOptions::default())
+    let lix = open_lix()
         .await
         .expect("document-scale workspace should open");
     install_plugin(&lix, "plugin_text", &build_git_text_v2_plugin_archive()).await;
@@ -107,7 +108,7 @@ async fn assert_format_scales(
     documents: Vec<Vec<u8>>,
     semantic_table: &str,
 ) -> Duration {
-    let lix = open_lix(OpenLixOptions::default())
+    let lix = open_lix()
         .await
         .expect("document-scale workspace should open");
     install_plugin(&lix, plugin_key, &archive).await;

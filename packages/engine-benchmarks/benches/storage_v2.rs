@@ -14,18 +14,17 @@ use bytes::Bytes;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use lix_engine::Storage;
-use lix_engine::storage::{
+use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
     Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
-use lix_engine::storage_adapter::{
+use lix::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterReadScope, StorageReadStats,
     StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_sqlite_storage::SQLite;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_sqlite::SQLite;
 use rustc_hash::FxBuildHasher;
 use tempfile::TempDir;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;

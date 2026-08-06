@@ -1,7 +1,9 @@
 //! Storage-backend coverage for the structured native file-write surface.
 
-use lix_engine::{Blob, Engine, LixError, SessionContext, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::{Blob, LixError, Value};
+use lix_storage_rocksdb::RocksDB;
 
 #[tokio::test]
 async fn native_file_upsert_works_with_rocksdb() {

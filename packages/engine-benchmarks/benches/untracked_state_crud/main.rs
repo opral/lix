@@ -16,21 +16,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use lix_engine::storage::{
+use lix::integration::{Engine, SessionContext};
+use lix::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StorageWrite,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
     WriteOptions,
 };
-use lix_engine::storage_adapter::{
+use lix::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions,
 };
-use lix_engine::{Engine, PreparedDmlParameterBatch, SessionContext, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
+use lix::{PreparedDmlParameterBatch, Value};
+use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
-use lix_slatedb_storage::SlateDB;
-use lix_sqlite_storage::SQLite;
+use lix_storage_slatedb::SlateDB;
+use lix_storage_sqlite::SQLite;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
@@ -554,9 +555,9 @@ fn profile_session_untracked_crud(runtime: &Runtime, all_rows: &[PointerRow]) {
                     runtime.block_on(session.insert_untracked_json_pointer_rows(rows));
                 }
                 let rss_before = process_resident_bytes();
-                let _ = lix_engine::storage_bench::
-                    take_certified_entity_insert_parameter_batch_executions();
-                let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
+                let _ =
+                    lix::storage_bench::take_certified_entity_insert_parameter_batch_executions();
+                let _ = lix::storage_bench::take_crud_physical_write_accounting();
                 reset_profile_allocations();
                 let started = Instant::now();
                 let affected = match operation {
@@ -580,9 +581,9 @@ fn profile_session_untracked_crud(runtime: &Runtime, all_rows: &[PointerRow]) {
                 let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
                 let (alloc_bytes, alloc_calls) = profile_allocations();
                 let rss_after = process_resident_bytes();
-                let certified_batches = lix_engine::storage_bench::
-                    take_certified_entity_insert_parameter_batch_executions();
-                let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
+                let certified_batches =
+                    lix::storage_bench::take_certified_entity_insert_parameter_batch_executions();
+                let physical = lix::storage_bench::take_crud_physical_write_accounting();
                 println!(
                     "| {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     profile.name(),

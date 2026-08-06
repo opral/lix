@@ -3,15 +3,14 @@ use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lix_engine::Storage;
-use lix_engine::changelog::bench as changelog_bench;
-use lix_engine::storage::{
+use lix::changelog::bench as changelog_bench;
+use lix::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead, StorageSpace, StorageWrite,
-    WriteOptions,
+    ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageSpace,
+    StorageWrite, WriteOptions,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 use tempfile::TempDir;
 
 const BACKENDS: &[Backend] = &[Backend::Rocks, Backend::Slate];

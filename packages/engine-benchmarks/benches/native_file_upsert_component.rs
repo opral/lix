@@ -21,9 +21,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lix_engine::{Blob, Engine, SessionContext, Storage};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix::Blob;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
 
 const DEFAULT_FILE_COUNT: usize = 5_000;

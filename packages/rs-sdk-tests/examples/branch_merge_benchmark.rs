@@ -1,10 +1,10 @@
 //! Isolated-process branching and merge qualification benchmark.
 //!
 //! Run the default qualification matrix and capture JSONL:
-//! `cargo run --release -p lix_sdk_tests --example branch_merge_benchmark -- qualification > results.jsonl`
+//! `cargo run --release -p lix_tests --example branch_merge_benchmark -- qualification > results.jsonl`
 //!
 //! Run one worker directly:
-//! `cargo run --release -p lix_sdk_tests --example branch_merge_benchmark -- worker rows clean 10000 100 10 100 8 64`
+//! `cargo run --release -p lix_tests --example branch_merge_benchmark -- worker rows clean 10000 100 10 100 8 64`
 
 use std::alloc::GlobalAlloc;
 use std::cell::Cell;
@@ -20,12 +20,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use lix_rocksdb_storage::RocksDB;
-use lix_sdk::{
+use lix::storage::Storage;
+use lix::{
     CreateBranchOptions, Lix, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
-    Storage, SwitchBranchOptions, Value, open_lix_with_storage,
+    SwitchBranchOptions, Value, open_lix,
 };
-use lix_slatedb_storage::SlateDB;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tracing::Subscriber;
@@ -1207,7 +1208,8 @@ where
     StorageImpl: BenchmarkStorage,
 {
     let storage = StorageImpl::open_for_benchmark(path);
-    open_lix_with_storage(storage)
+    open_lix()
+        .with_storage(storage)
         .await
         .expect("open benchmark Lix")
 }

@@ -43,7 +43,7 @@ lix exp git-replay \
 Validation:
 
 ```sh
-cargo test -p lix_rocksdb_storage
+cargo test -p lix_storage_rocksdb
 ```
 
 RocksDB persists `blob_compression_type=kZSTD` in its options file. The adapter

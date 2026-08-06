@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::transaction::bench::{
+use lix::storage_adapter::StorageAdapter;
+use lix::transaction::bench::{
     BenchLayoutAccounting, BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
 };
 

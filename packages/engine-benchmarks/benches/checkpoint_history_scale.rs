@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix_engine::Engine;
-use lix_engine::changelog::bench::{append_ordered_commits, append_with_shape, stage_append_once};
-use lix_engine::storage::Storage;
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::storage_bench::{CheckpointCommitScanBenchMode, scan_checkpoint_commits_for_bench};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+use lix::changelog::bench::{append_ordered_commits, append_with_shape, stage_append_once};
+use lix::integration::Engine;
+use lix::storage::Storage;
+use lix::storage_adapter::StorageAdapter;
+use lix::storage_bench::{CheckpointCommitScanBenchMode, scan_checkpoint_commits_for_bench};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const DEFAULT_BATCH_COMMITS: usize = 100_000;
 const DEFAULT_SAMPLES: usize = 5;

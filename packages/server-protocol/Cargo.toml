@@ -1,6 +1,6 @@
 [package]
-name = "lix_server_protocol"
-version.workspace = true
+name = "lix-server-protocol"
+version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 description = "Canonical HTTP server protocol for independent Lix workspace sessions."
@@ -22,7 +22,7 @@ async-stream = "0.3"
 axum = "0.8"
 futures-core = "0.3"
 getrandom = "0.3"
-lix_sdk = { path = "../rs-sdk", version = "0.10.0", default-features = false, features = ["default_wasm_runtime"] }
+lix = { workspace = true, default-features = false, features = ["default_wasm_runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -43,7 +43,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 lix_collaboration_test_support = { path = "../collaboration-test-support" }
-lix_slatedb_storage = { workspace = true }
+lix_storage_slatedb = { workspace = true }
 object_store = { version = "0.14", default-features = false }
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 tempfile = "3"

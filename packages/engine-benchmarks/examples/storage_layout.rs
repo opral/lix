@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use lix_engine::storage_adapter::{StorageAdapter, StorageReadOptions};
-use lix_engine::storage_bench::{
+use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
+use lix::storage_bench::{
     binary_cas_owner_layout_accounting, binary_manifest_layout_accounting,
     commit_delta_layout_accounting, layout_accounting, layout_space_catalog, space_inventory,
 };
-use lix_slatedb_storage::SlateDB;
+use lix_storage_slatedb::SlateDB;
 use object_store::local::LocalFileSystem;
 use slatedb::{SstReader, ValueDeletable};
 
@@ -182,7 +182,7 @@ async fn main() {
     }
 }
 
-async fn print_binary_cas_owners(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
+async fn print_binary_cas_owners(read: &impl lix::storage_adapter::StorageAdapterRead) {
     for owner in binary_cas_owner_layout_accounting(read)
         .await
         .expect("decode binary CAS owners")
@@ -204,9 +204,7 @@ async fn print_binary_cas_owners(read: &impl lix_engine::storage_adapter::Storag
     }
 }
 
-async fn print_plugin_checkpoint_layout(
-    read: &impl lix_engine::storage_adapter::StorageAdapterRead,
-) {
+async fn print_plugin_checkpoint_layout(read: &impl lix::storage_adapter::StorageAdapterRead) {
     const HEADER_BYTES: usize = 92;
 
     let inventory = space_inventory(read, "plugin.current_checkpoint.v1").await;
@@ -245,7 +243,7 @@ async fn print_plugin_checkpoint_layout(
     );
 }
 
-async fn print_binary_manifest_layout(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
+async fn print_binary_manifest_layout(read: &impl lix::storage_adapter::StorageAdapterRead) {
     let layout = binary_manifest_layout_accounting(read)
         .await
         .expect("decode binary manifest layout");
@@ -260,7 +258,7 @@ async fn print_binary_manifest_layout(read: &impl lix_engine::storage_adapter::S
     );
 }
 
-async fn print_commit_delta_inventory(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
+async fn print_commit_delta_inventory(read: &impl lix::storage_adapter::StorageAdapterRead) {
     for entry in commit_delta_layout_accounting(read)
         .await
         .expect("decode commit-delta inventory")

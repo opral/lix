@@ -2,7 +2,7 @@ use rusqlite::{Connection, Rows, params, params_from_iter};
 use tempfile::TempDir;
 
 use crate::workload::{WorkloadRow, sql_string};
-use lix_engine::{ExecuteResult, Value};
+use lix::{ExecuteResult, Value};
 
 pub(crate) struct RawSqliteFixture {
     connection: Connection,
