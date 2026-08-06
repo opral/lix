@@ -7145,46 +7145,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
-
-        let mut transaction = session.begin_transaction().await.unwrap();
-        transaction
-            .execute(
-                "UPDATE prepared_dml_contract_probe SET value = 'before' WHERE id = 'a'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let error = transaction
-            .execute_prepared_dml_batch(
-                Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
-                ),
-                PreparedDmlParameterBatch::from_rows([
-                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
-                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
-                ])
-                .unwrap(),
-            )
-            .await
-            .expect_err("failed prepared statement must roll back its own staging");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        transaction
-            .execute(
-                "UPDATE prepared_dml_contract_probe SET value = 'after' WHERE id = 'b'",
-                &[],
-            )
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-        let rows = session
-            .execute(
-                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "before");
-        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "after");
     }
 
     #[tokio::test]
@@ -7262,6 +7222,46 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "UPDATE prepared_dml_contract_probe SET value = 'before' WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let error = transaction
+            .execute_prepared_dml_batch(
+                Arc::<str>::from(
+                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                ),
+                PreparedDmlParameterBatch::from_rows([
+                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
+                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
+                ])
+                .unwrap(),
+            )
+            .await
+            .expect_err("failed prepared statement must roll back its own staging");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        transaction
+            .execute(
+                "UPDATE prepared_dml_contract_probe SET value = 'after' WHERE id = 'b'",
+                &[],
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let rows = session
+            .execute(
+                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "before");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "after");
     }
 
     #[tokio::test]
