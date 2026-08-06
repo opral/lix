@@ -27,7 +27,7 @@ mod filesystem_working_diff;
 mod history_table_function;
 mod history_util;
 mod spec;
-pub(crate) use spec::{SpecScanExec, StatementScanKey};
+pub(crate) use spec::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 mod upsert;
 mod values;
 mod working_diff;

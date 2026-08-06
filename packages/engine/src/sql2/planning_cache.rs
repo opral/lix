@@ -13,6 +13,7 @@ use datafusion::catalog::{
 use datafusion::execution::session_state::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use lru::LruCache;
@@ -47,6 +48,14 @@ enum ParameterType {
 struct ReadPlanCacheKey<CatalogKey> {
     sql: Arc<str>,
     parameter_types: SmallVec<[ParameterType; 4]>,
+    catalog: CatalogKey,
+    planner_contract: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PhysicalReadPlanCacheKey<CatalogKey> {
+    sql: Arc<str>,
+    parameters: Arc<[u8]>,
     catalog: CatalogKey,
     planner_contract: u32,
 }
@@ -87,6 +96,8 @@ pub(crate) struct SqlPlanningCache<CatalogKey> {
     public_catalogs: Mutex<LruCache<CatalogKey, Arc<PublicCatalog>>>,
     write_plans: Mutex<LruCache<WritePlanCacheKey<CatalogKey>, Arc<LogicalWritePlan>>>,
     read_plans: Mutex<LruCache<ReadPlanCacheKey<CatalogKey>, Arc<CachedReadPlan>>>,
+    physical_read_plans:
+        Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<dyn ExecutionPlan>>>,
 }
 
 impl<CatalogKey> std::fmt::Debug for SqlPlanningCache<CatalogKey> {
@@ -201,6 +212,25 @@ where
     ) {
         let key = ReadPlanCacheKey::new(sql, params, catalog);
         lock_or_recover(&self.read_plans).put(key, Arc::new(plan));
+    }
+
+    pub(crate) fn physical_read_plan(
+        &self,
+        key: &PhysicalReadPlanCacheKey<CatalogKey>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        lock_or_recover(&self.physical_read_plans).get(key).cloned()
+    }
+
+    pub(crate) fn remember_physical_read_plan(
+        &self,
+        key: PhysicalReadPlanCacheKey<CatalogKey>,
+        plan: Arc<dyn ExecutionPlan>,
+    ) {
+        lock_or_recover(&self.physical_read_plans).put(key, plan);
+    }
+
+    pub(crate) fn forget_physical_read_plan(&self, key: &PhysicalReadPlanCacheKey<CatalogKey>) {
+        lock_or_recover(&self.physical_read_plans).pop(key);
     }
 
     #[cfg(test)]
@@ -425,6 +455,7 @@ where
             public_catalogs: Mutex::new(LruCache::new(non_zero(public_catalog_capacity))),
             write_plans: Mutex::new(LruCache::new(non_zero(write_plan_capacity))),
             read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
+            physical_read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
         }
     }
 }
@@ -437,6 +468,39 @@ impl<CatalogKey> ReadPlanCacheKey<CatalogKey> {
             catalog,
             planner_contract: READ_PLANNER_CONTRACT,
         }
+    }
+}
+
+impl<CatalogKey> PhysicalReadPlanCacheKey<CatalogKey> {
+    pub(crate) fn new(sql: &str, params: &[Value], catalog: CatalogKey) -> Option<Self> {
+        let mut parameters = Vec::new();
+        for value in params {
+            let (tag, bytes) = match value {
+                Value::Null => (0, Vec::new()),
+                Value::Boolean(false) => (1, Vec::new()),
+                Value::Boolean(true) => (2, Vec::new()),
+                Value::Integer(value) => (3, value.to_le_bytes().to_vec()),
+                Value::Real(value) => (4, value.to_bits().to_le_bytes().to_vec()),
+                Value::Text(value) => (5, value.as_bytes().to_vec()),
+                Value::Json(value) => {
+                    parameters.push(6);
+                    let bytes = serde_json::to_vec(value).ok()?;
+                    parameters.extend_from_slice(&bytes.len().to_le_bytes());
+                    parameters.extend_from_slice(&bytes);
+                    continue;
+                }
+                Value::Blob(value) => (7, value.to_vec()),
+            };
+            parameters.push(tag);
+            parameters.extend_from_slice(&bytes.len().to_le_bytes());
+            parameters.extend_from_slice(&bytes);
+        }
+        Some(Self {
+            sql: Arc::from(sql),
+            parameters: parameters.into(),
+            catalog,
+            planner_contract: READ_PLANNER_CONTRACT,
+        })
     }
 }
 
