@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lix_sdk::{Blob, RequestBlobSpliceProvenance, VerifiedRequestBlob};
+use lix::{Blob, RequestBlobSpliceProvenance, VerifiedRequestBlob};
 use sha2::{Digest as _, Sha256};
 
 const TEN_MIB_JSON_BYTES: usize = 10 * 1024 * 1024;

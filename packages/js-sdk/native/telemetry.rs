@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use lix_sdk::{CompletedTelemetrySpan, TelemetrySpanStatus, TelemetryValue};
+use lix::telemetry::{CompletedTelemetrySpan, TelemetrySpanStatus, TelemetryValue};
 use serde::Serialize;
 
 #[derive(Serialize)]

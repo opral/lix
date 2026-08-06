@@ -1,0 +1,111 @@
+[package]
+name = "lix"
+version = "0.11.0"
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+autobenches = false
+autotests = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["default_wasm_runtime"]
+all-simulations = []
+storage-benches = []
+default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[[test]]
+name = "execute_result_allocations"
+path = "tests/execute_result_allocations.rs"
+
+[[test]]
+name = "third_party_storage_adapter"
+path = "tests/third_party_storage_adapter.rs"
+
+[[test]]
+name = "client_state"
+path = "tests/client_state.rs"
+
+[[test]]
+name = "runtime_contract"
+path = "tests/runtime_contract.rs"
+
+[[test]]
+name = "semantic_merge"
+path = "tests/semantic_merge.rs"
+
+[[test]]
+name = "send_futures"
+path = "tests/send_futures.rs"
+
+[[test]]
+name = "plugin_arena_scorecard"
+path = "tests/plugin_arena_scorecard.rs"
+
+[dependencies]
+ahash = "0.8"
+async-trait = "0.1"
+cel = { version = "0.12.0", features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
+datafusion = { version = "53.0.0", default-features = false, features = [
+    "sql",
+    "nested_expressions",
+    "datetime_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+] }
+musli = { version = "0.0.149", features = ["storage"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+smallvec = "1.15"
+jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
+globset = "0.4"
+jiff = { version = "0.2.27", default-features = false, features = ["std"] }
+lru = "0.18"
+memchr = "2"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v5", "v7", "std", "js", "fast-rng"] }
+web-time = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+blake3 = "1"
+fastcdc = "3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+base64 = "0.22"
+bytes = { version = "1", features = ["serde"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }
+wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
+
+[dev-dependencies]
+paste = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+wasm-encoder = "0.248"
+wit-parser = "0.247"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd = "0.13"
+notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }

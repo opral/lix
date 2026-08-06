@@ -36,19 +36,19 @@ bytes, so the v3 peak must be at most 12,386,304 bytes.
 Reproduction:
 
 ```sh
-cargo test -p lix_sdk --lib \
+cargo test -p lix --lib \
   csv_v2_initial_import_retains_64_mib_efficiency_invariant \
   --release -- --ignored --nocapture
 
-cargo test -p lix_sdk --lib \
+cargo test -p lix --lib \
   csv_v2_cold_open_and_warm_edit_retain_64_mib_efficiency_invariant \
   --release -- --ignored --nocapture
 
-cargo test -p lix_sdk_tests --test e2e \
+cargo test -p lix_tests --test e2e \
   v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded \
   --release -- --ignored --nocapture
 
-cargo test -p lix_sdk_tests --test e2e \
+cargo test -p lix_tests --test e2e \
   v2_json_ten_mib_ordinary_sql_byte_edit_benchmark \
   --release -- --ignored --nocapture
 ```
@@ -82,13 +82,13 @@ v2/v3 measurement order, and reports per-operation distributions:
 Reproduction:
 
 ```sh
-cargo test -p lix_plugin_arena --test scorecard -- --nocapture
-cargo test -p lix_plugin_arena --test scorecard --release \
+cargo test -p lix --test plugin_arena_scorecard -- --nocapture
+cargo test -p lix --test plugin_arena_scorecard --release \
   four_format_warm_edit_latency_scorecard -- --ignored --nocapture
 
 # The same benchmark exits nonzero if any lane misses 2x latency or 3x memory.
 LIX_PLUGIN_V1_ENFORCE_ACCEPTANCE=1 \
-  cargo test -p lix_plugin_arena --test scorecard --release \
+  cargo test -p lix --test plugin_arena_scorecard --release \
   four_format_warm_edit_latency_scorecard -- --ignored --nocapture
 ```
 

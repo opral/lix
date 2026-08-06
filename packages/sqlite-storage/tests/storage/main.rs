@@ -1,7 +1,7 @@
 mod observe_mutation_revision;
 
-use lix_engine::run_storage_conformance;
-use lix_sqlite_storage::SQLiteFactory;
+use lix::storage::conformance::run_storage_conformance;
+use lix_storage_sqlite::SQLiteFactory;
 
 #[tokio::test]
 async fn sqlite_passes_storage_conformance() {

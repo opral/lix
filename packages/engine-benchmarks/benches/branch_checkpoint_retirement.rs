@@ -6,15 +6,16 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix_engine::storage::Storage;
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::storage_bench::{
+use lix::integration::Engine;
+use lix::storage::Storage;
+use lix::storage_adapter::StorageAdapter;
+use lix::storage_bench::{
     BranchCheckpointDeleteBenchResult, delete_and_commit_branch_plugin_checkpoints_for_bench,
     delete_branch_plugin_checkpoints_for_bench, seed_branch_plugin_checkpoints_for_bench,
 };
-use lix_engine::{CreateBranchOptions, Engine, Value};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+use lix::{CreateBranchOptions, Value};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const BRANCH_ID: &str = "01920000-0000-7000-8000-000000000001";
 

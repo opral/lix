@@ -21,9 +21,9 @@ name = "lix"
 path = "src/main.rs"
 
 [dependencies]
-lix_sdk = { workspace = true }
-lix_rocksdb_storage = { workspace = true }
-lix_slatedb_storage = { workspace = true }
+lix = { workspace = true, features = ["default_wasm_runtime"] }
+lix_storage_rocksdb = { workspace = true }
+lix_storage_slatedb = { workspace = true }
 plugin_text = { path = "../../plugins/text", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }

@@ -60,7 +60,7 @@ pub(crate) fn render_error_output<W: Write>(err: &CliError, no_hints: bool, out:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lix_sdk::LixError;
+    use lix::LixError;
 
     fn rendered(err: &CliError, no_hints: bool) -> String {
         let mut buf: Vec<u8> = Vec::new();

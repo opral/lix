@@ -19,7 +19,7 @@
 //! LIX_NATIVE_FILE_READ_COMPONENT_FILE_COUNTS=1000,5000 \
 //! LIX_NATIVE_FILE_READ_COMPONENT_HISTORY_COMMITS=100,1000,5000 \
 //! LIX_NATIVE_FILE_READ_COMPONENT_PAIRS=30 \
-//! cargo bench -p lix_engine_benchmarks --bench native_file_read_component \
+//! cargo bench -p lix_benchmarks --bench native_file_read_component \
 //!   --features storage-benches,slatedb
 //! ```
 //!
@@ -36,9 +36,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lix_engine::{Blob, Engine, ExecuteResult, SessionContext, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::{Blob, ExecuteResult, Value};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
 
 const DEFAULT_FILE_COUNTS: &[usize] = &[1_000, 5_000];

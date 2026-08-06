@@ -3,11 +3,9 @@
 //! Git is reported both before and after explicit GC; Lix is measured after a
 //! clean close with its normal automatic storage maintenance.
 
-use lix_rocksdb_storage::RocksDB;
-use lix_sdk::{
-    CreateBranchOptions, Lix, MergeBranchOptions, Storage, SwitchBranchOptions, Value,
-    open_lix_with_storage,
-};
+use lix::storage::Storage;
+use lix::{CreateBranchOptions, Lix, MergeBranchOptions, SwitchBranchOptions, Value, open_lix};
+use lix_storage_rocksdb::RocksDB;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -80,7 +78,7 @@ async fn markdown_lix_byte_hotpath_profile() {
     let corpus = markdown_corpus(target_bytes);
     let archive = build_markdown_plugin_archive();
     let root = tempfile::tempdir().expect("create Markdown profile directory");
-    let lix = open_lix_with_rocksdb(root.path()).await;
+    let lix = open_rocksdb_lix(root.path()).await;
     install_plugin(&lix, "plugin_markdown", &archive).await;
     write_file(&lix, "/profile.md", corpus.bytes.clone()).await;
 
@@ -132,7 +130,7 @@ async fn markdown_syntax_rich_initial_import_control() {
 
     for _sample in 0..samples {
         let root = tempfile::tempdir().expect("create syntax-rich Markdown benchmark directory");
-        let lix = open_lix_with_rocksdb(root.path()).await;
+        let lix = open_rocksdb_lix(root.path()).await;
         install_plugin(&lix, "plugin_markdown", &archive).await;
 
         let started = Instant::now();
@@ -188,12 +186,12 @@ async fn markdown_git_semantic_entities_benchmark() {
     let archive = build_markdown_plugin_archive();
 
     let lix_root = tempfile::tempdir().expect("create semantic Lix benchmark directory");
-    let baseline_lix = open_lix_with_rocksdb(lix_root.path()).await;
+    let baseline_lix = open_rocksdb_lix(lix_root.path()).await;
     install_plugin(&baseline_lix, "plugin_markdown", &archive).await;
     baseline_lix.close().await.expect("close baseline Lix");
     let lix_fixed = lix_repo_sizes(lix_root.path());
 
-    let lix = open_lix_with_rocksdb(lix_root.path()).await;
+    let lix = open_rocksdb_lix(lix_root.path()).await;
     let lix_import_started = Instant::now();
     write_file(&lix, "/benchmark.md", corpus.bytes.clone()).await;
     let lix_import = lix_import_started.elapsed();
@@ -225,7 +223,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     lix.close().await.expect("close Lix history fixture");
     let lix_history = lix_repo_sizes(lix_root.path());
 
-    let lix = open_lix_with_rocksdb(lix_root.path()).await;
+    let lix = open_rocksdb_lix(lix_root.path()).await;
     let mut lix_merges = Vec::with_capacity(merge_samples);
     let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
     for sample in 0..merge_samples {
@@ -331,7 +329,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     let lix_live = lix_repo_sizes(lix_root.path());
 
     let byte_root = tempfile::tempdir().expect("create byte-path Lix benchmark directory");
-    let byte_lix = open_lix_with_rocksdb(byte_root.path()).await;
+    let byte_lix = open_rocksdb_lix(byte_root.path()).await;
     install_plugin(&byte_lix, "plugin_markdown", &archive).await;
     write_file(&byte_lix, "/benchmark.md", corpus.bytes.clone()).await;
     let mut byte_state = corpus.bytes.clone();
@@ -617,7 +615,8 @@ async fn cold_lix_byte_edits(
             RocksDB::open(root.join(".lix")).expect("open cold byte-edit Lix RocksDB storage");
         storage_open.push(storage_started.elapsed());
         let engine_started = Instant::now();
-        let lix = open_lix_with_storage(storage)
+        let lix = open_lix()
+            .with_storage(storage)
             .await
             .expect("open cold byte-edit Lix workspace");
         engine_open.push(engine_started.elapsed());
@@ -646,7 +645,8 @@ async fn cold_lix_reads(root: &Path, expected: &[u8], samples: usize) -> ColdLix
         let storage = RocksDB::open(root.join(".lix")).expect("open cold Lix RocksDB storage");
         storage_open.push(storage_started.elapsed());
         let engine_started = Instant::now();
-        let lix = open_lix_with_storage(storage)
+        let lix = open_lix()
+            .with_storage(storage)
             .await
             .expect("open cold Lix workspace");
         engine_open.push(engine_started.elapsed());
@@ -669,7 +669,7 @@ async fn semantic_table_merge_quality(archive: &[u8]) {
     const TABLE: &[u8] = b"| left | right |\n| --- | --- |\n| alpha | beta |\n";
 
     let root = tempfile::tempdir().expect("create Lix semantic quality directory");
-    let lix = open_lix_with_rocksdb(root.path()).await;
+    let lix = open_rocksdb_lix(root.path()).await;
     install_plugin(&lix, "plugin_markdown", archive).await;
     write_file(&lix, "/quality.md", TABLE.to_vec()).await;
     let file_id = file_id_at_path(&lix, "/quality.md").await;
@@ -985,9 +985,10 @@ fn init_perf_tracing() {
     }
 }
 
-async fn open_lix_with_rocksdb(path: &Path) -> Lix<RocksDB> {
+async fn open_rocksdb_lix(path: &Path) -> Lix<RocksDB> {
     let storage = RocksDB::open(path.join(".lix")).expect("open Lix RocksDB storage");
-    open_lix_with_storage(storage)
+    open_lix()
+        .with_storage(storage)
         .await
         .expect("open Lix workspace")
 }

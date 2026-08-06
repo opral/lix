@@ -1,15 +1,15 @@
-use lix_sdk::{
-    CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    CreateCheckpointReceipt, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, LocalFilesystem, LocalFilesystemOpenOptions, Memory,
-    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
+use lix::{
+    CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt,
+    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, RedoReceipt,
-    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, TelemetrySink, UndoReceipt,
-    Value, open_lix, open_lix_with_telemetry,
+    ObserveEvents as RsObserveEvents, RedoReceipt, SwitchBranchOptions as RsSwitchBranchOptions,
+    SwitchBranchReceipt, UndoReceipt, Value, open_lix,
 };
+use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -834,10 +834,9 @@ fn open_memory_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let options = RsOpenLixOptions::default();
     let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
-        None => rt.block_on(open_lix(options))?,
+        Some(telemetry) => rt.block_on(async { open_lix().with_telemetry(telemetry).await })?,
+        None => rt.block_on(async { open_lix().await })?,
     };
     NativeLix::new(NativeLixInner::Memory(lix))
 }
@@ -855,10 +854,14 @@ fn open_local_filesystem_native(
     let mut options = LocalFilesystemOpenOptions::new(path, sync_all_files);
     options.lix_dir = lix_dir.map(Into::into);
     let storage = rt.block_on(LocalFilesystem::open_with_options(options))?;
-    let options = RsOpenLixOptions::new(storage.clone());
     let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
-        None => rt.block_on(open_lix(options))?,
+        Some(telemetry) => rt.block_on(async {
+            open_lix()
+                .with_storage(storage.clone())
+                .with_telemetry(telemetry)
+                .await
+        })?,
+        None => rt.block_on(async { open_lix().with_storage(storage.clone()).await })?,
     };
     NativeLix::new(NativeLixInner::LocalFilesystem(lix, storage))
 }

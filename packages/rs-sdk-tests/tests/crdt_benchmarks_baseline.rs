@@ -10,7 +10,8 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lix_sdk::{Lix, OpenLixOptions, Storage, Value, open_lix};
+use lix::storage::Storage;
+use lix::{Lix, Value, open_lix};
 
 const N: usize = 6_000;
 const CONCURRENT_CLIENTS: usize = 100;
@@ -21,9 +22,7 @@ const SAMPLES: usize = 5;
 async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
     let mut samples = Vec::with_capacity(SAMPLES);
     for _sample in 0..SAMPLES {
-        let lix = open_lix(OpenLixOptions::default())
-            .await
-            .expect("B2.1 workspace should open");
+        let lix = open_lix().await.expect("B2.1 workspace should open");
         install_plugin(&lix, "plugin_markdown", &build_markdown_plugin_archive()).await;
 
         let path = "/b2-1.md";
@@ -104,9 +103,7 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
     let mut all_latencies = Vec::with_capacity(samples * clients);
     let mut batch_latencies = Vec::with_capacity(samples);
     for sample in 0..samples {
-        let lix = open_lix(OpenLixOptions::default())
-            .await
-            .expect("B3.1 workspace should open");
+        let lix = open_lix().await.expect("B3.1 workspace should open");
         install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
         let path = format!("/b3-1-{sample}.json");
         write_file(&lix, &path, br#"{"v":-1}"#).await;
@@ -214,7 +211,7 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
 
 #[tokio::test]
 async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
-    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let lix = open_lix().await.unwrap();
     let first = lix.open_workspace_session().await.unwrap();
     let second = lix.open_workspace_session().await.unwrap();
     lix.reset_plugin_transition_counters();
@@ -265,7 +262,7 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+                    let lix = open_lix().await.unwrap();
                     install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
                     let path = "/three-writer.json";
                     write_file(&lix, path, br#"{"v":-1}"#).await;
@@ -345,7 +342,7 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
 
 #[tokio::test]
 async fn invalid_aggregate_member_does_not_poison_valid_transaction() {
-    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let lix = open_lix().await.unwrap();
     install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
     let first = lix.open_workspace_session().await.unwrap();
     let second = lix.open_workspace_session().await.unwrap();

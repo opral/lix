@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use lix_engine::storage::{
+use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
+use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadEntry,
     ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, ValueSemantics, WriteOptions, WriteStats,
 };
-use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rusqlite::types::ValueRef as SqlValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::TempDir;

@@ -6,7 +6,7 @@ use crate::commands::version::{
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_sdk::{CreateBranchOptions, CreateBranchResult, SwitchBranchOptions};
+use lix::{CreateBranchOptions, CreateBranchReceipt, SwitchBranchOptions};
 
 pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
@@ -54,7 +54,7 @@ pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<Comman
 }
 
 fn create_confirmation_lines(
-    result: &CreateBranchResult,
+    result: &CreateBranchReceipt,
     parent: &ResolvedVersionRef,
     active: &ResolvedVersionRef,
 ) -> (String, String) {
@@ -74,11 +74,11 @@ fn create_confirmation_lines(
 mod tests {
     use super::create_confirmation_lines;
     use crate::commands::version::ResolvedVersionRef;
-    use lix_sdk::CreateBranchResult;
+    use lix::CreateBranchReceipt;
 
     #[test]
     fn create_confirmation_uses_active_version_not_parent_version() {
-        let result = CreateBranchResult {
+        let result = CreateBranchReceipt {
             id: "new-version".to_string(),
             name: "New Version".to_string(),
             hidden: false,

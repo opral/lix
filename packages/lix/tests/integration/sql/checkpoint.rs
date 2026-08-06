@@ -1,0 +1,533 @@
+use lix::{LixError, Value};
+use serde_json::json;
+
+use super::select_rows;
+
+simulation_test!(
+    checkpoint_compacts_working_interval_and_projects_sql_surfaces,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let initial_commit_id = sim.initial_commit_id().to_string();
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT commit_id, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+            )
+            .await,
+            vec![vec![
+                Value::Text(initial_commit_id.clone()),
+                Value::Integer(0),
+            ]]
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-key', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should succeed");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'two' WHERE key = 'checkpoint-key'",
+                &[],
+            )
+            .await
+            .expect("tracked update should succeed");
+        let old_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head should load")
+            .expect("head should exist");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT commit_id, lixcol_depth \
+                 FROM lix_checkpoint \
+                 WHERE lixcol_depth = 2",
+            )
+            .await,
+            vec![vec![
+                Value::Text(initial_commit_id.clone()),
+                Value::Integer(2),
+            ]],
+            "checkpoint depth is commit distance from the active head"
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT entity_pk, schema_key, diff_type \
+                 FROM lix_working_diff ORDER BY schema_key, entity_pk",
+            )
+            .await,
+            vec![vec![
+                Value::Json(json!(["checkpoint-key"])),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("added".to_string()),
+            ]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT entity_pk, schema_key, diff_type \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"checkpoint-key\"]')",
+            )
+            .await,
+            vec![vec![
+                Value::Json(json!(["checkpoint-key"])),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("added".to_string()),
+            ]]
+        );
+        assert!(
+            select_rows(
+                &session,
+                "SELECT entity_pk \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'other_schema'",
+            )
+            .await
+            .is_empty()
+        );
+
+        let receipt = session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+        assert_ne!(receipt.commit_id, old_head);
+        assert_eq!(
+            engine
+                .load_branch_head_commit_id(sim.main_branch_id())
+                .await
+                .expect("head should load"),
+            Some(receipt.commit_id.clone())
+        );
+
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_working_diff").await,
+            vec![vec![Value::Integer(0)]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT commit_id, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+            )
+            .await,
+            vec![
+                vec![Value::Text(receipt.commit_id.clone()), Value::Integer(0),],
+                vec![Value::Text(initial_commit_id.clone()), Value::Integer(1)],
+            ]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT parent_id FROM lix_commit_edge \
+                     WHERE child_id = '{}'",
+                    receipt.commit_id
+                ),
+            )
+            .await,
+            vec![vec![Value::Text(initial_commit_id)]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT value FROM lix_key_value WHERE key = 'checkpoint-key'",
+            )
+            .await,
+            vec![vec![Value::Json(json!("two"))]]
+        );
+
+        let timestamps_before_rebuild = select_rows(
+            &session,
+            "SELECT lixcol_created_at, lixcol_updated_at, lixcol_commit_id \
+             FROM lix_key_value WHERE key = 'checkpoint-key'",
+        )
+        .await;
+        assert_eq!(timestamps_before_rebuild.len(), 1);
+        assert_eq!(
+            timestamps_before_rebuild[0][0], timestamps_before_rebuild[0][1],
+            "a newly added row must use the changelog's canonical timestamp"
+        );
+        assert_eq!(
+            timestamps_before_rebuild[0][2],
+            Value::Text(receipt.commit_id.clone()),
+            "retained HOT rows must project the checkpoint as their live commit owner"
+        );
+
+        engine
+            .rebuild_tracked_state_for_branch(sim.main_branch_id())
+            .await
+            .expect("checkpoint tracked state should rebuild");
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT lixcol_created_at, lixcol_updated_at, lixcol_commit_id \
+                 FROM lix_key_value WHERE key = 'checkpoint-key'",
+            )
+            .await,
+            timestamps_before_rebuild,
+            "checkpoint timestamps must remain stable after tracked-state rebuild"
+        );
+    }
+);
+
+simulation_test!(
+    checkpoint_surfaces_are_branch_explicit_and_read_only,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        let rows = select_rows(
+            &session,
+            "SELECT lixcol_branch_id, commit_id \
+             FROM lix_checkpoint_by_branch \
+             ORDER BY lixcol_branch_id, lixcol_depth",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text(sim.main_branch_id().to_string()),
+                Value::Text(sim.initial_commit_id().to_string()),
+            ]]
+        );
+
+        for sql in [
+            "INSERT INTO lix_checkpoint (commit_id, created_at, lixcol_depth) \
+             VALUES ('fake', '2026-01-01T00:00:00Z', 0)",
+            "UPDATE lix_checkpoint SET created_at = 'fake'",
+            "DELETE FROM lix_working_diff",
+            "UPDATE lix_working_diff_by_branch SET diff_type = 'fake'",
+            "DELETE FROM lix_file_working_diff",
+            "UPDATE lix_directory_working_diff_by_branch SET change_kind = 'fake'",
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("checkpoint SQL surface should be read-only");
+            assert_eq!(error.code, LixError::CODE_READ_ONLY);
+        }
+    }
+);
+
+simulation_test!(
+    working_diff_reports_net_tracked_adds_and_removals_after_a_revert,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        for (key, value) in [("working-removed", "old"), ("working-reverted", "old")] {
+            session
+                .execute(
+                    &format!("INSERT INTO lix_key_value (key, value) VALUES ('{key}', '{value}')"),
+                    &[],
+                )
+                .await
+                .expect("tracked baseline insert should succeed");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should succeed");
+
+        for sql in [
+            "UPDATE lix_key_value SET value = 'new' WHERE key = 'working-reverted'",
+            "UPDATE lix_key_value SET value = 'old' WHERE key = 'working-reverted'",
+            "DELETE FROM lix_key_value WHERE key = 'working-removed'",
+            "INSERT INTO lix_key_value (key, value) VALUES ('working-added', 'new')",
+        ] {
+            session
+                .execute(sql, &[])
+                .await
+                .expect("tracked working diff should succeed");
+        }
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT entity_pk, diff_type \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                 ORDER BY entity_pk",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Json(json!(["working-added"])),
+                    Value::Text("added".to_string()),
+                ],
+                vec![
+                    Value::Json(json!(["working-removed"])),
+                    Value::Text("removed".to_string()),
+                ],
+            ],
+            "the direct working-diff path must collapse a payload revert",
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT diff_type \
+                 FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"working-removed\"]')",
+            )
+            .await,
+            vec![vec![Value::Text("removed".to_string())]],
+            "an exact PK filter must preserve the same net diff",
+        );
+    }
+);
+
+simulation_test!(
+    file_working_diff_reports_root_file_changes_without_directory_changes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let file_id = "01950000-0000-7000-8000-000000000099";
+        let nested_file_id = "01950000-0000-7000-8000-000000000100";
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ('{file_id}', '/a.md', X'6F6C64')"
+                ),
+                &[],
+            )
+            .await
+            .expect("root file insert should succeed");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_diff",
+            )
+            .await,
+            vec![vec![
+                Value::Text(file_id.to_string()),
+                Value::Text("/a.md".to_string()),
+                Value::Null,
+                Value::Text("added".to_string()),
+            ]],
+            "a root file add must not require an unrelated directory change",
+        );
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ('{nested_file_id}', '/existing/b.md', X'6F6C64')"
+                ),
+                &[],
+            )
+            .await
+            .expect("nested baseline file insert should succeed");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should succeed");
+        for changed_file_id in [file_id, nested_file_id] {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = X'6E6577' WHERE id = '{changed_file_id}'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file data update should succeed");
+        }
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_diff ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Text(file_id.to_string()),
+                    Value::Text("/a.md".to_string()),
+                    Value::Text("/a.md".to_string()),
+                    Value::Text("modified".to_string()),
+                ],
+                vec![
+                    Value::Text(nested_file_id.to_string()),
+                    Value::Text("/existing/b.md".to_string()),
+                    Value::Text("/existing/b.md".to_string()),
+                    Value::Text("modified".to_string()),
+                ],
+            ],
+            "data-only file changes must resolve targeted file and ancestor descriptors",
+        );
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("second baseline checkpoint should succeed");
+        session
+            .execute(&format!("DELETE FROM lix_file WHERE id = '{file_id}'"), &[])
+            .await
+            .expect("root file delete should succeed");
+        session
+            .execute(
+                &format!(
+                    "UPDATE lix_file SET path = '/existing/c.md' WHERE id = '{nested_file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("nested file rename should succeed");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_diff ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Text(file_id.to_string()),
+                    Value::Null,
+                    Value::Text("/a.md".to_string()),
+                    Value::Text("removed".to_string()),
+                ],
+                vec![
+                    Value::Text(nested_file_id.to_string()),
+                    Value::Text("/existing/c.md".to_string()),
+                    Value::Text("/existing/b.md".to_string()),
+                    Value::Text("modified".to_string()),
+                ],
+            ],
+            "descriptor-only removes and renames must use typed targeted keys",
+        );
+    }
+);
+
+simulation_test!(
+    filesystem_working_diff_surfaces_compose_paths_and_directory_moves,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('01950000-0000-7000-8000-000000000001', '/docs/readme.md', X'68656C6C6F')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_diff ORDER BY id",
+            )
+            .await,
+            vec![vec![
+                Value::Text("01950000-0000-7000-8000-000000000001".to_string()),
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Null,
+                Value::Text("added".to_string()),
+            ]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path, previous_path, change_kind \
+                 FROM lix_directory_working_diff",
+            )
+            .await,
+            vec![vec![
+                Value::Text("/docs".to_string()),
+                Value::Null,
+                Value::Text("added".to_string()),
+            ]]
+        );
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_file_working_diff",).await,
+            vec![vec![Value::Integer(0)]]
+        );
+
+        session
+            .execute(
+                "UPDATE lix_directory SET path = '/writing' WHERE path = '/docs'",
+                &[],
+            )
+            .await
+            .expect("directory move should succeed");
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_diff",
+            )
+            .await,
+            vec![vec![
+                Value::Text("01950000-0000-7000-8000-000000000001".to_string()),
+                Value::Text("/writing/readme.md".to_string()),
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Text("modified".to_string()),
+            ]],
+            "ancestor directory moves expand to descendant logical files"
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path, previous_path FROM lix_directory_working_diff",
+            )
+            .await,
+            vec![vec![
+                Value::Text("/writing".to_string()),
+                Value::Text("/docs".to_string()),
+            ]]
+        );
+    }
+);

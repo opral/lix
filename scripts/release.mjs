@@ -173,30 +173,7 @@ export function updateCargoToml(root, version) {
 		/(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")[^"]+(")/,
 		`$1${version}$2`,
 	);
-	text = updatePathDependencyVersions(text, version);
 	writeText(root, "Cargo.toml", text);
-
-	for (const path of [
-		"packages/js-sdk/Cargo.toml",
-		"packages/rs-sdk-tests/Cargo.toml",
-		"packages/server-protocol/Cargo.toml",
-	]) {
-		let packageText = readText(root, path);
-		packageText = updatePackageVersionField(packageText, version);
-		packageText = updatePathDependencyVersions(packageText, version);
-		writeText(root, path, packageText);
-	}
-}
-
-function updatePackageVersionField(text, version) {
-	return text.replace(/(\[package\][\s\S]*?\nversion\s*=\s*")[^"]+(")/, `$1${version}$2`);
-}
-
-function updatePathDependencyVersions(text, version) {
-	return text.replace(
-		/((?:^|\n)[A-Za-z0-9_-]+\s*=\s*\{[^}\n]*\bpath\s*=\s*"[^"]+"[^}\n]*\bversion\s*=\s*")[^"]+(")/g,
-		`$1${version}$2`,
-	);
 }
 
 export function updatePackageVersion(root, version) {
@@ -252,7 +229,7 @@ export function prepareRelease(root, { date = new Date().toISOString().slice(0, 
 	for (const change of changes) {
 		rmSync(join(root, change.path));
 	}
-	execFileSync("cargo", ["update", "-p", "lix_cli", "-p", "lix_engine", "-p", "lix_js_sdk", "-p", "lix_sdk"], {
+	execFileSync("cargo", ["update", "-p", "lix_cli", "-p", "lix_js_sdk"], {
 		cwd: root,
 		stdio: "inherit",
 	});

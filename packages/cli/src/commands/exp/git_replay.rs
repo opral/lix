@@ -1,11 +1,11 @@
 use crate::cli::exp::{ExpGitReplayArgs, GitReplayParentTree, GitReplayPlugins, GitReplayStorage};
 use crate::db;
 use crate::error::CliError;
-use lix_rocksdb_storage::RocksDB;
-use lix_sdk::{
-    Lix, PreparedDmlParameterBatch, Storage, Value, WasmTransitionCounters, open_lix_with_storage,
-};
-use lix_slatedb_storage::SlateDB;
+use lix::storage::Storage;
+use lix::wasm::WasmTransitionCounters;
+use lix::{Lix, PreparedDmlParameterBatch, Value, open_lix};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use zip::write::SimpleFileOptions;
 
 #[cfg(test)]
-use lix_sdk::Memory;
+use lix::Memory;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
@@ -368,7 +368,7 @@ where
     } else {
         "window"
     };
-    let lix = db::block_on(open_lix_with_storage(storage.clone()))
+    let lix = db::block_on(open_lix().with_storage(storage.clone()))
         .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
     db::block_on(lix.execute(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
@@ -2571,7 +2571,7 @@ mod tests {
     fn ordinary_multi_file_replay_uses_one_prepared_page_and_keeps_marker_atomic() {
         let before = PreparedDmlParameterBatch::take_execution_counters();
         let lix =
-            db::block_on(open_lix_with_storage(Memory::new())).expect("memory Lix should open");
+            db::block_on(open_lix().with_storage(Memory::new())).expect("memory Lix should open");
         let statements =
             vec![
             SqlStatement {
@@ -2726,7 +2726,7 @@ mod tests {
 
         fs::remove_dir_all(&repo).expect("Git and LFS source should be removable");
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen without Git");
-        let lix = db::block_on(open_lix_with_storage(storage))
+        let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen without Git");
         let marker_rows = db::block_on(lix.execute(
             "SELECT value, lixcol_observed_commit_id \
@@ -3411,7 +3411,7 @@ mod tests {
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
-        let lix = db::block_on(open_lix_with_storage(storage))
+        let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
         let checkpoint_rows =
             db::block_on(lix.execute("SELECT count(*) AS count FROM lix_checkpoint", &[]))
@@ -3529,8 +3529,8 @@ mod tests {
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
-        let lix =
-            db::block_on(open_lix_with_storage(storage)).expect("replay Lix should reopen cleanly");
+        let lix = db::block_on(open_lix().with_storage(storage))
+            .expect("replay Lix should reopen cleanly");
         let rows = db::block_on(lix.execute(
             "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
@@ -3687,7 +3687,7 @@ mod tests {
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
-        let lix = db::block_on(open_lix_with_storage(storage))
+        let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
         for (index, expected) in expected_final.iter().enumerate() {
             let path = format!("/bulk-{index:02}.txt");
@@ -3789,7 +3789,7 @@ mod tests {
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
-        let lix = db::block_on(open_lix_with_storage(storage))
+        let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
         let file_rows = db::block_on(lix.execute(
             "SELECT content FROM lix_file WHERE path = ?",

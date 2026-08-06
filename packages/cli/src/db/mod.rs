@@ -7,16 +7,16 @@ use crate::app::AppContext;
 use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
-use lix_sdk::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Lix, LixError,
-    ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
+use lix::storage::{
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
+    PutBatch, ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
     StorageError, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions, WriteStats,
-    open_lix_with_storage,
 };
+use lix::{Lix, LixError, open_lix};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -62,7 +62,7 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
 pub fn open_lix_at(path: &Path) -> Result<FileLix, CliError> {
     let storage = FileStorage::from_path(path)?;
 
-    block_on(open_lix_with_storage(storage))
+    block_on(open_lix().with_storage(storage))
         .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
 }
 
@@ -159,12 +159,16 @@ fn validate_lix_file_path(path: &Path) -> Result<(), CliError> {
     )))
 }
 
-pub fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F>(future: F) -> F::Output
+where
+    F: IntoFuture,
+    F::IntoFuture: Future<Output = F::Output>,
+{
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime should initialize")
-        .block_on(future)
+        .block_on(future.into_future())
 }
 
 fn remove_sidecar(path: &Path, suffix: &str) -> Result<(), CliError> {
@@ -235,7 +239,7 @@ impl Storage for FileStorage {
         opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
-            if opts.durability == lix_sdk::ReadDurability::Durable {
+            if opts.durability == ReadDurability::Durable {
                 return Err(StorageError::Durability);
             }
             Ok(FileStorageRead {

@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
-use lix_engine::Storage;
-use lix_engine::storage::{
+use lix::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
-    PutBatch, ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead, StorageSpace,
-    StorageWrite, WriteOptions,
+    PutBatch, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead,
+    StorageSpace, StorageWrite, WriteOptions,
 };
-use lix_rocksdb_storage::{RocksDB, RocksDBRead, RocksDBWrite};
-use lix_sqlite_storage::{SQLite, SQLiteRead, SQLiteWrite};
+use lix_storage_rocksdb::{RocksDB, RocksDBRead, RocksDBWrite};
+use lix_storage_sqlite::{SQLite, SQLiteRead, SQLiteWrite};
 use tempfile::TempDir;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

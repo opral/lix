@@ -2,12 +2,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use lix_engine::storage::{
+use lix::storage::{
     GetManyRequest, GetOptions, Key, PutBatch, PutEntry, ReadOptions, SpaceId, Storage,
     StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 const WARMUPS: usize = 10_000;
 const SAMPLES: usize = 100_001;

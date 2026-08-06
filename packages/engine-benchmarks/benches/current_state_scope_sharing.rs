@@ -1,13 +1,13 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::tracked_state::bench::{
+use lix::storage_adapter::StorageAdapter;
+use lix::tracked_state::bench::{
     BenchCurrentStatePointFixture, BenchCurrentStatePointMode, BenchCurrentStatePointTarget,
     BenchCurrentStateSparseShape, seed_current_state_point_fixture,
 };
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 fn main() {
     let rows = env_usize("LIX_CURRENT_STATE_ROWS", 1_000_000);
@@ -84,7 +84,7 @@ async fn run_backend<S>(
     sparse_shape: BenchCurrentStateSparseShape,
     point_target: BenchCurrentStatePointTarget,
 ) where
-    S: lix_engine::storage::Storage,
+    S: lix::storage::Storage,
 {
     let setup = Instant::now();
     let mut fixture = seed_current_state_point_fixture(
@@ -194,7 +194,7 @@ async fn measure<S>(
     samples: usize,
 ) -> (Duration, Duration)
 where
-    S: lix_engine::storage::Storage,
+    S: lix::storage::Storage,
 {
     for _ in 0..warmups {
         black_box(fixture.read_point(mode).await);

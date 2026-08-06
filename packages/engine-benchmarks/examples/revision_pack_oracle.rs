@@ -5,11 +5,11 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::{collections::HashMap, ffi::OsStr};
 
-use lix_engine::storage_adapter::{StorageAdapter, StorageReadOptions};
-use lix_engine::storage_bench::{
+use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
+use lix::storage_bench::{
     binary_cas_payload_inventory, current_image_cas_oracle_accounting, layout_accounting,
 };
-use lix_slatedb_storage::SlateDB;
+use lix_storage_slatedb::SlateDB;
 
 #[tokio::main]
 async fn main() {
@@ -111,7 +111,7 @@ fn is_likely_text(bytes: &[u8]) -> bool {
 
 fn import_payloads(
     repository: &Path,
-    payloads: &[lix_engine::storage_bench::BinaryCasPayloadInventoryEntry],
+    payloads: &[lix::storage_bench::BinaryCasPayloadInventoryEntry],
 ) {
     let mut child = Command::new("git")
         .arg("-C")
@@ -182,7 +182,7 @@ fn pack_bytes(repository: &Path) -> (u64, u64) {
 /// so already-compressed media cannot make the candidate larger.
 fn hybrid_pack_bytes(
     repository: &Path,
-    payloads: &[lix_engine::storage_bench::BinaryCasPayloadInventoryEntry],
+    payloads: &[lix::storage_bench::BinaryCasPayloadInventoryEntry],
     zstd_level: i32,
 ) -> u64 {
     let pack_dir = repository.join("objects/pack");

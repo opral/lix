@@ -131,38 +131,39 @@ test("updateChangelog inserts new entries after heading", () => {
 	);
 });
 
-test("updateCargoToml bumps internal path dependency versions", () => {
+test("updateCargoToml leaves independently released Rust packages untouched", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
 	mkdirSync(join(root, "packages", "rs-sdk-tests"), { recursive: true });
 	mkdirSync(join(root, "packages", "server-protocol"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
-		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_sqlite_storage = { path = "packages/sqlite-storage", version = "0.6.2" }\nlix_rocksdb_storage = { path = "packages/rocksdb-storage", version = "0.6.2" }\nlix_slatedb_storage = { path = "packages/slatedb-storage", version = "0.6.2" }\nlix_engine = { path = "packages/engine", version = "0.6.2" }\n`,
+		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_sqlite = { path = "packages/sqlite-storage", version = "0.6.2" }\nlix_storage_rocksdb = { path = "packages/rocksdb-storage", version = "0.6.2" }\nlix_storage_slatedb = { path = "packages/slatedb-storage", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
-		`[package]\nname = "lix_js_sdk"\nversion.workspace = true\n\n[dependencies]\nlix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false }\n`,
+		`[package]\nname = "lix_js_sdk"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "rs-sdk-tests", "Cargo.toml"),
-		`[package]\nname = "lix_sdk_tests"\nversion = "0.6.2"\n\n[dependencies]\nlix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false }\n`,
+		`[package]\nname = "lix_tests"\nversion = "0.6.2"\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "server-protocol", "Cargo.toml"),
-		`[package]\nname = "lix_server_protocol"\nversion.workspace = true\n\n[dependencies]\nlix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false }\n`,
+		`[package]\nname = "lix-server-protocol"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
 	);
 
 	updateCargoToml(root, "0.7.0");
 
 	const rootCargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
-	assert.match(rootCargoToml, /lix_sqlite_storage = \{ path = "packages\/sqlite-storage", version = "0\.7\.0"/);
-	assert.match(rootCargoToml, /lix_rocksdb_storage = \{ path = "packages\/rocksdb-storage", version = "0\.7\.0"/);
-	assert.match(rootCargoToml, /lix_slatedb_storage = \{ path = "packages\/slatedb-storage", version = "0\.7\.0"/);
-	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
-	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /version = "0\.7\.0"/);
-	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
-	assert.match(readFileSync(join(root, "packages", "server-protocol", "Cargo.toml"), "utf8"), /lix_sdk = \{ path = "\.\.\/rs-sdk", version = "0\.7\.0"/);
+	assert.match(rootCargoToml, /\[workspace\.package\]\nversion = "0\.7\.0"/);
+	assert.match(rootCargoToml, /lix_storage_sqlite = \{ path = "packages\/sqlite-storage", version = "0\.6\.2"/);
+	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/rocksdb-storage", version = "0\.6\.2"/);
+	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/slatedb-storage", version = "0\.6\.2"/);
+	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
+	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /version = "0\.6\.2"/);
+	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
+	assert.match(readFileSync(join(root, "packages", "server-protocol", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
 });
 
 test("updatePackageVersion pins native optional dependencies", () => {
