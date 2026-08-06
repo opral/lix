@@ -379,14 +379,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &deleted_checkpoint_files,
     )
     .await?;
-    for branch_id in &deleted_checkpoint_branches {
-        crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
-            &*read,
-            &mut writes,
-            branch_id,
-        )
-        .await?;
-    }
+    // Branch-owned plugin checkpoints are derived serving state.  Branch
+    // deletion publishes the authenticated lifecycle/control retirement here;
+    // the GC reachability consumer reclaims the UUID range after the retired
+    // root is proven unreachable.  Avoid scanning the entire checkpoint range
+    // in the foreground write transaction.
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,

@@ -1135,6 +1135,7 @@ where
     let mut queue_open = true;
     let mut reclaimed_commits = Vec::new();
     let mut reclaimed_standalone_changes = BTreeSet::new();
+    let mut reclaimed_checkpoint_branches = BTreeSet::new();
     for (sequence, batch) in batches {
         if queue_open && blocked_sequences.contains(&sequence) {
             queue_open = false;
@@ -1225,6 +1226,23 @@ where
                 &store, writes, old_root, &manifest,
             )
             .await?;
+            // Checkpoint rows are derived serving state owned by the branch,
+            // rather than by an individual historical commit.  Reclaim the
+            // branch UUID range only once that branch has no live control;
+            // an advanced branch may retire this old control while its newer
+            // control still needs the same checkpoint rows.
+            if !controls
+                .iter()
+                .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
+                && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
+            {
+                crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
+                    &store,
+                    writes,
+                    &delta.branch_id,
+                )
+                .await?;
+            }
             if let Some(control) = delta.old_control.as_ref() {
                 if !controls
                     .iter()
