@@ -64,6 +64,7 @@ async fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
                 sql_session::OlapReadShape::Sort => 85,
                 sql_session::OlapReadShape::Group => 32,
                 sql_session::OlapReadShape::Aggregate => 1,
+                sql_session::OlapReadShape::Join => 85,
             };
             assert_eq!(
                 fixture.read_olap(shape).await,
@@ -88,6 +89,7 @@ async fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
                 sql_session::OlapReadShape::Sort => 1_365,
                 sql_session::OlapReadShape::Group => 32,
                 sql_session::OlapReadShape::Aggregate => 1,
+                sql_session::OlapReadShape::Join => 1_365,
             };
             assert_eq!(
                 fixture.read_olap(shape).await,

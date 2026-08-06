@@ -69,10 +69,10 @@ impl SqlWriteResult {
 }
 
 pub(crate) use datafusion::{
-    DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadSqlResult,
-    execute_read_statement_from_parsed, execute_read_statement_in_session_from_parsed,
+    DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadResult, SessionReadSqlResult,
+    execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
     execute_transaction_read_statement_from_parsed, prepare_read_session,
-    prepare_read_session_at_head,
+    prepare_read_session_at_head, query_result_from_batches,
 };
 #[cfg(test)]
 pub(crate) use write::{

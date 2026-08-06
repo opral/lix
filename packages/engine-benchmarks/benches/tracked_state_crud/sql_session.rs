@@ -41,15 +41,17 @@ pub(crate) enum OlapReadShape {
     Sort,
     Group,
     Aggregate,
+    Join,
 }
 
 impl OlapReadShape {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Scan,
         Self::Filter,
         Self::Sort,
         Self::Group,
         Self::Aggregate,
+        Self::Join,
     ];
 
     pub(crate) const fn label(self) -> &'static str {
@@ -59,6 +61,7 @@ impl OlapReadShape {
             Self::Sort => "olap_sort",
             Self::Group => "olap_group",
             Self::Aggregate => "olap_aggregate",
+            Self::Join => "olap_join",
         }
     }
 
@@ -84,6 +87,11 @@ impl OlapReadShape {
                 "SELECT COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, AVG(score) AS score_avg, \
                  MIN(ordinal) AS min_ordinal, MAX(ordinal) AS max_ordinal \
                  FROM olap_row WHERE active = TRUE"
+            }
+            Self::Join => {
+                "SELECT left_row.id, right_row.score FROM olap_row AS left_row \
+                 JOIN olap_row AS right_row ON left_row.id = right_row.id \
+                 WHERE left_row.active = TRUE ORDER BY left_row.ordinal"
             }
         }
     }
@@ -511,6 +519,21 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.read_olap(shape).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_olap(shape).await,
+        }
+    }
+
+    /// Executes one typed OLAP query through the profiled public session path.
+    /// In the count-only ceiling mode the engine intentionally returns no
+    /// public rows, so the profile's retained Arrow row count is the result.
+    pub(crate) async fn read_olap_profiled(
+        &self,
+        shape: OlapReadShape,
+    ) -> (usize, lix::SqlReadProfile) {
+        match self {
+            Self::SQLite(fixture) => fixture.read_olap_profiled(shape).await,
+            Self::RocksDB(fixture) => fixture.read_olap_profiled(shape).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_olap_profiled(shape).await,
         }
     }
 
@@ -957,8 +980,43 @@ where
             OlapReadShape::Sort => assert_olap_sort(&result, expected),
             OlapReadShape::Group => assert_olap_group(&result, expected),
             OlapReadShape::Aggregate => assert_olap_aggregate(&result, expected),
+            OlapReadShape::Join => assert_olap_join(&result, expected),
         }
         result.len()
+    }
+
+    async fn read_olap_profiled(&self, shape: OlapReadShape) -> (usize, lix::SqlReadProfile) {
+        let expected = self
+            .olap_expected
+            .as_ref()
+            .expect("typed OLAP query requires a typed OLAP fixture");
+        let (result, profile) = self
+            .session
+            .execute_profiled(shape.sql(), &[])
+            .await
+            .expect("profile typed OLAP query");
+        let expected_len = match shape {
+            OlapReadShape::Scan => expected.visible_rows,
+            OlapReadShape::Filter => expected.filtered_rows,
+            OlapReadShape::Sort => 10_000.min(expected.active_rows as usize),
+            OlapReadShape::Group => expected.groups.len(),
+            OlapReadShape::Aggregate => 1,
+            OlapReadShape::Join => expected.active_rows as usize,
+        };
+        if profile.result_count_only_rows > 0 {
+            assert_eq!(profile.result_count_only_rows as usize, expected_len);
+            (expected_len, profile)
+        } else {
+            match shape {
+                OlapReadShape::Scan => assert_olap_scan(&result, expected),
+                OlapReadShape::Filter => assert_olap_filter(&result, expected),
+                OlapReadShape::Sort => assert_olap_sort(&result, expected),
+                OlapReadShape::Group => assert_olap_group(&result, expected),
+                OlapReadShape::Aggregate => assert_olap_aggregate(&result, expected),
+                OlapReadShape::Join => assert_olap_join(&result, expected),
+            }
+            (result.len(), profile)
+        }
     }
 
     async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
@@ -973,6 +1031,7 @@ where
             OlapReadShape::Sort => 10_000.min(expected.active_rows as usize),
             OlapReadShape::Group => expected.groups.len(),
             OlapReadShape::Aggregate => 1,
+            OlapReadShape::Join => expected.active_rows as usize,
         };
         assert_eq!(result.len(), expected_len);
         result.len()
@@ -1547,6 +1606,27 @@ fn assert_olap_aggregate(result: &ExecuteResult, expected: &OlapExpected) {
     );
     assert_eq!(integer_at(result, 0, 3), expected.active_min_ordinal);
     assert_eq!(integer_at(result, 0, 4), expected.active_max_ordinal);
+}
+
+fn assert_olap_join(result: &ExecuteResult, expected: &OlapExpected) {
+    assert_eq!(result.len(), expected.active_rows as usize);
+    assert_eq!(result.columns(), ["id", "score"]);
+    for row_index in 0..result.len() {
+        let id = text_at(result, row_index, 0);
+        let score = real_at(result, row_index, 1);
+        let ordinal = id
+            .strip_prefix("/~lix-olap/")
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("join id should carry the fixture ordinal");
+        let expected_row = olap_expected_row(
+            expected.initial_row_count,
+            expected.mutation_profile,
+            ordinal,
+        )
+        .expect("join returned an unknown row");
+        assert!(expected_row.active);
+        assert_eq!(score, expected_row.score);
+    }
 }
 
 fn integer_at(result: &ExecuteResult, row: usize, column: usize) -> i64 {
