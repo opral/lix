@@ -21,7 +21,7 @@ struct DuckDbPhaseSample {
 
 #[derive(Clone, Copy)]
 struct LixPhaseSample {
-    profile: lix_engine::SqlReadProfile,
+    profile: ::lix::SqlReadProfile,
     common_owned_row_normalization: Duration,
 }
 

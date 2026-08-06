@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-use lix_engine::{Engine, ObserveEvent, ObserveEvents, Storage, Value};
-use lix_sqlite_storage::SQLite;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::{ObserveEvent, ObserveEvents, Value};
+use lix_storage_sqlite::SQLite;
 use serde_json::json;
 
 const NEXT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -49,7 +51,7 @@ async fn observe_emits_when_independently_opened_sqlite_commits() {
 }
 
 fn observe_key<StorageImpl>(
-    session: &lix_engine::SessionContext<StorageImpl>,
+    session: &SessionContext<StorageImpl>,
     key: &str,
 ) -> ObserveEvents<StorageImpl>
 where

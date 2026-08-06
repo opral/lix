@@ -5,12 +5,13 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lix_engine::storage::Storage;
-use lix_engine::storage_adapter::StorageAdapter;
-use lix_engine::tracked_state::bench::seed_packed_history;
-use lix_engine::{Engine, SessionContext, Value};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+use lix::Value;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::storage_adapter::StorageAdapter;
+use lix::tracked_state::bench::seed_packed_history;
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const DEFAULT_HISTORY: &[usize] = &[100_000, 1_000_000, 10_000_000];
 const DEFAULT_WIDTHS: &[usize] = &[1, 10, 100, 10_000];

@@ -2,8 +2,8 @@ mod native_file_read;
 mod native_file_upsert;
 mod rocksdb_specific;
 
-use lix_engine::run_storage_conformance;
-use lix_rocksdb_storage::{RocksDB, RocksDBFactory};
+use lix::storage::conformance::run_storage_conformance;
+use lix_storage_rocksdb::{RocksDB, RocksDBFactory};
 
 #[tokio::test]
 async fn rocksdb_passes_storage_conformance() {

@@ -1,7 +1,9 @@
 //! Storage-backend coverage for the structured native file-read surface.
 
-use lix_engine::{Engine, SessionContext, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
+use lix::Value;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix_storage_rocksdb::RocksDB;
 
 #[tokio::test]
 async fn native_file_read_works_with_rocksdb() {

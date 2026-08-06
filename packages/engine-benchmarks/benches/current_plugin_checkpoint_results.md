@@ -122,12 +122,12 @@ part of that prototype is retained.
 
 ## Verification
 
-- `cargo test -p lix_engine --features all-simulations`: 1,664 unit tests and
+- `cargo test -p lix --features all-simulations`: 1,664 unit tests and
   800 base/rebuild integration simulations passed.
 - RocksDB: 15 tests passed, including storage conformance.
 - SlateDB: 58 tests passed, including storage conformance and cached storage.
 - SQLite: 2 tests passed, including storage conformance.
-- `cargo check -p lix_engine_benchmarks --all-features` passed.
+- `cargo check -p lix_benchmarks --all-features` passed.
 - `git_text_plugin` cold reopen passed and restored the durable checkpoint
   without full semantic-state hydration.
 - The matched benchmark passed its byte, semantic, merge, and cold-open

@@ -3,7 +3,7 @@
 `lix_server_protocol::LixProtocolServer` exposes the canonical HTTP protocol
 for one workspace. A host owns authentication, workspace routing, storage
 construction, and process lifecycle. The protocol server owns the root
-`lix_sdk::Lix` handle and a bounded registry of independent remote sessions.
+`lix::Lix` handle and a bounded registry of independent remote sessions.
 
 A JavaScript client connects with `openLix({ server })`:
 
@@ -19,17 +19,17 @@ const lix = await openLix({
 ```
 
 The host chooses the storage. For shared S3 deployments, use the shipped
-`lix_slatedb_storage` implementation backed by an S3-compatible object store.
+`lix-storage-slatedb` implementation backed by an S3-compatible object store.
 The JavaScript client does not connect to S3 directly.
 
 ```rust,no_run
 use std::sync::Arc;
 use axum::Router;
-use lix_sdk::{OpenLixOptions, open_lix};
+use lix::open_lix;
 use lix_server_protocol::LixProtocolServer;
 
-# async fn example() -> Result<(), lix_sdk::LixError> {
-let root = Arc::new(open_lix(OpenLixOptions::default()).await?);
+# async fn example() -> Result<(), lix::LixError> {
+let root = Arc::new(open_lix().await?);
 let protocol = LixProtocolServer::new(root);
 let app = Router::new().merge(protocol.router());
 

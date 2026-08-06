@@ -5,12 +5,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use lix_engine::storage::{
+use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, PutEntry,
     ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
     WriteOptions,
 };
-use lix_rocksdb_storage::RocksDB;
+use lix_storage_rocksdb::RocksDB;
 
 #[test]
 fn same_process_open_reuses_shared_database_handle() {

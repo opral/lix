@@ -5,15 +5,14 @@ use std::sync::Arc;
 
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
-use lix_sdk::{
-    CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions,
-    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
-    OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
-    SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, open_lix,
-    open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
+use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
+use lix::{
+    CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
+    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, Memory, MergeBranchOptions as RsMergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
+    SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
+    parse_sql_script as parse_rs_sql_script,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -58,7 +57,6 @@ pub async fn open_memory_from_snapshot(
         }
         None => Memory::new(),
     };
-    let options = RsOpenLixOptions::new(storage.clone());
     let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
@@ -70,8 +68,13 @@ pub async fn open_memory_from_snapshot(
         sink
     });
     let inner = match telemetry {
-        Some(telemetry) => open_lix_with_telemetry(options, telemetry).await,
-        None => open_lix(options).await,
+        Some(telemetry) => {
+            open_lix()
+                .with_storage(storage.clone())
+                .with_telemetry(telemetry)
+                .await
+        }
+        None => open_lix().with_storage(storage.clone()).await,
     }
     .map_err(lix_error_to_js)?;
     Ok(WasmLix { inner, storage })
@@ -524,8 +527,8 @@ struct MergeBranchReceiptDto {
     change_stats: MergeChangeStatsDto,
 }
 
-impl From<lix_sdk::MergeBranchReceipt> for MergeBranchReceiptDto {
-    fn from(receipt: lix_sdk::MergeBranchReceipt) -> Self {
+impl From<lix::MergeBranchReceipt> for MergeBranchReceiptDto {
+    fn from(receipt: lix::MergeBranchReceipt) -> Self {
         Self {
             outcome: merge_outcome(receipt.outcome),
             target_branch_id: receipt.target_branch_id,
@@ -553,8 +556,8 @@ struct MergeBranchPreviewDto {
     conflicts: Vec<MergeConflictDto>,
 }
 
-impl From<lix_sdk::MergeBranchPreview> for MergeBranchPreviewDto {
-    fn from(preview: lix_sdk::MergeBranchPreview) -> Self {
+impl From<lix::MergeBranchPreview> for MergeBranchPreviewDto {
+    fn from(preview: lix::MergeBranchPreview) -> Self {
         Self {
             outcome: merge_outcome(preview.outcome),
             target_branch_id: preview.target_branch_id,
@@ -584,8 +587,8 @@ struct MergeChangeStatsDto {
     removed: usize,
 }
 
-impl From<lix_sdk::MergeChangeStats> for MergeChangeStatsDto {
-    fn from(stats: lix_sdk::MergeChangeStats) -> Self {
+impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
+    fn from(stats: lix::MergeChangeStats) -> Self {
         Self {
             total: stats.total,
             added: stats.added,
@@ -606,8 +609,8 @@ struct MergeConflictDto {
     source: MergeConflictSideDto,
 }
 
-impl From<lix_sdk::MergeConflict> for MergeConflictDto {
-    fn from(conflict: lix_sdk::MergeConflict) -> Self {
+impl From<lix::MergeConflict> for MergeConflictDto {
+    fn from(conflict: lix::MergeConflict) -> Self {
         Self {
             kind: "sameEntityChanged",
             schema_key: conflict.schema_key,
@@ -627,12 +630,12 @@ struct MergeConflictSideDto {
     after_change_id: Option<String>,
 }
 
-impl From<lix_sdk::MergeConflictSide> for MergeConflictSideDto {
-    fn from(side: lix_sdk::MergeConflictSide) -> Self {
+impl From<lix::MergeConflictSide> for MergeConflictSideDto {
+    fn from(side: lix::MergeConflictSide) -> Self {
         let kind = match side.kind {
-            lix_sdk::MergeConflictChangeKind::Added => "added",
-            lix_sdk::MergeConflictChangeKind::Modified => "modified",
-            lix_sdk::MergeConflictChangeKind::Removed => "removed",
+            lix::MergeConflictChangeKind::Added => "added",
+            lix::MergeConflictChangeKind::Modified => "modified",
+            lix::MergeConflictChangeKind::Removed => "removed",
         };
         Self {
             kind,

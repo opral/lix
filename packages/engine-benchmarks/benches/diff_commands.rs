@@ -4,8 +4,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use lix_engine::storage::Memory;
-use lix_engine::{Engine, SessionContext, Value};
+use lix::Value;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Memory;
 use serde_json::json;
 
 fn diff_command_benches(c: &mut Criterion) {

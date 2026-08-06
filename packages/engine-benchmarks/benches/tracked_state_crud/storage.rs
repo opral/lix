@@ -1,7 +1,7 @@
-pub(crate) use lix_rocksdb_storage::RocksDB;
+pub(crate) use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
-pub(crate) use lix_slatedb_storage::SlateDB;
-pub(crate) use lix_sqlite_storage::SQLite;
+pub(crate) use lix_storage_slatedb::SlateDB;
+pub(crate) use lix_storage_sqlite::SQLite;
 use tempfile::TempDir;
 
 #[derive(Clone, Copy)]
@@ -106,7 +106,7 @@ impl StorageProfile {
                 let storage = SlateDB::open_object_store_with_options(
                     db_path,
                     object_store,
-                    lix_slatedb_storage::SlateDBObjectStoreOptions::default(),
+                    lix_storage_slatedb::SlateDBObjectStoreOptions::default(),
                 )
                 .expect("open remote-path SlateDB object store");
                 ProfileStorage::SlateDB { storage, _dir: dir }

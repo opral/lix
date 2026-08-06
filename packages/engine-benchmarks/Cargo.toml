@@ -1,5 +1,5 @@
 [package]
-name = "lix_engine_benchmarks"
+name = "lix_benchmarks"
 version.workspace = true
 publish = false
 authors.workspace = true
@@ -14,10 +14,10 @@ workspace = true
 
 [features]
 default = ["rocksdb"]
-rocksdb = ["dep:lix_rocksdb_storage"]
-sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite"]
-slatedb = ["dep:lix_slatedb_storage", "dep:object_store", "dep:slatedb", "dep:ulid"]
-storage-benches = ["lix_engine/storage-benches", "rocksdb", "sqlite"]
+rocksdb = ["dep:lix_storage_rocksdb"]
+sqlite = ["dep:lix_storage_sqlite", "dep:rusqlite"]
+slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
+storage-benches = ["lix/storage-benches", "rocksdb", "sqlite"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Opt-in profiling build that routes Rust allocations through libc so tools
 # such as heaptrack can attribute transient allocation churn to call stacks.
@@ -27,10 +27,10 @@ tpch = ["dep:duckdb", "dep:tpchgen"]
 system-allocation-profiler = []
 
 [dependencies]
-lix_engine = { workspace = true }
-lix_rocksdb_storage = { workspace = true, optional = true }
-lix_slatedb_storage = { workspace = true, optional = true }
-lix_sqlite_storage = { workspace = true, optional = true }
+lix = { workspace = true }
+lix_storage_rocksdb = { workspace = true, optional = true }
+lix_storage_slatedb = { workspace = true, optional = true }
+lix_storage_sqlite = { workspace = true, optional = true }
 object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
 slatedb = { version = "0.14.1", default-features = false, features = ["moka", "zstd"], optional = true }
 ulid = { version = "1.2.1", optional = true }
@@ -224,6 +224,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "branch_checkpoint_retirement"
+path = "benches/branch_checkpoint_retirement.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "fixed_live_history_scale"
 path = "benches/fixed_live_history_scale.rs"
 harness = false
@@ -239,7 +245,7 @@ required-features = ["storage-benches", "slatedb"]
 name = "uuid_v7_physical_keys"
 path = "benches/uuid_v7_physical_keys.rs"
 harness = false
-required-features = ["lix_engine/storage-benches", "rocksdb", "slatedb"]
+required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 
 [[bench]]
 name = "entity_pk_layout"

@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use lix::wasm::WasmTransitionCounters;
+
 pub const MACHINE_RECORD_PREFIX: &str = "LIX_BATCH_BENCHMARK_JSON=";
 pub const TRANSITION_RECORD_PREFIX: &str = "LIX_TRANSITION_PROFILE_JSON=";
 pub const LARGE_ALLOCATION_BYTES: u64 = 64 * 1024;
@@ -247,7 +249,7 @@ pub fn emit_transition_profile(
     benchmark: &'static str,
     lane: &'static str,
     sample: usize,
-    counters: lix_sdk::WasmTransitionCounters,
+    counters: WasmTransitionCounters,
     correctness: serde_json::Value,
 ) {
     eprintln!(

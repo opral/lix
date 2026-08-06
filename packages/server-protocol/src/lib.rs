@@ -1,5 +1,5 @@
 //! Canonical HTTP transport for independent pinned sessions on a workspace-mode
-//! root [`lix_sdk::Lix`] handle.
+//! root [`lix::Lix`] handle.
 
 #![recursion_limit = "256"]
 #![cfg_attr(test, allow(clippy::large_futures))]
@@ -20,12 +20,12 @@ use axum::{
     routing::{delete, get, post},
 };
 #[cfg(test)]
-use lix_sdk::FILE_UPLOAD_PART_BYTES;
-use lix_sdk::{
+use lix::FILE_UPLOAD_PART_BYTES;
+use lix::storage::Storage;
+use lix::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions,
     ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction,
-    ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, VerifiedRequestBlob,
-    WireValue,
+    ObserveEvent, ObserveEvents, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -957,7 +957,7 @@ where
     async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<lix_sdk::SwitchBranchReceipt, LixError> {
+    ) -> Result<lix::SwitchBranchReceipt, LixError> {
         let lix = Arc::clone(&self.record.lix);
         self.run_detached(
             async move { lix.switch_branch(options).await },
@@ -1324,7 +1324,7 @@ where
         // A stale client branch preference therefore cannot consume capacity or
         // evict another client.
         let active_account_id =
-            initial_active_account_id.unwrap_or_else(|| lix_sdk::ANONYMOUS_ACCOUNT_ID.to_string());
+            initial_active_account_id.unwrap_or_else(|| lix::ANONYMOUS_ACCOUNT_ID.to_string());
         let child = match self
             .inner
             .root
@@ -3444,7 +3444,7 @@ struct ExecuteResponse {
     columns: Vec<String>,
     rows: Vec<Vec<WireValue>>,
     rows_affected: u64,
-    notices: Vec<lix_sdk::LixNotice>,
+    notices: Vec<lix::LixNotice>,
 }
 
 impl TryFrom<ExecuteResult> for ExecuteResponse {
@@ -3950,15 +3950,16 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
+    use lix::storage::{
+        CommitResult, Key, KeyRange, MemoryRead, MemoryWrite, PutBatch, ReadOptions, Storage,
+        StorageError, StorageSpace, StorageWrite, WriteOptions,
+    };
+    use lix::telemetry::TracingTelemetrySink;
+    use lix::{Blob, Memory, RequestBlobSpliceProvenance, open_lix};
     use lix_collaboration_test_support::{
         CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
     };
-    use lix_sdk::{
-        Blob, CommitResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite, OpenLixOptions,
-        PutBatch, ReadOptions, RequestBlobSpliceProvenance, StorageError, StorageSpace,
-        StorageWrite, TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
-    };
-    use lix_slatedb_storage::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
+    use lix_storage_slatedb::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
     use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
@@ -4559,7 +4560,8 @@ mod tests {
     async fn fenced_resumed_handshake_reports_terminal_storage_signal() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -4599,7 +4601,8 @@ mod tests {
     async fn fenced_new_handshake_reports_terminal_storage_signal() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -4631,7 +4634,8 @@ mod tests {
     async fn fenced_new_handshake_with_explicit_branch_reports_terminal_storage_signal() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -4667,7 +4671,8 @@ mod tests {
     async fn fenced_observe_next_reports_terminal_storage_before_returning_error() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -4857,7 +4862,8 @@ mod tests {
     async fn fenced_observe_after_headers_signals_and_ends_stream() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -4909,7 +4915,8 @@ mod tests {
     async fn fenced_external_observe_watcher_signals_and_ends_stream() {
         let storage = FencedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -4991,7 +4998,8 @@ mod tests {
     async fn fenced_multiplex_observe_aborts_live_sibling_before_next_body_poll() {
         let storage = FailOneBlockedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -5080,7 +5088,8 @@ mod tests {
     async fn dropped_multiplex_response_aborts_unpolled_workers() {
         let storage = FailOneBlockedReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -5157,11 +5166,7 @@ mod tests {
     }
 
     async fn app_with_options(options: ProtocolServerOptions) -> TestApp {
-        let lix = Arc::new(
-            open_lix(OpenLixOptions::<Memory>::default())
-                .await
-                .expect("open lix"),
-        );
+        let lix = Arc::new(open_lix().await.expect("open lix"));
         let server = LixProtocolServer::with_options(lix, options).expect("protocol server");
         let router = handler(server.clone());
         TestApp { server, router }
@@ -5171,11 +5176,7 @@ mod tests {
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
-        let lix = Arc::new(
-            open_lix(OpenLixOptions::new(storage))
-                .await
-                .expect("open Lix"),
-        );
+        let lix = Arc::new(open_lix().with_storage(storage).await.expect("open Lix"));
         handler(LixProtocolServer::new(lix))
     }
 
@@ -5439,7 +5440,8 @@ mod tests {
     async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
         let storage = PostCommitUnknownStorage::new();
         let lix = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -5492,12 +5494,10 @@ mod tests {
 
     async fn app_with_tracing_telemetry() -> TestApp {
         let lix = Arc::new(
-            open_lix_with_telemetry(
-                OpenLixOptions::<Memory>::default(),
-                Arc::new(TracingTelemetrySink::new()),
-            )
-            .await
-            .expect("open lix"),
+            open_lix()
+                .with_telemetry(Arc::new(TracingTelemetrySink::new()))
+                .await
+                .expect("open lix"),
         );
         let server = LixProtocolServer::new(lix);
         let router = handler(server.clone());
@@ -5985,7 +5985,7 @@ mod tests {
         let app = app().await;
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(first["activeAccountId"], lix_sdk::ANONYMOUS_ACCOUNT_ID);
+        assert_eq!(first["activeAccountId"], lix::ANONYMOUS_ACCOUNT_ID);
         assert!(first["capabilities"].get("requestBlobSplice").is_none());
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsertBatch"], true);
@@ -6010,12 +6010,12 @@ mod tests {
         let mut create = Request::builder()
             .uri(format!(
                 "/lix/v1?activeAccountId={}",
-                lix_sdk::ANONYMOUS_ACCOUNT_ID
+                lix::ANONYMOUS_ACCOUNT_ID
             ))
             .body(Body::empty())
             .expect("trusted handshake request");
         create.extensions_mut().insert(TrustedActiveAccountId::new(
-            lix_sdk::SYSTEM_ACCOUNT_ID.to_string(),
+            lix::SYSTEM_ACCOUNT_ID.to_string(),
         ));
         let response = app
             .router
@@ -6025,7 +6025,7 @@ mod tests {
             .expect("trusted handshake response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["activeAccountId"], lix_sdk::SYSTEM_ACCOUNT_ID);
+        assert_eq!(body["activeAccountId"], lix::SYSTEM_ACCOUNT_ID);
         let session_id = body["sessionId"].as_str().expect("session id");
 
         let mut resume = Request::builder()
@@ -6034,7 +6034,7 @@ mod tests {
             .body(Body::empty())
             .expect("cross-account resume request");
         resume.extensions_mut().insert(TrustedActiveAccountId::new(
-            lix_sdk::ANONYMOUS_ACCOUNT_ID.to_string(),
+            lix::ANONYMOUS_ACCOUNT_ID.to_string(),
         ));
         let response = app
             .router
@@ -9301,7 +9301,8 @@ mod tests {
         const SESSION_COUNT: usize = 8;
         let storage = GatedReadStorage::new(SESSION_COUNT);
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open Lix"),
         );
@@ -9552,7 +9553,8 @@ mod tests {
     async fn cancelled_cancellable_read_releases_session_for_close_and_replacement() {
         let storage = BlockingReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open lix"),
         );
@@ -9621,7 +9623,8 @@ mod tests {
     async fn cancelled_resumed_handshake_releases_session_for_close() {
         let storage = BlockingReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open lix"),
         );
@@ -9664,7 +9667,8 @@ mod tests {
     async fn cancelled_raw_file_read_releases_session_for_close() {
         let storage = BlockingReadStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open lix"),
         );
@@ -9714,7 +9718,8 @@ mod tests {
     async fn cancelled_durable_operation_reports_terminal_storage_after_caller_cancellation() {
         let storage = BlockingFencedWriteStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open lix"),
         );
@@ -9792,7 +9797,8 @@ mod tests {
     async fn cancelled_remote_commit_releases_transaction_pin_after_detached_work() {
         let storage = BlockingFencedWriteStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open lix"),
         );
@@ -9976,7 +9982,8 @@ mod tests {
     async fn cancelled_branch_switch_reports_terminal_storage_after_caller_cancellation() {
         let storage = BlockingFencedWriteStorage::new();
         let root = Arc::new(
-            open_lix(OpenLixOptions::new(storage.clone()))
+            open_lix()
+                .with_storage(storage.clone())
                 .await
                 .expect("open lix"),
         );
@@ -10071,9 +10078,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
-        let lix = open_lix(OpenLixOptions::<Memory>::default())
-            .await
-            .expect("open lix");
+        let lix = open_lix().await.expect("open lix");
         let result = LixProtocolServer::with_options(
             Arc::new(lix),
             ProtocolServerOptions {
@@ -10088,11 +10093,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = LixProtocolServer::with_options(
-            Arc::new(
-                open_lix(OpenLixOptions::<Memory>::default())
-                    .await
-                    .expect("open second lix"),
-            ),
+            Arc::new(open_lix().await.expect("open second lix")),
             ProtocolServerOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ProtocolServerOptions::default()

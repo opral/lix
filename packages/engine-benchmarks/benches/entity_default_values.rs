@@ -4,8 +4,9 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use lix_engine::storage::Memory;
-use lix_engine::{Engine, SessionContext, Value};
+use lix::Value;
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Memory;
 use serde_json::json;
 
 const DEFAULT_VALUES_SQL: &str = "INSERT INTO bench_default_values DEFAULT VALUES";

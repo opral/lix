@@ -10,18 +10,18 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
-use lix_engine::storage::{
+use lix::integration::{Engine, SessionContext};
+use lix::storage::{
     GetManyRequest, GetOptions as StorageGetOptions, Key, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, SpaceId, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    WriteOptions,
 };
 #[cfg(feature = "storage-benches")]
-use lix_engine::storage_adapter::StorageAdapter;
+use lix::storage_adapter::StorageAdapter;
 #[cfg(feature = "storage-benches")]
-use lix_engine::transaction::bench::{
-    BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
-};
-use lix_engine::{Blob, Engine, SessionContext, Storage, Value};
-use lix_slatedb_storage::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
+use lix::transaction::bench::{BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting};
+use lix::{Blob, Value};
+use lix_storage_slatedb::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
