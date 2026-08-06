@@ -1,12 +1,10 @@
 ---
-description: Lix tracks semantic changes at the entity level, so apps and agents can review what changed in structured data instead of raw lines or bytes.
+description: A file is not a byte stream. It has entities. Lix records each change as a SQL row that says which entity changed and how.
 ---
 
 # Semantic Changes
 
-Semantic changes are changes to the things your app understands: rows, paragraphs, properties, tasks, or any other entity described by a Lix schema. File plugins map file content to these entities and apply entity changes back to normal files.
-
-Text-based diffs see lines and file bytes. Lix can see structured entities.
+A file is not a byte stream. It has entities: a paragraph, a cell, a property, a record. A semantic change says which entity changed and how. Lix stores it as a row you can query with SQL.
 
 That means Lix can represent:
 
@@ -15,68 +13,11 @@ That means Lix can represent:
 - `property theme: light -> dark`
 - `paragraph intro: updated`
 
-instead of only "line 4 changed" or "binary files differ".
+instead of "line 4 changed" or "binary files differ".
 
-## Why semantic changes matter
+## From file edit to change row
 
-Semantic changes make version control usable inside applications and agent workflows.
-
-- **Review the thing that changed.** Show a row, field, paragraph, or symbol instead of a patch hunk.
-- **Ask precise questions.** Query changes by schema, file, entity, branch, or time.
-- **Burn fewer tokens.** Agents can inspect structured change rows instead of rereading whole files.
-- **Rollback with intent.** Revert an entity or field using the model your app already understands.
-
-## How Lix stores them
-
-Lix stores changes as rows in its version-control model. Each row carries the schema, entity pk, optional file id, and the entity snapshot after the change.
-
-The global journal is `lix_change`:
-
-```sql
-SELECT created_at, schema_key, entity_pk, snapshot_content
-FROM lix_change
-ORDER BY created_at DESC
-LIMIT 20;
-```
-
-For branch-scoped reads, use the state and history surfaces documented in [SQL Surfaces](./surfaces.md) and [Change History](./history.md).
-
-## JSON example
-
-With a JSON plugin, Lix can track properties instead of formatting:
-
-Given a JSON file:
-
-**Before:**
-
-```json
-{ "theme": "light", "notifications": true, "language": "en" }
-```
-
-**After:**
-
-```json
-{ "theme": "dark", "notifications": true, "language": "en" }
-```
-
-Text-based diff:
-
-```diff
--{"theme":"light","notifications":true,"language":"en"}
-+{"theme":"dark","notifications":true,"language":"en"}
-```
-
-The plugin can expose:
-
-```diff
-property theme:
-- light
-+ dark
-```
-
-## CSV example
-
-The CSV plugin ships with the JavaScript SDK. It tracks CSV records as rows.
+An agent edits `/orders.csv` and sets order 1002 to shipped:
 
 **Before:**
 
@@ -96,14 +37,20 @@ The CSV plugin ships with the JavaScript SDK. It tracks CSV records as rows.
 | 1002     | Widget B | shipped |
 ```
 
-A text diff shows the whole line:
+A text diff sees the whole line and no meaning:
 
 ```diff
 -1002,Widget B,pending
 +1002,Widget B,shipped
 ```
 
-Lix can show the row field that changed:
+Lix stores the change as a row in `lix_change`:
+
+| schema_key | entity_pk  | snapshot_content                                                   |
+| ---------- | ---------- | ------------------------------------------------------------------ |
+| `csv_row`  | `["1002"]` | `{"order_id": "1002", "product": "Widget B", "status": "shipped"}` |
+
+That row is the semantic change: record 1002 changed, and its new state is `shipped`. An app renders it as a diff of the field:
 
 ```diff
 order_id 1002 status:
@@ -112,11 +59,19 @@ order_id 1002 status:
 + shipped
 ```
 
-## Query semantic changes
+## Where entities come from
 
-Because semantic changes are rows, agents can answer version-control questions with SQL.
+Plugins define the entities of a file format. The Markdown plugin defines blocks. The CSV plugin defines records. Both ship with the JavaScript SDK. Other formats, such as JSON, XLSX, or DOCX, need a plugin.
 
-For example:
+App data that does not come from a file uses the same model. Register a schema, and Lix tracks changes to its rows the same way.
+
+## What change rows buy you
+
+- **Review the thing that changed.** Show a record, field, or paragraph instead of a patch hunk.
+- **Ask precise questions.** Query changes by schema, file, entity, branch, or time.
+- **Revert one field, not the whole file.**
+
+## Query changes with SQL
 
 > Which orders changed status in this branch?
 
@@ -133,4 +88,7 @@ WHERE c.schema_key = 'csv_row'
 ORDER BY c.created_at DESC;
 ```
 
-The result is scoped to the file and entity type the agent asked about. No full CSV reread is required. Other formats use the same model when a plugin defines their entities. An XLSX plugin, for example, could define cells or rows.
+## Learn more
+
+- [SQL Surfaces](./surfaces.md) and [Change History](./history.md): branch-scoped state and history queries.
+- [Schemas](./schemas.md): define entities for app data.
