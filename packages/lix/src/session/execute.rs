@@ -866,7 +866,8 @@ where
                 // the same transaction and use its public upsert semantics.
                 let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
                 let plan = transaction
-                    .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
+                    .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)
+                    .await?;
                 sql2::execute_write_logical_plan_result_with_metadata(
                     transaction,
                     plan,
@@ -1083,7 +1084,8 @@ where
                             transaction.replace_origin_key(options.origin_key);
                         let result = async {
                             let tx_plan = transaction
-                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)
+                                .await?;
                             let result = execute_prepared_transaction_write(
                                 transaction,
                                 tx_plan,
@@ -1214,7 +1216,8 @@ where
                     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
                     let result = async {
                         let tx_plan = transaction
-                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)
+                            .await?;
                         let result = execute_prepared_transaction_write(
                             transaction,
                             tx_plan,
@@ -1387,7 +1390,9 @@ where
         let sql_for_error = Arc::clone(&sql);
         let result = self
             .with_write_transaction_lending(async move |transaction| {
-                let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
+                let plan = transaction
+                    .prepare_sql_write_logical_plan(&sql, &statement)
+                    .await?;
                 let results = sql2::execute_write_logical_plan_prepared_dml_batch(
                     transaction,
                     &plan,
@@ -2008,7 +2013,8 @@ where
                     write_access,
                     async move |transaction| {
                         let tx_plan = transaction
-                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)
+                            .await?;
                         let result = sql2::execute_write_logical_plan_with_mode_result(
                             transaction,
                             tx_plan,
@@ -2643,7 +2649,9 @@ where
         self.has_started_statement = true;
         let transaction = self.transaction_mut()?;
         transaction.flush_prepared_mutations().await?;
-        let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
+        let plan = transaction
+            .prepare_sql_write_logical_plan(&sql, &statement)
+            .await?;
         let checkpoint = transaction.begin_sql_statement_checkpoint()?;
         let result = sql2::execute_write_logical_plan_prepared_dml_batch(
             transaction,
@@ -3007,7 +3015,9 @@ where
 
     let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
     let execution = async {
-        let plan = transaction.prepare_sql_write_logical_plan(planning_sql, parsed_statement)?;
+        let plan = transaction
+            .prepare_sql_write_logical_plan(planning_sql, parsed_statement)
+            .await?;
         if let TransactionBatchStatements::AutoParameterizedUpdate {
             parameter_batch, ..
         } = parsed
@@ -3125,7 +3135,9 @@ where
             Ok(None) => {}
             Err(error) => return Err(error),
         }
-        let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
+        let tx_plan = transaction
+            .prepare_sql_write_logical_plan(sql, &statement)
+            .await?;
         transaction.remember_prepared_mutation(sql, &tx_plan)?;
         // The first statement is the producer of the typed program. Feed it
         // through that program immediately so a homogeneous transaction never
@@ -4203,7 +4215,9 @@ async fn execute_transaction_write_with_mode<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
+    let tx_plan = transaction
+        .prepare_sql_write_logical_plan(sql, &statement)
+        .await?;
     let result =
         sql2::execute_write_logical_plan_with_mode_result(transaction, tx_plan, params, mode)
             .await?;
@@ -4221,7 +4235,9 @@ async fn execute_transaction_write_with_mode_and_trace<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
+    let tx_plan = transaction
+        .prepare_sql_write_logical_plan(sql, &statement)
+        .await?;
     let (result, path) = sql2::execute_write_logical_plan_with_mode_and_trace_result(
         transaction,
         tx_plan,

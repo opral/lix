@@ -475,6 +475,7 @@ where
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>()
     } else {
+        transaction.ensure_catalogs_loaded().await?;
         let visible_schema_keys = transaction.visible_schema_keys()?;
         let dependency_commit = if desired_is_target { current } else { desired };
         let mut tracked = transaction.tracked_state_reader().await;

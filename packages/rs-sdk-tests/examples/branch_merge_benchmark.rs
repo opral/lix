@@ -733,6 +733,7 @@ where
         .await
         .expect("open source session");
 
+    collector.clear();
     let switch_measure = measure_async(|| async {
         lix.switch_branch(SwitchBranchOptions {
             branch_id: source_receipt.id.clone(),
@@ -746,6 +747,8 @@ where
         .expect("switch to main");
     })
     .await;
+    tokio::task::yield_now().await;
+    let switch_phases = collector.take_ms();
     let switch_roundtrip_ms = switch_measure.wall_ms;
     assert_eq!(
         source.active_branch_id().await.expect("pinned source"),
@@ -1095,6 +1098,7 @@ where
         "phase_ms": {
             "setup": setup_phases,
             "create_branches": branch_phases,
+            "switch_roundtrip": switch_phases,
             "preview": preview_phases,
             "merge": merge_phases,
         },

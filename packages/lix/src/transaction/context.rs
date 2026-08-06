@@ -524,7 +524,9 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// SQL binding is snapshot-isolated at transaction open. Schema writes
     /// staged later in this transaction affect validation but become visible
     /// to SQL planning only after commit opens a new transaction snapshot.
-    sql_schema_snapshot: Arc<CatalogSnapshot>,
+    sql_schema_snapshot: Option<Arc<CatalogSnapshot>>,
+    catalog_context: Arc<CatalogContext>,
+    opening_catalog_revision: Option<crate::catalog::CatalogRevision>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     prepared_mutation_program: Option<(
         Arc<str>,
@@ -1402,29 +1404,10 @@ where
                     .await?;
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let functions = runtime_functions.provider();
-            let (sql_schema_catalog, tracked_schema_catalog) = {
-                let catalog_revision = load_catalog_revision(&read).await?;
-                let visible_live_state = live_state.reader(&read);
-                let sql_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
-                        &visible_live_state,
-                        &Domain::schema_catalog(active_branch_id.clone(), true),
-                        catalog_revision.as_ref(),
-                    )
-                    .await?;
-                // SQL planning needs the untracked-visible catalog, while
-                // normal tracked mutations normalize against the tracked
-                // catalog. Pin both under the same revision at open so the
-                // first write never falls back to a catalog scan.
-                let tracked_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
-                        &visible_live_state,
-                        &Domain::schema_catalog(active_branch_id.clone(), false),
-                        catalog_revision.as_ref(),
-                    )
-                    .await?;
-                (sql_schema_catalog, tracked_schema_catalog)
-            };
+            // Catalog rows are derived SQL projections. Capture only the
+            // revision in the opening snapshot; raw branch/lifecycle writes
+            // do not need to scan retained history to open a transaction.
+            let catalog_revision = load_catalog_revision(&read).await?;
             let opening_tracked_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
                     .await?;
@@ -1440,8 +1423,7 @@ where
                 active_branch_id,
                 runtime_functions,
                 functions,
-                sql_schema_catalog,
-                tracked_schema_catalog,
+                catalog_revision,
                 opening_tracked_mutation_revision,
                 opening_active_branch_head,
                 opening_global_branch_head,
@@ -1452,8 +1434,7 @@ where
             active_branch_id,
             runtime_functions,
             functions,
-            sql_schema_catalog,
-            tracked_schema_catalog,
+            catalog_revision,
             opening_tracked_mutation_revision,
             opening_active_branch_head,
             opening_global_branch_head,
@@ -1464,15 +1445,7 @@ where
             }
         };
         drop(read);
-        let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
-        schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), true),
-            Arc::clone(&sql_schema_catalog),
-        );
-        schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), false),
-            tracked_schema_catalog,
-        );
+        let schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         Ok(OpenTransaction {
             transaction: Self {
@@ -1484,7 +1457,9 @@ where
                 plugin_host,
                 branch_ctx,
                 schema_resolver,
-                sql_schema_snapshot: sql_schema_catalog,
+                sql_schema_snapshot: None,
+                catalog_context,
+                opening_catalog_revision: catalog_revision,
                 sql_planning_cache,
                 prepared_mutation_program: None,
                 prepared_mutation_membership: PreparedMutationMembership::Unprepared,
@@ -1609,6 +1584,16 @@ where
         // current coherent snapshot, while user statements above observed the
         // snapshot retained from transaction open.
         transaction.opening_read = read.clone();
+        // The dense entity columnar writer needs the tracked schema surface to
+        // validate its physical layout. Keep that derived projection lazy for
+        // ordinary lifecycle writes, but load it before a large prepared batch
+        // reaches commit materialization so the optimized writer remains
+        // semantically identical to the eager path.
+        if prepared_writes.state_rows.len() >= 512
+            || !prepared_writes.commit_change_refs_by_branch.is_empty()
+        {
+            transaction.ensure_catalogs_loaded().await?;
+        }
         if let Err(error) = transaction
             .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
             .instrument(tracing::debug_span!(
@@ -1678,7 +1663,7 @@ where
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
                 &transaction.tracked_state,
-                Some(transaction.sql_schema_snapshot.as_ref()),
+                transaction.sql_schema_snapshot.as_deref(),
                 Some(runtime_functions),
                 &transaction.active_account_id,
                 &commit_parent_heads,
@@ -4347,7 +4332,7 @@ where
                 let descriptor = v2_file_descriptor(write, &selected);
                 let schemas = SchemaAllowlist::from_catalog(
                     selected.schema_keys(),
-                    Arc::clone(&self.sql_schema_snapshot),
+                    Arc::clone(self.sql_schema_snapshot_ref()),
                 )?;
                 let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                     local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
@@ -4733,7 +4718,7 @@ where
             let descriptor = v2_file_descriptor(write, selected);
             let schemas = SchemaAllowlist::from_catalog(
                 selected.schema_keys(),
-                Arc::clone(&self.sql_schema_snapshot),
+                Arc::clone(self.sql_schema_snapshot_ref()),
             )?;
             let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                 local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
@@ -6465,24 +6450,67 @@ where
         Ok(())
     }
 
+    /// Loads the derived catalogs on first SQL/provider use. Raw lifecycle
+    /// writes avoid scanning retained history merely to open a transaction.
+    pub(crate) async fn ensure_catalogs_loaded(&mut self) -> Result<(), LixError> {
+        if self.sql_schema_snapshot.is_some() {
+            return Ok(());
+        }
+        let read = self.opening_read();
+        let visible_live_state = self.live_state.reader(&read);
+        let sql_schema_catalog = self
+            .catalog_context
+            .compiled_catalog_for_transaction_open(
+                &visible_live_state,
+                &Domain::schema_catalog(self.active_branch_id.clone(), true),
+                self.opening_catalog_revision.as_ref(),
+            )
+            .await?;
+        let tracked_schema_catalog = self
+            .catalog_context
+            .compiled_catalog_for_transaction_open(
+                &visible_live_state,
+                &Domain::schema_catalog(self.active_branch_id.clone(), false),
+                self.opening_catalog_revision.as_ref(),
+            )
+            .await?;
+        self.schema_resolver.remember_compiled_catalog(
+            &Domain::schema_catalog(self.active_branch_id.clone(), true),
+            Arc::clone(&sql_schema_catalog),
+        );
+        self.schema_resolver.remember_compiled_catalog(
+            &Domain::schema_catalog(self.active_branch_id.clone(), false),
+            tracked_schema_catalog,
+        );
+        self.sql_schema_snapshot = Some(sql_schema_catalog);
+        Ok(())
+    }
+
+    fn sql_schema_snapshot_ref(&self) -> &Arc<CatalogSnapshot> {
+        self.sql_schema_snapshot
+            .as_ref()
+            .expect("SQL catalog must be loaded before SQL execution")
+    }
+
     /// Returns the content identity of the SQL schema catalog captured when
-    /// this transaction opened.
+    /// this transaction first executed SQL.
     pub(crate) fn sql_catalog_fingerprint(&self) -> &CatalogFingerprint {
-        self.sql_schema_snapshot.fingerprint()
+        self.sql_schema_snapshot_ref().fingerprint()
     }
 
     pub(crate) fn sql_public_catalog(&self) -> Result<Arc<crate::sql2::PublicCatalog>, LixError> {
         self.sql_planning_cache
             .public_catalog(self.sql_catalog_fingerprint(), || {
-                Ok(self.sql_schema_snapshot.schema_jsons())
+                Ok(self.sql_schema_snapshot_ref().schema_jsons())
             })
     }
 
-    pub(crate) fn prepare_sql_write_logical_plan(
-        &self,
+    pub(crate) async fn prepare_sql_write_logical_plan(
+        &mut self,
         sql: &str,
         statement: &DataFusionStatement,
     ) -> Result<crate::sql2::SqlLogicalPlan, LixError> {
+        self.ensure_catalogs_loaded().await?;
         let fingerprint = self.sql_catalog_fingerprint();
         if let Some(plan) =
             self.sql_planning_cache
@@ -7261,6 +7289,7 @@ where
         statement: DataFusionStatement,
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
+        self.ensure_catalogs_loaded().await?;
         let read_store = self.opening_read();
         let active_branch_id = self.active_branch_id.clone();
         let live_state = Arc::clone(&self.live_state);
@@ -7302,7 +7331,7 @@ where
     }
 
     fn sql_visible_schemas(&self) -> Vec<JsonValue> {
-        self.sql_schema_snapshot.schema_jsons()
+        self.sql_schema_snapshot_ref().schema_jsons()
     }
 
     pub(crate) fn visible_schema_keys(&self) -> Result<Vec<String>, LixError> {
@@ -8779,7 +8808,7 @@ where
     }
 
     fn schema_catalog_snapshot(&self) -> Option<Arc<CatalogSnapshot>> {
-        Some(Arc::clone(&self.sql_schema_snapshot))
+        self.sql_schema_snapshot.clone()
     }
 
     fn plugin_host(&self) -> PluginRuntimeHost {
@@ -12822,11 +12851,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_open_prewarms_tracked_and_sql_schema_catalogs() {
+    async fn transaction_open_defers_catalogs_until_sql_use() {
         let storage = Memory::new();
-        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, transaction) =
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
 
+        assert!(
+            !transaction
+                .schema_resolver
+                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, true))
+        );
+        assert!(
+            !transaction
+                .schema_resolver
+                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, false))
+        );
+        transaction
+            .ensure_catalogs_loaded()
+            .await
+            .expect("SQL use should load opening catalogs");
         assert!(
             transaction
                 .schema_resolver
