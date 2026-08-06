@@ -327,6 +327,36 @@ async fn load_reachability_queue(
     Ok((queue, bytes))
 }
 
+/// Benchmark-only queue observability.  This exposes authenticated sequence
+/// bounds without exposing the queue as a production authority or changing
+/// the ordinary O(64) planner.
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn reachability_queue_state_for_bench(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(u64, u64, u64, u64), LixError> {
+    let (queue, _) = load_reachability_queue(store).await?;
+    let pending_rows = if queue.head_sequence == 0 {
+        0
+    } else {
+        queue
+            .tail_sequence
+            .checked_sub(queue.head_sequence)
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authenticated GC queue span overflow",
+                )
+            })?
+    };
+    Ok((
+        queue.head_sequence,
+        queue.tail_sequence,
+        queue.next_sequence,
+        pending_rows,
+    ))
+}
+
 fn root_control_digest(raw: Option<&Bytes>) -> [u8; 32] {
     match raw {
         Some(raw) => *blake3::hash(raw.as_ref()).as_bytes(),

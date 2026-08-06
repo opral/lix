@@ -10,7 +10,9 @@ use lix::integration::Engine;
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
-    RepositoryGcBenchResult, audit_repository_gc_standalone_for_bench, plan_repository_gc_for_bench,
+    RepositoryGcBenchResult, audit_repository_gc_standalone_for_bench,
+    commit_repository_gc_for_bench, plan_repository_gc_for_bench,
+    repository_gc_queue_state_for_bench,
 };
 use lix::{CreateBranchOptions, Value};
 use lix_storage_rocksdb::RocksDB;
@@ -203,7 +205,143 @@ async fn run() {
                 }
             }
         }
+        "drain" => {
+            let cap_minutes = args
+                .get(6)
+                .map_or(20, |value| {
+                    value.parse::<u64>().expect("cap minutes must be positive")
+                })
+                .max(1);
+            match backend {
+                Backend::RocksDB => drain_rocks(path, cap_minutes).await,
+                Backend::SlateDB => drain_slate(path, cap_minutes).await,
+            }
+        }
         _ => print_usage(),
+    }
+}
+
+async fn drain_rocks(path: &str, cap_minutes: u64) {
+    let started = Instant::now();
+    let cap = Duration::from_secs(cap_minutes.saturating_mul(60));
+    let mut pass = 0usize;
+    loop {
+        if started.elapsed() >= cap {
+            println!("repository_gc_drain,backend=rocksdb,status=cap,passes={pass}");
+            break;
+        }
+        let storage = RocksDB::open(path).expect("open repository-GC RocksDB for drain");
+        let adapter = StorageAdapter::new(storage.clone());
+        let before = repository_gc_queue_state_for_bench(&adapter)
+            .await
+            .expect("read authenticated queue before GC pass");
+        if before.pending_rows == 0 {
+            println!(
+                "repository_gc_drain,backend=rocksdb,status=drained,passes={pass},head={},tail={},next={},pending=0",
+                before.head_sequence, before.tail_sequence, before.next_sequence
+            );
+            break;
+        }
+        let pass_started = Instant::now();
+        let result = commit_repository_gc_for_bench(&adapter)
+            .await
+            .expect("commit authenticated ordinary GC pass");
+        let after = repository_gc_queue_state_for_bench(&adapter)
+            .await
+            .expect("read authenticated queue after GC pass");
+        let elapsed_us = pass_started.elapsed().as_micros();
+        let bytes = directory_bytes(Path::new(path));
+        println!(
+            "repository_gc_drain,backend=rocksdb,pass={pass},before_head={},before_tail={},before_next={},before_pending={},after_head={},after_tail={},after_next={},after_pending={},swept_commits={},live_commits={},staged_puts={},staged_deletes={},written_bytes={},delete_descriptors={},root_discovery_us={},total_us={},pass_us={elapsed_us},logical_bytes={bytes},cpu_us=unavailable,alloc_bytes=unavailable,rss_bytes=unavailable,wal_sst_object_compaction=unavailable,root_history_survival=authenticated_plan",
+            before.head_sequence,
+            before.tail_sequence,
+            before.next_sequence,
+            before.pending_rows,
+            after.head_sequence,
+            after.tail_sequence,
+            after.next_sequence,
+            after.pending_rows,
+            result.swept_commits,
+            result.live_commits,
+            result.staged_puts,
+            result.staged_deletes,
+            result.staged_written_bytes,
+            result.delete_descriptors,
+            result.root_discovery_us,
+            result.total_us,
+        );
+        assert!(
+            after.pending_rows < before.pending_rows,
+            "ordinary GC pass did not advance the authenticated queue"
+        );
+        storage.flush().expect("flush RocksDB after GC pass");
+        pass += 1;
+    }
+}
+
+async fn drain_slate(path: &str, cap_minutes: u64) {
+    let started = Instant::now();
+    let cap = Duration::from_secs(cap_minutes.saturating_mul(60));
+    let counters = SlateDBIoCounters::default();
+    let mut pass = 0usize;
+    loop {
+        if started.elapsed() >= cap {
+            println!("repository_gc_drain,backend=slatedb,status=cap,passes={pass}");
+            break;
+        }
+        let storage = SlateDB::open_with_io_counters(path, counters.clone())
+            .expect("open repository-GC SlateDB for drain");
+        let adapter = StorageAdapter::new(storage.clone());
+        let io_before = counters.snapshot();
+        let before = repository_gc_queue_state_for_bench(&adapter)
+            .await
+            .expect("read authenticated queue before GC pass");
+        if before.pending_rows == 0 {
+            println!(
+                "repository_gc_drain,backend=slatedb,status=drained,passes={pass},head={},tail={},next={},pending=0",
+                before.head_sequence, before.tail_sequence, before.next_sequence
+            );
+            break;
+        }
+        let pass_started = Instant::now();
+        let result = commit_repository_gc_for_bench(&adapter)
+            .await
+            .expect("commit authenticated ordinary GC pass");
+        let after = repository_gc_queue_state_for_bench(&adapter)
+            .await
+            .expect("read authenticated queue after GC pass");
+        let io = counters.snapshot().saturating_sub(io_before);
+        let elapsed_us = pass_started.elapsed().as_micros();
+        let bytes = directory_bytes(Path::new(path));
+        println!(
+            "repository_gc_drain,backend=slatedb,pass={pass},before_head={},before_tail={},before_next={},before_pending={},after_head={},after_tail={},after_next={},after_pending={},swept_commits={},live_commits={},staged_puts={},staged_deletes={},written_bytes={},delete_descriptors={},root_discovery_us={},total_us={},pass_us={elapsed_us},logical_bytes={bytes},cpu_us=unavailable,alloc_bytes=unavailable,rss_bytes=unavailable,read_objects={},read_bytes={},write_objects={},write_bytes={},wal_sst_object_compaction=see_io_categories,root_history_survival=authenticated_plan",
+            before.head_sequence,
+            before.tail_sequence,
+            before.next_sequence,
+            before.pending_rows,
+            after.head_sequence,
+            after.tail_sequence,
+            after.next_sequence,
+            after.pending_rows,
+            result.swept_commits,
+            result.live_commits,
+            result.staged_puts,
+            result.staged_deletes,
+            result.staged_written_bytes,
+            result.delete_descriptors,
+            result.root_discovery_us,
+            result.total_us,
+            io.read_objects,
+            io.read_bytes,
+            io.write_objects,
+            io.write_bytes,
+        );
+        assert!(
+            after.pending_rows < before.pending_rows,
+            "ordinary GC pass did not advance the authenticated queue"
+        );
+        storage.flush().await.expect("flush SlateDB after GC pass");
+        pass += 1;
     }
 }
 
@@ -568,6 +706,8 @@ fn print_usage() {
         "usage:\n  repository_gc_scale setup <rocksdb|slatedb> <path> \
          <history-changes> <commit-width> [batch-commits]\n  \
          repository_gc_scale measure <rocksdb|slatedb> <path> \
-         <history-changes> <commit-width> [samples] [warmups]"
+         <history-changes> <commit-width> [samples] [warmups]\n  \
+         repository_gc_scale drain <rocksdb|slatedb> <path> \
+         <history-changes> <commit-width> [cap-minutes]"
     );
 }

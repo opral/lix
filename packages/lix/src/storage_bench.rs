@@ -648,6 +648,14 @@ pub struct RepositoryGcBenchResult {
     pub total_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryGcQueueBenchState {
+    pub head_sequence: u64,
+    pub tail_sequence: u64,
+    pub next_sequence: u64,
+    pub pending_rows: u64,
+}
+
 /// Isolates the branch-owned derived checkpoint retirement path.  This is a
 /// benchmark-only bridge: the checkpoint rows are seeded directly into their
 /// derived space, then the production branch-prefix retirement planner is
@@ -789,6 +797,19 @@ pub async fn plan_repository_gc_for_bench<StorageImpl>(
 where
     StorageImpl: Storage,
 {
+    let (result, _writes) = stage_repository_gc_for_bench(storage).await?;
+    Ok(result)
+}
+
+/// Stages one ordinary authenticated GC plan and returns the benchmark write
+/// set so a benchmark-only harness can commit it.  This bridge is compiled
+/// through the `storage-benches` feature and does not alter production GC.
+async fn stage_repository_gc_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<(RepositoryGcBenchResult, StorageWriteSet), crate::LixError>
+where
+    StorageImpl: Storage,
+{
     let read = crate::storage_adapter::SharedStorageAdapterRead::new(
         storage.begin_read(ReadOptions::default()).await?,
     );
@@ -822,47 +843,89 @@ where
     let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
     let deleted_semantic_reverse_index_rows =
         delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
-    Ok(RepositoryGcBenchResult {
-        live_commits: plan.changelog.live.commits.len(),
-        swept_commits: plan
-            .changelog
-            .sweep
-            .commits
-            .len()
-            .saturating_add(plan.sweep.tracked_commit_roots.len()),
-        swept_standalone_changes: plan
-            .changelog
-            .sweep
-            .changes
-            .len()
-            .saturating_add(plan.sweep.standalone_changes.len()),
-        standalone_swept_ids: plan
-            .sweep
-            .standalone_changes
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        swept_payloads: plan.changelog.sweep.json_payloads.len(),
-        staged_puts: stats.staged_puts,
-        staged_deletes: stats.staged_deletes,
-        delete_counts_by_space,
-        deleted_commit_state_manifests,
-        deleted_mutation_inventories,
-        deleted_semantic_commit_projections,
-        deleted_semantic_change_rows,
-        deleted_semantic_reverse_index_rows,
-        staged_written_bytes: stats.written_bytes,
-        delete_descriptors: arena.delete_descriptors,
-        delete_descriptor_capacity: arena.delete_descriptor_capacity,
-        key_inline_bytes: arena.key_inline_bytes,
-        key_inline_capacity: arena.key_inline_capacity,
-        key_shared_buffers: arena.key_shared_buffers,
-        key_shared_bytes: arena.key_shared_bytes,
-        key_shared_capacity: arena.key_shared_capacity,
-        root_discovery_us: plan.profile.root_discovery_us,
-        changelog_us: plan.profile.changelog_us,
-        tracked_root_stage_us: plan.profile.tracked_root_stage_us,
-        total_us: plan.profile.total_us,
+    Ok((
+        RepositoryGcBenchResult {
+            live_commits: plan.changelog.live.commits.len(),
+            swept_commits: plan
+                .changelog
+                .sweep
+                .commits
+                .len()
+                .saturating_add(plan.sweep.tracked_commit_roots.len()),
+            swept_standalone_changes: plan
+                .changelog
+                .sweep
+                .changes
+                .len()
+                .saturating_add(plan.sweep.standalone_changes.len()),
+            standalone_swept_ids: plan
+                .sweep
+                .standalone_changes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            swept_payloads: plan.changelog.sweep.json_payloads.len(),
+            staged_puts: stats.staged_puts,
+            staged_deletes: stats.staged_deletes,
+            delete_counts_by_space,
+            deleted_commit_state_manifests,
+            deleted_mutation_inventories,
+            deleted_semantic_commit_projections,
+            deleted_semantic_change_rows,
+            deleted_semantic_reverse_index_rows,
+            staged_written_bytes: stats.written_bytes,
+            delete_descriptors: arena.delete_descriptors,
+            delete_descriptor_capacity: arena.delete_descriptor_capacity,
+            key_inline_bytes: arena.key_inline_bytes,
+            key_inline_capacity: arena.key_inline_capacity,
+            key_shared_buffers: arena.key_shared_buffers,
+            key_shared_bytes: arena.key_shared_bytes,
+            key_shared_capacity: arena.key_shared_capacity,
+            root_discovery_us: plan.profile.root_discovery_us,
+            changelog_us: plan.profile.changelog_us,
+            tracked_root_stage_us: plan.profile.tracked_root_stage_us,
+            total_us: plan.profile.total_us,
+        },
+        writes,
+    ))
+}
+
+/// Commits one staged ordinary GC plan for the benchmark-only drain harness.
+/// The write set and its authenticated preconditions are committed atomically
+/// exactly as production would commit the same plan.
+#[inline(never)]
+pub async fn commit_repository_gc_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<RepositoryGcBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let (result, writes) = stage_repository_gc_for_bench(storage).await?;
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await?;
+    Ok(result)
+}
+
+/// Reads the authenticated queue bounds for the commit-capable benchmark
+/// wrapper.  The queue remains owned by production GC; this is observability
+/// only and uses the same coherent read snapshot as the caller.
+pub async fn repository_gc_queue_state_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<RepositoryGcQueueBenchState, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    let (head_sequence, tail_sequence, next_sequence, pending_rows) =
+        crate::gc::reachability_queue_state_for_bench(&read).await?;
+    Ok(RepositoryGcQueueBenchState {
+        head_sequence,
+        tail_sequence,
+        next_sequence,
+        pending_rows,
     })
 }
 
