@@ -13,20 +13,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lix_engine::storage::{
+use lix::integration::{Engine, SessionContext};
+use lix::storage::Storage;
+use lix::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
     ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead, StorageSpace, StorageWrite,
     WriteOptions,
 };
-use lix_engine::storage_bench::{
+use lix::storage_bench::{
     CRUD_OWNERSHIP_ADAPTER, CRUD_OWNERSHIP_AUTHORITY, CRUD_OWNERSHIP_ROOT_PUBLICATION,
     CRUD_OWNERSHIP_WRITE_SET, begin_crud_ownership_accounting, has_durable_commit_root_for_bench,
     take_crud_commit_state_manifest_bytes, take_crud_ownership_accounting,
     take_crud_physical_write_accounting,
 };
-use lix_engine::{Engine, ExecuteBatchStatement, SessionContext, Storage, Value};
-use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+use lix::{ExecuteBatchStatement, Value};
+use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
