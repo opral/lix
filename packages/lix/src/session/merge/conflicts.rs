@@ -160,6 +160,7 @@ mod tests {
         let plan = TrackedStateMergePlan {
             picks: Vec::new().into(),
             conflicts: vec![conflict].into(),
+            source_payloads: Default::default(),
         };
 
         let batch = MergeConflictBatch::from_plan(&plan);

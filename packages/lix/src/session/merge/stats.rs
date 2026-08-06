@@ -221,6 +221,7 @@ mod tests {
                 })
                 .collect(),
             conflicts: Vec::new().into(),
+            source_payloads: Default::default(),
         };
 
         reset_identity_comparison_count();

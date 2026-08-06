@@ -5416,13 +5416,14 @@ where
         {
             return Ok(None);
         }
-        let Some(entries) = hot_working_diff_entries(
+        let Some(diff) = hot_working_diff_entries(
             &self.store,
             branch_id,
             epoch.checkpoint_commit_id,
             generation,
             epoch.coverage,
             &request.filter,
+            request.retain_payloads,
         )
         .await?
         else {
@@ -5430,7 +5431,7 @@ where
         };
         Ok(Some(TrackedWorkingDiff {
             checkpoint_commit_id: epoch.checkpoint_commit_id,
-            diff: TrackedStateDiff::from_entries(entries),
+            diff,
         }))
     }
 
@@ -9378,7 +9379,8 @@ async fn hot_working_diff_entries(
     generation: CommitId,
     expected_coverage: WorkingDiffIndexCoverage,
     filter: &TrackedStateFilter,
-) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    retain_payloads: bool,
+) -> Result<Option<TrackedStateDiff>, LixError> {
     let packed_refs = packed_current_base_refs(store, branch_id, generation).await?;
     let packed_refs = packed_refs
         .into_iter()
@@ -9391,6 +9393,7 @@ async fn hot_working_diff_entries(
             checkpoint_commit_id,
             generation,
             filter,
+            retain_payloads,
         )
         .await;
     }
@@ -9404,6 +9407,7 @@ async fn hot_working_diff_entries(
     );
     let mut actual_coverage = WorkingDiffIndexCoverage::default();
     let mut selected = BTreeMap::<HeadIdentity, Option<WorkingDiffVersion>>::new();
+    let mut payloads = BTreeMap::<ChangeId, (JsonSlot, JsonSlot)>::new();
     let mut resume_after = None;
     loop {
         let page = plan
@@ -9493,6 +9497,14 @@ async fn hot_working_diff_entries(
             if !packed_member_matches_filter(&member, filter) {
                 continue;
             }
+            if retain_payloads {
+                insert_working_diff_payload(
+                    &mut payloads,
+                    member.change.change_id,
+                    member.change.snapshot.clone(),
+                    member.change.metadata.clone(),
+                )?;
+            }
             let identity = HeadIdentity {
                 branch_id: branch_id.to_string(),
                 generation,
@@ -9525,21 +9537,29 @@ async fn hot_working_diff_entries(
     for ((identity, after), base_after) in selected.into_iter().zip(after_values).zip(base_versions)
     {
         let hot_after = if let Some(after) = after {
-            let Ok(after) = decode_head_value(&after) else {
+            let Ok(head) = decode_head_value(&after) else {
                 return Ok(None);
             };
-            if after.untracked {
+            if head.untracked {
                 return Ok(None);
             }
             let Some(before) =
-                working_diff_baseline_before(after.working_diff_baseline, checkpoint_commit_id)
+                working_diff_baseline_before(head.working_diff_baseline, checkpoint_commit_id)
             else {
                 return Ok(None);
             };
-            let Some(after) = after.working_diff_version() else {
+            let Some(version) = head.working_diff_version() else {
                 return Ok(None);
             };
-            Some((before, after))
+            if retain_payloads && !version.deleted {
+                insert_working_diff_payload(
+                    &mut payloads,
+                    version.change_id,
+                    owned_head_slot(head.snapshot),
+                    owned_head_slot(head.metadata),
+                )?;
+            }
+            Some((before, version))
         } else {
             None
         };
@@ -9557,7 +9577,15 @@ async fn hot_working_diff_entries(
             after,
         ));
     }
-    Ok(Some(classify_hot_working_diff_entries(candidates)?))
+    let entries = classify_hot_working_diff_entries(candidates)?;
+    let payloads = TrackedStatePayloadBatch::from_payloads(
+        payloads
+            .into_iter()
+            .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
+    )?;
+    Ok(Some(TrackedStateDiff::from_entries_with_payloads(
+        entries, payloads,
+    )))
 }
 
 fn choose_hot_or_packed_working_diff(
@@ -9572,19 +9600,48 @@ fn choose_hot_or_packed_working_diff(
     }
 }
 
+fn owned_head_slot(slot: HeadSlotView<'_>) -> JsonSlot {
+    match slot {
+        HeadSlotView::None => JsonSlot::None,
+        HeadSlotView::Ref(json_ref) => JsonSlot::Ref(json_ref),
+        HeadSlotView::Inline(json) | HeadSlotView::InlineFingerprinted { json, .. } => {
+            JsonSlot::Inline(json.into())
+        }
+    }
+}
+
+fn insert_working_diff_payload(
+    payloads: &mut BTreeMap<ChangeId, (JsonSlot, JsonSlot)>,
+    change_id: ChangeId,
+    snapshot: JsonSlot,
+    metadata: JsonSlot,
+) -> Result<(), LixError> {
+    if let Some(previous) = payloads.insert(change_id, (snapshot.clone(), metadata.clone()))
+        && previous != (snapshot, metadata)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("working diff payload owner disagrees for change '{change_id}'"),
+        ));
+    }
+    Ok(())
+}
+
 async fn hot_working_diff_entries_for_finite_filter(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     checkpoint_commit_id: CommitId,
     generation: CommitId,
     filter: &TrackedStateFilter,
-) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    retain_payloads: bool,
+) -> Result<Option<TrackedStateDiff>, LixError> {
     let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
         .await?
         .expect("unbounded HOT scan cannot exhaust a byte budget");
     match rows {
         HotScanEntries::Decoded(rows) => {
             let mut candidates = Vec::with_capacity(rows.len());
+            let mut payloads = BTreeMap::new();
             for (identity, bytes) in rows {
                 let Some(versions) = finite_working_diff_versions(&bytes, checkpoint_commit_id)
                 else {
@@ -9593,9 +9650,28 @@ async fn hot_working_diff_entries_for_finite_filter(
                 let Some((before, after)) = versions else {
                     continue;
                 };
+                if retain_payloads && !after.deleted {
+                    let Ok(head) = decode_head_value(&bytes) else {
+                        return Ok(None);
+                    };
+                    insert_working_diff_payload(
+                        &mut payloads,
+                        after.change_id,
+                        owned_head_slot(head.snapshot),
+                        owned_head_slot(head.metadata),
+                    )?;
+                }
                 candidates.push((identity, before, after));
             }
-            Ok(Some(classify_hot_working_diff_scan_entries(candidates)?))
+            let entries = classify_hot_working_diff_scan_entries(candidates)?;
+            let payloads = TrackedStatePayloadBatch::from_payloads(
+                payloads
+                    .into_iter()
+                    .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
+            )?;
+            Ok(Some(TrackedStateDiff::from_entries_with_payloads(
+                entries, payloads,
+            )))
         }
         HotScanEntries::Finite(batches) => {
             let row_count = batches
@@ -9603,6 +9679,7 @@ async fn hot_working_diff_entries_for_finite_filter(
                 .map(|batch| batch.values.iter().flatten().count())
                 .sum();
             let mut candidates = Vec::with_capacity(row_count);
+            let mut payloads = BTreeMap::new();
             for batch in batches {
                 for (index, bytes) in batch.values.into_iter().enumerate() {
                     let Some(bytes) = bytes else {
@@ -9615,10 +9692,29 @@ async fn hot_working_diff_entries_for_finite_filter(
                     let Some((before, after)) = versions else {
                         continue;
                     };
+                    if retain_payloads && !after.deleted {
+                        let Ok(head) = decode_head_value(&bytes) else {
+                            return Ok(None);
+                        };
+                        insert_working_diff_payload(
+                            &mut payloads,
+                            after.change_id,
+                            owned_head_slot(head.snapshot),
+                            owned_head_slot(head.metadata),
+                        )?;
+                    }
                     candidates.push((batch.identities.key_ref(index), before, after));
                 }
             }
-            Ok(Some(classify_hot_working_diff_entry_refs(candidates)?))
+            let entries = classify_hot_working_diff_entry_refs(candidates)?;
+            let payloads = TrackedStatePayloadBatch::from_payloads(
+                payloads
+                    .into_iter()
+                    .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
+            )?;
+            Ok(Some(TrackedStateDiff::from_entries_with_payloads(
+                entries, payloads,
+            )))
         }
     }
 }

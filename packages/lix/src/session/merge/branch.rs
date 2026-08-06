@@ -478,7 +478,15 @@ where
                 transaction.stage_merge_commit(
                     active_branch_id.clone(),
                     analysis.commits.source_commit_id,
-                    selected_changes.finish(),
+                    selected_changes.finish_with_payloads(
+                        analysis
+                            .merge_plan
+                            .as_ref()
+                            .expect("merge commit has an analysis plan")
+                            .source_payloads
+                            .clone(),
+                        true,
+                    ),
                 )
             })?;
             Ok(MergeBranchReceipt {

@@ -553,7 +553,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         return Ok((writes, preconditions));
     }
 
-    let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
+    let selected_change_records =
+        load_selected_change_records(read, &commit_rows, active_account_id).await?;
     let mut replacement_generations = certify_complete_replacement_generations(
         read,
         &state_rows,
@@ -1932,25 +1933,49 @@ fn current_state_delta_from_engine_row(
 async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
     commit_rows: &[FinalizedCommitRow],
+    active_account_id: &str,
 ) -> Result<HashMap<SelectedChangeKey, ChangeRecord>, LixError> {
+    let mut records = HashMap::new();
     let mut by_source_commit = BTreeMap::<CommitId, Vec<StagedCommitChangeRef<'_>>>::new();
-    for change_ref in commit_rows
-        .iter()
-        .flat_map(|commit| selected_changes(&commit.selected_change_batches))
-    {
-        // Identity and timestamps fully describe a selected tombstone.
-        // Historical rows may be absent or retain metadata, while checkpoint
-        // HOT tombstones must carry no payload.
-        if change_ref.deleted {
-            continue;
+    for commit in commit_rows {
+        for batch in &commit.selected_change_batches {
+            for change_ref in batch.iter().filter(|change_ref| !change_ref.deleted) {
+                // A source diff has already authenticated this payload against
+                // its ChangeId and identity. Reuse its typed payload owner
+                // instead of issuing a second source changelog read.
+                if let Some(payloads) = batch.payloads() {
+                    let payload = payloads.get(change_ref.change_id).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "selected change '{}' has no payload in its authenticated diff owner",
+                                change_ref.change_id
+                            ),
+                        )
+                    })?;
+                    let record = ChangeRecord {
+                        format_version: 2,
+                        change_id: change_ref.change_id,
+                        account_id: active_account_id.to_owned(),
+                        schema_key: change_ref.schema_key().to_owned(),
+                        entity_pk: change_ref.entity_pk().clone(),
+                        file_id: change_ref.file_id().map(str::to_owned),
+                        snapshot: payload.snapshot.clone(),
+                        metadata: payload.metadata.clone(),
+                        created_at: change_ref.updated_at,
+                        origin_key: None,
+                    };
+                    records.insert(selected_change_key(change_ref), record);
+                } else {
+                    by_source_commit
+                        .entry(change_ref.source_commit_id)
+                        .or_default()
+                        .push(change_ref);
+                }
+            }
         }
-        by_source_commit
-            .entry(change_ref.source_commit_id)
-            .or_default()
-            .push(change_ref);
     }
 
-    let mut records = HashMap::new();
     for (source_commit_id, change_refs) in by_source_commit {
         let keys = change_refs
             .iter()

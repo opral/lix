@@ -25,6 +25,10 @@ use crate::tracked_state::{
 pub(crate) struct TrackedStateMergePlan {
     pub(crate) picks: TrackedStateMergePickBatch,
     pub(crate) conflicts: TrackedStateMergeConflictBatch,
+    /// Source diff payloads retained by the authenticated merge analysis.
+    /// Transaction publication can consume these slots without re-reading
+    /// source changelog records by identity.
+    pub(crate) source_payloads: TrackedStatePayloadBatch,
 }
 
 /// Contiguous fixed-metadata rows for source-side merge selections.
@@ -224,7 +228,7 @@ pub(crate) fn plan_merge(
         source: source_diff.payloads(),
         fallback: fallback_payloads,
     };
-    match SortedMergeInputs::new(target_diff, source_diff)? {
+    let plan = match SortedMergeInputs::new(target_diff, source_diff)? {
         SortedMergeInputs::Borrowed { target, source } => {
             plan_sorted_merge(target, source, &payloads)
         }
@@ -235,7 +239,11 @@ pub(crate) fn plan_merge(
             let (target, source) = entries.split_at(target_len);
             plan_sorted_merge(target, source, &payloads)
         }
-    }
+    }?;
+    Ok(TrackedStateMergePlan {
+        source_payloads: source_diff.payloads().clone(),
+        ..plan
+    })
 }
 
 /// Borrowed payload owners available to one merge analysis.

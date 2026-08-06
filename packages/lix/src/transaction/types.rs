@@ -16,7 +16,9 @@ use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance,
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
-use crate::tracked_state::{OrderedAddressableCommitDeltaStage, TrackedStateDiffIdentity};
+use crate::tracked_state::{
+    OrderedAddressableCommitDeltaStage, TrackedStateDiffIdentity, TrackedStatePayloadBatch,
+};
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -4057,6 +4059,10 @@ pub(crate) struct StagedCommitChangeBatch {
     /// independently supplied batches. The normal merge/checkpoint path views
     /// every row directly and allocates no selection column.
     selection: Option<Arc<[u32]>>,
+    /// Authenticated payload columns retained by the source diff. This owner
+    /// is transaction-local and lets checkpoint/merge publication consume the
+    /// already validated source payload without re-reading changelog rows.
+    payloads: Option<TrackedStatePayloadBatch>,
 }
 
 #[derive(Debug)]
@@ -4110,6 +4116,7 @@ impl StagedCommitChangeBatchBuilder {
             columns: Arc::new(self.columns),
             source_membership_certified: false,
             selection: None,
+            payloads: None,
         }
     }
 
@@ -4124,6 +4131,20 @@ impl StagedCommitChangeBatchBuilder {
             columns: Arc::new(self.columns),
             source_membership_certified: true,
             selection: None,
+            payloads: None,
+        }
+    }
+
+    pub(crate) fn finish_with_payloads(
+        self,
+        payloads: TrackedStatePayloadBatch,
+        source_membership_certified: bool,
+    ) -> StagedCommitChangeBatch {
+        StagedCommitChangeBatch {
+            columns: Arc::new(self.columns),
+            source_membership_certified,
+            selection: None,
+            payloads: Some(payloads),
         }
     }
 }
@@ -4180,12 +4201,17 @@ impl StagedCommitChangeBatch {
                 columns: self.columns,
                 source_membership_certified: self.source_membership_certified,
                 selection: Some(selection.into()),
+                payloads: self.payloads,
             }
         }
     }
 
     pub(crate) fn source_membership_certified(&self) -> bool {
         self.source_membership_certified
+    }
+
+    pub(crate) fn payloads(&self) -> Option<&TrackedStatePayloadBatch> {
+        self.payloads.as_ref()
     }
 
     #[cfg(test)]

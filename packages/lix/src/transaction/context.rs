@@ -7847,6 +7847,7 @@ where
                 )
                 .await?
         };
+        let diff_payloads = diff.payloads().clone();
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != diff_ids.len() {
             return Err(LixError::new(
@@ -7882,16 +7883,10 @@ where
                     push_checkpoint_selected_change(&mut unselected, target, entry.kind);
             }
         }
-        let selected = if selected_source_membership_exact {
-            selected.finish_source_certified()
-        } else {
-            selected.finish()
-        };
-        let unselected = if unselected_source_membership_exact {
-            unselected.finish_source_certified()
-        } else {
-            unselected.finish()
-        };
+        let selected =
+            selected.finish_with_payloads(diff_payloads.clone(), selected_source_membership_exact);
+        let unselected =
+            unselected.finish_with_payloads(diff_payloads, unselected_source_membership_exact);
         if matched != requested {
             return Err(stale_or_unknown_diff_id());
         }

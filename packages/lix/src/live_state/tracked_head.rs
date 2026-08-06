@@ -64,7 +64,7 @@ use crate::storage_codec;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity,
     TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStateFilter,
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateScanRequest,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStatePayloadBatch, TrackedStateScanRequest,
 };
 
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v16";

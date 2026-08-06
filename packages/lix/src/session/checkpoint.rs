@@ -66,6 +66,9 @@ where
                             &TrackedStateDiffRequest::default(),
                         )
                         .await?;
+                    let direct_working_diff_payloads = direct_working_diff
+                        .as_ref()
+                        .map(|direct| direct.diff.payloads().clone());
                     let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
                         direct.checkpoint_commit_id
                     } else {
@@ -97,18 +100,19 @@ where
                     let interval_has_commits =
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
-                        let entries = if let Some(direct) = direct_working_diff {
-                            direct.diff.entries
+                        let (entries, payloads) = if let Some(direct) = direct_working_diff {
+                            (direct.diff.entries, direct_working_diff_payloads)
                         } else {
                             let mut reader = transaction.tracked_state_reader().await;
-                            reader
+                            let diff = reader
                                 .diff_commits(
                                     &previous_checkpoint_commit_id.to_string(),
                                     &head_commit_id.to_string(),
                                     &TrackedStateDiffRequest::default(),
                                 )
-                                .await?
-                                .entries
+                                .await?;
+                            let payloads = diff.payloads().clone();
+                            (diff.entries, Some(payloads))
                         };
                         let mut selected_changes =
                             StagedCommitChangeBatchBuilder::with_capacity(entries.len());
@@ -131,10 +135,13 @@ where
                             source_membership_exact &=
                                 push_selected_change(&mut selected_changes, row, entry.kind);
                         }
-                        if source_membership_exact {
-                            selected_changes.finish_source_certified()
-                        } else {
-                            selected_changes.finish()
+                        match payloads {
+                            Some(payloads) => selected_changes
+                                .finish_with_payloads(payloads, source_membership_exact),
+                            None if source_membership_exact => {
+                                selected_changes.finish_source_certified()
+                            }
+                            None => selected_changes.finish(),
                         }
                     };
                     gc_state.checkpoint_sequence = gc_state
