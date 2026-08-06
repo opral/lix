@@ -381,6 +381,89 @@ const whatYouGet = [
       </svg>
     ),
   },
+  {
+    title: "Permissions",
+    badge: "soon",
+    description:
+      "Finance, legal, and contractors need different access, but Git is all or nothing. Lix models permissions per file and group inside the repository.",
+    icon: (
+      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
+        <rect
+          x="12"
+          y="16"
+          width="16"
+          height="24"
+          rx="2"
+          fill="#FFFFFF"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+        <line
+          x1="16"
+          y1="23"
+          x2="24"
+          y2="23"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+        <rect
+          x="52"
+          y="16"
+          width="16"
+          height="24"
+          rx="2"
+          fill="#FFFFFF"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+        <line
+          x1="56"
+          y1="23"
+          x2="64"
+          y2="23"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+        <rect
+          x="32"
+          y="16"
+          width="16"
+          height="24"
+          rx="2"
+          fill="#FFFFFF"
+          stroke="#8A8F96"
+          strokeWidth="1.5"
+        />
+        <line
+          x1="36"
+          y1="23"
+          x2="44"
+          y2="23"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+        <path
+          d="M37.5 32 v-2.2 a2.5 2.5 0 0 1 5 0 V32"
+          fill="none"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+        <rect
+          x="35.5"
+          y="32"
+          width="9"
+          height="7"
+          rx="1.5"
+          fill="rgba(7,182,213,0.14)"
+          stroke="#07B6D5"
+          strokeWidth="1.5"
+        />
+      </svg>
+    ),
+  },
 ];
 
 /**
@@ -457,7 +540,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             What you get
           </h2>
           <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
-            Putting more than code into a repository needs six things a code
+            Putting more than code into a repository needs seven things a code
             VCS never had:
           </p>
           <div className="mt-5">
@@ -469,8 +552,13 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 }`}
               >
                 {item.icon}
-                <span className="text-[15px] font-semibold tracking-[-0.01em]">
+                <span className="flex flex-wrap items-center gap-2 text-[15px] font-semibold tracking-[-0.01em]">
                   {item.title}
+                  {"badge" in item && (
+                    <span className="rounded border border-line-strong px-1.5 py-0.5 font-mono text-[10px] font-normal uppercase tracking-[0.08em] text-ink-muted">
+                      {item.badge}
+                    </span>
+                  )}
                 </span>
                 <span className="text-[15px] leading-[1.6] text-ink-secondary">
                   {item.description}
