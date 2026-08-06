@@ -9340,35 +9340,92 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
             .entries
             .chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS)
         {
-            let commit_ids = entry_batch
-                .iter()
-                .map(|entry| commit_id_from_delta_key(&entry.key))
-                .collect::<Result<Vec<_>, _>>()?;
-            let states = load_commit_state_manifests(store, &commit_ids).await?;
-            for (entry, (commit_id, state)) in
-                entry_batch.iter().zip(commit_ids.into_iter().zip(states))
-            {
+            for entry in entry_batch {
                 if entry.key.0.len() != 16 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "tracked_state commit_delta manifest key is not a 16-byte commit id",
                     ));
                 }
-                let StorageProjectedValue::FullValue(_) = &entry.value else {
+            }
+            let commit_ids = entry_batch
+                .iter()
+                .map(|entry| commit_id_from_delta_key(&entry.key))
+                .collect::<Result<Vec<_>, _>>()?;
+            // The scan already fetched every immutable authority header. Read
+            // only the split mutation inventories here; re-fetching those
+            // headers through load_commit_state_manifests doubled the physical
+            // header work for every history row.
+            let inventory_keys = commit_ids
+                .iter()
+                .map(|commit_id| StorageKey(Bytes::from(commit_mutation_inventory_key(*commit_id))))
+                .collect::<Vec<_>>();
+            let inventory_request = [StorageGetManyRequest {
+                space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+                keys: &inventory_keys,
+                opts: StorageGetOptions::default(),
+            }];
+            let inventories = exact_get_many(store, &inventory_request).await?.values;
+            let mut authorities = Vec::with_capacity(commit_ids.len());
+            for (entry, (commit_id, inventory_value)) in entry_batch
+                .iter()
+                .zip(commit_ids.iter().copied().zip(inventories))
+            {
+                let StorageProjectedValue::FullValue(header) = &entry.value else {
                     unreachable!("full commit-delta scan returned a key-only row");
                 };
-                let state = state.ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit-state scan lost its split authority",
-                    )
-                })?;
-                if state.commit_id != commit_id {
+                let inventory = inventory_value
+                    .and_then(full_value_bytes)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                            ),
+                        )
+                    })?;
+                let (stored, stored_inventory) =
+                    decode_stored_commit_state_authority(header, &inventory)?;
+                if stored.commit_id != commit_id {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit-state scan key and manifest commit disagree",
+                        format!(
+                            "tracked_state commit-state scan key and manifest commit disagree for '{commit_id}'"
+                        ),
                     ));
                 }
+                authorities.push((stored, stored_inventory));
+            }
+            let roots = authorities
+                .iter()
+                .filter_map(|(_, inventory)| inventory.directory_root.clone())
+                .collect::<Vec<_>>();
+            let mut directories = super::mutation_directory::load_all_mutation_part_read_plans(
+                store,
+                &roots,
+                super::mutation_directory::MutationDirectoryFullTraversalContext::BulkCommitStateManifests,
+            )
+            .await?
+            .into_iter();
+            let states = authorities
+                .into_iter()
+                .map(|(stored, inventory)| {
+                    let entries = if inventory.directory_root.is_some() {
+                        directories
+                            .next()
+                            .expect("each authenticated root returns one directory")
+                            .into_runs()
+                            .into_iter()
+                            .map(|run| run.entry)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    assemble_commit_state_manifest(stored, inventory, entries, true)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            debug_assert!(directories.next().is_none());
+            for (commit_id, state) in commit_ids.into_iter().zip(states) {
                 let manifest =
                     expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
                 if let Some(parts) = manifest.columnar_parts.as_ref() {
