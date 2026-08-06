@@ -112,7 +112,6 @@ struct DeleteAccounting {
 #[derive(Debug, Default)]
 struct DeleteMapping {
     present: Vec<(u32, DeleteAccounting)>,
-    absent_idempotent: Vec<(u32, u64)>,
 }
 
 impl DeleteAccounting {
@@ -356,14 +355,7 @@ where
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    let absent_by_space = delete_mapping
-        .absent_idempotent
-        .iter()
-        .copied()
-        .collect::<BTreeMap<_, _>>();
     let mut planned_deleted_rows = 0_u64;
-    let mut planned_present_rows = 0_u64;
-    let mut planned_noop_rows = 0_u64;
     for (space_id, count) in &gc.delete_counts_by_space {
         let Some((space, accounting)) = rows.iter().find(|(_, value)| value.id == *space_id) else {
             return Err(format!("GC planned deletion in unknown space id {space_id:#x}").into());
@@ -675,21 +667,18 @@ where
                 .saturating_add(4_u64.saturating_add(key.len() as u64));
             accounting.value_bytes = accounting.value_bytes.saturating_add(value.len() as u64);
         }
-        if accounting.rows != found.len() as u64 {
-            return Err(
-                format!("GC present-delete mapping count mismatch in {}", space.name).into(),
-            );
-        }
-        let absent = expected.len().saturating_sub(found.len()) as u64;
-        if accounting.rows.saturating_add(absent) != keys.len() as u64 {
+        if accounting.rows != found.len() as u64 || found.len() != expected.len() {
             return Err(format!(
-                "GC present/absent delete intent count mismatch in {} (inventory had {})",
-                space.name, inventory.rows
+                "GC delete mapping missing {} rows in {} (expected={}, found={}, inventory had {})",
+                expected.len().saturating_sub(found.len()),
+                space.name,
+                expected.len(),
+                found.len(),
+                inventory.rows,
             )
             .into());
         }
         mapped.present.push((*space_id, accounting));
-        mapped.absent_idempotent.push((*space_id, absent));
     }
     Ok(mapped)
 }
