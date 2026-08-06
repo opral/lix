@@ -120,6 +120,8 @@ fn print_allocation_accounting(_phase: &str) {}
 mod accounting;
 mod io_stats;
 mod kv_layout;
+#[cfg(feature = "postgres")]
+mod raw_postgres;
 mod raw_sqlite;
 mod sql_session;
 mod storage;
@@ -168,6 +170,10 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
 
     for (label, row_count) in [("smoke", SMOKE_ROWS), ("real_workload", REAL_WORKLOAD_ROWS)] {
         bench_raw_sqlite(c, &rows[..row_count], label);
+        #[cfg(feature = "postgres")]
+        if let Some(url) = raw_postgres::configured_url() {
+            bench_raw_postgres(c, &rows[..row_count], label, &url);
+        }
         for &profile in KV_STORAGE_PROFILES {
             bench_kv_layout(c, &runtime, profile, &rows[..row_count], label);
         }
@@ -1384,6 +1390,71 @@ fn bench_raw_sqlite(c: &mut Criterion, rows: &[WorkloadRow], label: &str) {
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || raw_sqlite::seeded_fixture(&rows),
+            |fixture| black_box(fixture.delete_one_by_pk()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+#[cfg(feature = "postgres")]
+fn bench_raw_postgres(c: &mut Criterion, rows: &[WorkloadRow], label: &str, url: &str) {
+    let mut group = c.benchmark_group(format!("tracked_state_crud/raw_postgres/{label}"));
+    configure_group(&mut group, rows.len());
+    let rows = rows.to_vec();
+
+    group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::empty_fixture(url, &rows),
+            |fixture| black_box(fixture.insert_all()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("read_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
+            |fixture| black_box(fixture.read_all()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
+            |fixture| black_box(fixture.read_one_by_pk()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
+            |fixture| black_box(fixture.read_many_by_pk(READ_MANY_PK_COUNT)),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
+            |fixture| black_box(fixture.update_all()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
+            |fixture| black_box(fixture.update_one_by_pk()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
+            |fixture| black_box(fixture.delete_all()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || raw_postgres::seeded_fixture(url, &rows),
             |fixture| black_box(fixture.delete_one_by_pk()),
             BatchSize::LargeInput,
         );
