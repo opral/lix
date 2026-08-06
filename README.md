@@ -19,9 +19,8 @@ Lix is a version control system for work beyond code: any file format, SQL over 
 - 🔍 **Semantic changes.** Review the clause, cell, or row that changed, not lines of bytes.
 - 🗄️ **SQL and transactions.** Query file content, app data, and history; update files and rows in one ACID transaction.
 - 👥 **Real-time collaboration.** People and agents share a repository and see changes live.
-- 🏁 **Checkpoints instead of commits.** Lix records every change automatically; a checkpoint marks a state you want to return to.
-- 🔌 **Pluggable storage.** An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale. Git assumes a POSIX filesystem.
-- 🔐 **Permissions (soon).** Finance, legal, and contractors need different access. Lix models permissions per file and group inside the repository.
+- 🔌 **Pluggable storage.** An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale, in contrast to existing VCS like Git that assume a local POSIX filesystem.
+- 🔐 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
 
 ## Try a demo app
 

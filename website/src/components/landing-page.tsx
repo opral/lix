@@ -288,45 +288,9 @@ const whatYouGet = [
     ),
   },
   {
-    title: "Checkpoints instead of commits",
-    description:
-      "Non-developers expect automatic saving, not commits. Lix records every change; a checkpoint marks a state you want to return to.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <line
-          x1="12"
-          y1="34"
-          x2="68"
-          y2="34"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <circle cx="20" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="32" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="44" cy="34" r="2.5" fill="#C9C7BF" />
-        <circle cx="56" cy="34" r="3.5" fill="#07B6D5" />
-        <line
-          x1="56"
-          y1="30"
-          x2="56"
-          y2="16"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <path
-          d="M56 16 L66 19 L56 22 Z"
-          fill="rgba(7,182,213,0.14)"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-          strokeLinejoin="round"
-        />
-      </svg>
-    ),
-  },
-  {
     title: "Pluggable storage",
     description:
-      "An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale. Git assumes a POSIX filesystem.",
+      "An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale, in contrast to existing VCS like Git that assume a local POSIX filesystem.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
@@ -385,7 +349,7 @@ const whatYouGet = [
     title: "Permissions",
     badge: "soon",
     description:
-      "Finance, legal, and contractors need different access. Lix models permissions per file and group inside the repository.",
+      "Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <path
@@ -493,7 +457,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             What you get
           </h2>
           <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
-            Putting more than code into a repository needs seven things a code
+            Putting more than code into a repository needs six things a code
             VCS never had:
           </p>
           <div className="mt-5">
