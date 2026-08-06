@@ -5914,30 +5914,122 @@ async fn load_physical_direct_change_records(
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("direct coordinate references a missing immutable part")
         })?;
-        let (bounds, direct_row_count) = match run.entry {
+        let (bounds, direct_row_count) = match &run.entry {
             super::mutation_directory::MutationDirectoryEntry::Bounded {
                 part,
                 direct_row_count,
             } => (
                 CommitDeltaSegmentBounds {
-                    first_key: part.first_key,
-                    last_key: part.last_key,
-                    replacement_part: part.replacement_part,
+                    first_key: part.first_key.clone(),
+                    last_key: part.last_key.clone(),
+                    replacement_part: part.replacement_part.clone(),
                 },
-                direct_row_count,
+                *direct_row_count,
             ),
             super::mutation_directory::MutationDirectoryEntry::CompactReplacement {
                 content_digest,
                 direct_row_count,
-            } => (
-                compact_replacement_bounds_for_selected_part(
-                    state,
-                    run.entry_index,
+            } => {
+                let generation =
+                    state
+                        .mutations
+                        .replacement_generation
+                        .as_ref()
+                        .ok_or_else(|| {
+                            replacement_payload_error("compact part omitted its generation")
+                        })?;
+                let lifecycle = state.mutations.lifecycle_summary.as_ref().ok_or_else(|| {
+                    replacement_payload_error("compact part omitted lifecycle metadata")
+                })?;
+                let authority = state.mutations.replacement_parts.as_ref().ok_or_else(|| {
+                    replacement_payload_error("compact part omitted payload authority")
+                })?;
+                if generation.owner_commit_id != *state.commit_id.as_uuid().as_bytes()
+                    || generation.integrity_digest
+                        != replacement_generation_integrity_digest(generation, lifecycle, authority)
+                {
+                    return Err(replacement_payload_error(
+                        "compact part generation authority is invalid",
+                    ));
+                }
+                let decoded = crate::tracked_state::replacement_part::decode_replacement_part(
                     content_digest,
                     &bytes,
-                )?,
-                direct_row_count,
-            ),
+                )?;
+                if decoded.len() != usize::from(*direct_row_count) {
+                    return Err(replacement_payload_error(
+                        "compact immutable part row count disagrees with directory authority",
+                    ));
+                }
+                #[cfg(any(test, feature = "storage-benches"))]
+                super::mutation_directory::record_direct_part_decoded(
+                    decoded.len(),
+                    bytes.len(),
+                    decoded.len(),
+                );
+                for output_index in run.selector_span.clone() {
+                    let coordinate = coordinates[output_index];
+                    let locator = locators[output_index];
+                    if coordinate.part_index != run.entry_index
+                        || coordinate.local_row != locator.ordinal
+                    {
+                        return Err(replacement_payload_error(
+                            "direct-coordinate run disagrees with its physical locator",
+                        ));
+                    }
+                    let packed = run
+                        .entry_index
+                        .checked_mul(
+                            u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                                .expect("replacement row bound fits u32"),
+                        )
+                        .and_then(|base| base.checked_add(u32::from(locator.ordinal)))
+                        .and_then(|address| address.checked_add(1))
+                        .ok_or_else(|| {
+                            replacement_payload_error("replacement address overflows")
+                        })?;
+                    if locator.change_id != change_id_from_packed_address(state.commit_id, packed) {
+                        return Err(replacement_payload_error(
+                            "compact locator change id disagrees with its physical address",
+                        ));
+                    }
+                    let encoded_key =
+                        decoded.key(usize::from(locator.ordinal))?.ok_or_else(|| {
+                            replacement_payload_error("replacement part omitted a key")
+                        })?;
+                    let key = decode_key(encoded_key)?;
+                    let snapshot = owned_scoped_json_slot(
+                        decoded
+                            .snapshot(usize::from(locator.ordinal))?
+                            .ok_or_else(|| {
+                                replacement_payload_error("replacement part omitted a snapshot")
+                            })?,
+                    );
+                    let metadata = owned_scoped_json_slot(
+                        decoded
+                            .metadata(usize::from(locator.ordinal))?
+                            .ok_or_else(|| {
+                                replacement_payload_error("replacement part omitted metadata")
+                            })?,
+                    );
+                    output.push((
+                        output_index,
+                        crate::changelog::ChangeRecord {
+                            account_id: state.change_account_id.clone(),
+                            format_version: 2,
+                            change_id: locator.change_id,
+                            schema_key: key.schema_key,
+                            entity_pk: key.entity_pk,
+                            file_id: key.file_id,
+                            snapshot,
+                            metadata,
+                            created_at: lifecycle.uniform_created_at,
+                            origin_key: None,
+                        },
+                    ));
+                }
+                continue;
+            }
             super::mutation_directory::MutationDirectoryEntry::DirectAddress { .. } => {
                 return Err(replacement_payload_error(
                     "non-columnar direct authority selected an address-only entry",
@@ -5977,55 +6069,6 @@ async fn load_physical_direct_change_records(
         }
     }
     Ok(output)
-}
-
-fn compact_replacement_bounds_for_selected_part(
-    state: &AuthenticatedReplayCommitStateManifest,
-    part_index: u32,
-    content_digest: [u8; 32],
-    bytes: &[u8],
-) -> Result<CommitDeltaSegmentBounds, LixError> {
-    let generation = state
-        .mutations
-        .replacement_generation
-        .as_ref()
-        .ok_or_else(|| replacement_payload_error("compact part omitted its generation"))?;
-    let lifecycle = state
-        .mutations
-        .lifecycle_summary
-        .as_ref()
-        .ok_or_else(|| replacement_payload_error("compact part omitted lifecycle metadata"))?;
-    let authority = state
-        .mutations
-        .replacement_parts
-        .as_ref()
-        .ok_or_else(|| replacement_payload_error("compact part omitted payload authority"))?;
-    let decoded =
-        crate::tracked_state::replacement_part::decode_replacement_part(&content_digest, bytes)?;
-    let first_key = decoded
-        .first_key()
-        .ok_or_else(|| replacement_payload_error("replacement part is empty"))?
-        .to_vec();
-    let last_key = decoded
-        .last_key()
-        .ok_or_else(|| replacement_payload_error("replacement part is empty"))?
-        .to_vec();
-    let first_address = part_index
-        .checked_mul(
-            u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("replacement row bound fits u32"),
-        )
-        .ok_or_else(|| replacement_payload_error("replacement address overflows"))?;
-    Ok(CommitDeltaSegmentBounds {
-        first_key,
-        last_key,
-        replacement_part: Some(StoredReplacementPart {
-            content_digest,
-            owner_commit_id: generation.owner_commit_id,
-            first_address,
-            uniform_created_at: lifecycle.uniform_created_at,
-            uniform_updated_at: authority.uniform_updated_at,
-        }),
-    })
 }
 
 async fn load_change_records_by_ids(
@@ -6136,18 +6179,22 @@ async fn load_explicit_change_records_at_locators(
     store: &(impl StorageAdapterRead + ?Sized),
     locators: &[CommitDeltaChangeLocator],
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    load_explicit_change_records_at_locators_selected(store, locators).await
+}
+
+async fn load_explicit_change_records_at_locators_selected(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locators: &[CommitDeltaChangeLocator],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
     let commit_ids = locators
         .iter()
         .map(|locator| locator.commit_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let manifest_values = load_commit_delta_manifests(store, &commit_ids).await?;
-    let manifests = commit_ids
-        .into_iter()
-        .zip(manifest_values)
-        .map(|(commit_id, value)| {
-            let manifest = value.ok_or_else(|| {
+        .collect::<BTreeSet<_>>();
+    let mut states = BTreeMap::<CommitId, AuthenticatedReplayCommitStateManifest>::new();
+    for commit_id in commit_ids {
+        let state = load_point_replay_commit_state(store, commit_id)
+            .await?
+            .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
@@ -6155,185 +6202,40 @@ async fn load_explicit_change_records_at_locators(
                     ),
                 )
             })?;
-            Ok((commit_id, manifest))
-        })
-        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        if let Some(source_commit_id) = state.mutations.selected_source_commit_id() {
+            let source = load_point_replay_commit_state(store, source_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    replacement_payload_error(&format!(
+                        "selected-source commit '{}' references missing authority '{}'",
+                        state.commit_id, source_commit_id
+                    ))
+                })?;
+            if source.mutations.selected_source_commit_id().is_some() {
+                return Err(replacement_payload_error(
+                    "selected-source mutation authority cannot alias another source",
+                ));
+            }
+        }
+        states.insert(commit_id, state);
+    }
 
     let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
-    let mut columnar_by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
-    for (locator_index, locator) in locators.iter().enumerate() {
-        if manifests[&locator.commit_id].columnar_parts.is_some() {
-            columnar_by_commit
-                .entry(locator.commit_id)
-                .or_default()
-                .push(locator_index);
-        }
+    let mut by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
+    for (index, locator) in locators.iter().enumerate() {
+        by_commit.entry(locator.commit_id).or_default().push(index);
     }
-    for (commit_id, locator_indices) in columnar_by_commit {
-        let parts = manifests[&commit_id]
-            .columnar_parts
-            .as_ref()
-            .expect("columnar locator group was selected from this manifest");
-        let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
-        let row_group_manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
-            .await?
-            .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
-        validate_columnar_mutation_manifest(&row_group_manifest, parts)?;
-        let projection = (0..row_group_manifest.fields.len()).collect::<Vec<_>>();
-        let mut page_groups = BTreeMap::<(usize, usize), Vec<(usize, usize)>>::new();
-        for locator_index in locator_indices {
-            let locator = locators[locator_index];
-            let logical_ordinal = usize::try_from(locator.segment_index)
-                .expect("u32 segment fits usize")
-                .checked_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                .and_then(|base| base.checked_add(usize::from(locator.ordinal)))
-                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
-            if logical_ordinal >= parts.row_count as usize {
-                return Err(replacement_payload_error(
-                    "columnar mutation locator is outside its inventory",
-                ));
-            }
-            let packed = u32::try_from(logical_ordinal)
-                .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
-                .checked_add(1)
-                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
-            if locator.change_id != change_id_from_packed_address(commit_id, packed) {
-                return Err(replacement_payload_error(
-                    "columnar mutation locator change id disagrees with its ordinal",
-                ));
-            }
-            let group_index = logical_ordinal / crate::columnar_row_group::ROW_GROUP_MAX_ROWS;
-            let row_in_group = logical_ordinal % crate::columnar_row_group::ROW_GROUP_MAX_ROWS;
-            let page_index = row_in_group / crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
-            let row_in_page = row_in_group % crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
-            page_groups
-                .entry((group_index, page_index))
-                .or_default()
-                .push((locator_index, row_in_page));
-        }
-        let page_coordinates = page_groups.keys().copied().collect::<Vec<_>>();
-        crate::columnar_row_group::visit_row_group_pages(
-            store,
-            id,
-            &row_group_manifest,
-            &page_coordinates,
-            &projection,
-            |coordinate, batch| {
-                for &(locator_index, row_in_page) in &page_groups[&coordinate] {
-                    let locator = locators[locator_index];
-                    loaded[locator_index] = Some(decode_columnar_change_record(
-                        &row_group_manifest,
-                        &batch,
-                        row_in_page,
-                        parts,
-                        locator.change_id,
-                        &manifests[&commit_id].account_id,
-                    )?);
-                }
-                Ok(())
-            },
-        )
-        .await?;
-    }
-
-    let routes = locators
-        .iter()
-        .filter_map(|locator| {
-            let manifest = &manifests[&locator.commit_id];
-            (manifest.columnar_parts.is_none() && manifest.inline_segment().is_none()).then_some((
-                locator.commit_id,
-                usize::try_from(locator.segment_index).expect("u32 fits usize"),
-            ))
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let segment_keys = routes
-        .iter()
-        .map(|&(commit_id, segment_index)| {
-            let bounds = manifests[&commit_id].segments.get(segment_index).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state selected change references out-of-range segment {segment_index} of commit '{commit_id}'"
-                    ),
-                )
-            })?;
-            commit_delta_segment_key_for_bounds(
-                commit_id,
-                segment_index,
-                bounds,
-            )
-            .map(|key| StorageKey(Bytes::from(key)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let segment_values =
-        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &segment_keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-    let segments = routes
-        .into_iter()
-        .zip(segment_values.value)
-        .map(|(route, value)| {
-            value
-                .and_then(full_value_bytes)
-                .map(|bytes| (route, bytes))
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state selected change references absent segment {} of commit '{}'",
-                            route.1, route.0
-                        ),
-                    )
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-
-    let mut locator_groups = BTreeMap::<(CommitId, usize), Vec<usize>>::new();
-    for (locator_index, locator) in locators.iter().enumerate() {
-        if manifests[&locator.commit_id].columnar_parts.is_some() {
-            continue;
-        }
-        locator_groups
-            .entry((
-                locator.commit_id,
-                usize::try_from(locator.segment_index).expect("u32 fits usize"),
-            ))
-            .or_default()
-            .push(locator_index);
-    }
-    for ((commit_id, segment_index), locator_indices) in locator_groups {
-        let manifest = &manifests[&commit_id];
-        let (bytes, bounds) = if let Some(inline) = manifest.inline_segment() {
-            if segment_index != 0 {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state selected change references a nonzero inline segment",
-                ));
-            }
-            (inline, None)
-        } else {
-            let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state selected change references an undeclared segment",
-                )
-            })?;
-            (segments[&(commit_id, segment_index)].as_ref(), Some(bounds))
-        };
-        let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, bounds)?;
-        for locator_index in locator_indices {
-            let locator = locators[locator_index];
-            loaded[locator_index] = Some(
-                decode_change_at_locator_from_decoded(
-                    &leaf,
-                    &payloads,
-                    locator,
-                    &manifest.account_id,
-                )?
-                .change_record,
-            );
+    for (commit_id, indices) in by_commit {
+        let state = states
+            .get(&commit_id)
+            .expect("every selected locator has an authenticated state");
+        let requested = indices
+            .iter()
+            .map(|&index| locators[index])
+            .collect::<Vec<_>>();
+        let records = load_selected_change_records_from_state(store, state, &requested).await?;
+        for (index, record) in indices.into_iter().zip(records) {
+            loaded[index] = Some(record);
         }
     }
     loaded
@@ -6344,6 +6246,159 @@ async fn load_explicit_change_records_at_locators(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked_state authoritative change unexpectedly disappeared",
                 )
+            })
+        })
+        .collect()
+}
+
+async fn load_selected_change_records_from_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
+    locators: &[CommitDeltaChangeLocator],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    if locators.is_empty() {
+        return Ok(Vec::new());
+    }
+    if locators
+        .iter()
+        .any(|locator| locator.commit_id != state.commit_id)
+    {
+        return Err(replacement_payload_error(
+            "selected change locator disagrees with its authenticated owner",
+        ));
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    let mut accounting_guard = super::mutation_directory::DirectRouteAccountingGuard::new();
+    #[cfg(any(test, feature = "storage-benches"))]
+    super::mutation_directory::record_direct_route_start(locators.len());
+
+    let mut request_indices = (0..locators.len()).collect::<Vec<_>>();
+    request_indices.sort_by_key(|&index| {
+        let locator = locators[index];
+        (locator.segment_index, locator.ordinal, locator.change_id)
+    });
+    let mut unique_indices = Vec::with_capacity(request_indices.len());
+    let mut scatter = Vec::with_capacity(request_indices.len());
+    for request_index in request_indices {
+        let unique_index = if unique_indices
+            .last()
+            .is_some_and(|&previous| locators[previous] == locators[request_index])
+        {
+            unique_indices.len() - 1
+        } else {
+            unique_indices.push(request_index);
+            unique_indices.len() - 1
+        };
+        scatter.push((request_index, unique_index));
+    }
+    let unique_locators = unique_indices
+        .iter()
+        .map(|&index| locators[index])
+        .collect::<Vec<_>>();
+    #[cfg(any(test, feature = "storage-benches"))]
+    super::mutation_directory::record_direct_route_unique_rows(unique_locators.len());
+
+    let unique_records = if let Some(root) = state.mutation_directory_root.as_ref() {
+        let coordinates = unique_locators
+            .iter()
+            .map(
+                |locator| super::mutation_directory::MutationDirectoryDirectCoordinate {
+                    part_index: locator.segment_index,
+                    local_row: locator.ordinal,
+                },
+            )
+            .collect::<Vec<_>>();
+        let (runs, not_owned) = super::mutation_directory::load_mutation_part_read_plan(
+            store,
+            root,
+            super::mutation_directory::MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(
+                &coordinates,
+            ),
+        )
+        .await?
+        .into_direct_routes();
+        if let Some(route) = not_owned.into_iter().next() {
+            return Err(replacement_payload_error(&format!(
+                "selected change locator is not owned by its authenticated directory ({:?})",
+                route.reason
+            )));
+        }
+        #[cfg(any(test, feature = "storage-benches"))]
+        super::mutation_directory::record_direct_route_claimed_rows(unique_locators.len());
+        if let Some(parts) = state.mutations.columnar_parts.as_ref() {
+            load_columnar_direct_change_records(store, state, parts, &unique_locators).await?
+        } else {
+            let routed = load_physical_direct_change_records(
+                store,
+                state,
+                &coordinates,
+                &unique_locators,
+                runs,
+            )
+            .await?;
+            let mut records = (0..unique_locators.len()).map(|_| None).collect::<Vec<_>>();
+            for (index, record) in routed {
+                records[index] = Some(record);
+            }
+            records
+                .into_iter()
+                .map(|record| {
+                    record.ok_or_else(|| {
+                        replacement_payload_error(
+                            "selected change directory route lost a requested row",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    } else if let Some(parts) = state.mutations.columnar_parts.as_ref() {
+        load_columnar_direct_change_records(store, state, parts, &unique_locators).await?
+    } else {
+        if state.mutations.inline_part.is_empty() {
+            return Err(replacement_payload_error(
+                "selected change owner has no authenticated physical authority",
+            ));
+        }
+        let (leaf, payloads) =
+            decode_commit_delta_with_payloads(&state.mutations.inline_part, None)?;
+        if leaf.len() != state.mutations.member_count as usize {
+            return Err(replacement_payload_error(
+                "inline selected change authority row count disagrees with its header",
+            ));
+        }
+        unique_locators
+            .iter()
+            .map(|&locator| {
+                if locator.segment_index != 0 {
+                    return Err(replacement_payload_error(
+                        "inline selected change locator names a nonzero segment",
+                    ));
+                }
+                Ok(decode_change_at_locator_from_decoded(
+                    &leaf,
+                    &payloads,
+                    locator,
+                    &state.change_account_id,
+                )?
+                .change_record)
+            })
+            .collect::<Result<Vec<_>, LixError>>()?
+    };
+
+    let mut output = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
+    for (request_index, unique_index) in scatter {
+        output[request_index] = Some(unique_records[unique_index].clone());
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    {
+        super::mutation_directory::record_direct_route_scattered_rows(locators.len());
+        accounting_guard.finish();
+    }
+    output
+        .into_iter()
+        .map(|record| {
+            record.ok_or_else(|| {
+                replacement_payload_error("selected change scatter lost a requested row")
             })
         })
         .collect()
