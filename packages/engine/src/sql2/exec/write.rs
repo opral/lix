@@ -12,6 +12,7 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::common::ExecuteStatementMetadata;
+use crate::session::PreparedDmlParameterBatch;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::BoundWriteTarget;
@@ -365,6 +366,50 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     )
     .await
     .map_err(normalize_bound_public_write_error)
+}
+
+pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &SqlLogicalPlan,
+    parameter_batch: &PreparedDmlParameterBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let SqlLogicalPlan::Write(write_plan) = plan else {
+        return Ok(None);
+    };
+    validate_write_parameter_count(&write_plan.plan, parameter_batch.column_count())?;
+    if let Some(results) = super::bound_public_write::try_execute_file_prepared_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_batch,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)?
+    {
+        PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
+        return Ok(Some(results));
+    }
+    if let Some(results) = super::bound_public_write::try_execute_entity_insert_prepared_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_batch,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)?
+    {
+        PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
+        return Ok(Some(results));
+    }
+    let results = super::bound_public_write::try_execute_entity_update_prepared_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_batch,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)?;
+    if results.is_some() {
+        PreparedDmlParameterBatch::record_execution(parameter_batch.row_count());
+    }
+    Ok(results)
 }
 
 pub(crate) async fn execute_write_logical_plan_value_batch<'a>(

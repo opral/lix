@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::{fmt::Write as _, ops::Range};
 
-use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
+use lix_engine::{
+    Engine, ExecuteBatchStatement, ExecuteResult, PreparedDmlParameterBatch, SessionContext,
+    Storage, Value,
+};
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
@@ -25,7 +28,12 @@ const GENERAL_FILTER_SORT_SQL: &str =
     "SELECT path, value FROM json_pointer WHERE path IS NOT NULL ORDER BY value, path";
 const GENERAL_AGGREGATE_SQL: &str = "SELECT COUNT(*) AS rows, MIN(path) AS first_path, MAX(path) AS last_path \
     FROM json_pointer WHERE path IS NOT NULL";
-type SharedParameterBatch = Arc<[Arc<[Value]>]>;
+type SharedParameterBatch = PreparedDmlParameterBatch;
+
+fn empty_parameter_batch() -> SharedParameterBatch {
+    PreparedDmlParameterBatch::from_rows(std::iter::empty::<Vec<Value>>())
+        .expect("empty prepared parameter batch is valid")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OlapReadShape {
@@ -650,30 +658,25 @@ where
     }
 
     fn release_bound_update_setup(&mut self) {
-        self.bound_seed_json_batch = Arc::from([]);
+        self.bound_seed_json_batch = empty_parameter_batch();
     }
 
     fn install_bound_seed_batch(&mut self, rows: Vec<WorkloadRow>) {
-        self.bound_seed_json_batch = rows
-            .into_iter()
-            .take(self.row_count)
-            .map(|row| Arc::from(vec![Value::Text(row.path), Value::Text(row.value_json)]))
-            .collect::<Vec<_>>()
-            .into();
+        self.bound_seed_json_batch = PreparedDmlParameterBatch::from_rows(
+            rows.into_iter()
+                .take(self.row_count)
+                .map(|row| vec![Value::Text(row.path), Value::Text(row.value_json)]),
+        )
+        .expect("seed parameter batch is rectangular");
     }
 
     fn install_bound_update_batch(&mut self, rows: Vec<UpdateWorkloadRow>) {
-        self.bound_update_all_batch = rows
-            .into_iter()
-            .take(self.row_count)
-            .map(|row| {
-                Arc::from(vec![
-                    Value::Text(row.updated_value_json),
-                    Value::Text(row.path),
-                ])
-            })
-            .collect::<Vec<_>>()
-            .into();
+        self.bound_update_all_batch = PreparedDmlParameterBatch::from_rows(
+            rows.into_iter()
+                .take(self.row_count)
+                .map(|row| vec![Value::Text(row.updated_value_json), Value::Text(row.path)]),
+        )
+        .expect("update parameter batch is rectangular");
     }
 
     #[expect(clippy::cast_possible_truncation)]
@@ -687,7 +690,7 @@ where
             .session
             .execute_prepared_dml_batch(
                 Arc::from(BOUND_INSERT_ALL_SQL),
-                Arc::clone(&self.bound_insert_all_batch),
+                self.bound_insert_all_batch.clone(),
             )
             .await
             .expect("execute tracked-state CRUD bound insert batch")
@@ -762,7 +765,7 @@ where
             .session
             .execute_prepared_dml_batch(
                 Arc::from(BOUND_SEED_JSON_SQL),
-                Arc::clone(&self.bound_seed_json_batch),
+                self.bound_seed_json_batch.clone(),
             )
             .await
             .expect("execute tracked-state CRUD generated JSON seed batch")
@@ -811,24 +814,19 @@ where
         let update_lane_rows = updated_rows
             .iter()
             .map(|row| {
-                Arc::from(vec![
+                vec![
                     Value::Text(olap_lane(row.lane_index)),
                     Value::Text(row.id.clone()),
-                ])
+                ]
             })
             .collect::<Vec<_>>();
         let update_score_rows = updated_rows
             .iter()
-            .map(|row| Arc::from(vec![Value::Real(row.score), Value::Text(row.id.clone())]))
+            .map(|row| vec![Value::Real(row.score), Value::Text(row.id.clone())])
             .collect::<Vec<_>>();
         let update_active_rows = updated_rows
             .iter()
-            .map(|row| {
-                Arc::from(vec![
-                    Value::Boolean(row.active),
-                    Value::Text(row.id.clone()),
-                ])
-            })
+            .map(|row| vec![Value::Boolean(row.active), Value::Text(row.id.clone())])
             .collect::<Vec<_>>();
         let delete_ordinals = (2..self.row_count).step_by(stride).collect::<Vec<_>>();
 
@@ -851,7 +849,11 @@ where
         ] {
             let affected = self
                 .session
-                .execute_prepared_dml_batch(Arc::from(sql), parameter_rows.into())
+                .execute_prepared_dml_batch(
+                    Arc::from(sql),
+                    PreparedDmlParameterBatch::from_rows(parameter_rows)
+                        .expect("OLAP parameter batch is rectangular"),
+                )
                 .await
                 .unwrap_or_else(|error| {
                     panic!("execute typed OLAP mutation batch '{sql}': {error:?}")
@@ -1021,7 +1023,7 @@ where
         let expected_rows = match &self.update_all_workload {
             UpdateWorkload::Transaction(statements) => statements.len(),
             UpdateWorkload::ExecuteBatch(_) => self.row_count,
-            UpdateWorkload::PreparedDml(rows) => rows.len(),
+            UpdateWorkload::PreparedDml(rows) => rows.row_count(),
         };
         let affected: u64 = match &self.update_all_workload {
             UpdateWorkload::Transaction(statements) => self
@@ -1050,10 +1052,7 @@ where
                 .sum(),
             UpdateWorkload::PreparedDml(parameter_rows) => self
                 .session
-                .execute_prepared_dml_batch(
-                    Arc::from(BOUND_UPDATE_ALL_SQL),
-                    Arc::clone(parameter_rows),
-                )
+                .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows.clone())
                 .await
                 .expect("execute tracked-state CRUD prepared DML batch")
                 .into_iter()
@@ -1075,14 +1074,17 @@ where
             "bound update row count must be between 1 and {}, got {row_count}",
             self.row_count
         );
-        let parameter_rows = if row_count == self.bound_update_all_batch.len() {
-            Arc::clone(&self.bound_update_all_batch)
+        let parameter_batch = if row_count == self.bound_update_all_batch.row_count() {
+            self.bound_update_all_batch.clone()
         } else {
-            Arc::from(self.bound_update_all_batch[..row_count].to_vec())
+            PreparedDmlParameterBatch::from_rows(
+                (0..row_count).map(|row| self.bound_update_all_batch.row_values(row).unwrap()),
+            )
+            .expect("bounded update parameter batch is rectangular")
         };
         let results = self
             .session
-            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows)
+            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_batch)
             .await
             .expect("execute tracked-state CRUD bound update batch");
         let affected = results
@@ -1101,18 +1103,22 @@ where
             self.row_count
         );
         let last = self.row_count - 1;
-        let parameter_rows = if row_count == 1 {
-            vec![Arc::clone(&self.bound_update_all_batch[0])]
+        let indices = if row_count == 1 {
+            vec![0]
         } else {
             (0..row_count)
-                .map(|index| {
-                    Arc::clone(&self.bound_update_all_batch[index * last / (row_count - 1)])
-                })
+                .map(|index| index * last / (row_count - 1))
                 .collect::<Vec<_>>()
         };
+        let parameter_batch = PreparedDmlParameterBatch::from_rows(
+            indices
+                .into_iter()
+                .map(|row| self.bound_update_all_batch.row_values(row).unwrap()),
+        )
+        .expect("spread update parameter batch is rectangular");
         let results = self
             .session
-            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows.into())
+            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_batch)
             .await
             .expect("execute spread tracked-state CRUD bound update batch");
         let affected = results
@@ -1185,32 +1191,26 @@ where
         untracked_fixture,
         read_many_by_pk_count,
         bound_insert_all_batch: if matches!(shape, FixtureShape::FullCrud) {
-            tracked_rows
-                .iter()
-                .map(|row| {
-                    Arc::from(vec![
-                        Value::Text(row.path.clone()),
-                        Value::Text(row.value_json.clone()),
-                    ])
-                })
-                .collect::<Vec<_>>()
-                .into()
+            PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
+                vec![
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.value_json.clone()),
+                ]
+            }))
+            .expect("insert parameter batch is rectangular")
         } else {
-            Arc::from([])
+            empty_parameter_batch()
         },
         bound_seed_json_batch: if matches!(shape, FixtureShape::FullCrud) {
-            tracked_rows
-                .iter()
-                .map(|row| {
-                    Arc::from(vec![
-                        Value::Text(row.path.clone()),
-                        Value::Text(row.value_json.clone()),
-                    ])
-                })
-                .collect::<Vec<_>>()
-                .into()
+            PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
+                vec![
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.value_json.clone()),
+                ]
+            }))
+            .expect("seed parameter batch is rectangular")
         } else {
-            Arc::from([])
+            empty_parameter_batch()
         },
         olap_expected,
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
@@ -1223,18 +1223,15 @@ where
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
         update_all_workload: update_workload(shape, tracked_rows),
         bound_update_all_batch: if matches!(shape, FixtureShape::FullCrud) {
-            tracked_rows
-                .iter()
-                .map(|row| {
-                    Arc::from(vec![
-                        Value::Text(row.updated_value_json.clone()),
-                        Value::Text(row.path.clone()),
-                    ])
-                })
-                .collect::<Vec<_>>()
-                .into()
+            PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
+                vec![
+                    Value::Text(row.updated_value_json.clone()),
+                    Value::Text(row.path.clone()),
+                ]
+            }))
+            .expect("update parameter batch is rectangular")
         } else {
-            Arc::from([])
+            empty_parameter_batch()
         },
         delete_all_sql: "DELETE FROM json_pointer".to_string(),
         delete_one_by_pk_sql: format!(
@@ -1633,18 +1630,13 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
 }
 
 fn prepared_update_rows(rows: &[WorkloadRow]) -> SharedParameterBatch {
-    rows.iter()
-        .map(|row| {
-            Arc::<[Value]>::from(
-                vec![
-                    Value::Text(row.updated_value_json.clone()),
-                    Value::Text(row.path.clone()),
-                ]
-                .into_boxed_slice(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .into()
+    PreparedDmlParameterBatch::from_rows(rows.iter().map(|row| {
+        vec![
+            Value::Text(row.updated_value_json.clone()),
+            Value::Text(row.path.clone()),
+        ]
+    }))
+    .expect("prepared update parameter batch is rectangular")
 }
 
 fn parameterized_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {

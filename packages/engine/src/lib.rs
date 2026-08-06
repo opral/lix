@@ -92,8 +92,9 @@ pub use init::InitReceipt;
 pub use session::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, FILE_UPLOAD_PART_BYTES, FileRead,
-    FileUploadProgress, MutationIdentity, ObserveEvent, ObserveEvents, RequestBlobSpliceProvenance,
-    Row, RowRef, TryFromValue, VerifiedRequestBlob,
+    FileUploadProgress, MutationIdentity, ObserveEvent, ObserveEvents, PreparedDmlParameterBatch,
+    PreparedDmlValueRef, RequestBlobSpliceProvenance, Row, RowRef, TryFromValue,
+    VerifiedRequestBlob,
 };
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,

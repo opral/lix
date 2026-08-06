@@ -20,6 +20,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
+use crate::session::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -111,6 +112,7 @@ pub(crate) enum BoundPublicWriteExecution {
 enum EntityInsertParameterBatch<'a> {
     Arrow(&'a RecordBatch),
     Values(&'a [&'a [Value]]),
+    Prepared(&'a PreparedDmlParameterBatch),
 }
 
 enum CertifiedEntityInsertParameterBatch {
@@ -145,6 +147,7 @@ impl<'a> EntityInsertParameterBatch<'a> {
         match self {
             Self::Arrow(batch) => batch.num_rows(),
             Self::Values(rows) => rows.len(),
+            Self::Prepared(batch) => batch.row_count(),
         }
     }
 
@@ -152,6 +155,7 @@ impl<'a> EntityInsertParameterBatch<'a> {
         match self {
             Self::Arrow(batch) => batch.num_columns(),
             Self::Values(rows) => rows.first().map_or(0, |row| row.len()),
+            Self::Prepared(batch) => batch.column_count(),
         }
     }
 
@@ -185,6 +189,18 @@ impl<'a> EntityInsertParameterBatch<'a> {
                         )
                 )
             }),
+            Self::Prepared(batch) => (0..batch.row_count()).all(|row| {
+                matches!(
+                    (column_type, batch.value(row, parameter_index)),
+                    (
+                        EntityColumnType::String,
+                        PreparedDmlValueRef::Text(_) | PreparedDmlValueRef::Null
+                    ) | (
+                        EntityColumnType::Boolean,
+                        PreparedDmlValueRef::Boolean(_) | PreparedDmlValueRef::Null
+                    )
+                )
+            }),
         }
     }
 
@@ -211,6 +227,12 @@ impl<'a> EntityInsertParameterBatch<'a> {
                 Value::Boolean(value) => DirectParameterValue::Boolean(*value),
                 _ => unreachable!("direct parameter value type was certified"),
             },
+            Self::Prepared(batch) => match batch.value(row_index, parameter_index) {
+                PreparedDmlValueRef::Null => DirectParameterValue::Null,
+                PreparedDmlValueRef::Text(value) => DirectParameterValue::String(value),
+                PreparedDmlValueRef::Boolean(value) => DirectParameterValue::Boolean(value),
+                _ => unreachable!("direct parameter value type was certified"),
+            },
         }
     }
 }
@@ -231,6 +253,84 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         true,
     )
     .await
+}
+
+pub(crate) async fn try_execute_entity_insert_prepared_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: &PreparedDmlParameterBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    try_execute_entity_insert_batch(
+        ctx,
+        plan,
+        EntityInsertParameterBatch::Prepared(parameter_batch),
+        true,
+    )
+    .await
+}
+
+/// Executes the prepared single-row lix_file path shape in one provider batch.
+/// This keeps Git replay on the same production parameter-page contract while
+/// preserving its explicit marker barrier in the surrounding transaction.
+pub(crate) async fn try_execute_file_prepared_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: &PreparedDmlParameterBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let BoundWriteTarget::File(surface) = &plan.bound.target else {
+        return Ok(None);
+    };
+    let Some(shape) = fast_file_path_write_shape(plan, surface) else {
+        return Ok(None);
+    };
+    let BoundWriteInput::Values(values) = &plan.bound.input else {
+        return Ok(None);
+    };
+    if values.rows.len() != 1 || parameter_batch.column_count() != values.columns.len() {
+        return Ok(None);
+    }
+    let metadata = ExecuteStatementMetadata::default();
+    let mut writes = Vec::with_capacity(parameter_batch.row_count());
+    for row_index in 0..parameter_batch.row_count() {
+        let params = parameter_batch.row_values(row_index)?;
+        let row = &values.rows[0];
+        writes.push((
+            shape
+                .id_index
+                .map(|index| eval_fast_file_text(&row[index], &params, "id"))
+                .transpose()?,
+            eval_fast_file_text(&row[shape.path_index], &params, "path")?,
+            eval_fast_file_blob(&row[shape.data_index], &params, "content")?,
+            shape
+                .metadata_index
+                .map(|index| eval_fast_file_metadata(&row[index], &params))
+                .transpose()?
+                .flatten(),
+            fast_file_blob_expr_splice_provenance(&row[shape.data_index], &metadata),
+        ));
+    }
+    let affected = crate::sql2::providers::execute_fast_lix_file_id_path_writes(
+        ctx,
+        writes,
+        shape.conflict,
+        metadata.mutation_identity(),
+    )
+    .await?;
+    if affected != Some(parameter_batch.row_count() as u64) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "prepared lix_file batch affected {:?} rows, expected {}",
+                affected,
+                parameter_batch.row_count()
+            ),
+        ));
+    }
+    Ok(Some(
+        (0..parameter_batch.row_count())
+            .map(|_| SqlWriteResult::affected(1))
+            .collect(),
+    ))
 }
 
 pub(crate) async fn try_execute_entity_insert_value_batch<'a>(
@@ -466,12 +566,21 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    if let Some(results) = try_execute_direct_path_value_replacement_batch(
+    try_execute_entity_update_batch(
         ctx,
         plan,
         EntityInsertParameterBatch::Arrow(parameter_batch),
     )
-    .await?
+    .await
+}
+
+async fn try_execute_entity_update_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: EntityInsertParameterBatch<'_>,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    if let Some(results) =
+        try_execute_direct_path_value_replacement_batch(ctx, plan, parameter_batch).await?
     {
         return Ok(Some(results));
     }
@@ -508,13 +617,18 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     let direct_primary_key_param =
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
     let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param);
-    let borrowed_direct_parameters = direct_replacement.as_ref().and_then(|replacement| {
-        direct_replacement_text_columns(
-            parameter_batch,
-            direct_primary_key_param?,
-            replacement.value_param_index,
-        )
-    });
+    let borrowed_direct_parameters = match parameter_batch {
+        EntityInsertParameterBatch::Arrow(batch) => {
+            direct_replacement.as_ref().and_then(|replacement| {
+                direct_replacement_text_columns(
+                    batch,
+                    direct_primary_key_param?,
+                    replacement.value_param_index,
+                )
+            })
+        }
+        EntityInsertParameterBatch::Values(_) | EntityInsertParameterBatch::Prepared(_) => None,
+    };
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
     let mut entity_pks = Vec::<EntityPk>::with_capacity(parameter_batch.num_rows());
     let mut entity_pks_strictly_ordered = true;
@@ -525,7 +639,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
             }
             EntityPk::single(columns.primary_keys.value(row_index).to_owned())
         } else {
-            let params = super::write::parameter_row(parameter_batch, row_index)
+            let params = parameter_batch_row_values(parameter_batch, row_index)
                 .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
             let entity_pk = if let Some(param_index) = direct_primary_key_param {
                 let Some(Value::Text(value)) = params.get(param_index) else {
@@ -573,7 +687,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     if borrowed_direct_parameters.is_some() && !entity_pks_strictly_ordered {
         for row_index in 0..parameter_batch.num_rows() {
             parameter_rows.push(
-                super::write::parameter_row(parameter_batch, row_index)
+                parameter_batch_row_values(parameter_batch, row_index)
                     .map_err(|error| with_parameter_batch_statement_index(error, row_index))?,
             );
         }
@@ -737,6 +851,37 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
             .map(SqlWriteResult::affected)
             .collect(),
     ))
+}
+
+pub(crate) async fn try_execute_entity_update_prepared_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: &PreparedDmlParameterBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    try_execute_entity_update_batch(
+        ctx,
+        plan,
+        EntityInsertParameterBatch::Prepared(parameter_batch),
+    )
+    .await
+}
+
+fn parameter_batch_row_values(
+    parameter_batch: EntityInsertParameterBatch<'_>,
+    row_index: usize,
+) -> Result<Vec<Value>, LixError> {
+    match parameter_batch {
+        EntityInsertParameterBatch::Arrow(batch) => super::write::parameter_row(batch, row_index),
+        EntityInsertParameterBatch::Prepared(batch) => batch.row_values(row_index),
+        EntityInsertParameterBatch::Values(rows) => {
+            rows.get(row_index).map(|row| row.to_vec()).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "SQL parameter row is outside the batch",
+                )
+            })
+        }
+    }
 }
 
 /// Lowers the dominant JSON-pointer replacement shape directly from borrowed
@@ -4359,9 +4504,6 @@ fn certified_entity_insert_parameter_batch(
     if !allow_generic_fallback {
         return Ok(None);
     }
-    let EntityInsertParameterBatch::Arrow(parameter_batch) = parameter_batch else {
-        unreachable!("generic parameter fallback is only available for Arrow batches")
-    };
     // The tracked/untracked lane is part of the registered schema domain, not
     // merely row payload. A parameterized batch can contain rows from both
     // lanes; committing that batch would defer the domain error until the
@@ -4385,7 +4527,22 @@ fn certified_entity_insert_parameter_batch(
         layout,
         parameter_batch.num_rows(),
         (0..parameter_batch.num_rows()).map(|statement_index| {
-            super::write::parameter_row(parameter_batch, statement_index)
+            let params = match parameter_batch {
+                EntityInsertParameterBatch::Arrow(batch) => {
+                    super::write::parameter_row(batch, statement_index)
+                }
+                EntityInsertParameterBatch::Prepared(batch) => batch.row_values(statement_index),
+                EntityInsertParameterBatch::Values(rows) => rows
+                    .get(statement_index)
+                    .map(|row| row.to_vec())
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "SQL parameter row is outside the batch",
+                        )
+                    }),
+            };
+            params
                 .map(|params| CertifiedInsertInput {
                     row,
                     params: CertifiedInsertParams::Owned(params),

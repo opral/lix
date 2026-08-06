@@ -23,6 +23,7 @@ pub(crate) mod idempotency;
 mod media_upload;
 mod merge;
 pub(crate) mod observe;
+mod prepared_dml;
 mod switch_branch;
 mod transaction;
 mod undo_redo;
@@ -49,6 +50,7 @@ pub use merge::{
     MergeConflictKind, MergeConflictSide,
 };
 pub use observe::{ObserveEvent, ObserveEvents};
+pub use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
 pub use undo_redo::{RedoReceipt, UndoReceipt};
