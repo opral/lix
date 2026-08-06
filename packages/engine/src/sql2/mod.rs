@@ -64,10 +64,10 @@ pub(crate) use exec::{
     append_path_value_replacement_snapshot_text, create_write_logical_plan_from_template,
     create_write_plan_template_from_parsed, diff_command_query, execute_read_statement_from_parsed,
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
-    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
-    execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
-    prepare_path_value_replacement_program, prepare_path_value_replacement_row,
-    prepare_read_session, prepare_read_session_at_head,
+    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_prepared_dml_batch,
+    execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
+    parameter_record_batch, parameter_row, prepare_path_value_replacement_program,
+    prepare_path_value_replacement_row, prepare_read_session, prepare_read_session_at_head,
     write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]

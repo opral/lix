@@ -5,8 +5,9 @@ use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
     ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, RedoReceipt,
-    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
+    PreparedDmlParameterBatch, RedoReceipt, SessionContext, Storage, SwitchBranchOptions,
+    SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{future::Future, sync::Arc};
 
@@ -356,6 +357,21 @@ where
         self.session.execute_batch(statements).await
     }
 
+    /// Executes one prepared DML statement shape for a rectangular parameter
+    /// page in one atomic transaction. The SQL is planned once and each
+    /// parameter row produces one result in input order. This is the public
+    /// bulk-write contract used by generated/transport callers; unsupported
+    /// shapes fail closed rather than degrading to per-row SQL execution.
+    pub async fn execute_prepared_dml_batch(
+        &self,
+        sql: Arc<str>,
+        parameter_batch: PreparedDmlParameterBatch,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session
+            .execute_prepared_dml_batch(sql, parameter_batch)
+            .await
+    }
+
     pub async fn execute_batch_with_options(
         &self,
         statements: &[ExecuteBatchStatement],
@@ -532,6 +548,18 @@ where
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
         self.inner.execute(sql, params).await
+    }
+
+    /// Executes one prepared DML page atomically inside this transaction.
+    /// Shape changes and dependency barriers remain explicit `execute` calls.
+    pub async fn execute_prepared_dml_batch(
+        &mut self,
+        sql: Arc<str>,
+        parameter_batch: PreparedDmlParameterBatch,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.inner
+            .execute_prepared_dml_batch(sql, parameter_batch)
+            .await
     }
 
     pub fn execute_with_options(

@@ -26,7 +26,7 @@ use lix_engine::storage_adapter::{
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions,
 };
-use lix_engine::{Engine, SessionContext, Storage, Value};
+use lix_engine::{Engine, PreparedDmlParameterBatch, SessionContext, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
 #[cfg(feature = "slatedb")]
 use lix_slatedb_storage::SlateDB;
@@ -1222,21 +1222,19 @@ async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let parameters = rows
-        .iter()
-        .map(|row| {
-            Arc::<[Value]>::from(vec![
-                Value::Text(row.path.clone()),
-                Value::Text(row.value_json.clone()),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let parameter_batch = PreparedDmlParameterBatch::from_rows(rows.iter().map(|row| {
+        vec![
+            Value::Text(row.path.clone()),
+            Value::Text(row.value_json.clone()),
+        ]
+    }))
+    .expect("untracked parameter batch is rectangular");
     let results = session
-        .execute_homogeneous_write_batch(
+        .execute_prepared_dml_batch(
             Arc::<str>::from(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, lix_json($2), true)",
             ),
-            Arc::from(parameters),
+            parameter_batch,
         )
         .await
         .expect("homogeneous insert untracked json_pointer rows");

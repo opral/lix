@@ -3,7 +3,7 @@ use crate::db;
 use crate::error::CliError;
 use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
-    ExecuteBatchStatement, Lix, Storage, Value, WasmTransitionCounters, open_lix_with_storage,
+    Lix, PreparedDmlParameterBatch, Storage, Value, WasmTransitionCounters, open_lix_with_storage,
 };
 use lix_slatedb_storage::SlateDB;
 use serde::Serialize;
@@ -14,9 +14,13 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use zip::write::SimpleFileOptions;
+
+#[cfg(test)]
+use lix_sdk::Memory;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
@@ -203,7 +207,8 @@ struct ReplayCommitProfile {
     inserts: usize,
     updates: usize,
     deletes: usize,
-    statement_count: usize,
+    logical_statement_count: usize,
+    physical_execution_groups: usize,
     sql_chars: usize,
     blob_bytes: usize,
     marker_only: bool,
@@ -451,7 +456,7 @@ where
         let build_sql_ms = duration_to_ms(build_sql_started.elapsed());
         phase_totals.build_sql_ms += build_sql_ms;
 
-        let statement_count = statements.len();
+        let logical_statement_count = statements.len();
         let sql_chars = total_statement_sql_chars(&statements);
         let blob_bytes = prepared_blob_bytes(&prepared);
         let inserts = prepared.inserts.len();
@@ -463,7 +468,8 @@ where
         }
         lix.reset_plugin_transition_counters();
         let execute_started = Instant::now();
-        execute_statements_as_transaction(&lix, &statements, commit_sha)?;
+        let physical_execution_groups =
+            execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
         let plugin_counters = lix.plugin_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
@@ -491,7 +497,8 @@ where
             inserts,
             updates,
             deletes,
-            statement_count,
+            logical_statement_count,
+            physical_execution_groups,
             sql_chars,
             blob_bytes,
             marker_only: prepared.deletes.is_empty()
@@ -618,29 +625,76 @@ fn execute_statements_as_transaction<StorageImpl>(
     lix: &Lix<StorageImpl>,
     statements: &[SqlStatement],
     commit_sha: &str,
-) -> Result<(), CliError>
+) -> Result<usize, CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let batch = statements
-        .iter()
-        .map(|statement| ExecuteBatchStatement {
-            sql: statement.sql.clone(),
-            params: statement.params.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    db::block_on(Box::pin(lix.execute_batch(&batch))).map_err(|error| {
-        let sql_preview = batch
-            .first()
-            .map(|statement| statement.sql.chars().take(160).collect::<String>())
-            .unwrap_or_default();
+    // Keep every statement in one explicit transaction. Maximal contiguous
+    // single-row lix_file runs use the same public prepared page contract as
+    // SDK/benchmark callers; marker and shape/dependency barriers stay in
+    // order through ordinary transaction.execute calls.
+    let mut transaction = db::block_on(lix.begin_transaction()).map_err(|error| {
         CliError::msg(format!(
-            "failed at commit {commit_sha} while executing atomic replay batch starting '{sql_preview}': {error}"
+            "failed to begin replay transaction {commit_sha}: {error}"
+        ))
+    })?;
+    let mut index = 0;
+    let mut physical_execution_groups = 0usize;
+    while index < statements.len() {
+        let statement = &statements[index];
+        let mut end = index + 1;
+        while end < statements.len()
+            && statements[end].sql == statement.sql
+            && statements[end].params.len() == statement.params.len()
+        {
+            end += 1;
+        }
+        if end - index >= 2 && is_prepared_replay_shape(&statement.sql) {
+            let parameter_batch = PreparedDmlParameterBatch::from_rows(
+                statements[index..end]
+                    .iter()
+                    .map(|statement| statement.params.clone()),
+            )
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed at commit {commit_sha} while packing prepared replay batch: {error}"
+                ))
+            })?;
+            db::block_on(transaction.execute_prepared_dml_batch(
+                Arc::<str>::from(statement.sql.as_str()),
+                parameter_batch,
+            ))
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed at commit {commit_sha} while executing prepared replay batch: {error}"
+                ))
+            })?;
+            physical_execution_groups += 1;
+        } else {
+            for statement in &statements[index..end] {
+                db::block_on(transaction.execute(&statement.sql, &statement.params)).map_err(
+                    |error| {
+                        CliError::msg(format!(
+                            "failed at commit {commit_sha} while executing replay statement: {error}"
+                        ))
+                    },
+                )?;
+                physical_execution_groups += 1;
+            }
+        }
+        index = end;
+    }
+    db::block_on(transaction.commit()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to commit replay transaction {commit_sha}: {error}"
         ))
     })?;
 
-    Ok(())
+    Ok(physical_execution_groups)
+}
+
+fn is_prepared_replay_shape(sql: &str) -> bool {
+    sql.starts_with("INSERT INTO lix_file (")
 }
 
 fn git_replay_marker_statement(commit: &ReplayCommit) -> SqlStatement {
@@ -1828,7 +1882,7 @@ fn resolve_write_target(state: &mut ReplayState, change: &Change) -> Result<Writ
 
 fn build_replay_commit_statements(
     batch: &PreparedBatch,
-    max_insert_rows: usize,
+    _max_insert_rows: usize,
 ) -> Vec<SqlStatement> {
     if batch.deletes.is_empty() && batch.inserts.is_empty() && batch.updates.is_empty() {
         return Vec::new();
@@ -1851,53 +1905,31 @@ fn build_replay_commit_statements(
         statements.push(SqlStatement { sql, params });
     }
 
-    let insert_batch_size = max_insert_rows.max(1);
-    for insert_chunk in batch.inserts.chunks(insert_batch_size) {
-        if insert_chunk.is_empty() {
-            continue;
-        }
-
-        let mut params = Vec::<Value>::with_capacity(insert_chunk.len() * 4);
-        let values_sql = insert_chunk
-            .iter()
-            .map(|row| {
-                params.push(Value::Text(row.id.clone()));
-                params.push(Value::Text(row.path.clone()));
-                params.push(value_from_optional_blob(row.data.as_ref()));
-                params.push(git_file_metadata_value(row));
-                "(?, ?, ?, ?)"
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES {values_sql}"
-        );
-        statements.push(SqlStatement { sql, params });
+    for row in &batch.inserts {
+        statements.push(SqlStatement {
+            sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
+                .to_string(),
+            params: vec![
+                Value::Text(row.id.clone()),
+                Value::Text(row.path.clone()),
+                value_from_optional_blob(row.data.as_ref()),
+                git_file_metadata_value(row),
+            ],
+        });
     }
 
-    for update_chunk in batch.updates.chunks(insert_batch_size) {
-        if update_chunk.is_empty() {
-            continue;
-        }
-        let mut params = Vec::<Value>::with_capacity(update_chunk.len() * 4);
-        let values_sql = update_chunk
-            .iter()
-            .map(|row| {
-                params.push(Value::Text(row.id.clone()));
-                params.push(Value::Text(row.path.clone()));
-                params.push(value_from_optional_blob(row.data.as_ref()));
-                params.push(git_file_metadata_value(row));
-                "(?, ?, ?, ?)"
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+    for row in &batch.updates {
         statements.push(SqlStatement {
-            sql: format!(
-                "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES {values_sql} \
+            sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
                  lixcol_metadata = excluded.lixcol_metadata"
-            ),
-            params,
+                .to_string(),
+            params: vec![
+                Value::Text(row.id.clone()),
+                Value::Text(row.path.clone()),
+                value_from_optional_blob(row.data.as_ref()),
+                git_file_metadata_value(row),
+            ],
         });
     }
 
@@ -2533,6 +2565,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn ordinary_multi_file_replay_uses_one_prepared_page_and_keeps_marker_atomic() {
+        let before = PreparedDmlParameterBatch::take_execution_counters();
+        let lix =
+            db::block_on(open_lix_with_storage(Memory::new())).expect("memory Lix should open");
+        let statements =
+            vec![
+            SqlStatement {
+                sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
+                    .to_string(),
+                params: vec![
+                    Value::Text(stable_file_id(&git_path(b"one"))),
+                    Value::Text("/one".to_string()),
+                    Value::Blob(vec![1_u8, 2].into()),
+                    Value::Json(json!({"git_mode": "100644", "git_oid": "oid-1"})),
+                ],
+            },
+            SqlStatement {
+                sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
+                    .to_string(),
+                params: vec![
+                    Value::Text(stable_file_id(&git_path(b"two"))),
+                    Value::Text("/two".to_string()),
+                    Value::Blob(vec![3_u8, 4].into()),
+                    Value::Json(json!({"git_mode": "100644", "git_oid": "oid-2"})),
+                ],
+            },
+            git_replay_marker_statement(&ReplayCommit {
+                sha: "commit-1".to_string(),
+                first_parent: None,
+            }),
+        ];
+        let physical_execution_groups =
+            execute_statements_as_transaction(&lix, &statements, "commit-1")
+                .expect("ordinary replay transaction should commit");
+        assert_eq!(physical_execution_groups, 2);
+        let after = PreparedDmlParameterBatch::take_execution_counters();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (1, 2),
+            "two contiguous file rows must enter one prepared production page"
+        );
+        let marker = db::block_on(lix.execute(
+            "SELECT value FROM lix_key_value WHERE key = ?",
+            &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
+        ))
+        .expect("marker should be visible after atomic replay");
+        assert_eq!(marker.rows().len(), 1);
     }
 
     #[test]
@@ -3459,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn rocksdb_replay_bounds_text_actor_lifecycle_across_hundred_commits() {
+    fn rocksdb_replay_reports_physical_groups_for_text_actor_lifecycle_across_hundred_commits() {
         const TEXT_FILES: usize = 17;
 
         let fixture = unique_temp_dir();
@@ -3571,10 +3653,17 @@ mod tests {
         );
         assert_eq!(
             commits[0]
-                .get("statement_count")
+                .get("logical_statement_count")
+                .and_then(serde_json::Value::as_u64),
+            Some((TEXT_FILES + 1) as u64),
+            "logical descriptors include each file row and the replay marker"
+        );
+        assert_eq!(
+            commits[0]
+                .get("physical_execution_groups")
                 .and_then(serde_json::Value::as_u64),
             Some(2),
-            "bulk inserts and the replay marker must share one atomic batch"
+            "bulk inserts and the replay marker must use one prepared page plus one marker group"
         );
         assert_eq!(
             commits[1]
@@ -3584,10 +3673,17 @@ mod tests {
         );
         assert_eq!(
             commits[1]
-                .get("statement_count")
+                .get("logical_statement_count")
+                .and_then(serde_json::Value::as_u64),
+            Some((TEXT_FILES + 1) as u64),
+            "logical descriptors include each file row and the replay marker"
+        );
+        assert_eq!(
+            commits[1]
+                .get("physical_execution_groups")
                 .and_then(serde_json::Value::as_u64),
             Some(2),
-            "bulk updates and the replay marker must share one atomic batch"
+            "bulk updates and the replay marker must use one prepared page plus one marker group"
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");

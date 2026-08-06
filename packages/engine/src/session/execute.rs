@@ -35,6 +35,7 @@ use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
+use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1274,49 +1275,40 @@ where
         Box::pin(self.execute_batch_with_options(statements, ExecuteOptions::default())).await
     }
 
-    /// Executes one write shape over a shared, homogeneous parameter page.
+    /// Executes one prepared DML shape over a shared parameter page.
     ///
     /// Unlike [`Self::execute_batch`], this API does not duplicate the SQL
     /// text and owned parameter strings into one statement object per row.
-    /// It is deliberately a hard, generated-write boundary: the bound write
-    /// must accept either the borrowed-value certificate or the physical
-    /// parameter-batch route. Shapes that require sequential statement
-    /// semantics remain on `execute_batch`.
-    pub async fn execute_homogeneous_write_batch(
+    /// The SQL plan is prepared once and the whole page is committed
+    /// atomically. The bound write must accept either the borrowed-value
+    /// certificate or the physical parameter-batch route; shapes that require
+    /// sequential statement semantics are rejected instead of silently
+    /// degrading to per-row execution.
+    pub async fn execute_prepared_dml_batch(
         &self,
         sql: Arc<str>,
-        parameter_rows: Arc<[Arc<[Value]>]>,
+        parameter_batch: PreparedDmlParameterBatch,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        Box::pin(self.execute_homogeneous_write_batch_inner(sql, parameter_rows)).await
+        Box::pin(self.execute_prepared_dml_batch_inner(sql, parameter_batch)).await
     }
 
-    async fn execute_homogeneous_write_batch_inner(
+    async fn execute_prepared_dml_batch_inner(
         &self,
         sql: Arc<str>,
-        parameter_rows: Arc<[Arc<[Value]>]>,
+        parameter_batch: PreparedDmlParameterBatch,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
-        if parameter_rows.is_empty() {
+        if parameter_batch.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "execute_homogeneous_write_batch requires at least one parameter row",
-            ));
-        }
-        let parameter_count = parameter_rows[0].len();
-        if parameter_rows
-            .iter()
-            .any(|parameters| parameters.len() != parameter_count)
-        {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_homogeneous_write_batch requires a rectangular parameter page",
+                "execute_prepared_dml_batch requires at least one parameter row",
             ));
         }
         let statement = self.sql_planning_cache.parse_statement(&sql)?;
         if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "execute_homogeneous_write_batch requires a write statement",
+                "execute_prepared_dml_batch requires a write statement",
             ));
         }
 
@@ -1324,33 +1316,12 @@ where
         let result = self
             .with_write_transaction_lending(async move |transaction| {
                 let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
-                let parameter_refs = parameter_rows
-                    .iter()
-                    .map(|parameters| parameters.as_ref())
-                    .collect::<Vec<_>>();
-                let results = if let Some(results) = sql2::execute_write_logical_plan_value_batch(
+                let results = sql2::execute_write_logical_plan_prepared_dml_batch(
                     transaction,
                     &plan,
-                    &parameter_refs,
+                    &parameter_batch,
                 )
-                .await?
-                {
-                    Some(results)
-                } else {
-                    let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_refs)?
-                    else {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            "homogeneous write parameters cannot be lowered as one batch",
-                        ));
-                    };
-                    sql2::execute_write_logical_plan_parameter_batch(
-                        transaction,
-                        plan,
-                        &parameter_batch,
-                    )
-                    .await?
-                };
+                .await?;
                 results
                     .ok_or_else(|| {
                         LixError::new(
@@ -2563,6 +2534,62 @@ where
     ) -> Result<ExecuteResult, LixError> {
         self.execute_with_options_inner(sql, params, ExecuteOptions::default())
             .await
+    }
+
+    /// Executes one public prepared-DML parameter page inside this explicit
+    /// transaction. The page is atomic with surrounding statements; callers
+    /// use ordinary `execute` for shape changes or dependency barriers.
+    pub async fn execute_prepared_dml_batch(
+        &mut self,
+        sql: Arc<str>,
+        parameter_batch: PreparedDmlParameterBatch,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.ensure_session_open()?;
+        if parameter_batch.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_prepared_dml_batch requires at least one parameter row",
+            ));
+        }
+        let statement = self.sql_planning_cache.parse_statement(&sql)?;
+        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_prepared_dml_batch requires a write statement",
+            ));
+        }
+        self.has_started_statement = true;
+        let transaction = self.transaction_mut()?;
+        transaction.flush_prepared_mutations().await?;
+        let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
+        let checkpoint = transaction.begin_sql_statement_checkpoint()?;
+        let result = sql2::execute_write_logical_plan_prepared_dml_batch(
+            transaction,
+            &plan,
+            &parameter_batch,
+        )
+        .await;
+        let result = match result {
+            Ok(Some(results)) => Ok(results),
+            Ok(None) => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "write shape is not supported by prepared DML batch",
+            )),
+            Err(error) => Err(normalize_sql_surface_error(error, &sql)),
+        };
+        let results = match result {
+            Ok(results) => results,
+            Err(error) => {
+                transaction
+                    .rollback_sql_statement_checkpoint(checkpoint)
+                    .await?;
+                return Err(error);
+            }
+        };
+        Ok(results
+            .into_iter()
+            .map(ExecuteResult::from_sql_write_result)
+            .collect())
     }
 
     async fn execute_with_options_inner(
@@ -7118,6 +7145,123 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_dml_batch_preserves_order_absence_and_atomic_errors() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "prepared_dml_contract_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO prepared_dml_contract_probe (id, value) VALUES \
+                 ('a', 'old-a'), ('b', 'old-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let sql =
+            Arc::<str>::from("UPDATE prepared_dml_contract_probe SET value = $1 WHERE id = $2");
+        let rows = PreparedDmlParameterBatch::from_rows([
+            vec![Value::Text("new-b".into()), Value::Text("b".into())],
+            vec![Value::Text("new-a".into()), Value::Text("a".into())],
+            vec![Value::Text("missing".into()), Value::Text("missing".into())],
+        ])
+        .unwrap();
+        let results = session
+            .execute_prepared_dml_batch(Arc::clone(&sql), rows)
+            .await
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 0]
+        );
+
+        let error = session
+            .execute_prepared_dml_batch(
+                Arc::<str>::from(
+                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                ),
+                PreparedDmlParameterBatch::from_rows([
+                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
+                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
+                ])
+                .unwrap(),
+            )
+            .await
+            .expect_err("invalid RETURN expression must abort the atomic prepared batch");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+
+        let rows = session
+            .execute(
+                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "UPDATE prepared_dml_contract_probe SET value = 'before' WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let error = transaction
+            .execute_prepared_dml_batch(
+                Arc::<str>::from(
+                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                ),
+                PreparedDmlParameterBatch::from_rows([
+                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
+                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
+                ])
+                .unwrap(),
+            )
+            .await
+            .expect_err("failed prepared statement must roll back its own staging");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        transaction
+            .execute(
+                "UPDATE prepared_dml_contract_probe SET value = 'after' WHERE id = 'b'",
+                &[],
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let rows = session
+            .execute(
+                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "before");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "after");
     }
 
     #[tokio::test]
