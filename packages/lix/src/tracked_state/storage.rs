@@ -3790,6 +3790,120 @@ pub(crate) async fn load_commit_state_manifests(
     Ok(output)
 }
 
+/// Loads the identity/value delta rows needed by ordinary tracked-root
+/// publication for a whole first-parent frontier.  The commit authorities and
+/// authenticated mutation-directory plans are resolved once, then every
+/// selected external segment is fetched in one unique point-read batch.  This
+/// path deliberately does not hydrate selected JSON payloads: root publication
+/// owns only the authenticated identity/index value, while explicit history
+/// consumers retain their payload-loading route.
+pub(crate) async fn load_commit_root_rebuild_deltas_batch(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_ids: &[CommitId],
+) -> Result<BTreeMap<CommitId, Vec<(TrackedStateKey, TrackedStateIndexValue)>>, LixError> {
+    if commit_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let states = load_commit_state_manifests(store, commit_ids).await?;
+    let mut members_by_commit = BTreeMap::<CommitId, Vec<CommitDeltaMember>>::new();
+    let mut pending_segments = Vec::<(CommitId, usize, CommitDeltaSegmentBounds, String)>::new();
+    let mut segment_keys = Vec::new();
+
+    for (commit_id, state) in commit_ids.iter().copied().zip(states) {
+        let state = state.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot rebuild tracked_state root for commit '{commit_id}' without its commit-state manifest"
+                ),
+            )
+        })?;
+        let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
+        let mut members = Vec::with_capacity(manifest.member_count as usize);
+        if let Some(parts) = manifest.columnar_parts.as_ref() {
+            members = load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id)
+                .await?;
+        } else if let Some(inline) = manifest.inline_segment() {
+            collect_strict_commit_delta_members(
+                inline,
+                None,
+                commit_id,
+                0,
+                &manifest.account_id,
+                &mut members,
+            )?;
+        } else {
+            for (segment_index, bounds) in manifest.segments.iter().cloned().enumerate() {
+                let key = commit_delta_segment_key_for_bounds(commit_id, segment_index, &bounds)?;
+                segment_keys.push(StorageKey(Bytes::from(key)));
+                pending_segments.push((
+                    commit_id,
+                    segment_index,
+                    bounds,
+                    manifest.account_id.clone(),
+                ));
+            }
+        }
+        if !members.is_empty() {
+            members_by_commit.insert(commit_id, members);
+        } else {
+            members_by_commit.entry(commit_id).or_default();
+        }
+    }
+
+    if !segment_keys.is_empty() {
+        let values =
+            PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value;
+        if values.len() != pending_segments.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state root rebuild segment batch returned an unexpected cardinality",
+            ));
+        }
+        for ((commit_id, segment_index, bounds, account_id), value) in
+            pending_segments.into_iter().zip(values)
+        {
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
+                    ),
+                )
+            })?;
+            collect_strict_commit_delta_members(
+                &bytes,
+                Some(&bounds),
+                commit_id,
+                u32::try_from(segment_index).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit_delta segment index exceeds u32",
+                    )
+                })?,
+                &account_id,
+                members_by_commit.entry(commit_id).or_default(),
+            )?;
+        }
+    }
+
+    let mut output = BTreeMap::new();
+    for (commit_id, members) in members_by_commit {
+        validate_commit_delta_member_order_and_ids(commit_id, &members)?;
+        output.insert(
+            commit_id,
+            members
+                .into_iter()
+                .map(|member| (member.key, member.value))
+                .collect(),
+        );
+    }
+    Ok(output)
+}
+
 /// Loads only the small immutable authority headers in request order.
 ///
 /// Topology membership and commit identity do not require mutation-directory

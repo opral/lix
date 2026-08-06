@@ -153,44 +153,147 @@ where
     Ok(report)
 }
 
-pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
+/// Loads the ordinary-publication rebuild frontier for all durable rootless
+/// parents in one request-local plan map.  Multiple rootless intervals often
+/// share a first-parent suffix; the previous per-parent loop reloaded that
+/// suffix for every interval before deduplicating it only at staging time.
+/// This frontier authenticates each commit/root boundary once, retains no
+/// authority outside the request, and returns unique plans child-first so the
+/// caller can replay them parent-first.  Explicit repair intentionally keeps
+/// its separate history-linear discovery path below.
+pub(crate) async fn load_rebuild_plan_frontier<S>(
     store: &S,
-    commit_id: &str,
+    commit_ids: &[CommitId],
     force_head: bool,
 ) -> Result<Vec<CommitRootRebuildPlan>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let mut plans = Vec::new();
-    let mut current_commit_id = commit_id.to_string();
-    let mut force_current = force_head;
-    let mut seen_commit_ids = HashSet::new();
-    loop {
-        if !seen_commit_ids.insert(current_commit_id.clone()) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot rebuild tracked_state commit_root for commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
-                ),
-            ));
+    let mut parent_by_id = BTreeMap::<CommitId, Option<CommitId>>::new();
+    let mut available_roots = BTreeMap::<CommitId, bool>::new();
+    for &root_commit_id in commit_ids {
+        let mut current_commit_id = root_commit_id;
+        let mut force_current = force_head;
+        let mut chain_seen = HashSet::new();
+        loop {
+            if !chain_seen.insert(current_commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot rebuild tracked_state commit_root for commit '{root_commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                    ),
+                ));
+            }
+            if !force_current {
+                let available = match available_roots.get(&current_commit_id) {
+                    Some(available) => *available,
+                    None => {
+                        let available = load_available_root(store, &current_commit_id.to_string())
+                            .await?
+                            .is_some();
+                        available_roots.insert(current_commit_id, available);
+                        available
+                    }
+                };
+                if available {
+                    break;
+                }
+            }
+            let parent_commit_id = match parent_by_id.get(&current_commit_id) {
+                Some(parent_commit_id) => *parent_commit_id,
+                None => {
+                    let parent_commit_id =
+                        load_commit_root_rebuild_topology(store, &current_commit_id.to_string())
+                            .await?;
+                    parent_by_id.insert(current_commit_id, parent_commit_id);
+                    parent_commit_id
+                }
+            };
+            let Some(parent_commit_id) = parent_commit_id else {
+                break;
+            };
+            current_commit_id = parent_commit_id;
+            force_current = false;
         }
-        if !force_current
-            && load_available_root(store, &current_commit_id)
-                .await?
-                .is_some()
-        {
-            break;
-        }
-        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
-        let parent_commit_id = plan.parent_commit_id;
-        plans.push(plan);
-        let Some(parent_commit_id) = parent_commit_id else {
-            break;
-        };
-        current_commit_id = parent_commit_id.to_string();
-        force_current = false;
     }
+
+    let commit_ids = parent_by_id.keys().copied().collect::<Vec<_>>();
+    let deltas_by_id = storage::load_commit_root_rebuild_deltas_batch(store, &commit_ids).await?;
+    let plans_by_id = parent_by_id
+        .into_iter()
+        .map(|(commit_id, parent_commit_id)| {
+            let deltas = deltas_by_id.get(&commit_id).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("tracked_state root rebuild batch omitted commit '{commit_id}'"),
+                )
+            })?;
+            Ok((
+                commit_id,
+                CommitRootRebuildPlan {
+                    commit_id,
+                    parent_commit_id,
+                    deltas: deltas
+                        .into_iter()
+                        .map(|(key, value)| CommitRootRebuildDelta {
+                            schema_key: key.schema_key,
+                            file_id: key.file_id,
+                            entity_pk: key.entity_pk,
+                            change_id: value.change_id,
+                            commit_id: value.commit_id,
+                            deleted: value.deleted,
+                            created_at: value.created_at,
+                            updated_at: value.updated_at,
+                        })
+                        .collect(),
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+    let mut plans = plans_by_id.values().cloned().collect::<Vec<_>>();
+    plans.sort_by_key(|plan| {
+        let mut depth = 0usize;
+        let mut parent = plan.parent_commit_id;
+        while let Some(parent_commit_id) = parent {
+            let Some(parent_plan) = plans_by_id.get(&parent_commit_id) else {
+                break;
+            };
+            depth = depth.saturating_add(1);
+            parent = parent_plan.parent_commit_id;
+        }
+        std::cmp::Reverse(depth)
+    });
     Ok(plans)
+}
+
+/// Loads only immutable changelog topology for the ordinary publication
+/// frontier. Delta identity/value rows are fetched later in one authenticated
+/// batch after all required first-parent commits are known.
+async fn load_commit_root_rebuild_topology<S>(
+    store: &S,
+    commit_id: &str,
+) -> Result<Option<CommitId>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut reader = ChangelogContext::new().reader(store);
+    let commit_id = CommitId::parse_lix(commit_id, "commit-root rebuild commit_id")?;
+    let batch = reader
+        .load_commits(CommitLoadRequest {
+            commit_ids: std::slice::from_ref(&commit_id),
+        })
+        .await?;
+    let commit = batch
+        .into_iter()
+        .next()
+        .and_then(|(_, value)| value)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("cannot rebuild tracked_state root for unknown commit '{commit_id}'"),
+            )
+        })?;
+    Ok(first_parent_commit_id(&commit))
 }
 
 /// Explicit recovery may use immutable changelog facts to replace a missing or
