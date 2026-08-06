@@ -44,10 +44,11 @@ type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
 /// Transaction-local branch publication controls.
 ///
-/// The selector map is retained only as bounded state for transaction-local
-/// metadata lanes. Selector reads always refresh from the caller's coherent
-/// storage snapshot before use, so a cache entry cannot outlive an automatic
-/// publication and select an older current-state generation.
+/// A transaction is fenced by the tracked mutation revision observed when it
+/// opens, so repeatedly loading the same immutable generation selector only
+/// adds storage round trips. Missing controls are cached as well: branch
+/// creation rotates that revision and therefore conflicts with the pinned
+/// transaction before commit.
 #[derive(Default)]
 pub(crate) struct BranchHeadControlCache {
     controls: StdMutex<std::collections::BTreeMap<String, Option<BranchHeadControl>>>,
@@ -1540,27 +1541,51 @@ async fn load_branch_head_controls(
             .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
             .collect());
     };
-    // Read the finite selector set at the current storage snapshot every time.
-    // The cache can outlive an automatic publication; returning an entry from
-    // an older transaction would select a stale generation and hide current
-    // rows. The read handle still provides snapshot coherence for explicit
-    // transactions, while successive autocommit reads observe the new control.
-    let loaded = reader.load_many(branch_ids).await?;
-    let mut controls = cache.controls.lock().map_err(|_| {
+    let missing = {
+        let controls = cache.controls.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction branch-head control cache lock is poisoned",
+            )
+        })?;
+        branch_ids
+            .iter()
+            .filter(|branch_id| !controls.contains_key(*branch_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut loaded_by_branch = std::collections::BTreeMap::new();
+    if !missing.is_empty() {
+        let loaded = reader.load_many(&missing).await?;
+        let mut controls = cache.controls.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction branch-head control cache lock is poisoned",
+            )
+        })?;
+        for (branch_id, control) in missing.into_iter().zip(loaded) {
+            if controls.len() < TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
+                controls.entry(branch_id.clone()).or_insert(control);
+            }
+            loaded_by_branch.insert(branch_id, control);
+        }
+    }
+    let controls = cache.controls.lock().map_err(|_| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "transaction branch-head control cache lock is poisoned",
         )
     })?;
-    for (branch_id, control) in branch_ids.iter().cloned().zip(loaded.iter().copied()) {
-        if controls.len() < TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
-            controls.insert(branch_id, control);
-        }
-    }
     Ok(branch_ids
         .iter()
-        .zip(loaded)
-        .filter_map(|(branch_id, control)| control.map(|control| (branch_id.clone(), control)))
+        .filter_map(|branch_id| {
+            controls
+                .get(branch_id)
+                .copied()
+                .or_else(|| loaded_by_branch.get(branch_id).copied())
+                .flatten()
+                .map(|control| (branch_id.clone(), control))
+        })
         .collect())
 }
 
@@ -1864,7 +1889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_branch_head_control_cache_refreshes_after_publication() {
+    async fn transaction_branch_head_control_cache_pins_loaded_generation() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
         let entity_pk = EntityPk::single("cached-control-row");
@@ -1912,17 +1937,17 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open repeated branch-control read");
-        let refreshed = load_branch_head_controls(&read, &[branch_id.to_string()], Some(&cache))
+        let pinned = load_branch_head_controls(&read, &[branch_id.to_string()], Some(&cache))
             .await
-            .expect("refreshed branch control should load")[branch_id];
+            .expect("cached branch control should load")[branch_id];
         let uncached = load_branch_head_controls(&read, &[branch_id.to_string()], None)
             .await
             .expect("uncached branch control should load")[branch_id];
-        assert_eq!(refreshed, current);
+        assert_eq!(pinned, first);
         assert_eq!(uncached, current);
         assert_ne!(
-            first.current_state_revision,
-            refreshed.current_state_revision
+            pinned.current_state_revision,
+            uncached.current_state_revision
         );
 
         let full_cache = BranchHeadControlCache::default();
