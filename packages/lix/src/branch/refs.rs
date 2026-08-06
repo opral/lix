@@ -38,10 +38,16 @@ impl<S> BranchRefStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) async fn load_control(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<crate::branch::BranchHeadControl>, LixError> {
+        self.controls.load(branch_id).await
+    }
+
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Ok(self
-            .controls
-            .load(branch_id)
+            .load_control(branch_id)
             .await?
             .map(|control| BranchHead {
                 branch_id: branch_id.to_string(),

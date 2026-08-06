@@ -12,6 +12,7 @@ use crate::catalog::snapshot::{
     CatalogFingerprint, fingerprint_schema_facts, hash_fingerprint_part,
 };
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
+use crate::changelog::CommitId;
 use crate::domain::{Domain, committed_row_ref_is_exact_branch_scoped};
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
@@ -54,8 +55,19 @@ struct CatalogRowsFingerprint(String);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TransactionOpeningCatalogKey {
-    domain: Domain,
+    untracked: bool,
     revision: CatalogRevision,
+}
+
+/// Authenticated identities for the two catalog visibility domains captured
+/// by the same transaction-opening read. These identities are content
+/// authority, not branch-name aliases, so equivalent branches can reuse the
+/// same immutable compiled snapshot without another selector read.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CatalogOpeningGeneration {
+    pub(crate) tracked_generation: CommitId,
+    pub(crate) untracked_generation: CommitId,
+    pub(crate) current_state_revision: u64,
 }
 
 impl CatalogContext {
@@ -89,7 +101,7 @@ impl CatalogContext {
             return self.compiled_catalog_for_domain(live_state, domain).await;
         };
         let key = TransactionOpeningCatalogKey {
-            domain: domain.clone(),
+            untracked: domain.untracked(),
             revision: revision.clone(),
         };
         if let Some(snapshot) = self
@@ -102,6 +114,61 @@ impl CatalogContext {
         }
 
         let snapshot = self.compiled_catalog_for_domain(live_state, domain).await?;
+        let mut cache = self
+            .transaction_opening_catalogs
+            .lock()
+            .expect("transaction opening catalog cache lock should not be poisoned");
+        if cache.len() >= COMPILED_CATALOG_CACHE_LIMIT {
+            if let Some(evicted) = cache.keys().find(|entry| **entry != key).cloned() {
+                cache.remove(&evicted);
+            }
+        }
+        cache.insert(key, Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
+    /// Returns the catalog captured by an opening snapshot and keyed by the
+    /// authenticated catalog revision and visibility domain rather than
+    /// branch name. The caller must have loaded the tracked/untracked control
+    /// from the same read; this method never performs another selector read.
+    pub(crate) async fn compiled_catalog_for_transaction_open_with_generation<R>(
+        &self,
+        live_state: &R,
+        domain: &Domain,
+        revision: Option<&CatalogRevision>,
+        generation: &CatalogOpeningGeneration,
+    ) -> Result<Arc<CatalogSnapshot>, LixError>
+    where
+        R: LiveStateReader + ?Sized,
+    {
+        let Some(revision) = revision else {
+            return self
+                .compiled_catalog_for_transaction_open(live_state, domain, None)
+                .await;
+        };
+        let original_domain = domain;
+        // CatalogRevision is the authenticated schema-generation fence. The
+        // tracked/untracked control tuple was loaded from this same opening
+        // snapshot by the caller, but is intentionally not part of the key:
+        // two branches can have different heads while sharing the same
+        // immutable schema catalog revision.
+        let _ = generation;
+        let key = TransactionOpeningCatalogKey {
+            untracked: original_domain.untracked(),
+            revision: revision.clone(),
+        };
+        if let Some(snapshot) = self
+            .transaction_opening_catalogs
+            .lock()
+            .expect("transaction opening catalog cache lock should not be poisoned")
+            .get(&key)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+
+        let snapshot = self
+            .compiled_catalog_for_domain(live_state, original_domain)
+            .await?;
         let mut cache = self
             .transaction_opening_catalogs
             .lock()
@@ -501,6 +568,53 @@ mod tests {
             3,
             "hot transaction opens must not rescan either schema catalog"
         );
+    }
+
+    #[tokio::test]
+    async fn generation_key_reuses_catalog_across_equivalent_branch_domains() {
+        let context = CatalogContext::new();
+        let first_domain = Domain::schema_catalog("branch-a", true);
+        let equivalent_domain = Domain::schema_catalog("branch-b", true);
+        let revision = CatalogRevision::for_test(b"revision-one");
+        let generation = CatalogOpeningGeneration {
+            tracked_generation: CommitId::for_test_label("tracked-generation"),
+            untracked_generation: CommitId::for_test_label("untracked-generation"),
+            current_state_revision: 7,
+        };
+        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+
+        let first = context
+            .compiled_catalog_for_transaction_open_with_generation(
+                &reader,
+                &first_domain,
+                Some(&revision),
+                &generation,
+            )
+            .await
+            .expect("first generation catalog should compile");
+        let second = context
+            .compiled_catalog_for_transaction_open_with_generation(
+                &reader,
+                &equivalent_domain,
+                Some(&revision),
+                &generation,
+            )
+            .await
+            .expect("equivalent generation catalog should hit");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(reader.scan_count(), 2);
+
+        let changed_revision = CatalogRevision::for_test(b"revision-two");
+        context
+            .compiled_catalog_for_transaction_open_with_generation(
+                &reader,
+                &equivalent_domain,
+                Some(&changed_revision),
+                &generation,
+            )
+            .await
+            .expect("changed schema revision should recompile");
+        assert_eq!(reader.scan_count(), 4);
     }
 
     #[tokio::test]

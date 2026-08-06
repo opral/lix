@@ -3,7 +3,7 @@ mod revision;
 mod schema;
 mod snapshot;
 
-pub(crate) use context::CatalogContext;
+pub(crate) use context::{CatalogContext, CatalogOpeningGeneration};
 pub(crate) use revision::{load_catalog_revision, stage_catalog_revision};
 pub(crate) use schema::{
     ForeignKeyPlan, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanFingerprint,

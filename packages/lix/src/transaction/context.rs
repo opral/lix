@@ -25,8 +25,8 @@ use crate::branch::{
     BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
-    CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
-    stage_catalog_revision,
+    CatalogContext, CatalogFingerprint, CatalogOpeningGeneration, CatalogSnapshot, SchemaPlanId,
+    load_catalog_revision, stage_catalog_revision,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId,
@@ -1402,14 +1402,43 @@ where
                     .await?;
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let functions = runtime_functions.provider();
+            let active_branch_control = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&active_branch_id)
+                .await?;
+            let opening_active_branch_head = active_branch_control
+                .as_ref()
+                .map(|control| control.head_commit_id);
+            let opening_global_branch_head = if active_branch_id == GLOBAL_BRANCH_ID {
+                opening_active_branch_head
+            } else {
+                branch_ctx
+                    .ref_reader(&read)
+                    .load_head_commit_id(GLOBAL_BRANCH_ID)
+                    .await?
+            };
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
                 let visible_live_state = live_state.reader(&read);
+                let catalog_generation = active_branch_control
+                    .as_ref()
+                    .map(|control| CatalogOpeningGeneration {
+                        tracked_generation: control.tracked_generation,
+                        untracked_generation: control.untracked_generation,
+                        current_state_revision: control.current_state_revision,
+                    })
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "active branch is missing its authenticated head control",
+                        )
+                    })?;
                 let sql_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
+                    .compiled_catalog_for_transaction_open_with_generation(
                         &visible_live_state,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
                         catalog_revision.as_ref(),
+                        &catalog_generation,
                     )
                     .await?;
                 // SQL planning needs the untracked-visible catalog, while
@@ -1417,10 +1446,11 @@ where
                 // catalog. Pin both under the same revision at open so the
                 // first write never falls back to a catalog scan.
                 let tracked_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
+                    .compiled_catalog_for_transaction_open_with_generation(
                         &visible_live_state,
                         &Domain::schema_catalog(active_branch_id.clone(), false),
                         catalog_revision.as_ref(),
+                        &catalog_generation,
                     )
                     .await?;
                 (sql_schema_catalog, tracked_schema_catalog)
@@ -1428,14 +1458,6 @@ where
             let opening_tracked_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
                     .await?;
-            let branch_reader = branch_ctx.ref_reader(&read);
-            let opening_active_branch_head =
-                branch_reader.load_head_commit_id(&active_branch_id).await?;
-            let opening_global_branch_head = if active_branch_id == GLOBAL_BRANCH_ID {
-                opening_active_branch_head
-            } else {
-                branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?
-            };
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
