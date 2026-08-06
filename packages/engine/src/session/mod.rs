@@ -52,6 +52,8 @@ pub use observe::{ObserveEvent, ObserveEvents};
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
 pub use undo_redo::{RedoReceipt, UndoReceipt};
+#[cfg(feature = "storage-benches")]
+pub(crate) use undo_redo::{marker_work_snapshot, reset_marker_work_counters};
 
 /// Zero-cost adapter for futures that rustc cannot prove `Send` because an
 /// opaque async call contains higher-ranked references. Construction is unsafe:

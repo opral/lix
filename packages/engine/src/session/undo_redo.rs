@@ -1,5 +1,5 @@
 use crate::LixError;
-use crate::changelog::{ChangeRecordProjection, CommitId};
+use crate::changelog::CommitId;
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
 use crate::sql2::SqlWriteExecutionContext;
@@ -14,6 +14,33 @@ use crate::undo_redo::{
 };
 
 use super::SessionContext;
+
+#[cfg(any(test, feature = "storage-benches"))]
+static AUTHENTICATED_MARKER_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+static AUTHENTICATED_MARKER_MEMBERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+static FULL_DELTA_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn marker_work_snapshot() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering;
+    (
+        AUTHENTICATED_MARKER_LOADS.load(Ordering::Relaxed),
+        AUTHENTICATED_MARKER_MEMBERS.load(Ordering::Relaxed),
+        FULL_DELTA_LOADS.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn reset_marker_work_counters() {
+    use std::sync::atomic::Ordering;
+    AUTHENTICATED_MARKER_LOADS.store(0, Ordering::Relaxed);
+    AUTHENTICATED_MARKER_MEMBERS.store(0, Ordering::Relaxed);
+    FULL_DELTA_LOADS.store(0, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoReceipt {
@@ -68,8 +95,7 @@ where
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "undo", "target"))?;
     let head_record = load_node(transaction, head).await?;
-    let (state, head_delta) =
-        semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
+    let state = semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
     let target = state.undo_top.ok_or_else(|| {
         LixError::new(
             LixError::CODE_NOTHING_TO_UNDO,
@@ -84,11 +110,7 @@ where
     let parent = only_parent(&target_record.parent_commit_ids, target, "undo")?;
     let state_before_target = semantic_state_at(transaction, &branch_id, parent).await?;
 
-    let target_delta = if target == head {
-        head_delta
-    } else {
-        load_commit_delta(transaction, target).await?
-    };
+    let target_delta = load_commit_delta(transaction, target).await?;
     let outcome = apply_state_diff(transaction, head, parent, target, false, &target_delta).await?;
     let inverse_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
@@ -126,7 +148,7 @@ where
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "redo", "target"))?;
     let head_record = load_node(transaction, head).await?;
-    let (state, _) = semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
+    let state = semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
     let redo_node = state.redo_top.ok_or_else(|| {
         LixError::new(
             LixError::CODE_NOTHING_TO_REDO,
@@ -188,46 +210,19 @@ where
     if record.parent_commit_ids.len() != 1 {
         return Ok(SemanticState::default());
     }
-    let keys = semantic_keys(branch_id)?;
-    let marker_schemas = [
-        CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
-        UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-    ];
-    let marker_delta = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .commit_delta_values_for_schemas(commit_id, &marker_schemas)
-            .await?
-    };
-    let mut has_checkpoint = false;
-    let mut has_foreign_operation = false;
-    let mut has_local_operation = false;
-    for row in marker_delta.iter().filter(|row| !row.value().deleted) {
-        let key = row.key_ref();
-        match key.schema_key {
-            CHECKPOINT_MARKER_SCHEMA_KEY => has_checkpoint = true,
-            UNDO_REDO_MARKER_SCHEMA_KEY if key.entity_pk == &keys[1].entity_pk => {
-                has_local_operation = true;
-            }
-            UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
-            _ => {}
-        }
-    }
-    if has_checkpoint || has_foreign_operation {
+    let marker_state = load_authenticated_marker_state(transaction, branch_id, commit_id).await?;
+    if marker_state.has_checkpoint || marker_state.has_foreign_operation {
         return Ok(SemanticState::default());
     }
-    if !has_local_operation {
-        return Ok(SemanticState {
+    Ok(marker_state.local_operation.map_or(
+        SemanticState {
             undo_top: Some(commit_id),
             redo_top: None,
             redo_target: None,
             redo_next: None,
-        });
-    }
-    let marker = operation_marker_at(transaction, branch_id, commit_id)
-        .await?
-        .ok_or_else(|| missing_operation_marker(commit_id))?;
-    Ok(semantic_state_from_marker(marker, commit_id))
+        },
+        |marker| semantic_state_from_marker(marker, commit_id),
+    ))
 }
 
 fn semantic_keys(branch_id: &str) -> Result<[TrackedStateKey; 2], LixError> {
@@ -256,67 +251,26 @@ async fn semantic_state_for_record<S>(
     branch_id: &str,
     commit_id: CommitId,
     record: &crate::commit_graph::CommitGraphNode,
-) -> Result<
-    (
-        SemanticState,
-        Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    ),
-    LixError,
->
+) -> Result<SemanticState, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     if record.parent_commit_ids.len() != 1 {
-        return Ok((SemanticState::default(), Vec::new()));
+        return Ok(SemanticState::default());
     }
-
-    let keys = semantic_keys(branch_id)?;
-    let delta = load_commit_delta(transaction, commit_id).await?;
-    if delta
-        .iter()
-        .any(|(key, value)| key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY && !value.deleted)
-    {
-        return Ok((SemanticState::default(), delta));
+    let marker_state = load_authenticated_marker_state(transaction, branch_id, commit_id).await?;
+    if marker_state.has_checkpoint || marker_state.has_foreign_operation {
+        return Ok(SemanticState::default());
     }
-    let operation_marker = delta
-        .iter()
-        .find(|(key, value)| key.schema_key == UNDO_REDO_MARKER_SCHEMA_KEY && !value.deleted);
-    let Some((operation_key, _)) = operation_marker else {
-        return Ok((
-            SemanticState {
-                undo_top: Some(commit_id),
-                redo_top: None,
-                redo_target: None,
-                redo_next: None,
-            },
-            delta,
-        ));
-    };
-    if operation_key != &keys[1] {
-        return Ok((SemanticState::default(), delta));
-    }
-    let rows = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .load_projected_batch_at_commit(
-                &commit_id.to_string(),
-                &keys[1..],
-                &ChangeRecordProjection::from_columns(&[
-                    "commit_id".to_string(),
-                    "snapshot_content".to_string(),
-                ]),
-            )
-            .await?
-    };
-    let Some(row) = rows.row(0).filter(|row| !row.deleted()) else {
-        return Err(missing_operation_marker(commit_id));
-    };
-    if row.commit_id() != commit_id {
-        return Err(missing_operation_marker(commit_id));
-    }
-    let marker = parse_marker(row.snapshot_content(), commit_id)?;
-    let state = semantic_state_from_marker(marker, commit_id);
-    Ok((state, delta))
+    Ok(marker_state.local_operation.map_or(
+        SemanticState {
+            undo_top: Some(commit_id),
+            redo_top: None,
+            redo_target: None,
+            redo_next: None,
+        },
+        |marker| semantic_state_from_marker(marker, commit_id),
+    ))
 }
 
 fn semantic_state_from_marker(marker: UndoRedoMarker, commit_id: CommitId) -> SemanticState {
@@ -344,32 +298,86 @@ async fn operation_marker_at<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id)
-        .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
-    let rows = {
+    Ok(
+        load_authenticated_marker_state(transaction, branch_id, commit_id)
+            .await?
+            .local_operation,
+    )
+}
+
+#[derive(Default)]
+struct AuthenticatedMarkerState {
+    has_checkpoint: bool,
+    has_foreign_operation: bool,
+    local_operation: Option<UndoRedoMarker>,
+}
+
+/// Reads the marker control plane directly from the authenticated commit
+/// mutation parts. This is deliberately narrower than `load_commit_delta`:
+/// semantic undo/redo state must never expand unrelated head mutations just
+/// to discover a marker. Every active operation marker is materialized and
+/// parsed; missing, malformed, or identity-mismatched payloads fail closed.
+async fn load_authenticated_marker_state<S>(
+    transaction: &mut Transaction<S>,
+    branch_id: &str,
+    commit_id: CommitId,
+) -> Result<AuthenticatedMarkerState, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let marker_schemas = [
+        CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
+        UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
+    ];
+    let branch_keys = semantic_keys(branch_id)?;
+    let members = {
         let mut tracked = transaction.tracked_state_reader().await;
         tracked
-            .load_projected_batch_at_commit(
-                &commit_id.to_string(),
-                &[TrackedStateKey {
-                    schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-                    file_id: None,
-                    entity_pk: branch_pk,
-                }],
-                &ChangeRecordProjection::from_columns(&[
-                    "commit_id".to_string(),
-                    "snapshot_content".to_string(),
-                ]),
-            )
+            .commit_delta_members_with_materialized_payloads_for_schemas(commit_id, &marker_schemas)
             .await?
     };
-    let Some(row) = rows
-        .row(0)
-        .filter(|row| !row.deleted() && row.commit_id() == commit_id)
-    else {
-        return Ok(None);
-    };
-    parse_marker(row.snapshot_content(), commit_id).map(Some)
+    #[cfg(any(test, feature = "storage-benches"))]
+    {
+        use std::sync::atomic::Ordering;
+        AUTHENTICATED_MARKER_LOADS.fetch_add(1, Ordering::Relaxed);
+        AUTHENTICATED_MARKER_MEMBERS.fetch_add(members.len(), Ordering::Relaxed);
+    }
+
+    let mut state = AuthenticatedMarkerState::default();
+    for (member, payload) in members {
+        if member.value.deleted {
+            continue;
+        }
+        match member.key.schema_key.as_str() {
+            CHECKPOINT_MARKER_SCHEMA_KEY => state.has_checkpoint = true,
+            UNDO_REDO_MARKER_SCHEMA_KEY => {
+                let marker = parse_marker(payload.snapshot_content.as_ref(), commit_id)?;
+                if member.key.entity_pk == branch_keys[1].entity_pk {
+                    if marker.branch_id.as_str() != branch_id {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("undo/redo marker at '{commit_id}' belongs to another branch"),
+                        ));
+                    }
+                    if state.local_operation.replace(marker).is_some() {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit '{commit_id}' contains duplicate undo/redo markers"),
+                        ));
+                    }
+                } else {
+                    state.has_foreign_operation = true;
+                }
+            }
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authenticated marker loader returned an unexpected schema",
+                ));
+            }
+        }
+    }
+    Ok(state)
 }
 
 fn parse_marker(
@@ -397,15 +405,6 @@ fn missing_redo_node(commit_id: CommitId) -> LixError {
     )
 }
 
-fn missing_operation_marker(commit_id: CommitId) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!(
-            "commit delta for '{commit_id}' contains an undo/redo marker that cannot be loaded"
-        ),
-    )
-}
-
 async fn load_commit_delta<S>(
     transaction: &mut Transaction<S>,
     commit_id: CommitId,
@@ -413,6 +412,8 @@ async fn load_commit_delta<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    #[cfg(any(test, feature = "storage-benches"))]
+    FULL_DELTA_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tracked = transaction.tracked_state_reader().await;
     tracked.commit_delta_members(commit_id).await
 }
@@ -573,7 +574,8 @@ where
 mod tests {
     use serde_json::Value as JsonValue;
 
-    use super::{load_commit_delta, load_node, only_parent};
+    use super::{load_commit_delta, load_node, marker_work_snapshot, only_parent, parse_marker};
+    use crate::common::SharedStr;
     use crate::sql2::SqlWriteExecutionContext;
     use crate::storage::Memory;
     use crate::{
@@ -616,9 +618,27 @@ mod tests {
             })
     }
 
+    #[test]
+    fn missing_marker_payload_fails_closed() {
+        let error = parse_marker(None, crate::changelog::CommitId::for_test_label("missing"))
+            .expect_err("a marker without an authenticated snapshot must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn malformed_marker_payload_fails_closed() {
+        let error = parse_marker(
+            Some(&SharedStr::from("{not-json")),
+            crate::changelog::CommitId::for_test_label("malformed"),
+        )
+        .expect_err("malformed marker JSON must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+    }
+
     #[tokio::test]
     async fn undo_redo_tracks_branch_actions_without_rewinding_history() {
         let session = setup().await;
+        let marker_work_before = marker_work_snapshot();
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('theme', 'light')",
@@ -644,6 +664,9 @@ mod tests {
         assert_eq!(value(&session, "theme").await.as_deref(), Some("light"));
         session.redo().await.expect("update redoes");
         assert_eq!(value(&session, "theme").await.as_deref(), Some("dark"));
+        let marker_work_after = marker_work_snapshot();
+        assert!(marker_work_after.0 > marker_work_before.0);
+        assert!(marker_work_after.1 > marker_work_before.1);
     }
 
     #[tokio::test]

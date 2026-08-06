@@ -1449,6 +1449,67 @@ where
             .await
     }
 
+    /// Loads and materializes only the authenticated payloads owned by the
+    /// requested commit-delta schemas. Callers that already have the physical
+    /// commit coordinate must not widen this into a full delta scan: marker
+    /// state is a small semantic control plane, and a missing or malformed
+    /// payload is a corruption error rather than a reason to consult another
+    /// authority.
+    pub(crate) async fn commit_delta_members_with_materialized_payloads_for_schemas(
+        &mut self,
+        commit_id: CommitId,
+        schema_keys: &[String],
+    ) -> Result<
+        Vec<(
+            storage::CommitDeltaMember,
+            crate::changelog::MaterializedChangePayload,
+        )>,
+        LixError,
+    > {
+        let members = storage::load_commit_delta_members_with_payloads_for_schemas(
+            &self.store,
+            commit_id,
+            schema_keys,
+            usize::MAX,
+        )
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("authenticated marker delta for '{commit_id}' exceeds the segment limit"),
+            )
+        })?;
+        let payloads = crate::changelog::materialize_known_change_payloads_in_order(
+            &self.store,
+            members.iter().map(|member| member.change.clone()),
+            ChangeRecordProjection::full(),
+        )
+        .await?;
+        if payloads.len() != members.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "authenticated marker delta for '{commit_id}' lost a payload while materializing"
+                ),
+            ));
+        }
+        members
+            .into_iter()
+            .zip(payloads)
+            .map(|(member, (payload_change_id, payload))| {
+                if payload_change_id != member.change.change_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "authenticated marker payload identity mismatch in commit '{commit_id}'"
+                        ),
+                    ));
+                }
+                Ok((member, payload))
+            })
+            .collect()
+    }
+
     /// Probes root publication in tests and storage benchmarks. Every current
     /// protocol commit must return true; false is valid only for explicit
     /// legacy-rootless fixtures or damaged storage awaiting repair.
