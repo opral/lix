@@ -5416,44 +5416,15 @@ async fn stage_tracked_roots(
         {
             let commit_id_text = root.commit_id.to_string();
             let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
-            let file_delete_cascades = state_row_indices
-                .iter()
-                .filter_map(|&row_index| {
-                    let row = state_rows.row(row_index);
-                    (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.snapshot.is_none())
-                        .then_some(row)
-                })
-                .map(|row| {
-                    let delta = tracked_delta_from_state_row(row)?;
-                    let file_id = row.entity_pk.as_single_string_owned().map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("file descriptor tombstone has invalid identity: {error}"),
-                        )
-                    })?;
-                    Ok((file_id, delta))
-                })
-                .collect::<Result<BTreeMap<_, _>, LixError>>()?;
-            let first_row = state_rows.row(state_row_indices[0]);
-            let first_mutation_key = encode_key_ref(TrackedStateKeyRef {
-                schema_key: first_row.schema_key,
-                file_id: first_row.file_id.map(crate::common::SharedStr::as_str),
-                entity_pk: first_row.entity_pk,
-            });
-            if tracked_writer
-                .try_stage_bulk_parent_root_from_ordered_mutations(
+            tracked_writer
+                .stage_sorted_mutation_frontier(
                     &commit_id_text,
                     parent_commit_id_text.as_deref(),
                     state_row_indices.len(),
-                    &first_mutation_key,
-                    &file_delete_cascades,
                     OrderedStateRowMutations::new(state_row_indices, state_rows, insert_selection),
                 )
-                .await?
-                .is_some()
-            {
-                continue;
-            }
+                .await?;
+            continue;
         }
         let deltas = state_row_indices
             .iter()

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,7 +19,7 @@ use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
-    TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateRootMutationRef, encode_key_ref,
+    TrackedStateDeltaRef, TrackedStateRootMutationRef,
 };
 
 /// Owned delta used only by explicit commit-root rebuild.
@@ -370,50 +370,14 @@ where
             .is_lt()
     });
     if strictly_sorted && plan.deltas.len() >= 2 {
-        let first = &plan.deltas[0];
-        let first_key = encode_key_ref(TrackedStateKeyRef {
-            schema_key: &first.schema_key,
-            file_id: first.file_id.as_deref(),
-            entity_pk: &first.entity_pk,
-        });
-        let file_delete_cascades = plan
-            .deltas
-            .iter()
-            .filter(|delta| delta.schema_key == "lix_file_descriptor" && delta.deleted)
-            .map(|delta| {
-                Ok((
-                    delta.entity_pk.as_single_string_owned().map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("file descriptor tombstone has invalid identity: {error}"),
-                        )
-                    })?,
-                    TrackedStateDeltaRef {
-                        schema_key: &delta.schema_key,
-                        file_id: delta.file_id.as_deref(),
-                        entity_pk: &delta.entity_pk,
-                        change_id: delta.change_id,
-                        commit_id: delta.commit_id,
-                        deleted: true,
-                        created_at: delta.created_at,
-                        updated_at: delta.updated_at,
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
-        if let Some(report) = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
+        return writer
+            .stage_sorted_mutation_frontier(
                 &commit_id,
                 parent_commit_id.as_deref(),
                 deltas.len(),
-                &first_key,
-                &file_delete_cascades,
                 RebuildRootMutations::new(&deltas),
             )
-            .await?
-        {
-            return Ok(report);
-        }
+            .await;
     }
     writer
         .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)

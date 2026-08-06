@@ -541,12 +541,6 @@ impl TrackedStateMutationBatch {
         self.mutations.len()
     }
 
-    pub(crate) fn first_encoded_key(&self) -> Option<&[u8]> {
-        self.mutations
-            .first()
-            .map(|mutation| mutation.encoded_key.as_ref())
-    }
-
     #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[TrackedStateMutation] {
         &self.mutations

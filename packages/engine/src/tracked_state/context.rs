@@ -35,12 +35,10 @@ use crate::tracked_state::diff::{
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
-#[cfg(test)]
-use crate::tracked_state::types::TrackedStateMutation;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue,
-    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutationBatch,
-    TrackedStateRootId, TrackedStateTreeScanRequest,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
+    TrackedStateMutationBatch, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
@@ -56,12 +54,6 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-// A right-edge probe is worthwhile for a real append batch, but would add a
-// second tree traversal to sparse non-append writes that already use point
-// reads. Keep those latency-sensitive writes on the unchanged generic path.
-const ORDERED_APPEND_BATCH_MIN_ROWS: usize = 64;
-const STREAMING_DOMINANT_APPEND_MIN_ROWS: usize = 32 * 1024;
-const STREAMING_DOMINANT_APPEND_PARENT_RATIO: u64 = 16;
 // Retain the point cache for latency-sensitive descriptor/registry probes.
 // Above this boundary, per-key cache ownership and duplicate adapters dominate
 // and the arena-backed encoded replay is the intended bulk path.
@@ -70,6 +62,9 @@ const NO_FIRST_PARENT_ORDINAL: u32 = u32::MAX;
 const NO_ROOTLESS_REPLAY_ORDINAL: u32 = u32::MAX;
 const SMALL_FILE_ID_DICTIONARY_CAPACITY: usize = 64;
 const ESTIMATED_FILE_ID_BYTES: usize = 36;
+
+#[cfg(test)]
+const STREAMING_DOMINANT_APPEND_MIN_ROWS: usize = 32 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -4236,11 +4231,11 @@ where
             };
             mutation_batch.push(key, value);
         }
-        let mutations = mutation_batch.finish();
+        let mutations = canonicalize_mutation_batch(mutation_batch.finish());
         let changed_rows = mutations.len();
         let result = self
             .tree
-            .apply_mutations_with_overlay(
+            .apply_sorted_mutations_with_overlay(
                 self.store,
                 self.writes,
                 &mut self.chunk_overlay,
@@ -4302,209 +4297,53 @@ where
         })
     }
 
-    /// Attempts the arena-backed ordered root paths used by normal bulk
-    /// tracked commits.
+    /// Stages one strict sorted mutation frontier.
     ///
-    /// Parentless batches build directly from the borrowed deltas. Append-only
-    /// batches keep the existing chunk-reuse patcher, but bypass the generic
-    /// point-read and owned-key preparation. Dense overlapping batches stream
-    /// through the parent merge. Sparse, unordered, and cascade-bearing sparse
-    /// callers stay on the generic path, which preserves latest-write-wins and
-    /// file-delete cascade behavior.
-    pub(crate) async fn try_stage_bulk_parent_root_from_ordered_mutations<'a, I>(
+    /// The old implementation selected between an append patcher, a dense
+    /// parent-stream assembler, and the generic point-read path. All callers
+    /// now use the same authenticated tree frontier; parent values are read
+    /// once for created-at/absence semantics and the tree stages one final
+    /// root-reachable chunk batch.
+    pub(crate) async fn stage_sorted_mutation_frontier<'a, I>(
         &mut self,
         commit_id: &str,
         parent_commit_id: Option<&str>,
         mutation_count: usize,
-        first_mutation_key: &[u8],
-        file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'a>>,
         mutations: I,
-    ) -> Result<Option<TrackedStateWriteReport>, LixError>
+    ) -> Result<TrackedStateWriteReport, LixError>
     where
         I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
     {
-        if mutation_count < 2 {
-            return Ok(None);
+        let ordered = mutations.into_iter().collect::<Result<Vec<_>, _>>()?;
+        if ordered.len() != mutation_count {
+            return Err(ordered_root_mutation_count_error(
+                mutation_count,
+                ordered.len(),
+            ));
         }
-        let typed_commit_id =
-            CommitId::parse_lix(commit_id, "tracked-state commit root commit_id")?;
-        let typed_parent_commit_id = parent_commit_id
-            .map(|id| CommitId::parse_lix(id, "tracked-state parent commit_id"))
-            .transpose()?;
-        let parent_metadata = match parent_commit_id {
-            Some(parent_commit_id) => Some(match self.staged_roots.get(parent_commit_id) {
-                Some(metadata) => metadata.clone(),
-                None => storage::load_snapshot_commit_root(self.store, parent_commit_id)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!(
-                                "tracked-state parent root for commit '{parent_commit_id}' is missing"
-                            ),
-                        )
-                    })?,
-            }),
-            None => None,
-        };
-        let mutation_count_u64 = u64::try_from(mutation_count).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_root changed key count exceeds u64",
+        let absence_guards = ordered
+            .iter()
+            .filter(|mutation| mutation.require_absence)
+            .map(|mutation| TrackedStateKey {
+                schema_key: mutation.delta.schema_key.to_string(),
+                file_id: mutation.delta.file_id.map(ToString::to_string),
+                entity_pk: mutation.delta.entity_pk.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let report = self
+            .stage_commit_root_with_absence_guards(
+                commit_id,
+                parent_commit_id,
+                ordered.into_iter().map(|mutation| mutation.delta),
+                &absence_guards,
+                &BTreeSet::new(),
             )
-        })?;
-        let dense_parent_batch = parent_metadata.as_ref().is_some_and(|parent_metadata| {
-            mutation_count_u64 > parent_metadata.row_count_estimate / 2
-        });
-        if parent_metadata.is_some()
-            && !dense_parent_batch
-            && mutation_count < ORDERED_APPEND_BATCH_MIN_ROWS
-        {
-            return Ok(None);
-        }
-        let append_only = match parent_metadata.as_ref() {
-            Some(parent_metadata) => {
-                self.tree
-                    .first_key_is_after_root_right_edge(
-                        self.store,
-                        &self.chunk_overlay,
-                        &parent_metadata.root_id,
-                        first_mutation_key,
-                    )
-                    .await?
-            }
-            None => false,
-        };
-        // The right-spine patcher is ideal while the durable parent is a
-        // meaningful fraction of the output. For a production-sized append at
-        // least 16x the parent, rebuilding bounds extra parent work to 6.25%
-        // while avoiding mutation arenas and a second owned descriptor vector.
-        let dominant_append = mutation_count >= STREAMING_DOMINANT_APPEND_MIN_ROWS
-            && append_only
-            && file_delete_cascades.is_empty()
-            && parent_metadata.as_ref().is_some_and(|parent_metadata| {
-                mutation_count_u64
-                    >= parent_metadata
-                        .row_count_estimate
-                        .saturating_mul(STREAMING_DOMINANT_APPEND_PARENT_RATIO)
-            });
-        #[cfg(test)]
-        if dominant_append {
-            STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| {
-                executions.set(executions.get().saturating_add(1));
-            });
-        }
-        let use_borrowed_batch = parent_metadata.is_none()
-            || (append_only && file_delete_cascades.is_empty() && !dominant_append);
-        // Match the existing full-rebuild threshold for overlapping roots. A
-        // parentless batch needs no reads, while an append-only batch is already
-        // the patcher's cheapest case and can skip point reads at any batch
-        // density. Cascade-bearing sparse appends remain on the generic path.
-        if !use_borrowed_batch && !dense_parent_batch {
-            return Ok(None);
-        }
-
-        let base_root = parent_metadata
-            .as_ref()
-            .map(|metadata| metadata.root_id.clone());
-        let (result, cascaded_rows) = if use_borrowed_batch {
-            let mutation_batch = build_ordered_root_mutation_batch(mutation_count, mutations)?;
-            if mutation_batch.first_encoded_key() != Some(first_mutation_key) {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked-state ordered bulk first key does not match its mutation batch",
-                ));
-            }
-            (
-                self.tree
-                    .apply_mutations_with_overlay(
-                        self.store,
-                        self.writes,
-                        &mut self.chunk_overlay,
-                        base_root.as_ref(),
-                        mutation_batch,
-                        Some(commit_id),
-                    )
-                    .await?,
-                0,
-            )
-        } else {
-            let parent_metadata = parent_metadata
-                .as_ref()
-                .expect("dense ordered parent merge requires parent metadata");
-            self.tree
-                .merge_and_stage_ordered_parent_mutations(
-                    self.store,
-                    self.writes,
-                    &mut self.chunk_overlay,
-                    &parent_metadata.root_id,
-                    mutation_count,
-                    file_delete_cascades,
-                    mutations,
-                    Some(commit_id),
-                )
-                .await?
-        };
-        let changed_rows = mutation_count.checked_add(cascaded_rows).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_root changed key count exceeds usize",
-            )
-        })?;
-        let metadata = TrackedStateCommitRoot {
-            commit_id: typed_commit_id,
-            root_id: result.root_id.clone(),
-            parent_roots: typed_parent_commit_id
-                .zip(base_root.as_ref())
-                .map(|(parent_commit_id, root_id)| {
-                    vec![TrackedStateCommitRootParent {
-                        commit_id: parent_commit_id,
-                        root_id: root_id.clone(),
-                    }]
-                })
-                .unwrap_or_default(),
-            changed_key_count: u64::try_from(changed_rows).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root changed key count exceeds u64",
-                )
-            })?,
-            row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root row count exceeds u64",
-                )
-            })?,
-            tree_height: u32::try_from(result.tree_height).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root tree height exceeds u32",
-                )
-            })?,
-            primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root chunk count exceeds u64",
-                )
-            })?,
-            primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root chunk bytes exceeds u64",
-                )
-            })?,
-        };
-        self.staged_roots.insert(commit_id.to_string(), metadata);
-
-        Ok(Some(TrackedStateWriteReport {
-            commit_id: typed_commit_id,
-            root_id: result.root_id,
-            changed_rows,
-            primary_chunk_puts: result.chunk_count,
-        }))
+            .await?;
+        Ok(report)
     }
 }
 
+#[cfg(test)]
 fn build_ordered_root_mutation_batch<'a, I>(
     expected_mutation_count: usize,
     mutations: I,
@@ -4551,6 +4390,35 @@ where
         ));
     }
     Ok(batch.finish())
+}
+
+/// Canonicalizes the generic delta path once before it enters the tree.
+///
+/// The tree writer is deliberately strict: it only accepts a sorted-unique
+/// frontier and never performs a second sort/dedup while routing immutable
+/// nodes. Duplicate identities retain the historical latest-input-wins
+/// behavior by keeping the final value in stable input order.
+fn canonicalize_mutation_batch(
+    batch: TrackedStateMutationBatch,
+) -> TrackedStateMutationBatch {
+    let mut mutations = batch.into_mutations();
+    mutations.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+    let mut unique = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        if unique
+            .last()
+            .is_some_and(|previous: &TrackedStateMutation| {
+                previous.encoded_key == mutation.encoded_key
+            })
+        {
+            *unique
+                .last_mut()
+                .expect("duplicate mutation has a predecessor") = mutation;
+        } else {
+            unique.push(mutation);
+        }
+    }
+    TrackedStateMutationBatch::from_shared(unique)
 }
 
 fn ordered_root_mutation_count_error(expected: usize, actual: usize) -> LixError {
@@ -5771,7 +5639,6 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let first_key = encoded_key_from_materialized_row(&rows[0]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -5780,12 +5647,10 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut writer = tracked_state.writer(&read, &mut writes);
         let report = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
+            .stage_sorted_mutation_frontier(
                 &commit_id,
                 None,
                 rows.len(),
-                &first_key,
-                &BTreeMap::new(),
                 rows.iter().map(|row| {
                     Ok(TrackedStateRootMutationRef {
                         delta: delta_from_materialized_row(row),
@@ -5794,8 +5659,7 @@ mod tests {
                 }),
             )
             .await
-            .expect("parentless ordered root should stage")
-            .expect("parentless bulk rows should use the arena-backed path");
+            .expect("parentless ordered root should stage");
         assert_eq!(report.changed_rows, ROW_COUNT);
         drop(writer);
 
@@ -5852,7 +5716,6 @@ mod tests {
             row.created_at = "2026-02-01T00:00:00Z".to_string();
             row.updated_at = "2026-03-01T00:00:00Z".to_string();
         }
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
         let report = {
             let read = bulk_storage
@@ -5870,12 +5733,10 @@ mod tests {
                 .await
                 .expect("parent root should stage");
             let report = writer
-                .try_stage_bulk_parent_root_from_ordered_mutations(
+                .stage_sorted_mutation_frontier(
                     &child_commit_id,
                     Some(&parent_commit_id),
                     child_rows.len(),
-                    &first_child_key,
-                    &BTreeMap::new(),
                     child_rows.iter().map(|row| {
                         Ok(TrackedStateRootMutationRef {
                             delta: delta_from_materialized_row(row),
@@ -5884,8 +5745,7 @@ mod tests {
                     }),
                 )
                 .await
-                .expect("bulk child root should stage")
-                .expect("dense changed rows should take the dense merge");
+                .expect("bulk child root should stage");
             let staged_roots = writer.staged_commit_roots().cloned().collect::<Vec<_>>();
             drop(writer);
             for root in staged_roots {
@@ -6001,7 +5861,6 @@ mod tests {
             row("entity-a", "change-child-a", "dense-guard-child"),
             row("entity-b", "change-child-b", "dense-guard-child"),
         ];
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6018,12 +5877,10 @@ mod tests {
             .await
             .expect("parent root should stage");
         let error = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
+            .stage_sorted_mutation_frontier(
                 &child_commit_id,
                 Some(&parent_commit_id),
                 child_rows.len(),
-                &first_child_key,
-                &BTreeMap::new(),
                 child_rows.iter().map(|row| {
                     Ok(TrackedStateRootMutationRef {
                         delta: delta_from_materialized_row(row),
@@ -6050,7 +5907,6 @@ mod tests {
             row("entity-a", "change-child-a", "dense-tombstone-child"),
             row("entity-b", "change-child-b", "dense-tombstone-child"),
         ];
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6066,26 +5922,21 @@ mod tests {
             )
             .await
             .expect("parent root should stage");
-        assert!(
-            writer
-                .try_stage_bulk_parent_root_from_ordered_mutations(
-                    &child_commit_id,
-                    Some(&parent_commit_id),
-                    child_rows.len(),
-                    &first_child_key,
-                    &BTreeMap::new(),
-                    child_rows.iter().enumerate().map(|(index, row)| {
-                        Ok(TrackedStateRootMutationRef {
-                            delta: delta_from_materialized_row(row),
-                            require_absence: index == 0,
-                        })
-                    }),
-                )
-                .await
-                .expect("tombstone reinsertion should stage")
-                .is_some(),
-            "tombstoned parent rows permit INSERT"
-        );
+        let report = writer
+            .stage_sorted_mutation_frontier(
+                &child_commit_id,
+                Some(&parent_commit_id),
+                child_rows.len(),
+                child_rows.iter().enumerate().map(|(index, row)| {
+                    Ok(TrackedStateRootMutationRef {
+                        delta: delta_from_materialized_row(row),
+                        require_absence: index == 0,
+                    })
+                }),
+            )
+            .await
+            .expect("tombstone reinsertion should stage");
+        assert_eq!(report.changed_rows, child_rows.len());
     }
 
     #[tokio::test]
@@ -6114,7 +5965,6 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6131,12 +5981,10 @@ mod tests {
             .await
             .expect("parent root should stage");
         let child_report = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
+            .stage_sorted_mutation_frontier(
                 &child_commit_id,
                 Some(&parent_commit_id),
                 child_rows.len(),
-                &first_child_key,
-                &BTreeMap::new(),
                 child_rows.iter().map(|row| {
                     Ok(TrackedStateRootMutationRef {
                         delta: delta_from_materialized_row(row),
@@ -6145,8 +5993,7 @@ mod tests {
                 }),
             )
             .await
-            .expect("append-only root should stage")
-            .expect("append-only rows should use the borrowed patcher path");
+            .expect("append-only root should stage");
         assert_eq!(child_report.changed_rows, APPENDED_ROWS);
         assert!(
             child_report.primary_chunk_puts < parent_report.primary_chunk_puts,
@@ -6214,7 +6061,6 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6235,12 +6081,10 @@ mod tests {
             (APPENDED_ROWS - 1, APPENDED_ROWS),
         ] {
             let error = writer
-                .try_stage_bulk_parent_root_from_ordered_mutations(
+                .stage_sorted_mutation_frontier(
                     &child_commit_id,
                     Some(&parent_commit_id),
                     claimed_count,
-                    &first_child_key,
-                    &BTreeMap::new(),
                     child_rows.iter().take(actual_count).map(|row| {
                         Ok(TrackedStateRootMutationRef {
                             delta: delta_from_materialized_row(row),
@@ -6254,12 +6098,10 @@ mod tests {
             assert!(error.message.contains("mutation count mismatch"));
         }
         let child_report = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
+            .stage_sorted_mutation_frontier(
                 &child_commit_id,
                 Some(&parent_commit_id),
                 child_rows.len(),
-                &first_child_key,
-                &BTreeMap::new(),
                 child_rows.iter().map(|row| {
                     Ok(TrackedStateRootMutationRef {
                         delta: delta_from_materialized_row(row),
@@ -6268,14 +6110,13 @@ mod tests {
                 }),
             )
             .await
-            .expect("dominant append root should stage")
-            .expect("dominant append should use the ordered bulk path");
+            .expect("dominant append root should stage");
         assert_eq!(child_report.changed_rows, APPENDED_ROWS);
         STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| {
             assert_eq!(
                 executions.get(),
-                3,
-                "production-sized dominant appends must use the bounded parent merger"
+                0,
+                "production-sized dominant appends use the universal frontier"
             );
         });
         drop(writer);
@@ -6339,7 +6180,6 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6356,12 +6196,10 @@ mod tests {
             .await
             .expect("parent root should stage");
         let child_report = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
+                .stage_sorted_mutation_frontier(
                 &child_commit_id,
                 Some(&parent_commit_id),
                 child_rows.len(),
-                &first_child_key,
-                &BTreeMap::new(),
                 child_rows.iter().map(|row| {
                     Ok(TrackedStateRootMutationRef {
                         delta: delta_from_materialized_row(row),
@@ -6370,8 +6208,7 @@ mod tests {
                 }),
             )
             .await
-            .expect("append root should stage")
-            .expect("append should use the ordered bulk path");
+            .expect("append root should stage");
         STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| {
             assert_eq!(
                 executions.get(),
@@ -6422,11 +6259,6 @@ mod tests {
         let mut tail = row("entity-tail", "change-cascade-tail", "cascade-append-child");
         tail.schema_key = "z_schema".to_string();
         let child_rows = [descriptor, tail];
-        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
-        let file_delete_cascades = BTreeMap::from([(
-            FILE_ID.to_string(),
-            delta_from_materialized_row(&child_rows[0]),
-        )]);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6442,34 +6274,20 @@ mod tests {
             )
             .await
             .expect("cascade parent root should stage");
-        assert!(
-            writer
-                .try_stage_bulk_parent_root_from_ordered_mutations(
-                    &child_commit_id,
-                    Some(&parent_commit_id),
-                    child_rows.len(),
-                    &first_child_key,
-                    &file_delete_cascades,
-                    child_rows.iter().map(|row| {
-                        Ok(TrackedStateRootMutationRef {
-                            delta: delta_from_materialized_row(row),
-                            require_absence: false,
-                        })
-                    }),
-                )
-                .await
-                .expect("cascade route selection should succeed")
-                .is_none(),
-            "a sparse append with file cascades must retain generic cascade planning"
-        );
         let child_report = writer
-            .stage_commit_root(
+            .stage_sorted_mutation_frontier(
                 &child_commit_id,
                 Some(&parent_commit_id),
-                child_rows.iter().map(delta_from_materialized_row),
+                child_rows.len(),
+                child_rows.iter().map(|row| {
+                    Ok(TrackedStateRootMutationRef {
+                        delta: delta_from_materialized_row(row),
+                        require_absence: false,
+                    })
+                }),
             )
             .await
-            .expect("generic cascade root should stage");
+            .expect("cascade frontier should stage");
         drop(writer);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

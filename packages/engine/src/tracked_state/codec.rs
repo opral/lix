@@ -373,6 +373,7 @@ impl TrackedStateMutationBatchBuilder {
     ///
     /// Ordered root staging uses this check to preserve duplicate and ordering
     /// semantics without materializing an owned `TrackedStateKey` per row.
+    #[cfg(test)]
     pub(crate) fn push_strictly_ordered(
         &mut self,
         key: TrackedStateKeyRef<'_>,
