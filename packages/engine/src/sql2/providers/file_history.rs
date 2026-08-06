@@ -1441,11 +1441,40 @@ where
     Load: Fn(HistoryRoute) -> LoadFuture,
     LoadFuture: Future<Output = Result<Vec<HistoryEntry>, LixError>>,
 {
-    let event_entries = load(event_route.clone()).await?;
-    let context_entries = if event_route == context_route {
-        event_entries.clone()
+    // Event and context routes intentionally differ only in traversal depth:
+    // event rows honor the user's depth predicate, while context rows need the
+    // complete ancestry to resolve paths/ownership. Load the authenticated
+    // superset once and derive the event view locally. A second commit-graph
+    // walk would repeat reachability, packed payload hydration, and JSON
+    // materialization for the same as-of roots.
+    let context_entries = load(context_route.clone()).await?;
+    let mut event_shape = event_route.clone();
+    event_shape.min_depth = None;
+    event_shape.max_depth = None;
+    let mut context_shape = context_route.clone();
+    context_shape.min_depth = None;
+    context_shape.max_depth = None;
+    if event_shape != context_shape {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "file history event/context routes differ beyond traversal depth",
+        ));
+    }
+    let event_entries = if event_route == context_route {
+        context_entries.clone()
     } else {
-        load(context_route.clone()).await?
+        context_entries
+            .iter()
+            .filter(|entry| {
+                event_route
+                    .min_depth
+                    .is_none_or(|minimum| i64::from(entry.depth) >= minimum)
+                    && event_route
+                        .max_depth
+                        .is_none_or(|maximum| i64::from(entry.depth) <= maximum)
+            })
+            .cloned()
+            .collect()
     };
     Ok((event_entries, context_entries))
 }
@@ -3092,7 +3121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn differing_depth_routes_load_history_twice() {
+    async fn differing_depth_routes_share_one_history_load() {
         let route = HistoryRoute {
             as_of_commit_ids: vec!["cid-start".to_string()],
             max_depth: Some(3),
@@ -3114,6 +3143,30 @@ mod tests {
 
         assert!(event_entries.is_empty());
         assert!(context_entries.is_empty());
-        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_history_load_filters_only_event_depth() {
+        let route = HistoryRoute {
+            as_of_commit_ids: vec!["cid-start".to_string()],
+            max_depth: Some(3),
+            ..HistoryRoute::default()
+        };
+        let event_route = route.traversal_only();
+        let context_route = route.anchors_only();
+        let (event_entries, context_entries) =
+            load_file_history_entry_sets(&event_route, &context_route, |_| async {
+                Ok(vec![
+                    history_entry("01920000-0000-7000-8000-0000000000a2", 1, None),
+                    history_entry("01920000-0000-7000-8000-0000000000b2", 4, None),
+                ])
+            })
+            .await
+            .expect("context superset should provide event depth filtering");
+
+        assert_eq!(event_entries.len(), 1);
+        assert_eq!(event_entries[0].depth, 1);
+        assert_eq!(context_entries.len(), 2);
     }
 }
