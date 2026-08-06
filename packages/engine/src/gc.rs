@@ -1157,7 +1157,7 @@ where
                     .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
                 && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
             {
-                crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
+                crate::transaction::stage_delete_branch_plugin_checkpoints(
                     &store,
                     writes,
                     &delta.branch_id,
