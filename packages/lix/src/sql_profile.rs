@@ -28,6 +28,11 @@ pub struct SqlReadProfile {
     /// Sum of Arrow's in-memory array sizes at the scan output boundary.
     /// This is not the number of bytes read from the storage backend.
     pub scan_arrow_bytes: u64,
+    /// Number of rows retained by the benchmark-only result ceiling probe.
+    /// A nonzero value means result conversion was intentionally bypassed;
+    /// it is never set by the production result path.
+    pub result_count_only_rows: u64,
+    pub result_count_only_batches: u64,
 }
 
 impl SqlReadProfile {
@@ -75,6 +80,17 @@ pub(crate) fn record_scan(rows: usize, batches: usize, arrow_bytes: usize, elaps
         profile.scan_batches = profile.scan_batches.saturating_add(batches as u64);
         profile.scan_arrow_bytes = profile.scan_arrow_bytes.saturating_add(arrow_bytes as u64);
         profile.scan_elapsed += elapsed;
+    });
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_result_count_only(rows: usize, batches: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.result_count_only_rows = profile.result_count_only_rows.saturating_add(rows as u64);
+        profile.result_count_only_batches = profile
+            .result_count_only_batches
+            .saturating_add(batches as u64);
     });
 }
 

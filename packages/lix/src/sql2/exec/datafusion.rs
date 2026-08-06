@@ -8,6 +8,7 @@
     clippy::unnecessary_wraps
 )]
 
+use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
@@ -75,7 +76,36 @@ pub(crate) struct DataFusionLogicalPlan {
 
 pub(crate) struct SessionReadSqlResult {
     pub(crate) runtime_functions: Option<FunctionContext>,
-    pub(crate) query: SqlQueryResult,
+    pub(crate) query: SessionReadResult,
+}
+
+/// One read-result authority. DataFusion results remain owned by their
+/// RecordBatches until a caller actually requests row views; small/native
+/// routes continue to carry their already-materialized rows.
+pub(crate) enum SessionReadResult {
+    Rows(SqlQueryResult),
+    Columnar {
+        fields: Vec<Field>,
+        batches: std::sync::Arc<[RecordBatch]>,
+        notices: Vec<LixNotice>,
+    },
+}
+
+impl SessionReadResult {
+    pub(crate) fn into_sql_query_result(self) -> Result<SqlQueryResult, LixError> {
+        match self {
+            Self::Rows(result) => Ok(result),
+            Self::Columnar {
+                fields,
+                batches,
+                notices,
+            } => {
+                let mut result = query_result_from_batches(&fields, &batches)?;
+                result.notices = notices;
+                Ok(result)
+            }
+        }
+    }
 }
 
 /// DataFusion catalog and providers scoped to one immutable storage read.
@@ -105,7 +135,8 @@ where
     execute_read_statement_from_parsed(ctx, sql, statement, params).await
 }
 
-pub(crate) async fn execute_read_statement_from_parsed<C>(
+#[cfg(test)]
+async fn execute_read_statement_from_parsed<C>(
     ctx: &C,
     sql: &str,
     statement: DataFusionStatement,
@@ -165,7 +196,31 @@ pub(crate) async fn execute_read_statement_in_session_from_parsed(
             started.elapsed(),
         );
     }
-    execute_logical_plan(plan, params).await
+    execute_logical_plan(plan, params)
+        .await?
+        .into_sql_query_result()
+}
+
+pub(crate) async fn execute_read_statement_in_session_with_result(
+    session: &ReadSqlSession<'_>,
+    sql: &str,
+    statement: DataFusionStatement,
+    params: &[Value],
+) -> Result<SessionReadSqlResult, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
+    let plan = create_logical_plan_in_session_from_parsed(session, sql, statement, params).await?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::LogicalPlanning,
+            started.elapsed(),
+        );
+    }
+    Ok(SessionReadSqlResult {
+        runtime_functions: None,
+        query: execute_logical_plan(plan, params).await?,
+    })
 }
 
 async fn create_logical_plan_in_session_from_parsed(
@@ -338,7 +393,9 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
         SqlLogicalPlan::DataFusion(plan) => plan.session.clone(),
         _ => unreachable!("transaction reads are planned by DataFusion"),
     };
-    let result = execute_logical_plan(plan, params).await;
+    let result = execute_logical_plan(plan, params)
+        .await
+        .and_then(SessionReadResult::into_sql_query_result);
     if let Some((cache, _)) = planning_environment {
         cache.recycle_datafusion_read_session(session);
     }
@@ -1049,7 +1106,7 @@ fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Res
 async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SessionReadResult, LixError> {
     let SqlLogicalPlan::DataFusion(plan) = plan else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -1087,6 +1144,27 @@ async fn execute_logical_plan(
     let batches = crate::sql2::runtime::collect_dataframe(dataframe)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    // This is a benchmark-only causal ceiling probe. It keeps DataFusion's
+    // RecordBatch owners alive through execution, counts the rows/batches,
+    // and deliberately omits public scalar/row conversion. No production
+    // build can enter this branch because the symbol is feature-gated.
+    #[cfg(feature = "storage-benches")]
+    if std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_RESULT_MODE").as_deref() == Ok("count_only") {
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        crate::sql_profile::record_result_count_only(rows, batches.len());
+        return Ok(SessionReadResult::Columnar {
+            fields: result_fields,
+            batches: std::sync::Arc::from(batches),
+            notices,
+        });
+    }
+    if retain_columnar_result(&result_fields, &batches) {
+        return Ok(SessionReadResult::Columnar {
+            fields: result_fields,
+            batches: std::sync::Arc::from(batches),
+            notices,
+        });
+    }
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
     let mut result = query_result_from_batches(&result_fields, &batches)?;
@@ -1098,7 +1176,71 @@ async fn execute_logical_plan(
         );
     }
     result.notices = notices;
-    Ok(result)
+    Ok(SessionReadResult::Rows(result))
+}
+
+/// Keep large, ordinary Arrow result sets columnar until a caller requests a
+/// row view. The threshold is based only on output cells, not SQL shape or
+/// table identity; unsupported/JSON fields retain the fallible eager route so
+/// public error semantics remain unchanged.
+fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
+    const COLUMNAR_CELL_THRESHOLD: usize = 4_096;
+    if fields.is_empty()
+        || fields.iter().any(|field| field_is_json(field))
+        || fields.iter().any(|field| {
+            !matches!(
+                field.data_type(),
+                DataType::Null
+                    | DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Utf8
+                    | DataType::Utf8View
+                    | DataType::LargeUtf8
+                    | DataType::Binary
+                    | DataType::LargeBinary
+            )
+        })
+    {
+        return false;
+    }
+    if batches.iter().enumerate().any(|(_, batch)| {
+        fields.iter().enumerate().any(|(column_index, field)| {
+            let array = batch.column(column_index);
+            match field.data_type() {
+                DataType::Float32 => array
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Float32Array>()
+                    .is_some_and(|values| {
+                        (0..values.len())
+                            .any(|index| values.is_valid(index) && !values.value(index).is_finite())
+                    }),
+                DataType::Float64 => array
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                    .is_some_and(|values| {
+                        (0..values.len())
+                            .any(|index| values.is_valid(index) && !values.value(index).is_finite())
+                    }),
+                _ => false,
+            }
+        })
+    }) {
+        return false;
+    }
+    batches
+        .iter()
+        .map(|batch| batch.num_rows().saturating_mul(batch.num_columns()))
+        .sum::<usize>()
+        >= COLUMNAR_CELL_THRESHOLD
 }
 
 pub(crate) async fn execute_datafusion_write_logical_plan(

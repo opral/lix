@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
@@ -88,12 +88,19 @@ pub struct ExecuteResult {
 #[derive(Debug)]
 struct ExecuteResultBacking {
     columns: Arc<[String]>,
-    rows: Vec<Row>,
+    rows: OnceLock<Vec<Row>>,
+    columnar: Option<ColumnarResult>,
     notices: Vec<LixNotice>,
     // Observe evaluations can be shared across sessions. Carry the exact
     // rendered plugin state with the rows so each receiving session can
     // acknowledge it only when `ObserveEvents::next()` delivers the event.
     file_view_mutations: Vec<sql2::SessionFileViewMutation>,
+}
+
+#[derive(Debug)]
+struct ColumnarResult {
+    fields: Vec<Field>,
+    batches: Arc<[RecordBatch]>,
 }
 
 impl PartialEq for ExecuteResult {
@@ -153,6 +160,17 @@ impl FileRead {
 }
 
 impl ExecuteResult {
+    pub(crate) fn from_session_read_result(result: sql2::SessionReadSqlResult) -> Self {
+        match result.query {
+            sql2::SessionReadResult::Rows(result) => Self::from_sql_query_result(result),
+            sql2::SessionReadResult::Columnar {
+                fields,
+                batches,
+                notices,
+            } => Self::from_columnar_result(fields, batches, notices),
+        }
+    }
+
     fn from_sql_query_result(result: SqlQueryResult) -> Self {
         #[cfg(feature = "storage-benches")]
         let started = crate::sql_profile::is_active().then(std::time::Instant::now);
@@ -207,7 +225,7 @@ impl ExecuteResult {
         notices: Vec<LixNotice>,
     ) -> Self {
         let columns: Arc<[String]> = columns.into();
-        let rows = rows
+        let rows: Vec<Row> = rows
             .into_iter()
             .map(|values| Row {
                 columns: Arc::clone(&columns),
@@ -217,7 +235,8 @@ impl ExecuteResult {
         Self {
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
-                rows,
+                rows: OnceLock::from(rows),
+                columnar: None,
                 notices,
                 file_view_mutations: Vec::new(),
             })),
@@ -225,11 +244,34 @@ impl ExecuteResult {
         }
     }
 
+    fn from_columnar_result(
+        fields: Vec<Field>,
+        batches: Arc<[RecordBatch]>,
+        notices: Vec<LixNotice>,
+    ) -> Self {
+        let columns = fields
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>()
+            .into();
+        Self {
+            backing: Some(Arc::new(ExecuteResultBacking {
+                columns,
+                rows: OnceLock::new(),
+                columnar: Some(ColumnarResult { fields, batches }),
+                notices,
+                file_view_mutations: Vec::new(),
+            })),
+            rows_affected: 0,
+        }
+    }
+
     fn with_file_view_mutations(mut self, mutations: Vec<sql2::SessionFileViewMutation>) -> Self {
         let backing = self.backing.get_or_insert_with(|| {
             Arc::new(ExecuteResultBacking {
                 columns: Vec::new().into(),
-                rows: Vec::new(),
+                rows: OnceLock::from(Vec::new()),
+                columnar: None,
                 notices: Vec::new(),
                 file_view_mutations: Vec::new(),
             })
@@ -255,9 +297,12 @@ impl ExecuteResult {
 
     /// Returns the owned rows. Use `iter()` for name-based access.
     pub fn rows(&self) -> &[Row] {
-        self.backing
-            .as_deref()
-            .map_or(&[], |backing| backing.rows.as_slice())
+        self.backing.as_deref().map_or(&[], |backing| {
+            backing
+                .rows
+                .get_or_init(|| backing.materialize_rows())
+                .as_slice()
+        })
     }
 
     /// Iterates rows with borrowed access to the shared column metadata.
@@ -302,6 +347,33 @@ impl ExecuteResult {
         self.columns()
             .iter()
             .position(|column| column == column_name)
+    }
+}
+
+impl ExecuteResultBacking {
+    fn materialize_rows(&self) -> Vec<Row> {
+        let Some(columnar) = &self.columnar else {
+            return Vec::new();
+        };
+        #[cfg(feature = "storage-benches")]
+        let started = crate::sql_profile::is_active().then(std::time::Instant::now);
+        let result = sql2::query_result_from_batches(&columnar.fields, &columnar.batches)
+            .expect("columnar result was validated before public ownership transfer");
+        #[cfg(feature = "storage-benches")]
+        if let Some(started) = started {
+            crate::sql_profile::record_phase(
+                crate::sql_profile::Phase::PublicResultMaterialization,
+                started.elapsed(),
+            );
+        }
+        result
+            .rows
+            .into_iter()
+            .map(|values| Row {
+                columns: Arc::clone(&self.columns),
+                values,
+            })
+            .collect()
     }
 }
 
@@ -1103,7 +1175,7 @@ where
         if let Some(stats) = runtime_storage_stats {
             self.observe_invalidation.bump_if_storage_changed(&stats);
         }
-        let result = ExecuteResult::from_sql_query_result(read_result.query)
+        let result = ExecuteResult::from_session_read_result(read_result)
             .with_file_view_mutations(file_view_mutations);
         if !defer_file_view_acknowledgement {
             self.file_views
@@ -2118,7 +2190,7 @@ where
             return Ok((
                 sql2::SessionReadSqlResult {
                     runtime_functions: None,
-                    query,
+                    query: sql2::SessionReadResult::Rows(query),
                 },
                 file_view_mutations,
             ));
@@ -2154,8 +2226,16 @@ where
             file_views: file_view_collector.clone(),
         };
 
-        let mut query =
-            sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
+        let read_session =
+            sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
+        let mut query = sql2::execute_read_statement_in_session_with_result(
+            &read_session,
+            sql,
+            statement,
+            params,
+        )
+        .await?;
+        drop(read_session);
         drop(ctx);
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
@@ -2164,6 +2244,7 @@ where
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                 Arc::new(self.binary_cas.reader(read_store));
+            let mut materialized = query.query.into_sql_query_result()?;
             hydrate_lix_file_content_result(
                 &active_branch_id,
                 Arc::clone(&live_state),
@@ -2172,10 +2253,11 @@ where
                 blob_reader,
                 self.plugin_host.clone(),
                 file_view_collector.clone(),
-                &mut query,
+                &mut materialized,
                 data_column_index,
             )
             .await?;
+            query.query = sql2::SessionReadResult::Rows(materialized);
         }
         drop(live_state);
         let file_view_mutations = file_view_collector
@@ -2184,7 +2266,7 @@ where
         Ok((
             sql2::SessionReadSqlResult {
                 runtime_functions,
-                query,
+                query: query.query,
             },
             file_view_mutations,
         ))
@@ -8963,6 +9045,31 @@ mod tests {
             row.value("title").unwrap(),
             &Value::Text("Hello".to_string())
         );
+    }
+
+    #[test]
+    fn columnar_result_keeps_batches_until_rows_are_requested() {
+        let fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("title", DataType::Utf8, false),
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(fields.clone())),
+            vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2])),
+                Arc::new(datafusion::arrow::array::StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("test columnar batch should be valid");
+        let batches: Arc<[RecordBatch]> = vec![batch].into();
+        let result = ExecuteResult::from_columnar_result(fields, batches, Vec::new());
+
+        assert_eq!(result.columns(), ["id", "title"]);
+        let rows = result.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<i64>("id").unwrap(), 1);
+        assert_eq!(rows[1].get::<String>("title").unwrap(), "b");
+        assert_eq!(result.rows().as_ptr(), rows.as_ptr());
     }
 
     #[test]
