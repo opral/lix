@@ -1,6 +1,6 @@
 use crate::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
-    ScanOptions, StorageError, StorageSpace, WriteOptions,
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch,
+    ReadOptions, ScanChunk, ScanCursor, ScanOptions, StorageError, StorageSpace, WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -67,6 +67,19 @@ pub trait StorageRead: Send + Sync {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send;
+
+    /// Opens one storage-owned iterator on this coherent read view.
+    ///
+    /// The returned cursor is ephemeral and cannot outlive this read handle.
+    /// Implementations must keep one native iterator alive as pages advance.
+    fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        async move { crate::storage::cursor::legacy_scan_cursor(self, space, range, opts) }
+    }
 
     /// Reads one owned page of a space in ascending logical key order and
     /// reports whether more rows remain. A page contains at most

@@ -14,16 +14,17 @@ use bytes::{Buf, Bytes};
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::validate_immutable_batch;
 use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
+    KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOptions, ScanOrder, SpaceId, Storage,
+    StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
+    ValueSemantics, WriteOptions, WriteStats,
 };
-use rocksdb::Snapshot;
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
     WriteBatch,
 };
+use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -364,6 +365,33 @@ impl StorageRead for RocksDBRead<'_> {
         }
     }
 
+    fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        async move {
+            if opts.order == ScanOrder::Descending {
+                return Err(StorageError::Unsupported(Capability::ReverseScan));
+            }
+            let bounds = EncodedBounds::new(physical_range(space.id, range.clone()), None);
+            let mut iterator = self.snapshot.raw_iterator_cf(column_family(self.db, space));
+            iterator.seek(&bounds.lower_seek);
+            iterator.status().map_err(rocksdb_error)?;
+            ScanCursor::from_source(
+                range,
+                opts.order,
+                RocksDBScanSource {
+                    iterator,
+                    bounds,
+                    projection: opts.projection,
+                    space,
+                },
+            )
+        }
+    }
+
     fn scan(
         &self,
         space: StorageSpace,
@@ -441,6 +469,64 @@ impl StorageRead for RocksDBRead<'_> {
             })
         }
     }
+}
+
+struct RocksDBScanSource<'a> {
+    iterator: DBRawIteratorWithThreadMode<'a, DB>,
+    bounds: EncodedBounds,
+    projection: CoreProjection,
+    space: StorageSpace,
+}
+
+impl StorageScanSource for RocksDBScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut entries = Vec::with_capacity(limit_rows);
+            while entries.len() < limit_rows {
+                let Some(encoded_key) = self.iterator.key() else {
+                    break;
+                };
+                if !self.bounds.after_lower(encoded_key) {
+                    self.iterator.next();
+                    continue;
+                }
+                if !self.bounds.before_upper(encoded_key) {
+                    break;
+                }
+                let key = decode_rocksdb_scan_key(self.space, encoded_key)?;
+                let value = match self.projection {
+                    CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                    CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(
+                        self.iterator.value().ok_or_else(|| {
+                            StorageError::Corruption(
+                                "RocksDB scan key had no corresponding value".to_string(),
+                            )
+                        })?,
+                    )),
+                };
+                entries.push(ReadEntry { key, value });
+                self.iterator.next();
+            }
+            self.iterator.status().map_err(rocksdb_error)?;
+            let has_more = self
+                .iterator
+                .key()
+                .is_some_and(|key| self.bounds.before_upper(key));
+            Ok(ScanChunk { entries, has_more })
+        })
+    }
+}
+
+fn decode_rocksdb_scan_key(space: StorageSpace, encoded_key: &[u8]) -> Result<Key, StorageError> {
+    if encoded_key.len() < 4 || encoded_key[..4] != space.id.0.to_be_bytes() {
+        return Err(StorageError::Corruption(
+            "RocksDB scan key escaped its storage space".to_string(),
+        ));
+    }
+    Ok(Key(Bytes::copy_from_slice(&encoded_key[4..])))
 }
 
 impl StorageWrite for RocksDBWrite {

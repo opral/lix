@@ -23,10 +23,11 @@ use lix::storage::immutable::{
     decode_immutable_value, encode_immutable_locator,
 };
 use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
+    KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOptions, ScanOrder,
+    SpaceId, Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite,
+    StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -2920,6 +2921,53 @@ impl StorageRead for SlateDBRead {
         }
     }
 
+    fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<StorageScanCursor<'_>, StorageError>> + Send {
+        async move {
+            self.write_pipeline.terminal_error()?;
+            if opts.order == ScanOrder::Descending {
+                return Err(StorageError::Unsupported(Capability::ReverseScan));
+            }
+            let bounds = EncodedBounds::new(physical_range(space.id, range.clone())?, None);
+            let visible_writes = self
+                .publication_view
+                .as_ref()
+                .map_or_else(Vec::new, |view| {
+                    self.write_pipeline
+                        .visible_writes(view.snapshot_sequence, view.publication_id)
+                });
+            let state = if bounds.is_empty() {
+                SlateStreamingScanState::empty(bounds, visible_writes)
+            } else {
+                let snapshot = Arc::clone(&self.snapshot);
+                let durability = self.durability;
+                let scan_bounds = bounds.clone();
+                self.worker
+                    .call_read(move |_db| async move {
+                        let iter = open_snapshot_scan(snapshot, scan_bounds, durability).await?;
+                        Ok(SlateStreamingScanState::new(iter, bounds, visible_writes))
+                    })
+                    .await?
+            };
+            StorageScanCursor::from_source(
+                range,
+                opts.order,
+                SlateDBScanSource {
+                    worker: self.worker.clone(),
+                    immutable_value_store: self.immutable_value_store.clone(),
+                    write_pipeline: self.write_pipeline.clone(),
+                    space,
+                    projection: opts.projection,
+                    state: Some(state),
+                },
+            )
+        }
+    }
+
     fn scan(
         &self,
         space: StorageSpace,
@@ -3097,6 +3145,218 @@ impl StorageRead for SlateDBRead {
             }
         }
     }
+}
+
+struct SlateDBScanSource {
+    worker: SlateDBWorker,
+    immutable_value_store: ImmutableValueStore,
+    write_pipeline: WritePipeline,
+    space: StorageSpace,
+    projection: CoreProjection,
+    state: Option<SlateStreamingScanState>,
+}
+
+impl StorageScanSource for SlateDBScanSource {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            self.write_pipeline.terminal_error()?;
+            let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
+            let projection = self.projection;
+            let (state, mut chunk) = self
+                .worker
+                .call_read(move |_db| streaming_scan_page(state, limit_rows, projection))
+                .await?;
+            self.state = Some(state);
+            hydrate_immutable_value_scan(
+                &self.immutable_value_store,
+                self.space,
+                self.projection,
+                &mut chunk,
+            )
+            .await?;
+            Ok(chunk)
+        })
+    }
+}
+
+struct SlateStreamingScanState {
+    iter: Option<DbIterator>,
+    base_pending: Option<KeyValue>,
+    overlays: StreamingOverlayCursor,
+    output_pending: Option<(Key, Bytes)>,
+}
+
+impl SlateStreamingScanState {
+    fn new(
+        iter: DbIterator,
+        bounds: EncodedBounds,
+        visible_writes: Vec<Arc<PublishedWrite>>,
+    ) -> Self {
+        Self {
+            iter: Some(iter),
+            base_pending: None,
+            overlays: StreamingOverlayCursor::new(bounds, visible_writes),
+            output_pending: None,
+        }
+    }
+
+    fn empty(bounds: EncodedBounds, visible_writes: Vec<Arc<PublishedWrite>>) -> Self {
+        Self {
+            iter: None,
+            base_pending: None,
+            overlays: StreamingOverlayCursor::new(bounds, visible_writes),
+            output_pending: None,
+        }
+    }
+}
+
+struct StreamingOverlayCursor {
+    bounds: EncodedBounds,
+    writes: Vec<Arc<PublishedWrite>>,
+    last_key: Option<Key>,
+    pending: Option<(Key, Option<Bytes>)>,
+}
+
+impl StreamingOverlayCursor {
+    fn new(bounds: EncodedBounds, writes: Vec<Arc<PublishedWrite>>) -> Self {
+        Self {
+            bounds,
+            writes,
+            last_key: None,
+            pending: None,
+        }
+    }
+
+    fn peek(&mut self) -> Option<&(Key, Option<Bytes>)> {
+        if self.pending.is_none() {
+            self.pending = self.find_next();
+        }
+        self.pending.as_ref()
+    }
+
+    fn take(&mut self) -> Option<(Key, Option<Bytes>)> {
+        let _ = self.peek();
+        let next = self.pending.take();
+        if let Some((key, _)) = &next {
+            self.last_key = Some(key.clone());
+        }
+        next
+    }
+
+    fn find_next(&self) -> Option<(Key, Option<Bytes>)> {
+        let lower = self.last_key.as_ref().map_or_else(
+            || bound_vec_to_key(&self.bounds.lower),
+            |key| Bound::Excluded(key.clone()),
+        );
+        let upper = bound_vec_to_key(&self.bounds.upper);
+        let next_key = self
+            .writes
+            .iter()
+            .filter_map(|write| {
+                write
+                    .overlay
+                    .range((lower.clone(), upper.clone()))
+                    .next()
+                    .map(|(key, _)| key)
+            })
+            .min()
+            .cloned()?;
+        let value = self
+            .writes
+            .iter()
+            .rev()
+            .find_map(|write| write.overlay.get(&next_key).cloned())?;
+        Some((next_key, value))
+    }
+}
+
+fn bound_vec_to_key(bound: &Bound<Vec<u8>>) -> Bound<Key> {
+    match bound {
+        Bound::Included(key) => Bound::Included(Key(Bytes::copy_from_slice(key))),
+        Bound::Excluded(key) => Bound::Excluded(Key(Bytes::copy_from_slice(key))),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+async fn streaming_scan_page(
+    mut state: SlateStreamingScanState,
+    limit_rows: usize,
+    projection: CoreProjection,
+) -> Result<(SlateStreamingScanState, ScanChunk), StorageError> {
+    let mut rows = Vec::with_capacity(limit_rows);
+    if let Some(row) = state.output_pending.take() {
+        rows.push(row);
+    }
+    while rows.len() < limit_rows {
+        let Some(row) = next_streaming_visible_row(&mut state).await? else {
+            break;
+        };
+        rows.push(row);
+    }
+    state.output_pending = next_streaming_visible_row(&mut state).await?;
+    let has_more = state.output_pending.is_some();
+    let entries = rows
+        .into_iter()
+        .map(|(key, value)| {
+            if key.0.len() < SPACE_PREFIX_LEN {
+                return Err(StorageError::Corruption(format!(
+                    "slatedb key was shorter than space prefix: {:?}",
+                    key.0
+                )));
+            }
+            Ok(ReadEntry {
+                key: Key(key.0.slice(SPACE_PREFIX_LEN..)),
+                value: project_value(value, projection),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((state, ScanChunk { entries, has_more }))
+}
+
+async fn next_streaming_visible_row(
+    state: &mut SlateStreamingScanState,
+) -> Result<Option<(Key, Bytes)>, StorageError> {
+    loop {
+        if state.base_pending.is_none()
+            && let Some(iter) = &mut state.iter
+        {
+            state.base_pending = iter.next().await.map_err(slatedb_error)?;
+        }
+        let decision = match (state.base_pending.as_ref(), state.overlays.peek()) {
+            (Some(base), Some((overlay_key, _))) => match base.key.cmp(&overlay_key.0) {
+                std::cmp::Ordering::Less => StreamingMergeDecision::Base,
+                std::cmp::Ordering::Equal => StreamingMergeDecision::OverlayAndBase,
+                std::cmp::Ordering::Greater => StreamingMergeDecision::Overlay,
+            },
+            (Some(_), None) => StreamingMergeDecision::Base,
+            (None, Some(_)) => StreamingMergeDecision::Overlay,
+            (None, None) => return Ok(None),
+        };
+        let row = match decision {
+            StreamingMergeDecision::Base => state
+                .base_pending
+                .take()
+                .map(|row| (Key(row.key), Some(row.value))),
+            StreamingMergeDecision::Overlay => state.overlays.take(),
+            StreamingMergeDecision::OverlayAndBase => {
+                state.base_pending.take();
+                state.overlays.take()
+            }
+        };
+        if let Some((key, Some(value))) = row {
+            return Ok(Some((key, value)));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamingMergeDecision {
+    Base,
+    Overlay,
+    OverlayAndBase,
 }
 
 async fn hydrate_immutable_value_gets(

@@ -284,6 +284,28 @@ pub struct GetOptions {
     pub projection: CoreProjection,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScanOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeginScanOptions {
+    pub projection: CoreProjection,
+    pub order: ScanOrder,
+}
+
+impl Default for BeginScanOptions {
+    fn default() -> Self {
+        Self {
+            projection: CoreProjection::FullValue,
+            order: ScanOrder::Ascending,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanOptions {
     pub projection: CoreProjection,

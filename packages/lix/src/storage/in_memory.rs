@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use crate::filesystem::PersistentMap;
+use crate::filesystem::{PersistentMap, PersistentMapRangeCursor};
 use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use crate::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
+    KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOptions, ScanOrder, SpaceId, Storage,
+    StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
+    ValueSemantics, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = PersistentMap<Key, Bytes>;
@@ -309,6 +310,28 @@ impl StorageRead for MemoryRead {
         Ok(GetManyResult::new(values))
     }
 
+    async fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        if opts.order == ScanOrder::Descending {
+            return Err(StorageError::Unsupported(Capability::ReverseScan));
+        }
+        let physical = physical_range(space.id, range.clone());
+        ScanCursor::from_source(
+            range,
+            opts.order,
+            MemoryScanSource {
+                cursor: self.entries.range_cursor(physical.lower, physical.upper),
+                projection: opts.projection,
+                space,
+                pending: None,
+            },
+        )
+    }
+
     async fn scan(
         &self,
         space: StorageSpace,
@@ -329,6 +352,50 @@ impl StorageRead for MemoryRead {
         }
         Ok(chunk)
     }
+}
+
+struct MemoryScanSource<'a> {
+    cursor: PersistentMapRangeCursor<'a, Key, Bytes>,
+    projection: CoreProjection,
+    space: StorageSpace,
+    pending: Option<(Key, Bytes)>,
+}
+
+impl StorageScanSource for MemoryScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut entries = Vec::with_capacity(limit_rows);
+            while entries.len() < limit_rows {
+                let Some((physical_key, value)) =
+                    self.pending.take().or_else(|| self.cursor.next())
+                else {
+                    break;
+                };
+                entries.push(ReadEntry {
+                    key: decode_memory_scan_key(self.space, physical_key)?,
+                    value: project_value(&value, self.projection),
+                });
+            }
+            self.pending = self.cursor.next();
+            Ok(ScanChunk {
+                entries,
+                has_more: self.pending.is_some(),
+            })
+        })
+    }
+}
+
+fn decode_memory_scan_key(space: StorageSpace, key: Key) -> Result<Key, StorageError> {
+    let bytes = key.0;
+    if bytes.len() < 4 || bytes[..4] != space.id.0.to_be_bytes() {
+        return Err(StorageError::Corruption(
+            "in-memory scan key escaped its storage space".to_string(),
+        ));
+    }
+    Ok(Key(bytes.slice(4..)))
 }
 
 impl StorageWrite for MemoryWrite {
