@@ -87,7 +87,6 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 // storage amplification, so retain their allocation-free direct-key path.
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const CERTIFIED_ENTITY_BATCH_MAGIC_V1: &[u8; 4] = b"CEB1";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
 pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_001f),
@@ -881,11 +880,8 @@ fn certified_external_page_plan(
     content_key: &[u8],
     request: &TrackedStateScanRequest,
     filter_index: &CertifiedScanFilterIndex,
-) -> Result<Option<Vec<(u32, StorageKey)>>, LixError> {
+) -> Result<Vec<(u32, StorageKey)>, LixError> {
     let mut input = CertifiedBatchReader::new(bytes)?;
-    if !input.external_pages {
-        return Ok(None);
-    }
     let schema_count = input.u16()? as usize;
     let mut schema_keys = Vec::with_capacity(schema_count);
     for _ in 0..schema_count {
@@ -893,10 +889,10 @@ fn certified_external_page_plan(
     }
     let file_id = input.text()?;
     if !filter_index.includes_any_schema(&schema_keys) {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     if !filter_index.includes_file(file_id) {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     let _commit_id = input.bytes(16)?;
     let _timestamp = input.text()?;
@@ -958,7 +954,7 @@ fn certified_external_page_plan(
             "certified entity batch header has trailing bytes",
         ));
     }
-    Ok(Some(pages))
+    Ok(pages)
 }
 
 async fn scan_certified_entity_batch_rows(
@@ -1055,14 +1051,10 @@ async fn scan_certified_entity_batch_rows(
         let external_plan =
             certified_external_page_plan(&value, content_key.0.as_ref(), request, &filter_index)?;
         let input_index = decode_inputs.len();
-        let external_pages = external_plan
-            .as_ref()
-            .map(|plan| Vec::with_capacity(plan.len()));
-        if let Some(plan) = external_plan {
-            for (page_index, key) in plan {
-                page_routes.push((input_index, page_index));
-                page_keys.push(key);
-            }
+        let external_pages = Vec::with_capacity(external_plan.len());
+        for (page_index, key) in external_plan {
+            page_routes.push((input_index, page_index));
+            page_keys.push(key);
         }
         decode_inputs.push((value, external_pages));
     }
@@ -1076,8 +1068,6 @@ async fn scan_certified_entity_batch_rows(
                 value.ok_or_else(|| head_value_error("certified entity batch page is missing"))?;
             decode_inputs[input_index]
                 .1
-                .as_mut()
-                .expect("external page route belongs to an external batch")
                 .push((page_index, full_value_bytes(value)?));
         }
     }
@@ -1087,7 +1077,7 @@ async fn scan_certified_entity_batch_rows(
     for (value, external_pages) in decode_inputs {
         decode_certified_entity_batch_rows(
             &value,
-            external_pages.as_deref(),
+            &external_pages,
             branch_id,
             request,
             &filter_index,
@@ -1175,29 +1165,27 @@ pub(crate) async fn scan_certified_history_rows(
                     request,
                     &filter_index,
                 )?;
-                let external_pages = if let Some(plan) = &external_plan {
-                    let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-                    let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
-                        .materialize(store, StorageGetOptions::default())
-                        .await?
-                        .value;
-                    Some(
-                        plan.iter()
-                            .zip(values)
-                            .map(|((page_index, _), value)| {
-                                let value = value.ok_or_else(|| {
-                                    head_value_error("certified history batch page is missing")
-                                })?;
-                                Ok((*page_index, full_value_bytes(value)?))
-                            })
-                            .collect::<Result<Vec<_>, LixError>>()?,
-                    )
-                } else {
-                    None
-                };
+                let keys = external_plan
+                    .iter()
+                    .map(|(_, key)| key.clone())
+                    .collect::<Vec<_>>();
+                let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
+                    .materialize(store, StorageGetOptions::default())
+                    .await?
+                    .value;
+                let external_pages = external_plan
+                    .iter()
+                    .zip(values)
+                    .map(|((page_index, _), value)| {
+                        let value = value.ok_or_else(|| {
+                            head_value_error("certified history batch page is missing")
+                        })?;
+                        Ok((*page_index, full_value_bytes(value)?))
+                    })
+                    .collect::<Result<Vec<_>, LixError>>()?;
                 decode_certified_entity_batch_rows(
                     &value,
-                    external_pages.as_deref(),
+                    &external_pages,
                     "",
                     request,
                     &filter_index,
@@ -1287,7 +1275,7 @@ pub(crate) fn materialize_certified_root_rows(
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(row_count);
     decode_certified_entity_batch_rows(
         &header,
-        Some(&pages),
+        &pages,
         branch_id,
         &request,
         &filter_index,
@@ -1378,7 +1366,7 @@ impl CertifiedScanFilterIndex {
 
 fn decode_certified_entity_batch_rows(
     bytes: &[u8],
-    external_pages: Option<&[(u32, Bytes)]>,
+    external_pages: &[(u32, Bytes)],
     branch_id: &str,
     request: &TrackedStateScanRequest,
     filter_index: &CertifiedScanFilterIndex,
@@ -1448,32 +1436,25 @@ fn decode_certified_entity_batch_rows(
         return Ok(());
     }
 
-    let complete_pages = !input.external_pages
-        || external_pages.is_some_and(|pages| pages.len() == page_count as usize);
+    let complete_pages = external_pages.len() == page_count as usize;
     let mut decoded_rows = 0_u64;
     for page_index in 0..page_count {
-        let page = if input.external_pages {
-            let _first_local_ref = input.u32()?;
-            let _last_local_ref = input.u32()?;
-            let page_len = input.u32()? as usize;
-            let Some((_, page)) = external_pages.and_then(|pages| {
-                pages
-                    .binary_search_by_key(&page_index, |(page_index, _)| *page_index)
-                    .ok()
-                    .map(|index| &pages[index])
-            }) else {
-                continue;
-            };
-            if page.len() != page_len {
-                return Err(head_value_error(
-                    "certified entity batch page length does not match its header",
-                ));
-            }
-            page.as_ref()
-        } else {
-            let page_len = input.u32()? as usize;
-            input.bytes(page_len)?
+        let _first_local_ref = input.u32()?;
+        let _last_local_ref = input.u32()?;
+        let page_len = input.u32()? as usize;
+        let Some((_, page)) = external_pages
+            .binary_search_by_key(&page_index, |(page_index, _)| *page_index)
+            .ok()
+            .map(|index| &external_pages[index])
+        else {
+            continue;
         };
+        if page.len() != page_len {
+            return Err(head_value_error(
+                "certified entity batch page length does not match its header",
+            ));
+        }
+        let page = page.as_ref();
         let decoded_page;
         let page = if format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
             decoded_page = decode_certified_zstd_packet_page(page)?;
@@ -1761,23 +1742,14 @@ fn certified_keyed_change_id(
 struct CertifiedBatchReader<'a> {
     bytes: &'a [u8],
     offset: usize,
-    external_pages: bool,
 }
 
 impl<'a> CertifiedBatchReader<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self, LixError> {
-        let external_pages = if bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC_V1) {
-            false
-        } else if bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC_V2) {
-            true
-        } else {
+        if !bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC_V2) {
             return Err(head_value_error("invalid certified entity batch magic"));
-        };
-        Ok(Self {
-            bytes,
-            offset: 4,
-            external_pages,
-        })
+        }
+        Ok(Self { bytes, offset: 4 })
     }
 
     fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
@@ -11003,6 +10975,19 @@ mod tests {
         Memory, StorageAdapter, StorageGetManyRequest, StorageGetManyResult, StorageKeyRange,
         StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageWriteOptions,
     };
+
+    #[test]
+    fn certified_batch_reader_rejects_legacy_ceb1_magic() {
+        let error = match CertifiedBatchReader::new(b"CEB1legacy-inline-page") {
+            Ok(_) => panic!("legacy CEB1 input must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message
+                .contains("invalid certified entity batch magic")
+        );
+    }
 
     #[tokio::test]
     async fn certified_batches_reject_duplicate_content_owner() {
