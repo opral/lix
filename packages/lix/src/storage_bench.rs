@@ -630,16 +630,13 @@ where
     )
     .await?;
     for record in &records {
-        let depth = u16::try_from(record.generation.saturating_add(1)).map_err(|_| {
-            crate::LixError::unknown("merge-base benchmark generation exceeds manifest depth")
-        })?;
         crate::tracked_state::stage_commit_state_manifest(
             &mut writes,
             &crate::tracked_state::CommitStateManifest {
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
                 replay_debt: crate::tracked_state::CommitStateReplayDebt {
-                    depth,
+                    depth: 1,
                     rows: 0,
                     bytes: 0,
                 },
