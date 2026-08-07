@@ -304,6 +304,7 @@ enum Scenario {
     BlobProfile,
     Relational,
     Olap,
+    OlapMemory,
 }
 
 impl Scenario {
@@ -314,6 +315,7 @@ impl Scenario {
             Some("blob-profile") => (Self::BlobProfile, 1),
             Some("relational") => (Self::Relational, 1),
             Some("olap") => (Self::Olap, 1),
+            Some("olap-memory") => (Self::OlapMemory, 1),
             _ => (Self::Apply, 0),
         }
     }
@@ -415,6 +417,10 @@ async fn main() {
     }
     if parameters.scenario == Scenario::Olap {
         olap::run(parameters).await;
+        return;
+    }
+    if parameters.scenario == Scenario::OlapMemory {
+        olap::run_memory_gate(parameters.rows).await;
         return;
     }
     if parameters.scenario != Scenario::Apply {

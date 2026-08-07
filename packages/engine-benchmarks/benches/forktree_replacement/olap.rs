@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use lix::storage::Storage;
+use lix::storage::{Memory, Storage};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
@@ -25,12 +25,42 @@ struct Expected {
 pub(super) async fn run(parameters: Parameters) {
     assert_eq!(parameters.layout, Layout::ForkTree);
     println!(
-        "forktree_olap_boundary,sql_wiring=false,comparison=authenticated_source_materialization_plus_identical_operators,current_big_o=O(N+Q),forktree_big_o=O(nodes+rows+Q),claim=source_layer_only"
+        "forktree_olap_boundary,sql_wiring=false,comparison=authenticated_source_materialization_plus_identical_operators,current_big_o=O(N+Q),forktree_big_o=O(height+touched_blocks+N+Q),forktree_backend_requests=O(height),claim=source_layer_only"
     );
     match parameters.backend {
         Backend::RocksDb => run_rocks(parameters).await,
         Backend::SlateDb => run_slate(parameters).await,
     }
+}
+
+pub(super) async fn run_memory_gate(rows: usize) {
+    let (storage, stats) = CountingStorage::new(Memory::default());
+    let (tree, expected) = prepare(storage, rows).await;
+    for &(query, digest, result_rows) in &expected.digests {
+        let _ = take_stats(&stats);
+        let result = execute(&tree, query).await;
+        assert_eq!(result.len(), result_rows);
+        assert_eq!(common::digest(&result), digest);
+        let io = take_stats(&stats);
+        assert_eq!(
+            io.begin_reads,
+            if query == Query::Join { 2 } else { 1 },
+            "each ordered range must use one coherent StorageRead"
+        );
+    }
+
+    let fault_tree = ForkTree::new(Memory::default());
+    fault_tree
+        .initialize(&[(b"a".to_vec(), b"value".to_vec())])
+        .await
+        .expect("initialize ordered-range corruption gate");
+    fault_tree
+        .verify_projected_range_corruption_fail_closed()
+        .await
+        .expect("ordered range corruption must fail closed");
+    println!(
+        "forktree_olap_memory_gate,rows={rows},exact_results=true,snapshot_coherent=true,malformed_fail_closed=true,truncated_fail_closed=true,substituted_fail_closed=true"
+    );
 }
 
 async fn run_rocks(parameters: Parameters) {
@@ -190,6 +220,9 @@ async fn execute<S>(tree: &ForkTree<CountingStorage<S>>, query: Query) -> Vec<Ve
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    if query == Query::Projection {
+        return load_wide_projection(tree).await;
+    }
     let narrow = if matches!(
         query,
         Query::NarrowScan | Query::Filter | Query::Group | Query::OrderLimit | Query::Join
@@ -215,7 +248,7 @@ async fn load_narrow<S>(tree: &ForkTree<CountingStorage<S>>) -> Vec<NarrowRow>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    tree.read_range("main", b"n/", b"n0")
+    tree.read_projected_range("main", b"n/", b"n0", |value| Ok(value.to_vec()))
         .await
         .expect("read authenticated narrow range")
         .into_iter()
@@ -227,7 +260,7 @@ async fn load_wide<S>(tree: &ForkTree<CountingStorage<S>>) -> Vec<WideRow>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    tree.read_range("main", b"w/", b"w0")
+    tree.read_projected_range("main", b"w/", b"w0", |value| Ok(value.to_vec()))
         .await
         .expect("read authenticated wide range")
         .into_iter()
@@ -235,11 +268,35 @@ where
         .collect()
 }
 
+async fn load_wide_projection<S>(tree: &ForkTree<CountingStorage<S>>) -> Vec<Vec<Cell>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    tree.read_projected_range("main", b"w/", b"w0", |value| {
+        let score = value
+            .get(16..24)
+            .ok_or_else(|| "projected wide row is truncated before score".to_string())?;
+        Ok(i64::from_be_bytes(
+            score.try_into().expect("validated score width"),
+        ))
+    })
+    .await
+    .expect("read authenticated projected wide range")
+    .into_iter()
+    .map(|(key, score)| {
+        vec![
+            Cell::Text(common::strip_key(b'w', &key)),
+            Cell::Integer(score),
+        ]
+    })
+    .collect()
+}
+
 async fn load_dimensions<S>(tree: &ForkTree<CountingStorage<S>>) -> Vec<(i64, String)>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    tree.read_range("main", b"d/", b"d0")
+    tree.read_projected_range("main", b"d/", b"d0", |value| Ok(value.to_vec()))
         .await
         .expect("read authenticated dimension range")
         .into_iter()

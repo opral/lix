@@ -1044,18 +1044,92 @@ where
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        self.read_projected_range(branch, start, end, |value| Ok(value.to_vec()))
+            .await
+    }
+
+    /// Reads one authenticated ordered range from one coherent storage view.
+    /// Tree nodes are fetched one path level at a time and value packs are
+    /// fetched once per distinct immutable object. `project` runs only after
+    /// the complete containing object has authenticated and decoded.
+    pub async fn read_projected_range<T, F>(
+        &self,
+        branch: &str,
+        start: &[u8],
+        end: &[u8],
+        mut project: F,
+    ) -> Result<Vec<(Vec<u8>, T)>, String>
+    where
+        T: Clone,
+        F: FnMut(&[u8]) -> Result<T, String>,
+    {
         if start > end {
             return Err("ForkTree range start exceeds end".to_string());
         }
-        let commit = self.load_commit(self.branch_head(branch).await?).await?;
-        let mut entries = Vec::new();
-        self.collect_range_entries(commit.root, start, end, &mut entries)
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let selector_keys = [key(&branch_key)];
+        let selector = read
+            .get_many(&[GetManyRequest {
+                space: REF_SPACE,
+                keys: &selector_keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .map_err(storage_error)?
+            .values
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| format!("missing ForkTree branch '{branch}'"))?;
+        let commit_id = decode_ref(projected_bytes(&selector)?)?;
+        let commit = decode_commit(
+            &self
+                .load_objects_from_read(&read, &[commit_id])
+                .await?
+                .pop()
+                .ok_or_else(|| "ForkTree commit batch unexpectedly empty".to_string())?,
+        )?;
+        let entries = self
+            .collect_range_entries_batched(&read, commit.root, start, end)
             .await?;
-        let mut output = Vec::with_capacity(entries.len());
-        for entry in entries {
-            output.push((entry.key, self.load_value(entry.value).await?));
+
+        let requested = entries.iter().fold(
+            BTreeMap::<ObjectId, std::collections::BTreeSet<u32>>::new(),
+            |mut requested, entry| {
+                requested
+                    .entry(entry.value.pack)
+                    .or_default()
+                    .insert(entry.value.index);
+                requested
+            },
+        );
+        let pack_ids = requested.keys().copied().collect::<Vec<_>>();
+        let pack_bytes = self.load_objects_from_read(&read, &pack_ids).await?;
+        let mut projected = BTreeMap::new();
+        for (id, bytes) in pack_ids.into_iter().zip(pack_bytes) {
+            let indices = requested
+                .get(&id)
+                .expect("loaded pack was requested by this range");
+            for (index, value) in decode_value_pack_projected(&bytes, indices, &mut project)? {
+                projected.insert((id, index), value);
+            }
         }
-        Ok(output)
+
+        entries
+            .into_iter()
+            .map(|entry| {
+                projected
+                    .get(&(entry.value.pack, entry.value.index))
+                    .cloned()
+                    .map(|value| (entry.key, value))
+                    .ok_or_else(|| "ForkTree projected value-pack reference is invalid".to_string())
+            })
+            .collect()
     }
 
     pub async fn diff_commits(
@@ -1945,6 +2019,82 @@ where
         Ok(())
     }
 
+    /// Constructs authenticated but semantically invalid test roots and
+    /// proves the ordered range reader rejects malformed, truncated, and
+    /// substituted blocks. Test branches are isolated from the live main ref.
+    pub async fn verify_projected_range_corruption_fail_closed(&self) -> Result<(), String> {
+        for fault in ["malformed", "truncated", "substituted"] {
+            let mut pending = BTreeMap::new();
+            let root = match fault {
+                "malformed" => {
+                    let mut bytes = object_prefix(LEAF_TAG);
+                    put_u32(&mut bytes, 16);
+                    bytes.extend_from_slice(b"not-zstd");
+                    stage_object(Bytes::from(bytes), &mut pending)
+                }
+                "truncated" => stage_object(Bytes::from(object_prefix(LEAF_TAG)), &mut pending),
+                "substituted" => {
+                    let value = RelationalValue::Bytes(b"value".to_vec());
+                    let pack =
+                        stage_object(encode_value_pack(std::iter::once(&value)), &mut pending);
+                    let leaf = stage_object(
+                        encode_leaf(&[LeafEntry {
+                            key: b"z/substituted".to_vec(),
+                            value: ValueRef { pack, index: 0 },
+                        }]),
+                        &mut pending,
+                    );
+                    stage_object(
+                        encode_internal(&[NodeRef {
+                            id: leaf,
+                            max_key: b"a/false-bound".to_vec(),
+                        }]),
+                        &mut pending,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let parent = self.branch_head("main").await?;
+            let parent_commit = self.load_commit(parent).await?;
+            let delta = stage_object(
+                encode_retention_delta(root, parent_commit.blob),
+                &mut pending,
+            );
+            let commit = stage_object(
+                encode_commit(Commit {
+                    parents: [Some(parent), None],
+                    root,
+                    delta,
+                    blob: parent_commit.blob,
+                }),
+                &mut pending,
+            );
+            let mut write = self
+                .storage
+                .begin_write(WriteOptions::default())
+                .await
+                .map_err(storage_error)?;
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+            write.commit().await.map_err(storage_error)?;
+            let branch = format!("range-fault-{fault}");
+            self.put_new_selector(selector_key(BRANCH_PREFIX, &branch), commit)
+                .await?;
+            if self
+                .read_projected_range(&branch, b"", &[0xff], |value| Ok(value.to_vec()))
+                .await
+                .is_ok()
+            {
+                return Err(format!(
+                    "ForkTree ordered range accepted {fault} authenticated block"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn stage_test_path_copy_orphan(&self, label: &[u8]) -> Result<ObjectId, String> {
         let mut pending = BTreeMap::new();
         let value = RelationalValue::Bytes(label.to_vec());
@@ -2549,34 +2699,65 @@ where
         })
     }
 
-    fn collect_range_entries<'a>(
-        &'a self,
-        id: ObjectId,
-        start: &'a [u8],
-        end: &'a [u8],
-        output: &'a mut Vec<LeafEntry>,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            match decode_node(&self.load_object(id).await?)? {
-                Node::Leaf(rows) => output.extend(
-                    rows.into_iter()
-                        .filter(|row| row.key.as_slice() >= start && row.key.as_slice() <= end),
-                ),
-                Node::Internal(children) => {
-                    for child in children {
-                        if child.max_key.as_slice() < start {
-                            continue;
-                        }
-                        self.collect_range_entries(child.id, start, end, output)
-                            .await?;
-                        if end <= child.max_key.as_slice() {
-                            break;
+    async fn collect_range_entries_batched<R>(
+        &self,
+        read: &R,
+        root: ObjectId,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<LeafEntry>, String>
+    where
+        R: StorageRead,
+    {
+        let mut frontier = vec![(root, None::<Vec<u8>>)];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut output = Vec::new();
+        while !frontier.is_empty() {
+            let ids = frontier.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            if ids.iter().any(|id| !seen.insert(*id)) {
+                return Err("ForkTree ordered range contains a repeated or cyclic node".to_string());
+            }
+            let objects = self.load_objects_from_read(read, &ids).await?;
+            let mut next = Vec::new();
+            for ((_, expected_max), bytes) in frontier.into_iter().zip(objects) {
+                let node = decode_node(&bytes)?;
+                if expected_max
+                    .as_deref()
+                    .is_some_and(|expected| node_max_key(&node).as_slice() != expected)
+                {
+                    return Err(
+                        "ForkTree ordered range child bound does not match its authenticated block"
+                            .to_string(),
+                    );
+                }
+                match node {
+                    Node::Leaf(rows) => output
+                        .extend(rows.into_iter().filter(|row| {
+                            row.key.as_slice() >= start && row.key.as_slice() <= end
+                        })),
+                    Node::Internal(children) => {
+                        for child in children {
+                            if child.max_key.as_slice() < start {
+                                continue;
+                            }
+                            let stop = end <= child.max_key.as_slice();
+                            next.push((child.id, Some(child.max_key)));
+                            if stop {
+                                break;
+                            }
                         }
                     }
                 }
             }
-            Ok(())
-        })
+            frontier = next;
+        }
+        if output
+            .windows(2)
+            .any(|pair| pair[0].key.as_slice() >= pair[1].key.as_slice())
+        {
+            return Err("ForkTree ordered range emitted non-increasing keys".to_string());
+        }
+        Ok(output)
     }
 
     fn collect_relational_rows<'a>(
@@ -3082,15 +3263,26 @@ where
     }
 
     async fn load_objects(&self, ids: &[ObjectId]) -> Result<Vec<Bytes>, String> {
-        let keys = ids
-            .iter()
-            .map(|id| Key(Bytes::copy_from_slice(&id.0)))
-            .collect::<Vec<_>>();
         let read = self
             .storage
             .begin_read(ReadOptions::default())
             .await
             .map_err(storage_error)?;
+        self.load_objects_from_read(&read, ids).await
+    }
+
+    async fn load_objects_from_read<R>(
+        &self,
+        read: &R,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Bytes>, String>
+    where
+        R: StorageRead,
+    {
+        let keys = ids
+            .iter()
+            .map(|id| Key(Bytes::copy_from_slice(&id.0)))
+            .collect::<Vec<_>>();
         let result = read
             .get_many(&[GetManyRequest {
                 space: OBJECT_SPACE,
@@ -3587,6 +3779,50 @@ fn decode_value_pack(bytes: &[u8]) -> Result<Vec<RelationalValue>, String> {
     Ok(values)
 }
 
+fn decode_value_pack_projected<T, F>(
+    bytes: &[u8],
+    requested: &std::collections::BTreeSet<u32>,
+    project: &mut F,
+) -> Result<Vec<(u32, T)>, String>
+where
+    F: FnMut(&[u8]) -> Result<T, String>,
+{
+    let mut decoder = Decoder::new(bytes);
+    if decoder.object_tag()? != VALUE_PACK_TAG {
+        return Err("ForkTree leaf does not reference a value-pack object".to_string());
+    }
+    let decoded_length = decoder.u32()?;
+    let compressed = decoder.remaining();
+    let decoded = zstd::bulk::decompress(compressed, decoded_length)
+        .map_err(|error| format!("decompress ForkTree value pack: {error}"))?;
+    decoder.finish()?;
+    let mut body = Decoder::new(&decoded);
+    let count = body.u32()?;
+    let mut projected = Vec::with_capacity(requested.len());
+    for index in 0..count {
+        let index = u32::try_from(index).map_err(|_| "ForkTree value-pack index overflow")?;
+        match body.take(1)?[0] {
+            0 => {
+                if requested.contains(&index) {
+                    return Err("ForkTree projected range encountered a null value".to_string());
+                }
+            }
+            1 => {
+                let value = body.bytes_ref()?;
+                if requested.contains(&index) {
+                    projected.push((index, project(value)?));
+                }
+            }
+            tag => return Err(format!("unknown ForkTree relational value tag {tag}")),
+        }
+    }
+    body.finish()?;
+    if projected.len() != requested.len() {
+        return Err("ForkTree projected value-pack index is out of bounds".to_string());
+    }
+    Ok(projected)
+}
+
 fn validate_blob_chunk(bytes: &[u8], expected_bytes: u64) -> Result<(), String> {
     if bytes.len() as u64 != expected_bytes {
         return Err("ForkTree blob chunk declared size mismatch".to_string());
@@ -3896,8 +4132,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, String> {
+        Ok(self.bytes_ref()?.to_vec())
+    }
+
+    fn bytes_ref(&mut self) -> Result<&'a [u8], String> {
         let length = self.u32()?;
-        Ok(self.take(length)?.to_vec())
+        self.take(length)
     }
 
     fn id(&mut self) -> Result<ObjectId, String> {
