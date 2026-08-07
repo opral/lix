@@ -68,6 +68,8 @@ mod schema;
 mod session;
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
+pub mod sql_dml_bench;
+#[cfg(feature = "storage-benches")]
 mod sql_profile;
 mod sql_telemetry;
 pub mod storage;

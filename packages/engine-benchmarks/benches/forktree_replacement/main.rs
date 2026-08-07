@@ -1,5 +1,6 @@
 #![allow(clippy::large_futures)]
 
+mod dml;
 mod model;
 mod olap;
 #[allow(dead_code)]
@@ -309,6 +310,7 @@ enum Scenario {
     Olap,
     OlapMemory,
     OlapDatafusion,
+    Dml,
 }
 
 impl Scenario {
@@ -321,6 +323,7 @@ impl Scenario {
             Some("olap") => (Self::Olap, 1),
             Some("olap-memory") => (Self::OlapMemory, 1),
             Some("olap-datafusion") => (Self::OlapDatafusion, 1),
+            Some("dml") => (Self::Dml, 1),
             _ => (Self::Apply, 0),
         }
     }
@@ -430,6 +433,10 @@ async fn main() {
     }
     if parameters.scenario == Scenario::OlapDatafusion {
         olap_datafusion::run(parameters).await;
+        return;
+    }
+    if parameters.scenario == Scenario::Dml {
+        dml::run(parameters).await;
         return;
     }
     if parameters.scenario != Scenario::Apply {

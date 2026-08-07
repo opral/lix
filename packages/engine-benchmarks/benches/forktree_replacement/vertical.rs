@@ -55,7 +55,8 @@ async fn run_rocksdb(parameters: Parameters) {
             | Scenario::Relational
             | Scenario::Olap
             | Scenario::OlapMemory
-            | Scenario::OlapDatafusion => unreachable!(),
+            | Scenario::OlapDatafusion
+            | Scenario::Dml => unreachable!(),
         };
         database
             .flush()
@@ -143,7 +144,8 @@ async fn run_slatedb(parameters: Parameters) {
             | Scenario::Relational
             | Scenario::Olap
             | Scenario::OlapMemory
-            | Scenario::OlapDatafusion => unreachable!(),
+            | Scenario::OlapDatafusion
+            | Scenario::Dml => unreachable!(),
         };
         database
             .flush_memtable_for_diagnostics()

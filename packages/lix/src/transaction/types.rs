@@ -1424,7 +1424,7 @@ impl RawWriteBatch {
         extracted
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) fn into_rows(self) -> Vec<TransactionWriteRow> {
         let mut batch = self;
         let mut rows = Vec::with_capacity(batch.len());
@@ -1434,7 +1434,7 @@ impl RawWriteBatch {
         rows
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "storage-benches"))]
     fn take_owned_row(&mut self, index: usize) -> TransactionWriteRow {
         let slot = self.slots[index];
         TransactionWriteRow {
