@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use crate::binary_cas::{BlobChunkReceipt, BlobId, ChunkHash};
@@ -41,7 +41,7 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
     writes: &mut crate::storage_adapter::StorageWriteSet,
     live_blob_roots: &BTreeSet<BlobId>,
     preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<BTreeSet<ChunkHash>, LixError> {
+) -> Result<BTreeMap<ChunkHash, u64>, LixError> {
     let (_, fence_token) = load_upload_reclaim_fence(store).await?;
     preconditions.push(upload_reclaim_fence_precondition(fence_token));
     let mut states = Vec::<(String, UploadState)>::new();
@@ -96,7 +96,7 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
         }
     }
 
-    let mut upload_chunks = BTreeSet::new();
+    let mut upload_chunks = BTreeMap::new();
     let mut resume_after = None;
     loop {
         let page = store
@@ -128,7 +128,24 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 ));
             };
             let leaf = decode_upload_manifest_leaf(&value)?;
-            upload_chunks.extend(leaf.chunks.into_iter().map(|chunk| chunk.hash));
+            for chunk in leaf.chunks {
+                match upload_chunks.entry(chunk.hash) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(chunk.size_bytes);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if *entry.get() != chunk.size_bytes =>
+                    {
+                        return Err(invalid_upload_storage(format!(
+                            "active upload chunk '{}' has conflicting declared sizes {} and {}",
+                            chunk.hash.to_hex(),
+                            entry.get(),
+                            chunk.size_bytes
+                        )));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
         }
         if !page.has_more || last_key.is_none() {
             break;
@@ -165,7 +182,7 @@ fn validate_upload_id_for_storage(upload_id: &str) -> Result<(), LixError> {
     Ok(())
 }
 
-fn invalid_upload_storage(message: &'static str) -> LixError {
+fn invalid_upload_storage(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_STORAGE_ERROR, message)
 }
 
@@ -1059,6 +1076,127 @@ mod tests {
                 .expect("completed receipt lookup should succeed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn active_receipt_declared_size_must_match_authenticated_chunk_bytes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"active-upload-chunk";
+        let chunk_hash = ChunkHash::from_content(payload);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("active receipt staging read should open");
+        let mut initial = storage.new_write_set();
+        crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut initial)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                payload.to_vec(),
+            ))
+            .await
+            .expect("active receipt chunk should stage");
+        stage_upload_state(
+            &mut initial,
+            upload_state_key("wrong-size-receipt").unwrap(),
+            &UploadState::Open(UploadOpen {
+                path: "/wrong-size.bin".to_owned(),
+                total_size: payload.len() as u64 + 1,
+            }),
+        )
+        .expect("active upload state should stage");
+        stage_upload_manifest_leaf(
+            &mut initial,
+            upload_manifest_leaf_key("wrong-size-receipt", 0).unwrap(),
+            &UploadManifestLeaf {
+                part_size: payload.len() as u64 + 1,
+                chunks: vec![BlobChunkReceipt {
+                    hash: chunk_hash,
+                    size_bytes: payload.len() as u64 + 1,
+                }],
+            },
+        )
+        .expect("wrong-size receipt should stage");
+        drop(read);
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("wrong-size receipt fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("wrong-size receipt GC read should open");
+        let mut sweep = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let upload_chunks = stage_reclaimable_upload_receipts(
+            &read,
+            &mut sweep,
+            &BTreeSet::new(),
+            &mut preconditions,
+        )
+        .await
+        .expect("active receipt should collect");
+        let error = crate::binary_cas::stage_gc_reclamation(
+            &read,
+            &mut sweep,
+            &BTreeSet::new(),
+            &upload_chunks,
+        )
+        .await
+        .expect_err("wrong declared upload size must fail GC closed");
+        assert!(
+            error.message.contains("expected 20 uncompressed bytes"),
+            "{error:?}"
+        );
+        assert!(sweep.is_empty(), "wrong size must stage no reclamation");
+    }
+
+    #[tokio::test]
+    async fn active_receipts_reject_conflicting_sizes_for_one_chunk() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hash = ChunkHash::from_content(b"shared-active-upload-chunk");
+        let mut initial = storage.new_write_set();
+        for (upload_id, size_bytes) in [("receipt-a", 7), ("receipt-b", 9)] {
+            stage_upload_state(
+                &mut initial,
+                upload_state_key(upload_id).unwrap(),
+                &UploadState::Open(UploadOpen {
+                    path: format!("/{upload_id}.bin"),
+                    total_size: size_bytes,
+                }),
+            )
+            .expect("active upload state should stage");
+            stage_upload_manifest_leaf(
+                &mut initial,
+                upload_manifest_leaf_key(upload_id, 0).unwrap(),
+                &UploadManifestLeaf {
+                    part_size: size_bytes,
+                    chunks: vec![BlobChunkReceipt { hash, size_bytes }],
+                },
+            )
+            .expect("active upload receipt should stage");
+        }
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("conflicting active receipt fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("conflicting receipt read should open");
+        let mut sweep = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let error = stage_reclaimable_upload_receipts(
+            &read,
+            &mut sweep,
+            &BTreeSet::new(),
+            &mut preconditions,
+        )
+        .await
+        .expect_err("conflicting active receipt sizes must fail closed");
+        assert!(error.message.contains("conflicting declared sizes"));
+        assert!(sweep.is_empty(), "conflict must stage no receipt cleanup");
     }
 
     #[tokio::test]

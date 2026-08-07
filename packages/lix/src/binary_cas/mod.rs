@@ -7,7 +7,7 @@ pub(crate) mod metrics;
 mod stats;
 mod types;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use chunking::BinaryCasChunking;
 #[cfg(all(feature = "storage-benches", test))]
@@ -44,7 +44,7 @@ pub(crate) async fn stage_gc_reclamation(
     store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
     writes: &mut crate::storage_adapter::StorageWriteSet,
     blob_roots: &BTreeSet<BlobId>,
-    upload_chunks: &BTreeSet<ChunkHash>,
+    upload_chunks: &BTreeMap<ChunkHash, u64>,
 ) -> Result<BinaryCasGcSweep, crate::LixError> {
     kv::stage_reclaim_unreachable_binary_cas(store, writes, blob_roots, upload_chunks).await
 }

@@ -6,7 +6,7 @@
 //! exact registry read and one batched owner read instead of a filesystem
 //! scan.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -16,11 +16,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
+use crate::branch::BranchHeadControl;
+use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::tracked_state::MaterializedTrackedStateRowRef;
+use crate::tracked_state::{
+    MaterializedTrackedStateRowRef, TrackedStateFilter, TrackedStateReadColumns,
+    TrackedStateScanRequest, TrackedStateStoreReader,
+};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::{GLOBAL_BRANCH_ID, LixError};
+use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
 use super::InstalledPlugin;
 use super::manifest::{
@@ -448,6 +453,98 @@ impl PluginRegistry {
         };
         Self::from_wire(wire).map(|_| ())
     }
+}
+
+/// Loads one retained registry through the plugin-owned durable decoder.
+pub(crate) async fn load_plugin_registry_at_commit<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    commit_id: &str,
+) -> Result<PluginRegistry, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
+{
+    let registry_key = crate::tracked_state::TrackedStateKey {
+        schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
+        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+        file_id: None,
+    };
+    let rows = reader
+        .load_projected_batch_at_commit(
+            commit_id,
+            std::slice::from_ref(&registry_key),
+            &ChangeRecordProjection::full(),
+        )
+        .await?
+        .into_rows();
+    let row = rows.into_iter().next().flatten();
+    let snapshot = match row {
+        None => None,
+        Some(row) if row.deleted || row.snapshot_content.is_none() => None,
+        Some(row) => Some(
+            serde_json::from_str(row.snapshot_content.as_deref().expect("checked")).map_err(
+                |error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("historical plugin registry snapshot is invalid JSON: {error}"),
+                    )
+                },
+            )?,
+        ),
+    };
+    PluginRegistry::from_optional_snapshot(snapshot.as_ref())
+}
+
+/// Re-derives every WASM payload root owned by current and retained plugin
+/// registry generations. Registry snapshots remain the sole serving authority;
+/// this returns only their authenticated content hashes for binary-CAS marking.
+pub(crate) async fn collect_gc_wasm_blob_roots<S>(
+    store: &S,
+    controls: &[(String, BranchHeadControl)],
+    retained_commits: &BTreeSet<CommitId>,
+) -> Result<BTreeSet<BlobId>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
+{
+    let request = TrackedStateScanRequest {
+        filter: TrackedStateFilter {
+            schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
+            entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+            file_ids: vec![NullableKeyFilter::Null],
+            ..TrackedStateFilter::default()
+        },
+        read_columns: TrackedStateReadColumns {
+            columns: vec!["snapshot_content".to_owned()],
+        },
+        limit: None,
+    };
+    let current = crate::live_state::TrackedHeadContext::new()
+        .reader(store)
+        .scan_live_batches_for_controls(controls, &request, None)
+        .await?;
+    let mut roots = BTreeSet::new();
+    for (branch_id, rows) in current {
+        for row in rows.into_rows() {
+            let registry = PluginRegistry::from_optional_live_state_row(Some(&row), &branch_id)?;
+            extend_registry_wasm_roots(&registry, &mut roots)?;
+        }
+    }
+
+    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+    for commit_id in retained_commits {
+        let registry = load_plugin_registry_at_commit(&mut reader, &commit_id.to_string()).await?;
+        extend_registry_wasm_roots(&registry, &mut roots)?;
+    }
+    Ok(roots)
+}
+
+fn extend_registry_wasm_roots(
+    registry: &PluginRegistry,
+    roots: &mut BTreeSet<BlobId>,
+) -> Result<(), LixError> {
+    for plugin in registry.plugins() {
+        roots.insert(BlobId::from_hex(plugin.wasm_blob_hash())?);
+    }
+    Ok(())
 }
 
 /// Durable per-file ownership. `file_id` is storage identity, not duplicated
