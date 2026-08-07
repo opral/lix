@@ -154,6 +154,11 @@ pub(crate) struct BranchHeadControlReader<S> {
     store: S,
 }
 
+pub(crate) struct BranchHeadControlPage {
+    pub(crate) entries: Vec<(String, BranchHeadControl)>,
+    pub(crate) next_resume_after: Option<StorageKey>,
+}
+
 impl<S> BranchHeadControlReader<S>
 where
     S: StorageAdapterRead,
@@ -221,39 +226,74 @@ where
 
     /// Returns every durable branch control in deterministic branch-id order.
     pub(crate) async fn scan(&self) -> Result<Vec<(String, BranchHeadControl)>, LixError> {
+        let mut rows = Vec::new();
+        let mut resume_after = None;
+        loop {
+            let page = self
+                .scan_page(resume_after, crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?;
+            rows.extend(page.entries);
+            let Some(next) = page.next_resume_after else {
+                break;
+            };
+            resume_after = Some(next);
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    /// Returns one opaque-key page for rebuildable background maintenance.
+    /// Root publication is fenced separately by the authenticated reachability
+    /// queue, so callers can persist `next_resume_after` between transactions.
+    pub(crate) async fn scan_page(
+        &self,
+        resume_after: Option<StorageKey>,
+        limit_rows: usize,
+    ) -> Result<BranchHeadControlPage, LixError> {
         let plan = ScanPlan::prefix(
             BRANCH_HEAD_CONTROL_SPACE,
             StoragePrefix {
                 bytes: Bytes::new(),
             },
         );
-        let mut rows = Vec::new();
-        let mut resume_after = None;
-        loop {
-            let page = plan
-                .collect(
-                    &self.store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
-                .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            for entry in page.value.entries {
+        let page = plan
+            .collect(
+                &self.store,
+                StorageScanOptions {
+                    limit_rows,
+                    resume_after,
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        if page.value.has_more && page.value.entries.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "branch-head control scan reported more rows after an empty page",
+            ));
+        }
+        let next_resume_after = page
+            .value
+            .has_more
+            .then(|| page.value.entries.last().map(|entry| entry.key.clone()))
+            .flatten();
+        let entries = page
+            .value
+            .entries
+            .into_iter()
+            .map(|entry| {
                 let key = storage_codec::decode::<BranchHeadControlKey>(
                     "branch-head control key",
                     entry.key.0.as_ref(),
                 )?;
                 let control = decode_projected_value(entry.value)?;
-                rows.push((key.branch_id, control));
-            }
-            if !page.value.has_more || resume_after.is_none() {
-                break;
-            }
-        }
-        rows.sort_by(|left, right| left.0.cmp(&right.0));
-        Ok(rows)
+                Ok((key.branch_id, control))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        Ok(BranchHeadControlPage {
+            entries,
+            next_resume_after,
+        })
     }
 }
 

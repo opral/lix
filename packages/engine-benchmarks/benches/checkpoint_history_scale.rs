@@ -296,6 +296,45 @@ async fn run() {
                 }
             }
         }
+        "measure-create" => {
+            let samples = args
+                .get(6)
+                .map_or(DEFAULT_SAMPLES, |value| {
+                    value.parse::<usize>().expect("samples must be positive")
+                })
+                .max(1);
+            let warmups = args.get(7).map_or(DEFAULT_WARMUPS, |value| {
+                value
+                    .parse::<usize>()
+                    .expect("warmups must be non-negative")
+            });
+            match backend {
+                Backend::RocksDB => {
+                    measure_create_checkpoint(
+                        RocksDB::open(path).expect("open checkpoint-create RocksDB"),
+                        backend,
+                        path,
+                        samples,
+                        warmups,
+                        None,
+                    )
+                    .await;
+                }
+                Backend::SlateDB => {
+                    let counters = SlateDBIoCounters::default();
+                    measure_create_checkpoint(
+                        SlateDB::open_with_io_counters(path, counters.clone())
+                            .expect("open checkpoint-create SlateDB"),
+                        backend,
+                        path,
+                        samples,
+                        warmups,
+                        Some(counters),
+                    )
+                    .await;
+                }
+            }
+        }
         _ => print_usage(),
     }
 }
@@ -499,6 +538,64 @@ async fn measure_query<StorageImpl>(
     );
 }
 
+async fn measure_create_checkpoint<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
+    path: &str,
+    samples: usize,
+    warmups: usize,
+    counters: Option<SlateDBIoCounters>,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let engine = Engine::new(storage)
+        .await
+        .expect("open checkpoint-create engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("open checkpoint-create session");
+    for _ in 0..warmups {
+        session
+            .create_checkpoint()
+            .await
+            .expect("warm checkpoint creation");
+        tokio::task::yield_now().await;
+    }
+    let io_before = counters
+        .as_ref()
+        .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
+    let mut timings = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        session
+            .create_checkpoint()
+            .await
+            .expect("measure checkpoint creation");
+        timings.push(started.elapsed());
+        tokio::task::yield_now().await;
+    }
+    timings.sort_unstable();
+    let io = counters
+        .as_ref()
+        .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot)
+        .saturating_sub(io_before);
+    println!(
+        "checkpoint_history_scale,phase=measure_create,backend={backend},warmups={warmups},samples={samples},p50_ms={},p95_ms={},p99_ms={},max_ms={},read_objects={},read_bytes={},write_objects={},write_bytes={},list_operations={},listed_objects={},backend_bytes={}",
+        millis(percentile(&timings, 50)),
+        millis(percentile(&timings, 95)),
+        millis(percentile(&timings, 99)),
+        millis(*timings.last().expect("checkpoint samples are positive")),
+        io.read_objects,
+        io.read_bytes,
+        io.write_objects,
+        io.write_bytes,
+        io.list_operations,
+        io.listed_objects,
+        directory_bytes(Path::new(path)),
+    );
+}
+
 #[expect(clippy::too_many_arguments)]
 fn print_setup(
     backend: Backend,
@@ -614,6 +711,8 @@ fn print_usage() {
          checkpoint_history_scale measure <rocksdb|slatedb> <path> \
          <history-changes> <commit-width> <materialize|stream> [samples] [warmups]\n  \
          checkpoint_history_scale measure-query <rocksdb|slatedb> <path> \
+         <history-changes> <commit-width> [samples] [warmups]\n  \
+         checkpoint_history_scale measure-create <rocksdb|slatedb> <path> \
          <history-changes> <commit-width> [samples] [warmups]"
     );
 }

@@ -59,15 +59,15 @@ pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace =
 /// Rebuildable metadata for an explicit tree-chunk sweep epoch. It is never
 /// consulted as a serving root; the active root closure is re-derived from
 /// branch/recovery controls and authenticated commit manifests.
-pub(crate) const GC_TREE_SWEEP_EPOCH_NAMESPACE: &str = "gc.tree_sweep_epoch.v1";
+pub(crate) const GC_TREE_SWEEP_EPOCH_NAMESPACE: &str = "gc.tree_sweep_epoch.v2";
 pub(crate) const GC_TREE_SWEEP_EPOCH_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0005), GC_TREE_SWEEP_EPOCH_NAMESPACE);
 /// One rebuildable live-chunk mark per content hash for the current epoch.
-pub(crate) const GC_TREE_SWEEP_MARK_NAMESPACE: &str = "gc.tree_sweep_mark.v1";
+pub(crate) const GC_TREE_SWEEP_MARK_NAMESPACE: &str = "gc.tree_sweep_mark.v2";
 pub(crate) const GC_TREE_SWEEP_MARK_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0006), GC_TREE_SWEEP_MARK_NAMESPACE);
 /// CAS-protected bounded cursor for an in-progress tree-chunk enumeration.
-pub(crate) const GC_TREE_SWEEP_CURSOR_NAMESPACE: &str = "gc.tree_sweep_cursor.v1";
+pub(crate) const GC_TREE_SWEEP_CURSOR_NAMESPACE: &str = "gc.tree_sweep_cursor.v2";
 pub(crate) const GC_TREE_SWEEP_CURSOR_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0007), GC_TREE_SWEEP_CURSOR_NAMESPACE);
 
@@ -77,14 +77,29 @@ const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
 const GC_REACHABILITY_FORMAT_VERSION: u32 = 2;
 const GC_REACHABILITY_QUEUE_KEY: &[u8] = b"queue";
 const GC_REACHABILITY_BATCH_LIMIT: usize = 64;
-#[allow(dead_code)]
 const GC_TREE_SWEEP_EPOCH_KEY: &[u8] = b"epoch";
-#[allow(dead_code)]
 const GC_TREE_SWEEP_CURSOR_KEY: &[u8] = b"cursor";
-#[allow(dead_code)]
-const GC_TREE_SWEEP_FORMAT_VERSION: u32 = 1;
-#[allow(dead_code)]
+const GC_TREE_SWEEP_FORMAT_VERSION: u32 = 2;
 const GC_TREE_SWEEP_PAGE_ROWS: usize = 64;
+const GC_TREE_SWEEP_WORK_PREFIX: &[u8] = b"\x03";
+const GC_TREE_SWEEP_COMMIT_SEEN_PREFIX: &[u8] = b"\x01";
+const GC_TREE_SWEEP_CANDIDATE_PREFIX: &[u8] = b"\x02";
+
+const TREE_SWEEP_PHASE_CLEAN_WORK: u8 = 0;
+const TREE_SWEEP_PHASE_CLEAN_CANDIDATES: u8 = 1;
+const TREE_SWEEP_PHASE_CONTROLS: u8 = 2;
+const TREE_SWEEP_PHASE_RECOVERY: u8 = 3;
+const TREE_SWEEP_PHASE_QUEUE: u8 = 4;
+const TREE_SWEEP_PHASE_TRACE: u8 = 5;
+const TREE_SWEEP_PHASE_VERIFY_MARKS: u8 = 6;
+const TREE_SWEEP_PHASE_SCAN_CHUNKS: u8 = 7;
+const TREE_SWEEP_PHASE_DELETE_CANDIDATES: u8 = 8;
+const TREE_SWEEP_PHASE_CLEAN_MARKS: u8 = 9;
+const TREE_SWEEP_PHASE_CLEAN_SEEN: u8 = 10;
+const TREE_SWEEP_PHASE_COMPLETE: u8 = 11;
+
+const TREE_SWEEP_WORK_COMMIT: u8 = 1;
+const TREE_SWEEP_WORK_CHUNK: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointRecoveryRef {
@@ -203,32 +218,35 @@ struct StoredReachabilityQueue {
     next_sequence: u64,
 }
 
-/// Authenticated metadata for one explicit tree-chunk sweep epoch. The root
-/// and closure digests are evidence for resumption only; immutable manifests
-/// and branch/recovery controls remain the sole logical root authority.
+/// Immutable identity and root-publication fence for one rebuildable sweep.
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-#[allow(dead_code)]
 struct StoredTreeSweepEpoch {
     format_version: u32,
     epoch_id: u64,
     queue_digest: [u8; 32],
-    root_set_digest: [u8; 32],
-    live_chunk_digest: [u8; 32],
-    live_chunk_count: u64,
 }
 
-/// CAS-protected bounded enumeration cursor. A completed cursor is retained
-/// until the next epoch so an interrupted/reopened maintenance pass can
-/// distinguish a resumable epoch from a fresh one.
+/// CAS-protected cursor for the bounded discovery, proof, and delete phases.
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-#[allow(dead_code)]
 struct StoredTreeSweepCursor {
     format_version: u32,
     epoch_id: u64,
+    phase: u8,
     #[musli(with = storage_codec::option)]
-    last_key: Option<Vec<u8>>,
+    scan_after: Option<Vec<u8>>,
+    queue_sequence: u64,
+    queue_tail_sequence: u64,
+    work_head_sequence: u64,
+    work_tail_sequence: u64,
+    root_count: u64,
+    live_mark_count: u64,
+    verified_mark_count: u64,
+    verified_mark_digest: [u8; 32],
+    observed_mark_count: u64,
+    observed_mark_digest: [u8; 32],
+    candidate_count: u64,
     scanned_rows: u64,
     deleted_rows: u64,
     complete: bool,
@@ -239,23 +257,57 @@ struct StoredTreeSweepCursor {
 /// tree chunk.
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-#[allow(dead_code)]
 struct StoredTreeSweepMark {
     format_version: u32,
     epoch_id: u64,
     chunk_hash: [u8; 32],
 }
 
-/// In-memory state for one authenticated sweep epoch. The live set is loaded
-/// and verified once when the session starts or reopens; ordinary queue-prefix
-/// GC never consults it.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct TreeSweepEpochSession {
-    epoch: StoredTreeSweepEpoch,
-    cursor: StoredTreeSweepCursor,
-    raw_cursor: Bytes,
-    live_chunks: BTreeSet<[u8; 32]>,
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredTreeSweepWork {
+    format_version: u32,
+    epoch_id: u64,
+    sequence: u64,
+    kind: u8,
+    #[musli(bytes)]
+    identity: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredTreeSweepCommitSeen {
+    format_version: u32,
+    epoch_id: u64,
+    commit_id: CommitId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredTreeSweepCandidate {
+    format_version: u32,
+    epoch_id: u64,
+    chunk_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TreeSweepMaintenanceProfile {
+    pub(crate) epoch_id: u64,
+    pub(crate) phase: u8,
+    pub(crate) root_count: u64,
+    pub(crate) live_chunk_count: u64,
+    pub(crate) candidate_count: u64,
+    pub(crate) scanned_rows: u64,
+    pub(crate) deleted_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TreeSweepMaintenanceStep {
+    Idle,
+    Started(TreeSweepMaintenanceProfile),
+    Restarted(TreeSweepMaintenanceProfile),
+    Progress(TreeSweepMaintenanceProfile),
+    Complete(TreeSweepMaintenanceProfile),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -607,251 +659,264 @@ async fn load_reachability_batches(
     Ok(batches)
 }
 
-#[allow(dead_code)]
 fn tree_sweep_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message)
 }
 
-#[allow(dead_code)]
-fn tree_sweep_digest(hashes: &BTreeSet<[u8; 32]>) -> [u8; 32] {
+fn tree_sweep_empty_digest() -> [u8; 32] {
+    *blake3::hash(b"lix.gc.tree_sweep.ordered_marks.v2").as_bytes()
+}
+
+fn tree_sweep_extend_digest(previous: [u8; 32], hash: [u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    for hash in hashes {
-        hasher.update(hash);
-    }
+    hasher.update(b"lix.gc.tree_sweep.ordered_mark.v2");
+    hasher.update(&previous);
+    hasher.update(&hash);
     *hasher.finalize().as_bytes()
 }
 
-#[allow(dead_code)]
-async fn load_all_reachability_batches_for_tree_sweep<S>(
+fn tree_sweep_work_key(sequence: u64) -> StorageKey {
+    let mut key = Vec::with_capacity(1 + size_of::<u64>());
+    key.extend_from_slice(GC_TREE_SWEEP_WORK_PREFIX);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    StorageKey(Bytes::from(key))
+}
+
+fn tree_sweep_commit_seen_key(commit_id: CommitId) -> StorageKey {
+    let mut key = Vec::with_capacity(1 + 16);
+    key.extend_from_slice(GC_TREE_SWEEP_COMMIT_SEEN_PREFIX);
+    key.extend_from_slice(commit_id.as_uuid().as_bytes());
+    StorageKey(Bytes::from(key))
+}
+
+fn tree_sweep_candidate_key(hash: &[u8; 32]) -> StorageKey {
+    let mut key = Vec::with_capacity(1 + hash.len());
+    key.extend_from_slice(GC_TREE_SWEEP_CANDIDATE_PREFIX);
+    key.extend_from_slice(hash);
+    StorageKey(Bytes::from(key))
+}
+
+fn tree_sweep_profile(
+    epoch: &StoredTreeSweepEpoch,
+    cursor: &StoredTreeSweepCursor,
+) -> TreeSweepMaintenanceProfile {
+    TreeSweepMaintenanceProfile {
+        epoch_id: epoch.epoch_id,
+        phase: cursor.phase,
+        root_count: cursor.root_count,
+        live_chunk_count: cursor.live_mark_count,
+        candidate_count: cursor.candidate_count,
+        scanned_rows: cursor.scanned_rows,
+        deleted_rows: cursor.deleted_rows,
+    }
+}
+
+async fn load_tree_sweep_reachability_page<S>(
     store: &S,
-    queue: &StoredReachabilityQueue,
-) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError>
+    start_sequence: u64,
+    tail_sequence: u64,
+    page_rows: usize,
+) -> Result<Vec<StoredRootReachabilityBatch>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    if queue.head_sequence == 0 {
+    if start_sequence == 0 || start_sequence > tail_sequence {
         return Ok(Vec::new());
     }
-    let mut sequence = queue.head_sequence;
+    let end = start_sequence
+        .saturating_add(page_rows as u64)
+        .min(tail_sequence.saturating_add(1));
+    let keys = (start_sequence..end)
+        .map(reachability_sequence_key)
+        .collect::<Vec<_>>();
+    let values = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
     let mut batches = Vec::new();
-    while sequence <= queue.tail_sequence {
-        let end = sequence
-            .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
-            .min(queue.tail_sequence.saturating_add(1));
-        let keys = (sequence..end)
-            .map(reachability_sequence_key)
-            .collect::<Vec<_>>();
-        let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-        for (expected_sequence, value) in (sequence..end).zip(result.value) {
-            let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                return Err(tree_sweep_error(format!(
-                    "GC tree sweep reachability delta {expected_sequence} is missing"
-                )));
-            };
-            let batch: StoredRootReachabilityBatch =
-                storage_codec::decode("GC tree sweep reachability delta", &bytes)?;
-            if batch.format_version != GC_REACHABILITY_FORMAT_VERSION
-                || batch.sequence != expected_sequence
-            {
-                return Err(tree_sweep_error(format!(
-                    "GC tree sweep reachability delta {expected_sequence} has invalid identity"
-                )));
-            }
-            let (_, digest) = encode_reachability_batch_body(
-                batch.sequence,
-                batch.deltas.clone(),
-                batch.checkpoint_roots.clone(),
-            )?;
-            if digest != batch.digest {
-                return Err(tree_sweep_error(format!(
-                    "GC tree sweep reachability delta {expected_sequence} digest mismatch"
-                )));
-            }
-            batches.push((expected_sequence, batch));
+    for (expected_sequence, value) in (start_sequence..end).zip(values) {
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            return Err(tree_sweep_error(format!(
+                "GC tree sweep reachability delta {expected_sequence} is missing"
+            )));
+        };
+        let batch: StoredRootReachabilityBatch =
+            storage_codec::decode("GC tree sweep reachability delta", &bytes)?;
+        if batch.format_version != GC_REACHABILITY_FORMAT_VERSION
+            || batch.sequence != expected_sequence
+        {
+            return Err(tree_sweep_error(format!(
+                "GC tree sweep reachability delta {expected_sequence} has invalid identity"
+            )));
         }
-        sequence = end;
+        let (_, digest) = encode_reachability_batch_body(
+            batch.sequence,
+            batch.deltas.clone(),
+            batch.checkpoint_roots.clone(),
+        )?;
+        if digest != batch.digest {
+            return Err(tree_sweep_error(format!(
+                "GC tree sweep reachability delta {expected_sequence} digest mismatch"
+            )));
+        }
+        batches.push(batch);
     }
     Ok(batches)
 }
 
-#[allow(dead_code)]
-async fn load_tree_sweep_root_closure<S>(
-    store: &S,
-) -> Result<([u8; 32], [u8; 32], Bytes, BTreeSet<[u8; 32]>), LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync,
-{
-    let controls = BranchHeadControlContext::new()
-        .reader(store.clone())
-        .scan()
-        .await?;
-    let recovery_refs = load_recovery_refs(store).await?;
-    let (queue, raw_queue) = load_reachability_queue(store).await?;
-    let batches = load_all_reachability_batches_for_tree_sweep(store, &queue).await?;
-    let mut commits = controls
-        .iter()
-        .flat_map(|(_, control)| {
-            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
-        })
-        .collect::<BTreeSet<_>>();
-    commits.extend(recovery_refs.iter().flat_map(|recovery| {
-        [
-            recovery.recovered_head_commit_id,
-            recovery.checkpoint_commit_id,
-        ]
-    }));
-    commits.extend(
-        batches
-            .iter()
-            .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
-    );
-    if commits.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root set is empty",
-        ));
-    }
-
-    let mut pending = commits.iter().copied().collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
-    let mut roots = BTreeSet::new();
-    while let Some(commit_id) = pending.pop() {
-        if !visited.insert(commit_id) {
-            continue;
-        }
-        let manifest = crate::tracked_state::load_commit_state_manifest(store, commit_id)
-            .await?
-            .ok_or_else(|| {
-                tree_sweep_error(format!(
-                    "tree sweep root '{commit_id}' has no authenticated physical manifest"
-                ))
-            })?;
-        if let Some(source) = manifest.mutations.selected_source_commit_id() {
-            pending.push(source);
-        }
-        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
-            roots.insert(*snapshot_root.root_id.as_bytes());
-            for parent in &snapshot_root.parent_roots {
-                roots.insert(*parent.root_id.as_bytes());
-            }
-        }
-    }
-    if roots.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root set has no tracked tree roots",
-        ));
-    }
-    let root_set_digest = tree_sweep_digest(&roots);
-    let typed_roots = roots
-        .iter()
-        .copied()
-        .map(crate::tracked_state::TrackedStateRootId::new)
-        .collect::<Vec<_>>();
-    let live_chunks =
-        crate::tracked_state::collect_reachable_tree_chunk_hashes(store, &typed_roots).await?;
-    if live_chunks.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root closure is empty",
-        ));
-    }
-    Ok((
-        root_set_digest,
-        tree_sweep_digest(&live_chunks),
-        raw_queue,
-        live_chunks,
-    ))
+struct TreeSweepScanPage {
+    entries: Vec<(StorageKey, StorageProjectedValue)>,
+    next_resume_after: Option<Vec<u8>>,
 }
 
-#[allow(dead_code)]
-async fn scan_tree_sweep_marks<S>(
+async fn scan_tree_sweep_prefix_page<S>(
     store: &S,
-    expected_epoch: Option<u64>,
-) -> Result<(BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>), LixError>
+    space: StorageSpace,
+    prefix: &'static [u8],
+    projection: StorageCoreProjection,
+    resume_after: Option<&[u8]>,
+    page_rows: usize,
+) -> Result<TreeSweepScanPage, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plan = ScanPlan::prefix(
-        GC_TREE_SWEEP_MARK_SPACE,
+    let page = ScanPlan::prefix(
+        space,
         StoragePrefix {
-            bytes: Bytes::new(),
+            bytes: Bytes::from_static(prefix),
         },
-    );
-    let mut resume_after = None;
-    let mut previous_key = None;
-    let mut current = BTreeSet::new();
-    let mut all = BTreeSet::new();
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: GC_TREE_SWEEP_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        if page.value.has_more && page.value.entries.is_empty() {
-            return Err(tree_sweep_error(
-                "tree sweep mark scan reported has_more with an empty page",
-            ));
-        }
-        for entry in &page.value.entries {
-            if entry.key.0.len() != 32
-                || previous_key
-                    .as_ref()
-                    .is_some_and(|previous: &StorageKey| entry.key <= *previous)
-            {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan keys are malformed or non-increasing",
-                ));
-            }
-            let key_hash: [u8; 32] = entry
-                .key
-                .0
-                .as_ref()
-                .try_into()
-                .map_err(|_| tree_sweep_error("tree sweep mark key is not 32 bytes"))?;
-            let StorageProjectedValue::FullValue(bytes) = &entry.value else {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan returned a key-only value",
-                ));
-            };
-            let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", bytes)
-                .map_err(|error| {
-                    tree_sweep_error(format!("tree sweep mark is malformed: {error}"))
-                })?;
-            if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION || mark.chunk_hash != key_hash {
-                return Err(tree_sweep_error(
-                    "tree sweep mark identity or format is invalid",
-                ));
-            }
-            all.insert(key_hash);
-            if expected_epoch.is_none_or(|epoch| mark.epoch_id == epoch) {
-                current.insert(key_hash);
-            }
-            previous_key = Some(entry.key.clone());
-        }
-        let Some(last) = page.value.entries.last() else {
-            if page.value.has_more {
-                return Err(tree_sweep_error(
-                    "tree sweep mark scan has_more without a resume key",
-                ));
-            }
-            break;
-        };
-        if page.value.has_more {
-            resume_after = Some(last.key.clone());
-        } else {
-            break;
-        }
+    )
+    .collect(
+        store,
+        StorageScanOptions {
+            projection,
+            limit_rows: page_rows,
+            resume_after: resume_after.map(|key| StorageKey(Bytes::copy_from_slice(key))),
+            ..StorageScanOptions::default()
+        },
+    )
+    .await?;
+    if page.value.has_more && page.value.entries.is_empty() {
+        return Err(tree_sweep_error(format!(
+            "tree sweep scan for '{}' reported more rows after an empty page",
+            space.name
+        )));
     }
-    Ok((current, all))
+    let next_resume_after = page
+        .value
+        .has_more
+        .then(|| page.value.entries.last().map(|entry| entry.key.0.to_vec()))
+        .flatten();
+    Ok(TreeSweepScanPage {
+        entries: page
+            .value
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect(),
+        next_resume_after,
+    })
 }
 
-#[allow(dead_code)]
+async fn scan_tree_sweep_chunk_page<S>(
+    store: &S,
+    resume_after: Option<&[u8]>,
+    page_rows: usize,
+) -> Result<TreeSweepScanPage, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let page = ScanPlan::range(
+        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+        StorageKeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    )
+    .collect(
+        store,
+        StorageScanOptions {
+            projection: StorageCoreProjection::FullValue,
+            limit_rows: page_rows,
+            resume_after: resume_after.map(|key| StorageKey(Bytes::copy_from_slice(key))),
+            ..StorageScanOptions::default()
+        },
+    )
+    .await?;
+    if page.value.has_more && page.value.entries.is_empty() {
+        return Err(tree_sweep_error(
+            "tree sweep chunk scan reported more rows after an empty page",
+        ));
+    }
+    let next_resume_after = page
+        .value
+        .has_more
+        .then(|| page.value.entries.last().map(|entry| entry.key.0.to_vec()))
+        .flatten();
+    Ok(TreeSweepScanPage {
+        entries: page
+            .value
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect(),
+        next_resume_after,
+    })
+}
+
+struct TreeSweepRecoveryPage {
+    refs: Vec<CheckpointRecoveryRef>,
+    next_resume_after: Option<Vec<u8>>,
+}
+
+async fn load_tree_sweep_recovery_page<S>(
+    store: &S,
+    resume_after: Option<&[u8]>,
+    page_rows: usize,
+) -> Result<TreeSweepRecoveryPage, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let page = scan_tree_sweep_prefix_page(
+        store,
+        CHECKPOINT_RECOVERY_REF_SPACE,
+        b"",
+        StorageCoreProjection::FullValue,
+        resume_after,
+        page_rows,
+    )
+    .await?;
+    let refs = page
+        .entries
+        .into_iter()
+        .map(|(key, value)| {
+            let StorageProjectedValue::FullValue(bytes) = value else {
+                return Err(tree_sweep_error(
+                    "tree sweep recovery scan returned a key-only value",
+                ));
+            };
+            let stored: StoredCheckpointRecoveryRef =
+                storage_codec::decode("checkpoint recovery ref", &bytes)?;
+            validate_stored_recovery_ref(&stored, &stored.branch_id)?;
+            if key.0.as_ref() != recovery_ref_key(&stored.branch_id)?.as_slice() {
+                return Err(tree_sweep_error(
+                    "tree sweep recovery ref key does not match its value",
+                ));
+            }
+            Ok(CheckpointRecoveryRef {
+                branch_id: stored.branch_id,
+                recovered_head_commit_id: stored.recovered_head_commit_id,
+                checkpoint_commit_id: stored.checkpoint_commit_id,
+                interval_has_commits: stored.interval_has_commits,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(TreeSweepRecoveryPage {
+        refs,
+        next_resume_after: page.next_resume_after,
+    })
+}
+
 async fn load_optional_tree_sweep_row<S, T>(
     store: &S,
     space: StorageSpace,
@@ -865,416 +930,956 @@ where
     let key = StorageKey(Bytes::from_static(key));
     let value = PointReadPlan::new(space, std::slice::from_ref(&key))
         .materialize(store, StorageGetOptions::default())
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten();
+        .await?;
+    let value = value.value.into_iter().next().flatten();
     let Some(StorageProjectedValue::FullValue(bytes)) = value else {
         return Ok(None);
     };
-    let decoded = storage_codec::decode(label, &bytes)?;
-    Ok(Some((decoded, bytes)))
+    Ok(Some((storage_codec::decode(label, &bytes)?, bytes)))
 }
 
-/// Starts a new authenticated tree sweep epoch. The expensive root closure
-/// and mark inventory are built once here; ordinary queue-prefix GC never
-/// calls this function.
-#[allow(dead_code)]
-pub(crate) async fn begin_tree_sweep_epoch<S>(
+async fn load_tree_sweep_state<S>(
     store: &S,
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<TreeSweepEpochSession, LixError>
+) -> Result<Option<(StoredTreeSweepEpoch, Bytes, StoredTreeSweepCursor, Bytes)>, LixError>
 where
-    S: StorageAdapterRead + Clone + Send + Sync,
+    S: StorageAdapterRead + ?Sized,
 {
-    let old_epoch = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
+    let epoch = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
         store,
         GC_TREE_SWEEP_EPOCH_SPACE,
         GC_TREE_SWEEP_EPOCH_KEY,
         "tree sweep epoch",
     )
     .await?;
-    let old_cursor = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
+    let cursor = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
         store,
         GC_TREE_SWEEP_CURSOR_SPACE,
         GC_TREE_SWEEP_CURSOR_KEY,
         "tree sweep cursor",
     )
     .await?;
-    if old_epoch.is_some() != old_cursor.is_some() {
-        return Err(tree_sweep_error(
-            "tree sweep epoch and cursor lifecycle rows disagree",
-        ));
-    }
-    if old_cursor
-        .as_ref()
-        .is_some_and(|(cursor, _)| !cursor.complete)
+    let (epoch, raw_epoch, cursor, raw_cursor) = match (epoch, cursor) {
+        (None, None) => return Ok(None),
+        (Some((epoch, raw_epoch)), Some((cursor, raw_cursor))) => {
+            (epoch, raw_epoch, cursor, raw_cursor)
+        }
+        _ => {
+            return Err(tree_sweep_error(
+                "tree sweep epoch and cursor lifecycle rows disagree",
+            ));
+        }
+    };
+    if epoch.format_version != GC_TREE_SWEEP_FORMAT_VERSION
+        || cursor.format_version != GC_TREE_SWEEP_FORMAT_VERSION
+        || epoch.epoch_id == 0
+        || cursor.epoch_id != epoch.epoch_id
+        || cursor.phase > TREE_SWEEP_PHASE_COMPLETE
+        || cursor.complete != (cursor.phase == TREE_SWEEP_PHASE_COMPLETE)
+        || cursor.work_head_sequence == 0
+        || cursor.work_head_sequence > cursor.work_tail_sequence
+        || (cursor.queue_sequence == 0) != (cursor.queue_tail_sequence == 0)
+        || (cursor.queue_sequence != 0
+            && cursor.queue_sequence > cursor.queue_tail_sequence.saturating_add(1))
     {
         return Err(tree_sweep_error(
-            "tree sweep epoch is already active; reopen it instead of creating a second epoch",
+            "tree sweep epoch or cursor identity, format, or bounds are invalid",
         ));
     }
-    let (root_set_digest, live_chunk_digest, raw_queue, live_chunks) =
-        load_tree_sweep_root_closure(store).await?;
-    let epoch_id = old_epoch
-        .as_ref()
-        .map_or(1, |(epoch, _)| epoch.epoch_id.saturating_add(1));
+    Ok(Some((epoch, raw_epoch, cursor, raw_cursor)))
+}
+
+fn stage_tree_sweep_cursor(
+    writes: &mut StorageWriteSet,
+    cursor: &StoredTreeSweepCursor,
+) -> Result<(), LixError> {
+    writes.put(
+        GC_TREE_SWEEP_CURSOR_SPACE,
+        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode("tree sweep cursor", cursor)?),
+        },
+    );
+    Ok(())
+}
+
+fn stage_tree_sweep_start(
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    queue: &StoredReachabilityQueue,
+    raw_queue: Bytes,
+    old_state: Option<(StoredTreeSweepEpoch, Bytes, StoredTreeSweepCursor, Bytes)>,
+) -> Result<(StoredTreeSweepEpoch, StoredTreeSweepCursor), LixError> {
+    let epoch_id = match old_state.as_ref() {
+        Some((epoch, _, _, _)) => epoch
+            .epoch_id
+            .checked_add(1)
+            .ok_or_else(|| tree_sweep_error("tree sweep epoch id overflowed"))?,
+        None => 1,
+    };
     let epoch = StoredTreeSweepEpoch {
         format_version: GC_TREE_SWEEP_FORMAT_VERSION,
         epoch_id,
         queue_digest: *blake3::hash(&raw_queue).as_bytes(),
-        root_set_digest,
-        live_chunk_digest,
-        live_chunk_count: live_chunks.len() as u64,
     };
     let cursor = StoredTreeSweepCursor {
         format_version: GC_TREE_SWEEP_FORMAT_VERSION,
         epoch_id,
-        last_key: None,
+        phase: TREE_SWEEP_PHASE_CLEAN_WORK,
+        scan_after: None,
+        queue_sequence: queue.head_sequence,
+        queue_tail_sequence: queue.tail_sequence,
+        work_head_sequence: 1,
+        work_tail_sequence: 1,
+        root_count: 0,
+        live_mark_count: 0,
+        verified_mark_count: 0,
+        verified_mark_digest: tree_sweep_empty_digest(),
+        observed_mark_count: 0,
+        observed_mark_digest: tree_sweep_empty_digest(),
+        candidate_count: 0,
         scanned_rows: 0,
         deleted_rows: 0,
         complete: false,
     };
-    let (current_marks, all_marks) = scan_tree_sweep_marks(store, None).await?;
-    let _ = current_marks;
-    for hash in all_marks.difference(&live_chunks) {
-        writes.delete(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-        );
-    }
-    for hash in &live_chunks {
-        let mark = StoredTreeSweepMark {
-            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-            epoch_id,
-            chunk_hash: *hash,
-        };
-        writes.put(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-            StorageValue {
-                bytes: Bytes::from(storage_codec::encode("tree sweep mark", &mark)?),
-            },
-        );
-    }
-    let epoch_bytes = Bytes::from(storage_codec::encode("tree sweep epoch", &epoch)?);
-    let cursor_bytes = Bytes::from(storage_codec::encode("tree sweep cursor", &cursor)?);
     writes.put(
         GC_TREE_SWEEP_EPOCH_SPACE,
         StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-        StorageValue { bytes: epoch_bytes },
-    );
-    writes.put(
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
         StorageValue {
-            bytes: cursor_bytes.clone(),
+            bytes: Bytes::from(storage_codec::encode("tree sweep epoch", &epoch)?),
         },
     );
+    stage_tree_sweep_cursor(writes, &cursor)?;
     preconditions.push(StoragePrecondition::KeyValueEquals {
         space: GC_REACHABILITY_QUEUE_SPACE,
         key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
         expected: raw_queue,
     });
-    if let Some((_, raw)) = old_epoch {
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_TREE_SWEEP_EPOCH_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-            expected: raw,
-        });
-    } else {
-        preconditions.push(StoragePrecondition::KeyAbsent {
-            space: GC_TREE_SWEEP_EPOCH_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
-        });
+    match old_state {
+        Some((_, raw_epoch, _, raw_cursor)) => {
+            preconditions.push(StoragePrecondition::KeyValueEquals {
+                space: GC_TREE_SWEEP_EPOCH_SPACE,
+                key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
+                expected: raw_epoch,
+            });
+            preconditions.push(StoragePrecondition::KeyValueEquals {
+                space: GC_TREE_SWEEP_CURSOR_SPACE,
+                key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
+                expected: raw_cursor,
+            });
+        }
+        None => {
+            preconditions.push(StoragePrecondition::KeyAbsent {
+                space: GC_TREE_SWEEP_EPOCH_SPACE,
+                key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
+            });
+            preconditions.push(StoragePrecondition::KeyAbsent {
+                space: GC_TREE_SWEEP_CURSOR_SPACE,
+                key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
+            });
+        }
     }
-    if let Some((_, raw)) = old_cursor {
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_TREE_SWEEP_CURSOR_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-            expected: raw,
-        });
-    } else {
-        preconditions.push(StoragePrecondition::KeyAbsent {
-            space: GC_TREE_SWEEP_CURSOR_SPACE,
-            key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        });
-    }
-    Ok(TreeSweepEpochSession {
-        epoch,
-        cursor,
-        raw_cursor: cursor_bytes,
-        live_chunks,
-    })
+    Ok((epoch, cursor))
 }
 
-/// Reopens an active or completed epoch. Mark rows are fully authenticated
-/// against the persisted count/digest before any page may stage a delete.
-#[allow(dead_code)]
-pub(crate) async fn open_tree_sweep_epoch<S>(
-    store: &S,
-) -> Result<Option<TreeSweepEpochSession>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let Some((epoch, _)) = load_optional_tree_sweep_row::<S, StoredTreeSweepEpoch>(
-        store,
-        GC_TREE_SWEEP_EPOCH_SPACE,
-        GC_TREE_SWEEP_EPOCH_KEY,
-        "tree sweep epoch",
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    if epoch.format_version != GC_TREE_SWEEP_FORMAT_VERSION {
-        return Err(tree_sweep_error("tree sweep epoch format is unsupported"));
-    }
-    let Some((cursor, raw_cursor)) = load_optional_tree_sweep_row::<S, StoredTreeSweepCursor>(
-        store,
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        GC_TREE_SWEEP_CURSOR_KEY,
-        "tree sweep cursor",
-    )
-    .await?
-    else {
-        return Err(tree_sweep_error("tree sweep cursor is missing"));
-    };
-    if cursor.format_version != GC_TREE_SWEEP_FORMAT_VERSION || cursor.epoch_id != epoch.epoch_id {
-        return Err(tree_sweep_error("tree sweep cursor identity is invalid"));
-    }
-    let (live_chunks, all_marks) = scan_tree_sweep_marks(store, Some(epoch.epoch_id)).await?;
-    if live_chunks != all_marks
-        || live_chunks.len() as u64 != epoch.live_chunk_count
-        || tree_sweep_digest(&live_chunks) != epoch.live_chunk_digest
-    {
+fn decode_tree_sweep_mark(
+    key_hash: [u8; 32],
+    value: StorageProjectedValue,
+) -> Result<StoredTreeSweepMark, LixError> {
+    let StorageProjectedValue::FullValue(bytes) = value else {
         return Err(tree_sweep_error(
-            "tree sweep mark inventory disagrees with epoch closure or contains stale rows",
+            "tree sweep mark read unexpectedly omitted its value",
+        ));
+    };
+    let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", &bytes)?;
+    if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION || mark.chunk_hash != key_hash {
+        return Err(tree_sweep_error(
+            "tree sweep mark identity or format is invalid",
         ));
     }
-    Ok(Some(TreeSweepEpochSession {
-        epoch,
-        cursor,
-        raw_cursor,
-        live_chunks,
-    }))
+    Ok(mark)
 }
 
-/// Enumerates one bounded tree-chunk page and stages only chunks absent from
-/// the authenticated epoch mark set. Every key/value and cursor transition is
-/// validated before staging; the queue and cursor CAS fences make interruption
-/// and root publication races fail closed.
-#[allow(dead_code)]
-pub(crate) async fn stage_tree_sweep_epoch_page<S>(
-    store: &S,
-    session: &mut TreeSweepEpochSession,
+fn stage_tree_sweep_work(
     writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if session.cursor.complete {
-        return Ok(true);
-    }
-    let (queue, raw_queue) = load_reachability_queue(store).await?;
-    if *blake3::hash(&raw_queue).as_bytes() != session.epoch.queue_digest {
-        return Err(tree_sweep_error(
-            "tree sweep root publication advanced during an active epoch",
-        ));
-    }
-    let plan = ScanPlan::range(
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
+    cursor: &mut StoredTreeSweepCursor,
+    kind: u8,
+    identity: Vec<u8>,
+) -> Result<(), LixError> {
+    let sequence = cursor.work_tail_sequence;
+    cursor.work_tail_sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| tree_sweep_error("tree sweep work sequence overflowed"))?;
+    let work = StoredTreeSweepWork {
+        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
+        epoch_id: cursor.epoch_id,
+        sequence,
+        kind,
+        identity,
+    };
+    writes.put(
+        GC_TREE_SWEEP_CURSOR_SPACE,
+        tree_sweep_work_key(sequence),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode("tree sweep work", &work)?),
         },
     );
-    let page = plan
-        .collect(
-            store,
-            StorageScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                limit_rows: GC_TREE_SWEEP_PAGE_ROWS,
-                resume_after: session
-                    .cursor
-                    .last_key
-                    .as_ref()
-                    .map(|key| StorageKey(Bytes::copy_from_slice(key))),
-                ..StorageScanOptions::default()
-            },
-        )
-        .await?;
-    if page.value.has_more && page.value.entries.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep tree-chunk scan reported has_more with an empty page",
-        ));
-    }
-    let previous = session.cursor.last_key.as_deref();
-    let mut hashes = Vec::with_capacity(page.value.entries.len());
-    for entry in &page.value.entries {
-        if entry.key.0.len() != 32
-            || previous.is_some_and(|previous| entry.key.0.as_ref() <= previous)
-            || hashes
-                .last()
-                .is_some_and(|last: &[u8; 32]| entry.key.0.as_ref() <= last.as_slice())
-        {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk keys are malformed or non-increasing",
-            ));
-        }
-        let hash: [u8; 32] = entry
-            .key
-            .0
-            .as_ref()
-            .try_into()
-            .map_err(|_| tree_sweep_error("tree sweep tree-chunk key is not 32 bytes"))?;
-        let StorageProjectedValue::FullValue(bytes) = &entry.value else {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk scan returned a key-only value",
-            ));
-        };
-        if *blake3::hash(bytes).as_bytes() != hash {
-            return Err(tree_sweep_error(
-                "tree sweep tree-chunk value hash disagrees with its key",
-            ));
-        }
-        hashes.push(hash);
-    }
-    let mark_keys = hashes
+    Ok(())
+}
+
+async fn stage_tree_sweep_enqueue<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    cursor: &mut StoredTreeSweepCursor,
+    commits: BTreeSet<CommitId>,
+    chunks: BTreeSet<[u8; 32]>,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let commit_keys = commits
         .iter()
-        .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+        .copied()
+        .map(tree_sweep_commit_seen_key)
         .collect::<Vec<_>>();
-    let marks = if mark_keys.is_empty() {
+    let commit_values = if commit_keys.is_empty() {
         Vec::new()
     } else {
-        PointReadPlan::new(GC_TREE_SWEEP_MARK_SPACE, &mark_keys)
+        PointReadPlan::new(GC_TREE_SWEEP_CURSOR_SPACE, &commit_keys)
             .materialize(store, StorageGetOptions::default())
             .await?
             .value
     };
-    if marks.len() != hashes.len() {
-        return Err(tree_sweep_error(
-            "tree sweep mark point read returned the wrong cardinality",
-        ));
-    }
-    let mut deletes = Vec::new();
-    for (hash, mark) in hashes.iter().zip(marks) {
-        let marked = match mark {
+    for ((commit_id, key), value) in commits.into_iter().zip(commit_keys).zip(commit_values) {
+        let current = match value {
             None => false,
             Some(StorageProjectedValue::KeyOnly) => {
                 return Err(tree_sweep_error(
-                    "tree sweep mark point read returned a key-only value",
+                    "tree sweep commit-seen read omitted its value",
                 ));
             }
             Some(StorageProjectedValue::FullValue(bytes)) => {
-                let mark: StoredTreeSweepMark = storage_codec::decode("tree sweep mark", &bytes)
-                    .map_err(|error| {
-                        tree_sweep_error(format!("tree sweep mark is malformed: {error}"))
-                    })?;
-                if mark.format_version != GC_TREE_SWEEP_FORMAT_VERSION
-                    || mark.epoch_id != session.epoch.epoch_id
-                    || mark.chunk_hash != *hash
+                let seen: StoredTreeSweepCommitSeen =
+                    storage_codec::decode("tree sweep commit seen", &bytes)?;
+                if seen.format_version != GC_TREE_SWEEP_FORMAT_VERSION
+                    || seen.commit_id != commit_id
                 {
                     return Err(tree_sweep_error(
-                        "tree sweep mark does not authenticate the current epoch chunk",
+                        "tree sweep commit-seen identity or format is invalid",
                     ));
                 }
-                true
+                seen.epoch_id == cursor.epoch_id
             }
         };
-        if marked != session.live_chunks.contains(hash) {
-            return Err(tree_sweep_error(
-                "tree sweep mark completeness disagrees with authenticated closure",
-            ));
+        if current {
+            continue;
         }
-        if !marked {
-            deletes.push(*hash);
-        }
+        let seen = StoredTreeSweepCommitSeen {
+            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
+            epoch_id: cursor.epoch_id,
+            commit_id,
+        };
+        writes.put(
+            GC_TREE_SWEEP_CURSOR_SPACE,
+            key,
+            StorageValue {
+                bytes: Bytes::from(storage_codec::encode("tree sweep commit seen", &seen)?),
+            },
+        );
+        stage_tree_sweep_work(
+            writes,
+            cursor,
+            TREE_SWEEP_WORK_COMMIT,
+            commit_id.as_uuid().as_bytes().to_vec(),
+        )?;
     }
 
-    // A complete keyspace scan must prove that every authenticated live mark
-    // still has its physical chunk before any delete is staged.  This catches
-    // a live chunk deleted between epoch creation and the final page (the
-    // mark inventory alone cannot distinguish that from a clean sweep).
-    if !page.value.has_more {
-        let live_keys = session
-            .live_chunks
-            .iter()
-            .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
-            .collect::<Vec<_>>();
-        for chunk_keys in live_keys.chunks(GC_TREE_SWEEP_PAGE_ROWS) {
-            let values = PointReadPlan::new(
-                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-                chunk_keys,
-            )
+    let chunk_keys = chunks
+        .iter()
+        .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+        .collect::<Vec<_>>();
+    let chunk_values = if chunk_keys.is_empty() {
+        Vec::new()
+    } else {
+        PointReadPlan::new(GC_TREE_SWEEP_MARK_SPACE, &chunk_keys)
             .materialize(store, StorageGetOptions::default())
             .await?
-            .value;
-            if values.len() != chunk_keys.len() {
-                return Err(tree_sweep_error(
-                    "tree sweep final live-chunk validation returned the wrong cardinality",
-                ));
+            .value
+    };
+    for ((hash, key), value) in chunks.into_iter().zip(chunk_keys).zip(chunk_values) {
+        let current = match value {
+            None => false,
+            Some(value) => decode_tree_sweep_mark(hash, value)?.epoch_id == cursor.epoch_id,
+        };
+        if current {
+            continue;
+        }
+        let mark = StoredTreeSweepMark {
+            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
+            epoch_id: cursor.epoch_id,
+            chunk_hash: hash,
+        };
+        writes.put(
+            GC_TREE_SWEEP_MARK_SPACE,
+            key,
+            StorageValue {
+                bytes: Bytes::from(storage_codec::encode("tree sweep mark", &mark)?),
+            },
+        );
+        stage_tree_sweep_work(writes, cursor, TREE_SWEEP_WORK_CHUNK, hash.to_vec())?;
+        cursor.live_mark_count = cursor
+            .live_mark_count
+            .checked_add(1)
+            .ok_or_else(|| tree_sweep_error("tree sweep live-mark count overflowed"))?;
+    }
+    Ok(())
+}
+
+fn tree_sweep_commit_id(bytes: &[u8]) -> Result<CommitId, LixError> {
+    uuid::Uuid::from_slice(bytes)
+        .map(CommitId::new)
+        .map_err(|error| tree_sweep_error(format!("tree sweep commit id is malformed: {error}")))
+}
+
+fn tree_sweep_hash(bytes: &[u8], context: &str) -> Result<[u8; 32], LixError> {
+    bytes
+        .try_into()
+        .map_err(|_| tree_sweep_error(format!("{context} is not a 32-byte hash")))
+}
+
+async fn stage_tree_sweep_active_page<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    cursor: &mut StoredTreeSweepCursor,
+    page_rows: usize,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + Send + Sync + ?Sized,
+{
+    match cursor.phase {
+        TREE_SWEEP_PHASE_CLEAN_WORK | TREE_SWEEP_PHASE_CLEAN_CANDIDATES => {
+            let prefix = if cursor.phase == TREE_SWEEP_PHASE_CLEAN_WORK {
+                GC_TREE_SWEEP_WORK_PREFIX
+            } else {
+                GC_TREE_SWEEP_CANDIDATE_PREFIX
+            };
+            let page = scan_tree_sweep_prefix_page(
+                store,
+                GC_TREE_SWEEP_CURSOR_SPACE,
+                prefix,
+                StorageCoreProjection::KeyOnly,
+                cursor.scan_after.as_deref(),
+                page_rows,
+            )
+            .await?;
+            for (key, _) in &page.entries {
+                writes.delete(GC_TREE_SWEEP_CURSOR_SPACE, key.clone());
             }
-            for (key, value) in chunk_keys.iter().zip(values) {
-                let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                    return Err(tree_sweep_error(
-                        "tree sweep final live-chunk validation found a missing or key-only chunk",
-                    ));
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                cursor.phase = if cursor.phase == TREE_SWEEP_PHASE_CLEAN_WORK {
+                    TREE_SWEEP_PHASE_CLEAN_CANDIDATES
+                } else {
+                    TREE_SWEEP_PHASE_CONTROLS
                 };
-                if blake3::hash(&bytes).as_bytes().as_slice() != key.0.as_ref() {
+            }
+        }
+        TREE_SWEEP_PHASE_CONTROLS => {
+            let page = BranchHeadControlContext::new()
+                .reader(store)
+                .scan_page(
+                    cursor
+                        .scan_after
+                        .as_ref()
+                        .map(|key| StorageKey(Bytes::copy_from_slice(key))),
+                    page_rows,
+                )
+                .await?;
+            let mut commits = BTreeSet::new();
+            for (_, control) in &page.entries {
+                commits.insert(control.head_commit_id);
+                commits.extend(control.working_diff_checkpoint_commit_id);
+            }
+            cursor.root_count = cursor
+                .root_count
+                .checked_add(commits.len() as u64)
+                .ok_or_else(|| tree_sweep_error("tree sweep root count overflowed"))?;
+            stage_tree_sweep_enqueue(store, writes, cursor, commits, BTreeSet::new()).await?;
+            cursor.scan_after = page.next_resume_after.map(|key| key.0.to_vec());
+            if cursor.scan_after.is_none() {
+                cursor.phase = TREE_SWEEP_PHASE_RECOVERY;
+            }
+        }
+        TREE_SWEEP_PHASE_RECOVERY => {
+            let page =
+                load_tree_sweep_recovery_page(store, cursor.scan_after.as_deref(), page_rows)
+                    .await?;
+            let mut commits = BTreeSet::new();
+            for recovery in page.refs {
+                commits.insert(recovery.recovered_head_commit_id);
+                commits.insert(recovery.checkpoint_commit_id);
+            }
+            cursor.root_count = cursor
+                .root_count
+                .checked_add(commits.len() as u64)
+                .ok_or_else(|| tree_sweep_error("tree sweep root count overflowed"))?;
+            stage_tree_sweep_enqueue(store, writes, cursor, commits, BTreeSet::new()).await?;
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                cursor.phase = TREE_SWEEP_PHASE_QUEUE;
+            }
+        }
+        TREE_SWEEP_PHASE_QUEUE => {
+            if cursor.queue_sequence == 0 || cursor.queue_sequence > cursor.queue_tail_sequence {
+                if cursor.root_count == 0 {
                     return Err(tree_sweep_error(
-                        "tree sweep final live-chunk validation found a corrupt chunk",
+                        "tree sweep authenticated root set is empty",
                     ));
+                }
+                cursor.phase = TREE_SWEEP_PHASE_TRACE;
+            } else {
+                let batches = load_tree_sweep_reachability_page(
+                    store,
+                    cursor.queue_sequence,
+                    cursor.queue_tail_sequence,
+                    page_rows,
+                )
+                .await?;
+                if batches.is_empty() {
+                    return Err(tree_sweep_error(
+                        "tree sweep reachability page unexpectedly returned no batches",
+                    ));
+                }
+                let mut commits = BTreeSet::new();
+                for batch in &batches {
+                    commits.extend(batch.checkpoint_roots.iter().copied());
+                }
+                cursor.root_count = cursor
+                    .root_count
+                    .checked_add(commits.len() as u64)
+                    .ok_or_else(|| tree_sweep_error("tree sweep root count overflowed"))?;
+                stage_tree_sweep_enqueue(store, writes, cursor, commits, BTreeSet::new()).await?;
+                cursor.queue_sequence = cursor
+                    .queue_sequence
+                    .checked_add(batches.len() as u64)
+                    .ok_or_else(|| tree_sweep_error("tree sweep queue cursor overflowed"))?;
+                if cursor.queue_sequence > cursor.queue_tail_sequence {
+                    cursor.phase = TREE_SWEEP_PHASE_TRACE;
                 }
             }
         }
+        TREE_SWEEP_PHASE_TRACE => {
+            if cursor.work_head_sequence >= cursor.work_tail_sequence {
+                if cursor.live_mark_count == 0 {
+                    return Err(tree_sweep_error(
+                        "tree sweep authenticated root closure has no tree chunks",
+                    ));
+                }
+                cursor.phase = TREE_SWEEP_PHASE_VERIFY_MARKS;
+                cursor.scan_after = None;
+            } else {
+                let end = cursor
+                    .work_head_sequence
+                    .saturating_add(page_rows as u64)
+                    .min(cursor.work_tail_sequence);
+                let keys = (cursor.work_head_sequence..end)
+                    .map(tree_sweep_work_key)
+                    .collect::<Vec<_>>();
+                let values = PointReadPlan::new(GC_TREE_SWEEP_CURSOR_SPACE, &keys)
+                    .materialize(store, StorageGetOptions::default())
+                    .await?
+                    .value;
+                let mut next_commits = BTreeSet::new();
+                let mut next_chunks = BTreeSet::new();
+                for ((sequence, key), value) in
+                    (cursor.work_head_sequence..end).zip(keys).zip(values)
+                {
+                    let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+                        return Err(tree_sweep_error(format!(
+                            "tree sweep work item {sequence} is missing"
+                        )));
+                    };
+                    let work: StoredTreeSweepWork =
+                        storage_codec::decode("tree sweep work", &bytes)?;
+                    if work.format_version != GC_TREE_SWEEP_FORMAT_VERSION
+                        || work.epoch_id != cursor.epoch_id
+                        || work.sequence != sequence
+                    {
+                        return Err(tree_sweep_error(
+                            "tree sweep work identity or format is invalid",
+                        ));
+                    }
+                    match work.kind {
+                        TREE_SWEEP_WORK_COMMIT => {
+                            let commit_id = tree_sweep_commit_id(&work.identity)?;
+                            let manifest = crate::tracked_state::load_commit_state_manifest(
+                                store, commit_id,
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                tree_sweep_error(format!(
+                                    "tree sweep root '{commit_id}' has no authenticated physical manifest"
+                                ))
+                            })?;
+                            next_commits.extend(manifest.mutations.selected_source_commit_id());
+                            if let Some(root) = manifest.snapshot_root.as_ref() {
+                                next_chunks.insert(*root.root_id.as_bytes());
+                                next_chunks.extend(
+                                    root.parent_roots
+                                        .iter()
+                                        .map(|parent| *parent.root_id.as_bytes()),
+                                );
+                            }
+                        }
+                        TREE_SWEEP_WORK_CHUNK => {
+                            let hash = tree_sweep_hash(&work.identity, "tree sweep work chunk")?;
+                            let mark_key = StorageKey(Bytes::copy_from_slice(&hash));
+                            let mark = PointReadPlan::new(
+                                GC_TREE_SWEEP_MARK_SPACE,
+                                std::slice::from_ref(&mark_key),
+                            )
+                            .materialize(store, StorageGetOptions::default())
+                            .await?
+                            .value
+                            .into_iter()
+                            .next()
+                            .flatten()
+                            .ok_or_else(|| {
+                                tree_sweep_error("tree sweep work chunk lost its live mark")
+                            })?;
+                            if decode_tree_sweep_mark(hash, mark)?.epoch_id != cursor.epoch_id {
+                                return Err(tree_sweep_error(
+                                    "tree sweep work chunk has a stale live mark",
+                                ));
+                            }
+                            next_chunks.extend(
+                                crate::tracked_state::load_tree_chunk_children(store, &hash)
+                                    .await?,
+                            );
+                        }
+                        _ => {
+                            return Err(tree_sweep_error("tree sweep work kind is invalid"));
+                        }
+                    }
+                    writes.delete(GC_TREE_SWEEP_CURSOR_SPACE, key);
+                }
+                cursor.work_head_sequence = end;
+                stage_tree_sweep_enqueue(store, writes, cursor, next_commits, next_chunks).await?;
+                if cursor.work_head_sequence >= cursor.work_tail_sequence {
+                    if cursor.live_mark_count == 0 {
+                        return Err(tree_sweep_error(
+                            "tree sweep authenticated root closure has no tree chunks",
+                        ));
+                    }
+                    cursor.phase = TREE_SWEEP_PHASE_VERIFY_MARKS;
+                    cursor.scan_after = None;
+                }
+            }
+        }
+        TREE_SWEEP_PHASE_VERIFY_MARKS => {
+            let page = scan_tree_sweep_prefix_page(
+                store,
+                GC_TREE_SWEEP_MARK_SPACE,
+                b"",
+                StorageCoreProjection::FullValue,
+                cursor.scan_after.as_deref(),
+                page_rows,
+            )
+            .await?;
+            let mut live = Vec::new();
+            for (key, value) in &page.entries {
+                let hash = tree_sweep_hash(key.0.as_ref(), "tree sweep mark key")?;
+                let mark = decode_tree_sweep_mark(hash, value.clone())?;
+                if mark.epoch_id == cursor.epoch_id {
+                    live.push(hash);
+                } else {
+                    writes.delete(GC_TREE_SWEEP_MARK_SPACE, key.clone());
+                }
+            }
+            let keys = live
+                .iter()
+                .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+                .collect::<Vec<_>>();
+            let values = if keys.is_empty() {
+                Vec::new()
+            } else {
+                PointReadPlan::new(crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE, &keys)
+                    .materialize(store, StorageGetOptions::default())
+                    .await?
+                    .value
+            };
+            for (hash, value) in live.into_iter().zip(values) {
+                let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+                    return Err(tree_sweep_error(
+                        "tree sweep live mark points to a missing tree chunk",
+                    ));
+                };
+                if *blake3::hash(&bytes).as_bytes() != hash {
+                    return Err(tree_sweep_error(
+                        "tree sweep live chunk value hash disagrees with its key",
+                    ));
+                }
+                cursor.verified_mark_count = cursor
+                    .verified_mark_count
+                    .checked_add(1)
+                    .ok_or_else(|| tree_sweep_error("tree sweep verified mark count overflowed"))?;
+                cursor.verified_mark_digest =
+                    tree_sweep_extend_digest(cursor.verified_mark_digest, hash);
+            }
+            cursor.scanned_rows = cursor
+                .scanned_rows
+                .saturating_add(page.entries.len() as u64);
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                if cursor.verified_mark_count != cursor.live_mark_count {
+                    return Err(tree_sweep_error(
+                        "tree sweep live-mark inventory is incomplete",
+                    ));
+                }
+                cursor.phase = TREE_SWEEP_PHASE_SCAN_CHUNKS;
+                cursor.observed_mark_count = 0;
+                cursor.observed_mark_digest = tree_sweep_empty_digest();
+                cursor.candidate_count = 0;
+            }
+        }
+        TREE_SWEEP_PHASE_SCAN_CHUNKS => {
+            let page =
+                scan_tree_sweep_chunk_page(store, cursor.scan_after.as_deref(), page_rows).await?;
+            let mut chunks = Vec::with_capacity(page.entries.len());
+            for (key, value) in &page.entries {
+                let hash = tree_sweep_hash(key.0.as_ref(), "tree sweep chunk key")?;
+                let StorageProjectedValue::FullValue(bytes) = value else {
+                    return Err(tree_sweep_error("tree sweep chunk scan omitted its value"));
+                };
+                if *blake3::hash(bytes).as_bytes() != hash {
+                    return Err(tree_sweep_error(
+                        "tree sweep chunk value hash disagrees with its key",
+                    ));
+                }
+                chunks.push(hash);
+            }
+            let mark_keys = chunks
+                .iter()
+                .map(|hash| StorageKey(Bytes::copy_from_slice(hash)))
+                .collect::<Vec<_>>();
+            let marks = if mark_keys.is_empty() {
+                Vec::new()
+            } else {
+                PointReadPlan::new(GC_TREE_SWEEP_MARK_SPACE, &mark_keys)
+                    .materialize(store, StorageGetOptions::default())
+                    .await?
+                    .value
+            };
+            for (hash, mark) in chunks.into_iter().zip(marks) {
+                let live = match mark {
+                    None => false,
+                    Some(value) => decode_tree_sweep_mark(hash, value)?.epoch_id == cursor.epoch_id,
+                };
+                if live {
+                    cursor.observed_mark_count =
+                        cursor.observed_mark_count.checked_add(1).ok_or_else(|| {
+                            tree_sweep_error("tree sweep observed mark count overflowed")
+                        })?;
+                    cursor.observed_mark_digest =
+                        tree_sweep_extend_digest(cursor.observed_mark_digest, hash);
+                } else {
+                    let candidate = StoredTreeSweepCandidate {
+                        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
+                        epoch_id: cursor.epoch_id,
+                        chunk_hash: hash,
+                    };
+                    writes.put(
+                        GC_TREE_SWEEP_CURSOR_SPACE,
+                        tree_sweep_candidate_key(&hash),
+                        StorageValue {
+                            bytes: Bytes::from(storage_codec::encode(
+                                "tree sweep candidate",
+                                &candidate,
+                            )?),
+                        },
+                    );
+                    cursor.candidate_count = cursor
+                        .candidate_count
+                        .checked_add(1)
+                        .ok_or_else(|| tree_sweep_error("tree sweep candidate count overflowed"))?;
+                }
+            }
+            cursor.scanned_rows = cursor
+                .scanned_rows
+                .saturating_add(page.entries.len() as u64);
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                if cursor.observed_mark_count != cursor.verified_mark_count
+                    || cursor.observed_mark_digest != cursor.verified_mark_digest
+                {
+                    return Err(tree_sweep_error(
+                        "tree sweep chunk scan does not reproduce the verified live inventory",
+                    ));
+                }
+                cursor.phase = TREE_SWEEP_PHASE_DELETE_CANDIDATES;
+            }
+        }
+        TREE_SWEEP_PHASE_DELETE_CANDIDATES => {
+            let page = scan_tree_sweep_prefix_page(
+                store,
+                GC_TREE_SWEEP_CURSOR_SPACE,
+                GC_TREE_SWEEP_CANDIDATE_PREFIX,
+                StorageCoreProjection::FullValue,
+                cursor.scan_after.as_deref(),
+                page_rows,
+            )
+            .await?;
+            let mut candidates = Vec::with_capacity(page.entries.len());
+            for (key, value) in &page.entries {
+                if key.0.len() != 33 || !key.0.starts_with(GC_TREE_SWEEP_CANDIDATE_PREFIX) {
+                    return Err(tree_sweep_error("tree sweep candidate key is malformed"));
+                }
+                let hash = tree_sweep_hash(&key.0[1..], "tree sweep candidate key")?;
+                let StorageProjectedValue::FullValue(bytes) = value else {
+                    return Err(tree_sweep_error("tree sweep candidate omitted its value"));
+                };
+                let candidate: StoredTreeSweepCandidate =
+                    storage_codec::decode("tree sweep candidate", bytes)?;
+                if candidate.format_version != GC_TREE_SWEEP_FORMAT_VERSION
+                    || candidate.epoch_id != cursor.epoch_id
+                    || candidate.chunk_hash != hash
+                {
+                    return Err(tree_sweep_error(
+                        "tree sweep candidate identity or format is invalid",
+                    ));
+                }
+                candidates.push((key.clone(), hash));
+            }
+            let chunk_keys = candidates
+                .iter()
+                .map(|(_, hash)| StorageKey(Bytes::copy_from_slice(hash)))
+                .collect::<Vec<_>>();
+            let chunks = if chunk_keys.is_empty() {
+                Vec::new()
+            } else {
+                PointReadPlan::new(
+                    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                    &chunk_keys,
+                )
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value
+            };
+            let marks = if chunk_keys.is_empty() {
+                Vec::new()
+            } else {
+                PointReadPlan::new(GC_TREE_SWEEP_MARK_SPACE, &chunk_keys)
+                    .materialize(store, StorageGetOptions::default())
+                    .await?
+                    .value
+            };
+            for (((candidate_key, hash), chunk), mark) in
+                candidates.into_iter().zip(chunks).zip(marks)
+            {
+                if let Some(value) = mark {
+                    if decode_tree_sweep_mark(hash, value)?.epoch_id == cursor.epoch_id {
+                        return Err(tree_sweep_error(
+                            "tree sweep candidate acquired a current live mark",
+                        ));
+                    }
+                }
+                let Some(StorageProjectedValue::FullValue(bytes)) = chunk else {
+                    return Err(tree_sweep_error("tree sweep candidate chunk is missing"));
+                };
+                if *blake3::hash(&bytes).as_bytes() != hash {
+                    return Err(tree_sweep_error("tree sweep candidate chunk is corrupt"));
+                }
+                writes.delete(
+                    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                    StorageKey(Bytes::copy_from_slice(&hash)),
+                );
+                writes.delete(GC_TREE_SWEEP_CURSOR_SPACE, candidate_key);
+                cursor.deleted_rows = cursor.deleted_rows.saturating_add(1);
+            }
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                cursor.phase = TREE_SWEEP_PHASE_CLEAN_MARKS;
+            }
+        }
+        TREE_SWEEP_PHASE_CLEAN_MARKS => {
+            let page = scan_tree_sweep_prefix_page(
+                store,
+                GC_TREE_SWEEP_MARK_SPACE,
+                b"",
+                StorageCoreProjection::FullValue,
+                cursor.scan_after.as_deref(),
+                page_rows,
+            )
+            .await?;
+            for (key, value) in &page.entries {
+                let hash = tree_sweep_hash(key.0.as_ref(), "tree sweep mark key")?;
+                let _ = decode_tree_sweep_mark(hash, value.clone())?;
+                writes.delete(GC_TREE_SWEEP_MARK_SPACE, key.clone());
+            }
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                cursor.phase = TREE_SWEEP_PHASE_CLEAN_SEEN;
+            }
+        }
+        TREE_SWEEP_PHASE_CLEAN_SEEN => {
+            let page = scan_tree_sweep_prefix_page(
+                store,
+                GC_TREE_SWEEP_CURSOR_SPACE,
+                GC_TREE_SWEEP_COMMIT_SEEN_PREFIX,
+                StorageCoreProjection::FullValue,
+                cursor.scan_after.as_deref(),
+                page_rows,
+            )
+            .await?;
+            for (key, value) in &page.entries {
+                if key.0.len() != 17 || !key.0.starts_with(GC_TREE_SWEEP_COMMIT_SEEN_PREFIX) {
+                    return Err(tree_sweep_error("tree sweep commit-seen key is malformed"));
+                }
+                let commit_id = tree_sweep_commit_id(&key.0[1..])?;
+                let StorageProjectedValue::FullValue(bytes) = value else {
+                    return Err(tree_sweep_error("tree sweep commit-seen value is missing"));
+                };
+                let seen: StoredTreeSweepCommitSeen =
+                    storage_codec::decode("tree sweep commit seen", bytes)?;
+                if seen.format_version != GC_TREE_SWEEP_FORMAT_VERSION
+                    || seen.epoch_id != cursor.epoch_id
+                    || seen.commit_id != commit_id
+                {
+                    return Err(tree_sweep_error(
+                        "tree sweep commit-seen identity or format is invalid",
+                    ));
+                }
+                writes.delete(GC_TREE_SWEEP_CURSOR_SPACE, key.clone());
+            }
+            cursor.scan_after = page.next_resume_after;
+            if cursor.scan_after.is_none() {
+                cursor.phase = TREE_SWEEP_PHASE_COMPLETE;
+                cursor.complete = true;
+            }
+        }
+        TREE_SWEEP_PHASE_COMPLETE => {}
+        _ => return Err(tree_sweep_error("tree sweep phase is invalid")),
+    }
+    Ok(())
+}
+
+/// Stages exactly one bounded production maintenance transaction. The
+/// authenticated reachability queue is both the root-publication identity and
+/// the CAS fence for every phase. A changed queue rebuilds the non-authoritative
+/// epoch metadata before any further candidate can be deleted.
+pub(crate) async fn stage_tree_sweep_maintenance_step<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    start_new_epoch: bool,
+) -> Result<TreeSweepMaintenanceStep, LixError>
+where
+    S: StorageAdapterRead + Send + Sync + ?Sized,
+{
+    stage_tree_sweep_maintenance_step_with_page_rows(
+        store,
+        writes,
+        preconditions,
+        start_new_epoch,
+        GC_TREE_SWEEP_PAGE_ROWS,
+    )
+    .await
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn stage_tree_sweep_maintenance_step_for_bench<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    start_new_epoch: bool,
+    page_rows: usize,
+) -> Result<TreeSweepMaintenanceStep, LixError>
+where
+    S: StorageAdapterRead + Send + Sync + ?Sized,
+{
+    stage_tree_sweep_maintenance_step_with_page_rows(
+        store,
+        writes,
+        preconditions,
+        start_new_epoch,
+        page_rows,
+    )
+    .await
+}
+
+async fn stage_tree_sweep_maintenance_step_with_page_rows<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    start_new_epoch: bool,
+    page_rows: usize,
+) -> Result<TreeSweepMaintenanceStep, LixError>
+where
+    S: StorageAdapterRead + Send + Sync + ?Sized,
+{
+    if page_rows == 0 || page_rows > crate::storage_adapter::MAX_SCAN_PAGE_ROWS {
+        return Err(tree_sweep_error(format!(
+            "tree sweep page rows must be between 1 and {}",
+            crate::storage_adapter::MAX_SCAN_PAGE_ROWS
+        )));
+    }
+    let state = load_tree_sweep_state(store).await?;
+    if state.is_none() && !start_new_epoch {
+        return Ok(TreeSweepMaintenanceStep::Idle);
+    }
+    if state
+        .as_ref()
+        .is_some_and(|(_, _, cursor, _)| cursor.complete)
+        && !start_new_epoch
+    {
+        return Ok(TreeSweepMaintenanceStep::Idle);
     }
 
-    for hash in &deletes {
-        writes.delete(
-            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-            StorageKey(Bytes::copy_from_slice(hash)),
-        );
+    let (queue, raw_queue) = load_reachability_queue(store).await?;
+    let restart = state.as_ref().is_some_and(|(epoch, _, cursor, _)| {
+        !cursor.complete && *blake3::hash(&raw_queue).as_bytes() != epoch.queue_digest
+    });
+    if state.is_none()
+        || state
+            .as_ref()
+            .is_some_and(|(_, _, cursor, _)| cursor.complete && start_new_epoch)
+        || restart
+    {
+        let (epoch, cursor) =
+            stage_tree_sweep_start(writes, preconditions, &queue, raw_queue, state)?;
+        let profile = tree_sweep_profile(&epoch, &cursor);
+        return Ok(if restart {
+            TreeSweepMaintenanceStep::Restarted(profile)
+        } else {
+            TreeSweepMaintenanceStep::Started(profile)
+        });
     }
-    let next_cursor = StoredTreeSweepCursor {
-        format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-        epoch_id: session.epoch.epoch_id,
-        last_key: page.value.entries.last().map(|entry| entry.key.0.to_vec()),
-        scanned_rows: session
-            .cursor
-            .scanned_rows
-            .saturating_add(hashes.len() as u64),
-        deleted_rows: session
-            .cursor
-            .deleted_rows
-            .saturating_add(deletes.len() as u64),
-        complete: !page.value.has_more,
+
+    let Some((epoch, raw_epoch, mut cursor, raw_cursor)) = state else {
+        return Ok(TreeSweepMaintenanceStep::Idle);
     };
-    let next_raw = Bytes::from(storage_codec::encode("tree sweep cursor", &next_cursor)?);
-    writes.put(
-        GC_TREE_SWEEP_CURSOR_SPACE,
-        StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        StorageValue {
-            bytes: next_raw.clone(),
-        },
-    );
+    stage_tree_sweep_active_page(store, writes, &mut cursor, page_rows).await?;
+    stage_tree_sweep_cursor(writes, &cursor)?;
     preconditions.push(StoragePrecondition::KeyValueEquals {
         space: GC_REACHABILITY_QUEUE_SPACE,
         key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
         expected: raw_queue,
     });
     preconditions.push(StoragePrecondition::KeyValueEquals {
+        space: GC_TREE_SWEEP_EPOCH_SPACE,
+        key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_EPOCH_KEY)),
+        expected: raw_epoch,
+    });
+    preconditions.push(StoragePrecondition::KeyValueEquals {
         space: GC_TREE_SWEEP_CURSOR_SPACE,
         key: StorageKey(Bytes::from_static(GC_TREE_SWEEP_CURSOR_KEY)),
-        expected: session.raw_cursor.clone(),
+        expected: raw_cursor,
     });
-    session.cursor = next_cursor;
-    session.raw_cursor = next_raw;
-    let _ = queue;
-    Ok(session.cursor.complete)
+    let profile = tree_sweep_profile(&epoch, &cursor);
+    Ok(if cursor.complete {
+        TreeSweepMaintenanceStep::Complete(profile)
+    } else {
+        TreeSweepMaintenanceStep::Progress(profile)
+    })
 }
 
 /// Returns the exact standalone semantic facts and the authenticated reason
@@ -3066,10 +3671,8 @@ mod tests {
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions,
+        StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
     };
-    use crate::storage_codec;
     use crate::tracked_state::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
         TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
@@ -3085,13 +3688,14 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, GC_TREE_SWEEP_FORMAT_VERSION,
-        GC_TREE_SWEEP_MARK_SPACE, RootReachabilityDelta, StoredTreeSweepMark,
-        begin_tree_sweep_epoch, load_checkpoint_gc_state, load_reachability_batches,
-        load_reachability_queue, load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch,
-        retirement_is_proven, root_control_digest_for_control, stage_checkpoint_gc_state,
-        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
-        stage_tree_sweep_epoch_page,
+        CheckpointGcState, CheckpointRecoveryRef, GC_TREE_SWEEP_MARK_SPACE, RootReachabilityDelta,
+        TREE_SWEEP_PHASE_DELETE_CANDIDATES, TREE_SWEEP_PHASE_SCAN_CHUNKS,
+        TREE_SWEEP_PHASE_VERIFY_MARKS, TreeSweepMaintenanceProfile, TreeSweepMaintenanceStep,
+        load_checkpoint_gc_state, load_reachability_batches, load_reachability_queue,
+        load_recovery_ref, load_recovery_refs, retirement_is_proven,
+        root_control_digest_for_control, stage_checkpoint_gc_state, stage_reachability_delta_batch,
+        stage_reachability_queue_seed, stage_recovery_ref_rotation,
+        stage_tree_sweep_maintenance_step,
     };
 
     async fn tree_sweep_fixture() -> (
@@ -3162,70 +3766,94 @@ mod tests {
         (storage, commit_id, root_hash, dead_hash, dead_hash_two)
     }
 
-    #[tokio::test]
-    async fn tree_sweep_epoch_closes_roots_once_and_reclaims_only_unmarked_chunks() {
-        let (storage, _commit_id, _root_hash, dead_hash, dead_hash_two) =
-            tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::<StoragePrecondition>::new();
-        let _session = begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch closure should build once");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch metadata should publish atomically");
-        drop(read);
+    fn tree_sweep_step_profile(
+        step: TreeSweepMaintenanceStep,
+    ) -> Option<TreeSweepMaintenanceProfile> {
+        match step {
+            TreeSweepMaintenanceStep::Idle => None,
+            TreeSweepMaintenanceStep::Started(profile)
+            | TreeSweepMaintenanceStep::Restarted(profile)
+            | TreeSweepMaintenanceStep::Progress(profile)
+            | TreeSweepMaintenanceStep::Complete(profile) => Some(profile),
+        }
+    }
 
+    async fn commit_tree_sweep_step(
+        storage: &StorageAdapter<Memory>,
+        start_new_epoch: bool,
+    ) -> TreeSweepMaintenanceStep {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("reopened epoch read should open");
-        let mut reopened = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should reopen")
-            .expect("epoch should exist");
-        assert_eq!(reopened.epoch.live_chunk_count, 1);
-        assert_eq!(reopened.live_chunks.len(), 1);
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
-        assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut reopened,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .expect("tree page should stage")
-        );
-        storage
-            .commit_write_set(
-                page_writes,
-                StorageWriteOptions {
-                    preconditions: page_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("tree page should commit");
+            .expect("tree sweep read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let step = stage_tree_sweep_maintenance_step(
+            &read,
+            &mut writes,
+            &mut preconditions,
+            start_new_epoch,
+        )
+        .await
+        .expect("tree sweep step should stage");
         drop(read);
+        if !matches!(step, TreeSweepMaintenanceStep::Idle) {
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("tree sweep step should commit");
+        }
+        step
+    }
+
+    async fn advance_tree_sweep_to_phase(
+        storage: &StorageAdapter<Memory>,
+        target_phase: u8,
+    ) -> TreeSweepMaintenanceProfile {
+        let mut start = true;
+        for _ in 0..128 {
+            let step = commit_tree_sweep_step(storage, start).await;
+            start = false;
+            let profile = tree_sweep_step_profile(step).expect("tree sweep should be active");
+            if profile.phase == target_phase {
+                return profile;
+            }
+        }
+        panic!("tree sweep did not reach phase {target_phase}");
+    }
+
+    async fn complete_tree_sweep(storage: &StorageAdapter<Memory>) -> TreeSweepMaintenanceProfile {
+        let mut start = true;
+        for _ in 0..256 {
+            let step = commit_tree_sweep_step(storage, start).await;
+            start = false;
+            if let TreeSweepMaintenanceStep::Complete(profile) = step {
+                return profile;
+            }
+        }
+        panic!("tree sweep did not complete");
+    }
+
+    #[tokio::test]
+    async fn tree_sweep_epoch_resumes_by_cursor_and_reclaims_only_unmarked_chunks() {
+        let (storage, _commit_id, root_hash, dead_hash, dead_hash_two) = tree_sweep_fixture().await;
+        let profile = complete_tree_sweep(&storage).await;
+        assert_eq!(profile.live_chunk_count, 1);
+        assert_eq!(profile.candidate_count, 2);
+        assert_eq!(profile.deleted_rows, 2);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("post-sweep read should open");
         let keys = [
+            StorageKey(Bytes::copy_from_slice(&root_hash)),
             StorageKey(Bytes::copy_from_slice(&dead_hash)),
             StorageKey(Bytes::copy_from_slice(&dead_hash_two)),
         ];
@@ -3234,57 +3862,25 @@ mod tests {
                 .materialize(&read, StorageGetOptions::default())
                 .await
                 .expect("post-sweep chunks should read");
-        assert!(result.value.into_iter().all(|value| value.is_none()));
-        assert!(
-            open_tree_sweep_epoch(&read)
-                .await
-                .expect("completed epoch should reopen")
-                .expect("completed epoch should remain")
-                .cursor
-                .complete
+        assert!(result.value[0].is_some(), "active root must survive");
+        assert!(result.value[1..].iter().all(Option::is_none));
+        drop(read);
+        assert_eq!(
+            commit_tree_sweep_step(&storage, false).await,
+            TreeSweepMaintenanceStep::Idle,
+            "completed epoch should reopen in O(1) and remain idle"
         );
     }
 
     #[tokio::test]
-    async fn tree_sweep_epoch_fails_closed_on_missing_mark_or_corrupt_chunk() {
-        let (storage, _commit_id, _root_hash, dead_hash, _dead_hash_two) =
+    async fn tree_sweep_epoch_fails_closed_on_missing_mark() {
+        let (storage, _commit_id, root_hash, _dead_hash, _dead_hash_two) =
             tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch should begin");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch should publish");
-        drop(read);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("reopened epoch read should open");
-        let session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should load")
-            .expect("epoch should exist");
-        let live_hash = *session.live_chunks.iter().next().expect("root mark");
-        let epoch_id = session.epoch.epoch_id;
-        drop(read);
+        advance_tree_sweep_to_phase(&storage, TREE_SWEEP_PHASE_VERIFY_MARKS).await;
         let mut remove_mark = storage.new_write_set();
         remove_mark.delete(
             GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&live_hash)),
+            StorageKey(Bytes::copy_from_slice(&root_hash)),
         );
         storage
             .commit_write_set(remove_mark, StorageWriteOptions::default())
@@ -3294,40 +3890,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("missing-mark read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
         assert!(
-            open_tree_sweep_epoch(&read)
+            stage_tree_sweep_maintenance_step(&read, &mut writes, &mut preconditions, false,)
                 .await
-                .expect_err("missing live mark must fail closed")
-                .to_string()
-                .contains("mark inventory")
+                .is_err()
         );
-        drop(read);
+        assert!(
+            writes.is_empty(),
+            "failed proof page must stage zero writes"
+        );
+    }
 
-        // Restore the mark and corrupt an unmarked chunk. The page validates
-        // every key/value before it stages any delete, so the failed page has
-        // an empty write set and cannot partially reclaim its siblings.
-        let mut restore = storage.new_write_set();
-        restore.put(
-            GC_TREE_SWEEP_MARK_SPACE,
-            StorageKey(Bytes::copy_from_slice(&live_hash)),
-            StorageValue {
-                bytes: Bytes::from(
-                    storage_codec::encode(
-                        "tree sweep mark",
-                        &StoredTreeSweepMark {
-                            format_version: GC_TREE_SWEEP_FORMAT_VERSION,
-                            epoch_id,
-                            chunk_hash: live_hash,
-                        },
-                    )
-                    .expect("mark should encode"),
-                ),
-            },
-        );
-        storage
-            .commit_write_set(restore, StorageWriteOptions::default())
-            .await
-            .expect("mark restoration should commit");
+    #[tokio::test]
+    async fn tree_sweep_epoch_fails_closed_on_corrupt_chunk() {
+        let (storage, _commit_id, _root_hash, dead_hash, _dead_hash_two) =
+            tree_sweep_fixture().await;
+        advance_tree_sweep_to_phase(&storage, TREE_SWEEP_PHASE_SCAN_CHUNKS).await;
         let mut corrupt = storage.new_write_set();
         corrupt.put(
             crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
@@ -3344,50 +3924,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("corruption read should open");
-        let mut session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("restored epoch should load")
-            .expect("restored epoch should exist");
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
         assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err()
+            stage_tree_sweep_maintenance_step(&read, &mut writes, &mut preconditions, false,)
+                .await
+                .is_err()
         );
-        assert!(page_writes.is_empty(), "failed page must stage zero writes");
+        assert!(
+            writes.is_empty(),
+            "failed chunk scan must stage zero writes"
+        );
     }
 
     #[tokio::test]
     async fn tree_sweep_epoch_fails_closed_when_live_chunk_disappears() {
         let (storage, _commit_id, root_hash, _dead_hash, _dead_hash_two) =
             tree_sweep_fixture().await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("fixture read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
-            .await
-            .expect("epoch should begin");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("epoch should publish");
-        drop(read);
-
+        advance_tree_sweep_to_phase(&storage, TREE_SWEEP_PHASE_VERIFY_MARKS).await;
         let mut remove_root = storage.new_write_set();
         remove_root.delete(
             crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
@@ -3402,27 +3956,81 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("missing-root read should open");
-        let mut session = open_tree_sweep_epoch(&read)
-            .await
-            .expect("epoch should load")
-            .expect("epoch should exist");
-        let mut page_writes = storage.new_write_set();
-        let mut page_preconditions = Vec::new();
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
         assert!(
-            stage_tree_sweep_epoch_page(
-                &read,
-                &mut session,
-                &mut page_writes,
-                &mut page_preconditions,
-            )
-            .await
-            .is_err(),
+            stage_tree_sweep_maintenance_step(&read, &mut writes, &mut preconditions, false)
+                .await
+                .is_err(),
             "missing live chunk must fail closed"
         );
         assert!(
-            page_writes.is_empty(),
-            "missing live chunk must stage zero deletes"
+            writes.is_empty(),
+            "failed proof page must stage zero writes"
         );
+    }
+
+    #[tokio::test]
+    async fn tree_sweep_epoch_restarts_before_delete_when_publication_advances_queue() {
+        let (storage, commit_id, root_hash, dead_hash, _dead_hash_two) = tree_sweep_fixture().await;
+        advance_tree_sweep_to_phase(&storage, TREE_SWEEP_PHASE_DELETE_CANDIDATES).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("publication read should open");
+        let mut publication = storage.new_write_set();
+        let mut publication_preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut publication,
+            &[],
+            &[commit_id],
+            &mut publication_preconditions,
+        )
+        .await
+        .expect("checkpoint-tail publication should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                publication,
+                StorageWriteOptions {
+                    preconditions: publication_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("checkpoint-tail publication should commit");
+
+        let step = commit_tree_sweep_step(&storage, false).await;
+        assert!(
+            matches!(step, TreeSweepMaintenanceStep::Restarted(_)),
+            "queue publication must restart the rebuildable epoch"
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-restart read should open");
+        let chunks = [
+            StorageKey(Bytes::copy_from_slice(&root_hash)),
+            StorageKey(Bytes::copy_from_slice(&dead_hash)),
+        ];
+        let values = PointReadPlan::new(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            &chunks,
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("post-restart chunks should read");
+        assert!(
+            values.value.iter().all(Option::is_some),
+            "restart step must not delete active or candidate chunks"
+        );
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("queue tail should survive restart");
+        assert_eq!(queue.head_sequence, 1);
+        assert_eq!(queue.tail_sequence, 1);
     }
 
     #[tokio::test]

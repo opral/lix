@@ -27,7 +27,6 @@ const CHECKPOINT_GC_HISTORY_FRACTION: u64 = 1;
 
 struct CreateCheckpointOutcome {
     receipt: CreateCheckpointReceipt,
-    gc_due: bool,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -150,8 +149,6 @@ where
                         gc_state
                             .add_collectible_interval(previous_recovery.interval_has_commits);
                     }
-                    let gc_due = checkpoint_gc_due(gc_state)?;
-
                     let mut marker_rows = RawWriteBatch::with_capacity(1);
                     marker_rows.push(checkpoint_marker_stage_row(&branch_id));
                     transaction
@@ -170,21 +167,17 @@ where
                     )?;
                     Ok(CreateCheckpointOutcome {
                         receipt: CreateCheckpointReceipt { commit_id },
-                        gc_due,
                     })
             })
             .await?;
-        if outcome.gc_due {
-            // GC debt is durable in the checkpoint transaction. The sweep is
-            // therefore safely retryable and does not need to delay the user
-            // checkpoint. A clone shares the same storage and collaboration
-            // write gate; concurrent schedules serialize, and only the first
-            // one that still sees debt performs work.
-            let gc_session = self.clone();
-            tokio::spawn(async move {
-                gc_session.collect_checkpoint_garbage_best_effort().await;
-            });
-        }
+        // The post-checkpoint owner performs ordinary GC only when durable debt
+        // is due, then starts or resumes the private tree-chunk epoch. Spawning
+        // on every checkpoint is the O(1) reopen trigger for an interrupted
+        // epoch; all root and chunk work remains in bounded background pages.
+        let gc_session = self.clone();
+        tokio::spawn(async move {
+            gc_session.collect_checkpoint_garbage_best_effort().await;
+        });
         Ok(outcome.receipt)
     }
 }

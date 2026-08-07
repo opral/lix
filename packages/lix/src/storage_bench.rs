@@ -648,6 +648,221 @@ pub struct RepositoryGcBenchResult {
     pub total_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeSweepEpochBenchResult {
+    pub complete: bool,
+    pub epoch_id: u64,
+    pub page_rows: usize,
+    pub steps: u64,
+    pub phase_steps: [u64; 12],
+    pub root_count: u64,
+    pub live_chunk_count: u64,
+    pub candidate_count: u64,
+    pub scanned_rows: u64,
+    pub deleted_rows: u64,
+    pub staged_puts: u64,
+    pub staged_deletes: u64,
+    pub staged_written_bytes: u64,
+    pub max_step_puts: u64,
+    pub max_step_deletes: u64,
+    pub max_step_written_bytes: u64,
+    pub total_us: u64,
+    pub max_step_us: u64,
+    pub commit_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeSweepGarbageSeedBenchResult {
+    pub chunks: usize,
+    pub logical_chunk_bytes: u64,
+    pub staged_written_bytes: u64,
+    pub elapsed_us: u64,
+}
+
+pub async fn seed_tree_sweep_garbage_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    chunks: usize,
+    batch_rows: usize,
+) -> Result<TreeSweepGarbageSeedBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let started = std::time::Instant::now();
+    let mut logical_chunk_bytes = 0_u64;
+    let mut staged_written_bytes = 0_u64;
+    for start in (0..chunks).step_by(batch_rows.max(1)) {
+        let end = start.saturating_add(batch_rows.max(1)).min(chunks);
+        let mut writes = storage.new_write_set();
+        for index in start..end {
+            let label = format!("tree-sweep-garbage-{index:016x}");
+            let (hash, bytes) = crate::tracked_state::test_gc_leaf_chunk(label.as_bytes());
+            logical_chunk_bytes = logical_chunk_bytes.saturating_add(bytes.len() as u64);
+            writes.put(
+                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&hash)),
+                crate::storage_adapter::StorageValue { bytes },
+            );
+        }
+        staged_written_bytes = staged_written_bytes.saturating_add(writes.stats().written_bytes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(crate::LixError::from)?;
+    }
+    Ok(TreeSweepGarbageSeedBenchResult {
+        chunks,
+        logical_chunk_bytes,
+        staged_written_bytes,
+        elapsed_us: started.elapsed().as_micros() as u64,
+    })
+}
+
+pub async fn count_tree_chunks_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<u64, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let plan = ScanPlan::prefix(
+        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut count = 0_u64;
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                &read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        count = count.saturating_add(page.value.entries.len() as u64);
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        if !page.value.has_more {
+            return Ok(count);
+        }
+        if resume_after.is_none() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tree sweep benchmark chunk scan stalled",
+            ));
+        }
+    }
+}
+
+pub async fn run_tree_sweep_epoch_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    page_rows: usize,
+) -> Result<TreeSweepEpochBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    run_tree_sweep_epoch_steps_for_bench(storage, page_rows, None).await
+}
+
+pub async fn run_tree_sweep_epoch_steps_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    page_rows: usize,
+    max_steps: Option<u64>,
+) -> Result<TreeSweepEpochBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let started = std::time::Instant::now();
+    let mut result = TreeSweepEpochBenchResult {
+        page_rows,
+        ..TreeSweepEpochBenchResult::default()
+    };
+    let mut start_new_epoch = true;
+    loop {
+        let step_started = std::time::Instant::now();
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage.begin_read(ReadOptions::default()).await?,
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let step = crate::gc::stage_tree_sweep_maintenance_step_for_bench(
+            &read,
+            &mut writes,
+            &mut preconditions,
+            start_new_epoch,
+            page_rows,
+        )
+        .await?;
+        start_new_epoch = false;
+        if matches!(step, crate::gc::TreeSweepMaintenanceStep::Idle) {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tree sweep benchmark epoch became idle before completion",
+            ));
+        }
+        let stats = writes.stats();
+        result.staged_puts = result.staged_puts.saturating_add(stats.staged_puts);
+        result.staged_deletes = result.staged_deletes.saturating_add(stats.staged_deletes);
+        result.staged_written_bytes = result
+            .staged_written_bytes
+            .saturating_add(stats.written_bytes);
+        result.max_step_puts = result.max_step_puts.max(stats.staged_puts);
+        result.max_step_deletes = result.max_step_deletes.max(stats.staged_deletes);
+        result.max_step_written_bytes = result.max_step_written_bytes.max(stats.written_bytes);
+        let commit_started = std::time::Instant::now();
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .map_err(crate::LixError::from)?;
+        result.commit_us = result
+            .commit_us
+            .saturating_add(commit_started.elapsed().as_micros() as u64);
+        let step_us = step_started.elapsed().as_micros() as u64;
+        result.max_step_us = result.max_step_us.max(step_us);
+        result.steps = result.steps.saturating_add(1);
+        let profile = match step {
+            crate::gc::TreeSweepMaintenanceStep::Started(profile)
+            | crate::gc::TreeSweepMaintenanceStep::Restarted(profile)
+            | crate::gc::TreeSweepMaintenanceStep::Progress(profile)
+            | crate::gc::TreeSweepMaintenanceStep::Complete(profile) => profile,
+            crate::gc::TreeSweepMaintenanceStep::Idle => unreachable!(),
+        };
+        result.epoch_id = profile.epoch_id;
+        result.root_count = profile.root_count;
+        result.live_chunk_count = profile.live_chunk_count;
+        result.candidate_count = profile.candidate_count;
+        result.scanned_rows = profile.scanned_rows;
+        result.deleted_rows = profile.deleted_rows;
+        if let Some(phase_steps) = result.phase_steps.get_mut(profile.phase as usize) {
+            *phase_steps = phase_steps.saturating_add(1);
+        }
+        if matches!(step, crate::gc::TreeSweepMaintenanceStep::Complete(_)) {
+            result.complete = true;
+            result.total_us = started.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+        if max_steps.is_some_and(|max_steps| result.steps >= max_steps) {
+            result.total_us = started.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+        if result.steps > 100_000_000 {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "tree sweep benchmark exceeded its bounded step guard",
+            ));
+        }
+    }
+}
+
 /// Isolates the branch-owned derived checkpoint retirement path.  This is a
 /// benchmark-only bridge: the checkpoint rows are seeded directly into their
 /// derived space, then the production branch-prefix retirement planner is

@@ -1,7 +1,5 @@
 #![cfg_attr(not(feature = "storage-benches"), allow(dead_code, unused_imports))]
 
-use std::collections::BTreeSet;
-
 use crate::LixError;
 
 #[cfg(feature = "storage-benches")]
@@ -109,10 +107,11 @@ pub(crate) use storage::{
     stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
     validate_current_state_scoped_range_serving_base_manifest,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use tree::test_gc_leaf_chunk;
 #[cfg(test)]
 pub(crate) use types::TrackedStateCommitRootParent;
+#[cfg(test)]
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
@@ -124,28 +123,30 @@ pub(crate) use types::{
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 
-/// Builds an authenticated content-addressed closure for a set of retained
-/// tracked-state roots. This is deliberately a read-only maintenance helper:
-/// the returned hashes are a rebuildable sweep inventory, never serving
-/// authority or a replacement for the immutable root metadata.
-#[allow(dead_code)]
-pub(crate) async fn collect_reachable_tree_chunk_hashes<S>(
+/// Authenticates one durable tree chunk and exposes its bounded direct
+/// frontier for cursor-driven maintenance traversal.
+pub(crate) async fn load_tree_chunk_children<S>(
     store: &S,
-    roots: &[TrackedStateRootId],
-) -> Result<BTreeSet<[u8; types::TRACKED_STATE_HASH_BYTES]>, LixError>
+    hash: &[u8; types::TRACKED_STATE_HASH_BYTES],
+) -> Result<Vec<[u8; types::TRACKED_STATE_HASH_BYTES]>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead + ?Sized,
 {
-    let tree = tree::TrackedStateTree::new();
-    let overlay = storage::TrackedStateChunkOverlay::new();
-    let mut reachable = BTreeSet::new();
-    for root in roots {
-        reachable.extend(
-            tree.reachable_chunk_hashes_with_overlay(store, &overlay, root)
-                .await?,
-        );
-    }
-    Ok(reachable)
+    let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-state tree chunk is missing",
+        )
+    })?;
+    storage::verify_chunk_hash(hash, &bytes)?;
+    Ok(match codec::decode_node(&bytes)? {
+        codec::DecodedNode::Leaf(_) => Vec::new(),
+        codec::DecodedNode::Internal(internal) => internal
+            .children()
+            .iter()
+            .map(|child| child.child_hash)
+            .collect(),
+    })
 }
 #[cfg(feature = "storage-benches")]
 pub mod bench {

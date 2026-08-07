@@ -18,7 +18,7 @@ use std::{
 use bytes::Bytes;
 use lru::LruCache;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::{ChangeId, CommitId};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
@@ -2697,7 +2697,7 @@ fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -
 /// Test-only content-addressed chunks for the GC sweep fixture. The empty
 /// leaf is a valid serving root; labelled leaves are valid hash-addressed
 /// chunks that are intentionally not referenced by that root.
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn test_gc_leaf_chunk(label: &[u8]) -> ([u8; TRACKED_STATE_HASH_BYTES], Bytes) {
     let entries = if label.is_empty() {
         Vec::new()
