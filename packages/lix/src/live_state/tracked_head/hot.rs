@@ -9690,7 +9690,12 @@ async fn hot_scan_entries<'a>(
     prefixes.sort();
     prefixes.dedup();
     let mut rows = Vec::new();
+    let mut saw_file_backed_row = false;
     let mut retained_bytes = 0_usize;
+    // A fixed file bucket has the same physical and logical order. Every
+    // broader file domain must defer LIMIT until file-first storage order has
+    // been restored to canonical `(schema, entity_pk, file_id)` order.
+    let physical_limit = limit.filter(|_| hot_filter_has_one_fixed_file_bucket(filter));
     for prefix in prefixes {
         let plan = ScanPlan::prefix(
             HOT_ROW_SPACE,
@@ -9700,8 +9705,13 @@ async fn hot_scan_entries<'a>(
         );
         let mut resume_after = None;
         loop {
-            let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
+            let remaining = physical_limit.map(|limit| limit.saturating_sub(rows.len()));
             if matches!(remaining, Some(0)) {
+                let rows = if saw_file_backed_row {
+                    canonicalize_hot_scan_rows(rows, limit)?
+                } else {
+                    rows
+                };
                 return Ok(Some(HotScanEntries::Decoded(rows)));
             }
             let page = plan
@@ -9720,6 +9730,7 @@ async fn hot_scan_entries<'a>(
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
+                    saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
                     retained_bytes = retained_bytes
                         .checked_add(encoded_key_bytes)
@@ -9730,7 +9741,12 @@ async fn hot_scan_entries<'a>(
                         return Ok(None);
                     }
                     rows.push((identity, value));
-                    if limit.is_some_and(|limit| rows.len() >= limit) {
+                    if physical_limit.is_some_and(|limit| rows.len() >= limit) {
+                        let rows = if saw_file_backed_row {
+                            canonicalize_hot_scan_rows(rows, limit)?
+                        } else {
+                            rows
+                        };
                         return Ok(Some(HotScanEntries::Decoded(rows)));
                     }
                 }
@@ -9740,7 +9756,58 @@ async fn hot_scan_entries<'a>(
             }
         }
     }
+    if saw_file_backed_row {
+        rows = canonicalize_hot_scan_rows(rows, limit)?;
+    } else if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
     Ok(Some(HotScanEntries::Decoded(rows)))
+}
+
+fn hot_filter_has_one_fixed_file_bucket(filter: &TrackedStateFilter) -> bool {
+    let Some(first) = filter.file_ids.first() else {
+        return false;
+    };
+    !matches!(first, NullableKeyFilter::Any)
+        && filter.file_ids.iter().all(|file_id| file_id == first)
+}
+
+/// Restores the logical live-state identity order before any caller observes
+/// rows or applies LIMIT.
+///
+/// One physical HOT primary key is the sole authority for its logical
+/// identity. Repeated scans may therefore collapse only byte-identical copies
+/// of that same key. Distinct keys or values for one logical identity are an
+/// invalid authority state and fail closed instead of selecting a second
+/// winner.
+fn canonicalize_hot_scan_rows(
+    mut rows: Vec<(HotScanIdentity, Bytes)>,
+    limit: Option<usize>,
+) -> Result<Vec<(HotScanIdentity, Bytes)>, LixError> {
+    let already_strictly_ordered = rows
+        .windows(2)
+        .all(|pair| pair[0].0.cmp(&pair[1].0).is_lt());
+    if !already_strictly_ordered {
+        rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for pair in rows.windows(2) {
+            if pair[0].0 != pair[1].0 {
+                continue;
+            }
+            if pair[0].0.key != pair[1].0.key || pair[0].1 != pair[1].1 {
+                return Err(head_value_error(format!(
+                    "duplicate HOT authority for schema '{}' entity_pk {:?} file_id {:?} has different physical bytes",
+                    pair[0].0.schema_key(),
+                    pair[0].0.entity_pk,
+                    pair[0].0.file_id(),
+                )));
+            }
+        }
+        rows.dedup_by(|left, right| left.0 == right.0);
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
 }
 
 fn hot_scan_entries_fit_budget<'a>(
@@ -9964,14 +10031,8 @@ async fn scan_hot_file_entries(
         }
     }
     // Physical rows are ordered `(schema, file_id, entity_pk)`, while SQL rows
-    // are ordered `(schema, entity_pk, file_id)`. Restore the public order
-    // after multi-file scans and defend against repeated predicates.
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    rows.dedup_by(|left, right| left.0 == right.0);
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    Ok(rows)
+    // are ordered `(schema, entity_pk, file_id)`.
+    canonicalize_hot_scan_rows(rows, limit)
 }
 
 async fn hot_schema_has_file_members(
@@ -12910,6 +12971,77 @@ mod tests {
         assert_eq!(
             rows.row(0).file_id().expect("file").as_ptr(),
             rows.row(ROW_COUNT - 1).file_id().expect("file").as_ptr()
+        );
+    }
+
+    fn adversarial_hot_scan_entry(
+        generation: CommitId,
+        entity_pk: &str,
+        file_id: &str,
+        value: &'static [u8],
+    ) -> (HotScanIdentity, Bytes) {
+        let scope = hot_scope_prefix("branch", generation);
+        let key = Bytes::from(encode_hot_row_key_parts(
+            "branch",
+            generation,
+            "schema",
+            &EntityPk::single(entity_pk),
+            Some(file_id),
+        ));
+        let identity = decode_hot_scan_row_key_in_scope(key, &scope)
+            .expect("decode adversarial HOT scan identity");
+        (identity, Bytes::from_static(value))
+    }
+
+    #[test]
+    fn hot_scan_canonicalizes_before_limit_and_collapses_only_identical_duplicates() {
+        let generation = CommitId::for_test_label("adversarial-hot-canonical-order");
+        let physical_rows = || {
+            vec![
+                adversarial_hot_scan_entry(generation, "entity-z", "file-a", b"z"),
+                adversarial_hot_scan_entry(generation, "entity-z", "file-a", b"z"),
+                adversarial_hot_scan_entry(generation, "entity-a", "file-b", b"a"),
+            ]
+        };
+
+        let canonical = canonicalize_hot_scan_rows(physical_rows(), None)
+            .expect("identical repeated HOT observations should canonicalize");
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(
+            canonical
+                .iter()
+                .map(|(identity, _)| (identity.entity_pk.clone(), identity.file_id()))
+                .collect::<Vec<_>>(),
+            [
+                (EntityPk::single("entity-a"), Some("file-b")),
+                (EntityPk::single("entity-z"), Some("file-a")),
+            ]
+        );
+
+        let limited = canonicalize_hot_scan_rows(physical_rows(), Some(1))
+            .expect("LIMIT should apply after HOT canonicalization");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0.entity_pk, EntityPk::single("entity-a"));
+        assert_eq!(limited[0].0.file_id(), Some("file-b"));
+    }
+
+    #[test]
+    fn hot_scan_rejects_conflicting_duplicate_authority() {
+        let generation = CommitId::for_test_label("conflicting-hot-authority");
+        let error = canonicalize_hot_scan_rows(
+            vec![
+                adversarial_hot_scan_entry(generation, "entity", "file", b"older"),
+                adversarial_hot_scan_entry(generation, "entity", "file", b"newer"),
+            ],
+            None,
+        )
+        .expect_err("one HOT identity cannot have two authoritative byte values");
+
+        assert!(
+            error
+                .message
+                .contains("duplicate HOT authority for schema 'schema'"),
+            "unexpected duplicate-authority error: {error:?}"
         );
     }
 
