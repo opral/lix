@@ -253,7 +253,10 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .await
         .expect("cold reopen healthy tracked tree");
     let healthy = lix
-        .execute("SELECT COUNT(*) AS count FROM lix_key_value", &[])
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_key_value WHERE key LIKE 'tree-%'",
+            &[],
+        )
         .await
         .expect("healthy tracked tree should survive cold reopen");
     assert_eq!(
@@ -272,7 +275,10 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     let error = match open_lix().with_storage(database.clone()).await {
         Ok(lix) => {
             let result = lix
-                .execute("SELECT COUNT(*) AS count FROM lix_key_value", &[])
+                .execute(
+                    "SELECT COUNT(*) AS count FROM lix_key_value WHERE key LIKE 'tree-%'",
+                    &[],
+                )
                 .await;
             let _ = lix.close().await;
             result.expect_err("corrupt tracked tree chunk must fail on first read")
