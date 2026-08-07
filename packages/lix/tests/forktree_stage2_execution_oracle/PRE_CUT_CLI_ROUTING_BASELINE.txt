@@ -1,0 +1,7 @@
+missing-cli-storage-route	Lix<RocksDB>	0
+invalid-cli-rocksdb-route	open_lix_at missing concrete Lix<RocksDB> return	0
+invalid-cli-rocksdb-route	open_lix_at missing RocksDB::open	0
+legacy-cli-storage-route	open_lix_at::FileLix	1
+legacy-cli-storage-route	open_lix_at::FileStorage	1
+finding_count=5
+CLI storage routing is not the typed RocksDB/SlateDB hard cut

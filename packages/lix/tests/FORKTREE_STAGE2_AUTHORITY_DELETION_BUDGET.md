@@ -24,10 +24,10 @@ the first runnable Stage-2 zero-residue gate; they are not accepted failures.
 
 | Input | legacy spaces | owner/codec tokens | deleted modules | old cursor IDs/patterns | FileStorage owners | SQLite tokens/package | required Stage1 owner occurrences | executable semantic facades passing | findings |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| b5 | 42 / 699 | 151 / 2,585 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
-| Stage1 138b | 42 / 657 | 151 / 2,210 | 23 / 23 | 7 / 619; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 524 | 1 / 19 | 233 |
-| e871 | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
-| main 803d | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
+| b5 | 42 / 699 | 151 / 2,585 | 23 / 23 | 7 / 358; 13 / 18 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 294 |
+| Stage1 138b | 42 / 657 | 151 / 2,210 | 23 / 23 | 7 / 347; 13 / 18 | 4 / 24 | 5 / 38; present | 17 / 524 | 1 / 19 | 232 |
+| e871 | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 358; 13 / 18 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 294 |
+| main 803d | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 358; 13 / 18 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 294 |
 
 The corrected 42nd durable space is
 `BINARY_CAS_MUTATION_EPOCH_SPACE`; it contributes six of b5's exact 699
@@ -45,6 +45,17 @@ runtime/test selector. The custom CLI `FileStorage` implementation and its
 must use RocksDB; explicitly selected SlateDB remains. There is no SQLite or
 FileStorage compatibility reader and no migration gate.
 
+This boundary is executable rather than a token-only claim. The item-scoped
+source gate requires exactly one `open_lix_at` resolving directly or through
+the sole `LocalLix` alias to `Lix<RocksDB>` and
+calling `RocksDB::open` plus `open_lix().with_storage(...)`; exactly one
+`init_lix_at` delegates to it; and the explicit `GitReplayStorage::Slatedb`
+arm calls `SlateDB::open`. None of those item bodies may mention a removed or
+SQLite owner. The separate `forktree_stage2_cli_storage_routing` integration
+test then commits a marker, closes/drops, cold reopens, and reads it through
+normal CLI RocksDB and explicit SlateDB paths. Its concrete
+`&Lix<RocksDB>` assertion makes the pre-cut `FileLix` route a compile error.
+
 The cursor scan covers every Rust source under retained `packages`, including
 Lix, CLI, local-filesystem/file support, Memory, RocksDB, SlateDB, benches,
 examples, integration support, and workspace tests. Only this oracle's own
@@ -59,6 +70,17 @@ The post-cursor allowlist is limited to `ScanChunk`, `BeginScanOptions`,
 `first_page`, hidden Slate resume/cache state, and adapter reconstruction loops
 are blockers. Exclusive `KeyRange.lower = Bound::Excluded(authenticated_key)`
 is the only restart shape.
+
+Cursor residue is syntax/item/path aware. It ignores only verified semantic
+non-collisions: upstream `slatedb::ScanOptions as SlateDBScanOptions`, plugin
+arena `Store::page`, changelog pagination's own `resume_after`, conformance's
+local exclusive-restart variable, and test-only `snapshot_scan_cursor`.
+`ScanOptions` declarations/usages in the Lix storage API, resume fields in an
+old scan-plan/options type, scan-related `.page(...)`, and every other listed
+old cursor symbol remain blockers. This corrected gate is green on immutable
+cursor head `d005a4ac2f2d62322bb477c958092d76efc45c9f`, tree
+`9a705d36392e88d8f5f363b2b23d373deec3321d`; its sole delta from reviewed
+`49ab1c85` is `scripts/release.test.mjs`.
 
 ## Production declaration and semantic gates
 
@@ -113,28 +135,39 @@ continuation-field probes must reject; direct begin-scan and authenticated
 exclusive restart must compile. On Stage2, equivalent-space mutation must
 also reject. Every probe uses an rlib built from the exact tree under review.
 
+The CLI runtime probe is separately compiled from the exact candidate. Both
+its RocksDB normal-route test and SlateDB explicit-route test must pass after a
+real close/drop/cold reopen. The four structural routing contracts and runtime
+probe are required in addition to the global FileStorage/SQLite zero-residue
+checks; no matching token in an unrelated test or benchmark can satisfy them.
+On exact immutable cursor successor `d005a4ac`, the typed probe compiled in
+9m19s and both cold-reopen tests passed. Its binary is SHA-256
+`0ee7e28aca8165ec0a36475f2feaa643884ab9cde1164f8864e75c0e7b3f222b`.
+
 ## Frozen evidence hashes
 
-- scanner source: `6fcc2e476f81f4d70227eef0d249d305ee30ba4edfad005f7fb7b73e0daf0d5f`;
-- warnings-denied scanner binary: `86741026c9f8ce8b746806c51a964d2b79a1a2477e11eb1c11e465ba13221d15`;
+- scanner source: `f71e91fcbccbb7d6df676a95e9d747725856b77f7e3177ec42f12ca8b28736cc`;
+- warnings-denied scanner binary: `e25cd2a89e2633d5312282a3b1a97b53a4071c025022eec5c0e23d19d89d663d`;
 - dependency source: `eb11912d9b8ed8b7222ee98792f00c2614373ff615d22c221f00a3ebeeb413e3`;
 - dependency binary: `1f1eadf3e0c8a1aeca8e8a4fc31cb4492f988dbe12d72c3832c223e522a8ae81`;
 - semantic allowlist: `1a70be6bf43e3f93bc57c0c5a8aec813757187484e3b1f4c45218621d0e79021`;
+- typed CLI runtime source:
+  `8fb6b08de60ec874731f72c0766efcce33c979d79b918618a56699c0d80c0327`;
 - b5/Stage1/e871/main-803d budgets:
-  `0d232b5eb18cf9ad409b2623d25ddb86fa83d3c1781e978fac5b36cde96503e6`,
-  `e2ae8494a2e47946c5625f00823508bc50e8cf154704f288cff61e4940e989dc`,
-  `224965d21b84c6171b0440122e0a223a16c07b7141ec019a408ae8e7bf2d117c`,
-  `0c00637446c057ecd2fe7717fcd61d2366fe679c2bc925eafa9d80e149db7ad7`;
+  `f482197223c7df53a9bad67f9c2552d8e6b5d9a0474a9a2be3468923167c6f69`,
+  `6b615cb9dba8ec1355b646f68293f95f8ad204d1c63fe155eb4444eb46d2881a`,
+  `ebb8d000872ac9db5b4e0f7294f17c240bbf59362a2fb36871911f49706b07b5`,
+  `60ff1291d627d719da4774ea6f274e92c3b7e57f87c4345049215eaf51d5b377`;
 - b5/Stage1/e871/main-803d declaration ledgers:
   `a6a7dbce81a6f2737474be309aed14dcddc28f28c29166ae63764be5c96baebf`,
   `17a71d6305963b7cc55ae522ce318c83031aa10b0c71d94e3742f6dd5a6740c5`,
   `90950db072d2ef516460ececa2404c0a05cd9542dec605da5216ce586e4d05bb`,
   `8144809e65f453667bba2b4b3c6dddab385cd94b81bd02e47cb7e1399470aa05`;
 - b5/Stage1/e871/main-803d baseline logs:
-  `5ac2e8c6ef3734d6b621694df9d0e5aee7f9bb9eb82051f7f3ff12fd2693ad3c`,
-  `626d6b80e35991e0b8cf576c50eae26a6835d9c90ee1f2d1e8fade03962958f9`,
-  `41f88b2aebc4333cd4ede6a7f43ff7a9a7fb86ec721ddeee036e1be5d36190c4`,
-  `41f88b2aebc4333cd4ede6a7f43ff7a9a7fb86ec721ddeee036e1be5d36190c4`;
+  `b0f42b1fb7efcd501181ad8c597f0ad79badab44dc8f08e2237b36ee8ebe122e`,
+  `c484b99d446921b449c9a587ccb98b2eba43beee7855244efa307692ac99eb66`,
+  `438e6452be37c740e16da51c0feee62cdc66c34a7154526045387ffd3414a3e7`,
+  `438e6452be37c740e16da51c0feee62cdc66c34a7154526045387ffd3414a3e7`;
 - landed #1258 verifier:
   `371f0dbe0e8423c5264f88bf33614ae2a559585643d340cd013f06e8e40db368`.
 

@@ -1,0 +1,49 @@
+ForkTree Stage-2 CLI storage-routing calibration
+Date: 2026-08-07 UTC
+
+Pre-cut production base: b5e78190f49cab5de7bb19b6f967706c214363b6
+Pre-cut source verdict: RED, five findings
+Source finding log SHA-256: 48a1d1fc57c8514e8c8885688fb186caf54ad5cbcaf26c67d043cf8daf498355
+
+Typed runtime probe source SHA-256:
+8fb6b08de60ec874731f72c0766efcce33c979d79b918618a56699c0d80c0327
+
+First bounded no-run cell:
+- command: cargo test -p lix_cli --test forktree_stage2_cli_storage_routing --no-run
+- timeout: 20m
+- exit: 124
+- classification: dependency/native compile boundary; test source did not compile or execute
+- full log SHA-256: 5542c9eda9016516b0eb60f6f44447c1dc4efa3cc049f81a250c2c24dc4b7ce2
+
+Single authorized warm-cache retry:
+- same command and exact source
+- exit: 101
+- classification: expected pre-cut route rejection only
+- diagnostics: two E0308 mismatches at the initial and cold-reopen assertions;
+  expected &Lix<RocksDB>, found &Lix<FileStorage>
+- full log SHA-256: 0750ba179f2f6b843167e01995dac4da08bf65d14276027bb8629a2c154374f5
+
+Immutable cursor/CLI candidate:
+- head d005a4ac2f2d62322bb477c958092d76efc45c9f
+- tree 9a705d36392e88d8f5f363b2b23d373deec3321d
+- parent 49ab1c85ef72ff0bcbf9b45f63efa7472ccfc43b
+- parent delta: scripts/release.test.mjs only
+- release fixture SHA-256: 4d4680b48335aaeeb673299365b00b942e56e8a278e8e5c5ff3522948efe45a9
+- main..head full-index binary SHA-256:
+  fba21f42f538ae1e840e6a30f6dd4f339680b5d409e2d77f63aabe2b0a5ccff1
+- strict cursor source audit: GREEN, log SHA-256
+  1c7dbfff87aa60693f112145c8a653dfd45c4bfaedfa82c3073350c10ffa8fa3
+- CLI route source audit: GREEN, log SHA-256
+  d6f55be20cccff33bf420841cb1848fe0e3e477208dccbe4e9a8e6a0be26f566
+
+Exact-head typed runtime gate:
+- no-run: PASS in 9m19s, log SHA-256
+  1e05e50f5a15ee43160d80dde0af421fd0e1d8f99d2361d49017ceb8ef1bfa0c
+- binary SHA-256:
+  0ee7e28aca8165ec0a36475f2feaa643884ab9cde1164f8864e75c0e7b3f222b
+- normal RocksDB init/open/write/close/drop/cold-reopen/read: PASS, log SHA-256
+  8b23ca1a0919791a99f71a97383201c0333c4c50ee7c9fa23f80cc723f08a89f
+- explicit SlateDB open/write/close/drop/cold-reopen/read: PASS, log SHA-256
+  030a406dc17239893c250229ad6e5e8c6e452cf69cec5da0590adb89e467d855
+
+No production source is part of this package.

@@ -1,3 +1,7 @@
+invalid-cli-rocksdb-route	open_lix_at missing RocksDB::open	0
+invalid-cli-rocksdb-route	open_lix_at missing concrete Lix<RocksDB> return	0
+legacy-cli-storage-route	open_lix_at::FileLix	1
+legacy-cli-storage-route	open_lix_at::FileStorage	1
 legacy-owner-or-codec	BinaryCasChunkRef	2
 legacy-owner-or-codec	BinaryCasChunking	18
 legacy-owner-or-codec	BinaryCasManifest	64
@@ -145,8 +149,7 @@ legacy-space	TRACKED_STATE_TREE_CHUNK_SPACE	34
 legacy-space	TRACKED_WORKING_DIFF_MARKER_SPACE	17
 legacy-space	UPLOAD_MANIFEST_LEAF_SPACE	9
 legacy-space	UPLOAD_STATE_SPACE	6
-missing-cli-rocksdb-default	Lix<RocksDB>	0
-missing-cli-rocksdb-default	RocksDB::open	0
+missing-cli-storage-route	Lix<RocksDB>	0
 missing-public-semantic-facade	load_plugin_registry_at_commit	0
 missing-streaming-cursor	#[doc(hidden)]\npub trait StorageScanSource	0
 missing-streaming-cursor	Capability::ReverseScan	0
@@ -163,18 +166,14 @@ missing-streaming-cursor	pub async fn next_page	0
 missing-streaming-cursor	pub enum ScanOrder	0
 missing-streaming-cursor	pub struct BeginScanOptions	0
 missing-streaming-cursor	pub struct ScanCursor<\'	0
-old-paginated-scan	.page(	1
-old-paginated-scan	ScanOptions	149
-old-paginated-scan	ScanPlan	81
-old-paginated-scan	StorageScanOptions	108
+old-paginated-scan	ScanOptions	113
+old-paginated-scan	ScanPlan	57
+old-paginated-scan	StorageScanOptions	74
 old-paginated-scan	expected_resume_after	6
-old-paginated-scan	older.scan(	1
-old-paginated-scan	read.scan(	14
-old-paginated-scan	resume_after	268
+old-paginated-scan	read.scan(	10
+old-paginated-scan	resume_after	32
 old-paginated-scan	scan_cursor: Mutex<Option<ScanCursor>>	1
-old-paginated-scan	scan_resume_after	7
-old-paginated-scan	snapshot_scan_cursor	1
-old-paginated-scan	stateless fallback	1
+old-paginated-scan	scan_resume_after	6
 removed-storage-owner	FileLix	8
 removed-storage-owner	FileStorage	6
 removed-storage-owner	FileStorageRead	4
@@ -231,4 +230,4 @@ superseded-module	tracked_state/scoped_range.rs	1
 superseded-module	tracked_state/storage.rs	1
 superseded-module	tracked_state/tree.rs	1
 superseded-module	transaction/plugin_checkpoint.rs	1
-finding_count=233
+finding_count=232

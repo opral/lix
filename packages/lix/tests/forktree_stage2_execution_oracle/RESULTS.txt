@@ -15,19 +15,47 @@ Standalone gates
   trees (1/19 passes), as required
 
 Exact red calibration totals
-- b5e78190: 295 findings; 42 spaces / 699 occurrences
-- Stage1 138b55e1: 233 findings; 42 spaces / 657 occurrences
-- e8713ed1: 295 findings; 42 spaces / 702 occurrences
-- landed main 803d19ec/tree 2ae6ffd8: 295 findings; 42 spaces / 702
+- b5e78190: 294 findings; 42 spaces / 699 occurrences
+- Stage1 138b55e1: 232 findings; 42 spaces / 657 occurrences
+- e8713ed1: 294 findings; 42 spaces / 702 occurrences
+- landed main 803d19ec/tree 2ae6ffd8: 294 findings; 42 spaces / 702
   occurrences (identical to the modeled post-#1260 tree)
 
 Boundary
 - packages/sqlite-storage and all runtime/dependency selectors: delete
 - CLI FileStorage/FileLix/read/write owners: delete
-- normal CLI local open/init: RocksDB
-- explicit SlateDB: retained
+- normal CLI local open/init: item-scoped RocksDB route plus typed close/drop/
+  cold-reopen runtime gate
+- explicit SlateDB: item-scoped selector route plus typed close/drop/cold-
+  reopen runtime gate
 - SQLite: not a conformance adapter and not a required consumer
 - all retained workspace Rust callers are cursor/residue scan roots
+
+CLI route calibration
+- pre-cut source audit: RED because open_lix_at returns FileLix/FileStorage,
+  does not call RocksDB::open, and does not return Lix<RocksDB>
+- pre-cut typed runtime no-run: required compile rejection at the concrete
+  Lix<RocksDB> assertion
+- first runnable Stage2: source audit, no-run, RocksDB runtime, SlateDB runtime,
+  and warnings-denied focused Clippy must all be GREEN
+
+Cursor calibration
+- immutable final cursor `d005a4ac2f2d62322bb477c958092d76efc45c9f`,
+  tree `9a705d36392e88d8f5f363b2b23d373deec3321d`: cursor audit GREEN
+- upstream SlateDB ScanOptions alias, plugin Store::page, changelog pagination,
+  conformance-local exclusive restart, and test-only snapshot name are proven
+  non-collisions; old Lix API/plan/resume declarations remain forbidden
+
+Exact d005 CLI routing gate
+- typed no-run: PASS in 9m19s
+- normal CLI concrete RocksDB owner and cold reopen: PASS
+- explicit SlateDB owner and cold reopen: PASS
+- typed binary SHA-256:
+  0ee7e28aca8165ec0a36475f2feaa643884ab9cde1164f8864e75c0e7b3f222b
+- no-run/RocksDB/SlateDB log SHA-256:
+  1e05e50f5a15ee43160d80dde0af421fd0e1d8f99d2361d49017ceb8ef1bfa0c,
+  8b23ca1a0919791a99f71a97383201c0333c4c50ee7c9fa23f80cc723f08a89f,
+  030a406dc17239893c250229ad6e5e8c6e452cf69cec5da0590adb89e467d855
 
 Compile calibration
 - exact b5 raw-space and old-scan probes compile

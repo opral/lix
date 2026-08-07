@@ -225,18 +225,23 @@ zero	removed-storage-owner	FileLix	8
 zero	removed-storage-owner	FileStorage	6
 zero	removed-storage-owner	FileStorageRead	4
 zero	removed-storage-owner	FileStorageWrite	6
-present	cli-rocksdb-default	lix_storage_rocksdb	1
-present	cli-rocksdb-default	RocksDB::open	0
-present	cli-rocksdb-default	Lix<RocksDB>	0
-zero	old-scan-identifier	ScanOptions	148
+present	cli-storage-route-token	lix_storage_rocksdb	2
+present	cli-storage-route-token	lix_storage_slatedb	2
+present	cli-storage-route-token	RocksDB::open	6
+present	cli-storage-route-token	SlateDB::open	2
+present	cli-storage-route-token	Lix<RocksDB>	0
+pass	cli-storage-route-contract	open_lix_at resolves to Lix<RocksDB> and calls RocksDB::open	0
+pass	cli-storage-route-contract	init_lix_at delegates exactly once to open_lix_at	1
+pass	cli-storage-route-contract	explicit SlateDB selector calls SlateDB::open	1
+pass	cli-storage-route-contract	CLI routes contain no FileStorage/SQLite compatibility	0
 zero	old-scan-identifier	StorageScanOptions	118
 zero	old-scan-identifier	ScanPlan	83
 zero	old-scan-identifier	ScanPlanCursor	0
-zero	old-scan-identifier	resume_after	293
 zero	old-scan-identifier	scan_resume_after	7
 zero	old-scan-identifier	expected_resume_after	6
+zero	old-scan-identifier	ScanOptions	112
+zero	old-scan-identifier	resume_after	32
 zero	old-scan-pattern	.first_page(	0
-zero	old-scan-pattern	.page(	1
 zero	old-scan-pattern	fn first_page(	0
 zero	old-scan-pattern	async fn first_page(	0
 zero	old-scan-pattern	StorageRead::scan	0
@@ -248,6 +253,7 @@ zero	old-scan-pattern	slate_scan_resume	0
 zero	old-scan-pattern	scan_resume_cache	0
 zero	old-scan-pattern	resume_cache	0
 zero	old-scan-pattern	scan_cursor: Mutex<Option<ScanCursor>>	1
+zero	old-scan-pattern	.page(	0
 zero	unsealed-owner	pub struct SpaceId(pub u32)	1
 zero	unsealed-owner	pub const fn mutable(id: SpaceId	1
 zero	unsealed-owner	pub const fn immutable(id: SpaceId	1

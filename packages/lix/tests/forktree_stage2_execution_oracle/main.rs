@@ -274,18 +274,15 @@ const DELETE_MODULES: &[&str] = &[
 // reconstructs a backend iterator from a continuation key. `ScanChunk` is the
 // one valid owned page shape and therefore is deliberately not listed here.
 const OLD_SCAN_IDENTIFIERS: &[&str] = &[
-    "ScanOptions",
     "StorageScanOptions",
     "ScanPlan",
     "ScanPlanCursor",
-    "resume_after",
     "scan_resume_after",
     "expected_resume_after",
 ];
 
 const OLD_SCAN_PATTERNS: &[&str] = &[
     ".first_page(",
-    ".page(",
     "fn first_page(",
     "async fn first_page(",
     "StorageRead::scan",
@@ -338,8 +335,23 @@ const REMOVED_STORAGE_OWNER_TOKENS: &[&str] = &[
     "FileStorageWrite",
 ];
 
-const REQUIRED_CLI_ROCKS_TOKENS: &[&str] =
-    &["lix_storage_rocksdb", "RocksDB::open", "Lix<RocksDB>"];
+const REQUIRED_CLI_ROUTE_TOKENS: &[&str] = &[
+    "lix_storage_rocksdb",
+    "lix_storage_slatedb",
+    "RocksDB::open",
+    "SlateDB::open",
+    "Lix<RocksDB>",
+];
+
+const FORBIDDEN_CLI_ROUTE_TOKENS: &[&str] = &[
+    "FileLix",
+    "FileStorage",
+    "FileStorageRead",
+    "FileStorageWrite",
+    "lix_storage_sqlite",
+    "SQLite",
+    "sqlite",
+];
 
 const UNSEALED_TOKENS: &[&str] = &[
     "pub struct SpaceId(pub u32)",
@@ -977,22 +989,130 @@ fn inspect_removed_storage_boundaries(files: &[SourceFile]) -> Vec<Finding> {
             });
         }
     }
-    let cli_boundary = files
+    findings.extend(inspect_cli_storage_routing(files));
+    findings
+}
+
+fn inspect_cli_storage_routing(files: &[SourceFile]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let cli_files = files
         .iter()
         .filter(|file| {
-            file.path == "packages/cli/Cargo.toml" || file.path == "packages/cli/src/db/mod.rs"
+            file.path == "packages/cli/Cargo.toml"
+                || file.path.starts_with("packages/cli/src/")
         })
+        .collect::<Vec<_>>();
+    let cli_source = cli_files
+        .iter()
         .map(|file| file.source.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    for token in REQUIRED_CLI_ROCKS_TOKENS {
-        if !cli_boundary.contains(token) {
+    for token in REQUIRED_CLI_ROUTE_TOKENS {
+        if !cli_source.contains(token) {
             findings.push(Finding {
-                class: "missing-cli-rocksdb-default",
+                class: "missing-cli-storage-route",
                 item: (*token).to_owned(),
                 count: 0,
             });
         }
+    }
+
+    let items = cli_files
+        .iter()
+        .filter(|file| file.path.ends_with(".rs"))
+        .flat_map(|file| all_declaration_items(&file.source))
+        .collect::<Vec<_>>();
+    let open_items = items
+        .iter()
+        .filter(|(header, _)| count_identifier(header, "open_lix_at") != 0)
+        .collect::<Vec<_>>();
+    let local_lix_aliases = items
+        .iter()
+        .filter(|(header, _)| {
+            header.contains("type LocalLix") && header.contains("Lix<RocksDB>")
+        })
+        .count();
+    if open_items.len() != 1 {
+        findings.push(Finding {
+            class: "invalid-cli-rocksdb-route",
+            item: "open_lix_at declaration count".to_owned(),
+            count: open_items.len(),
+        });
+    } else {
+        let (header, body) = open_items[0];
+        let concrete_rocks_return = header.contains("Lix<RocksDB>")
+            || (header.contains("LocalLix") && local_lix_aliases == 1);
+        if !concrete_rocks_return {
+            findings.push(Finding {
+                class: "invalid-cli-rocksdb-route",
+                item: "open_lix_at missing concrete Lix<RocksDB> return".to_owned(),
+                count: 0,
+            });
+        }
+        for required in ["RocksDB::open", "open_lix", "with_storage"] {
+            if !header.contains(required) && !body.contains(required) {
+                findings.push(Finding {
+                    class: "invalid-cli-rocksdb-route",
+                    item: format!("open_lix_at missing {required}"),
+                    count: 0,
+                });
+            }
+        }
+        for forbidden in FORBIDDEN_CLI_ROUTE_TOKENS {
+            let occurrences = count_identifier(body, forbidden);
+            if occurrences != 0 {
+                findings.push(Finding {
+                    class: "legacy-cli-storage-route",
+                    item: format!("open_lix_at::{forbidden}"),
+                    count: occurrences,
+                });
+            }
+        }
+    }
+
+    let init_items = items
+        .iter()
+        .filter(|(header, _)| count_identifier(header, "init_lix_at") != 0)
+        .collect::<Vec<_>>();
+    if init_items.len() != 1 {
+        findings.push(Finding {
+            class: "invalid-cli-rocksdb-route",
+            item: "init_lix_at declaration count".to_owned(),
+            count: init_items.len(),
+        });
+    } else {
+        let (_, body) = init_items[0];
+        if count_identifier(body, "open_lix_at") != 1 {
+            findings.push(Finding {
+                class: "invalid-cli-rocksdb-route",
+                item: "init_lix_at must call open_lix_at exactly once".to_owned(),
+                count: count_identifier(body, "open_lix_at"),
+            });
+        }
+        for forbidden in FORBIDDEN_CLI_ROUTE_TOKENS {
+            let occurrences = count_identifier(body, forbidden);
+            if occurrences != 0 {
+                findings.push(Finding {
+                    class: "legacy-cli-storage-route",
+                    item: format!("init_lix_at::{forbidden}"),
+                    count: occurrences,
+                });
+            }
+        }
+    }
+
+    let slate_items = items
+        .iter()
+        .filter(|(_, body)| {
+            body.contains("GitReplayStorage::Slatedb") && body.contains("SlateDB::open")
+        })
+        .count();
+    if slate_items == 0 {
+        findings.push(Finding {
+            class: "invalid-cli-slatedb-route",
+            item: "GitReplayStorage::Slatedb -> SlateDB::open".to_owned(),
+            count: 0,
+        });
     }
     findings
 }
@@ -1002,7 +1122,12 @@ fn cursor_sources(files: &[SourceFile]) -> impl Iterator<Item = &SourceFile> {
 }
 
 fn inspect_cursor(files: &[SourceFile]) -> Vec<Finding> {
-    let cursor_files = cursor_sources(files).collect::<Vec<_>>();
+    let cursor_files = cursor_sources(files)
+        .map(|file| SourceFile {
+            path: file.path.clone(),
+            source: production_source(&file.source),
+        })
+        .collect::<Vec<_>>();
     let cursor_source = cursor_files
         .iter()
         .map(|file| file.source.as_str())
@@ -1027,6 +1152,39 @@ fn inspect_cursor(files: &[SourceFile]) -> Vec<Finding> {
                 count: occurrences,
             });
         }
+    }
+    let scan_options = cursor_files
+        .iter()
+        .map(|file| count_lix_scan_options(&file.source))
+        .sum();
+    if scan_options != 0 {
+        findings.push(Finding {
+            class: "old-paginated-scan",
+            item: "ScanOptions".to_owned(),
+            count: scan_options,
+        });
+    }
+    let resume_after = cursor_files
+        .iter()
+        .map(|file| count_storage_resume_after(&file.source))
+        .sum();
+    if resume_after != 0 {
+        findings.push(Finding {
+            class: "old-paginated-scan",
+            item: "resume_after".to_owned(),
+            count: resume_after,
+        });
+    }
+    let scan_page_calls = cursor_files
+        .iter()
+        .map(|file| count_scan_related_page_calls(&file.source))
+        .sum();
+    if scan_page_calls != 0 {
+        findings.push(Finding {
+            class: "old-paginated-scan",
+            item: ".page(".to_owned(),
+            count: scan_page_calls,
+        });
     }
     for pattern in OLD_SCAN_PATTERNS {
         let occurrences = count(&cursor_source, pattern);
@@ -1111,6 +1269,55 @@ fn inspect_cursor(files: &[SourceFile]) -> Vec<Finding> {
         (left.class, left.item.as_str()).cmp(&(right.class, right.item.as_str()))
     });
     findings
+}
+
+fn count_lix_scan_options(source: &str) -> usize {
+    let mask = String::from_utf8(rust_code_mask(source)).expect("Rust source mask is UTF-8");
+    mask.match_indices("ScanOptions")
+        .filter(|(offset, _)| {
+            if !identifier_at(mask.as_bytes(), *offset, b"ScanOptions") {
+                return false;
+            }
+            let after = &mask[*offset + "ScanOptions".len()..];
+            !after.trim_start().starts_with("as SlateDBScanOptions")
+        })
+        .count()
+}
+
+fn scan_related_item(item: &str) -> bool {
+    [
+        "StorageRead",
+        "StorageAdapterRead",
+        "StorageScanSource",
+        "ScanOptions",
+        "ScanPlan",
+        "ScanPlanCursor",
+        "ScanCursor",
+        "ScanChunk",
+        "begin_scan",
+    ]
+    .iter()
+    .any(|marker| item.contains(marker))
+}
+
+fn count_storage_resume_after(source: &str) -> usize {
+    all_declaration_items(source)
+        .into_iter()
+        .filter(|(header, _)| {
+            ["ScanOptions", "StorageScanOptions", "ScanPlan", "ScanPlanCursor"]
+                .iter()
+                .any(|marker| header.contains(marker))
+        })
+        .map(|(_, item)| count_identifier(&item, "resume_after"))
+        .sum()
+}
+
+fn count_scan_related_page_calls(source: &str) -> usize {
+    all_declaration_items(source)
+        .into_iter()
+        .filter(|(_, item)| scan_related_item(item))
+        .map(|(_, item)| count(&item, ".page("))
+        .sum()
 }
 
 fn load_sources(root: &Path) -> Result<Vec<SourceFile>, String> {
@@ -1277,16 +1484,44 @@ fn print_budget(root: &Path) -> Result<(), String> {
     let cli_boundary = files
         .iter()
         .filter(|file| {
-            file.path == "packages/cli/Cargo.toml" || file.path == "packages/cli/src/db/mod.rs"
+            file.path == "packages/cli/Cargo.toml"
+                || file.path.starts_with("packages/cli/src/")
         })
         .map(|file| file.source.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    for token in REQUIRED_CLI_ROCKS_TOKENS {
+    for token in REQUIRED_CLI_ROUTE_TOKENS {
         println!(
-            "present\tcli-rocksdb-default\t{}\t{}",
+            "present\tcli-storage-route-token\t{}\t{}",
             escaped(token),
             count(&cli_boundary, token)
+        );
+    }
+    let route_findings = inspect_cli_storage_routing(&files);
+    for contract in [
+        "open_lix_at resolves to Lix<RocksDB> and calls RocksDB::open",
+        "init_lix_at delegates exactly once to open_lix_at",
+        "explicit SlateDB selector calls SlateDB::open",
+        "CLI routes contain no FileStorage/SQLite compatibility",
+    ] {
+        let failed = route_findings.iter().any(|finding| match contract {
+            "open_lix_at resolves to Lix<RocksDB> and calls RocksDB::open" => {
+                finding.class == "invalid-cli-rocksdb-route"
+                    && finding.item.starts_with("open_lix_at")
+            }
+            "init_lix_at delegates exactly once to open_lix_at" => {
+                finding.class == "invalid-cli-rocksdb-route"
+                    && finding.item.starts_with("init_lix_at")
+            }
+            "explicit SlateDB selector calls SlateDB::open" => {
+                finding.class == "invalid-cli-slatedb-route"
+            }
+            _ => finding.class == "legacy-cli-storage-route",
+        });
+        println!(
+            "pass\tcli-storage-route-contract\t{}\t{}",
+            escaped(contract),
+            usize::from(!failed)
         );
     }
     for token in OLD_SCAN_IDENTIFIERS {
@@ -1300,6 +1535,20 @@ fn print_budget(root: &Path) -> Result<(), String> {
             occurrences
         );
     }
+    println!(
+        "zero\told-scan-identifier\tScanOptions\t{}",
+        cursor_files
+            .iter()
+            .map(|file| count_lix_scan_options(&production_source(&file.source)))
+            .sum::<usize>()
+    );
+    println!(
+        "zero\told-scan-identifier\tresume_after\t{}",
+        cursor_files
+            .iter()
+            .map(|file| count_storage_resume_after(&production_source(&file.source)))
+            .sum::<usize>()
+    );
     for token in OLD_SCAN_PATTERNS {
         println!(
             "zero\told-scan-pattern\t{}\t{}",
@@ -1307,6 +1556,13 @@ fn print_budget(root: &Path) -> Result<(), String> {
             count(&cursor_source, token)
         );
     }
+    println!(
+        "zero\told-scan-pattern\t.page(\t{}",
+        cursor_files
+            .iter()
+            .map(|file| count_scan_related_page_calls(&production_source(&file.source)))
+            .sum::<usize>()
+    );
     for token in UNSEALED_TOKENS {
         println!(
             "zero\tunsealed-owner\t{}\t{}",
@@ -1466,7 +1722,7 @@ fn self_test() -> Result<(), String> {
         }
     }
     let clean_cursor = REQUIRED_CURSOR_TOKENS.join("\n");
-    let clean_cursor_files = vec![
+    let mut clean_cursor_files = vec![
         SourceFile {
             path: "packages/lix/src/storage/traits.rs".to_owned(),
             source: format!("{clean_cursor}\nfn begin_scan("),
@@ -1488,19 +1744,39 @@ fn self_test() -> Result<(), String> {
             source: "fn begin_scan( Capability::ReverseScan".to_owned(),
         },
     ];
+    clean_cursor_files.extend([
+        SourceFile {
+            path: "packages/slatedb-storage/src/slatedb.rs".to_owned(),
+            source: "use slatedb::config::ScanOptions as SlateDBScanOptions;".to_owned(),
+        },
+        SourceFile {
+            path: "packages/lix/src/plugin_arena/mod.rs".to_owned(),
+            source: "fn lookup(store: &Store) { let _ = store.page(1); }".to_owned(),
+        },
+        SourceFile {
+            path: "packages/lix/src/changelog/context.rs".to_owned(),
+            source: "fn page_changes(resume_after: ChangeId) { let _ = resume_after; }".to_owned(),
+        },
+        SourceFile {
+            path: "packages/slatedb-storage/src/slatedb.rs".to_owned(),
+            source: "#[cfg(test)] fn snapshot_scan_cursor() {}".to_owned(),
+        },
+    ]);
     if !inspect_cursor(&clean_cursor_files).is_empty() {
-        return Err("synthetic clean cursor source rejected".to_owned());
+        return Err("non-storage page/resume/upstream ScanOptions was rejected".to_owned());
     }
     let mut dirty_cursor_files = clean_cursor_files;
     dirty_cursor_files[0]
         .source
-        .push_str("\nScanPlan resume_after");
+        .push_str("\nstruct ScanOptions { resume_after: Key }\nimpl StorageRead { fn scan_page(&self) { self.page(); } }\nScanPlan");
     let dirty_cursor = inspect_cursor(&dirty_cursor_files);
-    if !dirty_cursor
-        .iter()
-        .any(|finding| finding.class == "old-paginated-scan")
-    {
-        return Err("synthetic dirty cursor source missed residue".to_owned());
+    for residue in ["ScanOptions", "resume_after", ".page(", "ScanPlan"] {
+        if !dirty_cursor
+            .iter()
+            .any(|finding| finding.class == "old-paginated-scan" && finding.item == residue)
+        {
+            return Err(format!("synthetic dirty cursor source missed {residue}"));
+        }
     }
     let reconstruction = "fn adapter() {\nloop {\nread.begin_scan(space, range, options);\n}\n}";
     if count_adapter_scan_reconstruction_loops(reconstruction) != 1 {
@@ -1552,6 +1828,55 @@ impl Owner {
     }
     if count_adapter_scan_reconstruction_loops(interleaved) != 4 {
         return Err("item-scoped loop scan did not preserve all production items".to_owned());
+    }
+    let clean_cli = vec![
+        SourceFile {
+            path: "packages/cli/Cargo.toml".to_owned(),
+            source: "lix_storage_rocksdb lix_storage_slatedb".to_owned(),
+        },
+        SourceFile {
+            path: "packages/cli/src/db/mod.rs".to_owned(),
+            source: r#"
+use lix_storage_rocksdb::RocksDB;
+pub fn open_lix_at(path: &Path) -> Result<Lix<RocksDB>, CliError> {
+    let storage = RocksDB::open(path)?;
+    block_on(open_lix().with_storage(storage))
+}
+pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
+    let _ = open_lix_at(path)?;
+    Ok(true)
+}
+"#
+            .to_owned(),
+        },
+        SourceFile {
+            path: "packages/cli/src/commands/exp/git_replay.rs".to_owned(),
+            source: r#"
+use lix_storage_slatedb::SlateDB;
+fn run(storage: GitReplayStorage, path: &Path) {
+    match storage { GitReplayStorage::Slatedb => { let _ = SlateDB::open(path); } }
+}
+"#
+            .to_owned(),
+        },
+    ];
+    if !inspect_cli_storage_routing(&clean_cli).is_empty() {
+        return Err("synthetic typed CLI storage routes were rejected".to_owned());
+    }
+    let mut dirty_cli = clean_cli;
+    dirty_cli[1].source = dirty_cli[1]
+        .source
+        .replace("Lix<RocksDB>", "FileLix")
+        .replace("RocksDB::open(path)?", "FileStorage::from_path(path)?");
+    let dirty_cli_findings = inspect_cli_storage_routing(&dirty_cli);
+    if !dirty_cli_findings
+        .iter()
+        .any(|finding| finding.class == "invalid-cli-rocksdb-route")
+        || !dirty_cli_findings
+            .iter()
+            .any(|finding| finding.class == "legacy-cli-storage-route")
+    {
+        return Err("synthetic legacy CLI route was not rejected".to_owned());
     }
     println!("forktree-stage2-execution-oracle self-test PASS");
     Ok(())
@@ -1624,6 +1949,20 @@ fn run() -> Result<(), String> {
                 Err("semantic facades are absent, non-ForkTree, or own raw storage".to_owned())
             }
         }
+        Some("cli-routing-audit") => {
+            let root = PathBuf::from(
+                args.next()
+                    .ok_or("cli-routing-audit requires repository root")?,
+            );
+            let findings = inspect_cli_storage_routing(&load_sources(&root)?);
+            if findings.is_empty() {
+                println!("forktree-stage2-execution-oracle cli-routing-audit PASS");
+                Ok(())
+            } else {
+                print_findings(&findings);
+                Err("CLI storage routing is not the typed RocksDB/SlateDB hard cut".to_owned())
+            }
+        }
         Some("budget") => {
             let root = PathBuf::from(args.next().ok_or("budget requires repository root")?);
             print_budget(&root)
@@ -1633,7 +1972,7 @@ fn run() -> Result<(), String> {
             print_deleted_module_definitions(&root)
         }
         _ => Err(
-            "usage: oracle <self-test|baseline REPO|audit REPO|cursor-baseline REPO|cursor-audit REPO|semantic-audit REPO|budget REPO|definitions REPO>".to_owned(),
+            "usage: oracle <self-test|baseline REPO|audit REPO|cursor-baseline REPO|cursor-audit REPO|semantic-audit REPO|cli-routing-audit REPO|budget REPO|definitions REPO>".to_owned(),
         ),
     }
 }

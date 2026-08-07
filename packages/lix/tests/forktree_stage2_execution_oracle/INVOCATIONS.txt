@@ -36,6 +36,17 @@ diff -u "$ORACLE/PRE_CUT_STAGE1_BASELINE.txt" "$EVIDENCE/stage1-baseline.txt"
 diff -u "$ORACLE/PRE_CUT_E871_BASELINE.txt" "$EVIDENCE/e871-baseline.txt"
 diff -u "$ORACLE/PRE_CUT_MAIN803D_BASELINE.txt" "$EVIDENCE/main803d-baseline.txt"
 
+# All four pre-cut trees intentionally fail the same typed CLI route contract.
+for ROOT in \
+  /absolute/path/to/main-b5e \
+  /absolute/path/to/stage1-138b \
+  /absolute/path/to/main-e871 \
+  /absolute/path/to/main-803d
+do
+  if "$EVIDENCE/residue-oracle" cli-routing-audit "$ROOT" > "$EVIDENCE/cli-routing.txt" 2>&1; then exit 1; fi
+  diff -u "$ORACLE/PRE_CUT_CLI_ROUTING_BASELINE.txt" "$EVIDENCE/cli-routing.txt"
+done
+
 # The immutable cursor successor must be green before Stage 2 starts.
 "$EVIDENCE/residue-oracle" cursor-audit /absolute/path/to/immutable-cursor-head
 
@@ -43,6 +54,16 @@ diff -u "$ORACLE/PRE_CUT_MAIN803D_BASELINE.txt" "$EVIDENCE/main803d-baseline.txt
 # executable public-facade ownership.
 "$EVIDENCE/residue-oracle" audit "$PWD"
 "$EVIDENCE/residue-oracle" semantic-audit "$PWD"
+"$EVIDENCE/residue-oracle" cli-routing-audit "$PWD"
+
+# The item-scoped source audit above proves the call graph. This typed runtime
+# gate independently proves concrete RocksDB ownership for normal CLI init/open
+# and durable cold reopen for both RocksDB and explicitly selected SlateDB.
+# It cannot compile while open_lix_at still returns FileLix/FileStorage.
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo test -p lix_cli --test forktree_stage2_cli_storage_routing --no-run
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target cargo test -p lix_cli --test forktree_stage2_cli_storage_routing normal_cli_init_open_is_rocksdb_and_cold_reopens -- --exact --nocapture --test-threads=1
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target cargo test -p lix_cli --test forktree_stage2_cli_storage_routing explicit_slatedb_selection_cold_reopens -- --exact --nocapture --test-threads=1
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo clippy -p lix_cli --test forktree_stage2_cli_storage_routing -- -D warnings
 
 # Build the exact candidate before compile probes; stale rlibs are invalid.
 CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo build -p lix --lib
@@ -68,7 +89,7 @@ rg 'E0432|E0560|has no field|unknown field' "$EVIDENCE/cursor-resume.stderr"
 test ! -e packages/sqlite-storage
 ! rg -n 'lix_storage_sqlite|StorageProfile::SQLite|LixStorageProfile::SQLite|SQLiteTempBenchStorage|ChangelogScoreStorage::SQLite|FileLix|FileStorage(Read|Write)?' packages Cargo.toml
 if cargo metadata --no-deps --format-version 1 | rg -q 'sqlite-storage|lix_storage_sqlite'; then exit 1; fi
-rg -n 'lix_storage_rocksdb|RocksDB::open|Lix<RocksDB>' packages/cli
+"$EVIDENCE/residue-oracle" cli-routing-audit "$PWD"
 
 CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo check --workspace --all-targets
 CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo check -p lix -p lix-storage-rocksdb -p lix-storage-slatedb -p lix_cli -p lix-storage-filesystem -p lix_collaboration_test_support -p lix_tests -p lix-server-protocol --all-targets

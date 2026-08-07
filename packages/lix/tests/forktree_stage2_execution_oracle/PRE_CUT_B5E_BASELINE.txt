@@ -1,3 +1,7 @@
+invalid-cli-rocksdb-route	open_lix_at missing RocksDB::open	0
+invalid-cli-rocksdb-route	open_lix_at missing concrete Lix<RocksDB> return	0
+legacy-cli-storage-route	open_lix_at::FileLix	1
+legacy-cli-storage-route	open_lix_at::FileStorage	1
 legacy-owner-or-codec	AuthenticatedControlCommitReachability	3
 legacy-owner-or-codec	AuthenticatedServingDependencyClosure	6
 legacy-owner-or-codec	BinaryCasChunkRef	2
@@ -187,8 +191,7 @@ legacy-space	TRACKED_STATE_TREE_CHUNK_SPACE	36
 legacy-space	TRACKED_WORKING_DIFF_MARKER_SPACE	17
 legacy-space	UPLOAD_MANIFEST_LEAF_SPACE	12
 legacy-space	UPLOAD_STATE_SPACE	9
-missing-cli-rocksdb-default	Lix<RocksDB>	0
-missing-cli-rocksdb-default	RocksDB::open	0
+missing-cli-storage-route	Lix<RocksDB>	0
 missing-required-owner	ChangeCatalog	0
 missing-required-owner	CommitCatalog	0
 missing-required-owner	GcEdgeCursorV1	0
@@ -221,18 +224,14 @@ missing-streaming-cursor	pub async fn next_page	0
 missing-streaming-cursor	pub enum ScanOrder	0
 missing-streaming-cursor	pub struct BeginScanOptions	0
 missing-streaming-cursor	pub struct ScanCursor<\'	0
-old-paginated-scan	.page(	1
-old-paginated-scan	ScanOptions	148
-old-paginated-scan	ScanPlan	83
-old-paginated-scan	StorageScanOptions	118
+old-paginated-scan	ScanOptions	112
+old-paginated-scan	ScanPlan	58
+old-paginated-scan	StorageScanOptions	82
 old-paginated-scan	expected_resume_after	6
-old-paginated-scan	older.scan(	1
-old-paginated-scan	read.scan(	14
-old-paginated-scan	resume_after	293
+old-paginated-scan	read.scan(	10
+old-paginated-scan	resume_after	32
 old-paginated-scan	scan_cursor: Mutex<Option<ScanCursor>>	1
-old-paginated-scan	scan_resume_after	7
-old-paginated-scan	snapshot_scan_cursor	1
-old-paginated-scan	stateless fallback	1
+old-paginated-scan	scan_resume_after	6
 removed-storage-owner	FileLix	8
 removed-storage-owner	FileStorage	6
 removed-storage-owner	FileStorageRead	4
@@ -293,4 +292,4 @@ superseded-module	transaction/plugin_checkpoint.rs	1
 unsealed-owner	pub const fn immutable(id: SpaceId	1
 unsealed-owner	pub const fn mutable(id: SpaceId	1
 unsealed-owner	pub struct SpaceId(pub u32)	1
-finding_count=295
+finding_count=294
