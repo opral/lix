@@ -220,6 +220,13 @@ pub struct ReclaimAccounting {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SelectorConflictAccounting {
+    pub unrelated_global_epoch_conflicts: u64,
+    pub unrelated_writer_success_potential: u64,
+    pub same_selector_stale_rejections: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ApplyAccounting {
     pub object_writes: u64,
     pub object_bytes: u64,
@@ -1969,6 +1976,95 @@ where
         Ok(())
     }
 
+    /// Deterministic fanout oracle for selector CAS and branch-delete/GC epoch
+    /// orderings. Both stale operations must fail at the adapter boundary; the
+    /// public owner retries only after rereading the canonical epoch.
+    pub async fn verify_selector_stale_write_and_delete_gc_races(
+        &self,
+    ) -> Result<SelectorConflictAccounting, String> {
+        let main = self.branch_head("main").await?;
+        let mut conflicts = SelectorConflictAccounting::default();
+
+        let (create_epoch, create_raw_epoch) = self.load_epoch().await?;
+        let first = selector_key(BRANCH_PREFIX, "race-selector-first");
+        let unrelated = selector_key(BRANCH_PREFIX, "race-selector-unrelated");
+        self.attempt_test_selector_create(
+            first.clone(),
+            main,
+            create_epoch,
+            create_raw_epoch.clone(),
+        )
+        .await?;
+        if self
+            .attempt_test_selector_create(unrelated, main, create_epoch, create_raw_epoch)
+            .await
+            .is_ok()
+        {
+            return Err("ForkTree unrelated stale-epoch selector write committed".to_string());
+        }
+        conflicts.unrelated_global_epoch_conflicts += 1;
+        conflicts.unrelated_writer_success_potential += 1;
+        self.delete_selector(first).await?;
+
+        let same = selector_key(BRANCH_PREFIX, "race-selector-same");
+        let (same_epoch, same_raw_epoch) = self.load_epoch().await?;
+        self.attempt_test_selector_create(same.clone(), main, same_epoch, same_raw_epoch.clone())
+            .await?;
+        if self
+            .attempt_test_selector_create(same.clone(), main, same_epoch, same_raw_epoch)
+            .await
+            .is_ok()
+        {
+            return Err("ForkTree same-selector stale write committed".to_string());
+        }
+        conflicts.same_selector_stale_rejections += 1;
+        self.delete_selector(same).await?;
+
+        self.create_branch("race-delete-gc-first", Some(main))
+            .await?;
+        let delete_key = selector_key(BRANCH_PREFIX, "race-delete-gc-first");
+        let delete_raw_ref = self
+            .load_raw_selector(&delete_key)
+            .await?
+            .ok_or_else(|| "missing branch-delete race selector".to_string())?;
+        let (delete_epoch, delete_raw_epoch) = self.load_epoch().await?;
+        self.stage_test_path_copy_orphan(b"delete-gc-first").await?;
+        let swept = self.reclaim_unreachable().await?;
+        if swept.reclaimed_objects == 0 {
+            return Err("ForkTree delete/GC race did not rotate the epoch".to_string());
+        }
+        if self
+            .attempt_test_selector_delete(
+                delete_key,
+                delete_raw_ref,
+                delete_epoch,
+                delete_raw_epoch,
+            )
+            .await
+            .is_ok()
+        {
+            return Err("ForkTree stale branch delete committed after GC".to_string());
+        }
+        self.delete_branch("race-delete-gc-first").await?;
+
+        self.create_branch("race-delete-first", Some(main)).await?;
+        let delete_first_orphan = self.stage_test_path_copy_orphan(b"delete-first").await?;
+        let (gc_epoch, gc_raw_epoch) = self.load_epoch().await?;
+        self.delete_branch("race-delete-first").await?;
+        if self
+            .attempt_test_delete(delete_first_orphan, gc_epoch, gc_raw_epoch)
+            .await
+            .is_ok()
+        {
+            return Err("ForkTree stale GC committed after branch deletion".to_string());
+        }
+        let swept = self.reclaim_unreachable().await?;
+        if swept.reclaimed_objects == 0 {
+            return Err("ForkTree branch-delete crash orphan was not reclaimed".to_string());
+        }
+        Ok(conflicts)
+    }
+
     /// Corrupts one live chunk through the raw benchmark adapter and proves
     /// that the next cold-cache owner read authenticates the object key before
     /// returning bytes. This is destructive test injection and must run last.
@@ -2114,6 +2210,104 @@ where
             .map_err(storage_error)?;
         write
             .delete_many(OBJECT_SPACE, &[key(&id.0)])
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key(EPOCH_KEY),
+                        value: StoredValue { bytes: next_epoch },
+                    }],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn attempt_test_selector_create(
+        &self,
+        selector: Vec<u8>,
+        commit: ObjectId,
+        epoch: u64,
+        raw_epoch: Bytes,
+    ) -> Result<(), String> {
+        let raw_ref = encode_ref(commit);
+        let next_epoch = encode_epoch(epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyAbsent {
+                        space: REF_SPACE,
+                        key: key(&selector),
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: raw_ref.len() + next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&selector),
+                            value: StoredValue { bytes: raw_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn attempt_test_selector_delete(
+        &self,
+        selector: Vec<u8>,
+        raw_ref: Bytes,
+        epoch: u64,
+        raw_epoch: Bytes,
+    ) -> Result<(), String> {
+        let next_epoch = encode_epoch(epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&selector),
+                        expected: raw_ref,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .delete_many(REF_SPACE, &[key(&selector)])
             .await
             .map_err(storage_error)?;
         write

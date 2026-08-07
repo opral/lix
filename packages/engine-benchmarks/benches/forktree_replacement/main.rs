@@ -2,6 +2,7 @@
 
 mod model;
 mod multimedia_acceptance;
+mod multimedia_fanout;
 mod relational;
 mod vertical;
 mod workload;
@@ -406,6 +407,10 @@ struct Sample {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("multimedia-fanout") {
+        multimedia_fanout::run().await;
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("multimedia-acceptance") {
         multimedia_acceptance::run().await;
         return;
