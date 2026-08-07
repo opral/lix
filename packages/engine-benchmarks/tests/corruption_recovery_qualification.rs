@@ -310,7 +310,9 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         Err(error) => error,
     };
     assert!(
-        error.to_string().contains("digest") || error.to_string().contains("tree"),
+        error
+            .to_string()
+            .contains("tracked-state chunk hash mismatch"),
         "unexpected tree corruption error: {error}"
     );
     drop(database);
