@@ -26,6 +26,7 @@ struct CountingAllocator;
 static PROFILE_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static NEXT_VIEW_NONCE: AtomicU64 = AtomicU64::new(1);
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
@@ -281,6 +282,7 @@ impl Selector {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Progress {
     cycle: u64,
+    revision: u64,
     fenced_authority: Bytes,
     root_count: u64,
     root_digest: Id,
@@ -289,8 +291,9 @@ struct Progress {
 impl Progress {
     fn encode(&self) -> Bytes {
         let mut body = Vec::with_capacity(160);
-        body.extend_from_slice(b"NLG1");
+        body.extend_from_slice(b"NLG2");
         body.extend_from_slice(&self.cycle.to_be_bytes());
+        body.extend_from_slice(&self.revision.to_be_bytes());
         body.extend_from_slice(&(self.fenced_authority.len() as u32).to_be_bytes());
         body.extend_from_slice(&self.fenced_authority);
         body.extend_from_slice(&self.root_count.to_be_bytes());
@@ -300,15 +303,15 @@ impl Progress {
 
     fn decode(raw: &Bytes) -> Result<Self, StorageError> {
         verify_checksum(raw)?;
-        if raw.len() < 4 + 8 + 4 + 8 + 32 + 32 || &raw[..4] != b"NLG1" {
+        if raw.len() < 4 + 8 + 8 + 4 + 8 + 32 + 32 || &raw[..4] != b"NLG2" {
             return Err(corruption("GC progress is malformed"));
         }
         let authority_len = u32::from_be_bytes(
-            raw[12..16]
+            raw[20..24]
                 .try_into()
                 .map_err(|_| corruption("GC authority length is malformed"))?,
         ) as usize;
-        let end = 16usize
+        let end = 24usize
             .checked_add(authority_len)
             .ok_or_else(|| corruption("GC authority length overflow"))?;
         if end + 40 + 32 != raw.len() {
@@ -316,10 +319,18 @@ impl Progress {
         }
         Ok(Self {
             cycle: read_u64(raw, 4)?,
-            fenced_authority: Bytes::copy_from_slice(&raw[16..end]),
+            revision: read_u64(raw, 12)?,
+            fenced_authority: Bytes::copy_from_slice(&raw[24..end]),
             root_count: read_u64(raw, end)?,
             root_digest: read_id(raw, end + 8)?,
         })
+    }
+
+    fn rotated_for_deletion(&self) -> Self {
+        Self {
+            revision: self.revision.checked_add(1).expect("GC revision overflow"),
+            ..self.clone()
+        }
     }
 }
 
@@ -382,6 +393,7 @@ struct PinnedView<R> {
     read: R,
     root: Id,
     view_id: Id,
+    valid: AtomicBool,
 }
 
 fn corruption(message: impl Into<String>) -> StorageError {
@@ -986,9 +998,15 @@ async fn open_pinned<'a, S: Storage>(
     };
     trace(&read, &[root], metrics).await?;
     let mut digest = blake3::Hasher::new();
-    digest.update(b"no-lease-live-storage-read-v1");
+    digest.update(b"no-lease-live-storage-read-v2");
     digest.update(&raw);
     digest.update(&authority.active);
+    let nonce = NEXT_VIEW_NONCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("StorageRead nonce overflow");
+    digest.update(&nonce.to_be_bytes());
     if let Some(cache_key) = read.snapshot_cache_key() {
         digest.update(&cache_key.to_be_bytes());
     }
@@ -996,6 +1014,7 @@ async fn open_pinned<'a, S: Storage>(
         read,
         root: authority.active,
         view_id: *digest.finalize().as_bytes(),
+        valid: AtomicBool::new(true),
     })
 }
 
@@ -1006,66 +1025,77 @@ async fn page<R: StorageRead>(
     limit: usize,
     metrics: &mut Metrics,
 ) -> Result<(Vec<(Vec<u8>, Bytes)>, Option<Bytes>), StorageError> {
-    let cursor = encoded_cursor.map(Cursor::decode).transpose()?;
-    if let Some(cursor) = &cursor {
-        if cursor.view_id != view.view_id || cursor.root != view.root || restart_after.is_some() {
-            return Err(StorageError::InvalidCursor);
-        }
+    if !view.valid.load(Ordering::Acquire) {
+        return Err(StorageError::ReadExpired);
     }
-    let lower = cursor
-        .as_ref()
-        .map(|cursor| cursor.last_delivered.as_slice())
-        .or(restart_after);
-    let prefix = view.root;
-    let range = prefix_range(&prefix);
-    let resume_after = lower.map(|logical| row_key(view.root, logical));
-    metrics.scans += 1;
-    let chunk = view
-        .read
-        .scan(
-            ROWS,
-            range,
-            ScanOptions {
-                projection: CoreProjection::FullValue,
-                limit_rows: limit,
-                resume_after,
-            },
-        )
-        .await?;
-    let mut result = Vec::new();
-    for entry in chunk.entries {
-        let raw =
-            full_value(Some(entry.value))?.ok_or_else(|| corruption("page row has no value"))?;
-        let decoded = decode_row(view.root, &entry.key, &raw)?;
-        if lower.is_some_and(|last| decoded.0.as_slice() <= last)
-            || result
-                .last()
-                .is_some_and(|(last, _): &(Vec<u8>, Bytes)| last >= &decoded.0)
-        {
-            return Err(corruption("page output is not strictly Excluded/ordered"));
-        }
-        metrics.scan_rows += 1;
-        metrics.scan_bytes += (entry.key.0.len() + raw.len()) as u64;
-        result.push(decoded);
-    }
-    let next = if chunk.has_more {
-        let last = result
-            .last()
-            .ok_or_else(|| corruption("empty page claims continuation"))?
-            .0
-            .clone();
-        Some(
-            Cursor {
-                view_id: view.view_id,
-                root: view.root,
-                last_delivered: last,
+    let result = async {
+        let cursor = encoded_cursor.map(Cursor::decode).transpose()?;
+        if let Some(cursor) = &cursor {
+            if cursor.view_id != view.view_id || cursor.root != view.root || restart_after.is_some()
+            {
+                return Err(StorageError::InvalidCursor);
             }
-            .encode(),
-        )
-    } else {
-        None
+        }
+        let lower = cursor
+            .as_ref()
+            .map(|cursor| cursor.last_delivered.as_slice())
+            .or(restart_after);
+        let prefix = view.root;
+        let range = prefix_range(&prefix);
+        let resume_after = lower.map(|logical| row_key(view.root, logical));
+        metrics.scans += 1;
+        let chunk = view
+            .read
+            .scan(
+                ROWS,
+                range,
+                ScanOptions {
+                    projection: CoreProjection::FullValue,
+                    limit_rows: limit,
+                    resume_after,
+                },
+            )
+            .await?;
+        let mut result = Vec::new();
+        for entry in chunk.entries {
+            let raw = full_value(Some(entry.value))?
+                .ok_or_else(|| corruption("page row has no value"))?;
+            let decoded = decode_row(view.root, &entry.key, &raw)?;
+            if lower.is_some_and(|last| decoded.0.as_slice() <= last)
+                || result
+                    .last()
+                    .is_some_and(|(last, _): &(Vec<u8>, Bytes)| last >= &decoded.0)
+            {
+                return Err(corruption("page output is not strictly Excluded/ordered"));
+            }
+            metrics.scan_rows += 1;
+            metrics.scan_bytes += (entry.key.0.len() + raw.len()) as u64;
+            result.push(decoded);
+        }
+        let next = if chunk.has_more {
+            let last = result
+                .last()
+                .ok_or_else(|| corruption("empty page claims continuation"))?
+                .0
+                .clone();
+            Some(
+                Cursor {
+                    view_id: view.view_id,
+                    root: view.root,
+                    last_delivered: last,
+                }
+                .encode(),
+            )
+        } else {
+            None
+        };
+        Ok((result, next))
     };
-    Ok((result, next))
+    let result = result.await;
+    if result.is_err() {
+        view.valid.store(false, Ordering::Release);
+    }
+    result
 }
 
 fn resume_without_live_read(_: &Bytes) -> Result<(), StorageError> {
@@ -1408,6 +1438,7 @@ async fn prepare_gc<S: Storage>(
         next_authority: next_authority.clone(),
         progress: Progress {
             cycle: next_authority.epoch,
+            revision: 0,
             fenced_authority: next_authority.encode(),
             root_count: roots.len() as u64,
             root_digest: root_digest(&roots),
@@ -1476,6 +1507,42 @@ fn gc_fence(authority: &Bytes, progress: &Bytes) -> Vec<Precondition> {
     ]
 }
 
+async fn commit_gc_deletion_page<S: Storage>(
+    storage: &S,
+    raw_authority: &Bytes,
+    raw_progress: &Bytes,
+    progress: &mut Progress,
+    space: lix::storage::StorageSpace,
+    deletes: Vec<Key>,
+    metrics: &mut Metrics,
+) -> Result<Bytes, StorageError> {
+    let next = progress.rotated_for_deletion();
+    let next_raw = next.encode();
+    write_batches(
+        storage,
+        WriteOptions {
+            preconditions: gc_fence(raw_authority, raw_progress),
+            ..WriteOptions::default()
+        },
+        vec![(
+            META,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key(Bytes::from_static(PROGRESS_KEY)),
+                    value: StoredValue {
+                        bytes: next_raw.clone(),
+                    },
+                }],
+            },
+        )],
+        vec![(space, deletes)],
+        metrics,
+    )
+    .await?;
+    *progress = next;
+    Ok(next_raw)
+}
+
 async fn resume_gc<S: Storage>(storage: &S, metrics: &mut Metrics) -> Result<(), StorageError> {
     let read = storage.begin_read(ReadOptions::default()).await?;
     let wanted = [
@@ -1487,10 +1554,10 @@ async fn resume_gc<S: Storage>(storage: &S, metrics: &mut Metrics) -> Result<(),
         .clone()
         .ok_or_else(|| corruption("fenced authority is absent"))?;
     let authority = Authority::decode(&raw_authority)?;
-    let raw_progress = values[1]
+    let mut raw_progress = values[1]
         .clone()
         .ok_or_else(|| corruption("GC progress is absent"))?;
-    let progress = Progress::decode(&raw_progress)?;
+    let mut progress = Progress::decode(&raw_progress)?;
     if progress.fenced_authority != raw_authority || progress.cycle != authority.epoch {
         return Err(corruption("GC progress does not bind raw authority"));
     }
@@ -1513,14 +1580,13 @@ async fn resume_gc<S: Storage>(storage: &S, metrics: &mut Metrics) -> Result<(),
             .collect::<Vec<_>>();
         if !deletes.is_empty() {
             metrics.swept_objects += deletes.len() as u64;
-            write_batches(
+            raw_progress = commit_gc_deletion_page(
                 storage,
-                WriteOptions {
-                    preconditions: gc_fence(&raw_authority, &raw_progress),
-                    ..WriteOptions::default()
-                },
-                Vec::new(),
-                vec![(OBJECTS, deletes)],
+                &raw_authority,
+                &raw_progress,
+                &mut progress,
+                OBJECTS,
+                deletes,
                 metrics,
             )
             .await?;
@@ -1536,14 +1602,13 @@ async fn resume_gc<S: Storage>(storage: &S, metrics: &mut Metrics) -> Result<(),
             .collect::<Vec<_>>();
         if !deletes.is_empty() {
             metrics.swept_rows += deletes.len() as u64;
-            write_batches(
+            raw_progress = commit_gc_deletion_page(
                 storage,
-                WriteOptions {
-                    preconditions: gc_fence(&raw_authority, &raw_progress),
-                    ..WriteOptions::default()
-                },
-                Vec::new(),
-                vec![(ROWS, deletes)],
+                &raw_authority,
+                &raw_progress,
+                &mut progress,
+                ROWS,
+                deletes,
                 metrics,
             )
             .await?;
@@ -2092,10 +2157,16 @@ async fn after_selector_crash<S: Storage>(
         page(&fresh, Some(&cursor), None, 8, metrics).await,
         Err(StorageError::InvalidCursor)
     ));
-    let (restarted, _) = page(&fresh, None, Some(&last_authenticated), 8, metrics).await?;
+    assert!(matches!(
+        page(&fresh, None, Some(&last_authenticated), 8, metrics).await,
+        Err(StorageError::ReadExpired)
+    ));
+    drop(fresh);
+    let restarted_view = open_pinned(storage, metrics).await?;
+    let (restarted, _) = page(&restarted_view, None, Some(&last_authenticated), 8, metrics).await?;
     assert_eq!(restarted.len(), 8);
     assert!(restarted[0].0 > last_authenticated);
-    drop(fresh);
+    drop(restarted_view);
     drop(old_view);
     assert!(matches!(
         resume_without_live_read(&cursor),

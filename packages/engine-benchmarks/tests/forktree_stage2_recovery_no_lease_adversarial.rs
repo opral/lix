@@ -103,7 +103,7 @@ mod frozen_oracle {
             }
         }
 
-        async fn deletion_page_first_must_fence_prepared_publish<S: Storage>(storage: S) {
+        async fn deletion_page_first_must_fence_prepared_publish<S: Storage>(storage: S) -> Id {
             let mut setup_metrics = Metrics::default();
             let initial = seed(&storage, &mut setup_metrics).await.expect("seed");
             let prepared_gc = prepare_gc(&storage, &mut setup_metrics)
@@ -168,6 +168,81 @@ mod frozen_oracle {
             graph_present(&storage, &successor, false, &mut verify_metrics)
                 .await
                 .expect("GC must reclaim the unpublished successor");
+
+            // The losing writer must restage bytes before retrying; a stale
+            // publication cannot resurrect the objects reclaimed by GC.
+            stage(&storage, &successor, &mut verify_metrics)
+                .await
+                .expect("restage successor after losing deletion-page race");
+            let retry = prepare_publish(
+                &storage,
+                initial.root.id,
+                successor.root.id,
+                &mut verify_metrics,
+            )
+            .await
+            .expect("prepare retry after restage");
+            commit_publish(&storage, &retry, &mut verify_metrics)
+                .await
+                .expect("retry after restage");
+            verify_active(&storage, successor.root.id, &mut verify_metrics)
+                .await
+                .expect("retried publication is active");
+
+            // Reverse race: publication wins p0 and removes progress before
+            // the already-prepared deletion transaction reaches commit.
+            let prepared_gc = prepare_gc(&storage, &mut verify_metrics)
+                .await
+                .expect("prepare reverse-order GC");
+            start_gc(&storage, &prepared_gc, &mut verify_metrics)
+                .await
+                .expect("start reverse-order GC");
+            let winner = graph(102);
+            stage(&storage, &winner, &mut verify_metrics)
+                .await
+                .expect("stage publication-first winner");
+            let prepared_publish = prepare_publish(
+                &storage,
+                successor.root.id,
+                winner.root.id,
+                &mut verify_metrics,
+            )
+            .await
+            .expect("prepare publication-first winner");
+            let (raw_authority, _) = load_authority(&storage, &mut verify_metrics)
+                .await
+                .expect("load deletion-page authority");
+            let raw_progress = progress_value(&storage, &mut verify_metrics)
+                .await
+                .expect("load deletion-page progress")
+                .expect("active deletion-page progress");
+            let mut progress = Progress::decode(&raw_progress).expect("decode deletion progress");
+            commit_publish(&storage, &prepared_publish, &mut verify_metrics)
+                .await
+                .expect("publication wins reverse race");
+            assert!(matches!(
+                commit_gc_deletion_page(
+                    &storage,
+                    &raw_authority,
+                    &raw_progress,
+                    &mut progress,
+                    OBJECTS,
+                    vec![winner.objects[0].key.clone()],
+                    &mut verify_metrics,
+                )
+                .await,
+                Err(StorageError::PreconditionFailed(_))
+            ));
+            verify_active(&storage, winner.root.id, &mut verify_metrics)
+                .await
+                .expect("publication-first winner remains active");
+            graph_present(&storage, &winner, true, &mut verify_metrics)
+                .await
+                .expect("losing deletion page cannot remove winner objects");
+            assert_no_persisted_reader_state(&storage, &mut verify_metrics)
+                .await
+                .expect("no reader authority after either race order");
+            winner.root.id
         }
 
         async fn same_root_distinct_reads_reject_cursor<S: Storage>(storage: &S) {
@@ -260,20 +335,33 @@ mod frozen_oracle {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn rocks_deletion_page_first_fences_prepared_publish() {
             let directory = tempfile::tempdir().expect("RocksDB directory");
-            deletion_page_first_must_fence_prepared_publish(
+            let path = directory.path().to_path_buf();
+            let active = deletion_page_first_must_fence_prepared_publish(
                 RocksDB::open(directory.path()).expect("open RocksDB"),
             )
             .await;
+            let reopened = RocksDB::open(path).expect("cold reopen RocksDB");
+            let mut metrics = Metrics::default();
+            verify_active(&reopened, active, &mut metrics)
+                .await
+                .expect("retried RocksDB publication survives cold reopen");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn slate_deletion_page_first_fences_prepared_publish() {
             let directory = tempfile::tempdir().expect("SlateDB directory");
-            deletion_page_first_must_fence_prepared_publish(
+            let path = directory.path().to_path_buf();
+            let active = deletion_page_first_must_fence_prepared_publish(
                 SlateDB::open_with_io_counters(directory.path(), SlateDBIoCounters::default())
                     .expect("open SlateDB"),
             )
             .await;
+            let reopened = SlateDB::open_with_io_counters(path, SlateDBIoCounters::default())
+                .expect("cold reopen SlateDB");
+            let mut metrics = Metrics::default();
+            verify_active(&reopened, active, &mut metrics)
+                .await
+                .expect("retried SlateDB publication survives cold reopen");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
