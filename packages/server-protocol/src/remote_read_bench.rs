@@ -493,6 +493,7 @@ impl Seed {
 async fn seed_state_rows(lix: &Lix<SlateDB>) {
     let statements = (0..STATE_ROW_COUNT)
         .map(|index| ExecuteBatchStatement {
+            label: None,
             sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
             params: vec![
                 Value::Text(format!("{STATE_KEY_PREFIX}{index:05}")),

@@ -5,6 +5,7 @@ mod lix_active_branch_id;
 mod lix_json;
 mod lix_json_get;
 mod lix_json_get_text;
+mod lix_octet_length;
 mod lix_timestamp;
 mod lix_uuid_v7;
 
@@ -40,6 +41,7 @@ pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
     ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));
     ctx.register_udf(ScalarUDF::from(lix_json::LixJson));
+    ctx.register_udf(ScalarUDF::from(lix_octet_length::LixOctetLength::new()));
 }
 
 pub(crate) fn register_execution_sql2_functions(

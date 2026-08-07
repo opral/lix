@@ -97,17 +97,17 @@ const PARAM_MULTI_FILE_PATH_AND_DATA: &[DifferentialParam] = &[
 
 #[cfg(test)]
 const SETUP_SEED_LIX_FILE_ROW: &[&str] = &[
-    "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000362', '/diff/existing.md', X'6f6c64')",
+    "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000362', '/diff/existing.md', CAST('old' AS BYTEA))",
 ];
 
 #[cfg(test)]
 const TX_SETUP_STAGED_LIX_FILE_ROW: &[&str] = &[
-    "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000552', '/diff/tx.md', X'62617365')",
+    "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000552', '/diff/tx.md', CAST('base' AS BYTEA))",
 ];
 
 #[cfg(test)]
 const SETUP_SEED_UNTRACKED_LIX_FILE_ROW: &[&str] = &[
-    "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ('01920000-0000-7000-8000-000000000542', '/diff/untracked.md', X'6f6c64', true)",
+    "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ('01920000-0000-7000-8000-000000000542', '/diff/untracked.md', CAST('old' AS BYTEA), true)",
 ];
 
 #[cfg(test)]
@@ -205,7 +205,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/repeated-contradictory-predicates".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_file SET content = X'6e6577' WHERE path = '/diff/existing.md' AND path = '/diff/other.md'".into(),
+            sql: "UPDATE lix_file SET content = CAST('new' AS BYTEA) WHERE path = '/diff/existing.md' AND path = '/diff/other.md'".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -215,7 +215,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/duplicate-insert-target-columns".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, path, content) VALUES ('/diff/dup.md', '/diff/dup.md', X'647570')".into(),
+            sql: "INSERT INTO lix_file (path, path, content) VALUES ('/diff/dup.md', '/diff/dup.md', CAST('dup' AS BYTEA))".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -251,7 +251,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/empty-branch-filter-base-staged-dedupe".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_file SET content = X'737461676564' WHERE path IN ('/diff/existing.md') AND path = '/diff/existing.md'".into(),
+            sql: "UPDATE lix_file SET content = CAST('staged' AS BYTEA) WHERE path IN ('/diff/existing.md') AND path = '/diff/existing.md'".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -271,7 +271,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/staged-overlay-update-sees-prior-staged-row".into(),
             setup_sql: &[],
             transaction_setup_sql: TX_SETUP_STAGED_LIX_FILE_ROW,
-            sql: "UPDATE lix_file SET content = X'75706461746564' WHERE path = '/diff/tx.md'".into(),
+            sql: "UPDATE lix_file SET content = CAST('updated' AS BYTEA) WHERE path = '/diff/tx.md'".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -311,7 +311,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/insert-path-data-literal".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/insert.md', X'696e73657274')".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/insert.md', CAST('insert' AS BYTEA))".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -331,7 +331,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/upsert-path-data-insert".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/upsert-new.md', X'6e6577') ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/upsert-new.md', CAST('new' AS BYTEA)) ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -341,7 +341,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/upsert-path-data-update".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', X'6e6577') ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', CAST('new' AS BYTEA)) ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -351,7 +351,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/upsert-path-data-do-nothing".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', X'736b6970') ON CONFLICT (path) DO NOTHING".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', CAST('skip' AS BYTEA)) ON CONFLICT (path) DO NOTHING".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -361,7 +361,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/upsert-path-data-do-nothing-duplicate-existing".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', X'736b6970'), ('/diff/existing.md', X'736b6970') ON CONFLICT (path) DO NOTHING".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', CAST('skip' AS BYTEA)), ('/diff/existing.md', CAST('skip' AS BYTEA)) ON CONFLICT (path) DO NOTHING".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -371,7 +371,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/upsert-path-data-rejects-untracked-update".into(),
             setup_sql: SETUP_SEED_UNTRACKED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/untracked.md', X'6e6577') ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/untracked.md', CAST('new' AS BYTEA)) ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -383,7 +383,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/upsert-path-data-rejects-untracked-do-nothing".into(),
             setup_sql: SETUP_SEED_UNTRACKED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/untracked.md', X'736b6970') ON CONFLICT (path) DO NOTHING".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/untracked.md', CAST('skip' AS BYTEA)) ON CONFLICT (path) DO NOTHING".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -395,7 +395,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/multi-row-path-data-fast".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/multi-a.md', X'61'), ('/diff/multi-b.md', X'62')".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/multi-a.md', CAST('a' AS BYTEA)), ('/diff/multi-b.md', CAST('b' AS BYTEA))".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -415,7 +415,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/multi-row-upsert-path-data-update".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', X'6e6577'), ('/diff/multi-a.md', X'61') ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', CAST('new' AS BYTEA)), ('/diff/multi-a.md', CAST('a' AS BYTEA)) ON CONFLICT (path) DO UPDATE SET content = excluded.content".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
@@ -425,7 +425,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-file/multi-row-upsert-path-data-do-nothing".into(),
             setup_sql: SETUP_SEED_LIX_FILE_ROW,
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', X'736b6970'), ('/diff/multi-b.md', X'62') ON CONFLICT (path) DO NOTHING".into(),
+            sql: "INSERT INTO lix_file (path, content) VALUES ('/diff/existing.md', CAST('skip' AS BYTEA)), ('/diff/multi-b.md', CAST('b' AS BYTEA)) ON CONFLICT (path) DO NOTHING".into(),
             params: EMPTY_PARAMS,
             probes: LIX_FILE_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,

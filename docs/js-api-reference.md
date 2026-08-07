@@ -126,6 +126,8 @@ Result:
 
 ```ts
 type ExecuteResult = {
+  statementIndex?: number;
+  label?: string;
   columns: string[];
   rows: Row[];
   rowsAffected: number;
@@ -158,15 +160,26 @@ const content = result.rows[0]?.value("content").asBytes();
 const results = await lix.executeBatch(statements, options?);
 ```
 
-Executes multiple statements in one call. `statements` is a non-empty array of
-`{ sql, params? }` objects. `options` accepts the same `originKey` and
-`idempotencyKey` as `execute()`. Returns one `ExecuteResult` per statement.
+Executes multiple statements atomically in one call. `statements` is a non-empty
+array of `{ sql, params?, label? }` objects. `options` accepts the same
+`originKey` and `idempotencyKey` as `execute()`. Results preserve input order and
+include a zero-based `statementIndex`. A supplied label is echoed unchanged;
+labels are opaque and may repeat. If a label is omitted, the result has no
+`label` property.
 
 ```ts
 const results = await lix.executeBatch([
-  { sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/a.txt", bytes] },
+  { label: "create", sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/a.txt", bytes] },
   { sql: "SELECT count(*) AS n FROM lix_file" },
 ]);
+
+console.log(results[0].statementIndex, results[0].label); // 0, "create"
+console.log(results[1].statementIndex, results[1].label); // 1, undefined
+
+const returning = await lix.executeBatch([
+  { label: "update", sql: "UPDATE task SET done = true WHERE id = $1 RETURNING id, done", params: ["task-1"] },
+]);
+console.log(returning[0].rows[0]?.get("done"));
 ```
 
 ### observe()

@@ -649,6 +649,7 @@ async fn update_file_group<S>(
         let file_index =
             benchmark_file_index(file_count, checkpoint_index, auto_commit_index, offset);
         statements.push(ExecuteBatchStatement {
+            label: None,
             sql: "UPDATE lix_file SET content = $1 WHERE id = $2".to_string(),
             params: vec![
                 Value::Blob(payload(checkpoint_index, file_index, FILE_BYTES).into()),

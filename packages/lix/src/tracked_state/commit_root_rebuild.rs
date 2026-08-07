@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use crate::LixError;
 use crate::changelog::{
@@ -7,6 +7,7 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
+use crate::tracked_state::TrackedStateDeltaRef;
 use crate::tracked_state::context::{
     TrackedStateContext, TrackedStateRootRebuilder, TrackedStateTransientRebuildState,
     TrackedStateWriteReport, TrackedStateWriter,
@@ -15,9 +16,6 @@ use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
-};
-use crate::tracked_state::{
-    TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateRootMutationRef, encode_key_ref,
 };
 
 /// Owned delta used only by explicit commit-root rebuild.
@@ -362,95 +360,14 @@ where
         .collect::<Vec<_>>();
     let commit_id = plan.commit_id.to_string();
     let parent_commit_id = plan.parent_commit_id.map(|commit_id| commit_id.to_string());
-    let strictly_sorted = plan.deltas.windows(2).all(|pair| {
-        pair[0]
-            .schema_key
-            .cmp(&pair[1].schema_key)
-            .then_with(|| pair[0].file_id.cmp(&pair[1].file_id))
-            .then_with(|| pair[0].entity_pk.cmp(&pair[1].entity_pk))
-            .is_lt()
-    });
-    if strictly_sorted && plan.deltas.len() >= 2 {
-        let first = &plan.deltas[0];
-        let first_key = encode_key_ref(TrackedStateKeyRef {
-            schema_key: &first.schema_key,
-            file_id: first.file_id.as_deref(),
-            entity_pk: &first.entity_pk,
-        });
-        let file_delete_cascades = plan
-            .deltas
-            .iter()
-            .filter(|delta| delta.schema_key == "lix_file_descriptor" && delta.deleted)
-            .map(|delta| {
-                Ok((
-                    delta.entity_pk.as_single_string_owned().map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("file descriptor tombstone has invalid identity: {error}"),
-                        )
-                    })?,
-                    TrackedStateDeltaRef {
-                        schema_key: &delta.schema_key,
-                        file_id: delta.file_id.as_deref(),
-                        entity_pk: &delta.entity_pk,
-                        change_id: delta.change_id,
-                        commit_id: delta.commit_id,
-                        deleted: true,
-                        created_at: delta.created_at,
-                        updated_at: delta.updated_at,
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
-        if let Some(report) = writer
-            .try_stage_bulk_parent_root_from_ordered_mutations(
-                &commit_id,
-                parent_commit_id.as_deref(),
-                deltas.len(),
-                &first_key,
-                &file_delete_cascades,
-                RebuildRootMutations::new(&deltas),
-            )
-            .await?
-        {
-            return Ok(report);
-        }
-    }
+    // Explicit repair must replay the same identity-aware path used by the
+    // canonical root writer. The ordered bulk merge is a publication
+    // optimization whose parent-stream assumptions are not sufficient for a
+    // repair frontier containing shuffled filesystem lifecycle changes.
     writer
         .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
         .await
 }
-
-struct RebuildRootMutations<'iter, 'delta> {
-    inner: std::slice::Iter<'iter, TrackedStateDeltaRef<'delta>>,
-}
-
-impl<'iter, 'delta> RebuildRootMutations<'iter, 'delta> {
-    fn new(deltas: &'iter [TrackedStateDeltaRef<'delta>]) -> Self {
-        Self {
-            inner: deltas.iter(),
-        }
-    }
-}
-
-impl<'delta> Iterator for RebuildRootMutations<'_, 'delta> {
-    type Item = Result<TrackedStateRootMutationRef<'delta>, LixError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().copied().map(|delta| {
-            Ok(TrackedStateRootMutationRef {
-                delta,
-                require_absence: false,
-            })
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl ExactSizeIterator for RebuildRootMutations<'_, '_> {}
 
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
     commit.parent_commit_ids.first().copied()

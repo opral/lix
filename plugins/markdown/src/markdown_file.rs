@@ -938,6 +938,77 @@ pub(crate) fn render_tree(root: &NodeTree) -> Result<Vec<u8>, PluginError> {
     Ok(rendered.into_bytes())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_parse_serialize_fixpoint(label: &str, source: &str) {
+        let first = parse_markdown_source(source)
+            .unwrap_or_else(|error| panic!("{label} should parse: {error:?}"));
+        let canonical = first
+            .canonical_render
+            .clone()
+            .expect("parser returns canonical bytes");
+        let canonical_source =
+            std::str::from_utf8(&canonical).expect("canonical Markdown is UTF-8");
+        let second = parse_markdown_source(canonical_source)
+            .unwrap_or_else(|error| panic!("{label} canonical form should parse: {error:?}"));
+        assert_eq!(
+            second.canonical_render.as_deref(),
+            Some(canonical.as_slice()),
+            "{label} canonical serialization must be a fixpoint"
+        );
+        let third = parse_markdown_source(canonical_source)
+            .unwrap_or_else(|error| panic!("{label} repeated parse should parse: {error:?}"));
+        assert_eq!(
+            serde_json::to_vec(&second.root).expect("serialize second AST"),
+            serde_json::to_vec(&third.root).expect("serialize third AST"),
+            "{label} AST serialization must be deterministic"
+        );
+    }
+
+    #[test]
+    fn markdown_corpus_parse_serialize_is_deterministic_and_stable() {
+        let cases = [
+            (
+                "reported punctuation and wrapped strong",
+                "*Counter:\n\n(~26 users)\n\nA paragraph directly followed by\n- list item\n\n**knowledge base / shared workspace agents read and\nwrite to.**\n",
+            ),
+            (
+                "emphasis and strike",
+                "*single-asterisk* _underscore emphasis_ and ~~strike~~\n\n***nested***\n",
+            ),
+            (
+                "unicode and crlf",
+                "# 日本語 😀\r\n\r\nRésumé — naïve café\r\n",
+            ),
+            (
+                "frontmatter",
+                "---\nDateApproved: 6/10/2020\nOwner: team\n---\n\n# Title\n\nA suffix.\n",
+            ),
+            (
+                "fenced and inline code",
+                "```rust\nlet value = *Counter;\n```\n\nUse `a\\~b` literally.\n",
+            ),
+            (
+                "malformed but storable markdown",
+                "An unmatched *marker and [unfinished link\n\n> quote without closure\n",
+            ),
+        ];
+        for (label, source) in cases {
+            assert_parse_serialize_fixpoint(label, source);
+        }
+
+        for index in 0..128 {
+            let source = format!(
+                "# Case {index}\n\n*Counter:\n\n(~{} users)\n\nparagraph {index}\n- list item\n\n**wrapped strong {index}\nand unicode λ 😀.**\n\n`code {index}` and *emphasis*.\n",
+                index + 1
+            );
+            assert_parse_serialize_fixpoint("generated corpus case", &source);
+        }
+    }
+}
+
 fn remove_line_containing(source: &mut String, needle: &str) {
     while let Some(position) = source.find(needle) {
         let line_start = source[..position]

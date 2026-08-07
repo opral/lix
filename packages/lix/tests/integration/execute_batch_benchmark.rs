@@ -164,6 +164,7 @@ async fn run_case(
     let statements = statements
         .iter()
         .map(|statement| ExecuteBatchStatement {
+            label: None,
             sql: statement.sql.to_string(),
             params: statement.params.clone(),
         })
@@ -245,7 +246,7 @@ async fn seed_files(session: &SessionContext<CountingStorage>, file_count: usize
         sql.push_str(&file_id(index));
         sql.push_str("','");
         sql.push_str(&file_path(index));
-        sql.push_str("',X'62656E6368')");
+        sql.push_str("',CAST('bench' AS BYTEA))");
     }
     let result = session.execute(&sql, &[]).await.unwrap();
     assert_eq!(

@@ -244,7 +244,7 @@ simulation_test!(
                     Value::Text("content".to_string()),
                     Value::Text("BYTEA".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("X''".to_string()),
+                    Value::Text("CAST('' AS BYTEA)".to_string()),
                     Value::Text("DEFAULT".to_string()),
                 ],
                 vec![
@@ -869,7 +869,7 @@ simulation_test!(
             .expect("upsert with an omitted file id should generate");
         session
             .execute(
-                "UPDATE lix_file SET content = X'6F6C64' WHERE path = '/generated.txt'",
+                "UPDATE lix_file SET content = CAST('old' AS BYTEA) WHERE path = '/generated.txt'",
                 &[],
             )
             .await

@@ -3392,6 +3392,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lix",
+ "lix-storage-rocksdb",
  "lix-storage-slatedb",
  "lix_collaboration_test_support",
  "object_store 0.14.0",

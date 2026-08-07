@@ -98,6 +98,7 @@ fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>, LixError> {
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize_with_location()
         .map_err(tokenizer_error)?;
+    super::parse::reject_sql_hex_literals(&tokens)?;
     let statement_tokens = split_statement_tokens(&tokens);
     let statements = DFParserBuilder::new(tokens)
         .with_dialect(&dialect)
@@ -415,5 +416,14 @@ mod tests {
                 .code,
             LixError::CODE_INVALID_PARAM
         );
+    }
+
+    #[test]
+    fn rejects_hex_literals_in_atomic_scripts() {
+        let error = parse_sql_script("SELECT 1; SELECT X'4142'", 0)
+            .expect_err("hex literal should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(error.message, "SQL hex literals are not supported");
     }
 }

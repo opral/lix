@@ -81,6 +81,7 @@ impl From<NativeExecuteOptions> for RsExecuteOptions {
 pub struct NativeExecuteBatchStatement {
     pub sql: String,
     pub params: Option<Vec<LixValue>>,
+    pub label: Option<String>,
 }
 
 #[derive(Clone)]
@@ -939,6 +940,7 @@ impl NativeLix {
                 Ok(RsExecuteBatchStatement {
                     sql: statement.sql,
                     params,
+                    label: statement.label,
                 })
             })
             .collect::<std::result::Result<Vec<_>, LixError>>()
@@ -1873,6 +1875,8 @@ impl TryFrom<&Value> for LixValue {
 
 #[napi(object)]
 pub struct ExecuteResult {
+    pub statement_index: Option<u32>,
+    pub label: Option<String>,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<LixValue>>,
     pub rows_affected: u32,
@@ -1893,6 +1897,8 @@ impl TryFrom<RsExecuteResult> for ExecuteResult {
             rows.push(values);
         }
         Ok(Self {
+            statement_index: result.statement_index().map(|index| index as u32),
+            label: result.label().map(str::to_owned),
             columns: result.columns().to_vec(),
             rows,
             rows_affected: result.rows_affected() as u32,

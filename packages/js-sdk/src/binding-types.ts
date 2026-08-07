@@ -17,6 +17,8 @@ import type {
 import type { NativeLixValue } from "./value.js";
 
 export type BindingExecuteResult = {
+	statementIndex?: number;
+	label?: string;
 	columns: string[];
 	rows: NativeLixValue[][];
 	rowsAffected: number;
@@ -38,6 +40,7 @@ export type BindingParam = NativeLixValue;
 export type BindingBatchStatement = {
 	sql: string;
 	params: BindingParam[];
+	label?: string;
 };
 
 export type LixBinding = {
