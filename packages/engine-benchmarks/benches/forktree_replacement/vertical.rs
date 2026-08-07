@@ -15,7 +15,7 @@ use super::{
     Backend, CountingStorage, IoStats, Layout, Parameters, Scenario, apply_current,
     apply_replacement, begin_allocation_profile, directory_bytes, end_allocation_profile,
     physical_delta, prepare_current, prepare_replacement, process_cpu_ticks,
-    process_resident_bytes, take_stats, value_for_generation,
+    process_resident_bytes, settle_rocksdb_compaction, take_stats, value_for_generation,
 };
 
 const SOURCE_BRANCH_ID: &str = "019f0000-0000-7000-8000-000000000111";
@@ -79,12 +79,22 @@ async fn run_rocksdb(parameters: Parameters) {
     database
         .flush()
         .expect("flush ForkTree vertical RocksDB final state");
+    let post_flush_disk_bytes = directory_bytes(directory.path());
     println!(
         "forktree_vertical_lifecycle,scenario={:?},backend=rocksdb,layout={},post_flush_disk_bytes={}",
         parameters.scenario,
         parameters.layout.label(),
-        directory_bytes(directory.path())
+        post_flush_disk_bytes
     );
+    drop(database);
+    if std::env::var_os("FORKTREE_SETTLE_COMPACTION").is_some() {
+        println!(
+            "forktree_vertical_settled,scenario={:?},backend=rocksdb,layout={},post_flush_disk_bytes={post_flush_disk_bytes},post_compaction_disk_bytes={}",
+            parameters.scenario,
+            parameters.layout.label(),
+            settle_rocksdb_compaction(directory.path())
+        );
+    }
 }
 
 async fn run_slatedb(parameters: Parameters) {

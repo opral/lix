@@ -11,13 +11,13 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
 use super::model::{
-    ApplyAccounting, ForkTree, MergeOutcome, Mutation, ObjectId, RelationalValue,
-    SegmentedByteSource,
+    ApplyAccounting, ForkTree, INTERNAL_CHILDREN, LEAF_ROWS, MergeOutcome, Mutation, ObjectId,
+    ObjectLayoutStats, RelationalValue, SegmentedByteSource,
 };
 use super::{
     Backend, CountingStorage, IoStats, Layout, Parameters, begin_allocation_profile,
     directory_bytes, end_allocation_profile, physical_delta, process_cpu_nanos,
-    process_resident_bytes, take_stats,
+    process_resident_bytes, settle_rocksdb_compaction, take_stats,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -71,9 +71,13 @@ struct Observation {
 
 pub(super) async fn run(parameters: Parameters) {
     let kind = MutationKind::from_environment();
+    let value_bytes = std::env::var("FORKTREE_RELATIONAL_VALUE_BYTES")
+        .unwrap_or_else(|_| "fixture_default".to_string());
+    let value_shape = std::env::var("FORKTREE_RELATIONAL_VALUE_SHAPE")
+        .unwrap_or_else(|_| "fixture_default".to_string());
     println!(
-        "forktree_relational_model,current_big_o=O(U*current_publication_work),proposed_big_o=O(U*log_F(N)+copied_blocks),diff_merge_big_o=O(changed_paths+output+conflicts),selector_big_o=O(1),memory=O(U+copied_blocks),kind={}",
-        kind.label()
+        "forktree_relational_model,current_big_o=O(U*current_publication_work),proposed_big_o=O(U*log_F(N)+copied_blocks),diff_merge_big_o=O(changed_paths+output+conflicts),selector_big_o=O(1),memory=O(U+copied_blocks),kind={},value_bytes={value_bytes},value_shape={value_shape}",
+        kind.label(),
     );
     match parameters.backend {
         Backend::RocksDb => run_rocks(parameters, kind).await,
@@ -89,6 +93,7 @@ async fn run_rocks(parameters: Parameters, kind: MutationKind) {
         let (storage, stats) = CountingStorage::new(database.clone());
         let (fixture, mutations, expected) = prepare(storage, parameters, kind).await;
         database.flush().expect("flush relational RocksDB setup");
+        print_layout_stats(&fixture, parameters, kind, sample, "initial").await;
         let observation = measure_one(
             fixture,
             &mutations,
@@ -103,6 +108,20 @@ async fn run_rocks(parameters: Parameters, kind: MutationKind) {
         )
         .await;
         database.flush().expect("flush relational RocksDB result");
+        let open_disk_bytes = directory_bytes(directory.path());
+        if density_profile_requested() {
+            drop(database);
+            if std::env::var_os("FORKTREE_SETTLE_COMPACTION").is_some() {
+                println!(
+                    "forktree_density_compaction,backend=rocksdb,layout={},kind={},rows={},mutations={},settled_disk_bytes={}",
+                    parameters.layout.label(),
+                    kind.label(),
+                    parameters.rows,
+                    parameters.updates,
+                    settle_rocksdb_compaction(directory.path())
+                );
+            }
+        }
         let observation = Observation {
             post_flush_disk_bytes: directory_bytes(directory.path()),
             ..observation
@@ -115,6 +134,7 @@ async fn run_rocks(parameters: Parameters, kind: MutationKind) {
                 kind.label(),
                 observation.post_flush_disk_bytes
             );
+            print_physical_layout(directory.path(), parameters, kind, sample, open_disk_bytes);
             observations.push(observation);
         }
     }
@@ -137,6 +157,7 @@ async fn run_slate(parameters: Parameters, kind: MutationKind) {
             .flush_memtable_for_diagnostics()
             .await
             .expect("flush relational SlateDB setup");
+        print_layout_stats(&fixture, parameters, kind, sample, "initial").await;
         let observation = measure_one(
             fixture,
             &mutations,
@@ -154,6 +175,10 @@ async fn run_slate(parameters: Parameters, kind: MutationKind) {
             .flush_memtable_for_diagnostics()
             .await
             .expect("flush relational SlateDB result");
+        let open_disk_bytes = directory_bytes(directory.path());
+        if density_profile_requested() {
+            drop(database);
+        }
         let observation = Observation {
             post_flush_disk_bytes: directory_bytes(directory.path()),
             ..observation
@@ -166,6 +191,7 @@ async fn run_slate(parameters: Parameters, kind: MutationKind) {
                 kind.label(),
                 observation.post_flush_disk_bytes
             );
+            print_physical_layout(directory.path(), parameters, kind, sample, open_disk_bytes);
             observations.push(observation);
         }
     }
@@ -291,6 +317,7 @@ where
     let io = take_stats(stats);
     let physical = physical_delta(counters, physical_before);
     verify(&fixture, expected).await;
+    print_layout_stats(&fixture, parameters, kind, sample, "post_mutation").await;
     if report {
         println!(
             "forktree_relational_gate,sample={},backend={},layout={},kind={},rows={},mutations={},wall_us={:.3},cpu_us={:.3},alloc_bytes={},alloc_calls={},rss_before_bytes={},rss_after_bytes={},begin_reads={},begin_writes={},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},write_batches={},write_puts={},write_deletes={},write_bytes={},commits={},logical_bytes={},object_writes={},object_bytes={},node_writes={},node_bytes={},leaf_writes={},leaf_bytes={},internal_writes={},internal_bytes={},reused_objects={},disk_before_bytes={},disk_after_bytes={},slate_read_objects={},slate_read_bytes={},slate_write_objects={},slate_write_bytes={}",
@@ -344,6 +371,160 @@ where
         allocated_bytes,
         allocation_calls,
         post_flush_disk_bytes: 0,
+    }
+}
+
+fn density_profile_requested() -> bool {
+    std::env::var_os("FORKTREE_DENSITY_PROFILE").is_some()
+}
+
+async fn print_layout_stats<S>(
+    fixture: &Fixture<S>,
+    parameters: Parameters,
+    kind: MutationKind,
+    sample: usize,
+    stage: &str,
+) where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    if !density_profile_requested() || sample < parameters.warmups {
+        return;
+    }
+    let Fixture::ForkTree(tree) = fixture else {
+        return;
+    };
+    let stats = tree
+        .object_layout_stats()
+        .await
+        .expect("derive authenticated ForkTree layout stats");
+    print_object_layout(parameters, kind, sample, stage, stats);
+}
+
+fn print_object_layout(
+    parameters: Parameters,
+    kind: MutationKind,
+    sample: usize,
+    stage: &str,
+    stats: ObjectLayoutStats,
+) {
+    let accounted_bytes = stats
+        .object_value_bytes
+        .saturating_add(stats.object_physical_key_bytes)
+        .saturating_add(stats.selector_physical_key_bytes)
+        .saturating_add(stats.selector_value_bytes);
+    println!(
+        "forktree_density_objects,sample={},stage={stage},backend={},kind={},rows={},mutations={},objects={},object_value_bytes={},object_logical_key_bytes={},object_physical_key_bytes={},object_header_bytes={},reachable_objects={},unreachable_objects={},leaves={},leaf_rows={},leaf_capacity_rows={},leaf_encoded_bytes={},leaf_decoded_bytes={},leaf_key_bytes={},leaf_value_ref_bytes={},leaf_fill_ppm={},internals={},internal_children={},internal_capacity_children={},internal_encoded_bytes={},internal_fill_ppm={},value_packs={},packed_values={},value_pack_encoded_bytes={},value_pack_decoded_bytes={},value_payload_bytes={},deltas={},delta_bytes={},commits={},commit_bytes={},blob_chunks={},blob_chunk_bytes={},blob_manifests={},blob_manifest_bytes={},selectors={},selector_logical_key_bytes={},selector_physical_key_bytes={},selector_value_bytes={},accounted_bytes={accounted_bytes}",
+        sample - parameters.warmups + 1,
+        parameters.backend.label(),
+        kind.label(),
+        parameters.rows,
+        parameters.updates,
+        stats.objects,
+        stats.object_value_bytes,
+        stats.object_logical_key_bytes,
+        stats.object_physical_key_bytes,
+        stats.object_header_bytes,
+        stats.reachable_objects,
+        stats.unreachable_objects,
+        stats.leaves,
+        stats.leaf_rows,
+        stats.leaves.saturating_mul(LEAF_ROWS as u64),
+        stats.leaf_encoded_bytes,
+        stats.leaf_decoded_bytes,
+        stats.leaf_key_bytes,
+        stats.leaf_value_ref_bytes,
+        stats
+            .leaf_rows
+            .saturating_mul(1_000_000)
+            .checked_div(stats.leaves.saturating_mul(LEAF_ROWS as u64))
+            .unwrap_or(0),
+        stats.internals,
+        stats.internal_children,
+        stats.internals.saturating_mul(INTERNAL_CHILDREN as u64),
+        stats.internal_encoded_bytes,
+        stats
+            .internal_children
+            .saturating_mul(1_000_000)
+            .checked_div(stats.internals.saturating_mul(INTERNAL_CHILDREN as u64),)
+            .unwrap_or(0),
+        stats.value_packs,
+        stats.packed_values,
+        stats.value_pack_encoded_bytes,
+        stats.value_pack_decoded_bytes,
+        stats.value_payload_bytes,
+        stats.deltas,
+        stats.delta_bytes,
+        stats.commits,
+        stats.commit_bytes,
+        stats.blob_chunks,
+        stats.blob_chunk_bytes,
+        stats.blob_manifests,
+        stats.blob_manifest_bytes,
+        stats.selectors,
+        stats.selector_logical_key_bytes,
+        stats.selector_physical_key_bytes,
+        stats.selector_value_bytes,
+    );
+}
+
+fn print_physical_layout(
+    path: &std::path::Path,
+    parameters: Parameters,
+    kind: MutationKind,
+    sample: usize,
+    open_disk_bytes: u64,
+) {
+    if !density_profile_requested() {
+        return;
+    }
+    let mut classes = BTreeMap::<String, (u64, u64)>::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read density database directory") {
+            let entry = entry.expect("read density database entry");
+            let metadata = entry.metadata().expect("read density database metadata");
+            if metadata.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(path)
+                .expect("density path prefix")
+                .to_path_buf();
+            let display = relative.to_string_lossy();
+            let class = if display.contains("/compacted/") {
+                "slate_compacted"
+            } else if display.contains("/wal/") {
+                "slate_wal"
+            } else if display.contains("/manifest/") {
+                "slate_manifest"
+            } else {
+                match relative.extension().and_then(|value| value.to_str()) {
+                    Some("sst") => "rocks_sst",
+                    Some("blob") => "rocks_blob",
+                    Some("log") => "rocks_wal",
+                    _ if display.contains("MANIFEST") => "rocks_manifest",
+                    _ if display.contains("OPTIONS") => "rocks_options",
+                    _ => "metadata_other",
+                }
+            };
+            let entry = classes.entry(class.to_string()).or_default();
+            entry.0 += 1;
+            entry.1 += metadata.len();
+        }
+    }
+    let settled_disk_bytes = directory_bytes(path);
+    for (class, (files, bytes)) in classes {
+        println!(
+            "forktree_density_files,sample={},backend={},layout={},kind={},rows={},mutations={},class={class},files={files},bytes={bytes},open_disk_bytes={open_disk_bytes},settled_disk_bytes={settled_disk_bytes}",
+            sample - parameters.warmups + 1,
+            parameters.backend.label(),
+            parameters.layout.label(),
+            kind.label(),
+            parameters.rows,
+            parameters.updates,
+        );
     }
 }
 
@@ -1248,7 +1429,7 @@ fn initial_rows(rows: usize) -> BTreeMap<Vec<u8>, RelationalValue> {
         .map(|index| {
             (
                 row_key(index.saturating_mul(2)),
-                RelationalValue::Bytes(format!("value-{index:010}").into_bytes()),
+                RelationalValue::Bytes(relational_value("value", index)),
             )
         })
         .collect()
@@ -1266,7 +1447,7 @@ fn mutation_batch(rows: usize, mutations: usize, kind: MutationKind) -> Vec<Muta
                 if ordinal % 4 == 0 {
                     RelationalValue::Null
                 } else {
-                    RelationalValue::Bytes(format!("changed-{ordinal:010}").into_bytes())
+                    RelationalValue::Bytes(relational_value("changed", ordinal))
                 }
             };
             match kind {
@@ -1300,6 +1481,64 @@ fn mutation_batch(rows: usize, mutations: usize, kind: MutationKind) -> Vec<Muta
     batch.sort_by(|left, right| left.key().cmp(right.key()));
     assert!(batch.windows(2).all(|pair| pair[0].key() < pair[1].key()));
     batch
+}
+
+fn relational_value(label: &str, identity: usize) -> Vec<u8> {
+    let Some(configured_bytes) =
+        std::env::var("FORKTREE_RELATIONAL_VALUE_BYTES")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("FORKTREE_RELATIONAL_VALUE_BYTES must be an integer")
+            })
+    else {
+        return format!("{label}-{identity:010}").into_bytes();
+    };
+    assert!(
+        configured_bytes > 0,
+        "relational value bytes must be positive"
+    );
+    match std::env::var("FORKTREE_RELATIONAL_VALUE_SHAPE")
+        .unwrap_or_else(|_| "compressible".to_string())
+        .as_str()
+    {
+        "compressible" => {
+            let mut value = vec![b'x'; configured_bytes];
+            let identity = format!("{identity:016x}");
+            for (offset, byte) in label
+                .as_bytes()
+                .iter()
+                .chain(identity.as_bytes())
+                .enumerate()
+            {
+                if offset >= value.len() {
+                    break;
+                }
+                value[offset] = *byte;
+            }
+            value
+        }
+        "incompressible" => {
+            let mut state = (identity as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(if label == "value" {
+                    0x243f_6a88_85a3_08d3
+                } else {
+                    0x1319_8a2e_0370_7344
+                });
+            (0..configured_bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                        [(state as usize) & 63]
+                })
+                .collect()
+        }
+        shape => panic!("unknown FORKTREE_RELATIONAL_VALUE_SHAPE '{shape}'"),
+    }
 }
 
 fn apply_oracle(

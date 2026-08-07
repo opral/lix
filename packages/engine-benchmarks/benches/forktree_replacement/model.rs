@@ -18,8 +18,8 @@ const COMMIT_TAG: u8 = 4;
 const VALUE_PACK_TAG: u8 = 5;
 const BLOB_CHUNK_TAG: u8 = 6;
 const BLOB_MANIFEST_TAG: u8 = 7;
-const LEAF_ROWS: usize = 8;
-const INTERNAL_CHILDREN: usize = 8;
+pub(super) const LEAF_ROWS: usize = 64;
+pub(super) const INTERNAL_CHILDREN: usize = 32;
 const BLOB_MIN_BYTES: usize = 512 * 1024;
 const BLOB_AVG_BYTES: usize = 512 * 1024;
 const BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -218,6 +218,43 @@ pub struct ApplyAccounting {
     pub internal_bytes: u64,
     pub reused_objects: u64,
     pub logical_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjectLayoutStats {
+    pub objects: u64,
+    pub object_value_bytes: u64,
+    pub object_logical_key_bytes: u64,
+    pub object_physical_key_bytes: u64,
+    pub object_header_bytes: u64,
+    pub reachable_objects: u64,
+    pub unreachable_objects: u64,
+    pub leaves: u64,
+    pub leaf_rows: u64,
+    pub leaf_encoded_bytes: u64,
+    pub leaf_decoded_bytes: u64,
+    pub leaf_key_bytes: u64,
+    pub leaf_value_ref_bytes: u64,
+    pub internals: u64,
+    pub internal_children: u64,
+    pub internal_encoded_bytes: u64,
+    pub value_packs: u64,
+    pub packed_values: u64,
+    pub value_pack_encoded_bytes: u64,
+    pub value_pack_decoded_bytes: u64,
+    pub value_payload_bytes: u64,
+    pub deltas: u64,
+    pub delta_bytes: u64,
+    pub commits: u64,
+    pub commit_bytes: u64,
+    pub blob_chunks: u64,
+    pub blob_chunk_bytes: u64,
+    pub blob_manifests: u64,
+    pub blob_manifest_bytes: u64,
+    pub selectors: u64,
+    pub selector_logical_key_bytes: u64,
+    pub selector_physical_key_bytes: u64,
+    pub selector_value_bytes: u64,
 }
 
 impl std::ops::AddAssign for ApplyAccounting {
@@ -2103,6 +2140,188 @@ where
             resume_after = page.entries.last().map(|entry| entry.key.clone());
         }
         Ok((rows, bytes))
+    }
+
+    /// Derives physical-layout accounting from the authenticated object and
+    /// selector authorities. The fold retains object identities and the mark
+    /// frontier, but never retains object bodies: memory is
+    /// `O(unique objects + frontier + page)` and each body is bounded by one
+    /// canonical block or blob chunk.
+    pub async fn object_layout_stats(&self) -> Result<ObjectLayoutStats, String> {
+        const PAGE: usize = 1_024;
+        let mut stats = ObjectLayoutStats::default();
+        let mut object_ids = std::collections::BTreeSet::new();
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut resume_after = None;
+        loop {
+            let page = read
+                .scan(
+                    OBJECT_SPACE,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: PAGE,
+                        resume_after: resume_after.clone(),
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            for entry in &page.entries {
+                let id = object_id_from_key(&entry.key)?;
+                let bytes = projected_bytes(&entry.value)?;
+                authenticate(id, bytes)?;
+                object_ids.insert(id);
+                stats.objects += 1;
+                stats.object_value_bytes += bytes.len() as u64;
+                stats.object_logical_key_bytes += entry.key.0.len() as u64;
+                stats.object_physical_key_bytes += 4 + entry.key.0.len() as u64;
+                if blob_chunk_id(bytes) == id && blake3::hash(bytes).as_bytes() != &id.0 {
+                    stats.blob_chunks += 1;
+                    stats.blob_chunk_bytes += bytes.len() as u64;
+                    continue;
+                }
+                stats.object_header_bytes += OBJECT_MAGIC.len() as u64 + 1;
+                match object_tag(bytes)? {
+                    LEAF_TAG => {
+                        let mut decoder = Decoder::new(bytes);
+                        let _tag = decoder.object_tag()?;
+                        let decoded_bytes = decoder.u32()? as u64;
+                        let rows = match decode_node(bytes)? {
+                            Node::Leaf(rows) => rows,
+                            Node::Internal(_) => unreachable!(),
+                        };
+                        stats.object_header_bytes += 4;
+                        stats.leaves += 1;
+                        stats.leaf_rows += rows.len() as u64;
+                        stats.leaf_encoded_bytes += bytes.len() as u64;
+                        stats.leaf_decoded_bytes += decoded_bytes;
+                        stats.leaf_key_bytes +=
+                            rows.iter().map(|row| row.key.len() as u64).sum::<u64>();
+                        stats.leaf_value_ref_bytes += rows.len() as u64 * (32 + 4);
+                    }
+                    INTERNAL_TAG => {
+                        let children = match decode_node(bytes)? {
+                            Node::Internal(children) => children,
+                            Node::Leaf(_) => unreachable!(),
+                        };
+                        stats.internals += 1;
+                        stats.internal_children += children.len() as u64;
+                        stats.internal_encoded_bytes += bytes.len() as u64;
+                    }
+                    VALUE_PACK_TAG => {
+                        let mut decoder = Decoder::new(bytes);
+                        let _tag = decoder.object_tag()?;
+                        let decoded_bytes = decoder.u32()? as u64;
+                        let values = decode_value_pack(bytes)?;
+                        stats.object_header_bytes += 4;
+                        stats.value_packs += 1;
+                        stats.packed_values += values.len() as u64;
+                        stats.value_pack_encoded_bytes += bytes.len() as u64;
+                        stats.value_pack_decoded_bytes += decoded_bytes;
+                        stats.value_payload_bytes += values
+                            .iter()
+                            .map(|value| match value {
+                                RelationalValue::Null => 0,
+                                RelationalValue::Bytes(bytes) => bytes.len() as u64,
+                            })
+                            .sum::<u64>();
+                    }
+                    DELTA_TAG => {
+                        object_edges(bytes)?;
+                        stats.deltas += 1;
+                        stats.delta_bytes += bytes.len() as u64;
+                    }
+                    COMMIT_TAG => {
+                        decode_commit(bytes)?;
+                        stats.commits += 1;
+                        stats.commit_bytes += bytes.len() as u64;
+                    }
+                    BLOB_MANIFEST_TAG => {
+                        decode_blob_manifest(bytes)?;
+                        stats.blob_manifests += 1;
+                        stats.blob_manifest_bytes += bytes.len() as u64;
+                    }
+                    tag => return Err(format!("unknown ForkTree layout object tag {tag}")),
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+        }
+
+        let selector_read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut roots = Vec::new();
+        let mut resume_after = None;
+        loop {
+            let page = selector_read
+                .scan(
+                    REF_SPACE,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: PAGE,
+                        resume_after: resume_after.clone(),
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            for entry in &page.entries {
+                let value = projected_bytes(&entry.value)?;
+                stats.selectors += 1;
+                stats.selector_logical_key_bytes += entry.key.0.len() as u64;
+                stats.selector_physical_key_bytes += 4 + entry.key.0.len() as u64;
+                stats.selector_value_bytes += value.len() as u64;
+                if entry.key.0.as_ref() != EPOCH_KEY {
+                    roots.push(decode_ref(value)?);
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+        }
+
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut frontier = roots;
+        while !frontier.is_empty() {
+            let mut ids = Vec::with_capacity(PAGE);
+            while ids.len() < PAGE {
+                let Some(id) = frontier.pop() else {
+                    break;
+                };
+                if reachable.insert(id) {
+                    ids.push(id);
+                }
+            }
+            for bytes in self.load_objects(&ids).await? {
+                let edges = object_edges(&bytes)?;
+                reachable.extend(edges.terminal);
+                frontier.extend(
+                    edges
+                        .traverse
+                        .into_iter()
+                        .filter(|edge| !reachable.contains(edge)),
+                );
+            }
+        }
+        stats.reachable_objects = reachable.len() as u64;
+        stats.unreachable_objects = object_ids.difference(&reachable).count() as u64;
+        Ok(stats)
     }
 
     fn rewrite_general<'a>(

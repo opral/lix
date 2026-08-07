@@ -1106,6 +1106,47 @@ fn directory_bytes(path: &std::path::Path) -> u64 {
     })
 }
 
+fn settle_rocksdb_compaction(path: &std::path::Path) -> u64 {
+    let database_options = rocksdb::Options::default();
+    let column_families = rocksdb::DB::list_cf(&database_options, path)
+        .expect("list ForkTree diagnostic RocksDB column families");
+    let descriptors = column_families.iter().map(|name| {
+        let mut options = rocksdb::Options::default();
+        options.set_write_buffer_size(64 * 1024 * 1024);
+        let mut table = rocksdb::BlockBasedOptions::default();
+        table.set_bloom_filter(8.0, false);
+        table.set_optimize_filters_for_memory(true);
+        options.set_block_based_table_factory(&table);
+        if name == "default" {
+            options.set_compression_type(rocksdb::DBCompressionType::Zstd);
+            options.set_compression_options(-14, 1, 0, 0);
+        } else if name == "lix-immutable-v1" {
+            options.set_compression_type(rocksdb::DBCompressionType::None);
+            options.set_enable_blob_files(true);
+            options.set_min_blob_size(32 * 1024);
+            options.set_blob_file_size(256 * 1024 * 1024);
+            options.set_blob_compression_type(rocksdb::DBCompressionType::None);
+            options.set_enable_blob_gc(true);
+            options.set_blob_gc_age_cutoff(0.0);
+            options.set_blob_gc_force_threshold(0.5);
+        }
+        rocksdb::ColumnFamilyDescriptor::new(name, options)
+    });
+    let database = rocksdb::DB::open_cf_descriptors(&database_options, path, descriptors)
+        .expect("open ForkTree RocksDB for diagnostic compaction");
+    for name in &column_families {
+        let column_family = database
+            .cf_handle(name)
+            .expect("diagnostic RocksDB column family is open");
+        database.compact_range_cf::<&[u8], &[u8]>(column_family, None, None);
+    }
+    database
+        .flush()
+        .expect("flush diagnostically compacted ForkTree RocksDB");
+    drop(database);
+    directory_bytes(path)
+}
+
 fn parse_positive(value: Option<&String>, name: &str, default: usize) -> usize {
     let parsed = parse_nonnegative(value, name, default);
     assert!(parsed > 0, "{name} must be positive");
