@@ -4,25 +4,219 @@
 //! implementation children stay private so object encodings, tree mechanics,
 //! selector fencing, and reachability cannot become competing authorities.
 
+mod blob;
 mod codec;
 mod model;
 mod object;
 mod publication;
+mod reachability;
+mod serving;
+mod state;
 mod tree;
 mod view;
 
+pub(crate) use blob::{UploadBindingRef, prepare_upload_completion};
 pub(crate) use model::{
-    BlobChunkRefV1, BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId,
-    CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1,
-    CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, UploadPartV1,
-    UploadProgressV1, UploadSelectorV1,
+    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
+    CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GcMarkPackV1,
+    GcProgressSelectorV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId,
+    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 pub(crate) use object::{OBJECT_SPACE, ObjectId};
-pub(crate) use publication::{PreparedPublication, SelectorExpectation};
+pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
+pub(crate) use reachability::discover_sweep_plan;
+pub(crate) use serving::{
+    CatalogPage, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree, load_change,
+    load_commit, page_changes, page_commits, put_change_catalog_entries,
+    put_commit_catalog_entries, state_point, state_range,
+};
+pub(crate) use state::{
+    StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef, UntrackedValueRef,
+    decode_state_key, decode_state_value, encode_state_key, encode_state_prefix,
+    encode_state_value,
+};
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
-pub(crate) use view::{CoherentView, open_coherent_view};
+pub(crate) use view::{CoherentView, open_coherent_view, open_coherent_view_on_read};
+
+// Stage 1 is deliberately unwired. This zero-runtime compile contract keeps
+// the root facade type-checked in non-test builds without connecting a reader
+// or writer before the independently reviewed compiler wave.
+const _: () = {
+    fn facade_contract<R, S>()
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+        S: crate::storage::Storage,
+    {
+        let _: Option<(
+            BlobChunkRefV1,
+            BlobChunkV1,
+            BlobManifestV1,
+            BranchSelectorV1,
+            BranchSnapshotV1,
+            CanonicalBranchId,
+            CanonicalUploadId,
+            ChangeCatalogEntry,
+            ChangeCatalogOwner,
+            ChangeId,
+            ChangeObjectV1,
+            CommitCatalogEntry,
+            CommitId,
+            CommitObjectV1,
+            GcMarkPackV1,
+            GcProgressSelectorV1,
+            GlobalSelectorV1,
+            RepositoryRootV1,
+            SnapshotRole,
+            SnapshotSelectorId,
+            SnapshotSelectorV1,
+            SnapshotTargetV1,
+            UploadPartV1,
+            UploadProgressV1,
+            UploadSelectorV1,
+        )> = None;
+        let _: Option<(
+            ObjectId,
+            BranchStateTransition,
+            PreparedPublication,
+            SelectorExpectation,
+            CatalogPage<(CommitId, CommitObjectV1)>,
+            StateSource,
+            StateTreeMutation,
+            VisibleStateRow,
+            StateCell,
+            StateCellRef<'static>,
+            StateKey,
+            StateKeyRef<'static>,
+            StateValue,
+            StateValueRef<'static>,
+            UntrackedValueRef<'static>,
+            ReceiptTreeEdit,
+            ReceiptTreeRoot,
+            CoherentView<R>,
+            UploadBindingRef<'static>,
+        )> = None;
+        let _ = OBJECT_SPACE;
+        let _ = RECEIPT_TREE_FANOUT;
+        let _ = RECEIPT_TREE_LEAF_ENTRIES;
+        let _ = prepare_upload_completion::<R>;
+        let _ = discover_sweep_plan::<R>;
+        let _ = edit_state_tree::<R>;
+        let _ = load_change::<R>;
+        let _ = load_commit::<R>;
+        let _ = page_changes::<R>;
+        let _ = page_commits::<R>;
+        let _ = put_change_catalog_entries::<R>;
+        let _ = put_commit_catalog_entries::<R>;
+        let _ = state_point::<R>;
+        let _ = state_range::<R>;
+        let _ = decode_state_key;
+        let _ = decode_state_value;
+        let _ = encode_state_key;
+        let _ = encode_state_prefix;
+        let _ = encode_state_value;
+        let _ = open_coherent_view::<S>;
+        let _ = open_coherent_view_on_read::<R>;
+        let _ = PreparedPublication::from_branch_view::<R>;
+        let _ = PreparedPublication::from_global_epoch::<R>;
+        let _ = PreparedPublication::publish_new_upload;
+        let _ = PreparedPublication::stage_blob_chunk;
+        let _ = PreparedPublication::stage_upload_part;
+        let _ = PreparedPublication::stage_upload_progress;
+        let _ = PreparedPublication::stage_receipt_tree_edit;
+        let _ = PreparedPublication::abort_upload;
+        let _ = PreparedPublication::publish_current_snapshot_pin::<R>;
+        let _ = PreparedPublication::release_snapshot_pin;
+        let _ = PreparedPublication::publish_gc_progress;
+        let _ = PreparedPublication::release_gc_progress;
+        let _ = PreparedPublication::publish_state_transition::<R>;
+        let _ = PreparedPublication::publish_completed_upload::<R>;
+        let _ = PreparedPublication::put_untracked_row;
+        let _ = PreparedPublication::delete_untracked_row;
+        let _ = PreparedPublication::apply_sweep_plan;
+        let _ = PreparedPublication::publish_branch_retirement::<R>;
+        let _ = PreparedPublication::commit::<S>;
+        let _ = StateTreeMutation::insert;
+        let _ = StateTreeMutation::update;
+        let _ = StateTreeMutation::remove;
+        let _ = serving::StateTreeEdit::entry_count;
+        let _ = serving::StateTreeEdit::copied_nodes;
+        let _ = serving::CatalogTreeEdit::entry_count;
+        let _ = serving::CatalogTreeEdit::copied_nodes;
+        let _ = serving::retire_commit_catalog_entries::<R>;
+        let _ = serving::retire_change_catalog_entries::<R>;
+        let _ = StateCellRef::Value("");
+        let _ = StateCellRef::Null;
+        let _ = StateCellRef::Tombstone;
+        let _ = tree::empty_receipt_tree;
+        let _ = tree::ImmutableObjectSet::extend;
+        let _ = tree::build_commit_catalog;
+        let _ = tree::build_change_catalog;
+        let _ = tree::build_state_tree;
+        let _ = tree::build_retention_tree;
+        let _ = |build: tree::TreeBuild| {
+            let _ = build.root;
+            let _ = build.objects;
+        };
+        let _ = |edit: ReceiptTreeEdit| {
+            let _ = edit.root;
+            let _ = edit.copied_nodes;
+            let _ = edit.inserted;
+        };
+        let _ = |root: ReceiptTreeRoot, id: ObjectId, part: &UploadPartV1| {
+            tree::insert_receipt_part(root, id, part, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |root: ObjectId, kind: &'static str, key: &[u8]| {
+            tree::lookup(root, kind, key, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |root: ObjectId, kind: &'static str| {
+            tree::scan_all(root, kind, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |key: CommitId, entry: CommitCatalogEntry| {
+            tree::validate_commit_catalog_back_edge(key, entry, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |key: ChangeId, entry: ChangeCatalogEntry| {
+            tree::validate_change_catalog_back_edge(key, entry, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |root: ReceiptTreeRoot, upload: &CanonicalUploadId| {
+            tree::validate_receipt_tree(root, upload, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |progress: &UploadProgressV1| {
+            tree::validate_upload_progress_tree(progress, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |selector: &UploadSelectorV1| {
+            tree::validate_upload_selector_progress(selector, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+        let _ = |snapshot: &BranchSnapshotV1| {
+            tree::validate_branch_snapshot_ref_edge(snapshot, |_| {
+                Err(crate::storage::StorageError::InvalidCursor)
+            })
+        };
+    }
+
+    let _: fn() = facade_contract::<
+        crate::storage_adapter::StorageAdapterReadScope<crate::storage::MemoryRead>,
+        crate::storage::Memory,
+    >;
+};
 
 #[cfg(test)]
 mod tests;

@@ -3,13 +3,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
+use crate::common::LixTimestamp;
+use crate::entity_pk::EntityPk;
 use crate::storage::{
     CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead,
     MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError,
     StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
+use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
-use super::model::{branch_selector_key, upload_binding_digest, upload_selector_key};
+use super::model::{
+    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
+    upload_binding_digest, upload_selector_key,
+};
+use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
     build_state_tree, empty_receipt_tree, insert_receipt_part, lookup, scan_all,
@@ -19,12 +26,18 @@ use super::tree::{
 };
 use super::view::SELECTOR_SPACE;
 use super::{
-    BlobChunkRefV1, BlobChunkV1, BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId,
-    CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1,
-    CoherentView, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1, OBJECT_SPACE,
-    ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
-    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, open_coherent_view,
+    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
+    BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage, ChangeCatalogEntry,
+    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
+    CommitObjectV1, GcMarkPackV1, GcProgressSelectorV1, GlobalSelectorV1, OBJECT_SPACE, ObjectId,
+    PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
+    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
+    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource,
+    StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1,
+    UploadProgressV1, UploadSelectorV1, VisibleStateRow, discover_sweep_plan, edit_state_tree,
+    encode_state_key, encode_state_value, load_change, load_commit, open_coherent_view,
+    page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
+    put_commit_catalog_entries, state_point, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -33,6 +46,40 @@ fn raw_id(byte: u8) -> [u8; 16] {
 
 fn content_id(byte: u8) -> ObjectId {
     ObjectId::from_bytes([byte; 32])
+}
+
+fn public_commit_id(byte: u8) -> crate::changelog::CommitId {
+    crate::changelog::CommitId::new(uuid::Uuid::from_bytes(raw_id(byte)))
+}
+
+fn public_change_id(byte: u8) -> crate::changelog::ChangeId {
+    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(raw_id(byte)))
+}
+
+fn state_entry(
+    primary_key: &str,
+    cell: StateCellRef<'_>,
+    commit_byte: u8,
+    manifests: &[ObjectId],
+) -> (Vec<u8>, Vec<u8>) {
+    let entity_pk = EntityPk::single(primary_key);
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: Some("file"),
+        entity_pk: &entity_pk,
+    });
+    let value = encode_state_value(StateValueRef {
+        change_id: public_change_id(commit_byte.wrapping_add(1)),
+        commit_id: public_commit_id(commit_byte),
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        cell,
+        metadata: None,
+        origin_key: None,
+        blob_manifest_object_ids: manifests,
+    })
+    .expect("state value");
+    (key, value)
 }
 
 #[derive(Clone)]
@@ -47,8 +94,11 @@ struct SeedData {
     ref_change_object_id: ObjectId,
     repository_root_id: ObjectId,
     branch_snapshot_id: ObjectId,
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
     global_selector: GlobalSelectorV1,
     branch_selector: BranchSelectorV1,
+    state_keys: Vec<Vec<u8>>,
     orphan_object_id: ObjectId,
     orphan_object_bytes: Bytes,
 }
@@ -60,14 +110,26 @@ fn build_seed() -> SeedData {
     let ref_change_id = ChangeId::from_bytes(raw_id(0x31));
     let mut objects = ImmutableObjectSet::default();
 
-    let global_state =
-        build_state_tree(&[(b"global/k".to_vec(), b"global".to_vec())]).expect("global state");
+    let mut global_rows = vec![
+        state_entry("a", StateCellRef::Value("global-a"), 0x20, &[]),
+        state_entry("b", StateCellRef::Value("global-b"), 0x20, &[]),
+        state_entry("c", StateCellRef::Null, 0x20, &[]),
+    ];
+    global_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let state_keys = global_rows.iter().map(|row| row.0.clone()).collect();
+    let global_state = build_state_tree(&global_rows).expect("global state");
     let global_state_root = global_state.root.object_id;
     objects
         .extend(global_state.objects)
         .expect("global objects");
-    let local_state =
-        build_state_tree(&[(b"local/k".to_vec(), b"local".to_vec())]).expect("local state");
+
+    let mut local_rows = vec![
+        state_entry("a", StateCellRef::Value("local-a"), 0x20, &[]),
+        state_entry("b", StateCellRef::Tombstone, 0x20, &[]),
+        state_entry("d", StateCellRef::Null, 0x20, &[]),
+    ];
+    local_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let local_state = build_state_tree(&local_rows).expect("local state");
     let local_state_root = local_state.root.object_id;
     objects.extend(local_state.objects).expect("local objects");
     let retention = build_retention_tree(&[]).expect("retention");
@@ -85,7 +147,6 @@ fn build_seed() -> SeedData {
     objects
         .insert(semantic_change_object_id, semantic_change_bytes)
         .expect("semantic object");
-
     let commit = CommitObjectV1 {
         commit_id,
         generation: 1,
@@ -99,7 +160,6 @@ fn build_seed() -> SeedData {
     objects
         .insert(commit_object_id, commit_bytes)
         .expect("commit object");
-
     let ref_change = ChangeObjectV1::BranchRef {
         change_id: ref_change_id,
         branch_id,
@@ -112,7 +172,6 @@ fn build_seed() -> SeedData {
     objects
         .insert(ref_change_object_id, ref_change_bytes)
         .expect("ref-change object");
-
     let commit_catalog =
         build_commit_catalog(&[(commit_id, CommitCatalogEntry { commit_object_id })])
             .expect("commit catalog");
@@ -147,7 +206,6 @@ fn build_seed() -> SeedData {
     objects
         .extend(change_catalog.objects)
         .expect("change catalog objects");
-
     let repository_root = RepositoryRootV1 {
         global_state_root,
         commit_catalog_root,
@@ -159,7 +217,6 @@ fn build_seed() -> SeedData {
     objects
         .insert(repository_root_id, repository_root_bytes)
         .expect("repository object");
-
     let branch_snapshot = BranchSnapshotV1 {
         branch_id,
         local_state_root,
@@ -172,7 +229,6 @@ fn build_seed() -> SeedData {
     objects
         .insert(branch_snapshot_id, branch_snapshot_bytes)
         .expect("branch snapshot object");
-
     let orphan = ChangeObjectV1::Semantic {
         change_id: ChangeId::from_bytes(raw_id(0xee)),
         payload: b"unreachable".to_vec(),
@@ -181,7 +237,6 @@ fn build_seed() -> SeedData {
     objects
         .insert(orphan_object_id, orphan_object_bytes.clone())
         .expect("orphan object");
-
     SeedData {
         objects,
         branch_id,
@@ -193,6 +248,8 @@ fn build_seed() -> SeedData {
         ref_change_object_id,
         repository_root_id,
         branch_snapshot_id,
+        global_state_root,
+        local_state_root,
         global_selector: GlobalSelectorV1 {
             repository_root: repository_root_id,
             epoch: 1,
@@ -203,6 +260,7 @@ fn build_seed() -> SeedData {
             branch_snapshot_object_id: branch_snapshot_id,
             selector_generation: 1,
         },
+        state_keys,
         orphan_object_id,
         orphan_object_bytes,
     }
@@ -240,7 +298,7 @@ where
             PutBatch {
                 entries: vec![
                     PutEntry {
-                        key: Key(super::model::global_selector_key()),
+                        key: Key(global_selector_key()),
                         value: StoredValue {
                             bytes: seed.global_selector.encode().expect("global selector"),
                         },
@@ -259,9 +317,9 @@ where
     write.commit().await.expect("commit seed");
 }
 
-fn load_from<'a>(
-    objects: &'a ImmutableObjectSet,
-) -> impl Fn(ObjectId) -> Result<Bytes, StorageError> + 'a {
+fn load_from(
+    objects: &ImmutableObjectSet,
+) -> impl Fn(ObjectId) -> Result<Bytes, StorageError> + '_ {
     move |id| {
         objects
             .get(id)
@@ -270,207 +328,323 @@ fn load_from<'a>(
     }
 }
 
+async fn object_present<S: Storage>(storage: &S, id: ObjectId) -> bool {
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("object read");
+    let keys = [Key(Bytes::copy_from_slice(id.as_bytes()))];
+    read.get_many(&[GetManyRequest {
+        space: OBJECT_SPACE,
+        keys: &keys,
+        opts: GetOptions {
+            projection: CoreProjection::FullValue,
+        },
+    }])
+    .await
+    .expect("object point")
+    .values[0]
+        .is_some()
+}
+
+async fn sweep<S: Storage>(storage: &S, branch_id: CanonicalBranchId) {
+    let view = open_coherent_view(storage, branch_id)
+        .await
+        .expect("sweep view");
+    let plan = discover_sweep_plan(&view).await.expect("sweep discovery");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("sweep epoch");
+    publication.apply_sweep_plan(plan).expect("sweep proof");
+    drop(view);
+    publication.commit(storage).await.expect("sweep commit");
+}
+
+async fn branch_transition<R: StorageAdapterRead>(
+    view: &CoherentView<R>,
+    state_edit: super::serving::StateTreeEdit,
+    identity: u8,
+) -> BranchStateTransition {
+    let semantic_commit = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(identity)),
+        generation: identity as u64,
+        parent_commit_object_ids: vec![view.branch_snapshot().semantic_head_commit_object_id],
+        member_change_object_ids: Vec::new(),
+        global_state_root: view.repository_root().global_state_root,
+        local_state_root: state_edit.root,
+        metadata: vec![identity],
+    };
+    let (commit_object_id, _) = semantic_commit.encode().expect("next commit");
+    let ref_change = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(identity.wrapping_add(1))),
+        branch_id: view.branch_id(),
+        before_semantic_head_commit_object_id: Some(
+            view.branch_snapshot().semantic_head_commit_object_id,
+        ),
+        after_semantic_head_commit_object_id: Some(commit_object_id),
+        previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
+        payload: vec![identity],
+    };
+    let (ref_object_id, _) = ref_change.encode().expect("next ref change");
+    let commit_catalog_edit = put_commit_catalog_entries(
+        view.repository_root().commit_catalog_root,
+        &[(
+            semantic_commit.commit_id,
+            CommitCatalogEntry { commit_object_id },
+        )],
+        view.read(),
+    )
+    .await
+    .expect("commit catalog edit");
+    let change_catalog_edit = put_change_catalog_entries(
+        view.repository_root().change_catalog_root,
+        &[(
+            ref_change.change_id(),
+            ChangeCatalogEntry {
+                change_object_id: ref_object_id,
+                owner: ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id: ref_object_id,
+                    branch_id: view.branch_id(),
+                },
+            },
+        )],
+        view.read(),
+    )
+    .await
+    .expect("change catalog edit");
+    let local_state_root = state_edit.root;
+    BranchStateTransition {
+        state_edit,
+        repository_root: RepositoryRootV1 {
+            commit_catalog_root: commit_catalog_edit.root,
+            change_catalog_root: change_catalog_edit.root,
+            ..view.repository_root()
+        },
+        commit_catalog_edit,
+        change_catalog_edit,
+        semantic_commit,
+        changes: vec![ref_change],
+        branch_snapshot: BranchSnapshotV1 {
+            branch_id: view.branch_id(),
+            local_state_root,
+            semantic_head_commit_object_id: commit_object_id,
+            latest_ref_change_object_id: Some(ref_object_id),
+            historical_global_state_root: view.repository_root().global_state_root,
+        },
+    }
+}
+
 #[test]
-fn immutable_objects_authenticate_domain_length_and_bytes() {
+fn immutable_objects_and_typed_state_codecs_fail_closed() {
     let seed = build_seed();
     let encoded = seed
         .objects
         .get(seed.repository_root_id)
-        .expect("repository bytes");
-    let decoded = RepositoryRootV1::decode(seed.repository_root_id, encoded)
-        .expect("repository root authenticates");
-    assert_ne!(decoded.commit_catalog_root, ObjectId::ZERO);
-
+        .expect("root bytes");
+    RepositoryRootV1::decode(seed.repository_root_id, encoded).expect("root authenticates");
     let mut corrupted = encoded.to_vec();
-    *corrupted.last_mut().expect("nonempty object") ^= 1;
+    *corrupted.last_mut().expect("nonempty") ^= 1;
+    assert!(RepositoryRootV1::decode(seed.repository_root_id, &corrupted).is_err());
+    assert!(BranchSnapshotV1::decode(seed.repository_root_id, encoded).is_err());
+
+    for cell in [
+        StateCellRef::Value("value"),
+        StateCellRef::Null,
+        StateCellRef::Tombstone,
+    ] {
+        let (_, encoded) = state_entry("typed", cell, 7, &[]);
+        let decoded: super::StateValue = super::decode_state_value(&encoded).expect("typed state");
+        assert_eq!(
+            decoded.cell.deleted(),
+            matches!(cell, StateCellRef::Tombstone)
+        );
+    }
+    let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
+    let decoded_key: super::StateKey = super::decode_state_key(&key).expect("typed key");
+    assert_eq!(decoded_key.schema_key, "app.row");
+    assert!(super::encode_state_prefix("app.row", Some("file")).len() < key.len());
+    assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
+}
+
+#[tokio::test]
+async fn coherent_state_point_and_range_preserve_overlay_semantics() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("coherent view");
+    let a: VisibleStateRow = state_point(&view, &seed.state_keys[0], false)
+        .await
+        .expect("point a")
+        .expect("a visible");
+    assert_eq!(a.source, StateSource::Branch);
+    assert!(
+        matches!(a.value.cell, StateCell::Value(ref value) if <_ as AsRef<str>>::as_ref(value) == "local-a")
+    );
+    assert!(
+        state_point(&view, &seed.state_keys[1], false)
+            .await
+            .expect("point b")
+            .is_none()
+    );
     assert!(matches!(
-        RepositoryRootV1::decode(seed.repository_root_id, &corrupted),
-        Err(StorageError::Corruption(_))
+        state_point(&view, &seed.state_keys[2], false)
+            .await
+            .expect("point c")
+            .expect("c visible")
+            .value
+            .cell,
+        StateCell::Null
     ));
-    assert!(matches!(
-        BranchSnapshotV1::decode(seed.repository_root_id, encoded),
-        Err(StorageError::Corruption(_))
-    ));
-    assert!(matches!(
-        RepositoryRootV1::decode(content_id(0x55), encoded),
-        Err(StorageError::Corruption(_))
-    ));
+    let rows = state_range(&view, None, None, Some(3), false)
+        .await
+        .expect("merged range");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].source, StateSource::Branch);
+    assert!(rows.iter().all(|row| !row.value.cell.deleted()));
+    let with_tombstone = state_range(&view, None, None, None, true)
+        .await
+        .expect("range with tombstones");
+    assert_eq!(with_tombstone.len(), 4);
+    assert!(with_tombstone.iter().any(|row| row.value.cell.deleted()));
+    let (_, updated) = state_entry("a", StateCellRef::Value("updated-a"), 0x22, &[]);
+    let (local_d, _) = state_entry("d", StateCellRef::Null, 0x22, &[]);
+    let edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![
+            StateTreeMutation::update(seed.state_keys[0].clone(), updated),
+            StateTreeMutation::remove(local_d),
+        ],
+        view.read(),
+    )
+    .await
+    .expect("update/remove path copy");
+    assert_eq!(edit.entry_count(), 2);
+    assert!(edit.copied_nodes() >= 2);
 }
 
 #[test]
-fn catalogs_use_one_raw_uuid_tree_for_exact_and_ordered_access() {
+fn catalogs_use_one_raw_uuid_tree_and_fail_closed_on_owner_mismatch() {
     let seed = build_seed();
     let repository = RepositoryRootV1::decode(
         seed.repository_root_id,
-        seed.objects
-            .get(seed.repository_root_id)
-            .expect("repository bytes"),
+        seed.objects.get(seed.repository_root_id).expect("root"),
     )
     .expect("repository");
     let load = load_from(&seed.objects);
-
-    let commit_value = lookup(
+    let value = lookup(
         repository.commit_catalog_root,
         "commit",
         seed.commit_id.as_bytes(),
         &load,
     )
-    .expect("commit lookup")
-    .expect("commit present");
-    let commit_entry = CommitCatalogEntry::decode(&commit_value).expect("commit entry");
-    let commit = validate_commit_catalog_back_edge(seed.commit_id, commit_entry, &load)
-        .expect("commit back-edge");
-    assert_eq!(commit.commit_id, seed.commit_id);
-
-    let changes =
-        scan_all(repository.change_catalog_root, "change", &load).expect("ordered change scan");
-    assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].0, seed.semantic_change_id.as_bytes());
-    assert_eq!(changes[1].0, seed.ref_change_id.as_bytes());
-    for (key, value) in changes {
-        let entry = ChangeCatalogEntry::decode(&value).expect("change entry");
-        let key = ChangeId::from_bytes(key.try_into().expect("raw UUID key"));
-        validate_change_catalog_back_edge(key, entry, &load).expect("change back-edge");
-    }
-    let snapshot = BranchSnapshotV1::decode(
-        seed.branch_snapshot_id,
-        seed.objects
-            .get(seed.branch_snapshot_id)
-            .expect("branch snapshot bytes"),
-    )
-    .expect("branch snapshot");
-    validate_branch_snapshot_ref_edge(&snapshot, &load).expect("branch ref edge");
-}
-
-#[test]
-fn catalog_back_edges_fail_closed_without_change_owner_cycles() {
-    let seed = build_seed();
-    let load = load_from(&seed.objects);
-    let semantic_entry = ChangeCatalogEntry {
+    .expect("lookup")
+    .expect("commit");
+    let entry = CommitCatalogEntry::decode(&value).expect("entry");
+    validate_commit_catalog_back_edge(seed.commit_id, entry, &load).expect("back edge");
+    let rows = scan_all(repository.change_catalog_root, "change", &load).expect("scan");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, seed.semantic_change_id.as_bytes());
+    assert_eq!(rows[1].0, seed.ref_change_id.as_bytes());
+    let bad = ChangeCatalogEntry {
         change_object_id: seed.semantic_change_object_id,
         owner: ChangeCatalogOwner::CommitMember {
             commit_object_id: seed.commit_object_id,
-            ordinal: 0,
+            ordinal: 9,
         },
     };
-    validate_change_catalog_back_edge(seed.semantic_change_id, semantic_entry, &load)
-        .expect("valid semantic owner");
-
-    for bad in [
-        ChangeCatalogEntry {
-            owner: ChangeCatalogOwner::CommitMember {
-                commit_object_id: seed.commit_object_id,
-                ordinal: 1,
-            },
-            ..semantic_entry
-        },
-        ChangeCatalogEntry {
-            owner: ChangeCatalogOwner::BranchRef {
-                ref_change_object_id: seed.semantic_change_object_id,
-                branch_id: seed.branch_id,
-            },
-            ..semantic_entry
-        },
-    ] {
-        assert!(matches!(
-            validate_change_catalog_back_edge(seed.semantic_change_id, bad, &load),
-            Err(StorageError::Corruption(_))
-        ));
-    }
-    assert!(matches!(
-        validate_change_catalog_back_edge(
-            ChangeId::from_bytes(raw_id(0x99)),
-            semantic_entry,
-            &load,
-        ),
-        Err(StorageError::Corruption(_))
-    ));
-
-    let ref_entry = ChangeCatalogEntry {
-        change_object_id: seed.ref_change_object_id,
-        owner: ChangeCatalogOwner::BranchRef {
-            ref_change_object_id: seed.ref_change_object_id,
-            branch_id: CanonicalBranchId::from_bytes(raw_id(0xff)),
-        },
-    };
-    assert!(matches!(
-        validate_change_catalog_back_edge(seed.ref_change_id, ref_entry, &load),
-        Err(StorageError::Corruption(_))
-    ));
-    assert!(
-        ChangeCatalogEntry {
-            change_object_id: seed.ref_change_object_id,
-            owner: ChangeCatalogOwner::BranchRef {
-                ref_change_object_id: seed.semantic_change_object_id,
-                branch_id: seed.branch_id,
-            },
-        }
-        .encode()
-        .is_err()
-    );
-
-    let change = ChangeObjectV1::decode(
+    assert!(validate_change_catalog_back_edge(seed.semantic_change_id, bad, &load).is_err());
+    let semantic = ChangeObjectV1::decode(
         seed.semantic_change_object_id,
         seed.objects
             .get(seed.semantic_change_object_id)
             .expect("semantic bytes"),
     )
-    .expect("semantic change");
-    assert!(matches!(change, ChangeObjectV1::Semantic { .. }));
+    .expect("semantic");
     assert_eq!(
-        change.encode().expect("re-encode semantic").0,
-        seed.semantic_change_object_id,
-        "semantic Change identity is independent of its catalog owner"
+        semantic.encode().expect("re-encode").0,
+        seed.semantic_change_object_id
     );
 }
 
-#[test]
-fn selector_codecs_authenticate_and_branch_selector_has_no_change_id() {
+#[tokio::test]
+async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
     let seed = build_seed();
-    let raw_global = seed.global_selector.encode().expect("global selector");
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view");
+    let old_token = page_commits(&view, None, 1)
+        .await
+        .expect("first page")
+        .resume_token
+        .expect("resume token");
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        Vec::new(),
+        view.read(),
+    )
+    .await
+    .expect("no-op state edit");
+    let transition = branch_transition(&view, state_edit, 0x60).await;
+    assert!(transition.commit_catalog_edit.copied_nodes() <= 2);
+    assert_eq!(transition.commit_catalog_edit.entry_count(), 2);
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("typed transition");
+    drop(view);
+    publication
+        .commit(&storage)
+        .await
+        .expect("commit transition");
+    let reopened = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("reopen");
+    assert!(matches!(
+        page_commits(&reopened, Some(&old_token), 1).await,
+        Err(StorageError::InvalidCursor)
+    ));
+    let first: CatalogPage<(CommitId, CommitObjectV1)> =
+        page_commits(&reopened, None, 1).await.expect("page one");
+    let second = page_commits(&reopened, first.resume_token.as_deref(), 1)
+        .await
+        .expect("page two");
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(second.entries.len(), 1);
     assert_eq!(
-        GlobalSelectorV1::decode(&raw_global).expect("decode global"),
-        seed.global_selector
-    );
-    let raw_branch = seed.branch_selector.encode().expect("branch selector");
-    assert_eq!(
-        BranchSelectorV1::decode(&raw_branch).expect("decode branch"),
-        seed.branch_selector
+        load_commit(&reopened, CommitId::from_bytes(raw_id(0x60)))
+            .await
+            .expect("load")
+            .expect("new commit")
+            .commit_id,
+        CommitId::from_bytes(raw_id(0x60))
     );
     assert!(
-        !raw_branch
-            .windows(seed.ref_change_id.as_bytes().len())
-            .any(|window| window == seed.ref_change_id.as_bytes()),
-        "BranchSelector must not duplicate ref_change_id"
+        load_change(&reopened, ChangeId::from_bytes(raw_id(0x61)))
+            .await
+            .expect("change")
+            .is_some()
     );
-    let mut corrupt = raw_branch.to_vec();
-    corrupt[12] ^= 1;
-    assert!(matches!(
-        BranchSelectorV1::decode(&corrupt),
-        Err(StorageError::Corruption(_))
-    ));
+    assert_eq!(
+        page_changes(&reopened, None, 2)
+            .await
+            .expect("changes")
+            .entries
+            .len(),
+        2
+    );
 }
 
 #[derive(Clone)]
 struct CountingStorage {
     inner: Memory,
     begin_reads: Arc<AtomicUsize>,
-    get_many_calls: Arc<AtomicUsize>,
-}
-
-impl CountingStorage {
-    fn new() -> Self {
-        Self {
-            inner: Memory::new(),
-            begin_reads: Arc::new(AtomicUsize::new(0)),
-            get_many_calls: Arc::new(AtomicUsize::new(0)),
-        }
-    }
 }
 
 struct CountingRead {
     inner: MemoryRead,
-    get_many_calls: Arc<AtomicUsize>,
 }
 
 impl StorageRead for CountingRead {
@@ -482,7 +656,6 @@ impl StorageRead for CountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        self.get_many_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.get_many(requests)
     }
 
@@ -496,21 +669,23 @@ impl StorageRead for CountingRead {
     }
 }
 
+impl CountingStorage {
+    fn new() -> Self {
+        Self {
+            inner: Memory::new(),
+            begin_reads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 impl Storage for CountingStorage {
-    type Read<'a>
-        = CountingRead
-    where
-        Self: 'a;
-    type Write<'a>
-        = MemoryWrite
-    where
-        Self: 'a;
+    type Read<'a> = CountingRead;
+    type Write<'a> = MemoryWrite;
 
     async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.begin_reads.fetch_add(1, Ordering::Relaxed);
         Ok(CountingRead {
             inner: self.inner.begin_read(options).await?,
-            get_many_calls: Arc::clone(&self.get_many_calls),
         })
     }
 
@@ -520,506 +695,70 @@ impl Storage for CountingStorage {
 }
 
 #[tokio::test]
-async fn coherent_view_uses_one_read_and_binds_resume_to_raw_selector_pair() {
+async fn coherent_open_uses_one_read_and_authenticates_the_complete_graph() {
     let seed = build_seed();
     let storage = CountingStorage::new();
     seed_storage(&storage, &seed).await;
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("open coherent view");
+        .expect("open");
     assert_eq!(storage.begin_reads.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        storage.get_many_calls.load(Ordering::Relaxed),
-        2,
-        "one selector get_many and one root-object get_many use the same read"
-    );
-    assert_eq!(
-        view.repository_root().commit_catalog_root != ObjectId::ZERO,
-        true
-    );
-    assert_eq!(view.branch_snapshot().branch_id, seed.branch_id);
-    assert_eq!(view.branch_selector(), seed.branch_selector);
-    let _ = view.read().snapshot_cache_key();
     let token = view.bind_resume_key(
         view.repository_root().change_catalog_root,
         seed.semantic_change_id.as_bytes(),
     );
     assert_eq!(
         view.validate_resume_key(view.repository_root().change_catalog_root, &token)
-            .expect("resume token"),
+            .expect("token"),
         seed.semantic_change_id.as_bytes()
     );
-
-    let original_view_id = view.view_id();
-    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
-    let next_branch = BranchSelectorV1 {
-        selector_generation: 2,
-        ..seed.branch_selector
-    };
-    publication
-        .put_selector(
-            branch_selector_key(seed.branch_id),
-            next_branch.encode().expect("next branch selector"),
-            SelectorExpectation::Equals(view.raw_branch_selector().clone()),
-        )
-        .expect("stage branch selector");
     drop(view);
-    publication
-        .commit(&storage)
-        .await
-        .expect("publish branch move");
 
-    let next_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("open next coherent view");
-    assert_ne!(next_view.view_id(), original_view_id);
-    assert!(matches!(
-        next_view.validate_resume_key(next_view.repository_root().change_catalog_root, &token),
-        Err(StorageError::InvalidCursor)
-    ));
-}
-
-fn make_part(
-    upload_id: &CanonicalUploadId,
-    part_number: u64,
-    byte_offset: u64,
-    payload: &'static [u8],
-) -> (ObjectId, Bytes, UploadPartV1, ObjectId, Bytes) {
-    let chunk = BlobChunkV1 {
-        bytes: Bytes::from_static(payload),
-    };
-    let (chunk_id, chunk_bytes) = chunk.encode().expect("chunk");
-    let part = UploadPartV1 {
-        upload_id: upload_id.clone(),
-        part_number,
-        byte_offset,
-        declared_part_len: payload.len() as u64,
-        ordered_chunks: vec![BlobChunkRefV1 {
-            chunk_object_id: chunk_id,
-            declared_len: payload.len() as u64,
-        }],
-        part_digest: *blake3::hash(payload).as_bytes(),
-    };
-    let (part_id, part_bytes) = part.encode().expect("part");
-    (chunk_id, chunk_bytes, part, part_id, part_bytes)
-}
-
-#[test]
-fn receipt_tree_path_copies_with_bounded_aggregates_and_no_predecessor() {
-    let upload_id = CanonicalUploadId::new("upload-a").expect("upload id");
-    let initial: ReceiptTreeEdit = empty_receipt_tree().expect("empty receipt");
-    assert_eq!(RECEIPT_TREE_LEAF_ENTRIES, 64);
-    assert_eq!(RECEIPT_TREE_FANOUT, 32);
-    let mut arena = initial.objects;
-    let mut root = initial.root;
-    let order = (0_u64..70).map(|part| (part * 17) % 70).collect::<Vec<_>>();
-    for part_number in order {
-        let payload = Box::leak(vec![part_number as u8; 8].into_boxed_slice());
-        let (chunk_id, chunk_bytes, part, part_id, part_bytes) =
-            make_part(&upload_id, part_number, part_number * 8, payload);
-        arena.insert(chunk_id, chunk_bytes).expect("chunk object");
-        arena.insert(part_id, part_bytes).expect("part object");
-        let edit = insert_receipt_part(root, part_id, &part, load_from(&arena))
-            .expect("insert receipt part");
-        assert!(edit.copied_nodes <= 4, "bounded path copy at 70 parts");
-        root = edit.root;
-        arena.extend(edit.objects).expect("tree nodes");
-    }
-    assert_eq!(root.completed_part_count, 70);
-    assert_eq!(root.received_bytes, 560);
-    assert_eq!(root.contiguous_prefix_bytes, 560);
-    let parts =
-        validate_receipt_tree(root, &upload_id, load_from(&arena)).expect("receipt closure");
-    assert_eq!(parts.len(), 70);
-
-    let duplicate = &parts[32];
-    let duplicate_id = ObjectId::from_bytes(
-        lookup(
-            root.object_id,
-            "receipt",
-            &duplicate.part_number.to_be_bytes(),
-            load_from(&arena),
-        )
-        .expect("duplicate lookup")
-        .expect("part present")
-        .try_into()
-        .expect("part id"),
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("manual coherent read"),
     );
-    let duplicate_edit = insert_receipt_part(root, duplicate_id, duplicate, load_from(&arena))
-        .expect("idempotent duplicate");
-    assert!(!duplicate_edit.inserted);
-    assert_eq!(duplicate_edit.root, root);
-    assert!(duplicate_edit.objects.is_empty());
+    let manual = super::open_coherent_view_on_read(read, seed.branch_id)
+        .await
+        .expect("same-handle open");
+    assert_eq!(manual.branch_id(), seed.branch_id);
+    drop(manual);
 
-    let (_, _, conflicting, conflicting_id, conflicting_bytes) =
-        make_part(&upload_id, 32, 256, b"different");
-    arena
-        .insert(conflicting_id, conflicting_bytes)
-        .expect("conflicting part object");
-    assert!(matches!(
-        insert_receipt_part(root, conflicting_id, &conflicting, load_from(&arena)),
-        Err(StorageError::WriteConflict)
-    ));
-}
-
-#[test]
-fn receipt_progress_and_part_corruption_fail_closed() {
-    let upload_id = CanonicalUploadId::new("upload-corruption").expect("upload id");
-    let initial = empty_receipt_tree().expect("empty receipt");
-    let mut arena = initial.objects;
-    let (chunk_id, chunk_bytes, part, part_id, part_bytes) =
-        make_part(&upload_id, 0, 0, b"payload");
-    arena.insert(chunk_id, chunk_bytes).expect("chunk");
-    arena.insert(part_id, part_bytes).expect("part");
-    let edit =
-        insert_receipt_part(initial.root, part_id, &part, load_from(&arena)).expect("insert");
-    let root = edit.root;
-    arena.extend(edit.objects).expect("nodes");
-    let binding_digest =
-        upload_binding_digest(b"repository", b"/file", b"file", 7, None).expect("binding");
-    let progress = UploadProgressV1 {
-        upload_id: upload_id.clone(),
-        binding_digest,
-        receipt_tree_root: root.object_id,
-        completed_part_count: root.completed_part_count,
-        received_bytes: root.received_bytes,
-        contiguous_prefix_bytes: root.contiguous_prefix_bytes,
-    };
-    let (progress_id, progress_bytes) = progress.encode().expect("progress");
-    let decoded = UploadProgressV1::decode(progress_id, &progress_bytes).expect("decode progress");
-    validate_upload_progress_tree(&decoded, load_from(&arena)).expect("progress closure");
-
-    let wrong_count = UploadProgressV1 {
-        completed_part_count: 2,
-        ..progress.clone()
-    };
-    assert!(validate_upload_progress_tree(&wrong_count, load_from(&arena)).is_err());
-    let wrong_size = UploadProgressV1 {
-        received_bytes: 8,
-        ..progress
-    };
-    assert!(validate_upload_progress_tree(&wrong_size, load_from(&arena)).is_err());
-
-    let malformed = UploadPartV1 {
-        declared_part_len: 8,
-        ..part
-    };
-    assert!(malformed.encode().is_err());
-    let mut corrupt_chunk = arena.get(chunk_id).expect("chunk bytes").to_vec();
-    corrupt_chunk.push(0);
-    assert!(BlobChunkV1::decode(chunk_id, &corrupt_chunk).is_err());
-
-    let wrong_declared_chunk = UploadPartV1 {
-        upload_id: upload_id.clone(),
-        part_number: 1,
-        byte_offset: 7,
-        declared_part_len: 8,
-        ordered_chunks: vec![BlobChunkRefV1 {
-            chunk_object_id: chunk_id,
-            declared_len: 8,
-        }],
-        part_digest: *blake3::hash(b"payload").as_bytes(),
-    };
-    let (wrong_part_id, wrong_part_bytes) = wrong_declared_chunk
-        .encode()
-        .expect("self-consistent part metadata");
-    arena
-        .insert(wrong_part_id, wrong_part_bytes)
-        .expect("wrong declared part");
-    let wrong_edit = insert_receipt_part(
-        root,
-        wrong_part_id,
-        &wrong_declared_chunk,
-        load_from(&arena),
-    )
-    .expect("tree accepts authenticated part metadata before closure validation");
-    let wrong_root = wrong_edit.root;
-    arena.extend(wrong_edit.objects).expect("wrong tree nodes");
-    assert!(validate_receipt_tree(wrong_root, &upload_id, load_from(&arena)).is_err());
-}
-
-struct UploadPublication {
-    selector_key: Bytes,
-    selector_value: Bytes,
-    objects: ImmutableObjectSet,
-    progress_id: ObjectId,
-}
-
-fn make_upload_publication() -> UploadPublication {
-    let upload_id = CanonicalUploadId::new("race-upload").expect("upload id");
-    let binding_digest = upload_binding_digest(
-        b"repository",
-        b"/race.bin",
-        b"file",
-        4,
-        Some(*blake3::hash(b"data").as_bytes()),
-    )
-    .expect("binding");
-    let initial = empty_receipt_tree().expect("receipt root");
-    let mut objects = initial.objects;
-    let (chunk_id, chunk_bytes, part, part_id, part_bytes) = make_part(&upload_id, 0, 0, b"data");
-    objects.insert(chunk_id, chunk_bytes).expect("chunk");
-    objects.insert(part_id, part_bytes).expect("part");
-    let edit = insert_receipt_part(initial.root, part_id, &part, load_from(&objects))
-        .expect("receipt insert");
-    let root = edit.root;
-    objects.extend(edit.objects).expect("receipt nodes");
-    let progress = UploadProgressV1 {
-        upload_id: upload_id.clone(),
-        binding_digest,
-        receipt_tree_root: root.object_id,
-        completed_part_count: root.completed_part_count,
-        received_bytes: root.received_bytes,
-        contiguous_prefix_bytes: root.contiguous_prefix_bytes,
-    };
-    let (progress_id, progress_bytes) = progress.encode().expect("progress");
-    objects
-        .insert(progress_id, progress_bytes)
-        .expect("progress object");
-    let selector = UploadSelectorV1 {
-        upload_id: upload_id.clone(),
-        binding_digest,
-        progress_object_id: progress_id,
-        selector_generation: 1,
-    };
-    UploadPublication {
-        selector_key: upload_selector_key(&upload_id).expect("upload key"),
-        selector_value: selector.encode().expect("upload selector"),
-        objects,
-        progress_id,
-    }
-}
-
-async fn prepare_upload(
-    view: &CoherentView<impl StorageRead>,
-    upload: &UploadPublication,
-) -> PreparedPublication {
-    let mut publication = PreparedPublication::from_global_epoch(view).expect("upload fence");
-    publication
-        .put_selector(
-            upload.selector_key.clone(),
-            upload.selector_value.clone(),
-            SelectorExpectation::Absent,
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("corruption write");
+    write
+        .delete_many(
+            OBJECT_SPACE,
+            &[Key(Bytes::copy_from_slice(
+                seed.semantic_change_object_id.as_bytes(),
+            ))],
         )
-        .expect("upload selector");
-    publication
-        .put_objects(upload.objects.clone())
-        .expect("upload objects");
-    publication
+        .await
+        .expect("delete selected member");
+    write.commit().await.expect("commit corruption");
+    assert!(open_coherent_view(&storage, seed.branch_id).await.is_err());
 }
 
 #[tokio::test]
-async fn upload_publication_and_gc_are_epoch_fenced_in_both_orders() {
-    // Publication first: stale GC cannot delete an object after the receipt
-    // selector makes its closure reachable.
-    let seed = build_seed();
-    let storage = Memory::new();
-    seed_storage(&storage, &seed).await;
-    let publication_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("publication view");
-    let gc_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("gc view");
-    let upload = make_upload_publication();
-    let publication = prepare_upload(&publication_view, &upload).await;
-    let mut stale_gc = PreparedPublication::from_global_epoch(&gc_view).expect("gc fence");
-    stale_gc
-        .delete_object(upload.progress_id)
-        .expect("stage stale delete");
-    drop(publication_view);
-    drop(gc_view);
-    publication.commit(&storage).await.expect("publish receipt");
-    assert!(matches!(
-        stale_gc.commit(&storage).await,
-        Err(StorageError::PreconditionFailed(_))
-    ));
-    let reopened = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("cold reopen");
-    reopened
-        .load_object_bytes(upload.progress_id)
-        .await
-        .expect("receipt progress survives");
-
-    // GC first: the stale receipt cannot publish against deleted/deduplicated
-    // payloads. Retry reopens the epoch and restages every absent object.
-    let storage = Memory::new();
-    seed_storage(&storage, &seed).await;
-    let publication_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("publication view");
-    let gc_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("gc view");
-    let stale_publication = prepare_upload(&publication_view, &upload).await;
-    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("gc fence");
-    gc.delete_object(seed.orphan_object_id)
-        .expect("delete existing orphan");
-    drop(publication_view);
-    drop(gc_view);
-    gc.commit(&storage).await.expect("gc first");
-    assert!(matches!(
-        stale_publication.commit(&storage).await,
-        Err(StorageError::PreconditionFailed(_))
-    ));
-    let retry_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("retry view");
-    let retry = prepare_upload(&retry_view, &upload).await;
-    drop(retry_view);
-    retry.commit(&storage).await.expect("retry publication");
-    let reopened = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("cold reopen");
-    let progress_bytes = reopened
-        .load_object_bytes(upload.progress_id)
-        .await
-        .expect("restaged progress");
-    let progress = UploadProgressV1::decode(upload.progress_id, &progress_bytes)
-        .expect("authenticated progress");
-    let receipt_root = ReceiptTreeRoot {
-        object_id: progress.receipt_tree_root,
-        completed_part_count: progress.completed_part_count,
-        received_bytes: progress.received_bytes,
-        contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
-    };
-    assert_eq!(receipt_root.completed_part_count, 1);
-}
-
-#[tokio::test]
-async fn upload_abort_releases_only_the_selector_under_the_epoch() {
-    let seed = build_seed();
-    let storage = Memory::new();
-    seed_storage(&storage, &seed).await;
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("upload view");
-    let upload = make_upload_publication();
-    let publication = prepare_upload(&view, &upload).await;
-    drop(view);
-    publication.commit(&storage).await.expect("publish upload");
-
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("abort view");
-    let keys = [Key(upload.selector_key.clone())];
-    let loaded = view
-        .read()
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await
-        .expect("load upload selector");
-    let raw_selector = match loaded.values.into_iter().next().flatten() {
-        Some(crate::storage::ProjectedValue::FullValue(bytes)) => bytes,
-        value => panic!("expected upload selector bytes, got {value:?}"),
-    };
-    let mut abort = PreparedPublication::from_global_epoch(&view).expect("abort fence");
-    abort
-        .delete_selector(upload.selector_key.clone(), raw_selector)
-        .expect("delete upload selector");
-    drop(view);
-    abort.commit(&storage).await.expect("abort upload");
-
-    let read = storage
-        .begin_read(ReadOptions::default())
-        .await
-        .expect("read after abort");
-    let selectors = read
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions::default(),
-        }])
-        .await
-        .expect("selector after abort");
-    assert_eq!(selectors.values, vec![None]);
-    let object_keys = [Key(Bytes::copy_from_slice(upload.progress_id.as_bytes()))];
-    let objects = read
-        .get_many(&[GetManyRequest {
-            space: OBJECT_SPACE,
-            keys: &object_keys,
-            opts: GetOptions::default(),
-        }])
-        .await
-        .expect("orphan after abort");
-    assert!(objects.values[0].is_some(), "sweep owns physical deletion");
-}
-
-fn alternate_root_publication(
-    seed: &SeedData,
-) -> (BranchSelectorV1, ImmutableObjectSet, ObjectId, ObjectId) {
-    let seed_commit = CommitObjectV1::decode(
-        seed.commit_object_id,
-        seed.objects
-            .get(seed.commit_object_id)
-            .expect("seed commit"),
-    )
-    .expect("decode seed commit");
-    let alternate_commit = CommitObjectV1 {
-        commit_id: CommitId::from_bytes(raw_id(0x44)),
-        generation: 2,
-        parent_commit_object_ids: vec![seed.commit_object_id],
-        member_change_object_ids: Vec::new(),
-        global_state_root: seed_commit.global_state_root,
-        local_state_root: seed_commit.local_state_root,
-        metadata: b"alternate-root".to_vec(),
-    };
-    let (alternate_commit_id, alternate_commit_bytes) =
-        alternate_commit.encode().expect("alternate commit");
-    let ref_change = ChangeObjectV1::BranchRef {
-        change_id: ChangeId::from_bytes(raw_id(0x45)),
+async fn coherent_open_rejects_ref_targets_outside_the_commit_domain() {
+    let mut seed = build_seed();
+    let bad_ref = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x40)),
         branch_id: seed.branch_id,
-        before_semantic_head_commit_object_id: Some(seed.commit_object_id),
-        after_semantic_head_commit_object_id: Some(alternate_commit_id),
+        before_semantic_head_commit_object_id: Some(seed.semantic_change_object_id),
+        after_semantic_head_commit_object_id: Some(seed.commit_object_id),
         previous_ref_change_object_id: Some(seed.ref_change_object_id),
-        payload: b"root-only-move".to_vec(),
+        payload: b"wrong-domain-before".to_vec(),
     };
-    let (ref_change_id, ref_change_bytes) = ref_change.encode().expect("root ref change");
-    let snapshot = BranchSnapshotV1 {
-        branch_id: seed.branch_id,
-        local_state_root: seed_commit.local_state_root,
-        semantic_head_commit_object_id: alternate_commit_id,
-        latest_ref_change_object_id: Some(ref_change_id),
-        historical_global_state_root: seed_commit.global_state_root,
-    };
-    let (snapshot_id, snapshot_bytes) = snapshot.encode().expect("alternate snapshot");
-    let mut objects = ImmutableObjectSet::default();
-    objects
-        .insert(alternate_commit_id, alternate_commit_bytes)
-        .expect("alternate commit object");
-    objects
-        .insert(ref_change_id, ref_change_bytes)
-        .expect("root ref-change object");
-    objects
-        .insert(snapshot_id, snapshot_bytes)
-        .expect("alternate snapshot object");
-
-    let commit_catalog = build_commit_catalog(&[
-        (
-            seed.commit_id,
-            CommitCatalogEntry {
-                commit_object_id: seed.commit_object_id,
-            },
-        ),
-        (
-            alternate_commit.commit_id,
-            CommitCatalogEntry {
-                commit_object_id: alternate_commit_id,
-            },
-        ),
-    ])
-    .expect("next commit catalog");
-    let commit_catalog_root = commit_catalog.root.object_id;
-    objects
-        .extend(commit_catalog.objects)
-        .expect("next commit catalog objects");
-    let change_catalog = build_change_catalog(&[
+    let (bad_ref_id, bad_ref_bytes) = bad_ref.encode().expect("bad ref envelope");
+    seed.objects
+        .insert(bad_ref_id, bad_ref_bytes)
+        .expect("bad ref object");
+    let catalog = build_change_catalog(&[
         (
             seed.semantic_change_id,
             ChangeCatalogEntry {
@@ -1041,325 +780,1240 @@ fn alternate_root_publication(
             },
         ),
         (
-            ref_change.change_id(),
+            bad_ref.change_id(),
             ChangeCatalogEntry {
-                change_object_id: ref_change_id,
+                change_object_id: bad_ref_id,
                 owner: ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id: ref_change_id,
+                    ref_change_object_id: bad_ref_id,
                     branch_id: seed.branch_id,
                 },
             },
         ),
     ])
-    .expect("next change catalog");
-    let change_catalog_root = change_catalog.root.object_id;
-    objects
-        .extend(change_catalog.objects)
-        .expect("next change catalog objects");
+    .expect("bad catalog");
+    let change_catalog_root = catalog.root.object_id;
+    seed.objects
+        .extend(catalog.objects)
+        .expect("catalog objects");
     let current_repository = RepositoryRootV1::decode(
         seed.repository_root_id,
         seed.objects
             .get(seed.repository_root_id)
-            .expect("current repository root"),
+            .expect("repository"),
     )
-    .expect("decode current repository root");
-    let next_repository = RepositoryRootV1 {
-        commit_catalog_root,
+    .expect("repository");
+    let repository = RepositoryRootV1 {
         change_catalog_root,
         ..current_repository
     };
-    let (next_repository_id, next_repository_bytes) =
-        next_repository.encode().expect("next repository root");
-    objects
-        .insert(next_repository_id, next_repository_bytes)
-        .expect("next repository object");
-    (
-        BranchSelectorV1 {
-            branch_id: seed.branch_id,
-            branch_snapshot_object_id: snapshot_id,
-            selector_generation: seed.branch_selector.selector_generation + 1,
-        },
-        objects,
-        alternate_commit_id,
-        next_repository_id,
-    )
+    let (repository_id, repository_bytes) = repository.encode().expect("new repository");
+    seed.objects
+        .insert(repository_id, repository_bytes)
+        .expect("repository object");
+    let snapshot = BranchSnapshotV1 {
+        latest_ref_change_object_id: Some(bad_ref_id),
+        ..BranchSnapshotV1::decode(
+            seed.branch_snapshot_id,
+            seed.objects.get(seed.branch_snapshot_id).expect("snapshot"),
+        )
+        .expect("snapshot")
+    };
+    let (snapshot_id, snapshot_bytes) = snapshot.encode().expect("new snapshot");
+    seed.objects
+        .insert(snapshot_id, snapshot_bytes)
+        .expect("snapshot object");
+    seed.repository_root_id = repository_id;
+    seed.branch_snapshot_id = snapshot_id;
+    seed.global_selector.repository_root = repository_id;
+    seed.global_selector.selector_generation += 1;
+    seed.branch_selector.branch_snapshot_object_id = snapshot_id;
+    seed.branch_selector.selector_generation += 1;
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    assert!(open_coherent_view(&storage, seed.branch_id).await.is_err());
 }
 
-async fn prepare_root_move(
-    view: &CoherentView<impl StorageRead>,
-    selector: BranchSelectorV1,
-    objects: ImmutableObjectSet,
-    repository_root: ObjectId,
-) -> PreparedPublication {
-    let mut publication = PreparedPublication::from_branch_view(view).expect("branch fence");
+fn make_part(
+    upload_id: &CanonicalUploadId,
+    part_number: u64,
+    byte_offset: u64,
+    payload: &'static [u8],
+) -> (BlobChunkV1, UploadPartV1) {
+    let chunk = BlobChunkV1 {
+        bytes: Bytes::from_static(payload),
+    };
+    let (chunk_id, _) = chunk.encode().expect("chunk");
+    let part = UploadPartV1 {
+        upload_id: upload_id.clone(),
+        part_number,
+        byte_offset,
+        declared_part_len: payload.len() as u64,
+        ordered_chunks: vec![BlobChunkRefV1 {
+            chunk_object_id: chunk_id,
+            declared_len: payload.len() as u64,
+        }],
+        part_digest: *blake3::hash(payload).as_bytes(),
+    };
+    (chunk, part)
+}
+
+#[derive(Clone)]
+struct UploadData {
+    upload_id: CanonicalUploadId,
+    chunk: BlobChunkV1,
+    chunk_id: ObjectId,
+    part: UploadPartV1,
+    receipt: ReceiptTreeEdit,
+    progress: UploadProgressV1,
+    progress_id: ObjectId,
+    selector: UploadSelectorV1,
+}
+
+fn make_upload() -> UploadData {
+    let upload_id = CanonicalUploadId::new("upload").expect("upload ID");
+    let binding = upload_binding_digest(
+        b"repository",
+        b"/blob.bin",
+        b"file",
+        4,
+        Some(*blake3::hash(b"data").as_bytes()),
+    )
+    .expect("binding");
+    let initial = empty_receipt_tree().expect("empty receipt");
+    let (chunk, part) = make_part(&upload_id, 0, 0, b"data");
+    let (chunk_id, chunk_bytes) = chunk.encode().expect("chunk");
+    let (part_id, part_bytes) = part.encode().expect("part");
+    let mut arena = initial.objects;
+    arena.insert(chunk_id, chunk_bytes).expect("chunk arena");
+    arena.insert(part_id, part_bytes).expect("part arena");
+    let receipt = insert_receipt_part(initial.root, part_id, &part, load_from(&arena))
+        .expect("receipt insert");
+    let progress = UploadProgressV1 {
+        upload_id: upload_id.clone(),
+        binding_digest: binding,
+        receipt_tree_root: receipt.root.object_id,
+        completed_part_count: receipt.root.completed_part_count,
+        received_bytes: receipt.root.received_bytes,
+        contiguous_prefix_bytes: receipt.root.contiguous_prefix_bytes,
+    };
+    let (progress_id, _) = progress.encode().expect("progress");
+    let selector = UploadSelectorV1 {
+        upload_id: upload_id.clone(),
+        binding_digest: binding,
+        progress_object_id: progress_id,
+        selector_generation: 1,
+    };
+    UploadData {
+        upload_id,
+        chunk,
+        chunk_id,
+        part,
+        receipt,
+        progress,
+        progress_id,
+        selector,
+    }
+}
+
+fn stage_upload(publication: &mut PreparedPublication, upload: &UploadData) {
     publication
-        .set_repository_root(repository_root)
-        .expect("next repository root");
-    publication
-        .put_objects(objects)
-        .expect("root-only immutable objects");
-    publication
-        .put_selector(
-            branch_selector_key(view.branch_id()),
-            selector.encode().expect("next branch selector"),
-            SelectorExpectation::Equals(view.raw_branch_selector().clone()),
+        .publish_new_upload(
+            std::slice::from_ref(&upload.chunk),
+            std::slice::from_ref(&upload.part),
+            upload.receipt.clone(),
+            &upload.progress,
+            &upload.selector,
         )
-        .expect("root-only selector");
-    publication
+        .expect("publish typed upload closure");
+}
+
+#[test]
+fn receipt_tree_is_path_copied_bounded_and_has_no_predecessor() {
+    let upload_id = CanonicalUploadId::new("many-parts").expect("upload ID");
+    let initial = empty_receipt_tree().expect("empty");
+    assert_eq!(RECEIPT_TREE_LEAF_ENTRIES, 64);
+    assert_eq!(RECEIPT_TREE_FANOUT, 32);
+    let mut arena = initial.objects;
+    let mut root: ReceiptTreeRoot = initial.root;
+    for part_number in (0_u64..70).map(|part| (part * 17) % 70) {
+        let payload = Box::leak(vec![part_number as u8; 8].into_boxed_slice());
+        let (chunk, part) = make_part(&upload_id, part_number, part_number * 8, payload);
+        let (chunk_id, chunk_bytes) = chunk.encode().expect("chunk");
+        let (part_id, part_bytes) = part.encode().expect("part");
+        arena.insert(chunk_id, chunk_bytes).expect("chunk arena");
+        arena.insert(part_id, part_bytes).expect("part arena");
+        let edit =
+            insert_receipt_part(root, part_id, &part, load_from(&arena)).expect("receipt edit");
+        assert!(edit.copied_nodes <= 4);
+        root = edit.root;
+        arena.extend(edit.objects).expect("receipt nodes");
+    }
+    assert_eq!(root.completed_part_count, 70);
+    assert_eq!(root.contiguous_prefix_bytes, 560);
+    let parts = validate_receipt_tree(root, &upload_id, load_from(&arena)).expect("closure");
+    assert_eq!(parts.len(), 70);
+    let duplicate = &parts[32];
+    let duplicate_id = ObjectId::from_bytes(
+        lookup(
+            root.object_id,
+            "receipt",
+            &duplicate.part_number.to_be_bytes(),
+            load_from(&arena),
+        )
+        .expect("lookup")
+        .expect("part")
+        .try_into()
+        .expect("part ID"),
+    );
+    let duplicate_edit =
+        insert_receipt_part(root, duplicate_id, duplicate, load_from(&arena)).expect("duplicate");
+    assert!(!duplicate_edit.inserted);
+    assert!(duplicate_edit.objects.is_empty());
+}
+
+#[test]
+fn receipt_declared_size_digest_and_aggregate_corruption_fail_closed() {
+    let upload = make_upload();
+    let mut arena = upload.receipt.objects.clone();
+    let (chunk_id, chunk_bytes) = upload.chunk.encode().expect("chunk");
+    let (part_id, part_bytes) = upload.part.encode().expect("part");
+    arena.insert(chunk_id, chunk_bytes).expect("chunk arena");
+    arena.insert(part_id, part_bytes).expect("part arena");
+    validate_upload_progress_tree(&upload.progress, load_from(&arena)).expect("progress closure");
+    let wrong = UploadProgressV1 {
+        completed_part_count: 2,
+        ..upload.progress.clone()
+    };
+    assert!(validate_upload_progress_tree(&wrong, load_from(&arena)).is_err());
+    let wrong_part = UploadPartV1 {
+        declared_part_len: 5,
+        ..upload.part.clone()
+    };
+    assert!(wrong_part.encode().is_err());
+    let wrong_selector = UploadSelectorV1 {
+        binding_digest: [9; 32],
+        ..upload.selector.clone()
+    };
+    arena
+        .insert(
+            upload.progress_id,
+            upload.progress.encode().expect("progress").1,
+        )
+        .expect("progress arena");
+    assert!(validate_upload_selector_progress(&wrong_selector, load_from(&arena)).is_err());
 }
 
 #[tokio::test]
-async fn root_only_publication_and_gc_are_epoch_fenced_in_both_orders() {
+async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     let seed = build_seed();
-    let (selector, objects, alternate_commit_id, repository_root) =
-        alternate_root_publication(&seed);
+    let upload = make_upload();
 
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
-    let root_view = open_coherent_view(&storage, seed.branch_id)
+    let publish_view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("root view");
+        .expect("publish view");
     let gc_view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("gc view");
-    let root_move = prepare_root_move(&root_view, selector, objects.clone(), repository_root).await;
-    let mut stale_gc = PreparedPublication::from_global_epoch(&gc_view).expect("gc fence");
-    stale_gc
-        .delete_object(alternate_commit_id)
-        .expect("stale root delete");
-    drop(root_view);
+        .expect("GC view");
+    let stale_plan = discover_sweep_plan(&gc_view).await.expect("stale plan");
+    let mut publish = PreparedPublication::from_global_epoch(&publish_view).expect("publish");
+    stage_upload(&mut publish, &upload);
+    let mut stale_gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
+    stale_gc.apply_sweep_plan(stale_plan).expect("sweep proof");
+    drop(publish_view);
     drop(gc_view);
-    root_move.commit(&storage).await.expect("root publication");
+    publish.commit(&storage).await.expect("receipt first");
     assert!(matches!(
         stale_gc.commit(&storage).await,
         Err(StorageError::PreconditionFailed(_))
     ));
+    assert!(object_present(&storage, upload.progress_id).await);
 
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
-    let root_view = open_coherent_view(&storage, seed.branch_id)
+    let publish_view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("root view");
+        .expect("publish view");
     let gc_view = open_coherent_view(&storage, seed.branch_id)
         .await
-        .expect("gc view");
-    let stale_root_move =
-        prepare_root_move(&root_view, selector, objects.clone(), repository_root).await;
-    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("gc fence");
-    gc.delete_object(seed.orphan_object_id)
-        .expect("existing orphan delete");
-    drop(root_view);
+        .expect("GC view");
+    let mut stale_publish = PreparedPublication::from_global_epoch(&publish_view).expect("publish");
+    stage_upload(&mut stale_publish, &upload);
+    let plan = discover_sweep_plan(&gc_view).await.expect("plan");
+    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
+    gc.apply_sweep_plan(plan).expect("proof");
+    drop(publish_view);
     drop(gc_view);
-    gc.commit(&storage).await.expect("gc first");
+    gc.commit(&storage).await.expect("GC first");
     assert!(matches!(
-        stale_root_move.commit(&storage).await,
+        stale_publish.commit(&storage).await,
         Err(StorageError::PreconditionFailed(_))
     ));
     let retry_view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("retry view");
-    let retry = prepare_root_move(&retry_view, selector, objects, repository_root).await;
+    let mut retry = PreparedPublication::from_global_epoch(&retry_view).expect("retry");
+    stage_upload(&mut retry, &upload);
     drop(retry_view);
-    retry
-        .commit(&storage)
-        .await
-        .expect("retry root publication");
-    let reopened = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("reopen root");
-    assert_eq!(
-        reopened.branch_snapshot().semantic_head_commit_object_id,
-        alternate_commit_id
-    );
-}
-
-#[test]
-fn upload_selector_has_bounded_progress_edge_and_no_predecessor_encoding() {
-    let upload = make_upload_publication();
-    let selector = UploadSelectorV1::decode(&upload.selector_value).expect("selector");
-    assert_eq!(selector.progress_object_id, upload.progress_id);
-    let progress = UploadProgressV1::decode(
-        upload.progress_id,
-        upload
-            .objects
-            .get(upload.progress_id)
-            .expect("progress bytes"),
-    )
-    .expect("progress");
-    assert_eq!(progress.completed_part_count, 1);
-    assert_eq!(progress.received_bytes, 4);
-    assert_eq!(progress.contiguous_prefix_bytes, 4);
-    assert_eq!(
-        upload
-            .objects
-            .iter()
-            .filter(|(id, _)| *id == upload.progress_id)
-            .count(),
-        1,
-        "exactly one current progress object is reachable by the selector"
-    );
-    assert!(upload.objects.len() >= 4);
+    retry.commit(&storage).await.expect("retry publication");
+    assert!(object_present(&storage, upload.chunk_id).await);
 }
 
 #[tokio::test]
-async fn partial_object_staging_without_selector_publication_is_not_visible() {
-    let seed = build_seed();
-    let storage = Memory::new();
-    seed_storage(&storage, &seed).await;
-    let (selector, objects, alternate_commit_id, _) = alternate_root_publication(&seed);
-    let mut write = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .expect("orphan write");
-    write
-        .put_many(
-            OBJECT_SPACE,
-            PutBatch {
-                entries: objects
-                    .iter()
-                    .map(|(id, bytes)| PutEntry {
-                        key: Key(Bytes::copy_from_slice(id.as_bytes())),
-                        value: StoredValue {
-                            bytes: bytes.clone(),
-                        },
-                    })
-                    .collect(),
-            },
-        )
-        .await
-        .expect("stage orphan path copy");
-    write.commit().await.expect("commit orphan objects");
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("open old root");
-    assert_eq!(view.branch_selector(), seed.branch_selector);
-    assert_ne!(
-        view.branch_snapshot().semantic_head_commit_object_id,
-        alternate_commit_id
-    );
-    assert_ne!(selector, seed.branch_selector);
-}
-
-#[test]
-fn upload_part_declared_size_and_selector_binding_mismatches_fail_closed() {
-    let upload_id = CanonicalUploadId::new("binding").expect("upload id");
-    let (_, _, part, _, _) = make_part(&upload_id, 0, 0, b"1234");
-    let wrong_size = UploadPartV1 {
-        declared_part_len: 3,
-        ..part
-    };
-    assert!(wrong_size.encode().is_err());
-
-    let upload = make_upload_publication();
-    let selector = UploadSelectorV1::decode(&upload.selector_value).expect("selector");
-    let progress = UploadProgressV1::decode(
-        upload.progress_id,
-        upload.objects.get(upload.progress_id).expect("progress"),
-    )
-    .expect("progress");
-    assert_eq!(selector.upload_id, progress.upload_id);
-    assert_eq!(selector.binding_digest, progress.binding_digest);
-    validate_upload_selector_progress(&selector, load_from(&upload.objects))
-        .expect("selector/progress binding");
-    let mismatched = UploadSelectorV1 {
-        binding_digest: [0xff; 32],
-        ..selector
-    };
-    assert!(validate_upload_selector_progress(&mismatched, load_from(&upload.objects)).is_err());
-}
-
-#[test]
-fn object_id_display_is_stable_hex() {
-    let id = content_id(0xab);
-    assert_eq!(id.to_string(), "ab".repeat(32));
-    assert_eq!(id.into_bytes(), [0xab; 32]);
-    assert_eq!(CommitId::from_bytes(raw_id(1)).into_bytes(), raw_id(1));
-    assert_eq!(ChangeId::from_bytes(raw_id(2)).into_bytes(), raw_id(2));
-    assert_eq!(
-        CanonicalBranchId::from_bytes(raw_id(3)).into_bytes(),
-        raw_id(3)
-    );
-}
-
-#[test]
-fn catalog_entry_widths_are_canonical() {
-    let commit = CommitCatalogEntry {
-        commit_object_id: content_id(1),
-    };
-    assert_eq!(commit.encode().expect("commit entry").len(), 32);
-    let semantic = ChangeCatalogEntry {
-        change_object_id: content_id(2),
-        owner: ChangeCatalogOwner::CommitMember {
-            commit_object_id: content_id(3),
-            ordinal: 7,
-        },
-    };
-    assert_eq!(semantic.encode().expect("semantic entry").len(), 69);
-    let branch = ChangeCatalogEntry {
-        change_object_id: content_id(4),
-        owner: ChangeCatalogOwner::BranchRef {
-            ref_change_object_id: content_id(4),
-            branch_id: CanonicalBranchId::from_bytes(raw_id(5)),
-        },
-    };
-    assert_eq!(branch.encode().expect("branch entry").len(), 81);
-}
-
-#[tokio::test]
-async fn coherent_view_object_reads_stay_on_original_snapshot() {
+async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
     let seed = build_seed();
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("view");
-    let raw_before = view
-        .load_object_bytes(seed.orphan_object_id)
+
+    assert!(
+        edit_state_tree(
+            view.branch_snapshot().local_state_root,
+            vec![StateTreeMutation::remove(vec![0xff])],
+            view.read(),
+        )
         .await
-        .expect("snapshot sees orphan");
-    let mut publication = PreparedPublication::from_global_epoch(&view).expect("gc fence");
-    publication
-        .delete_object(seed.orphan_object_id)
-        .expect("delete orphan");
-    // Memory's write can commit while the immutable read remains alive.
-    publication.commit(&storage).await.expect("delete orphan");
-    assert_eq!(
-        view.load_object_bytes(seed.orphan_object_id)
-            .await
-            .expect("old coherent snapshot remains stable"),
-        raw_before
+        .is_err(),
+        "opaque state keys must fail before path copying"
     );
-    drop(view);
-    let read = storage
-        .begin_read(ReadOptions::default())
+    assert!(
+        put_commit_catalog_entries(
+            view.repository_root().commit_catalog_root,
+            &[
+                (
+                    CommitId::from_bytes(raw_id(0x72)),
+                    CommitCatalogEntry {
+                        commit_object_id: content_id(0x72),
+                    },
+                ),
+                (
+                    CommitId::from_bytes(raw_id(0x71)),
+                    CommitCatalogEntry {
+                        commit_object_id: content_id(0x71),
+                    },
+                ),
+            ],
+            view.read(),
+        )
         .await
-        .expect("new read");
-    let keys = [Key(Bytes::copy_from_slice(
-        seed.orphan_object_id.as_bytes(),
-    ))];
-    let loaded = read
+        .is_err(),
+        "catalog updates must use canonical raw-UUID order"
+    );
+
+    let wrong_base = edit_state_tree(
+        view.repository_root().global_state_root,
+        Vec::new(),
+        view.read(),
+    )
+    .await
+    .expect("wrong-base edit remains a valid standalone tree edit");
+    let transition = branch_transition(&view, wrong_base, 0x72).await;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    assert!(
+        publication
+            .publish_state_transition(&view, transition)
+            .await
+            .is_err(),
+        "a valid edit from another selected root must not publish"
+    );
+
+    let (key, value) = state_entry("wrong-commit", StateCellRef::Value("value"), 0x73, &[]);
+    let wrong_commit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::insert(key, value)],
+        view.read(),
+    )
+    .await
+    .expect("typed state edit");
+    let transition = branch_transition(&view, wrong_commit, 0x74).await;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    assert!(
+        publication
+            .publish_state_transition(&view, transition)
+            .await
+            .is_err(),
+        "state rows must authenticate the semantic commit that publishes them"
+    );
+}
+
+#[tokio::test]
+async fn upload_abort_releases_receipt_closure_after_final_selector_move() {
+    let seed = build_seed();
+    let upload = make_upload();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("upload view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("upload");
+    stage_upload(&mut publication, &upload);
+    drop(view);
+    publication.commit(&storage).await.expect("publish upload");
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("abort view");
+    let keys = [Key(
+        upload_selector_key(&upload.upload_id).expect("upload key")
+    )];
+    let loaded = view
+        .read()
         .get_many(&[GetManyRequest {
-            space: OBJECT_SPACE,
+            space: SELECTOR_SPACE,
             keys: &keys,
             opts: GetOptions {
                 projection: CoreProjection::FullValue,
             },
         }])
         .await
-        .expect("load deleted object");
-    assert_eq!(loaded.values, vec![None]);
+        .expect("selector read");
+    let raw = match loaded.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
+        other => panic!("expected upload selector, got {other:?}"),
+    };
+    let mut abort = PreparedPublication::from_global_epoch(&view).expect("abort");
+    abort
+        .abort_upload(&upload.selector, raw)
+        .expect("typed abort");
+    drop(view);
+    abort.commit(&storage).await.expect("abort commit");
+    sweep(&storage, seed.branch_id).await;
+    assert!(!object_present(&storage, upload.progress_id).await);
+    assert!(!object_present(&storage, upload.chunk_id).await);
+}
+
+#[tokio::test]
+async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
+    let seed = build_seed();
+    let upload = make_upload();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("upload view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("upload");
+    stage_upload(&mut publication, &upload);
+    drop(view);
+    publication.commit(&storage).await.expect("publish receipt");
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("completion view");
+    let completion = prepare_upload_completion(
+        &view,
+        &upload.upload_id,
+        UploadBindingRef {
+            repository_identity: b"repository",
+            path: b"/blob.bin",
+            payload_domain: b"file",
+            declared_total_size: 4,
+            declared_final_hash: Some(*blake3::hash(b"data").as_bytes()),
+        },
+    )
+    .await
+    .expect("completion proof");
+    let manifest = BlobManifestV1 {
+        logical_bytes: 4,
+        ordered_chunks: upload.part.ordered_chunks.clone(),
+        content_digest: *blake3::hash(b"data").as_bytes(),
+    };
+    let (manifest_id, _) = manifest.encode().expect("manifest");
+    let (key, value) = state_entry("blob", StateCellRef::Value("blob"), 0x70, &[manifest_id]);
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::insert(key.clone(), value)],
+        view.read(),
+    )
+    .await
+    .expect("state edit");
+    let transition = branch_transition(&view, state_edit, 0x70).await;
+    let mut publish = PreparedPublication::from_branch_view(&view).expect("completion publication");
+    assert_eq!(
+        publish
+            .publish_completed_upload(&view, completion, transition)
+            .await
+            .expect("atomic handoff"),
+        manifest_id
+    );
+    drop(view);
+    publish.commit(&storage).await.expect("complete upload");
+
+    let reopened = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("cold reopen");
+    let row = state_point(&reopened, &key, false)
+        .await
+        .expect("blob state")
+        .expect("blob row");
+    assert_eq!(row.value.blob_manifest_object_ids, vec![manifest_id]);
+    assert_eq!(
+        BlobManifestV1::decode(
+            manifest_id,
+            &reopened
+                .load_object_bytes(manifest_id)
+                .await
+                .expect("manifest"),
+        )
+        .expect("authenticated manifest")
+        .logical_bytes,
+        4
+    );
+    let selector_keys = [Key(upload_selector_key(&upload.upload_id).expect("key"))];
+    let selector = reopened
+        .read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &selector_keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("selector read");
+    assert_eq!(selector.values, vec![None]);
+    drop(reopened);
+    sweep(&storage, seed.branch_id).await;
+    assert!(!object_present(&storage, upload.progress_id).await);
+    assert!(object_present(&storage, manifest_id).await);
+    assert!(object_present(&storage, upload.chunk_id).await);
+}
+
+async fn publish_untracked_manifest(
+    storage: &Memory,
+    seed: &SeedData,
+    primary_key: &str,
+    manifest: &BlobManifestV1,
+    chunks: &[BlobChunkV1],
+) -> ObjectId {
+    let view = open_coherent_view(storage, seed.branch_id)
+        .await
+        .expect("untracked view");
+    let (manifest_id, _) = manifest.encode().expect("manifest");
+    let entity_pk = EntityPk::single(primary_key);
+    let roots = [manifest_id];
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("untracked put");
+    for chunk in chunks {
+        publication.stage_blob_chunk(chunk).expect("chunk");
+    }
+    publication.stage_blob_manifest(manifest).expect("manifest");
+    publication
+        .put_untracked_row(
+            seed.branch_id,
+            StateKeyRef {
+                schema_key: "app.untracked",
+                file_id: None,
+                entity_pk: &entity_pk,
+            },
+            UntrackedValueRef {
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell: StateCellRef::Value("blob"),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &roots,
+            },
+        )
+        .expect("untracked row");
+    drop(view);
+    publication.commit(storage).await.expect("untracked commit");
+    manifest_id
+}
+
+async fn delete_untracked(storage: &Memory, seed: &SeedData, primary_key: &str) {
+    let view = open_coherent_view(storage, seed.branch_id)
+        .await
+        .expect("delete view");
+    let entity_pk = EntityPk::single(primary_key);
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("delete");
+    publication
+        .delete_untracked_row(
+            seed.branch_id,
+            StateKeyRef {
+                schema_key: "app.untracked",
+                file_id: None,
+                entity_pk: &entity_pk,
+            },
+        )
+        .expect("delete untracked");
+    drop(view);
+    publication.commit(storage).await.expect("delete commit");
+}
+
+async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBranchId, ChangeId) {
+    let mut seed = build_seed();
+    let disposable = CanonicalBranchId::from_bytes(raw_id(0x12));
+    let disposable_ref_id = ChangeId::from_bytes(raw_id(0x32));
+    let disposable_ref = ChangeObjectV1::BranchRef {
+        change_id: disposable_ref_id,
+        branch_id: disposable,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(seed.commit_object_id),
+        previous_ref_change_object_id: None,
+        payload: b"create-disposable".to_vec(),
+    };
+    let (disposable_ref_object_id, disposable_ref_bytes) =
+        disposable_ref.encode().expect("disposable ref");
+    seed.objects
+        .insert(disposable_ref_object_id, disposable_ref_bytes)
+        .expect("disposable ref object");
+    let catalog = build_change_catalog(&[
+        (
+            seed.semantic_change_id,
+            ChangeCatalogEntry {
+                change_object_id: seed.semantic_change_object_id,
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id: seed.commit_object_id,
+                    ordinal: 0,
+                },
+            },
+        ),
+        (
+            seed.ref_change_id,
+            ChangeCatalogEntry {
+                change_object_id: seed.ref_change_object_id,
+                owner: ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id: seed.ref_change_object_id,
+                    branch_id: seed.branch_id,
+                },
+            },
+        ),
+        (
+            disposable_ref_id,
+            ChangeCatalogEntry {
+                change_object_id: disposable_ref_object_id,
+                owner: ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id: disposable_ref_object_id,
+                    branch_id: disposable,
+                },
+            },
+        ),
+    ])
+    .expect("disposable catalog");
+    let change_catalog_root = catalog.root.object_id;
+    seed.objects
+        .extend(catalog.objects)
+        .expect("catalog objects");
+    let current_repository = RepositoryRootV1::decode(
+        seed.repository_root_id,
+        seed.objects
+            .get(seed.repository_root_id)
+            .expect("repository"),
+    )
+    .expect("repository");
+    let repository = RepositoryRootV1 {
+        change_catalog_root,
+        ..current_repository
+    };
+    let (repository_id, repository_bytes) = repository.encode().expect("repository");
+    seed.objects
+        .insert(repository_id, repository_bytes)
+        .expect("repository object");
+    seed.repository_root_id = repository_id;
+    seed.global_selector.repository_root = repository_id;
+    seed.global_selector.selector_generation += 1;
+    let snapshot = BranchSnapshotV1 {
+        branch_id: disposable,
+        local_state_root: seed.local_state_root,
+        semantic_head_commit_object_id: seed.commit_object_id,
+        latest_ref_change_object_id: Some(disposable_ref_object_id),
+        historical_global_state_root: seed.global_state_root,
+    };
+    let (snapshot_id, snapshot_bytes) = snapshot.encode().expect("disposable snapshot");
+    seed.objects
+        .insert(snapshot_id, snapshot_bytes)
+        .expect("snapshot object");
+    seed_storage(storage, &seed).await;
+    let selector = BranchSelectorV1 {
+        branch_id: disposable,
+        branch_snapshot_object_id: snapshot_id,
+        selector_generation: 1,
+    };
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("disposable selector write");
+    write
+        .put_many(
+            SELECTOR_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: Key(branch_selector_key(disposable)),
+                    value: StoredValue {
+                        bytes: selector.encode().expect("disposable selector"),
+                    },
+                }],
+            },
+        )
+        .await
+        .expect("put disposable selector");
+    write.commit().await.expect("commit disposable selector");
+    (seed, disposable, disposable_ref_id)
+}
+
+#[tokio::test]
+async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
+    let storage = Memory::new();
+    let (seed, disposable, initial_ref_id) = seed_with_disposable_branch(&storage).await;
+    let upload = make_upload();
+    let view = open_coherent_view(&storage, disposable)
+        .await
+        .expect("upload view");
+    let mut upload_publication = PreparedPublication::from_global_epoch(&view).expect("upload");
+    stage_upload(&mut upload_publication, &upload);
+    drop(view);
+    upload_publication
+        .commit(&storage)
+        .await
+        .expect("publish upload");
+
+    let view = open_coherent_view(&storage, disposable)
+        .await
+        .expect("completion view");
+    let completion = prepare_upload_completion(
+        &view,
+        &upload.upload_id,
+        UploadBindingRef {
+            repository_identity: b"repository",
+            path: b"/blob.bin",
+            payload_domain: b"file",
+            declared_total_size: 4,
+            declared_final_hash: Some(*blake3::hash(b"data").as_bytes()),
+        },
+    )
+    .await
+    .expect("completion");
+    let manifest = BlobManifestV1 {
+        logical_bytes: 4,
+        ordered_chunks: upload.part.ordered_chunks.clone(),
+        content_digest: *blake3::hash(b"data").as_bytes(),
+    };
+    let (manifest_id, _) = manifest.encode().expect("manifest");
+    let (key, value) = state_entry(
+        "disposable-blob",
+        StateCellRef::Value("blob"),
+        0x80,
+        &[manifest_id],
+    );
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::insert(key, value)],
+        view.read(),
+    )
+    .await
+    .expect("state edit");
+    let transition = branch_transition(&view, state_edit, 0x80).await;
+    let mut complete = PreparedPublication::from_branch_view(&view).expect("complete");
+    complete
+        .publish_completed_upload(&view, completion, transition)
+        .await
+        .expect("handoff");
+    drop(view);
+    complete.commit(&storage).await.expect("complete upload");
+
+    let checkpoint_id = SnapshotSelectorId::from_bytes(raw_id(0x90));
+    let view = open_coherent_view(&storage, disposable)
+        .await
+        .expect("checkpoint view");
+    let mut checkpoint = PreparedPublication::from_global_epoch(&view).expect("checkpoint");
+    checkpoint
+        .publish_current_snapshot_pin(
+            &view,
+            SnapshotRole::Checkpoint,
+            checkpoint_id,
+            SelectorExpectation::Absent,
+        )
+        .expect("checkpoint pin");
+    drop(view);
+    checkpoint
+        .commit(&storage)
+        .await
+        .expect("checkpoint commit");
+
+    let view = open_coherent_view(&storage, disposable)
+        .await
+        .expect("retirement view");
+    let commit_catalog_edit = retire_commit_catalog_entries(
+        view.repository_root().commit_catalog_root,
+        &[CommitId::from_bytes(raw_id(0x80))],
+        view.read(),
+    )
+    .await
+    .expect("retire commit");
+    let change_catalog_edit = retire_change_catalog_entries(
+        view.repository_root().change_catalog_root,
+        &[initial_ref_id, ChangeId::from_bytes(raw_id(0x81))],
+        view.read(),
+    )
+    .await
+    .expect("retire changes");
+    let repository = RepositoryRootV1 {
+        commit_catalog_root: commit_catalog_edit.root,
+        change_catalog_root: change_catalog_edit.root,
+        ..view.repository_root()
+    };
+    let mut retire = PreparedPublication::from_branch_view(&view).expect("retire branch");
+    retire
+        .publish_branch_retirement(&view, commit_catalog_edit, change_catalog_edit, repository)
+        .expect("branch retirement");
+    drop(view);
+    retire.commit(&storage).await.expect("retire commit");
+    sweep(&storage, seed.branch_id).await;
+    assert!(object_present(&storage, manifest_id).await);
+    assert!(object_present(&storage, upload.chunk_id).await);
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("release view");
+    let key = snapshot_selector_key(SnapshotRole::Checkpoint, checkpoint_id);
+    let keys = [Key(key)];
+    let loaded = view
+        .read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("checkpoint selector read");
+    let raw = match loaded.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
+        other => panic!("expected checkpoint selector, got {other:?}"),
+    };
+    let selector = SnapshotSelectorV1::decode(&raw).expect("checkpoint selector");
+    let mut release = PreparedPublication::from_global_epoch(&view).expect("release");
+    release
+        .release_snapshot_pin(selector, raw)
+        .expect("release checkpoint");
+    drop(view);
+    release.commit(&storage).await.expect("release commit");
+    sweep(&storage, seed.branch_id).await;
+    assert!(!object_present(&storage, manifest_id).await);
+    assert!(!object_present(&storage, upload.chunk_id).await);
+}
+
+#[tokio::test]
+async fn untracked_and_real_shared_chunk_roots_release_only_at_final_reference() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let shared = BlobChunkV1 {
+        bytes: Bytes::from_static(b"shared"),
+    };
+    let first_unique = BlobChunkV1 {
+        bytes: Bytes::from_static(b"one"),
+    };
+    let second_unique = BlobChunkV1 {
+        bytes: Bytes::from_static(b"two"),
+    };
+    let (shared_id, _) = shared.encode().expect("shared chunk");
+    let (first_unique_id, _) = first_unique.encode().expect("first unique");
+    let (second_unique_id, _) = second_unique.encode().expect("second unique");
+    let shared_reference = BlobChunkRefV1 {
+        chunk_object_id: shared_id,
+        declared_len: 6,
+    };
+    let first = BlobManifestV1 {
+        logical_bytes: 9,
+        ordered_chunks: vec![
+            BlobChunkRefV1 {
+                chunk_object_id: first_unique_id,
+                declared_len: 3,
+            },
+            shared_reference.clone(),
+        ],
+        content_digest: *blake3::hash(b"oneshared").as_bytes(),
+    };
+    let second = BlobManifestV1 {
+        logical_bytes: 9,
+        ordered_chunks: vec![
+            BlobChunkRefV1 {
+                chunk_object_id: second_unique_id,
+                declared_len: 3,
+            },
+            shared_reference,
+        ],
+        content_digest: *blake3::hash(b"twoshared").as_bytes(),
+    };
+    let first_id = publish_untracked_manifest(
+        &storage,
+        &seed,
+        "one",
+        &first,
+        &[first_unique.clone(), shared.clone()],
+    )
+    .await;
+    let second_id = publish_untracked_manifest(
+        &storage,
+        &seed,
+        "two",
+        &second,
+        &[second_unique.clone(), shared.clone()],
+    )
+    .await;
+    assert_ne!(first_id, second_id);
+    sweep(&storage, seed.branch_id).await;
+    assert!(object_present(&storage, shared_id).await);
+    delete_untracked(&storage, &seed, "one").await;
+    sweep(&storage, seed.branch_id).await;
+    assert!(!object_present(&storage, first_id).await);
+    assert!(!object_present(&storage, first_unique_id).await);
+    assert!(object_present(&storage, second_id).await);
+    assert!(object_present(&storage, shared_id).await);
+    delete_untracked(&storage, &seed, "two").await;
+    sweep(&storage, seed.branch_id).await;
+    assert!(!object_present(&storage, second_id).await);
+    assert!(!object_present(&storage, second_unique_id).await);
+    assert!(!object_present(&storage, shared_id).await);
+}
+
+#[tokio::test]
+async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let target = SnapshotTargetV1 {
+        role: SnapshotRole::Checkpoint,
+        selector_id: SnapshotSelectorId::from_bytes(raw_id(1)),
+        branch_id: seed.branch_id,
+        branch_snapshot_object_id: seed.branch_snapshot_id,
+        semantic_commit_object_id: seed.commit_object_id,
+    };
+    let (target_id, _) = target.encode().expect("target");
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("orphan view");
+    let mut orphan_stage = PreparedPublication::from_global_epoch(&view).expect("orphan stage");
+    orphan_stage
+        .stage_snapshot_target(target)
+        .expect("orphan target");
+    drop(view);
+    orphan_stage
+        .commit(&storage)
+        .await
+        .expect("stage orphan target");
+    let publish_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("publish view");
+    let gc_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("GC view");
+    let mut root_only = PreparedPublication::from_global_epoch(&publish_view).expect("root move");
+    assert_eq!(
+        root_only
+            .publish_current_snapshot_pin(
+                &publish_view,
+                target.role,
+                target.selector_id,
+                SelectorExpectation::Absent,
+            )
+            .expect("checkpoint selector"),
+        target_id
+    );
+    let plan = discover_sweep_plan(&gc_view).await.expect("stale plan");
+    let mut stale_gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
+    stale_gc.apply_sweep_plan(plan).expect("proof");
+    drop(publish_view);
+    drop(gc_view);
+    root_only.commit(&storage).await.expect("root first");
+    assert!(matches!(
+        stale_gc.commit(&storage).await,
+        Err(StorageError::PreconditionFailed(_))
+    ));
+
+    let inverse = Memory::new();
+    seed_storage(&inverse, &seed).await;
+    let view = open_coherent_view(&inverse, seed.branch_id)
+        .await
+        .expect("orphan view");
+    let mut orphan_stage = PreparedPublication::from_global_epoch(&view).expect("orphan stage");
+    orphan_stage
+        .stage_snapshot_target(target)
+        .expect("orphan target");
+    drop(view);
+    orphan_stage
+        .commit(&inverse)
+        .await
+        .expect("stage orphan target");
+    let publish_view = open_coherent_view(&inverse, seed.branch_id)
+        .await
+        .expect("publish view");
+    let gc_view = open_coherent_view(&inverse, seed.branch_id)
+        .await
+        .expect("GC view");
+    let mut stale_root = PreparedPublication::from_global_epoch(&publish_view).expect("root move");
+    stale_root
+        .publish_current_snapshot_pin(
+            &publish_view,
+            target.role,
+            target.selector_id,
+            SelectorExpectation::Absent,
+        )
+        .expect("root selector");
+    let plan = discover_sweep_plan(&gc_view).await.expect("GC plan");
+    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
+    gc.apply_sweep_plan(plan).expect("proof");
+    drop(publish_view);
+    drop(gc_view);
+    gc.commit(&inverse).await.expect("GC first");
+    assert!(matches!(
+        stale_root.commit(&inverse).await,
+        Err(StorageError::PreconditionFailed(_))
+    ));
+    let retry_view = open_coherent_view(&inverse, seed.branch_id)
+        .await
+        .expect("retry view");
+    let mut retry = PreparedPublication::from_global_epoch(&retry_view).expect("retry");
+    retry
+        .publish_current_snapshot_pin(
+            &retry_view,
+            target.role,
+            target.selector_id,
+            SelectorExpectation::Absent,
+        )
+        .expect("retry selector");
+    drop(retry_view);
+    retry
+        .commit(&inverse)
+        .await
+        .expect("retry root publication");
+    assert!(object_present(&inverse, target_id).await);
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("role view");
+    let mut roles = PreparedPublication::from_global_epoch(&view).expect("roles");
+    for (index, role) in [
+        SnapshotRole::Recovery,
+        SnapshotRole::Undo,
+        SnapshotRole::Redo,
+        SnapshotRole::BranchTombstone,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selector_id = SnapshotSelectorId::from_bytes(raw_id(index as u8 + 2));
+        roles
+            .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
+            .expect("role selector");
+    }
+    let mark_pack = GcMarkPackV1 {
+        object_ids: vec![target_id],
+        next_pack_object_id: None,
+    };
+    let progress_id = roles
+        .publish_gc_progress(
+            &mark_pack,
+            None,
+            view.global_selector().epoch,
+            1,
+            SelectorExpectation::Absent,
+        )
+        .expect("GC selector");
+    drop(view);
+    roles.commit(&storage).await.expect("all roles");
+    sweep(&storage, seed.branch_id).await;
+    assert!(object_present(&storage, target_id).await);
+    assert!(object_present(&storage, progress_id).await);
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("release GC progress view");
+    let keys = [Key(gc_progress_selector_key())];
+    let loaded = view
+        .read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("GC selector read");
+    let raw = match loaded.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
+        other => panic!("expected GC selector, got {other:?}"),
+    };
+    let selector = GcProgressSelectorV1::decode(&raw).expect("GC selector");
+    let mut release = PreparedPublication::from_global_epoch(&view).expect("GC release");
+    release
+        .release_gc_progress(selector, raw)
+        .expect("release GC progress");
+    drop(view);
+    release.commit(&storage).await.expect("GC release commit");
+    sweep(&storage, seed.branch_id).await;
+    assert!(!object_present(&storage, progress_id).await);
+}
+
+#[tokio::test]
+async fn full_selector_scan_crosses_storage_page_and_corruption_fails_closed() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("selectors");
+    let mut last_target = ObjectId::ZERO;
+    for index in 0_u16..1030 {
+        let mut raw = [0_u8; 16];
+        raw[..2].copy_from_slice(&index.to_be_bytes());
+        let selector_id = SnapshotSelectorId::from_bytes(raw);
+        last_target = publication
+            .publish_current_snapshot_pin(
+                &view,
+                SnapshotRole::Checkpoint,
+                selector_id,
+                SelectorExpectation::Absent,
+            )
+            .expect("selector");
+    }
+    drop(view);
+    publication.commit(&storage).await.expect("selector pages");
+    sweep(&storage, seed.branch_id).await;
+    assert!(object_present(&storage, last_target).await);
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("corrupt upload view");
+    let upload = make_upload();
+    let wrong_progress = UploadProgressV1 {
+        completed_part_count: 2,
+        ..upload.progress.clone()
+    };
+    let mut corrupt = PreparedPublication::from_global_epoch(&view).expect("corrupt receipt");
+    corrupt.stage_blob_chunk(&upload.chunk).expect("chunk");
+    corrupt.stage_upload_part(&upload.part).expect("part");
+    corrupt
+        .stage_receipt_tree_edit(upload.receipt.clone())
+        .expect("receipt");
+    let wrong_progress_id = corrupt
+        .stage_upload_progress(&wrong_progress)
+        .expect("wrong progress");
+    corrupt
+        .put_upload_selector(
+            &UploadSelectorV1 {
+                progress_object_id: wrong_progress_id,
+                ..upload.selector.clone()
+            },
+            SelectorExpectation::Absent,
+        )
+        .expect("wrong selector");
+    drop(view);
+    corrupt
+        .commit(&storage)
+        .await
+        .expect("publish authenticated corruption");
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view after corruption");
+    assert!(discover_sweep_plan(&view).await.is_err());
 }
 
 #[test]
-fn seed_provenance_fields_are_not_accidentally_aliased() {
+fn selector_codecs_have_single_edges_and_canonical_keys() {
+    let seed = build_seed();
+    let raw_branch = seed.branch_selector.encode().expect("branch");
+    assert_eq!(
+        BranchSelectorV1::decode(&raw_branch).expect("decode"),
+        seed.branch_selector
+    );
+    assert!(
+        !raw_branch
+            .windows(16)
+            .any(|window| window == seed.ref_change_id.as_bytes())
+    );
+    assert_eq!(branch_selector_key(seed.branch_id).len(), 23);
+    let checkpoint = SnapshotSelectorV1 {
+        role: SnapshotRole::Checkpoint,
+        selector_id: SnapshotSelectorId::from_bytes(raw_id(7)),
+        target_object_id: content_id(7),
+        selector_generation: 1,
+    };
+    assert_eq!(
+        SnapshotSelectorV1::decode(&checkpoint.encode().expect("checkpoint"))
+            .expect("decode checkpoint"),
+        checkpoint
+    );
+    assert!(
+        snapshot_selector_key(checkpoint.role, checkpoint.selector_id).starts_with(b"checkpoint/")
+    );
+    assert_eq!(
+        gc_progress_selector_key(),
+        Bytes::from_static(b"gc-progress")
+    );
+}
+
+#[test]
+fn object_and_catalog_encodings_are_canonical() {
+    assert_eq!(content_id(0xab).to_string(), "ab".repeat(32));
+    assert_eq!(*CommitId::from_bytes(raw_id(1)).as_bytes(), raw_id(1));
+    assert_eq!(*ChangeId::from_bytes(raw_id(2)).as_bytes(), raw_id(2));
+    assert_eq!(
+        *CanonicalBranchId::from_bytes(raw_id(3)).as_bytes(),
+        raw_id(3)
+    );
+    assert_eq!(
+        *SnapshotSelectorId::from_bytes(raw_id(4)).as_bytes(),
+        raw_id(4)
+    );
+    assert_eq!(*content_id(5).as_bytes(), [5; 32]);
+    assert_eq!(
+        CommitCatalogEntry {
+            commit_object_id: content_id(1),
+        }
+        .encode()
+        .expect("commit entry")
+        .len(),
+        32
+    );
+    assert_eq!(
+        ChangeCatalogEntry {
+            change_object_id: content_id(2),
+            owner: ChangeCatalogOwner::CommitMember {
+                commit_object_id: content_id(3),
+                ordinal: 7,
+            },
+        }
+        .encode()
+        .expect("change entry")
+        .len(),
+        69
+    );
+}
+
+#[test]
+fn seed_provenance_and_ref_edge_are_not_aliased() {
     let seed = build_seed();
     assert_ne!(seed.commit_object_id, seed.semantic_change_object_id);
     assert_ne!(seed.ref_change_object_id, seed.semantic_change_object_id);
     assert_ne!(seed.repository_root_id, seed.branch_snapshot_id);
-    assert_eq!(
+    let repository = RepositoryRootV1::decode(
+        seed.repository_root_id,
         seed.objects
-            .get(seed.orphan_object_id)
-            .expect("orphan bytes"),
+            .get(seed.repository_root_id)
+            .expect("repository"),
+    )
+    .expect("repository decode");
+    let branch = BranchSnapshotV1::decode(
+        seed.branch_snapshot_id,
+        seed.objects.get(seed.branch_snapshot_id).expect("branch"),
+    )
+    .expect("branch decode");
+    assert_eq!(seed.global_state_root, repository.global_state_root);
+    assert_eq!(seed.local_state_root, branch.local_state_root);
+    assert_eq!(
+        seed.objects.get(seed.orphan_object_id).expect("orphan"),
         &seed.orphan_object_bytes
     );
+    let snapshot = BranchSnapshotV1::decode(
+        seed.branch_snapshot_id,
+        seed.objects.get(seed.branch_snapshot_id).expect("snapshot"),
+    )
+    .expect("snapshot decode");
+    validate_branch_snapshot_ref_edge(&snapshot, load_from(&seed.objects)).expect("ref edge");
 }

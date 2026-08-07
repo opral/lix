@@ -1,13 +1,17 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use bytes::Bytes;
 
 use crate::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, ReadOptions, Storage,
-    StorageError, StorageRead,
+    StorageError,
 };
+use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
-    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, GlobalSelectorV1, RepositoryRootV1,
+    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
+    ChangeObjectV1, CommitCatalogEntry, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1,
     branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
@@ -37,7 +41,7 @@ pub(crate) struct CoherentView<R> {
 
 impl<R> CoherentView<R>
 where
-    R: StorageRead,
+    R: StorageAdapterRead,
 {
     pub(crate) fn branch_id(&self) -> CanonicalBranchId {
         self.branch_id
@@ -75,13 +79,10 @@ where
         &self.read
     }
 
-    pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
-        load_object_bytes(&self.read, id).await
-    }
-
     pub(crate) fn bind_resume_key(&self, catalog_root: ObjectId, last_key: &[u8]) -> Vec<u8> {
         let mut encoder = Encoder::with_prefix(b"LIXFTR\0\x01");
         encoder.fixed(&self.view_id);
+        encoder.fixed(self.global_selector.repository_root.as_bytes());
         encoder.fixed(catalog_root.as_bytes());
         encoder
             .bytes(last_key)
@@ -106,6 +107,7 @@ where
         }
         let mut decoder = super::codec::Decoder::after_prefix(body, b"LIXFTR\0\x01")?;
         if decoder.fixed::<32>()? != self.view_id
+            || decoder.fixed::<32>()? != *self.global_selector.repository_root.as_bytes()
             || decoder.fixed::<32>()? != *catalog_root.as_bytes()
         {
             return Err(StorageError::InvalidCursor);
@@ -114,18 +116,35 @@ where
         decoder.finish()?;
         Ok(last_key)
     }
+    pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
+        load_object_bytes(&self.read, id).await
+    }
 }
 
 pub(crate) async fn open_coherent_view<S>(
     storage: &S,
     branch_id: CanonicalBranchId,
-) -> Result<CoherentView<S::Read<'_>>, StorageError>
+) -> Result<CoherentView<StorageAdapterReadScope<S::Read<'_>>>, StorageError>
 where
     S: Storage,
 {
     // This is intentionally the one and only begin_read in the acquisition
     // protocol. Every later object load receives this owned handle.
-    let read = storage.begin_read(ReadOptions::default()).await?;
+    let read = StorageAdapterReadScope::new(storage.begin_read(ReadOptions::default()).await?);
+    open_coherent_view_on_read(read, branch_id).await
+}
+
+/// Acquires the exact selector pair and all root objects through a caller-owned
+/// adapter read. Transaction/session open calls `begin_read` once, passes that
+/// handle here, and must retain the resulting view for all traversal,
+/// pagination, and publication preconditions.
+pub(crate) async fn open_coherent_view_on_read<R>(
+    read: R,
+    branch_id: CanonicalBranchId,
+) -> Result<CoherentView<R>, StorageError>
+where
+    R: StorageAdapterRead,
+{
     let selector_keys = [
         Key(global_selector_key()),
         Key(branch_selector_key(branch_id)),
@@ -201,6 +220,14 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
+    authenticate_selected_graph(
+        &read,
+        global_selector.repository_root,
+        branch_selector.branch_snapshot_object_id,
+        repository_root,
+        branch_snapshot,
+    )
+    .await?;
     let view_id = derive_view_id(&raw_global_selector, &raw_branch_selector);
     Ok(CoherentView {
         read,
@@ -216,7 +243,7 @@ where
 }
 
 pub(super) async fn load_object_bytes(
-    read: &impl StorageRead,
+    read: &(impl StorageAdapterRead + ?Sized),
     id: ObjectId,
 ) -> Result<Bytes, StorageError> {
     let keys = [Key(Bytes::copy_from_slice(id.as_bytes()))];
@@ -233,6 +260,228 @@ pub(super) async fn load_object_bytes(
         loaded.values.into_iter().next().flatten(),
         format!("object {id} is absent"),
     )
+}
+
+async fn authenticate_selected_graph<R>(
+    read: &R,
+    repository_id: ObjectId,
+    branch_snapshot_id: ObjectId,
+    repository: RepositoryRootV1,
+    branch: BranchSnapshotV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    // Open authenticates the complete selected immutable closure, including
+    // every tree node, catalog/state edge, blob manifest/chunk, commit parent,
+    // and retained object reachable from the selected pair. No later read can
+    // discover a dangling or mistyped selected edge that open accepted.
+    let _ =
+        super::reachability::mark_reachable(read, vec![repository_id, branch_snapshot_id]).await?;
+    let mut ids = BTreeSet::from([
+        repository.global_state_root,
+        repository.commit_catalog_root,
+        repository.change_catalog_root,
+        repository.retention_policy_root,
+        branch.local_state_root,
+        branch.historical_global_state_root,
+        branch.semantic_head_commit_object_id,
+    ]);
+    if let Some(id) = branch.latest_ref_change_object_id {
+        ids.insert(id);
+    }
+    let objects = load_object_map(read, ids.into_iter()).await?;
+    for (id, kind) in [
+        (repository.global_state_root, "state"),
+        (branch.local_state_root, "state"),
+        (branch.historical_global_state_root, "state"),
+        (repository.commit_catalog_root, "commit"),
+        (repository.change_catalog_root, "change"),
+        (repository.retention_policy_root, "retention"),
+    ] {
+        super::tree::validate_root_bytes(id, kind, required_object(&objects, id)?)?;
+    }
+    validate_global_state_has_no_tombstones(read, repository.global_state_root).await?;
+    let head = CommitObjectV1::decode(
+        branch.semantic_head_commit_object_id,
+        required_object(&objects, branch.semantic_head_commit_object_id)?,
+    )?;
+    if head.global_state_root != branch.historical_global_state_root
+        || head.local_state_root != branch.local_state_root
+    {
+        return Err(corruption(
+            "selected semantic head does not authenticate the branch/global state pair",
+        ));
+    }
+    let commit_entry = super::tree::lookup_on_read(
+        repository.commit_catalog_root,
+        "commit",
+        head.commit_id.as_bytes(),
+        read,
+    )
+    .await?
+    .ok_or_else(|| corruption("selected semantic head is absent from CommitCatalog"))?;
+    if CommitCatalogEntry::decode(&commit_entry)?.commit_object_id
+        != branch.semantic_head_commit_object_id
+    {
+        return Err(corruption(
+            "selected semantic head CommitCatalog entry names another object",
+        ));
+    }
+
+    let Some(ref_id) = branch.latest_ref_change_object_id else {
+        return Ok(());
+    };
+    let change = ChangeObjectV1::decode(ref_id, required_object(&objects, ref_id)?)?;
+    let ChangeObjectV1::BranchRef {
+        change_id,
+        branch_id,
+        before_semantic_head_commit_object_id,
+        after_semantic_head_commit_object_id,
+        previous_ref_change_object_id,
+        ..
+    } = change
+    else {
+        return Err(corruption(
+            "branch snapshot latest ref-change edge names a semantic Change",
+        ));
+    };
+    if branch_id != branch.branch_id
+        || after_semantic_head_commit_object_id != Some(branch.semantic_head_commit_object_id)
+    {
+        return Err(corruption(
+            "branch snapshot latest ref-change does not match its branch/head",
+        ));
+    }
+    let catalog_entry = super::tree::lookup_on_read(
+        repository.change_catalog_root,
+        "change",
+        change_id.as_bytes(),
+        read,
+    )
+    .await?
+    .ok_or_else(|| corruption("selected branch RefChange is absent from ChangeCatalog"))?;
+    let catalog_entry = ChangeCatalogEntry::decode(&catalog_entry)?;
+    if catalog_entry.change_object_id != ref_id
+        || catalog_entry.owner
+            != (ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_id,
+                branch_id: branch.branch_id,
+            })
+    {
+        return Err(corruption(
+            "selected branch RefChange has an invalid ChangeCatalog owner edge",
+        ));
+    }
+
+    let mut target_ids = BTreeSet::new();
+    target_ids.extend(before_semantic_head_commit_object_id);
+    target_ids.extend(after_semantic_head_commit_object_id);
+    target_ids.extend(previous_ref_change_object_id);
+    let targets = load_object_map(read, target_ids.into_iter()).await?;
+    for target in [
+        before_semantic_head_commit_object_id,
+        after_semantic_head_commit_object_id,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = CommitObjectV1::decode(target, required_object(&targets, target)?)?;
+    }
+    if let Some(previous) = previous_ref_change_object_id {
+        match ChangeObjectV1::decode(previous, required_object(&targets, previous)?)? {
+            ChangeObjectV1::BranchRef {
+                branch_id: previous_branch,
+                after_semantic_head_commit_object_id: previous_after,
+                ..
+            } if previous_branch == branch.branch_id
+                && previous_after == before_semantic_head_commit_object_id => {}
+            ChangeObjectV1::BranchRef { .. } => {
+                return Err(corruption(
+                    "branch RefChange predecessor does not join its before target",
+                ));
+            }
+            ChangeObjectV1::Semantic { .. } => {
+                return Err(corruption(
+                    "branch RefChange predecessor names a semantic Change",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_global_state_has_no_tombstones<R>(
+    read: &R,
+    root: ObjectId,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut start_after: Option<Vec<u8>> = None;
+    loop {
+        let page =
+            super::tree::scan_page_on_read(root, "state", start_after.as_deref(), 64, read).await?;
+        for (_, value) in &page {
+            let value = super::state::decode_state_value(value)
+                .map_err(|error| corruption(error.to_string()))?;
+            if value.cell.deleted() {
+                return Err(corruption("global state root contains a tombstone"));
+            }
+        }
+        start_after = page.last().map(|(key, _)| key.clone());
+        if page.len() < 64 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn load_object_map<R>(
+    read: &R,
+    ids: impl IntoIterator<Item = ObjectId>,
+) -> Result<BTreeMap<ObjectId, Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let keys = ids
+        .iter()
+        .map(|id| Key(Bytes::copy_from_slice(id.as_bytes())))
+        .collect::<Vec<_>>();
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: OBJECT_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    if loaded.values.len() != ids.len() {
+        return Err(corruption(
+            "selected graph object read returned the wrong number of values",
+        ));
+    }
+    ids.into_iter()
+        .zip(loaded.values)
+        .map(|(id, value)| {
+            projected_required(value, format!("selected object {id} is absent"))
+                .map(|bytes| (id, bytes))
+        })
+        .collect()
+}
+
+fn required_object(
+    objects: &BTreeMap<ObjectId, Bytes>,
+    id: ObjectId,
+) -> Result<&Bytes, StorageError> {
+    objects
+        .get(&id)
+        .ok_or_else(|| corruption(format!("selected object {id} is absent")))
 }
 
 fn derive_view_id(raw_global: &[u8], raw_branch: &[u8]) -> [u8; 32] {

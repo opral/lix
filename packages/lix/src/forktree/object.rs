@@ -23,10 +23,6 @@ impl ObjectId {
     pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
-    pub(crate) const fn into_bytes(self) -> [u8; 32] {
-        self.0
-    }
 }
 
 impl std::fmt::Display for ObjectId {
@@ -50,6 +46,10 @@ pub(super) enum ObjectDomain {
     UploadPart = 7,
     UploadProgress = 8,
     BlobChunk = 9,
+    BlobManifest = 10,
+    SnapshotTarget = 11,
+    GcMarkPack = 12,
+    GcProgress = 13,
 }
 
 impl ObjectDomain {
@@ -64,9 +64,29 @@ impl ObjectDomain {
             7 => Ok(Self::UploadPart),
             8 => Ok(Self::UploadProgress),
             9 => Ok(Self::BlobChunk),
+            10 => Ok(Self::BlobManifest),
+            11 => Ok(Self::SnapshotTarget),
+            12 => Ok(Self::GcMarkPack),
+            13 => Ok(Self::GcProgress),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }
+}
+
+pub(super) fn authenticate_object_domain(
+    expected_id: ObjectId,
+    bytes: &[u8],
+) -> Result<ObjectDomain, StorageError> {
+    let actual = ObjectId(keyed_hash(OBJECT_HASH_DOMAIN, bytes));
+    if actual != expected_id {
+        return Err(corruption(format!(
+            "object {expected_id} failed content authentication"
+        )));
+    }
+    let mut decoder = Decoder::after_prefix(bytes, OBJECT_MAGIC)?;
+    let domain =
+        u16::try_from(decoder.u32()?).map_err(|_| corruption("object domain exceeds u16"))?;
+    ObjectDomain::decode(domain)
 }
 
 pub(super) fn encode_object(

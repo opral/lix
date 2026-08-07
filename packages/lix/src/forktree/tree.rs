@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
 use crate::storage::StorageError;
+use crate::storage::{CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue};
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::{Decoder, Encoder, corruption};
 use super::model::{
@@ -142,10 +144,6 @@ impl ImmutableObjectSet {
         self.objects.iter().map(|(id, bytes)| (*id, bytes))
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.objects.len()
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.objects.is_empty()
     }
@@ -163,6 +161,118 @@ pub(crate) struct ReceiptTreeEdit {
     pub(crate) objects: ImmutableObjectSet,
     pub(crate) copied_nodes: usize,
     pub(crate) inserted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OrderedTreeMutation {
+    Insert { key: Vec<u8>, value: Vec<u8> },
+    Update { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+impl OrderedTreeMutation {
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Insert { key, .. } | Self::Update { key, .. } | Self::Delete { key } => key,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OrderedTreeEdit {
+    pub(crate) root: OrderedTreeRoot,
+    pub(crate) objects: ImmutableObjectSet,
+    pub(crate) copied_nodes: usize,
+}
+
+/// Authenticated outgoing object edges from one ordered-tree node.
+///
+/// Internal nodes contribute child edges. Leaf edges are decoded according to
+/// the node's authenticated kind, so reachability never has a second decoder
+/// for state, catalog, receipt, or retention values.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct OrderedTreeEdges {
+    pub(super) object_ids: Vec<ObjectId>,
+    pub(super) commit_entries: Vec<(CommitId, CommitCatalogEntry)>,
+    pub(super) change_entries: Vec<(ChangeId, ChangeCatalogEntry)>,
+}
+
+pub(super) fn ordered_tree_edges(
+    id: ObjectId,
+    bytes: &[u8],
+) -> Result<OrderedTreeEdges, StorageError> {
+    let node = decode_node(id, bytes)?;
+    let mut object_ids = Vec::new();
+    let mut commit_entries = Vec::new();
+    let mut change_entries = Vec::new();
+    match node.body {
+        NodeBody::Internal(children) => {
+            object_ids.extend(children.into_iter().map(|child| child.id));
+        }
+        NodeBody::Leaf(entries) => {
+            for entry in entries {
+                match node.kind {
+                    TreeKind::State => {
+                        let value = super::state::decode_state_value(&entry.value)
+                            .map_err(|error| corruption(error.to_string()))?;
+                        object_ids.extend(value.blob_manifest_object_ids);
+                    }
+                    TreeKind::CommitCatalog => {
+                        let key = CommitId::from_bytes(
+                            entry
+                                .key
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| corruption("CommitCatalog key is not a UUID"))?,
+                        );
+                        let value = CommitCatalogEntry::decode(&entry.value)?;
+                        object_ids.push(value.commit_object_id);
+                        commit_entries.push((key, value));
+                    }
+                    TreeKind::ChangeCatalog => {
+                        let key = ChangeId::from_bytes(
+                            entry
+                                .key
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| corruption("ChangeCatalog key is not a UUID"))?,
+                        );
+                        let value = ChangeCatalogEntry::decode(&entry.value)?;
+                        object_ids.push(value.change_object_id);
+                        object_ids.push(match value.owner {
+                            ChangeCatalogOwner::CommitMember {
+                                commit_object_id, ..
+                            } => commit_object_id,
+                            ChangeCatalogOwner::BranchRef {
+                                ref_change_object_id,
+                                ..
+                            } => ref_change_object_id,
+                        });
+                        change_entries.push((key, value));
+                    }
+                    TreeKind::Receipt | TreeKind::Retention => {
+                        object_ids.push(ObjectId::from_bytes(
+                            entry
+                                .value
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| corruption("tree object edge is not 32 bytes"))?,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if object_ids.contains(&ObjectId::ZERO) {
+        return Err(corruption("ordered-tree node contains a zero object edge"));
+    }
+    object_ids.sort_unstable();
+    object_ids.dedup();
+    Ok(OrderedTreeEdges {
+        object_ids,
+        commit_entries,
+        change_entries,
+    })
 }
 
 pub(super) fn empty_receipt_tree() -> Result<ReceiptTreeEdit, StorageError> {
@@ -207,12 +317,18 @@ pub(super) fn build_change_catalog(
 pub(super) fn build_state_tree(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<TreeBuild, StorageError> {
     let entries = entries
         .iter()
-        .map(|(key, value)| LeafEntry {
-            key: key.clone(),
-            value: value.clone(),
-            receipt: None,
+        .map(|(key, value)| {
+            let _ = super::state::decode_state_key(key)
+                .map_err(|error| corruption(error.to_string()))?;
+            let _ = super::state::decode_state_value(value)
+                .map_err(|error| corruption(error.to_string()))?;
+            Ok(LeafEntry {
+                key: key.clone(),
+                value: value.clone(),
+                receipt: None,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, StorageError>>()?;
     build_tree(TreeKind::State, &entries)
 }
 
@@ -228,6 +344,270 @@ pub(super) fn build_retention_tree(
         })
         .collect::<Vec<_>>();
     build_tree(TreeKind::Retention, &entries)
+}
+
+/// Applies distinct, sorted mutations by copying only each affected root-to-leaf
+/// path. Operation-local intermediate nodes are removed from the returned
+/// object set, so only objects reachable from the final root are published.
+///
+/// Time is `O(U log_F N + copied blocks)` for `U` mutations and memory is
+/// `O(U log_F N)` before final reachable-object pruning. The caller may lower
+/// mutations in smaller sorted windows when it needs a stricter memory bound.
+pub(super) async fn apply_ordered_mutations<R>(
+    root: OrderedTreeRoot,
+    expected_kind: &'static str,
+    mutations: &[OrderedTreeMutation],
+    read: &R,
+) -> Result<OrderedTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if mutations
+        .windows(2)
+        .any(|pair| pair[0].key() >= pair[1].key())
+    {
+        return Err(corruption(
+            "ordered-tree mutations are not strictly ordered and distinct",
+        ));
+    }
+    let kind = parse_kind(expected_kind)?;
+    let mut objects = ImmutableObjectSet::default();
+    let mut current_root = root;
+    let mut copied_nodes = 0_usize;
+    for mutation in mutations {
+        current_root = apply_one_mutation(
+            current_root,
+            kind,
+            mutation,
+            read,
+            &mut objects,
+            &mut copied_nodes,
+        )
+        .await?;
+    }
+    retain_reachable_new_nodes(current_root.object_id, kind, &mut objects)?;
+    Ok(OrderedTreeEdit {
+        root: current_root,
+        objects,
+        copied_nodes,
+    })
+}
+
+pub(super) async fn lookup_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    key: &[u8],
+    read: &R,
+) -> Result<Option<Vec<u8>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let kind = parse_kind(expected_kind)?;
+    let mut current = root;
+    let mut expected: Option<NodeRef> = None;
+    loop {
+        let node = decode_node(current, &load_object_on_read(read, current).await?)?;
+        validate_loaded_node(current, &node, kind, expected.as_ref())?;
+        match node.body {
+            NodeBody::Leaf(entries) => {
+                return Ok(entries
+                    .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+                    .ok()
+                    .map(|index| entries[index].value.clone()));
+            }
+            NodeBody::Internal(children) => {
+                let index = child_index(&children, key);
+                expected = Some(children[index].clone());
+                current = children[index].id;
+            }
+        }
+    }
+}
+
+pub(super) async fn validate_root_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    read: &R,
+) -> Result<OrderedTreeRoot, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let kind = parse_kind(expected_kind)?;
+    let node = decode_node(root, &load_object_on_read(read, root).await?)?;
+    validate_loaded_node(root, &node, kind, None)?;
+    Ok(OrderedTreeRoot {
+        object_id: root,
+        entry_count: node.summary.entry_count,
+    })
+}
+
+pub(super) async fn validate_receipt_root_on_read<R>(
+    root: ReceiptTreeRoot,
+    read: &R,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let node = decode_node(
+        root.object_id,
+        &load_object_on_read(read, root.object_id).await?,
+    )?;
+    if node.kind != TreeKind::Receipt || receipt_root(&node_ref(root.object_id, &node)) != root {
+        return Err(corruption(
+            "receipt root summary does not match its authenticated node",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_root_bytes(
+    root: ObjectId,
+    expected_kind: &'static str,
+    bytes: &[u8],
+) -> Result<OrderedTreeRoot, StorageError> {
+    let kind = parse_kind(expected_kind)?;
+    let node = decode_node(root, bytes)?;
+    validate_loaded_node(root, &node, kind, None)?;
+    Ok(OrderedTreeRoot {
+        object_id: root,
+        entry_count: node.summary.entry_count,
+    })
+}
+
+/// Returns the next strict raw-key page after `start_after`. The descent seeks
+/// directly to the containing leaf and then visits only enough ordered blocks
+/// to fill the page, for `O(log_F M + page)` authenticated work.
+pub(super) async fn scan_page_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    start_after: Option<&[u8]>,
+    page_size: usize,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if page_size == 0 {
+        return Err(corruption("ordered-tree page size must be nonzero"));
+    }
+    let requested = page_size
+        .checked_add(usize::from(start_after.is_some()))
+        .ok_or_else(|| corruption("ordered-tree page size overflows usize"))?;
+    let mut rows = scan_range_on_read(
+        root,
+        expected_kind,
+        start_after,
+        None,
+        Some(requested),
+        read,
+    )
+    .await?;
+    if let Some(start_after) = start_after {
+        rows.retain(|(key, _)| key.as_slice() > start_after);
+    }
+    rows.truncate(page_size);
+    Ok(rows)
+}
+
+pub(super) async fn scan_bounded_page_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    start_after: Option<&[u8]>,
+    page_size: usize,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if page_size == 0 {
+        return Err(corruption("ordered-tree page size must be nonzero"));
+    }
+    let effective_lower = match (lower, start_after) {
+        (Some(lower), Some(start)) => Some(lower.max(start)),
+        (Some(lower), None) => Some(lower),
+        (None, Some(start)) => Some(start),
+        (None, None) => None,
+    };
+    let requested = page_size
+        .checked_add(usize::from(start_after.is_some()))
+        .ok_or_else(|| corruption("ordered-tree page size overflows usize"))?;
+    let mut rows = scan_range_on_read(
+        root,
+        expected_kind,
+        effective_lower,
+        upper,
+        Some(requested),
+        read,
+    )
+    .await?;
+    if let Some(start_after) = start_after {
+        rows.retain(|(key, _)| key.as_slice() > start_after);
+    }
+    rows.truncate(page_size);
+    Ok(rows)
+}
+
+/// Authenticates and returns an ordered half-open range. Work is proportional
+/// to visited tree blocks plus returned key/value bytes; unrelated subtrees
+/// whose authenticated separator is below the lower bound are skipped.
+pub(super) async fn scan_range_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    limit: Option<usize>,
+    read: &R,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if lower.zip(upper).is_some_and(|(lower, upper)| lower > upper) {
+        return Err(corruption("ordered-tree range bounds are inverted"));
+    }
+    let kind = parse_kind(expected_kind)?;
+    let mut output = Vec::new();
+    let mut frontier = vec![(root, None)];
+    while let Some((id, expected)) = frontier.pop() {
+        if limit.is_some_and(|limit| output.len() >= limit) {
+            break;
+        }
+        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        validate_loaded_node(id, &node, kind, expected.as_ref())?;
+        match node.body {
+            NodeBody::Leaf(entries) => {
+                for entry in entries {
+                    if lower.is_some_and(|lower| entry.key.as_slice() < lower) {
+                        continue;
+                    }
+                    if upper.is_some_and(|upper| entry.key.as_slice() >= upper) {
+                        break;
+                    }
+                    output.push((entry.key, entry.value));
+                    if limit.is_some_and(|limit| output.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+            NodeBody::Internal(children) => {
+                let first = lower.map_or(0, |lower| child_index(&children, lower));
+                let last = upper.map_or(children.len() - 1, |upper| child_index(&children, upper));
+                for child in children
+                    .into_iter()
+                    .take(last.saturating_add(1))
+                    .skip(first)
+                    .rev()
+                {
+                    frontier.push((child.id, Some(child)));
+                }
+            }
+        }
+    }
+    if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(corruption("ordered-tree range is not globally ordered"));
+    }
+    Ok(output)
 }
 
 pub(super) fn insert_receipt_part(
@@ -659,6 +1039,194 @@ fn rewrite_insert(
             *copied_nodes += 1;
             stage_internal_level(kind, &next, objects)
         }
+    }
+}
+
+async fn apply_one_mutation<R>(
+    root: OrderedTreeRoot,
+    kind: TreeKind,
+    mutation: &OrderedTreeMutation,
+    read: &R,
+    objects: &mut ImmutableObjectSet,
+    copied_nodes: &mut usize,
+) -> Result<OrderedTreeRoot, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut path = Vec::<(ObjectId, Node, usize)>::new();
+    let mut current = root.object_id;
+    let mut expected: Option<NodeRef> = None;
+    let leaf = loop {
+        let bytes = match objects.get(current) {
+            Some(bytes) => bytes.clone(),
+            None => load_object_on_read(read, current).await?,
+        };
+        let node = decode_node(current, &bytes)?;
+        validate_loaded_node(current, &node, kind, expected.as_ref())?;
+        if path.is_empty() && node.summary.entry_count != root.entry_count {
+            return Err(corruption(
+                "ordered-tree root count does not match its authenticated node",
+            ));
+        }
+        match node.body {
+            NodeBody::Leaf(entries) => break entries,
+            NodeBody::Internal(ref children) => {
+                let index = child_index(children, mutation.key());
+                expected = Some(children[index].clone());
+                let next = children[index].id;
+                path.push((current, node, index));
+                current = next;
+            }
+        }
+    };
+
+    let mut entries = leaf;
+    match entries.binary_search_by(|entry| entry.key.as_slice().cmp(mutation.key())) {
+        Ok(index) => match mutation {
+            OrderedTreeMutation::Insert { .. } => return Err(StorageError::WriteConflict),
+            OrderedTreeMutation::Update { value, .. } => entries[index].value.clone_from(value),
+            OrderedTreeMutation::Delete { .. } => {
+                entries.remove(index);
+            }
+        },
+        Err(index) => match mutation {
+            OrderedTreeMutation::Insert { key, value } => entries.insert(
+                index,
+                LeafEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    receipt: None,
+                },
+            ),
+            OrderedTreeMutation::Update { .. } | OrderedTreeMutation::Delete { .. } => {
+                return Err(StorageError::WriteConflict);
+            }
+        },
+    }
+
+    *copied_nodes = copied_nodes.saturating_add(1);
+    let mut rewritten = if entries.is_empty() && !path.is_empty() {
+        Vec::new()
+    } else {
+        stage_leaf_level(kind, &entries, objects)?
+    };
+    while let Some((_parent_id, parent, child_index)) = path.pop() {
+        let NodeBody::Internal(children) = parent.body else {
+            return Err(corruption(
+                "ordered-tree edit path contains a non-internal parent",
+            ));
+        };
+        if child_index >= children.len() || children[child_index].id != current {
+            return Err(corruption(
+                "ordered-tree edit path no longer matches its authenticated parent",
+            ));
+        }
+        let mut next = Vec::with_capacity(
+            children
+                .len()
+                .saturating_sub(1)
+                .saturating_add(rewritten.len()),
+        );
+        next.extend_from_slice(&children[..child_index]);
+        next.extend(rewritten);
+        next.extend_from_slice(&children[child_index + 1..]);
+        rewritten = match next.as_slice() {
+            [] => Vec::new(),
+            [only] => vec![only.clone()],
+            _ => stage_internal_level(kind, &next, objects)?,
+        };
+        *copied_nodes = copied_nodes.saturating_add(1);
+        current = _parent_id;
+    }
+    if rewritten.is_empty() {
+        rewritten.push(stage_leaf(kind, &[], objects)?);
+    }
+    while rewritten.len() > 1 {
+        rewritten = stage_internal_level(kind, &rewritten, objects)?;
+        *copied_nodes = copied_nodes.saturating_add(rewritten.len());
+    }
+    let root = rewritten
+        .pop()
+        .ok_or_else(|| corruption("ordered-tree edit emitted no root"))?;
+    Ok(OrderedTreeRoot {
+        object_id: root.id,
+        entry_count: root.summary.entry_count,
+    })
+}
+
+fn retain_reachable_new_nodes(
+    root: ObjectId,
+    kind: TreeKind,
+    objects: &mut ImmutableObjectSet,
+) -> Result<(), StorageError> {
+    let mut reachable = BTreeSet::new();
+    let mut frontier = vec![root];
+    while let Some(id) = frontier.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        let Some(bytes) = objects.get(id) else {
+            // A durable immutable node cannot reference a not-yet-published
+            // child, so an old subtree contains no new objects to retain.
+            continue;
+        };
+        let node = decode_node(id, bytes)?;
+        if node.kind != kind {
+            return Err(corruption(
+                "ordered-tree final root reaches a node of the wrong kind",
+            ));
+        }
+        if let NodeBody::Internal(children) = node.body {
+            frontier.extend(children.into_iter().map(|child| child.id));
+        }
+    }
+    objects.objects.retain(|id, _| reachable.contains(id));
+    Ok(())
+}
+
+fn child_index(children: &[NodeRef], key: &[u8]) -> usize {
+    children
+        .partition_point(|child| child.max_key.as_slice() < key)
+        .min(children.len().saturating_sub(1))
+}
+
+fn validate_loaded_node(
+    id: ObjectId,
+    node: &Node,
+    kind: TreeKind,
+    expected: Option<&NodeRef>,
+) -> Result<(), StorageError> {
+    if node.kind != kind {
+        return Err(corruption("ordered-tree node has the wrong kind"));
+    }
+    if expected.is_some_and(|expected| node_ref(id, node) != *expected) {
+        return Err(corruption(
+            "ordered-tree child body does not match its authenticated parent reference",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_object_on_read<R>(read: &R, id: ObjectId) -> Result<Bytes, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let keys = [Key(Bytes::copy_from_slice(id.as_bytes()))];
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: super::object::OBJECT_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    match loaded.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(bytes)) => Ok(bytes),
+        Some(ProjectedValue::KeyOnly) => Err(corruption(
+            "ordered-tree object read returned a key-only projection",
+        )),
+        None => Err(corruption(format!("ordered-tree object {id} is absent"))),
     }
 }
 
