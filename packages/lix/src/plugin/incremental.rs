@@ -1859,10 +1859,31 @@ pub(crate) struct ResolvedOutputSplice {
 /// complete renderer output has passed host range/order validation and has
 /// been reconstructed from the immutable base. Transaction code may pair it
 /// with an independently loaded durable blob hash as a private CAS hint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedSameLengthOutputSplice {
     pub(crate) offset: usize,
     pub(crate) length: usize,
+    validated_result: Blob,
+}
+
+impl ValidatedSameLengthOutputSplice {
+    fn new_validated(offset: usize, length: usize, result: &Blob) -> Option<Self> {
+        (length != 0 && offset.checked_add(length)? <= result.len()).then(|| Self {
+            offset,
+            length,
+            validated_result: result.clone(),
+        })
+    }
+
+    pub(crate) fn matches_result(&self, result: &[u8]) -> bool {
+        self.validated_result.len() == result.len()
+            && self.validated_result.as_ptr() == result.as_ptr()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_validated_for_test(offset: usize, length: usize, result: &Blob) -> Self {
+        Self::new_validated(offset, length, result).expect("test plugin splice should be in bounds")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2873,7 +2894,7 @@ async fn drain_entity_transition_edits_inner(
             validate_resolved_output_against_known_delta(base, expected, expected_delta, &edits)?;
             (expected.clone(), None)
         } else {
-            let (rendered_bytes, same_length_output_splice) =
+            let (rendered_bytes, same_length_output_splice_shape) =
                 apply_resolved_output_splices(base, &edits)?;
             let bytes: Blob = rendered_bytes.into();
             if expected
@@ -2884,6 +2905,10 @@ async fn drain_entity_transition_edits_inner(
                     "component renderer edits do not reproduce the independently expected bytes",
                 ));
             }
+            let same_length_output_splice =
+                same_length_output_splice_shape.and_then(|(offset, length)| {
+                    ValidatedSameLengthOutputSplice::new_validated(offset, length, &bytes)
+                });
             (bytes, same_length_output_splice)
         };
     // Cold-open validation benefits from caching the accepted protocol
@@ -2911,7 +2936,7 @@ fn same_length_output_splice_after_host_validation(
     base_len: usize,
     output_len: usize,
     edits: &[ResolvedOutputSplice],
-) -> Option<ValidatedSameLengthOutputSplice> {
+) -> Option<(usize, usize)> {
     let [edit] = edits else {
         return None;
     };
@@ -2921,7 +2946,7 @@ fn same_length_output_splice_after_host_validation(
     if length == 0 || length != edit.insert.len() || end > base_len || output_len != base_len {
         return None;
     }
-    Some(ValidatedSameLengthOutputSplice { offset, length })
+    Some((offset, length))
 }
 
 async fn cleanup_rejected_transition(
@@ -3382,7 +3407,7 @@ impl OutputDrainBudget {
 fn apply_resolved_output_splices(
     base: &[u8],
     edits: &[ResolvedOutputSplice],
-) -> Result<(Vec<u8>, Option<ValidatedSameLengthOutputSplice>), LixError> {
+) -> Result<(Vec<u8>, Option<(usize, usize)>), LixError> {
     let mut capacity = base.len();
     let mut previous_start = None;
     let mut previous_end = 0usize;
@@ -5195,13 +5220,12 @@ mod tests {
         .expect("one valid fixed-width renderer edit should drain");
 
         assert_eq!(drained.bytes.as_ref(), b"abXYef");
-        assert_eq!(
-            drained.same_length_output_splice,
-            Some(ValidatedSameLengthOutputSplice {
-                offset: 2,
-                length: 2,
-            })
-        );
+        let splice = drained
+            .same_length_output_splice
+            .as_ref()
+            .expect("fixed-width output should carry a proof");
+        assert_eq!((splice.offset, splice.length), (2, 2));
+        assert!(splice.matches_result(&drained.bytes));
         assert!(actor.finished);
     }
 
@@ -5218,10 +5242,7 @@ mod tests {
                 b"abXYef".len(),
                 std::slice::from_ref(&fixed_width),
             ),
-            Some(ValidatedSameLengthOutputSplice {
-                offset: 2,
-                length: 2,
-            })
+            Some((2, 2))
         );
 
         let length_changing = ResolvedOutputSplice {

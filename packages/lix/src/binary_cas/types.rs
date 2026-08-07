@@ -3,6 +3,7 @@ use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobId([u8; 32]);
@@ -13,6 +14,8 @@ impl BlobId {
     }
 
     pub(crate) fn from_content(content: &[u8]) -> Self {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_binary_cas_blob_identity_input_bytes(content.len());
         if content.len() <= MEDIA_CHUNK_BYTES {
             return Self::from_single_chunk(ChunkHash::from_content(content));
         }
@@ -72,6 +75,8 @@ impl ChunkHash {
     }
 
     pub(crate) fn from_content(content: &[u8]) -> Self {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_binary_cas_chunk_identity_hash_bytes(content.len());
         Self(binary_blob_hash_bytes(content))
     }
 
@@ -125,16 +130,79 @@ impl BlobSameLengthSplice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthenticatedBlobManifestReuse {
+    pub(crate) receipt: BlobWriteReceipt,
+    pub(crate) chunks: Vec<AuthenticatedBlobManifestChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManifestReuseAuthentication {
+    /// The verified splice or valid base layout cannot use fixed-manifest
+    /// reuse and may continue through its existing writer.
+    Ineligible,
+    /// A valid historical noncanonical chunk layout was authenticated. Its
+    /// bytes must use the canonical full writer, never the delta shortcut.
+    CanonicalFullWrite,
+    Reuse(AuthenticatedBlobManifestReuse),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthenticatedBlobManifestChunk {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) hash: ChunkHash,
+    pub(crate) changed: bool,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
-    hash: Option<BlobId>,
+    hash: OnceLock<BlobId>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let hash = (!bytes.is_empty()).then(|| BlobId::from_content(&bytes));
+        let hash = OnceLock::new();
+        if !bytes.is_empty() {
+            hash.set(BlobId::from_content(&bytes))
+                .expect("new binary CAS payload hash cell is empty");
+        }
         Self { bytes, hash }
+    }
+
+    pub(crate) fn from_verified_splice_bytes(
+        bytes: impl Into<crate::Blob>,
+        provenance: &crate::common::RequestBlobSpliceProvenance,
+    ) -> Result<Self, LixError> {
+        let bytes = bytes.into();
+        if !provenance.matches_result(&bytes) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "binary CAS deferred payload does not match its verified transport splice",
+            ));
+        }
+        Ok(Self {
+            bytes,
+            hash: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn from_verified_plugin_splice_bytes(
+        bytes: impl Into<crate::Blob>,
+        splice: &crate::plugin::ValidatedSameLengthOutputSplice,
+    ) -> Result<Self, LixError> {
+        let bytes = bytes.into();
+        if !splice.matches_result(&bytes) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "binary CAS deferred payload does not match its host-validated plugin splice",
+            ));
+        }
+        Ok(Self {
+            bytes,
+            hash: OnceLock::new(),
+        })
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -146,7 +214,39 @@ impl BlobPayload {
     }
 
     pub(crate) fn hash(&self) -> Option<BlobId> {
-        self.hash
+        (!self.bytes.is_empty()).then(|| {
+            *self
+                .hash
+                .get_or_init(|| BlobId::from_content(self.bytes.as_ref()))
+        })
+    }
+
+    pub(crate) fn bind_authenticated_manifest_reuse(
+        &self,
+        reuse: &AuthenticatedBlobManifestReuse,
+    ) -> Result<(), LixError> {
+        let hash = reuse.receipt.hash;
+        if self.bytes.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "an empty binary CAS payload cannot receive a manifest identity",
+            ));
+        }
+        if let Some(existing) = self.hash.get() {
+            if *existing != hash {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authenticated binary CAS manifest identity disagrees with the payload owner",
+                ));
+            }
+            return Ok(());
+        }
+        self.hash.set(hash).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "binary CAS payload identity was initialized concurrently",
+            )
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -157,6 +257,14 @@ impl BlobPayload {
         self.bytes.is_empty()
     }
 }
+
+impl PartialEq for BlobPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for BlobPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobDeltaSegment {

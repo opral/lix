@@ -335,7 +335,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             blob_writer
                 .stage_file_payload(
                     payload,
-                    write.same_length_blob_splice(),
+                    write.authenticated_manifest_reuse(),
+                    write.force_canonical_blob_write(),
                     write.edit_blob_splice(),
                 )
                 .instrument(tracing::debug_span!(

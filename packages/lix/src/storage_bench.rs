@@ -67,6 +67,8 @@ static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+static BINARY_CAS_BLOB_IDENTITY_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static BINARY_CAS_CHUNK_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Matched transaction ownership counters used by the CRUD profile.  These
 /// counters are deliberately disabled unless the profile enables them, so the
@@ -237,6 +239,8 @@ pub struct MediaStructuralAccounting {
     pub legacy_equivalent_chunk_rows: u64,
     pub chunk_payload_hash_bytes: u64,
     pub segment_identity_hash_bytes: u64,
+    pub blob_identity_input_bytes: u64,
+    pub chunk_identity_hash_bytes: u64,
 }
 
 pub(crate) fn record_media_upload_manifest_leaf(chunk_count: usize) {
@@ -252,6 +256,14 @@ pub(crate) fn record_immutable_segment_identity_hash_bytes(bytes: usize) {
     IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
+pub(crate) fn record_binary_cas_blob_identity_input_bytes(bytes: usize) {
+    BINARY_CAS_BLOB_IDENTITY_INPUT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_binary_cas_chunk_identity_hash_bytes(bytes: usize) {
+    BINARY_CAS_CHUNK_IDENTITY_HASH_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
 pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
     MediaStructuralAccounting {
         temporary_manifest_leaf_rows: MEDIA_UPLOAD_MANIFEST_LEAF_ROWS.swap(0, Ordering::Relaxed),
@@ -259,6 +271,8 @@ pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
         chunk_payload_hash_bytes: MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES.swap(0, Ordering::Relaxed),
         segment_identity_hash_bytes: IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES
             .swap(0, Ordering::Relaxed),
+        blob_identity_input_bytes: BINARY_CAS_BLOB_IDENTITY_INPUT_BYTES.swap(0, Ordering::Relaxed),
+        chunk_identity_hash_bytes: BINARY_CAS_CHUNK_IDENTITY_HASH_BYTES.swap(0, Ordering::Relaxed),
     }
 }
 

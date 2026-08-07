@@ -4,7 +4,7 @@
     clippy::needless_pass_by_ref_mut
 )]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -115,8 +115,8 @@ use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
-    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, FileContent,
+    PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
     StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
@@ -2261,7 +2261,7 @@ where
                 }
                 Some(first) if first == scope => true,
                 Some(first) => !additional_checked_scopes
-                    .get_or_insert_with(|| std::collections::HashSet::from([first]))
+                    .get_or_insert_with(|| HashSet::from([first]))
                     .insert(scope),
             };
             if already_checked {
@@ -2936,6 +2936,8 @@ where
                 let mut reconciliation = self
                     .plugin_write_reconciliation(&mut rows, &mut file_content)
                     .await?;
+                self.authenticate_file_content_manifest_reuse(&mut file_content)
+                    .await?;
                 reconciliation.attach_durable_checkpoints(&mut file_content)?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 for (file_key, version) in &reconciliation.materialization_versions {
@@ -3010,6 +3012,8 @@ where
                         "lix.perf.plugin_reconciliation"
                     ))
                     .await?;
+                self.authenticate_file_content_manifest_reuse(&mut file_content)
+                    .await?;
                 reconciliation.attach_durable_checkpoints(&mut file_content)?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 rows.retain_raw(|row| {
@@ -3063,6 +3067,41 @@ where
                     mark_plugin_reconciliation_batch(&mut materialization_rows, 0)?;
                     rows.append_raw_batch(materialization_rows);
                 }
+                for write in &mut file_content {
+                    let Some(origin) = write.take_deferred_blob_ref_origin() else {
+                        continue;
+                    };
+                    let file_key = PluginFileWriteKey::from(&*write);
+                    if reconciliation
+                        .materialization_versions
+                        .contains_key(&file_key)
+                        || reconciliation.file_keys.contains(&file_key)
+                    {
+                        continue;
+                    }
+                    let mut blob_ref_rows = RawWriteBatch::with_capacity(1);
+                    let row_index = blob_ref_rows.len();
+                    BlobRefRowInput {
+                        file_id: write.file_id.clone(),
+                        blob_hash: write.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "deferred binary CAS blob reference has no payload identity",
+                            )
+                        })?,
+                        size_bytes: write.len(),
+                        context: FilesystemRowContext {
+                            branch_id: write.branch_id.clone(),
+                            global: write.global,
+                            untracked: write.untracked,
+                            file_id: None,
+                            metadata: None,
+                        },
+                    }
+                    .append_to(&mut blob_ref_rows)?;
+                    blob_ref_rows.set_origin(row_index, origin);
+                    rows.append_raw_batch(blob_ref_rows);
+                }
                 let file_content = file_content
                     .into_iter()
                     .filter_map(|mut write| {
@@ -3092,6 +3131,55 @@ where
                 ))
             }
         }
+    }
+
+    async fn authenticate_file_content_manifest_reuse(
+        &mut self,
+        file_content: &mut [TransactionFileContent],
+    ) -> Result<(), LixError> {
+        let mut transaction_owned_blob_hashes = HashSet::new();
+        for write in file_content {
+            if let Some(splice) = write.same_length_blob_splice() {
+                if transaction_owned_blob_hashes.contains(&splice.base_blob_hash) {
+                    // The named base is an earlier transaction-local payload,
+                    // not persisted CAS authority yet. Preserve transaction
+                    // semantics with the canonical writer; its identity is
+                    // already owned by the preceding write in this buffer.
+                    write.require_canonical_blob_write();
+                } else {
+                    let payload = write.inline_payload().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "verified same-length binary CAS splice has no inline payload owner",
+                        )
+                    })?;
+                    match self
+                        .binary_cas
+                        .authenticate_same_length_manifest_reuse(
+                            &self.opening_read,
+                            payload,
+                            splice,
+                        )
+                        .await?
+                    {
+                        crate::binary_cas::ManifestReuseAuthentication::Ineligible => {}
+                        crate::binary_cas::ManifestReuseAuthentication::CanonicalFullWrite => {
+                            write.require_canonical_blob_write();
+                        }
+                        crate::binary_cas::ManifestReuseAuthentication::Reuse(reuse) => {
+                            write.set_authenticated_manifest_reuse(reuse)?;
+                        }
+                    }
+                }
+            }
+            // Eligible manifest reuse has already bound this value without a
+            // full-content pass. Ineligible/full-write cases intentionally pay
+            // their ordinary canonical identity once and cache it here.
+            if let Some(blob_hash) = write.blob_hash() {
+                transaction_owned_blob_hashes.insert(blob_hash);
+            }
+        }
+        Ok(())
     }
 
     fn acknowledged_session_plugin_view(
@@ -5917,7 +6005,7 @@ where
                 hash,
                 rendered_bytes,
                 same_length_output_splice,
-            );
+            )?;
             file_content.push(rendered_file);
             reconciliation
                 .materialized_file_keys
@@ -10533,7 +10621,11 @@ fn semantic_rendered_file_content(
     base_blob_hash: BlobId,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
-) -> TransactionFileContent {
+) -> Result<TransactionFileContent, LixError> {
+    let content = match &same_length_output_splice {
+        Some(splice) => FileContent::inline_verified_plugin_splice(rendered_bytes, splice)?,
+        None => FileContent::inline(rendered_bytes),
+    };
     let mut rendered_file = TransactionFileContent::new(
         file_id,
         Some(path),
@@ -10541,7 +10633,7 @@ fn semantic_rendered_file_content(
         branch_id,
         false,
         false,
-        rendered_bytes,
+        content,
     )
     .with_had_blob_ref(true)
     .with_base_blob_hash(Some(base_blob_hash));
@@ -10552,7 +10644,7 @@ fn semantic_rendered_file_content(
             splice.length,
         );
     }
-    rendered_file
+    Ok(rendered_file)
 }
 
 async fn render_semantic_changes_with_lease(
@@ -11580,10 +11672,12 @@ mod tests {
     use super::*;
     use crate::GLOBAL_BRANCH_ID;
     use crate::NullableKeyFilter;
+    use crate::RequestBlobSpliceProvenance;
+    use crate::binary_cas::BlobPayload;
     use crate::branch::BranchContext;
     use crate::engine::Engine;
     use crate::functions::{DeterministicFunctionProvider, FunctionProvider};
-    use crate::storage_adapter::{Memory, StorageReadOptions};
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
     };
@@ -11807,18 +11901,21 @@ mod tests {
     #[test]
     fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
         let base_blob_hash = BlobId::from_content(b"abcdef");
+        let rendered_bytes: crate::Blob = b"abXYef".as_slice().into();
         let rendered = semantic_rendered_file_content(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
             base_blob_hash,
-            b"abXYef".as_slice().into(),
-            Some(ValidatedSameLengthOutputSplice {
-                offset: 2,
-                length: 2,
-            }),
-        );
+            rendered_bytes.clone(),
+            Some(ValidatedSameLengthOutputSplice::new_validated_for_test(
+                2,
+                2,
+                &rendered_bytes,
+            )),
+        )
+        .expect("proof bound to rendered bytes should be accepted");
 
         assert_eq!(rendered.base_blob_hash(), Some(base_blob_hash));
         assert_eq!(
@@ -11830,24 +11927,118 @@ mod tests {
             ))
         );
 
-        let malformed = semantic_rendered_file_content(
+        let unrelated_bytes: crate::Blob = b"abZZef".as_slice().into();
+        let error = semantic_rendered_file_content(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
             base_blob_hash,
-            b"abXYef".as_slice().into(),
-            Some(ValidatedSameLengthOutputSplice {
-                offset: 6,
-                length: 1,
-            }),
+            rendered_bytes,
+            Some(ValidatedSameLengthOutputSplice::new_validated_for_test(
+                2,
+                2,
+                &unrelated_bytes,
+            )),
+        )
+        .expect_err("plugin splice proof must not be transplanted onto other result bytes");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn transaction_local_manifest_successor_uses_canonical_writer() {
+        const FIXED_CHUNK_BYTES: usize = 1024 * 1024;
+        let storage = Memory::new();
+        let adapter = StorageAdapter::new(storage.clone());
+        let base = (0..(3 * FIXED_CHUNK_BYTES))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let base_hash = BlobId::from_content(&base);
+        let base_payload = BlobPayload::from_bytes(base.clone());
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("empty CAS read should open");
+        let mut writes = adapter.new_write_set();
+        BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut writes)
+            .stage_file_payload(&base_payload, None, false, None)
+            .await
+            .expect("fixed-manifest base should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fixed-manifest base should commit");
+        drop(read);
+
+        let mut first = base.clone();
+        let first_offset = FIXED_CHUNK_BYTES + 17;
+        first[first_offset] ^= 0xff;
+        let first_blob: crate::Blob = first.clone().into();
+        let first_provenance = RequestBlobSpliceProvenance::new_validated_for_test(
+            &base,
+            &first_blob,
+            first_offset,
+            base.len() - first_offset - 1,
+            vec![first[first_offset]],
         );
-        assert_eq!(malformed.base_blob_hash(), Some(base_blob_hash));
-        assert_eq!(
-            malformed.same_length_blob_splice(),
+        let first_content = FileContent::inline_verified_splice(first_blob, &first_provenance)
+            .expect("first successor should retain its transport proof");
+        let mut first_write = TransactionFileContent::new(
+            "file".to_string(),
             None,
-            "transaction-side bounds checks must force malformed metadata through the ordinary CAS path"
+            None,
+            "main".to_string(),
+            false,
+            false,
+            first_content,
+        )
+        .with_base_blob_hash(Some(base_hash));
+        first_write.set_splice_provenance(Some(first_provenance));
+
+        let first_hash = BlobId::from_content(&first);
+        let mut second = first.clone();
+        let second_offset = 2 * FIXED_CHUNK_BYTES + 29;
+        second[second_offset] ^= 0xff;
+        let second_blob: crate::Blob = second.clone().into();
+        let second_provenance = RequestBlobSpliceProvenance::new_validated_for_test(
+            &first,
+            &second_blob,
+            second_offset,
+            first.len() - second_offset - 1,
+            vec![second[second_offset]],
         );
+        let second_content = FileContent::inline_verified_splice(second_blob, &second_provenance)
+            .expect("second successor should retain its transport proof");
+        let mut second_write = TransactionFileContent::new(
+            "file".to_string(),
+            None,
+            None,
+            "main".to_string(),
+            false,
+            false,
+            second_content,
+        )
+        .with_base_blob_hash(Some(first_hash));
+        second_write.set_splice_provenance(Some(second_provenance));
+
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+        let mut file_content = vec![first_write, second_write];
+        transaction
+            .authenticate_file_content_manifest_reuse(&mut file_content)
+            .await
+            .expect("transaction-local successor should not be reported as corrupt durable state");
+
+        assert!(
+            file_content[0].authenticated_manifest_reuse().is_some(),
+            "the durable base should use authenticated manifest reuse"
+        );
+        assert!(
+            file_content[1].force_canonical_blob_write(),
+            "a transaction-local base has no durable manifest and must use the canonical writer"
+        );
+        assert!(file_content[1].authenticated_manifest_reuse().is_none());
     }
 
     #[test]

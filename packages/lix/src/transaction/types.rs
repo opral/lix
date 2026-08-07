@@ -8,7 +8,8 @@ use std::{
 
 use crate::LixError;
 use crate::binary_cas::{
-    BlobEditSplice, BlobId, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
+    AuthenticatedBlobManifestReuse, BlobEditSplice, BlobId, BlobPayload, BlobSameLengthSplice,
+    BlobWriteReceipt,
 };
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
@@ -1817,6 +1818,24 @@ impl FileContent {
         Self::Inline(BlobPayload::from_bytes(data))
     }
 
+    pub(crate) fn inline_verified_splice(
+        data: impl Into<crate::Blob>,
+        provenance: &RequestBlobSpliceProvenance,
+    ) -> Result<Self, LixError> {
+        Ok(Self::Inline(BlobPayload::from_verified_splice_bytes(
+            data, provenance,
+        )?))
+    }
+
+    pub(crate) fn inline_verified_plugin_splice(
+        data: impl Into<crate::Blob>,
+        splice: &crate::plugin::ValidatedSameLengthOutputSplice,
+    ) -> Result<Self, LixError> {
+        Ok(Self::Inline(
+            BlobPayload::from_verified_plugin_splice_bytes(data, splice)?,
+        ))
+    }
+
     pub(crate) fn blob_id(&self) -> Option<BlobId> {
         match self {
             Self::Inline(payload) => payload.hash(),
@@ -1887,6 +1906,8 @@ pub(crate) struct TransactionFileContent {
     /// exact accepted document. The complete output bytes remain authoritative;
     /// this only permits an internal CAS staging fast path.
     same_length_blob_splice: Option<BlobSameLengthSplice>,
+    authenticated_manifest_reuse: Option<AuthenticatedBlobManifestReuse>,
+    force_canonical_blob_write: bool,
     edit_blob_splice: Option<BlobEditSplice>,
     /// Validated transport splice that produced `payload`, when the ordinary
     /// SQL blob parameter arrived through the remote splice optimization.
@@ -1908,6 +1929,10 @@ pub(crate) struct TransactionFileContent {
     /// semantic batches after its file payload has already been materialized
     /// through the ordinary plugin path.
     stage_payload_at_commit: bool,
+    /// Original SQL ownership retained while a transport-authenticated update
+    /// defers its blob-reference identity until plugin reconciliation proves
+    /// whether the named base manifest can derive it.
+    deferred_blob_ref_origin: Option<Option<TransactionWriteOrigin>>,
     /// Certified v3 semantic owners which remain encoded through commit.
     certified_entity_batches: Vec<WasmCertifiedEntityBatch>,
 }
@@ -1932,6 +1957,8 @@ impl TransactionFileContent {
             had_blob_ref: false,
             base_blob_hash: None,
             same_length_blob_splice: None,
+            authenticated_manifest_reuse: None,
+            force_canonical_blob_write: false,
             edit_blob_splice: None,
             splice_provenance: None,
             mutation_identity: None,
@@ -1939,6 +1966,7 @@ impl TransactionFileContent {
             auxiliary_payloads: Vec::new(),
             plugin_checkpoint: None,
             stage_payload_at_commit: true,
+            deferred_blob_ref_origin: None,
             certified_entity_batches: Vec::new(),
         }
     }
@@ -1958,7 +1986,25 @@ impl TransactionFileContent {
         &mut self,
         splice_provenance: Option<RequestBlobSpliceProvenance>,
     ) {
+        self.same_length_blob_splice =
+            splice_provenance
+                .as_ref()
+                .and_then(RequestBlobSpliceProvenance::same_length_replacement)
+                .and_then(|(base_blob_hash, offset, length)| {
+                    (self.base_blob_hash == Some(base_blob_hash))
+                        .then_some(BlobSameLengthSplice::new(base_blob_hash, offset, length))
+                });
         self.splice_provenance = splice_provenance;
+    }
+
+    pub(crate) fn defer_blob_ref(&mut self, origin: Option<TransactionWriteOrigin>) {
+        self.deferred_blob_ref_origin = Some(origin);
+    }
+
+    pub(crate) fn take_deferred_blob_ref_origin(
+        &mut self,
+    ) -> Option<Option<TransactionWriteOrigin>> {
+        self.deferred_blob_ref_origin.take()
     }
 
     pub(crate) fn splice_provenance(&self) -> Option<&RequestBlobSpliceProvenance> {
@@ -2029,6 +2075,8 @@ impl TransactionFileContent {
         self.splice_provenance = None;
         self.base_blob_hash = None;
         self.same_length_blob_splice = None;
+        self.authenticated_manifest_reuse = None;
+        self.force_canonical_blob_write = false;
         self.edit_blob_splice = None;
     }
 
@@ -2098,6 +2146,35 @@ impl TransactionFileContent {
 
     pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {
         self.same_length_blob_splice
+    }
+
+    pub(crate) fn set_authenticated_manifest_reuse(
+        &mut self,
+        reuse: AuthenticatedBlobManifestReuse,
+    ) -> Result<(), LixError> {
+        let payload = self.inline_payload().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "authenticated binary CAS manifest reuse requires inline payload ownership",
+            )
+        })?;
+        payload.bind_authenticated_manifest_reuse(&reuse)?;
+        self.authenticated_manifest_reuse = Some(reuse);
+        self.force_canonical_blob_write = false;
+        Ok(())
+    }
+
+    pub(crate) fn authenticated_manifest_reuse(&self) -> Option<&AuthenticatedBlobManifestReuse> {
+        self.authenticated_manifest_reuse.as_ref()
+    }
+
+    pub(crate) fn require_canonical_blob_write(&mut self) {
+        self.authenticated_manifest_reuse = None;
+        self.force_canonical_blob_write = true;
+    }
+
+    pub(crate) fn force_canonical_blob_write(&self) -> bool {
+        self.force_canonical_blob_write
     }
 
     pub(crate) fn edit_blob_splice(&self) -> Option<BlobEditSplice> {
@@ -5867,6 +5944,42 @@ mod tests {
             write.same_length_blob_splice(),
             Some(BlobSameLengthSplice::new(base, 2, 1))
         );
+    }
+
+    #[test]
+    fn transport_splice_installs_only_for_its_exact_visible_blob_identity() {
+        let base_bytes = b"before";
+        let result: crate::Blob = b"befXre".as_slice().into();
+        let provenance = RequestBlobSpliceProvenance::new_validated_for_test(
+            base_bytes,
+            &result,
+            3,
+            2,
+            b"X".to_vec(),
+        );
+        let base = BlobId::from_content(base_bytes);
+        let content = FileContent::inline_verified_splice(result, &provenance)
+            .expect("transport proof should own its exact result bytes");
+        let mut write = TransactionFileContent::new(
+            "file".to_string(),
+            None,
+            None,
+            "main".to_string(),
+            false,
+            false,
+            content,
+        )
+        .with_base_blob_hash(Some(base));
+
+        write.set_splice_provenance(Some(provenance.clone()));
+        assert_eq!(
+            write.same_length_blob_splice(),
+            Some(BlobSameLengthSplice::new(base, 3, 1))
+        );
+
+        write.base_blob_hash = Some(BlobId::from_content(b"other!!"));
+        write.set_splice_provenance(Some(provenance));
+        assert_eq!(write.same_length_blob_splice(), None);
     }
 
     #[test]

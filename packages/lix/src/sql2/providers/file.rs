@@ -2585,9 +2585,13 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         writes
             .into_iter()
             .map(|(path, data, metadata, splice)| {
-                (None, path, FileContent::inline(data), metadata, splice)
+                let content = match &splice {
+                    Some(provenance) => FileContent::inline_verified_splice(data, provenance)?,
+                    None => FileContent::inline(data),
+                };
+                Ok((None, path, content, metadata, splice))
             })
-            .collect(),
+            .collect::<std::result::Result<Vec<_>, LixError>>()?,
         conflict,
         mutation_identity,
     )
@@ -2611,9 +2615,13 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
         writes
             .into_iter()
             .map(|(id, path, data, metadata, splice)| {
-                (id, path, FileContent::inline(data), metadata, splice)
+                let content = match &splice {
+                    Some(provenance) => FileContent::inline_verified_splice(data, provenance)?,
+                    None => FileContent::inline(data),
+                };
+                Ok((id, path, content, metadata, splice))
             })
-            .collect(),
+            .collect::<std::result::Result<Vec<_>, LixError>>()?,
         conflict,
         mutation_identity,
     )
@@ -2749,6 +2757,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         context,
                         existing.blob_hash.is_some(),
                         base_blob_hash,
+                        write.splice_provenance.clone(),
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -2783,6 +2792,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         context,
                         existing.blob_hash.is_some(),
                         base_blob_hash,
+                        write.splice_provenance.clone(),
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -3034,6 +3044,7 @@ async fn stage_indexed_file_path_writes(
                 context,
                 materialization.has_blob_ref,
                 materialization.blob_hash,
+                write.splice_provenance.clone(),
                 None,
             )
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -3265,15 +3276,20 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
             }
             .append_to(&mut staged.state_rows);
         }
+        let content = match &splice_provenance {
+            Some(provenance) => FileContent::inline_verified_splice(data.clone(), provenance)?,
+            None => FileContent::inline(data.clone()),
+        };
         stage_lix_file_content_update_write(
             &mut staged,
             existing.id,
             Some(path),
             Some(existing.name),
-            data.clone(),
+            content,
             context,
             has_blob_ref,
             base_blob_hash,
+            splice_provenance.clone(),
             None,
         )
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -3649,6 +3665,7 @@ fn lix_file_existing_update_stage_from_batch(
                 has_blob_ref,
                 None,
                 None,
+                None,
             )?;
         }
 
@@ -3881,6 +3898,7 @@ fn lix_file_path_update_stage_from_batch(
                 has_blob_ref,
                 None,
                 None,
+                None,
             )?;
         } else if plugin_rewrite_file_ids.contains(&id) {
             let data = required_binary_value(batch, row_index, "content")?;
@@ -3894,6 +3912,7 @@ fn lix_file_path_update_stage_from_batch(
                 data,
                 context,
                 has_blob_ref,
+                None,
                 None,
                 None,
             )?;
@@ -4185,9 +4204,11 @@ fn stage_lix_file_content_update_write(
     context: FilesystemRowContext,
     has_blob_ref: bool,
     base_blob_hash: Option<BlobId>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
-    let file_payload = TransactionFileContent::new(
+    let defer_blob_ref = base_blob_hash.is_some() && splice_provenance.is_some();
+    let mut file_payload = TransactionFileContent::new(
         file_id.clone(),
         path,
         filename,
@@ -4198,6 +4219,7 @@ fn stage_lix_file_content_update_write(
     )
     .with_had_blob_ref(has_blob_ref)
     .with_base_blob_hash(base_blob_hash);
+    file_payload.set_splice_provenance(splice_provenance);
     if file_payload.is_empty() {
         if has_blob_ref {
             let row_index = staged.state_rows.len();
@@ -4207,7 +4229,11 @@ fn stage_lix_file_content_update_write(
         staged.file_content_writes.push(file_payload);
         return Ok(());
     }
-    stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin.clone())?;
+    if defer_blob_ref {
+        file_payload.defer_blob_ref(origin);
+    } else {
+        stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin)?;
+    }
     staged.file_content_writes.push(file_payload);
     Ok(())
 }

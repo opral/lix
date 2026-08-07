@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{
-    BlobBytesBatch, BlobChunkReceipt, BlobEditSplice, BlobId, BlobPayload, BlobRangeBytes,
-    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt,
+    AuthenticatedBlobManifestReuse, BlobBytesBatch, BlobChunkReceipt, BlobEditSplice, BlobId,
+    BlobPayload, BlobRangeBytes, BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt,
+    ManifestReuseAuthentication,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use std::collections::HashSet;
@@ -114,6 +115,24 @@ impl BinaryCasContext {
     {
         ExistingChunkAwareBinaryCasWriter::new(store, writes, self.chunking)
     }
+
+    #[expect(clippy::unused_self)]
+    pub(crate) async fn authenticate_same_length_manifest_reuse<S>(
+        &self,
+        store: &S,
+        payload: &BlobPayload,
+        splice: BlobSameLengthSplice,
+    ) -> Result<ManifestReuseAuthentication, LixError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        crate::binary_cas::kv::authenticate_same_length_manifest_reuse(
+            store,
+            payload.bytes(),
+            splice,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -217,35 +236,34 @@ where
         crate::binary_cas::kv::stage_fixed_manifest(self.writes, chunks)
     }
 
-    /// Stages a normal file payload, opportunistically retaining unchanged
-    /// manifest chunks for one host-verified same-length splice. Any
-    /// ineligible or unavailable base falls through to the canonical full
-    /// rechunking path.
+    /// Stages a normal file payload from either an already-authenticated
+    /// successor manifest or the canonical full/delta writer.
     pub(crate) async fn stage_file_payload(
         &mut self,
         payload: &BlobPayload,
-        same_length_splice: Option<BlobSameLengthSplice>,
+        authenticated_reuse: Option<&AuthenticatedBlobManifestReuse>,
+        force_canonical_full_write: bool,
         edit_splice: Option<BlobEditSplice>,
     ) -> Result<(), LixError> {
+        if let Some(reuse) = authenticated_reuse {
+            crate::binary_cas::kv::stage_authenticated_manifest_reuse(
+                self.writes,
+                &mut self.blob_hashes,
+                &mut self.chunk_keys,
+                payload.bytes(),
+                reuse,
+            )?;
+            return Ok(());
+        }
+        if force_canonical_full_write {
+            self.stage_payload(payload).await?;
+            return Ok(());
+        }
         if let Some(splice) = edit_splice
             && crate::binary_cas::kv::try_stage_blob_write_as_flat_delta(
                 self.store,
                 self.writes,
                 &mut self.blob_hashes,
-                payload.bytes(),
-                payload.hash(),
-                splice,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        if let Some(splice) = same_length_splice
-            && crate::binary_cas::kv::try_stage_blob_write_reusing_same_length_splice(
-                self.store,
-                self.writes,
-                &mut self.blob_hashes,
-                &mut self.chunk_keys,
                 payload.bytes(),
                 payload.hash(),
                 splice,

@@ -18,7 +18,8 @@ pub(crate) use codec::{
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use kv::load_bytes_many;
 pub(crate) use types::{
-    BlobBytesBatch, BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
-    BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobPayload, BlobRangeBytes,
-    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
+    AuthenticatedBlobManifestChunk, AuthenticatedBlobManifestReuse, BlobBytesBatch,
+    BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice, BlobId, BlobLayout,
+    BlobMetadata, BlobMetadataBatch, BlobPayload, BlobRangeBytes, BlobRangeBytesBatch,
+    BlobSameLengthSplice, BlobWriteReceipt, ChunkHash, ManifestReuseAuthentication,
 };

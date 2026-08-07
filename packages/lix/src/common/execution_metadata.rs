@@ -2,7 +2,7 @@
 
 use sha2::{Digest as _, Sha256};
 
-use crate::{Blob, LixError};
+use crate::{Blob, LixError, binary_cas::BlobId};
 
 /// An immutable request blob whose complete SHA-256 proof has been established.
 ///
@@ -14,13 +14,22 @@ use crate::{Blob, LixError};
 pub struct VerifiedRequestBlob {
     blob: Blob,
     sha256: String,
+    /// Canonical identity established while accepting one complete request
+    /// blob. Reconstructed successors deliberately leave this absent: the
+    /// transaction's authenticated storage manifest derives their identity.
+    canonical_blob_id: Option<BlobId>,
 }
 
 impl VerifiedRequestBlob {
     /// Establishes the full-content proof for an inbound blob once.
     pub fn verify(blob: Blob) -> Self {
         let sha256 = sha256_lower_hex(&blob);
-        Self { blob, sha256 }
+        let canonical_blob_id = Some(BlobId::from_content(&blob));
+        Self {
+            blob,
+            sha256,
+            canonical_blob_id,
+        }
     }
 
     /// Returns the immutable bytes protected by this proof.
@@ -72,9 +81,12 @@ impl VerifiedRequestBlob {
         let result = Self {
             blob: reconstructed.into(),
             sha256: actual_result_sha256,
+            canonical_blob_id: None,
         };
         let provenance = RequestBlobSpliceProvenance {
             base_sha256: self.sha256.clone(),
+            base_blob_id: self.canonical_blob_id,
+            base_len: self.blob.len(),
             result_sha256: result.sha256.clone(),
             prefix_bytes,
             suffix_bytes,
@@ -97,6 +109,10 @@ impl VerifiedRequestBlob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestBlobSpliceProvenance {
     base_sha256: String,
+    /// Canonical CAS identity computed from the exact bytes authenticated by
+    /// `base_sha256`. Callers cannot supply this identity independently.
+    base_blob_id: Option<BlobId>,
+    base_len: usize,
     result_sha256: String,
     prefix_bytes: usize,
     suffix_bytes: usize,
@@ -153,6 +169,12 @@ impl RequestBlobSpliceProvenance {
         }
         Ok(Self {
             base_sha256: actual_base_sha256,
+            // This explicit full-base validator is used when accepting bytes
+            // without an existing VerifiedRequestBlob. The production splice
+            // cache pays the same canonical identity pass once in `verify`,
+            // never in splice reconstruction or publication.
+            base_blob_id: Some(BlobId::from_content(base)),
+            base_len: base.len(),
             result_sha256: actual_result_sha256,
             prefix_bytes,
             suffix_bytes,
@@ -184,6 +206,22 @@ impl RequestBlobSpliceProvenance {
     pub(crate) fn matches_result(&self, result: &[u8]) -> bool {
         self.validated_result.len() == result.len()
             && self.validated_result.as_ptr() == result.as_ptr()
+    }
+
+    /// Returns the fixed-width replacement proven against the exact accepted
+    /// base bytes, including that base's internally derived canonical CAS ID.
+    pub(crate) fn same_length_replacement(&self) -> Option<(BlobId, usize, usize)> {
+        let replaced = self
+            .base_len
+            .checked_sub(self.prefix_bytes.checked_add(self.suffix_bytes)?)?;
+        if self.base_len == self.validated_result.len()
+            && replaced != 0
+            && replaced == self.insert.len()
+        {
+            Some((self.base_blob_id?, self.prefix_bytes, replaced))
+        } else {
+            None
+        }
     }
 
     #[cfg(test)]

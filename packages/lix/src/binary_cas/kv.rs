@@ -1,7 +1,9 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::{MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking};
+use crate::binary_cas::chunking::{
+    MAX_BINARY_CAS_CHUNK_BYTES, MEDIA_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking,
+};
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, StorageBinaryCasDeltaBaseLayout,
     StorageBinaryCasDeltaSegment, decode_binary_cas_chunk, decode_binary_cas_manifest,
@@ -9,9 +11,10 @@ use crate::binary_cas::codec::{
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BinaryCasChunking, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
-    BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
-    BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
+    AuthenticatedBlobManifestChunk, AuthenticatedBlobManifestReuse, BinaryCasChunking,
+    BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice, BlobId, BlobLayout,
+    BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch, BlobSameLengthSplice,
+    BlobWriteReceipt, ChunkHash, ManifestReuseAuthentication,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -284,7 +287,7 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_media_upload_chunk_payload_hash_bytes(bytes.len());
     let receipts = bytes
-        .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
+        .chunks(MEDIA_CHUNK_BYTES)
         .map(|chunk| crate::binary_cas::BlobChunkReceipt {
             hash: ChunkHash::from_content(chunk),
             size_bytes: chunk.len() as u64,
@@ -304,10 +307,7 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
         .zip(existing)
         .filter_map(|((hash, _), exists)| (!exists).then_some(hash))
         .collect::<HashSet<_>>();
-    for (chunk, receipt) in bytes
-        .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
-        .zip(&receipts)
-    {
+    for (chunk, receipt) in bytes.chunks(MEDIA_CHUNK_BYTES).zip(&receipts) {
         if missing.remove(&receipt.hash) {
             stage_content_chunk(writes, receipt.hash, chunk)?;
         }
@@ -329,9 +329,8 @@ pub(in crate::binary_cas) fn stage_fixed_manifest(
     for (index, chunk) in chunks.iter().enumerate() {
         let is_last = index + 1 == chunks.len();
         if chunk.size_bytes == 0
-            || chunk.size_bytes > crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64
-            || (!is_last
-                && chunk.size_bytes != crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64)
+            || chunk.size_bytes > MEDIA_CHUNK_BYTES as u64
+            || (!is_last && chunk.size_bytes != MEDIA_CHUNK_BYTES as u64)
         {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -464,6 +463,35 @@ async fn scan_all_values_for_plan(
         }
     }
     Ok(values)
+}
+
+async fn scan_all_entries_for_plan(
+    store: &(impl StorageAdapterRead + ?Sized),
+    plan: &ScanPlan,
+) -> Result<Vec<(StorageKey, Vec<u8>)>, LixError> {
+    let mut entries = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        entries.extend(
+            page.value.entries.into_iter().filter_map(|entry| {
+                full_value(entry.value).map(|value| (entry.key, value.to_vec()))
+            }),
+        );
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(entries)
 }
 
 pub(crate) async fn load_metadata_many(
@@ -798,7 +826,7 @@ async fn load_blob_range(
             decoded[start..end].to_vec()
         }
         BlobLayout::Chunked { chunk_count } => {
-            let fixed_chunk_bytes = crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64;
+            let fixed_chunk_bytes = MEDIA_CHUNK_BYTES as u64;
             let first_chunk_index = range.start / fixed_chunk_bytes;
             let end_chunk_index = range
                 .end
@@ -1315,122 +1343,395 @@ where
     Ok(receipt)
 }
 
-/// Attempts to stage a full replacement by retaining the base manifest's
-/// unchanged chunk references around one host-verified fixed-width splice.
+/// Authenticates a named fixed-chunk base and derives a successor publication
+/// by hashing only chunks which overlap one already-verified same-length edit.
 ///
-/// This is deliberately opportunistic. The caller still owns complete
-/// replacement bytes and falls back to [`stage_blob_write_skipping_existing_chunks`]
-/// for every missing, malformed, non-chunked, length-changing, or otherwise
-/// ineligible base. A manifest is an ordered content-addressed chunk list;
-/// readers do not require its boundaries to have been freshly produced by
-/// FastCDC, so keeping valid existing boundaries is format-compatible.
-pub(in crate::binary_cas) async fn try_stage_blob_write_reusing_same_length_splice<S>(
+/// Once the named base is opened, every missing or malformed authority is an
+/// error. A caller may use the canonical full-write path only when the edit or
+/// a valid non-chunked base is ineligible for manifest reuse.
+pub(in crate::binary_cas) async fn authenticate_same_length_manifest_reuse<S>(
     store: &S,
+    bytes: &[u8],
+    splice: BlobSameLengthSplice,
+) -> Result<ManifestReuseAuthentication, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let Some(splice_end) = splice.end() else {
+        return Ok(ManifestReuseAuthentication::Ineligible);
+    };
+    if splice.length == 0 || splice_end > bytes.len() {
+        return Ok(ManifestReuseAuthentication::Ineligible);
+    }
+
+    let metadata = load_metadata_many(store, &[splice.base_blob_hash])
+        .await?
+        .into_vec()
+        .pop()
+        .flatten()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice base '{}' is missing",
+                    splice.base_blob_hash.to_hex()
+                ),
+            )
+        })?;
+    if metadata.size_bytes != bytes.len() as u64 {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' has size {}, expected {}",
+                splice.base_blob_hash.to_hex(),
+                metadata.size_bytes,
+                bytes.len()
+            ),
+        ));
+    }
+    let chunk_count = match &metadata.layout {
+        BlobLayout::Chunked { chunk_count } => *chunk_count,
+        BlobLayout::Empty | BlobLayout::SingleChunk { .. } | BlobLayout::Delta { .. } => {
+            authenticate_historical_named_blob(store, &metadata).await?;
+            return Ok(ManifestReuseAuthentication::CanonicalFullWrite);
+        }
+    };
+    if chunk_count == 0 {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' has an empty chunked manifest",
+                splice.base_blob_hash.to_hex()
+            ),
+        ));
+    }
+    let expected_chunk_count = bytes.len().div_ceil(MEDIA_CHUNK_BYTES);
+
+    let range = StorageKeyRange {
+        lower: Bound::Included(StorageKey(Bytes::from(manifest_chunk_key(
+            splice.base_blob_hash,
+            0,
+        )))),
+        upper: Bound::Excluded(StorageKey(Bytes::from(manifest_chunk_key(
+            splice.base_blob_hash,
+            u64::from(chunk_count),
+        )))),
+    };
+    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
+    let rows = scan_all_entries_for_plan(store, &plan).await?;
+    if rows.len() != chunk_count as usize {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' expected {} manifest chunks, found {}",
+                splice.base_blob_hash.to_hex(),
+                chunk_count,
+                rows.len()
+            ),
+        ));
+    }
+
+    let mut base_identity_chunks = Vec::with_capacity(rows.len());
+    let mut cumulative_size = 0u64;
+    let mut canonical_fixed_layout =
+        chunk_count >= 2 && chunk_count as usize == expected_chunk_count;
+    for (chunk_index, (row_key, row_value)) in rows.into_iter().enumerate() {
+        let expected_key = manifest_chunk_key(splice.base_blob_hash, chunk_index as u64);
+        if row_key.0.as_ref() != expected_key.as_slice() {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice base '{}' has a malformed manifest ordinal at {}",
+                    splice.base_blob_hash.to_hex(),
+                    chunk_index
+                ),
+            ));
+        }
+        let (chunk_hash, chunk_size) = decode_binary_cas_manifest_chunk(&row_value)?;
+        if chunk_size == 0 || chunk_size > MAX_BINARY_CAS_CHUNK_BYTES as u64 {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice base '{}' chunk {} has invalid size {}",
+                    splice.base_blob_hash.to_hex(),
+                    chunk_index,
+                    chunk_size
+                ),
+            ));
+        }
+        cumulative_size = cumulative_size.checked_add(chunk_size).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                "authenticated binary CAS manifest cumulative size overflowed",
+            )
+        })?;
+        if cumulative_size > metadata.size_bytes {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice base '{}' manifest exceeds its declared size",
+                    splice.base_blob_hash.to_hex()
+                ),
+            ));
+        }
+        let is_last = chunk_index + 1 == chunk_count as usize;
+        let expected_size = if is_last {
+            metadata
+                .size_bytes
+                .checked_sub(
+                    u64::try_from(chunk_index)
+                        .expect("manifest chunk index fits u64")
+                        .saturating_mul(MEDIA_CHUNK_BYTES as u64),
+                )
+                .unwrap_or(0)
+        } else {
+            MEDIA_CHUNK_BYTES as u64
+        };
+        canonical_fixed_layout &= chunk_size == expected_size;
+        let base_hash = ChunkHash::from_bytes(chunk_hash);
+        base_identity_chunks.push((base_hash, chunk_size));
+    }
+    if cumulative_size != metadata.size_bytes {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' manifest covers {} bytes, expected {}",
+                splice.base_blob_hash.to_hex(),
+                cumulative_size,
+                metadata.size_bytes
+            ),
+        ));
+    }
+    // Older physical layouts may use noncanonical chunk boundaries under the
+    // same canonical content identity. They cannot prove fixed-chunk reuse
+    // from rows alone, so authenticate their complete payload once before
+    // selecting the canonical full writer. A corrupt named layout must never
+    // become an eligibility fallback.
+    if !canonical_fixed_layout {
+        authenticate_noncanonical_manifest_payload(
+            store,
+            splice.base_blob_hash,
+            metadata.size_bytes,
+            &base_identity_chunks,
+        )
+        .await?;
+        return Ok(ManifestReuseAuthentication::CanonicalFullWrite);
+    }
+    if BlobId::from_chunks(metadata.size_bytes, base_identity_chunks.iter().copied())
+        != splice.base_blob_hash
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' failed manifest-root verification",
+                splice.base_blob_hash.to_hex()
+            ),
+        ));
+    }
+    require_named_chunk_availability(store, splice.base_blob_hash, &base_identity_chunks).await?;
+    let mut chunks = Vec::with_capacity(chunk_count as usize);
+    for chunk_index in 0..chunk_count as usize {
+        let start = chunk_index * MEDIA_CHUNK_BYTES;
+        let end = start.saturating_add(MEDIA_CHUNK_BYTES).min(bytes.len());
+        let changed = start < splice_end && splice.offset < end;
+        // The canonical manifest was authenticated above; indexing is the
+        // same complete ordered list used for its root.
+        let base_hash = base_identity_chunks[chunk_index].0;
+        chunks.push(AuthenticatedBlobManifestChunk {
+            start,
+            end,
+            hash: if changed {
+                ChunkHash::from_content(&bytes[start..end])
+            } else {
+                base_hash
+            },
+            changed,
+        });
+    }
+    if !chunks.iter().any(|chunk| chunk.changed) {
+        return Ok(ManifestReuseAuthentication::Ineligible);
+    }
+    let blob_hash = BlobId::from_chunks(
+        metadata.size_bytes,
+        chunks
+            .iter()
+            .map(|chunk| (chunk.hash, (chunk.end - chunk.start) as u64)),
+    );
+    Ok(ManifestReuseAuthentication::Reuse(
+        AuthenticatedBlobManifestReuse {
+            receipt: BlobWriteReceipt {
+                hash: blob_hash,
+                size_bytes: metadata.size_bytes,
+                layout: BlobLayout::Chunked { chunk_count },
+            },
+            chunks,
+        },
+    ))
+}
+
+/// Proves that every immutable payload named by an authenticated manifest is
+/// still serving before publishing a successor which retains those names.
+/// Presence markers are staged and retired atomically with payload rows; they
+/// are an availability precondition, never a content-identity authority.
+async fn require_named_chunk_availability(
+    store: &(impl StorageAdapterRead + ?Sized),
+    blob_hash: BlobId,
+    chunks: &[(ChunkHash, u64)],
+) -> Result<(), LixError> {
+    let mut seen = HashSet::with_capacity(chunks.len());
+    let keys = chunks
+        .iter()
+        .filter_map(|(hash, _)| {
+            seen.insert(*hash)
+                .then(|| StorageKey(Bytes::from(chunk_key(*hash))))
+        })
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_PRESENCE_SPACE, keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    if result.value.iter().any(
+        |value| !matches!(value, Some(StorageProjectedValue::FullValue(bytes)) if bytes.is_empty()),
+    ) {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' is missing a named chunk availability marker",
+                blob_hash.to_hex()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Opens a historical non-fixed layout completely before it can select the
+/// canonical full writer. The visible blob ID remains the authority: valid
+/// legacy layouts may be rewritten, while missing or corrupt named content
+/// fails instead of silently downgrading to an ordinary fallback.
+async fn authenticate_historical_named_blob(
+    store: &(impl StorageAdapterRead + ?Sized),
+    metadata: &BlobMetadata,
+) -> Result<(), LixError> {
+    let mut hashes = vec![metadata.hash];
+    if let BlobLayout::Delta { base_blob_hash, .. } = &metadata.layout {
+        hashes.push(*base_blob_hash);
+    }
+    let entries = load_bytes_many(store, &hashes).await?.into_vec();
+    for (hash, entry) in hashes.into_iter().zip(entries) {
+        let bytes = entry.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice authority '{}' is missing",
+                    hash.to_hex()
+                ),
+            )
+        })?;
+        if BlobId::from_content(&bytes) != hash {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice authority '{}' failed content-address verification",
+                    hash.to_hex()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn authenticate_noncanonical_manifest_payload(
+    store: &(impl StorageAdapterRead + ?Sized),
+    blob_hash: BlobId,
+    size_bytes: u64,
+    chunks: &[(ChunkHash, u64)],
+) -> Result<(), LixError> {
+    let hashes = chunks.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+    let rows = load_chunk_rows(store, &hashes).await?;
+    if rows.len() != chunks.len() {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' returned {} payload rows for {} manifest chunks",
+                blob_hash.to_hex(),
+                rows.len(),
+                chunks.len()
+            ),
+        ));
+    }
+    let expected_size = persisted_size_to_usize(size_bytes, "binary CAS blob")?;
+    let mut bytes = Vec::with_capacity(expected_size);
+    for ((chunk_hash, chunk_size), row) in chunks.iter().copied().zip(rows) {
+        let row = row.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!(
+                    "authenticated binary CAS splice base '{}' is missing chunk '{}'",
+                    blob_hash.to_hex(),
+                    chunk_hash.to_hex()
+                ),
+            )
+        })?;
+        let decoded = decode_and_verify_chunk(
+            &row,
+            persisted_size_to_usize(chunk_size, "binary CAS chunk")?,
+            blob_hash,
+            chunk_hash,
+        )?;
+        bytes.extend_from_slice(&decoded);
+    }
+    if bytes.len() != expected_size || BlobId::from_content(&bytes) != blob_hash {
+        return Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!(
+                "authenticated binary CAS splice base '{}' noncanonical layout failed content-address verification",
+                blob_hash.to_hex()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(in crate::binary_cas) fn stage_authenticated_manifest_reuse(
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
-    precomputed_hash: Option<BlobId>,
-    splice: BlobSameLengthSplice,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let Some(blob_hash) = precomputed_hash else {
-        return Ok(false);
+    reuse: &AuthenticatedBlobManifestReuse,
+) -> Result<(), LixError> {
+    if reuse.receipt.size_bytes != bytes.len() as u64
+        || reuse.chunks.is_empty()
+        || reuse.chunks.last().map(|chunk| chunk.end) != Some(bytes.len())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "authenticated binary CAS successor plan no longer matches its payload owner",
+        ));
+    }
+    if !blob_hashes.insert(reuse.receipt.hash.into_bytes()) {
+        return Ok(());
+    }
+    let BlobLayout::Chunked { chunk_count } = reuse.receipt.layout else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "authenticated binary CAS successor plan is not chunked",
+        ));
     };
-    let Some(splice_end) = splice.end() else {
-        return Ok(false);
-    };
-    if splice.length == 0 || splice_end > bytes.len() {
-        return Ok(false);
-    }
-    if blob_hashes.contains(&blob_hash.into_bytes()) {
-        return Ok(true);
-    }
-
-    let metadata = match load_metadata_many(&store, &[splice.base_blob_hash]).await {
-        Ok(metadata) => metadata.into_vec().pop().flatten(),
-        Err(_) => return Ok(false),
-    };
-    let Some(metadata) = metadata else {
-        return Ok(false);
-    };
-    let BlobLayout::Chunked { chunk_count } = &metadata.layout else {
-        return Ok(false);
-    };
-    let chunk_count = *chunk_count;
-    if metadata.size_bytes != bytes.len() as u64 {
-        return Ok(false);
-    }
-
-    let Ok(base_chunks) =
-        load_declared_manifest_chunks(&store, splice.base_blob_hash, chunk_count).await
-    else {
-        return Ok(false);
-    };
-    if base_chunks.len() != chunk_count as usize {
-        return Ok(false);
-    }
-
-    let mut cursor = 0usize;
-    let mut chunks = Vec::with_capacity(base_chunks.len());
-    let mut changed_chunks = Vec::new();
-    for base_chunk in base_chunks {
-        let Ok(chunk_len) = usize::try_from(base_chunk.chunk_size) else {
-            return Ok(false);
-        };
-        if chunk_len == 0 || chunk_len > MAX_BINARY_CAS_CHUNK_BYTES {
-            return Ok(false);
-        }
-        let Some(end) = cursor.checked_add(chunk_len) else {
-            return Ok(false);
-        };
-        if end > bytes.len() {
-            return Ok(false);
-        }
-        let changed = cursor < splice_end && splice.offset < end;
-        let chunk = PreparedChunk {
-            start: cursor,
-            end,
-            hash: if changed {
-                ChunkHash::from_content(&bytes[cursor..end])
-            } else {
-                ChunkHash::from_bytes(base_chunk.chunk_hash)
-            },
-        };
-        if changed {
-            changed_chunks.push(chunk);
-        }
-        chunks.push((chunk, changed));
-        cursor = end;
-    }
-    if cursor != bytes.len() || changed_chunks.is_empty() {
-        return Ok(false);
-    }
-
-    let mut chunk_hashes_to_stage =
-        missing_chunk_hashes_for_chunks(store, chunk_keys, &changed_chunks).await?;
-    if !blob_hashes.insert(blob_hash.into_bytes()) {
-        return Ok(true);
-    }
-
     stage_manifest(
         writes,
-        blob_hash,
+        reuse.receipt.hash,
         &BinaryCasManifest::Chunked {
-            size_bytes: bytes.len() as u64,
+            size_bytes: reuse.receipt.size_bytes,
             chunk_count,
         },
     );
-    for (chunk_index, (chunk, changed)) in chunks.into_iter().enumerate() {
+    for (chunk_index, chunk) in reuse.chunks.iter().copied().enumerate() {
         let chunk_data = &bytes[chunk.start..chunk.end];
-        if changed && chunk_hashes_to_stage.remove(&chunk.hash) {
+        if chunk.changed && chunk_keys.insert(chunk_key(chunk.hash)) {
             stage_content_chunk(writes, chunk.hash, chunk_data)?;
         }
         stage_manifest_chunk(
             writes,
-            blob_hash,
+            reuse.receipt.hash,
             chunk_index as u64,
             &KvBlobManifestChunk {
                 chunk_hash: *chunk.hash.as_bytes(),
@@ -1438,7 +1739,7 @@ where
             },
         );
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Stores a bounded, one-level edit delta against a canonical full blob.
@@ -1821,30 +2122,6 @@ async fn missing_chunk_hashes(
         return Ok(HashSet::new());
     }
 
-    let keys = candidates
-        .iter()
-        .map(|(_, key)| key.clone())
-        .collect::<Vec<_>>();
-    let existing = chunk_keys_exist(store, keys).await?;
-    Ok(candidates
-        .into_iter()
-        .zip(existing)
-        .filter_map(|((chunk_hash, _), exists)| (!exists).then_some(chunk_hash))
-        .collect())
-}
-
-async fn missing_chunk_hashes_for_chunks(
-    store: &(impl StorageAdapterRead + ?Sized),
-    transaction_chunk_keys: &mut HashSet<Vec<u8>>,
-    chunks: &[PreparedChunk],
-) -> Result<HashSet<ChunkHash>, LixError> {
-    let mut candidates = Vec::<(ChunkHash, StorageKey)>::new();
-    for chunk in chunks {
-        collect_chunk_lookup_candidate(chunk.hash, transaction_chunk_keys, &mut candidates);
-    }
-    if candidates.is_empty() {
-        return Ok(HashSet::new());
-    }
     let keys = candidates
         .iter()
         .map(|(_, key)| key.clone())
@@ -2304,9 +2581,27 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("test blob read should open");
-        BinaryCasContext::new()
+        let binary_cas = BinaryCasContext::new();
+        let authentication = match same_length_splice {
+            Some(splice) => binary_cas
+                .authenticate_same_length_manifest_reuse(&store, payload, splice)
+                .await
+                .expect("test manifest reuse should authenticate"),
+            None => ManifestReuseAuthentication::Ineligible,
+        };
+        let (reuse, force_canonical_full_write) = match &authentication {
+            ManifestReuseAuthentication::Ineligible => (None, false),
+            ManifestReuseAuthentication::CanonicalFullWrite => (None, true),
+            ManifestReuseAuthentication::Reuse(reuse) => (Some(reuse), false),
+        };
+        if let Some(reuse) = reuse {
+            payload
+                .bind_authenticated_manifest_reuse(reuse)
+                .expect("test successor identity should bind to payload");
+        }
+        binary_cas
             .writer_skipping_existing_chunks(&store, writes)
-            .stage_file_payload(payload, same_length_splice, None)
+            .stage_file_payload(payload, reuse, force_canonical_full_write, None)
             .await
             .expect("test file payload should stage");
     }
@@ -3020,6 +3315,473 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_manifest_reuse_uses_one_manifest_point_and_one_ordinal_scan() {
+        let storage = StorageAdapter::new(Memory::new());
+        let before = definitely_multi_chunk_blob_bytes();
+        let base_blob_hash = BlobId::from_content(&before);
+        let mut writes = storage.new_write_set();
+        stage_test_bytes(&storage, &mut writes, &before).await;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("base blob should commit");
+
+        let edit_offset = MEDIA_CHUNK_BYTES * 2 + 17;
+        let mut after = before.clone();
+        after[edit_offset] ^= 0xff;
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("base read should open");
+        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
+        let ManifestReuseAuthentication::Reuse(reuse) = authenticate_same_length_manifest_reuse(
+            &counted,
+            &after,
+            BlobSameLengthSplice::new(base_blob_hash, edit_offset, 1),
+        )
+        .await
+        .expect("fixed manifest should authenticate") else {
+            panic!("fixed manifest should be eligible");
+        };
+
+        assert_eq!(reuse.receipt.hash, BlobId::from_content(&after));
+        assert_eq!(reuse.chunks.iter().filter(|chunk| chunk.changed).count(), 1);
+        assert_eq!(counted.manifest_get_many_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.manifest_scan_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.chunk_get_many_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counted.presence_get_many_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_manifest_reuse_fails_closed_on_named_base_corruption() {
+        #[derive(Clone, Copy, Debug)]
+        enum Corruption {
+            MissingManifest,
+            MalformedManifest,
+            WrongManifestSize,
+            ZeroChunkCount,
+            MissingOrdinal,
+            MalformedOrdinal,
+            WrongChunkSize,
+            ReorderedRows,
+            RootMismatch,
+            MissingPayload,
+        }
+
+        for corruption in [
+            Corruption::MissingManifest,
+            Corruption::MalformedManifest,
+            Corruption::WrongManifestSize,
+            Corruption::ZeroChunkCount,
+            Corruption::MissingOrdinal,
+            Corruption::MalformedOrdinal,
+            Corruption::WrongChunkSize,
+            Corruption::ReorderedRows,
+            Corruption::RootMismatch,
+            Corruption::MissingPayload,
+        ] {
+            let storage = StorageAdapter::new(Memory::new());
+            let before = definitely_multi_chunk_blob_bytes();
+            let base_blob_hash = BlobId::from_content(&before);
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &before).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("base blob should commit");
+            let base_chunks = {
+                let store = storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("base manifest read should open");
+                scan_manifest_chunks(&store, base_blob_hash)
+                    .await
+                    .expect("base manifest should scan")
+            };
+
+            let mut corruption_writes = storage.new_write_set();
+            match corruption {
+                Corruption::MissingManifest => corruption_writes
+                    .delete(BINARY_CAS_MANIFEST_SPACE, manifest_key(base_blob_hash)),
+                Corruption::MalformedManifest => corruption_writes.put(
+                    BINARY_CAS_MANIFEST_SPACE,
+                    key(manifest_key(base_blob_hash)),
+                    value(vec![0xff]),
+                ),
+                Corruption::WrongManifestSize => stage_manifest(
+                    &mut corruption_writes,
+                    base_blob_hash,
+                    &BinaryCasManifest::Chunked {
+                        size_bytes: before.len() as u64 + 1,
+                        chunk_count: base_chunks.len() as u32,
+                    },
+                ),
+                Corruption::ZeroChunkCount => stage_manifest(
+                    &mut corruption_writes,
+                    base_blob_hash,
+                    &BinaryCasManifest::Chunked {
+                        size_bytes: before.len() as u64,
+                        chunk_count: 0,
+                    },
+                ),
+                Corruption::MissingOrdinal => corruption_writes.delete(
+                    BINARY_CAS_MANIFEST_CHUNK_SPACE,
+                    manifest_chunk_key(base_blob_hash, 1),
+                ),
+                Corruption::MalformedOrdinal => corruption_writes.put(
+                    BINARY_CAS_MANIFEST_CHUNK_SPACE,
+                    key(manifest_chunk_key(base_blob_hash, 1)),
+                    value(vec![0xff]),
+                ),
+                Corruption::WrongChunkSize => stage_manifest_chunk(
+                    &mut corruption_writes,
+                    base_blob_hash,
+                    1,
+                    &KvBlobManifestChunk {
+                        chunk_hash: base_chunks[1].chunk_hash,
+                        chunk_size: base_chunks[1].chunk_size - 1,
+                    },
+                ),
+                Corruption::ReorderedRows => {
+                    stage_manifest_chunk(
+                        &mut corruption_writes,
+                        base_blob_hash,
+                        0,
+                        &base_chunks[1],
+                    );
+                    stage_manifest_chunk(
+                        &mut corruption_writes,
+                        base_blob_hash,
+                        1,
+                        &base_chunks[0],
+                    );
+                }
+                Corruption::RootMismatch => {
+                    let mut changed = base_chunks[0].clone();
+                    changed.chunk_hash[0] ^= 0xff;
+                    stage_manifest_chunk(&mut corruption_writes, base_blob_hash, 0, &changed);
+                }
+                Corruption::MissingPayload => corruption_writes.delete(
+                    BINARY_CAS_CHUNK_SPACE,
+                    chunk_key(ChunkHash::from_bytes(base_chunks[0].chunk_hash)),
+                ),
+            }
+            if matches!(corruption, Corruption::MissingPayload) {
+                corruption_writes.delete(
+                    BINARY_CAS_CHUNK_PRESENCE_SPACE,
+                    chunk_key(ChunkHash::from_bytes(base_chunks[0].chunk_hash)),
+                );
+            }
+            storage
+                .commit_write_set(corruption_writes, StorageWriteOptions::default())
+                .await
+                .expect("corruption fixture should commit");
+
+            let edit_offset = MEDIA_CHUNK_BYTES + 7;
+            let mut after = before;
+            after[edit_offset] ^= 0xff;
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("corrupt base read should open");
+            let error = authenticate_same_length_manifest_reuse(
+                &store,
+                &after,
+                BlobSameLengthSplice::new(base_blob_hash, edit_offset, 1),
+            )
+            .await
+            .expect_err("named corrupt base must fail closed");
+            assert!(
+                !error.message.is_empty(),
+                "{corruption:?} should report a concrete corruption error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_manifest_reuse_authenticates_single_chunk_before_full_fallback() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            Valid,
+            ManifestRootMismatch,
+            PayloadMismatch,
+        }
+
+        for case in [
+            Case::Valid,
+            Case::ManifestRootMismatch,
+            Case::PayloadMismatch,
+        ] {
+            let storage = StorageAdapter::new(Memory::new());
+            let before = b"single-chunk authenticated base".repeat(128);
+            let base_blob_hash = BlobId::from_content(&before);
+            let base_chunk_hash = ChunkHash::from_content(&before);
+            let mut writes = storage.new_write_set();
+            match case {
+                Case::Valid => {
+                    stage_test_bytes(&storage, &mut writes, &before).await;
+                }
+                Case::ManifestRootMismatch => {
+                    let substitute = b"different authenticated content".repeat(128);
+                    assert_eq!(substitute.len(), before.len());
+                    let substitute_hash = ChunkHash::from_content(&substitute);
+                    stage_manifest(
+                        &mut writes,
+                        base_blob_hash,
+                        &BinaryCasManifest::SingleChunk {
+                            size_bytes: before.len() as u64,
+                            chunk_hash: substitute_hash.into_bytes(),
+                        },
+                    );
+                    stage_content_chunk(&mut writes, substitute_hash, &substitute)
+                        .expect("substitute chunk should stage");
+                }
+                Case::PayloadMismatch => {
+                    let mut substitute = before.clone();
+                    substitute[0] ^= 0xff;
+                    stage_manifest(
+                        &mut writes,
+                        base_blob_hash,
+                        &BinaryCasManifest::SingleChunk {
+                            size_bytes: before.len() as u64,
+                            chunk_hash: base_chunk_hash.into_bytes(),
+                        },
+                    );
+                    stage_chunk(
+                        &mut writes,
+                        base_chunk_hash,
+                        BinaryChunkCodec::Raw,
+                        substitute.len() as u64,
+                        &substitute,
+                    );
+                }
+            }
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("single-chunk fixture should commit");
+
+            let mut after = before.clone();
+            after[17] ^= 0xff;
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("single-chunk base read should open");
+            let result = authenticate_same_length_manifest_reuse(
+                &store,
+                &after,
+                BlobSameLengthSplice::new(base_blob_hash, 17, 1),
+            )
+            .await;
+            match case {
+                Case::Valid => assert_eq!(
+                    result.expect("valid single-chunk base should authenticate"),
+                    ManifestReuseAuthentication::CanonicalFullWrite
+                ),
+                Case::ManifestRootMismatch | Case::PayloadMismatch => {
+                    result.expect_err("corrupt named single-chunk base must fail closed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_manifest_reuse_authenticates_delta_and_its_base_before_fallback() {
+        #[derive(Clone, Copy, Debug)]
+        enum Corruption {
+            None,
+            MissingBase,
+            SegmentMismatch,
+            BasePayloadMismatch,
+        }
+
+        for corruption in [
+            Corruption::None,
+            Corruption::MissingBase,
+            Corruption::SegmentMismatch,
+            Corruption::BasePayloadMismatch,
+        ] {
+            let storage = StorageAdapter::new(Memory::new());
+            let before = b"delta authority base bytes with stable copy ranges\n".repeat(256);
+            let full_base_hash = BlobId::from_content(&before);
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &before).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("delta full base should commit");
+
+            let edit_offset = before.len() / 2;
+            let mut delta_bytes = before.clone();
+            delta_bytes[edit_offset] ^= 0xff;
+            let delta_hash = BlobId::from_content(&delta_bytes);
+            let payload = BlobPayload::from_bytes(delta_bytes.clone());
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("delta staging read should open");
+            let mut writes = storage.new_write_set();
+            BinaryCasContext::new()
+                .writer_skipping_existing_chunks(&store, &mut writes)
+                .stage_file_payload(
+                    &payload,
+                    None,
+                    false,
+                    Some(BlobEditSplice {
+                        base_blob_hash: full_base_hash,
+                        offset: edit_offset,
+                        delete_len: 1,
+                        insert_len: 1,
+                    }),
+                )
+                .await
+                .expect("delta fixture should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("delta fixture should commit");
+
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("delta manifest read should open");
+            let mut manifest = load_manifest(&store, delta_hash)
+                .await
+                .expect("delta manifest should load")
+                .expect("delta manifest should exist");
+            drop(store);
+            let mut corruption_writes = storage.new_write_set();
+            match corruption {
+                Corruption::None => {}
+                Corruption::MissingBase => corruption_writes
+                    .delete(BINARY_CAS_MANIFEST_SPACE, manifest_key(full_base_hash)),
+                Corruption::SegmentMismatch => {
+                    let BinaryCasManifest::Delta { segments, .. } = &mut manifest else {
+                        panic!("fixture should be a delta manifest")
+                    };
+                    let StorageBinaryCasDeltaSegment::Insert { bytes } = &mut segments[1] else {
+                        panic!("fixture should contain an inserted edit")
+                    };
+                    bytes[0] ^= 1;
+                    stage_manifest(&mut corruption_writes, delta_hash, &manifest);
+                }
+                Corruption::BasePayloadMismatch => {
+                    let mut substitute = before.clone();
+                    substitute[0] ^= 0xff;
+                    let substitute_hash = ChunkHash::from_content(&substitute);
+                    stage_manifest(
+                        &mut corruption_writes,
+                        full_base_hash,
+                        &BinaryCasManifest::SingleChunk {
+                            size_bytes: substitute.len() as u64,
+                            chunk_hash: substitute_hash.into_bytes(),
+                        },
+                    );
+                    stage_content_chunk(&mut corruption_writes, substitute_hash, &substitute)
+                        .expect("substitute base chunk should stage");
+                }
+            }
+            if !matches!(corruption, Corruption::None) {
+                storage
+                    .commit_write_set(corruption_writes, StorageWriteOptions::default())
+                    .await
+                    .expect("delta corruption fixture should commit");
+            }
+
+            let mut successor = delta_bytes.clone();
+            successor[edit_offset + 7] ^= 0xff;
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("delta authority read should open");
+            let result = authenticate_same_length_manifest_reuse(
+                &store,
+                &successor,
+                BlobSameLengthSplice::new(delta_hash, edit_offset + 7, 1),
+            )
+            .await;
+            match corruption {
+                Corruption::None => assert_eq!(
+                    result.expect("valid delta authority should authenticate"),
+                    ManifestReuseAuthentication::CanonicalFullWrite
+                ),
+                Corruption::MissingBase
+                | Corruption::SegmentMismatch
+                | Corruption::BasePayloadMismatch => {
+                    result.expect_err("corrupt named delta authority must fail closed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_noncanonical_manifest_is_ineligible_without_becoming_corruption() {
+        let storage = StorageAdapter::new(Memory::new());
+        let before = definitely_multi_chunk_blob_bytes();
+        let base_blob_hash = BlobId::from_content(&before);
+        let mut writes = storage.new_write_set();
+        stage_test_bytes(&storage, &mut writes, &before).await;
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("base blob should commit");
+        let mut legacy = storage.new_write_set();
+        let split = MEDIA_CHUNK_BYTES / 2;
+        let ranges = std::iter::once(0..split)
+            .chain(std::iter::once(split..MEDIA_CHUNK_BYTES))
+            .chain(
+                (MEDIA_CHUNK_BYTES..before.len())
+                    .step_by(MEDIA_CHUNK_BYTES)
+                    .map(|start| start..start.saturating_add(MEDIA_CHUNK_BYTES).min(before.len())),
+            )
+            .collect::<Vec<_>>();
+        stage_manifest(
+            &mut legacy,
+            base_blob_hash,
+            &BinaryCasManifest::Chunked {
+                size_bytes: before.len() as u64,
+                chunk_count: ranges.len() as u32,
+            },
+        );
+        for (index, range) in ranges.iter().enumerate() {
+            let chunk = &before[range.clone()];
+            let chunk_hash = ChunkHash::from_content(chunk);
+            stage_content_chunk(&mut legacy, chunk_hash, chunk).expect("legacy chunk should stage");
+            stage_manifest_chunk(
+                &mut legacy,
+                base_blob_hash,
+                index as u64,
+                &KvBlobManifestChunk {
+                    chunk_hash: chunk_hash.into_bytes(),
+                    chunk_size: chunk.len() as u64,
+                },
+            );
+        }
+        storage
+            .commit_write_set(legacy, StorageWriteOptions::default())
+            .await
+            .expect("valid noncanonical layout should commit");
+
+        let edit_offset = MEDIA_CHUNK_BYTES + 7;
+        let mut after = before;
+        after[edit_offset] ^= 0xff;
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy base read should open");
+        assert_eq!(
+            authenticate_same_length_manifest_reuse(
+                &store,
+                &after,
+                BlobSameLengthSplice::new(base_blob_hash, edit_offset, 1),
+            )
+            .await
+            .expect("valid noncanonical base should not be corruption"),
+            ManifestReuseAuthentication::CanonicalFullWrite
+        );
+    }
+
+    #[tokio::test]
     async fn flat_delta_writer_merges_edits_against_one_full_base_and_roundtrips() {
         let storage = StorageAdapter::new(Memory::new());
         let before = b"a representative text line with stable compression boundaries\n".repeat(512);
@@ -3048,7 +3810,8 @@ mod tests {
                 .writer_skipping_existing_chunks(&store, &mut writes)
                 .stage_file_payload(
                     &payload,
-                    Some(BlobSameLengthSplice::new(full_base_hash, first_offset, 1)),
+                    None,
+                    false,
                     Some(BlobEditSplice {
                         base_blob_hash: full_base_hash,
                         offset: first_offset,
@@ -3080,7 +3843,8 @@ mod tests {
                 .writer_skipping_existing_chunks(&store, &mut writes)
                 .stage_file_payload(
                     &payload,
-                    Some(BlobSameLengthSplice::new(first_hash, second_offset, 1)),
+                    None,
+                    false,
                     Some(BlobEditSplice {
                         base_blob_hash: first_hash,
                         offset: second_offset,
@@ -3114,6 +3878,7 @@ mod tests {
                 .stage_file_payload(
                     &payload,
                     None,
+                    false,
                     Some(BlobEditSplice {
                         base_blob_hash: second_hash,
                         offset: third_offset,
@@ -3164,7 +3929,6 @@ mod tests {
     async fn same_length_splice_writer_falls_back_when_result_length_changes() {
         let storage = StorageAdapter::new(Memory::new());
         let before = definitely_multi_chunk_blob_bytes();
-        let base_blob_hash = BlobId::from_content(&before);
 
         {
             let mut writes = storage.new_write_set();
@@ -3182,13 +3946,7 @@ mod tests {
         let after_payload = BlobPayload::from_bytes(after.clone());
         {
             let mut writes = storage.new_write_set();
-            stage_test_file_payload(
-                &storage,
-                &mut writes,
-                &after_payload,
-                Some(BlobSameLengthSplice::new(base_blob_hash, edit_offset, 1)),
-            )
-            .await;
+            stage_test_file_payload(&storage, &mut writes, &after_payload, None).await;
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
