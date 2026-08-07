@@ -1,0 +1,62 @@
+ForkTree Stage-2 execution-oracle qualification
+Date: 2026-08-07 UTC
+
+Pinned sources
+- current main: b5e78190f49cab5de7bb19b6f967706c214363b6
+- current tree: c913465505bc773d21a6e2804530287ee937a3f1
+- inventory predecessor: 4763408467d265b288a124e24b1d47be423f5d17
+- approved Stage 1: 138b55e1de90806c380ad27b2b349f4c66a1387f
+- Stage-1 tree: 26a3e6ead4d690bf1fe2ebca1e2da7d597256b84
+
+Standalone source gate
+- warnings-denied scanner compile: PASS
+- scanner self-test: PASS
+- scanner binary SHA-256:
+  99fecd777b94f86e5116278bb3dcaac7bc94ff06da21d3fc28fcea8dd25814c6
+- main b5e baseline: 169 findings
+  - 41 legacy spaces
+  - 80 legacy owner/codec tokens, including the merged #1258 physical
+    CAS/retention implementation
+  - 23 superseded modules
+  - 5 old paginated-scan tokens
+  - 3 unsealed raw-space tokens
+  - 17 missing required owner tokens
+- main baseline log SHA-256:
+  3cb7dd957f9c8c24f7fed11e0d0b10c6dbf84f614de99c8322de10bf228f471e
+- Stage1 138b baseline: 133 findings
+  - 41 legacy spaces
+  - 64 legacy owner/codec tokens
+  - 23 superseded modules
+  - 5 old paginated-scan tokens
+  - no unsealed or missing-owner finding
+- Stage1 baseline log SHA-256:
+  11286ebd28bb7d962c6a7ca997f9075f2035696291efba015b8c14013a8a5182
+- self-test log SHA-256:
+  5aa097ea408a9bbce25c119b546cc2e887e50066ee85d4b825dbc7274333bb33
+
+External safe-Rust probe calibration
+- Exact-main b5e lix build: PASS (58.38s incremental after the predecessor
+  calibration build).
+- Exact-main rlib SHA-256:
+  0d4b3ee07fa2b68648ba1c44e2f365658f011ba94da643debed6aaa6b19a5d47
+- On b5e, equivalent object-space construction/put/delete: COMPILES, as expected
+  for the legacy baseline.
+- On b5e, StorageRead::scan + ScanOptions resume page: COMPILES, as expected
+  for the legacy baseline.
+- Approved-Stage1 138b lix build: PASS in 2m44s.
+- Exact-Stage1 rlib SHA-256:
+  c388bca15c65b92316b37473cf210f4c79306ec4a8f93d1f4dc18a2b3be1feea
+- On 138b, equivalent object-space construction/put/delete: REJECTED as
+  required with E0599 (no StorageSpace::immutable) and E0423 (private SpaceId
+  tuple field).
+- Stage1 rejection stderr SHA-256:
+  583b8d926242dae57ff8776a3b953cbbe33ef2aee01994c7b13e550893423006
+- On 138b, StorageRead::scan + ScanOptions resume page: COMPILES, as expected;
+  cursor ownership is a separately held prerequisite.
+
+Acceptance meaning
+- Baselines are deliberately red and are not Stage-2 acceptance.
+- The first runnable Stage-2 candidate must report zero scanner findings.
+- The equivalent-space and old-scan probes must both fail against an rlib
+  built from that exact candidate. A stale rlib is invalid evidence.
+- No production file was modified or compiled with Stage-2 wiring here.

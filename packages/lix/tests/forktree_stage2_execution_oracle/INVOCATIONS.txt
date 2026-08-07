@@ -1,0 +1,30 @@
+# Run from the exact candidate repository root. Source scanner is independent
+# of Lix compilation.
+ORACLE=packages/lix/tests/forktree_stage2_execution_oracle
+EVIDENCE=/tmp/forktree-stage2-execution-evidence
+mkdir -p "$EVIDENCE"
+rustc --edition=2024 -D warnings "$ORACLE/main.rs" -o "$EVIDENCE/residue-oracle"
+"$EVIDENCE/residue-oracle" self-test
+
+# Pinned inputs must be red; this records rather than accepts their residue.
+"$EVIDENCE/residue-oracle" baseline /absolute/path/to/main-b5e
+"$EVIDENCE/residue-oracle" baseline /absolute/path/to/stage1-138b
+
+# The first runnable candidate must be green.
+"$EVIDENCE/residue-oracle" audit "$PWD"
+
+# Resolve the rlib from the exact candidate target directory. Both commands
+# MUST fail to compile. A stale rlib is invalid evidence.
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo build -p lix --lib
+LIX_RLIB=$(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -name 'liblix-*.rlib' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+test -n "$LIX_RLIB"
+if rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps" "$ORACLE/space_forge_rejection.rs" --extern "lix=$LIX_RLIB" -o "$EVIDENCE/space-forge" 2>"$EVIDENCE/space-forge.stderr"; then exit 1; fi
+rg 'E0423|E0624|private|cannot initialize|not found' "$EVIDENCE/space-forge.stderr"
+if rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps" "$ORACLE/old_scan_compile_rejection.rs" --extern "lix=$LIX_RLIB" -o "$EVIDENCE/old-scan" 2>"$EVIDENCE/old-scan.stderr"; then exit 1; fi
+rg 'E0432|E0599|unresolved import|no method named' "$EVIDENCE/old-scan.stderr"
+
+# Only after zero residue and both expected compile failures:
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo check -p lix --all-features
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo clippy -p lix --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+git diff --check
