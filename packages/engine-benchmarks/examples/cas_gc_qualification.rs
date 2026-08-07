@@ -225,7 +225,6 @@ where
     }
 }
 
-#[derive(Debug)]
 struct RunResult {
     upload_ms: u128,
     retention_checkpoints: usize,
@@ -235,6 +234,22 @@ struct RunResult {
     immediate_gc: lix::storage_bench::RepositoryGcCommitBenchResult,
     retained_gc: lix::storage_bench::RepositoryGcCommitBenchResult,
     physical_bytes: u64,
+}
+
+impl std::fmt::Debug for RunResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunResult")
+            .field("upload_ms", &self.upload_ms)
+            .field("retention_checkpoints", &self.retention_checkpoints)
+            .field("before_delete", &self.before_delete)
+            .field("immediate", &self.immediate)
+            .field("after_retention", &self.after_retention)
+            .field("immediate_gc", &self.immediate_gc)
+            .field("retained_gc", &self.retained_gc)
+            .field("physical_bytes", &self.physical_bytes)
+            .finish()
+    }
 }
 
 fn print_result(backend: &str, path: &str, size_mib: usize, result: impl std::fmt::Debug) {
