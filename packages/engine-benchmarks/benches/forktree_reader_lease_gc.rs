@@ -18,6 +18,9 @@ use lix::storage_bench::synthetic_space_for_bench;
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
+#[path = "forktree_stage2_recovery_model.rs"]
+mod stage2_recovery;
+
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
@@ -2111,6 +2114,20 @@ async fn run_slate(readers: usize) -> Result<(), StorageError> {
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("stage2-recovery") {
+        let backend = args.get(2).map(String::as_str).unwrap_or("rocksdb");
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("create Stage-2 recovery-oracle runtime")
+            .block_on(async {
+                stage2_recovery::run_backend(backend)
+                    .await
+                    .expect("ForkTree Stage-2 crash/recovery qualification");
+            });
+        return;
+    }
     let backend = args.get(1).map(String::as_str).unwrap_or("rocksdb");
     let readers = args
         .get(2)
