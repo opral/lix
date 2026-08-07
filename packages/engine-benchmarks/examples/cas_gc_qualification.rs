@@ -23,6 +23,10 @@ const PRESENCE_SPACE: lix::storage::SpaceId = lix::storage::SpaceId(0x0005_0004)
 const FILE_PATH: &str = "/qualification/blob.bin";
 const RETAINED_BRANCH_ID: &str = "01990000-0000-7000-8000-00000000005a";
 
+fn observe_unreclaimed_baseline() -> bool {
+    std::env::var_os("LIX_CAS_GC_OBSERVE_UNRECLAIMED").is_some()
+}
+
 struct CountingAllocator;
 
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -208,6 +212,7 @@ struct PreparedFixture {
     root_a: String,
     root_b: String,
     blob_hash: String,
+    content_hash: String,
     expected_size: usize,
     upload: PhaseMeasurement,
     retained_gc: PhaseMeasurement,
@@ -229,6 +234,7 @@ struct RunResult {
     root_a: String,
     root_b: String,
     blob_hash: String,
+    content_hash: String,
     upload: PhaseMeasurement,
     retained_gc: PhaseMeasurement,
     cold_reopen: PhaseMeasurement,
@@ -251,6 +257,7 @@ impl std::fmt::Debug for RunResult {
             .field("root_a", &self.root_a)
             .field("root_b", &self.root_b)
             .field("blob_hash", &self.blob_hash)
+            .field("content_hash", &self.content_hash)
             .field("upload", &self.upload)
             .field("retained_gc", &self.retained_gc)
             .field("cold_reopen", &self.cold_reopen)
@@ -414,7 +421,19 @@ where
         part = part.saturating_add(1);
     }
     let upload = upload_started.finish(slate_io, None);
-    let blob_hash = expected_hasher.finalize().to_hex().to_string();
+    let expected_content_hash = expected_hasher.finalize().to_hex().to_string();
+    let uploaded = session
+        .read_file_content(FILE_PATH.to_owned(), None)
+        .await
+        .expect("read uploaded qualification payload")
+        .expect("uploaded qualification payload should exist");
+    assert_eq!(uploaded.total_size(), total_size as u64);
+    assert_eq!(
+        blake3::hash(uploaded.content()).to_hex().to_string(),
+        expected_content_hash,
+    );
+    let blob_hash = uploaded.content_identity().to_owned();
+    drop(uploaded);
     let root_a = branch_commit(&session).await;
     session
         .execute(
@@ -455,12 +474,19 @@ where
         .expect("retained-owner GC should commit");
     let retained_gc = gc_started.finish(slate_io, Some(sweep));
     let retained = cas_stats(&storage).await;
+    println!(
+        "cas_gc_retained_observation,root_a={},root_b={},blob_hash={},before={:?},retained={:?},gc={:?}",
+        root_a, root_b, blob_hash, before_gc, retained, retained_gc.gc,
+    );
     let bytes = read_binary_cas_for_bench(&adapter, &blob_hash)
         .await
         .expect("retained payload CAS lookup should succeed")
         .expect("retained payload must survive GC");
     assert_eq!(bytes.len(), total_size);
-    assert_eq!(blake3::hash(&bytes).to_hex().to_string(), blob_hash);
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().to_string(),
+        expected_content_hash,
+    );
     drop(bytes);
     drop(adapter);
     drop(session);
@@ -471,6 +497,7 @@ where
         root_a,
         root_b,
         blob_hash,
+        content_hash: expected_content_hash,
         expected_size: total_size,
         upload,
         retained_gc,
@@ -523,7 +550,10 @@ where
         .expect("retained owner undo should succeed");
     let bytes = read_current_file(&session).await;
     assert_eq!(bytes.len(), fixture.expected_size);
-    assert_eq!(blake3::hash(&bytes).to_hex().to_string(), fixture.blob_hash);
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().to_string(),
+        fixture.content_hash,
+    );
     drop(bytes);
     session
         .redo()
@@ -557,11 +587,13 @@ where
     let sweep = collect_repository_gc_for_bench(&adapter)
         .await
         .expect("final owner-release GC should commit");
+    let payload_reclaimed = read_binary_cas_for_bench(&adapter, &fixture.blob_hash)
+        .await
+        .expect("released payload CAS lookup should succeed")
+        .is_none();
+    println!("cas_gc_reclamation_observation,phase=release,payload_reclaimed={payload_reclaimed}");
     assert!(
-        read_binary_cas_for_bench(&adapter, &fixture.blob_hash)
-            .await
-            .expect("released payload CAS lookup should succeed")
-            .is_none(),
+        payload_reclaimed || observe_unreclaimed_baseline(),
         "payload must reclaim after the final owner releases it",
     );
     let final_release_gc = release_started.finish(slate_io, Some(sweep));
@@ -597,12 +629,14 @@ where
         .expect("released branch absence should read");
     assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     let adapter = StorageAdapter::new(storage.clone());
-    assert!(
-        read_binary_cas_for_bench(&adapter, &fixture.blob_hash)
-            .await
-            .expect("final released payload lookup should succeed")
-            .is_none(),
+    let payload_reclaimed = read_binary_cas_for_bench(&adapter, &fixture.blob_hash)
+        .await
+        .expect("final released payload lookup should succeed")
+        .is_none();
+    println!(
+        "cas_gc_reclamation_observation,phase=final_reopen,payload_reclaimed={payload_reclaimed}"
     );
+    assert!(payload_reclaimed || observe_unreclaimed_baseline());
     let stats = cas_stats(&storage).await;
     drop(adapter);
     drop(workspace);
@@ -625,6 +659,7 @@ fn finish_result(
         root_a: prepared.root_a,
         root_b: prepared.root_b,
         blob_hash: prepared.blob_hash,
+        content_hash: prepared.content_hash,
         upload: prepared.upload,
         retained_gc: prepared.retained_gc,
         cold_reopen: released.cold_reopen,
