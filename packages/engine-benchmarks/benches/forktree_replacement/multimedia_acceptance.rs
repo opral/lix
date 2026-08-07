@@ -259,7 +259,7 @@ where
         "writer accounting omitted identity-proven base reuse"
     );
     println!(
-        "forktree_multimedia_sharing,family={},shape={},size_mib={},base_bytes={},edited_bytes={},mutation_bytes={},edit_offset={},base_chunks={},edited_chunks={},shared_chunks={},shared_declared_bytes={},new_unique_chunks={},base_hash={},edited_hash={}",
+        "forktree_multimedia_sharing,family={},shape={},size_mib={},base_bytes={},edited_bytes={},mutation_bytes={},edit_offset={},base_chunks={},edited_chunks={},shared_chunk_refs={},shared_unique_chunks={},shared_declared_bytes={},new_unique_chunks={},base_hash={},edited_hash={}",
         payload.spec.family,
         payload.spec.shape,
         payload.spec.size_mib,
@@ -270,6 +270,7 @@ where
         base_identity.chunks.len(),
         edited_identity.chunks.len(),
         sharing.shared_chunks,
+        sharing.shared_unique_chunks,
         sharing.shared_declared_bytes,
         sharing.new_unique_chunks,
         hex(&payload.base_hash),
@@ -286,7 +287,7 @@ where
     )
     .await
     .expect("diff image edit");
-    assert_eq!(diff.shared_chunks as usize, sharing.shared_chunks);
+    assert_eq!(diff.shared_chunks as usize, sharing.shared_unique_chunks);
     assert!(diff.changed_chunks > 0);
     println!(
         "forktree_multimedia_diff,before_chunks={},after_chunks={},shared_chunks={},changed_chunks={}",
@@ -543,6 +544,7 @@ async fn assert_identity_present<S>(
 #[derive(Clone, Copy, Debug)]
 struct Sharing {
     shared_chunks: usize,
+    shared_unique_chunks: usize,
     shared_declared_bytes: u64,
     new_unique_chunks: usize,
 }
@@ -566,6 +568,7 @@ fn sharing(base: &BlobIdentityInventory, edited: &BlobIdentityInventory) -> Shar
         .collect::<Vec<_>>();
     Sharing {
         shared_chunks: shared.len(),
+        shared_unique_chunks: edited_ids.intersection(&base_ids).count(),
         shared_declared_bytes: shared.iter().map(|chunk| chunk.declared_bytes).sum(),
         new_unique_chunks: edited_ids.difference(&base_ids).count(),
     }
