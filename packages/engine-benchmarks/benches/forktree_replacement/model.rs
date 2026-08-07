@@ -253,6 +253,8 @@ pub struct SharedObjectAccounting {
     pub shared_bytes: u64,
     pub left_objects: u64,
     pub right_objects: u64,
+    pub left_bytes: u64,
+    pub right_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1145,6 +1147,14 @@ where
         ))
     }
 
+    pub async fn commit_root(&self, commit: ObjectId) -> Result<ObjectId, String> {
+        self.load_commit(commit).await.map(|commit| commit.root)
+    }
+
+    pub fn object_id_hex(id: ObjectId) -> String {
+        hex_id(id)
+    }
+
     pub async fn verify_diff_corruption_fail_closed(
         &self,
         before: ObjectId,
@@ -1187,7 +1197,41 @@ where
     ) -> Result<SharedObjectAccounting, String> {
         let left = self.object_closure(left).await?;
         let right = self.object_closure(right).await?;
+        self.shared_closure_inventory(left, right).await
+    }
+
+    pub async fn shared_root_inventory(
+        &self,
+        left: ObjectId,
+        right: ObjectId,
+    ) -> Result<SharedObjectAccounting, String> {
+        let left = self
+            .object_closure(self.load_commit(left).await?.root)
+            .await?;
+        let right = self
+            .object_closure(self.load_commit(right).await?.root)
+            .await?;
+        self.shared_closure_inventory(left, right).await
+    }
+
+    async fn shared_closure_inventory(
+        &self,
+        left: std::collections::BTreeSet<ObjectId>,
+        right: std::collections::BTreeSet<ObjectId>,
+    ) -> Result<SharedObjectAccounting, String> {
         let shared = left.intersection(&right).copied().collect::<Vec<_>>();
+        let left_bytes = self
+            .load_objects(&left.iter().copied().collect::<Vec<_>>())
+            .await?
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .sum();
+        let right_bytes = self
+            .load_objects(&right.iter().copied().collect::<Vec<_>>())
+            .await?
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .sum();
         let shared_bytes = self
             .load_objects(&shared)
             .await?
@@ -1199,6 +1243,8 @@ where
             shared_bytes,
             left_objects: left.len() as u64,
             right_objects: right.len() as u64,
+            left_bytes,
+            right_bytes,
         })
     }
 
