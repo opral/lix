@@ -2543,9 +2543,14 @@ mod tests {
         assert_eq!(first.swept_standalone_changes, 10);
         assert_eq!(first.deleted_commit_state_manifests, 10);
         assert_eq!(first.deleted_mutation_inventories, 10);
-        assert_eq!(first.deleted_semantic_commit_projections, 11);
-        assert_eq!(first.deleted_semantic_change_rows, 21);
-        assert_eq!(first.deleted_semantic_reverse_index_rows, 11);
+        // The ten branch-only commits are reclaimable, while the branch base
+        // remains the active main head and therefore keeps its semantic
+        // projection in the authenticated serving-dependency closure.
+        assert_eq!(first.deleted_semantic_commit_projections, 10);
+        // Each reclaimed projection owns one change fact and reverse-index
+        // row; the other ten change deletes are retired branch-ref facts.
+        assert_eq!(first.deleted_semantic_change_rows, 20);
+        assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
@@ -2561,9 +2566,9 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 11), // semantic commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 21), // semantic change facts
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 11), // commit -> change reverse index
+                (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 20), // projection and branch-ref changes
+                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
         assert_eq!(
@@ -2575,8 +2580,13 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize);
-        assert_eq!(first.key_shared_bytes, first.staged_deletes as usize * 16);
+        // GC also stages the mandatory five-byte binary-CAS epoch key. Its
+        // put shares the key arena with the UUID-keyed delete descriptors.
+        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
+        assert_eq!(
+            first.key_shared_bytes,
+            first.staged_deletes as usize * 16 + 5
+        );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
         assert_eq!(second.staged_deletes, first.staged_deletes);
