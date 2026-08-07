@@ -87,6 +87,7 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 // storage amplification, so retain their allocation-free direct-key path.
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
 pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_001f),
@@ -6693,7 +6694,33 @@ where
                 &mut retired_untracked_json_refs,
             )?;
         }
+        let has_key_value_scope = rows
+            .keys()
+            .any(|identity| identity.schema_key == KEY_VALUE_SCHEMA_KEY);
         stage_complete_collection_controls(self.writes, branch_id, new_generation, &rows)?;
+        // Deterministic runtime state performs required point reads in this
+        // engine-owned collection. A complete untracked generation must
+        // therefore authenticate its empty set as well as its present rows;
+        // absence without a control is reserved for revision-zero bootstrap.
+        if !has_key_value_scope {
+            let scope = crate::collection_generation::CollectionScopeRef {
+                schema_key: KEY_VALUE_SCHEMA_KEY,
+                file_id: None,
+            };
+            stage_hot_collection_control(
+                self.writes,
+                branch_id,
+                new_generation,
+                scope,
+                HotCollectionControl {
+                    active_generation: new_generation,
+                    live_count: 0,
+                    ordered_identity_digest: Some(
+                        CompleteHotCollectionDigest::new(branch_id, new_generation, scope).finish(),
+                    ),
+                },
+            )?;
+        }
         stage_complete_hot_rows(self.writes, branch_id, new_generation, rows);
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,
@@ -11951,6 +11978,94 @@ mod tests {
         )
         .await
         .expect("explicit empty control should authenticate an empty scope");
+    }
+
+    #[tokio::test]
+    async fn exact_collection_closure_distinguishes_bootstrap_from_published_missing_digest() {
+        const BRANCH_ID: &str = "closure-bootstrap-branch";
+        const SCHEMA_KEY: &str = "closure_bootstrap_schema";
+        let generation = CommitId::for_test_label("closure-bootstrap-generation");
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: SCHEMA_KEY,
+            file_id: None,
+        };
+        let missing_entity_pk = EntityPk::single("missing-member");
+        let required_identity = TrackedStateKeyRef {
+            schema_key: SCHEMA_KEY,
+            entity_pk: &missing_entity_pk,
+            file_id: None,
+        };
+        let storage = StorageAdapter::new(Memory::new());
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("bootstrap read should open");
+        let reader = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+        };
+        reader
+            .validate_exact_collection_closure(
+                BRANCH_ID,
+                generation,
+                scope,
+                required_identity,
+                LiveStateReadDomain::Untracked,
+                true,
+            )
+            .await
+            .expect("an explicitly allowed empty bootstrap may omit its control");
+        let error = reader
+            .validate_exact_collection_closure(
+                BRANCH_ID,
+                generation,
+                scope,
+                required_identity,
+                LiveStateReadDomain::Untracked,
+                false,
+            )
+            .await
+            .expect_err("a published empty scope must carry its exact control");
+        assert!(error.message.contains("missing its exact control"));
+        drop(read);
+
+        let mut writes = StorageWriteSet::new();
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH_ID,
+            generation,
+            scope,
+            HotCollectionControl {
+                active_generation: generation,
+                live_count: 0,
+                ordered_identity_digest: None,
+            },
+        )
+        .expect("digestless published control should encode as a corruption fixture");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("digestless corruption fixture should publish");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("published corruption read should open");
+        let error = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+        }
+        .validate_exact_collection_closure(
+            BRANCH_ID,
+            generation,
+            scope,
+            required_identity,
+            LiveStateReadDomain::Untracked,
+            true,
+        )
+        .await
+        .expect_err("bootstrap allowance must not accept a published digestless control");
+        assert!(error.message.contains("no exact identity digest"));
     }
 
     #[tokio::test]

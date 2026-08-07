@@ -535,13 +535,20 @@ mod tests {
             .expect("global control should load")
             .expect("global control should exist");
         let snapshot = JsonSlot::from_json(&snapshot_content);
-        let mut working_diff_coverage = crate::live_state::WorkingDiffIndexCoverage::default();
+        let mut next_control = control
+            .next_current_state_revision()
+            .expect("global control revision should advance");
+        let next_generation = untracked_lifecycle_generation(
+            GLOBAL_BRANCH_ID,
+            control.untracked_generation,
+            next_control.current_state_revision,
+        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
+            .stage_untracked_generation(
                 GLOBAL_BRANCH_ID,
-                Some(control.tracked_generation),
-                control.head_commit_id,
+                control.untracked_generation,
+                next_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
@@ -557,13 +564,13 @@ mod tests {
                     columnar_base_coordinate: None,
                 }],
                 &std::collections::BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut working_diff_coverage,
             )
             .await
             .expect("test key-value current row should stage");
+        next_control.untracked_generation = next_generation;
+        next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
+        stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
+            .expect("global control should publish current state");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
