@@ -106,6 +106,12 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
+name = "forktree_stage2_recovery_no_lease"
+path = "benches/forktree_stage2_recovery_no_lease.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "changelog_scorecard"
 path = "benches/changelog/scorecard.rs"
 harness = false
