@@ -3476,6 +3476,7 @@ dependencies = [
  "duckdb",
  "fastcdc",
  "futures-util",
+ "libc",
  "lix",
  "lix-storage-rocksdb",
  "lix-storage-slatedb",

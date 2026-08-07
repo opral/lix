@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 mod model;
+mod relational;
 mod vertical;
 mod workload;
 
@@ -300,6 +301,7 @@ enum Scenario {
     History,
     Blob,
     BlobProfile,
+    Relational,
 }
 
 impl Scenario {
@@ -308,6 +310,7 @@ impl Scenario {
             Some("history") => (Self::History, 1),
             Some("blob") => (Self::Blob, 1),
             Some("blob-profile") => (Self::BlobProfile, 1),
+            Some("relational") => (Self::Relational, 1),
             _ => (Self::Apply, 0),
         }
     }
@@ -403,6 +406,10 @@ struct Sample {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let parameters = Parameters::parse();
+    if parameters.scenario == Scenario::Relational {
+        relational::run(parameters).await;
+        return;
+    }
     if parameters.scenario != Scenario::Apply {
         vertical::run(parameters).await;
         return;
@@ -1067,6 +1074,21 @@ fn process_cpu_ticks() -> u64 {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
         )
+}
+
+fn process_cpu_nanos() -> u64 {
+    let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes `value` when it reports success, and
+    // CLOCK_PROCESS_CPUTIME_ID requires no caller-owned pointer lifetime.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, value.as_mut_ptr()) };
+    if status != 0 {
+        return 0;
+    }
+    // SAFETY: the successful call above initialized both timespec fields.
+    let value = unsafe { value.assume_init() };
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(value.tv_nsec as u64)
 }
 
 fn directory_bytes(path: &std::path::Path) -> u64 {

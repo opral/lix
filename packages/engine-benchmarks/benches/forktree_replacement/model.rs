@@ -43,6 +43,68 @@ pub struct Update {
     pub value: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelationalValue {
+    Null,
+    Bytes(Vec<u8>),
+}
+
+impl RelationalValue {
+    fn logical_bytes(&self) -> usize {
+        match self {
+            Self::Null => 1,
+            Self::Bytes(bytes) => 1 + bytes.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Mutation {
+    Insert {
+        key: Vec<u8>,
+        value: RelationalValue,
+    },
+    Update {
+        key: Vec<u8>,
+        value: RelationalValue,
+    },
+    Delete {
+        key: Vec<u8>,
+    },
+}
+
+impl Mutation {
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Insert { key, .. } | Self::Update { key, .. } | Self::Delete { key } => key,
+        }
+    }
+
+    fn value(&self) -> Option<&RelationalValue> {
+        match self {
+            Self::Insert { value, .. } | Self::Update { value, .. } => Some(value),
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeConflict {
+    pub key: Vec<u8>,
+    pub base: Option<RelationalValue>,
+    pub target: Option<RelationalValue>,
+    pub source: Option<RelationalValue>,
+}
+
+#[derive(Clone, Debug)]
+pub enum MergeOutcome {
+    Merged {
+        commit: ObjectId,
+        accounting: ApplyAccounting,
+    },
+    Conflicts(Vec<MergeConflict>),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlobAccounting {
     pub chunks: u64,
@@ -203,9 +265,23 @@ struct ValueRef {
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedUpdate {
+struct ResolvedMutation {
     key: Vec<u8>,
-    value: ValueRef,
+    operation: ResolvedOperation,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolvedOperation {
+    Insert(ValueRef),
+    Update(ValueRef),
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RowChange {
+    key: Vec<u8>,
+    before: Option<RelationalValue>,
+    after: Option<RelationalValue>,
 }
 
 #[derive(Clone, Copy)]
@@ -684,58 +760,113 @@ where
         branch: &str,
         updates: &[Update],
     ) -> Result<(ObjectId, ApplyAccounting), String> {
-        self.apply_sorted_updates_with_merge_parent(branch, updates, None)
+        let mutations = updates
+            .iter()
+            .map(|update| Mutation::Update {
+                key: update.key.clone(),
+                value: RelationalValue::Bytes(update.value.clone()),
+            })
+            .collect::<Vec<_>>();
+        self.apply_sorted_mutations_with_merge_parent(branch, &mutations, None)
             .await
     }
 
-    async fn apply_sorted_updates_with_merge_parent(
+    pub async fn apply_sorted_mutations(
+        &self,
+        mutations: &[Mutation],
+    ) -> Result<(ObjectId, ApplyAccounting), String> {
+        self.apply_sorted_mutations_on("main", mutations).await
+    }
+
+    pub async fn apply_sorted_mutations_on(
         &self,
         branch: &str,
-        updates: &[Update],
+        mutations: &[Mutation],
+    ) -> Result<(ObjectId, ApplyAccounting), String> {
+        self.apply_sorted_mutations_with_merge_parent(branch, mutations, None)
+            .await
+    }
+
+    async fn apply_sorted_mutations_with_merge_parent(
+        &self,
+        branch: &str,
+        mutations: &[Mutation],
         merge_parent: Option<ObjectId>,
     ) -> Result<(ObjectId, ApplyAccounting), String> {
-        validate_sorted_updates(updates)?;
+        validate_sorted_mutations(mutations, merge_parent.is_some())?;
         let branch_key = selector_key(BRANCH_PREFIX, branch);
         let head = self.load_head_at_key(&branch_key).await?;
         let commit = self.load_commit(head.commit).await?;
         let mut pending = BTreeMap::new();
         let mut accounting = ApplyAccounting {
-            logical_bytes: updates
+            logical_bytes: mutations
                 .iter()
-                .map(|update| update.key.len() as u64 + update.value.len() as u64)
+                .map(|mutation| {
+                    mutation.key().len() as u64
+                        + mutation
+                            .value()
+                            .map_or(0, |value| value.logical_bytes() as u64)
+                        + 1
+                })
                 .sum(),
             ..ApplyAccounting::default()
         };
-        let value_pack = stage_object(
-            encode_value_pack(updates.iter().map(|update| update.value.as_slice())),
-            &mut pending,
-        );
-        let resolved_updates = updates
+        let values = mutations
             .iter()
-            .enumerate()
-            .map(|(index, update)| ResolvedUpdate {
-                key: update.key.clone(),
-                value: ValueRef {
-                    pack: value_pack,
-                    index: u32::try_from(index).expect("ForkTree value-pack index fits u32"),
-                },
+            .filter_map(Mutation::value)
+            .collect::<Vec<_>>();
+        let value_pack = (!values.is_empty())
+            .then(|| stage_object(encode_value_pack(values.iter().copied()), &mut pending));
+        let mut value_index = 0_u32;
+        let resolved_mutations = mutations
+            .iter()
+            .map(|mutation| {
+                let value_ref = mutation.value().map(|_| {
+                    let value = ValueRef {
+                        pack: value_pack.expect("nonempty values have a pack"),
+                        index: value_index,
+                    };
+                    value_index = value_index
+                        .checked_add(1)
+                        .expect("ForkTree value-pack index fits u32");
+                    value
+                });
+                ResolvedMutation {
+                    key: mutation.key().to_vec(),
+                    operation: match mutation {
+                        Mutation::Insert { .. } => {
+                            ResolvedOperation::Insert(value_ref.expect("insert value"))
+                        }
+                        Mutation::Update { .. } => {
+                            ResolvedOperation::Update(value_ref.expect("update value"))
+                        }
+                        Mutation::Delete { .. } => ResolvedOperation::Delete,
+                    },
+                }
             })
             .collect::<Vec<_>>();
-        let root = self
-            .rewrite_node(
-                commit.root,
-                &resolved_updates,
-                &mut pending,
-                &mut accounting,
-            )
+        // One operation-local authenticated working set batches every stored
+        // node needed by the changed paths and their bounded rebalance
+        // siblings. It is derived from the authoritative root, discarded
+        // after publication, and grows only with copied blocks; it is not a
+        // durable or serving-side index/cache authority.
+        let node_cache = self
+            .load_mutation_working_set(commit.root, &resolved_mutations)
             .await?;
-        let delta = stage_object(
-            encode_delta(
-                value_pack,
-                updates.iter().map(|update| update.key.as_slice()),
-            ),
-            &mut pending,
-        );
+        let rewritten =
+            if resolved_mutations.is_empty() {
+                vec![NodeRef {
+                    id: commit.root,
+                    max_key: node_max_key(node_cache.get(&commit.root).ok_or_else(|| {
+                        "ForkTree root is absent from its working set".to_string()
+                    })?),
+                }]
+            } else {
+                self.rewrite_general(commit.root, &resolved_mutations, &node_cache, &mut pending)
+                    .await?
+            };
+        let root = self.finish_root(rewritten, &node_cache, &mut pending)?;
+        let delta = stage_object(encode_mutation_delta(value_pack, mutations), &mut pending);
         let next_commit = stage_object(
             encode_commit(Commit {
                 parents: [Some(head.commit), merge_parent],
@@ -840,6 +971,36 @@ where
         self.load_value(value).await
     }
 
+    pub async fn read_relational_point(
+        &self,
+        branch: &str,
+        key: &[u8],
+    ) -> Result<Option<RelationalValue>, String> {
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        match self.find_value_optional(commit.root, key).await? {
+            Some(value) => self.load_relational_value(value).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn read_relational_all(
+        &self,
+        branch: &str,
+    ) -> Result<Vec<(Vec<u8>, RelationalValue)>, String> {
+        self.read_relational_all_at(self.branch_head(branch).await?)
+            .await
+    }
+
+    pub async fn read_relational_all_at(
+        &self,
+        commit: ObjectId,
+    ) -> Result<Vec<(Vec<u8>, RelationalValue)>, String> {
+        let commit = self.load_commit(commit).await?;
+        let mut rows = Vec::new();
+        self.collect_relational_rows(commit.root, &mut rows).await?;
+        Ok(rows)
+    }
+
     pub async fn read_range(
         &self,
         branch: &str,
@@ -865,15 +1026,12 @@ where
         before: ObjectId,
         after: ObjectId,
     ) -> Result<Vec<Vec<u8>>, String> {
-        if before == after {
-            return Ok(Vec::new());
-        }
-        let before = self.load_commit(before).await?;
-        let after = self.load_commit(after).await?;
-        let mut changed = Vec::new();
-        self.diff_nodes(before.root, after.root, &mut changed)
-            .await?;
-        Ok(changed)
+        Ok(self
+            .diff_rows(before, after)
+            .await?
+            .into_iter()
+            .map(|change| change.key)
+            .collect())
     }
 
     pub async fn merge_branches(
@@ -882,27 +1040,78 @@ where
         source: &str,
         base: ObjectId,
     ) -> Result<(ObjectId, ApplyAccounting), String> {
+        match self.merge_branches_three_way(target, source, base).await? {
+            MergeOutcome::Merged { commit, accounting } => Ok((commit, accounting)),
+            MergeOutcome::Conflicts(conflicts) => Err(format!(
+                "ForkTree three-way merge has {} semantic conflict(s)",
+                conflicts.len()
+            )),
+        }
+    }
+
+    pub async fn merge_branches_three_way(
+        &self,
+        target: &str,
+        source: &str,
+        base: ObjectId,
+    ) -> Result<MergeOutcome, String> {
         let target_head = self.branch_head(target).await?;
         let source_head = self.branch_head(source).await?;
-        let source_changes = self.diff_commits(base, source_head).await?;
-        let target_changes = self.diff_commits(base, target_head).await?;
-        let target_keys = target_changes
+        let source_changes = self
+            .diff_rows(base, source_head)
+            .await?
             .into_iter()
+            .map(|change| (change.key.clone(), change))
+            .collect::<BTreeMap<_, _>>();
+        let target_changes = self
+            .diff_rows(base, target_head)
+            .await?
+            .into_iter()
+            .map(|change| (change.key.clone(), change))
+            .collect::<BTreeMap<_, _>>();
+        let identities = source_changes
+            .keys()
+            .chain(target_changes.keys())
+            .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        if source_changes.iter().any(|key| target_keys.contains(key)) {
-            return Err("ForkTree prototype merge has a semantic conflict".to_string());
-        }
-        let mut updates = Vec::with_capacity(source_changes.len());
-        for key in source_changes {
-            let source_commit = self.load_commit(source_head).await?;
-            let value = self.find_value(source_commit.root, &key).await?;
-            updates.push(Update {
-                key,
-                value: self.load_value(value).await?,
+        let mut conflicts = Vec::new();
+        let mut mutations = Vec::new();
+        for key in identities {
+            let source = source_changes.get(&key);
+            let target = target_changes.get(&key);
+            let base_value = source
+                .and_then(|change| change.before.clone())
+                .or_else(|| target.and_then(|change| change.before.clone()));
+            let source_value =
+                source.map_or_else(|| base_value.clone(), |change| change.after.clone());
+            let target_value =
+                target.map_or_else(|| base_value.clone(), |change| change.after.clone());
+            if source_value == target_value || source_value == base_value {
+                continue;
+            }
+            if target_value != base_value {
+                conflicts.push(MergeConflict {
+                    key,
+                    base: base_value,
+                    target: target_value,
+                    source: source_value,
+                });
+                continue;
+            }
+            mutations.push(match (target_value, source_value) {
+                (None, Some(value)) => Mutation::Insert { key, value },
+                (Some(_), Some(value)) => Mutation::Update { key, value },
+                (Some(_), None) => Mutation::Delete { key },
+                (None, None) => continue,
             });
         }
-        self.apply_sorted_updates_with_merge_parent(target, &updates, Some(source_head))
-            .await
+        if !conflicts.is_empty() {
+            return Ok(MergeOutcome::Conflicts(conflicts));
+        }
+        let (commit, accounting) = self
+            .apply_sorted_mutations_with_merge_parent(target, &mutations, Some(source_head))
+            .await?;
+        Ok(MergeOutcome::Merged { commit, accounting })
     }
 
     /// Consumes one canonical segmented source through the single CDC profile,
@@ -1524,7 +1733,8 @@ where
     }
 
     /// Deterministic prototype oracle for both epoch orderings. It stages an
-    /// unreachable authenticated object as the crash-before-root case, then
+    /// unreachable authenticated path-copy objects as the crash-before-root
+    /// case, then
     /// proves publication-first rejects a stale deleting sweep and GC-first
     /// rejects a stale root-only publication. The retry uses the public owner
     /// path after rereading the epoch.
@@ -1532,7 +1742,7 @@ where
         let main = self.branch_head("main").await?;
 
         let publication_first_orphan = self
-            .stage_test_orphan(b"ForkTree publication-first crash orphan")
+            .stage_test_path_copy_orphan(b"publication-first")
             .await?;
         let (publication_epoch, publication_raw_epoch) = self.load_epoch().await?;
         self.create_branch("race-publication-first", Some(main))
@@ -1554,8 +1764,7 @@ where
             return Err("ForkTree crash orphan was not reclaimed after retry".to_string());
         }
 
-        self.stage_test_orphan(b"ForkTree GC-first crash orphan")
-            .await?;
+        self.stage_test_path_copy_orphan(b"gc-first").await?;
         let (gc_epoch, gc_raw_epoch) = self.load_epoch().await?;
         let selector = selector_key(BRANCH_PREFIX, "race-gc-first");
         let raw_ref = encode_ref(main);
@@ -1670,14 +1879,63 @@ where
         Ok(())
     }
 
-    async fn stage_test_orphan(&self, payload: &'static [u8]) -> Result<ObjectId, String> {
-        let payload = Bytes::from_static(payload);
-        let id = blob_chunk_id(&payload);
+    /// Corrupts the live relational root through the raw benchmark adapter and
+    /// proves authenticated owner reads reject it. Immutable adapters may
+    /// reject the overwrite even earlier; both outcomes are fail-closed.
+    pub async fn verify_tree_corruption_fail_closed(&self, branch: &str) -> Result<(), String> {
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        let mut corrupted = self.load_object(commit.root).await?.to_vec();
+        corrupted[0] ^= 0x80;
         let mut pending = BTreeMap::new();
-        pending.insert(id, payload);
+        pending.insert(commit.root, Bytes::from(corrupted));
+        let overwrite = async {
+            let mut write = self
+                .storage
+                .begin_write(WriteOptions::default())
+                .await
+                .map_err(storage_error)?;
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+            write.commit().await.map_err(storage_error)?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if overwrite.is_ok() && self.read_relational_all(branch).await.is_ok() {
+            return Err("ForkTree returned rows from a corrupted tree node".to_string());
+        }
+        Ok(())
+    }
+
+    async fn stage_test_path_copy_orphan(&self, label: &[u8]) -> Result<ObjectId, String> {
+        let mut pending = BTreeMap::new();
+        let value = RelationalValue::Bytes(label.to_vec());
+        let pack = stage_object(encode_value_pack([&value].into_iter()), &mut pending);
+        let orphan_key = [b"race-path-copy/".as_slice(), label].concat();
+        let leaf = stage_object(
+            encode_leaf(&[LeafEntry {
+                key: orphan_key.clone(),
+                value: ValueRef { pack, index: 0 },
+            }]),
+            &mut pending,
+        );
+        stage_object(
+            encode_mutation_delta(
+                Some(pack),
+                &[Mutation::Insert {
+                    key: orphan_key,
+                    value,
+                }],
+            ),
+            &mut pending,
+        );
         let mut write = self
             .storage
-            .begin_write(WriteOptions::default())
+            .begin_write(WriteOptions {
+                batch_capacity_hint_bytes: pending.values().map(Bytes::len).sum(),
+                ..WriteOptions::default()
+            })
             .await
             .map_err(storage_error)?;
         write
@@ -1685,7 +1943,7 @@ where
             .await
             .map_err(storage_error)?;
         write.commit().await.map_err(storage_error)?;
-        Ok(id)
+        Ok(leaf)
     }
 
     async fn attempt_test_delete(
@@ -1847,65 +2105,185 @@ where
         Ok((rows, bytes))
     }
 
-    fn rewrite_node<'a>(
+    fn rewrite_general<'a>(
         &'a self,
         id: ObjectId,
-        updates: &'a [ResolvedUpdate],
+        mutations: &'a [ResolvedMutation],
+        node_cache: &'a BTreeMap<ObjectId, Node>,
         pending: &'a mut BTreeMap<ObjectId, Bytes>,
-        accounting: &'a mut ApplyAccounting,
-    ) -> BoxFuture<'a, Result<NodeRef, String>> {
+    ) -> BoxFuture<'a, Result<Vec<NodeRef>, String>> {
         Box::pin(async move {
-            let node = decode_node(&self.load_object(id).await?)?;
+            let node = load_pending_or_cached_node(id, node_cache, pending)?;
             match node {
                 Node::Leaf(mut rows) => {
-                    for update in updates {
-                        let index = rows
-                            .binary_search_by(|row| row.key.as_slice().cmp(update.key.as_slice()))
-                            .map_err(|_| {
-                                format!(
-                                    "focused prototype update key is absent: {}",
-                                    String::from_utf8_lossy(&update.key)
-                                )
-                            })?;
-                        rows[index].value = update.value;
-                    }
-                    let bytes = encode_leaf(&rows);
-                    let id = stage_object(bytes, pending);
-                    Ok(NodeRef {
-                        id,
-                        max_key: rows.last().expect("leaf nodes are nonempty").key.clone(),
-                    })
-                }
-                Node::Internal(mut children) => {
-                    let mut start = 0;
-                    for child in &mut children {
-                        let length = updates[start..].partition_point(|update| {
-                            update.key.as_slice() <= child.max_key.as_slice()
+                    for mutation in mutations {
+                        let position = rows.binary_search_by(|row| {
+                            row.key.as_slice().cmp(mutation.key.as_slice())
                         });
+                        match (mutation.operation, position) {
+                            (ResolvedOperation::Insert(value), Err(index)) => {
+                                rows.insert(
+                                    index,
+                                    LeafEntry {
+                                        key: mutation.key.clone(),
+                                        value,
+                                    },
+                                );
+                            }
+                            (ResolvedOperation::Insert(_), Ok(_)) => {
+                                return Err(format!(
+                                    "ForkTree insert violates identity uniqueness: {}",
+                                    String::from_utf8_lossy(&mutation.key)
+                                ));
+                            }
+                            (ResolvedOperation::Update(value), Ok(index)) => {
+                                rows[index].value = value;
+                            }
+                            (ResolvedOperation::Update(_), Err(_)) => {
+                                return Err(format!(
+                                    "ForkTree update identity is absent: {}",
+                                    String::from_utf8_lossy(&mutation.key)
+                                ));
+                            }
+                            (ResolvedOperation::Delete, Ok(index)) => {
+                                rows.remove(index);
+                            }
+                            (ResolvedOperation::Delete, Err(_)) => {
+                                return Err(format!(
+                                    "ForkTree delete identity is absent: {}",
+                                    String::from_utf8_lossy(&mutation.key)
+                                ));
+                            }
+                        }
+                    }
+                    Ok(stage_leaf_level(&rows, pending))
+                }
+                Node::Internal(children) => {
+                    let child_count = children.len();
+                    let mut rewritten = Vec::new();
+                    let mut start = 0;
+                    for (index, child) in children.into_iter().enumerate() {
+                        let length = if index + 1 == child_count {
+                            mutations.len() - start
+                        } else {
+                            mutations[start..].partition_point(|mutation| {
+                                mutation.key.as_slice() <= child.max_key.as_slice()
+                            })
+                        };
                         let end = start + length;
                         if end > start {
-                            *child = self
-                                .rewrite_node(child.id, &updates[start..end], pending, accounting)
-                                .await?;
+                            rewritten.extend(
+                                self.rewrite_general(
+                                    child.id,
+                                    &mutations[start..end],
+                                    node_cache,
+                                    pending,
+                                )
+                                .await?,
+                            );
+                        } else {
+                            rewritten.push(child);
                         }
                         start = end;
                     }
-                    if start != updates.len() {
-                        return Err("update key sorts beyond tree maximum".to_string());
+                    if start != mutations.len() {
+                        return Err("ForkTree mutation routing lost an identity".to_string());
                     }
-                    let bytes = encode_internal(&children);
-                    let id = stage_object(bytes, pending);
-                    Ok(NodeRef {
-                        id,
-                        max_key: children
-                            .last()
-                            .expect("internal nodes are nonempty")
-                            .max_key
-                            .clone(),
-                    })
+                    // Copy only this parent's authenticated references. A
+                    // bounded split can add a sibling and an empty child can
+                    // disappear; unchanged sibling bodies are not loaded or
+                    // rewritten. Nonempty underfull blocks remain valid and
+                    // avoid turning ordinary CRUD into fanout-wide repacking.
+                    Ok(stage_internal_level(&rewritten, pending))
                 }
             }
         })
+    }
+
+    fn finish_root(
+        &self,
+        mut roots: Vec<NodeRef>,
+        node_cache: &BTreeMap<ObjectId, Node>,
+        pending: &mut BTreeMap<ObjectId, Bytes>,
+    ) -> Result<NodeRef, String> {
+        if roots.is_empty() {
+            let id = stage_object(encode_leaf(&[]), pending);
+            return Ok(NodeRef {
+                id,
+                max_key: Vec::new(),
+            });
+        }
+        while roots.len() > 1 {
+            roots = stage_internal_level(&roots, pending);
+        }
+        let mut root = roots.pop().expect("ForkTree root level is nonempty");
+        loop {
+            match load_pending_or_cached_node(root.id, node_cache, pending)? {
+                Node::Internal(children) if children.len() == 1 => {
+                    root = children.into_iter().next().expect("one root child");
+                }
+                _ => return Ok(root),
+            }
+        }
+    }
+
+    async fn load_mutation_working_set(
+        &self,
+        root: ObjectId,
+        mutations: &[ResolvedMutation],
+    ) -> Result<BTreeMap<ObjectId, Node>, String> {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(root, decode_node(&self.load_object(root).await?)?);
+        let mut frontier = vec![(root, 0_usize, mutations.len())];
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            let mut needed = std::collections::BTreeSet::new();
+            for (id, mutation_start, mutation_end) in frontier {
+                let Some(Node::Internal(children)) = nodes.get(&id) else {
+                    continue;
+                };
+                let mutations = &mutations[mutation_start..mutation_end];
+                let mut local_start = 0_usize;
+                for (index, child) in children.iter().enumerate() {
+                    let length = if index + 1 == children.len() {
+                        mutations.len() - local_start
+                    } else {
+                        mutations[local_start..].partition_point(|mutation| {
+                            mutation.key.as_slice() <= child.max_key.as_slice()
+                        })
+                    };
+                    let local_end = local_start + length;
+                    if local_end > local_start {
+                        needed.insert(child.id);
+                        next.push((
+                            child.id,
+                            mutation_start + local_start,
+                            mutation_start + local_end,
+                        ));
+                    }
+                    local_start = local_end;
+                }
+                if local_start != mutations.len() {
+                    return Err("ForkTree prefetch routing lost an identity".to_string());
+                }
+            }
+            let missing = needed
+                .into_iter()
+                .filter(|id| !nodes.contains_key(id))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                let loaded = self.load_objects(&missing).await?;
+                for (id, bytes) in missing.into_iter().zip(loaded) {
+                    nodes.insert(id, decode_node(&bytes)?);
+                }
+            }
+            frontier = next;
+        }
+        Ok(nodes)
+    }
+
+    async fn node_max_key(&self, id: ObjectId) -> Result<Vec<u8>, String> {
+        Ok(node_max_key(&decode_node(&self.load_object(id).await?)?))
     }
 
     fn find_value<'a>(
@@ -1926,6 +2304,28 @@ where
                         .ok_or_else(|| "ForkTree point key exceeds root maximum".to_string())?;
                     self.find_value(child.id, key).await
                 }
+            }
+        })
+    }
+
+    fn find_value_optional<'a>(
+        &'a self,
+        id: ObjectId,
+        key: &'a [u8],
+    ) -> BoxFuture<'a, Result<Option<ValueRef>, String>> {
+        Box::pin(async move {
+            match decode_node(&self.load_object(id).await?)? {
+                Node::Leaf(rows) => Ok(rows
+                    .binary_search_by(|row| row.key.as_slice().cmp(key))
+                    .ok()
+                    .map(|index| rows[index].value)),
+                Node::Internal(children) => match children
+                    .iter()
+                    .find(|child| key <= child.max_key.as_slice())
+                {
+                    Some(child) => self.find_value_optional(child.id, key).await,
+                    None => Ok(None),
+                },
             }
         })
     }
@@ -1960,60 +2360,222 @@ where
         })
     }
 
-    fn diff_nodes<'a>(
+    fn collect_relational_rows<'a>(
         &'a self,
-        before: ObjectId,
-        after: ObjectId,
-        output: &'a mut Vec<Vec<u8>>,
+        id: ObjectId,
+        output: &'a mut Vec<(Vec<u8>, RelationalValue)>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if before == after {
-                return Ok(());
-            }
-            let objects = self.load_objects(&[before, after]).await?;
-            let before = decode_node(&objects[0])?;
-            let after = decode_node(&objects[1])?;
-            match (before, after) {
-                (Node::Leaf(before), Node::Leaf(after)) => {
-                    if before.len() != after.len()
-                        || before
-                            .iter()
-                            .zip(&after)
-                            .any(|(left, right)| left.key != right.key)
-                    {
-                        return Err(
-                            "ForkTree focused diff encountered a key-set layout change".to_string()
-                        );
-                    }
-                    output.extend(before.into_iter().zip(after).filter_map(|(left, right)| {
-                        (left.value != right.value).then_some(left.key)
-                    }));
-                }
-                (Node::Internal(before), Node::Internal(after)) => {
-                    if before.len() != after.len()
-                        || before
-                            .iter()
-                            .zip(&after)
-                            .any(|(left, right)| left.max_key != right.max_key)
-                    {
-                        return Err(
-                            "ForkTree focused diff encountered an internal layout change"
-                                .to_string(),
-                        );
-                    }
-                    for (left, right) in before.into_iter().zip(after) {
-                        if left.id != right.id {
-                            self.diff_nodes(left.id, right.id, output).await?;
-                        }
+            match decode_node(&self.load_object(id).await?)? {
+                Node::Leaf(rows) => {
+                    let ids = rows
+                        .iter()
+                        .map(|row| row.value.pack)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let packs = ids
+                        .iter()
+                        .copied()
+                        .zip(self.load_objects(&ids).await?)
+                        .map(|(id, bytes)| decode_value_pack(&bytes).map(|values| (id, values)))
+                        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                    for row in rows {
+                        let value = packs
+                            .get(&row.value.pack)
+                            .and_then(|values| values.get(row.value.index as usize))
+                            .cloned()
+                            .ok_or_else(|| {
+                                "ForkTree relational value-pack reference is invalid".to_string()
+                            })?;
+                        output.push((row.key, value));
                     }
                 }
-                _ => return Err("ForkTree diff encountered mismatched node kinds".to_string()),
+                Node::Internal(children) => {
+                    for child in children {
+                        self.collect_relational_rows(child.id, output).await?;
+                    }
+                }
             }
             Ok(())
         })
     }
 
+    async fn diff_rows(&self, before: ObjectId, after: ObjectId) -> Result<Vec<RowChange>, String> {
+        if before == after {
+            return Ok(Vec::new());
+        }
+        let before = self.load_commit(before).await?;
+        let after = self.load_commit(after).await?;
+        let mut output = Vec::new();
+        self.diff_forests(
+            vec![NodeRef {
+                id: before.root,
+                max_key: self.node_max_key(before.root).await?,
+            }],
+            vec![NodeRef {
+                id: after.root,
+                max_key: self.node_max_key(after.root).await?,
+            }],
+            &mut output,
+        )
+        .await?;
+        output.sort_by(|left, right| left.key.cmp(&right.key));
+        if output.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+            return Err("ForkTree diff emitted duplicate identities".to_string());
+        }
+        Ok(output)
+    }
+
+    fn diff_forests<'a>(
+        &'a self,
+        before: Vec<NodeRef>,
+        after: Vec<NodeRef>,
+        output: &'a mut Vec<RowChange>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if before.is_empty() && after.is_empty() {
+                return Ok(());
+            }
+            let after_positions = after
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.id, index))
+                .collect::<BTreeMap<_, _>>();
+            let mut before_start = 0;
+            let mut after_start = 0;
+            let mut found_common = false;
+            for (before_index, node) in before.iter().enumerate() {
+                let Some(&after_index) = after_positions.get(&node.id) else {
+                    continue;
+                };
+                if before_index < before_start || after_index < after_start {
+                    continue;
+                }
+                found_common = true;
+                self.diff_forests(
+                    before[before_start..before_index].to_vec(),
+                    after[after_start..after_index].to_vec(),
+                    output,
+                )
+                .await?;
+                before_start = before_index + 1;
+                after_start = after_index + 1;
+            }
+            if found_common {
+                return self
+                    .diff_forests(
+                        before[before_start..].to_vec(),
+                        after[after_start..].to_vec(),
+                        output,
+                    )
+                    .await;
+            }
+
+            let mut before_nodes = Vec::with_capacity(before.len());
+            for node in &before {
+                before_nodes.push(decode_node(&self.load_object(node.id).await?)?);
+            }
+            let mut after_nodes = Vec::with_capacity(after.len());
+            for node in &after {
+                after_nodes.push(decode_node(&self.load_object(node.id).await?)?);
+            }
+            let before_leaves = before_nodes
+                .iter()
+                .all(|node| matches!(node, Node::Leaf(_)));
+            let after_leaves = after_nodes.iter().all(|node| matches!(node, Node::Leaf(_)));
+            if before_leaves && after_leaves {
+                let mut before_rows = Vec::new();
+                for node in before_nodes {
+                    let Node::Leaf(mut rows) = node else {
+                        unreachable!();
+                    };
+                    before_rows.append(&mut rows);
+                }
+                let mut after_rows = Vec::new();
+                for node in after_nodes {
+                    let Node::Leaf(mut rows) = node else {
+                        unreachable!();
+                    };
+                    after_rows.append(&mut rows);
+                }
+                let mut before_index = 0;
+                let mut after_index = 0;
+                while before_index < before_rows.len() || after_index < after_rows.len() {
+                    match (before_rows.get(before_index), after_rows.get(after_index)) {
+                        (Some(left), Some(right)) if left.key == right.key => {
+                            if left.value != right.value {
+                                let before_value = self.load_relational_value(left.value).await?;
+                                let after_value = self.load_relational_value(right.value).await?;
+                                if before_value != after_value {
+                                    output.push(RowChange {
+                                        key: left.key.clone(),
+                                        before: Some(before_value),
+                                        after: Some(after_value),
+                                    });
+                                }
+                            }
+                            before_index += 1;
+                            after_index += 1;
+                        }
+                        (Some(left), Some(right)) if left.key < right.key => {
+                            output.push(RowChange {
+                                key: left.key.clone(),
+                                before: Some(self.load_relational_value(left.value).await?),
+                                after: None,
+                            });
+                            before_index += 1;
+                        }
+                        (Some(_), Some(right)) => {
+                            output.push(RowChange {
+                                key: right.key.clone(),
+                                before: None,
+                                after: Some(self.load_relational_value(right.value).await?),
+                            });
+                            after_index += 1;
+                        }
+                        (Some(left), None) => {
+                            output.push(RowChange {
+                                key: left.key.clone(),
+                                before: Some(self.load_relational_value(left.value).await?),
+                                after: None,
+                            });
+                            before_index += 1;
+                        }
+                        (None, Some(right)) => {
+                            output.push(RowChange {
+                                key: right.key.clone(),
+                                before: None,
+                                after: Some(self.load_relational_value(right.value).await?),
+                            });
+                            after_index += 1;
+                        }
+                        (None, None) => break,
+                    }
+                }
+                return Ok(());
+            }
+
+            let before = expand_forest(before, before_nodes);
+            let after = expand_forest(after, after_nodes);
+            self.diff_forests(before, after, output).await
+        })
+    }
+
     async fn load_value(&self, value: ValueRef) -> Result<Vec<u8>, String> {
+        match decode_value_pack(&self.load_object(value.pack).await?)?
+            .get(value.index as usize)
+            .cloned()
+            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())?
+        {
+            RelationalValue::Bytes(bytes) => Ok(bytes),
+            RelationalValue::Null => {
+                Err("ForkTree byte-only reader encountered a relational NULL".to_string())
+            }
+        }
+    }
+
+    async fn load_relational_value(&self, value: ValueRef) -> Result<RelationalValue, String> {
         decode_value_pack(&self.load_object(value.pack).await?)?
             .get(value.index as usize)
             .cloned()
@@ -2105,7 +2667,15 @@ where
                                 "ForkTree value-pack index is out of bounds".to_string()
                             })?
                             .clone();
-                        output.push((row.key, value));
+                        match value {
+                            RelationalValue::Bytes(bytes) => output.push((row.key, bytes)),
+                            RelationalValue::Null => {
+                                return Err(
+                                    "ForkTree byte-only row scan encountered a relational NULL"
+                                        .to_string(),
+                                );
+                            }
+                        }
                     }
                 }
                 Node::Internal(children) => {
@@ -2397,6 +2967,33 @@ where
     }
 }
 
+fn load_pending_or_cached_node(
+    id: ObjectId,
+    node_cache: &BTreeMap<ObjectId, Node>,
+    pending: &BTreeMap<ObjectId, Bytes>,
+) -> Result<Node, String> {
+    match pending.get(&id) {
+        Some(bytes) => decode_node(bytes),
+        None => node_cache.get(&id).cloned().ok_or_else(|| {
+            format!(
+                "ForkTree node {} is absent from its working set",
+                hex_id(id)
+            )
+        }),
+    }
+}
+
+fn node_max_key(node: &Node) -> Vec<u8> {
+    match node {
+        Node::Leaf(rows) => rows.last().map_or_else(Vec::new, |row| row.key.clone()),
+        Node::Internal(children) => children
+            .last()
+            .expect("authenticated internal node is nonempty")
+            .max_key
+            .clone(),
+    }
+}
+
 fn build_tree(
     rows: &[(Vec<u8>, Vec<u8>)],
     pending: &mut BTreeMap<ObjectId, Bytes>,
@@ -2407,10 +3004,11 @@ fn build_tree(
     let mut level = rows
         .chunks(LEAF_ROWS)
         .map(|chunk| {
-            let value_pack = stage_object(
-                encode_value_pack(chunk.iter().map(|(_, value)| value.as_slice())),
-                pending,
-            );
+            let values = chunk
+                .iter()
+                .map(|(_, value)| RelationalValue::Bytes(value.clone()))
+                .collect::<Vec<_>>();
+            let value_pack = stage_object(encode_value_pack(values.iter()), pending);
             let leaf = chunk
                 .iter()
                 .enumerate()
@@ -2448,6 +3046,65 @@ fn build_tree(
     Ok(level.pop().expect("nonempty tree has a root"))
 }
 
+fn balanced_chunk_sizes(total: usize, maximum: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let groups = total.div_ceil(maximum);
+    let base = total / groups;
+    let remainder = total % groups;
+    (0..groups)
+        .map(|index| base + usize::from(index < remainder))
+        .collect()
+}
+
+fn stage_leaf_level(rows: &[LeafEntry], pending: &mut BTreeMap<ObjectId, Bytes>) -> Vec<NodeRef> {
+    let mut offset = 0;
+    balanced_chunk_sizes(rows.len(), LEAF_ROWS)
+        .into_iter()
+        .map(|size| {
+            let leaf = &rows[offset..offset + size];
+            offset += size;
+            NodeRef {
+                id: stage_object(encode_leaf(leaf), pending),
+                max_key: leaf.last().expect("balanced leaf is nonempty").key.clone(),
+            }
+        })
+        .collect()
+}
+
+fn stage_internal_level(
+    children: &[NodeRef],
+    pending: &mut BTreeMap<ObjectId, Bytes>,
+) -> Vec<NodeRef> {
+    let mut offset = 0;
+    balanced_chunk_sizes(children.len(), INTERNAL_CHILDREN)
+        .into_iter()
+        .map(|size| {
+            let internal = &children[offset..offset + size];
+            offset += size;
+            NodeRef {
+                id: stage_object(encode_internal(internal), pending),
+                max_key: internal
+                    .last()
+                    .expect("balanced internal is nonempty")
+                    .max_key
+                    .clone(),
+            }
+        })
+        .collect()
+}
+
+fn expand_forest(refs: Vec<NodeRef>, nodes: Vec<Node>) -> Vec<NodeRef> {
+    refs.into_iter()
+        .zip(nodes)
+        .flat_map(|(node_ref, node)| match node {
+            Node::Leaf(_) => vec![node_ref],
+            Node::Internal(children) => children,
+        })
+        .collect()
+}
+
 fn validate_sorted_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
     if rows.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err("ForkTree bulk input must be strictly key sorted".to_string());
@@ -2455,12 +3112,15 @@ fn validate_sorted_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_sorted_updates(updates: &[Update]) -> Result<(), String> {
-    if updates.is_empty() {
-        return Err("ForkTree update batch must not be empty".to_string());
+fn validate_sorted_mutations(mutations: &[Mutation], allow_empty: bool) -> Result<(), String> {
+    if mutations.is_empty() && !allow_empty {
+        return Err("ForkTree mutation batch must not be empty".to_string());
     }
-    if updates.windows(2).any(|pair| pair[0].key >= pair[1].key) {
-        return Err("ForkTree updates must be strictly key sorted".to_string());
+    if mutations
+        .windows(2)
+        .any(|pair| pair[0].key() >= pair[1].key())
+    {
+        return Err("ForkTree mutations must be strictly identity sorted".to_string());
     }
     Ok(())
 }
@@ -2503,11 +3163,17 @@ fn encode_leaf(rows: &[LeafEntry]) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn encode_value_pack<'a>(values: impl ExactSizeIterator<Item = &'a [u8]>) -> Bytes {
+fn encode_value_pack<'a>(values: impl ExactSizeIterator<Item = &'a RelationalValue>) -> Bytes {
     let mut body = Vec::new();
     put_u32(&mut body, values.len());
     for value in values {
-        put_bytes(&mut body, value);
+        match value {
+            RelationalValue::Null => body.push(0),
+            RelationalValue::Bytes(bytes) => {
+                body.push(1);
+                put_bytes(&mut body, bytes);
+            }
+        }
     }
     let compressed =
         zstd::bulk::compress(&body, 1).expect("compress canonical ForkTree value pack");
@@ -2543,13 +3209,18 @@ fn encode_initial_delta(root: ObjectId, rows: usize) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn encode_delta<'a>(value_pack: ObjectId, keys: impl ExactSizeIterator<Item = &'a [u8]>) -> Bytes {
+fn encode_mutation_delta(value_pack: Option<ObjectId>, mutations: &[Mutation]) -> Bytes {
     let mut bytes = object_prefix(DELTA_TAG);
-    bytes.push(1);
-    bytes.extend_from_slice(&value_pack.0);
-    put_u32(&mut bytes, keys.len());
-    for key in keys {
-        put_bytes(&mut bytes, key);
+    bytes.push(4);
+    put_optional_id(&mut bytes, value_pack);
+    put_u32(&mut bytes, mutations.len());
+    for mutation in mutations {
+        bytes.push(match mutation {
+            Mutation::Insert { .. } => 0,
+            Mutation::Update { .. } => 1,
+            Mutation::Delete { .. } => 2,
+        });
+        put_bytes(&mut bytes, mutation.key());
     }
     Bytes::from(bytes)
 }
@@ -2673,7 +3344,7 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
     }
 }
 
-fn decode_value_pack(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+fn decode_value_pack(bytes: &[u8]) -> Result<Vec<RelationalValue>, String> {
     let mut decoder = Decoder::new(bytes);
     if decoder.object_tag()? != VALUE_PACK_TAG {
         return Err("ForkTree leaf does not reference a value-pack object".to_string());
@@ -2687,7 +3358,11 @@ fn decode_value_pack(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let count = body.u32()?;
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
-        values.push(body.bytes()?);
+        values.push(match body.take(1)?[0] {
+            0 => RelationalValue::Null,
+            1 => RelationalValue::Bytes(body.bytes()?),
+            tag => return Err(format!("unknown ForkTree relational value tag {tag}")),
+        });
     }
     body.finish()?;
     Ok(values)
@@ -2797,15 +3472,6 @@ fn object_edges(bytes: &[u8]) -> Result<ObjectEdges, String> {
                     decoder.finish()?;
                     Ok(ObjectEdges::traverse([root]))
                 }
-                1 => {
-                    let pack = decoder.id()?;
-                    let count = decoder.u32()?;
-                    for _ in 0..count {
-                        let _ = decoder.bytes()?;
-                    }
-                    decoder.finish()?;
-                    Ok(ObjectEdges::terminal([pack]))
-                }
                 2 => {
                     let before = decoder.optional_id()?;
                     let after = decoder.id()?;
@@ -2819,6 +3485,23 @@ fn object_edges(bytes: &[u8]) -> Result<ObjectEdges, String> {
                     let blob = decoder.optional_id()?;
                     decoder.finish()?;
                     Ok(ObjectEdges::traverse(std::iter::once(root).chain(blob)))
+                }
+                4 => {
+                    let pack = decoder.optional_id()?;
+                    let count = decoder.u32()?;
+                    for _ in 0..count {
+                        match decoder.take(1)?[0] {
+                            0..=2 => {}
+                            operation => {
+                                return Err(format!(
+                                    "unknown ForkTree mutation operation {operation}"
+                                ));
+                            }
+                        }
+                        let _key = decoder.bytes()?;
+                    }
+                    decoder.finish()?;
+                    Ok(ObjectEdges::terminal(pack))
                 }
                 mode => Err(format!("unknown ForkTree delta mode {mode}")),
             }
