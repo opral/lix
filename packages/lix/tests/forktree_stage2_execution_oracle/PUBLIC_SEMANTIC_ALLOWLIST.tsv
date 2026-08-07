@@ -1,0 +1,25 @@
+symbol	retained_owner_boundary	reason_allowed
+BlobDataReader	ForkTree authenticated blob manifest/chunk facade	Public file/blob read semantics remain; old binary-CAS KV and codec bodies do not.
+BranchContext	ForkTree branch selector facade	Branch API remains while BRANCH_HEAD_CONTROL_SPACE and control codec disappear.
+BranchLifecycle	ForkTree selector and RefChange publication facade	Create/delete/rename/switch semantics remain without branch-control persistence.
+BranchOperation	Immutable RefChange semantic value	Public operation identity is semantic data, not physical branch control.
+ChangeId	Unified raw-UUID ChangeCatalog	Stable public identity remains; CHANGE_SPACE and COMMIT_CHANGE_ID_SPACE do not.
+ChangelogContext	CommitCatalog and unified ChangeCatalog facade	Public history API remains; changelog store/codec authority does not.
+CommitId	Raw-UUID CommitCatalog	Stable public identity remains; COMMIT_SPACE does not.
+Engine	ForkTree-backed public engine facade	Session/bootstrap behavior remains; no physical legacy owner is implied.
+LiveStateContext	Coherent global+branch+untracked view facade	Current-state semantics remain; tracked HOT/base authorities do not.
+LiveStateReader	Coherent selected-view reader facade	Point/range materialization remains without a legacy tracked serving path.
+SessionContext	ForkTree-backed public session facade	Public transactions/files/history remain unchanged.
+load_plugin_registry_at_commit	Authenticated selected plugin-registry object reader	Semantic facade explicitly retained from #1258; old plugin checkpoint rows are deleted.
+stage_repository_gc	Bounded ForkTree owner GC facade	Public maintenance entry remains; old queue/mark/CAS sweep internals do not.
+stage_repository_gc_with_preconditions	Bounded ForkTree owner GC facade	Preconditioned maintenance entry remains; it cannot decode old owner bytes.
+upsert_file_content_part	UploadSelector/ReceiptTree publication facade	Multipart API remains; UPLOAD_STATE_SPACE and cumulative leaf format do not.
+lix_branch	Derived branch selector materialization	Public SQL relation remains and is not durable authority.
+lix_branch_ref	Derived RefChange materialization	Public SQL relation remains; selector does not duplicate ref_change_id.
+lix_change	Unified ChangeCatalog materialization	Public SQL relation remains; no semantic/ref split directory.
+lix_commit	CommitCatalog materialization	Public SQL relation remains; no COMMIT_SPACE compatibility reader.
+BeginScanOptions	Ephemeral storage cursor options	Projection/order only; no resume or durable continuation state.
+ScanOrder	Ephemeral storage cursor ordering request	Descending may report Unsupported(ReverseScan); it owns no persisted state.
+ScanCursor	Read-handle-bound ephemeral cursor	Only next_page survives; errors/cancellation poison terminally.
+ScanChunk	Owned result page	Rows and stats only; never a durable continuation or authority.
+StorageScanSource	Doc-hidden adapter implementation trait	Backend iterator implementation only; no public compatibility wrapper.

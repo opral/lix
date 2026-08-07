@@ -67,20 +67,42 @@ const LEGACY_OWNER_TOKENS: &[&str] = &[
     "build_mutation_directory",
     "load_mutation_part_read_plan",
     "load_commit_state_manifest",
+    "load_snapshot_commit_root",
+    "load_published_commit_state_topology",
+    "load_commit_state_manifests",
+    "load_commit_state_authority_ids",
+    "load_commit_mutation_directory_roots",
     "load_published_commit_state_manifest",
     "stage_commit_state_manifest",
     "stage_addressable_commit_deltas",
     "stage_ordered_addressable_commit_deltas",
     "stage_change_locators",
+    "stage_ordered_addressable_replacement_parts",
+    "stage_ordered_columnar_mutations",
+    "stage_current_state_scoped_ranges_from_published_parent",
+    "stage_current_state_scoped_ranges_from_published_topology_parent",
+    "stage_current_state_scoped_ranges_from_staged_parent",
+    "stage_current_state_scoped_ranges_from_topology",
+    "stage_delete_commit_state_manifest_for_gc",
     "load_change_record_by_id",
+    "load_commit_delta_change_records",
+    "load_commit_delta_members_with_payloads",
+    "load_commit_delta_replay_metadata",
+    "load_owned_commit_delta_entries",
     "scan_commit_delta_inventory",
     "scan_commit_delta_values",
     "scan_change_records_from_commit_deltas",
     "stage_certified_entity_batches",
     "scan_certified_history_rows",
     "stage_current_state_with_working_diff",
+    "stage_complete_current_state_with_working_diff",
     "stage_commit_with_working_diff",
     "working_diff_for_control",
+    "working_diff_epoch",
+    "hot_working_diff_entries",
+    "choose_hot_or_packed_working_diff",
+    "stage_active_working_diff_scopes",
+    "stage_checkpoint_working_diff_epochs",
     "stage_tracked_working_diff_epoch",
     "stage_delete_tracked_working_diff_epoch",
     // Canonical branch/HOT deterministic-sequence closure. Stage 2 must move
@@ -94,6 +116,8 @@ const LEGACY_OWNER_TOKENS: &[&str] = &[
     // Changelog and branch control authorities.
     "ChangelogStoreReader",
     "ChangelogStoreWriter",
+    "ChangelogReader",
+    "ChangelogWriter",
     "ChangelogStorageRead",
     "stage_transaction_append",
     "commit_change_id_key",
@@ -109,11 +133,21 @@ const LEGACY_OWNER_TOKENS: &[&str] = &[
     "ExistingChunkAwareBinaryCasWriter",
     "StorageBinaryCasDeltaBaseLayout",
     "BinaryCasManifest",
+    "BinaryCasChunking",
+    "BinaryCasStorageStats",
+    "BinaryCasChunkRef",
+    "BinaryChunkCodec",
+    "StorageBinaryCasManifestChunk",
+    "StorageBinaryCasDeltaSegment",
+    "PreparedChunk",
+    "BlobWritePlan",
     "encode_binary_cas_manifest",
     "decode_binary_cas_manifest",
     "stage_manifest_chunk",
     "scan_manifest_chunks",
     "stage_blob_write_skipping_existing_chunks",
+    "UploadState",
+    "UploadManifestLeaf",
     "load_upload_state",
     "stage_upload_state",
     "load_upload_manifest_leaf",
@@ -133,6 +167,11 @@ const LEGACY_OWNER_TOKENS: &[&str] = &[
     "GcMarkPackV1",
     "GcProgressV1",
     "stage_plugin_checkpoint",
+    "CurrentPluginCheckpoint",
+    "load_current_plugin_checkpoint",
+    "stage_current_plugin_checkpoint",
+    "stage_delete_branch_plugin_checkpoints",
+    "stage_delete_current_plugin_checkpoints",
     // #1258 current-main physical CAS/retention implementation. Its semantics
     // move into typed ForkTree edges and bounded owner progress; these names
     // must not survive as a parallel authority.
@@ -175,6 +214,31 @@ const LEGACY_OWNER_TOKENS: &[&str] = &[
     "may_contain_finite_selected_members",
     "RepositoryGcCommitBenchResult",
     "collect_repository_gc_for_bench",
+];
+
+// These names describe retained public semantics or facades, never legacy
+// physical ownership. They are intentionally not residue tokens. Their bodies
+// must be replaced by the ForkTree owner before the first runnable compile.
+const SEMANTIC_ALLOWLIST: &[&str] = &[
+    "BlobDataReader",
+    "BranchContext",
+    "BranchLifecycle",
+    "BranchOperation",
+    "ChangeId",
+    "ChangelogContext",
+    "CommitId",
+    "Engine",
+    "LiveStateContext",
+    "LiveStateReader",
+    "SessionContext",
+    "load_plugin_registry_at_commit",
+    "stage_repository_gc",
+    "stage_repository_gc_with_preconditions",
+    "upsert_file_content_part",
+    "lix_branch",
+    "lix_branch_ref",
+    "lix_change",
+    "lix_commit",
 ];
 
 const DELETE_MODULES: &[&str] = &[
@@ -563,7 +627,171 @@ fn cursor_audit(root: &Path) -> Result<Vec<Finding>, String> {
     Ok(inspect_cursor(&load_sources(root)?))
 }
 
+fn escaped(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
+fn print_budget(root: &Path) -> Result<(), String> {
+    let files = load_sources(root)?;
+    let all_source = files
+        .iter()
+        .map(|file| file.source.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cursor_files = cursor_sources(&files).collect::<Vec<_>>();
+    let cursor_source = cursor_files
+        .iter()
+        .map(|file| file.source.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    println!("disposition\tclass\titem\toccurrences");
+    for token in LEGACY_SPACES {
+        println!(
+            "zero\tlegacy-space\t{}\t{}",
+            escaped(token),
+            count(&all_source, token)
+        );
+    }
+    for token in LEGACY_OWNER_TOKENS {
+        println!(
+            "zero\tlegacy-owner-or-codec\t{}\t{}",
+            escaped(token),
+            count(&all_source, token)
+        );
+    }
+    for module in DELETE_MODULES {
+        let occurrences = usize::from(files.iter().any(|file| {
+            PRODUCTION_ROOTS
+                .iter()
+                .any(|root| file.path == format!("{root}/{module}"))
+        }));
+        println!(
+            "absent\tsuperseded-module\t{}\t{}",
+            escaped(module),
+            occurrences
+        );
+    }
+    for token in OLD_SCAN_IDENTIFIERS {
+        let occurrences = cursor_files
+            .iter()
+            .map(|file| count_identifier(&file.source, token))
+            .sum::<usize>();
+        println!(
+            "zero\told-scan-identifier\t{}\t{}",
+            escaped(token),
+            occurrences
+        );
+    }
+    for token in OLD_SCAN_PATTERNS {
+        println!(
+            "zero\told-scan-pattern\t{}\t{}",
+            escaped(token),
+            count(&cursor_source, token)
+        );
+    }
+    for token in UNSEALED_TOKENS {
+        println!(
+            "zero\tunsealed-owner\t{}\t{}",
+            escaped(token),
+            count(&all_source, token)
+        );
+    }
+    for token in REQUIRED_OWNER_TOKENS {
+        println!(
+            "present\trequired-owner\t{}\t{}",
+            escaped(token),
+            count(&all_source, token)
+        );
+    }
+    for token in REQUIRED_CURSOR_TOKENS {
+        println!(
+            "present\trequired-cursor\t{}\t{}",
+            escaped(token),
+            count(&all_source, token)
+        );
+    }
+    for token in SEMANTIC_ALLOWLIST {
+        println!(
+            "allow\tpublic-semantic\t{}\t{}",
+            escaped(token),
+            count_identifier(&all_source, token)
+        );
+    }
+    Ok(())
+}
+
+fn declaration(line: &str) -> Option<(&'static str, String)> {
+    const KINDS: &[&str] = &["fn", "struct", "enum", "trait", "type", "const", "static"];
+    let words = line
+        .split(|character: char| !(character == '_' || character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    for pair in words.windows(2) {
+        if let Some(kind) = KINDS.iter().find(|kind| **kind == pair[0]) {
+            return Some((kind, pair[1].to_owned()));
+        }
+    }
+    None
+}
+
+fn print_deleted_module_definitions(root: &Path) -> Result<(), String> {
+    let files = load_sources(root)?;
+    let all_source = files
+        .iter()
+        .map(|file| file.source.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!("module\tkind\tsymbol\tproduction_occurrences");
+    for module in DELETE_MODULES {
+        let file = files.iter().find(|file| {
+            PRODUCTION_ROOTS
+                .iter()
+                .any(|source_root| file.path == format!("{source_root}/{module}"))
+        });
+        let Some(file) = file else {
+            continue;
+        };
+        let production = file
+            .source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&file.source);
+        let mut definitions = BTreeSet::new();
+        for raw_line in production.lines() {
+            let line = raw_line.split("//").next().unwrap_or(raw_line);
+            if let Some((kind, symbol)) = declaration(line) {
+                definitions.insert((kind, symbol));
+            }
+        }
+        for (kind, symbol) in definitions {
+            println!(
+                "{}\t{}\t{}\t{}",
+                escaped(module),
+                kind,
+                escaped(&symbol),
+                count_identifier(&all_source, &symbol)
+            );
+        }
+    }
+    Ok(())
+}
+
 fn self_test() -> Result<(), String> {
+    let forbidden = LEGACY_SPACES
+        .iter()
+        .chain(LEGACY_OWNER_TOKENS)
+        .chain(OLD_SCAN_IDENTIFIERS)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if let Some(overlap) = SEMANTIC_ALLOWLIST
+        .iter()
+        .find(|token| forbidden.contains(**token))
+    {
+        return Err(format!(
+            "semantic allowlist overlaps forbidden token {overlap}"
+        ));
+    }
     let required = REQUIRED_OWNER_TOKENS.join("\n");
     let clean = inspect(&required, &BTreeSet::new());
     if !clean.is_empty() {
@@ -638,7 +866,12 @@ fn self_test() -> Result<(), String> {
 
 fn print_findings(findings: &[Finding]) {
     for finding in findings {
-        println!("{}\t{}\t{}", finding.class, finding.item, finding.count);
+        println!(
+            "{}\t{}\t{}",
+            finding.class,
+            escaped(&finding.item),
+            finding.count
+        );
     }
     println!("finding_count={}", findings.len());
 }
@@ -687,9 +920,16 @@ fn run() -> Result<(), String> {
                 Err("cursor hard cut retains forbidden residue".to_owned())
             }
         }
+        Some("budget") => {
+            let root = PathBuf::from(args.next().ok_or("budget requires repository root")?);
+            print_budget(&root)
+        }
+        Some("definitions") => {
+            let root = PathBuf::from(args.next().ok_or("definitions requires repository root")?);
+            print_deleted_module_definitions(&root)
+        }
         _ => Err(
-            "usage: oracle <self-test|baseline REPO|audit REPO|cursor-baseline REPO|cursor-audit REPO>"
-                .to_owned(),
+            "usage: oracle <self-test|baseline REPO|audit REPO|cursor-baseline REPO|cursor-audit REPO|budget REPO|definitions REPO>".to_owned(),
         ),
     }
 }
