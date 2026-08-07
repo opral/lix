@@ -350,16 +350,15 @@ function decodeStoredClientState(
 		snapshot.length < header.length ||
 		header.some((byte, index) => snapshot[index] !== byte)
 	) {
-		// Remote storage previously contained a full Lix snapshot. Backward
-		// compatibility is intentionally not provided: start with empty state and
-		// replace it on the next write.
-		return new Map();
+		throw new Error("Stored Lix client state header is invalid");
 	}
 
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(
-			new TextDecoder().decode(snapshot.subarray(header.length)),
+			new TextDecoder("utf-8", { fatal: true }).decode(
+				snapshot.subarray(header.length),
+			),
 		);
 	} catch (error) {
 		throw new Error("Stored Lix client state is invalid", { cause: error });
