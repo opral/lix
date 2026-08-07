@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest,
-    CommitRecord, CommitScanRequest,
+    ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
+    CommitScanRequest,
 };
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_nodes};
 use crate::commit_graph::{
@@ -22,7 +22,12 @@ use crate::commit_graph::{
 };
 use crate::common::ExactBatch;
 use crate::entity_pk::EntityPk;
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{
+    StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
+    StorageProjectedValue, exact_get_many,
+};
+use crate::storage_codec;
+use bytes::Bytes;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 /// Read model for resolving changelog commit facts at a head.
@@ -112,15 +117,52 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         if !uncached_ids.is_empty() {
-            let mut reader = ChangelogContext::new().reader(&self.store);
-            let batch = reader
-                .load_commits(CommitLoadRequest {
-                    commit_ids: &uncached_ids,
+            let commit_keys = uncached_ids
+                .iter()
+                .map(|commit_id| StorageKey(Bytes::from(crate::changelog::commit_key(*commit_id))))
+                .collect::<Vec<_>>();
+            let authority_keys = uncached_ids
+                .iter()
+                .map(|commit_id| crate::tracked_state::commit_state_authority_key(*commit_id))
+                .collect::<Vec<_>>();
+            let requests = [
+                StorageGetManyRequest {
+                    space: crate::changelog::COMMIT_SPACE,
+                    keys: &commit_keys,
+                    opts: StorageGetOptions::default(),
+                },
+                StorageGetManyRequest {
+                    space: crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+                    keys: &authority_keys,
+                    opts: StorageGetOptions::default(),
+                },
+            ];
+            let mut values = exact_get_many(&self.store, &requests)
+                .await?
+                .values
+                .into_iter();
+            let records = uncached_ids
+                .iter()
+                .map(|_| {
+                    let value = values.next().expect("exact commit slot is present");
+                    let Some(bytes) = full_value_bytes(value) else {
+                        return Ok(None);
+                    };
+                    let record = storage_codec::decode("commit record", &bytes)?;
+                    Ok(Some(record))
                 })
-                .await?;
-            let authority_ids =
-                crate::tracked_state::load_commit_state_authority_ids(&self.store, &uncached_ids)
-                    .await?;
+                .collect::<Result<Vec<Option<CommitRecord>>, LixError>>()?;
+            let batch = ExactBatch::try_new("changelog commit", &uncached_ids, records)?;
+            let authority_ids = uncached_ids
+                .iter()
+                .map(|commit_id| {
+                    crate::tracked_state::decode_commit_state_authority_id(
+                        *commit_id,
+                        values.next().expect("exact authority slot is present"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            debug_assert!(values.next().is_none());
             for ((commit_id, record), authority_id) in batch.into_iter().zip(authority_ids) {
                 let node = commit_graph_node_from_authority(*commit_id, record, authority_id)?;
                 self.node_cache.insert(*commit_id, node);
@@ -514,6 +556,13 @@ fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
         "LIX_ERROR_UNKNOWN",
         format!("commit_graph missing commit '{commit_id}'"),
     )
+}
+
+fn full_value_bytes(value: Option<StorageProjectedValue>) -> Option<Bytes> {
+    match value? {
+        StorageProjectedValue::FullValue(bytes) => Some(bytes),
+        StorageProjectedValue::KeyOnly => None,
+    }
 }
 
 fn validate_parent_generation(
