@@ -1,0 +1,20 @@
+# Every benchmark cell is capped at 20 minutes.
+
+# Exact accepted prototype, 1K gate.
+timeout 20m env CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target FORKTREE_SETTLE_COMPACTION=1 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history rocksdb forktree 1000 1 1 0 1000
+timeout 20m env CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history slatedb forktree 1000 1 1 0 1000
+
+# Exact f77 current controls with the benchmark-only directory replayed.
+timeout 20m env CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target FORKTREE_SETTLE_COMPACTION=1 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history rocksdb current 1000 1 1 0 1000
+timeout 20m env CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history slatedb current 1000 1 1 0 1000
+
+# 10K localized commits plus 64 immutable-root-sharing child branches.
+timeout 20m env CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target FORKTREE_SETTLE_COMPACTION=1 FORKTREE_SHARED_BRANCHES=64 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history rocksdb forktree 10000 1 1 0 10000
+timeout 20m env CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target FORKTREE_SHARED_BRANCHES=64 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history slatedb forktree 10000 1 1 0 10000
+timeout 20m env TMPDIR=/root/projects/lix-forktree-physical-f77/.benchmark-tmp CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target FORKTREE_SETTLE_COMPACTION=1 FORKTREE_SHARED_BRANCHES=64 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history rocksdb current 10000 1 1 0 10000
+timeout 20m env TMPDIR=/root/projects/lix-forktree-physical-f77/.benchmark-tmp CARGO_TARGET_DIR=/root/projects/lix-real-app-lifecycle-e9b3/target FORKTREE_SHARED_BRANCHES=64 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history slatedb current 10000 1 1 0 10000
+
+# Standalone reader-pin/safe-point model.
+timeout 20m rustc --edition=2024 -D warnings -O packages/engine-benchmarks/benches/forktree_replacement/gc_safe_point_oracle.rs -o /tmp/forktree_gc_safe_point_oracle
+timeout 20m /tmp/forktree_gc_safe_point_oracle 1000
+timeout 20m /tmp/forktree_gc_safe_point_oracle 10000

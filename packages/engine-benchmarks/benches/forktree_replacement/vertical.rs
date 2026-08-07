@@ -20,6 +20,21 @@ use super::{
 
 const SOURCE_BRANCH_ID: &str = "019f0000-0000-7000-8000-000000000111";
 
+fn shared_branch_count() -> usize {
+    std::env::var("FORKTREE_SHARED_BRANCHES")
+        .ok()
+        .map(|value| value.parse().expect("FORKTREE_SHARED_BRANCHES is usize"))
+        .unwrap_or(0)
+}
+
+fn current_shared_branch_id(ordinal: usize) -> String {
+    format!("019f0000-0000-7000-8001-{ordinal:012x}")
+}
+
+fn shared_branch_name(ordinal: usize) -> String {
+    format!("shared-{ordinal:04}")
+}
+
 #[derive(Clone)]
 struct HistoryOracle {
     point_key: String,
@@ -207,7 +222,6 @@ async fn run_history_setup<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    assert_eq!(parameters.rows, 1_000, "semantic gate uses 1K live rows");
     assert_eq!(
         parameters.updates, 1,
         "semantic history uses localized K=1 commits"
@@ -268,7 +282,7 @@ where
 
     let mut logical_bytes = 0_u64;
     measure_phase(
-        "history_1000_localized_updates",
+        "history_localized_updates",
         parameters,
         parameters.iterations as u64,
         stats,
@@ -314,6 +328,30 @@ where
     .await
     .expect("create current-Lix semantic source branch");
     assert_eq!(branch.commit_id, history_head);
+    let sharing = shared_branch_count();
+    measure_phase(
+        "high_sharing_branch_publication",
+        parameters,
+        sharing as u64,
+        stats,
+        path,
+        counters,
+        async {
+            for ordinal in 0..sharing {
+                let branch = fixture
+                    .session
+                    .create_branch(CreateBranchOptions {
+                        id: Some(current_shared_branch_id(ordinal)),
+                        name: shared_branch_name(ordinal),
+                        from_commit_id: Some(history_head.clone()),
+                    })
+                    .await
+                    .expect("create current-Lix shared-root branch");
+                assert_eq!(branch.commit_id, history_head);
+            }
+        },
+    )
+    .await;
     let main_branch = fixture
         .session
         .active_branch_id()
@@ -477,7 +515,7 @@ where
 
     let mut accounting = ApplyAccounting::default();
     measure_phase(
-        "history_1000_localized_updates",
+        "history_localized_updates",
         parameters,
         parameters.iterations as u64,
         stats,
@@ -528,6 +566,25 @@ where
     )
     .await
     .expect("create ForkTree semantic source branch");
+    let sharing = shared_branch_count();
+    measure_phase(
+        "high_sharing_branch_publication",
+        parameters,
+        sharing as u64,
+        stats,
+        path,
+        counters,
+        async {
+            for ordinal in 0..sharing {
+                fixture
+                    .tree
+                    .create_branch(&shared_branch_name(ordinal), Some(history_head))
+                    .await
+                    .expect("create ForkTree shared-root branch");
+            }
+        },
+    )
+    .await;
     let source_value = value_for_generation(&fixture.rows[source_index], parameters.iterations + 1);
     fixture
         .tree
@@ -713,6 +770,15 @@ async fn run_history_reopen<S>(
                 )
                 .await
                 .expect("release current-Lix source branch");
+            for ordinal in 0..shared_branch_count() {
+                session
+                    .execute(
+                        "DELETE FROM lix_branch WHERE id = $1",
+                        &[Value::Text(current_shared_branch_id(ordinal))],
+                    )
+                    .await
+                    .expect("release current-Lix shared-root branch");
+            }
             measure_phase(
                 "retention_checkpoint_and_gc",
                 parameters,
@@ -778,6 +844,11 @@ async fn run_history_reopen<S>(
             tree.delete_branch("source")
                 .await
                 .expect("release ForkTree source branch");
+            for ordinal in 0..shared_branch_count() {
+                tree.delete_branch(&shared_branch_name(ordinal))
+                    .await
+                    .expect("release ForkTree shared-root branch");
+            }
             tree.delete_checkpoint("history")
                 .await
                 .expect("release ForkTree history checkpoint");
