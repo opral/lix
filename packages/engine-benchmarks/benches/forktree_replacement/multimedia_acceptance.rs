@@ -16,13 +16,9 @@ use super::{
     process_resident_bytes, settle_rocksdb_compaction, take_stats,
 };
 
-const SIZE_MIB: usize = 8;
-const SIZE: usize = SIZE_MIB * 1024 * 1024;
-const EDIT_BYTES: usize = SIZE / 100;
-const EDIT_OFFSET: usize = SIZE / 3 + 12_345;
 const RANGE_BYTES: usize = 64 * 1024;
-const RANGE_START: usize = EDIT_OFFSET - RANGE_BYTES / 2;
 const SEED: u64 = 0x89a3_10fd_4242_73c1;
+const MIB: usize = 1024 * 1024;
 
 pub(super) async fn run() {
     let backend = match std::env::args().nth(2).as_deref() {
@@ -129,6 +125,7 @@ struct AcceptanceOracle {
     edited_hash: [u8; 32],
     base_range: Vec<u8>,
     edited_range: Vec<u8>,
+    range_start: usize,
     base_identity: BlobIdentityInventory,
     edited_identity: BlobIdentityInventory,
 }
@@ -143,7 +140,7 @@ async fn run_setup<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let payload = PreparedImage::new();
+    let payload = PreparedMedia::new();
     let tree = ForkTree::new(storage);
     tree.initialize(&[(b"multimedia-oracle".to_vec(), b"v1".to_vec())])
         .await
@@ -159,13 +156,13 @@ where
         tree.ingest_blob("main", SingleSpanSource::new(payload.base.clone())),
     )
     .await
-    .expect("ingest 8 MiB image fixture");
+    .expect("ingest multimedia fixture");
     print_blob_accounting("ingest", ingest);
     let base_identity = tree
         .blob_identity_at_commit(base_head)
         .await
         .expect("load base blob identity");
-    assert_eq!(base_identity.logical_bytes, SIZE as u64);
+    assert_eq!(base_identity.logical_bytes, payload.base.len() as u64);
     print_identity("base", &base_identity);
     print_layout(
         "after_ingest",
@@ -189,8 +186,8 @@ where
     let range = measured(backend, "range_read_64k", stats, path, counters, async {
         tree.read_blob_range(
             "main",
-            RANGE_START as u64,
-            (RANGE_START + RANGE_BYTES) as u64,
+            payload.range_start as u64,
+            (payload.range_start + RANGE_BYTES) as u64,
         )
         .await
         .map(|bytes| bytes.materialize())
@@ -235,28 +232,38 @@ where
 
     let (edited_head, edit) = measured(
         backend,
-        "localized_edit_1pct",
+        payload.spec.shape,
         stats,
         path,
         counters,
         tree.ingest_blob("source", SingleSpanSource::new(payload.edited.clone())),
     )
     .await
-    .expect("publish 1% image edit");
-    print_blob_accounting("localized_edit_1pct", edit);
+    .expect("publish multimedia mutation");
+    print_blob_accounting(payload.spec.shape, edit);
     let edited_identity = tree
         .blob_identity_at_commit(edited_head)
         .await
         .expect("load edited blob identity");
     let sharing = sharing(&base_identity, &edited_identity);
-    assert!(sharing.shared_chunks > 0, "localized edit shared no chunks");
     assert!(
-        sharing.shared_declared_bytes > SIZE as u64 / 2,
-        "localized edit failed the smallest credible sharing gate"
+        sharing.shared_chunks > 0,
+        "multimedia mutation shared no chunks"
+    );
+    assert!(
+        sharing.shared_declared_bytes >= payload.spec.minimum_shared_bytes(),
+        "multimedia mutation failed its minimum sharing gate"
     );
     assert_eq!(edit.reused_chunks, sharing.shared_chunks as u64);
     println!(
-        "forktree_multimedia_sharing,size_mib={SIZE_MIB},edit_bytes={EDIT_BYTES},edit_offset={EDIT_OFFSET},base_chunks={},edited_chunks={},shared_chunks={},shared_declared_bytes={},new_unique_chunks={},base_hash={},edited_hash={}",
+        "forktree_multimedia_sharing,family={},shape={},size_mib={},base_bytes={},edited_bytes={},mutation_bytes={},edit_offset={},base_chunks={},edited_chunks={},shared_chunks={},shared_declared_bytes={},new_unique_chunks={},base_hash={},edited_hash={}",
+        payload.spec.family,
+        payload.spec.shape,
+        payload.spec.size_mib,
+        payload.base.len(),
+        payload.edited.len(),
+        payload.spec.mutation_bytes,
+        payload.spec.edit_offset,
         base_identity.chunks.len(),
         edited_identity.chunks.len(),
         sharing.shared_chunks,
@@ -321,6 +328,7 @@ where
         edited_hash: payload.edited_hash,
         base_range: payload.base_range,
         edited_range: payload.edited_range,
+        range_start: payload.range_start,
         base_identity,
         edited_identity,
     }
@@ -345,8 +353,8 @@ async fn run_reopen<S>(
         let range = tree
             .read_blob_range(
                 "main",
-                RANGE_START as u64,
-                (RANGE_START + RANGE_BYTES) as u64,
+                oracle.range_start as u64,
+                (oracle.range_start + RANGE_BYTES) as u64,
             )
             .await?
             .materialize();
@@ -407,8 +415,8 @@ async fn run_reopen<S>(
             let range = tree
                 .read_blob_range(
                     "retained-base",
-                    RANGE_START as u64,
-                    (RANGE_START + RANGE_BYTES) as u64,
+                    oracle.range_start as u64,
+                    (oracle.range_start + RANGE_BYTES) as u64,
                 )
                 .await?
                 .materialize();
@@ -498,6 +506,16 @@ async fn run_reopen<S>(
             .await
             .expect("inventory final layout"),
     );
+    measured(
+        backend,
+        "corruption_fail_closed",
+        stats,
+        path,
+        counters,
+        tree.verify_blob_corruption_fail_closed("main"),
+    )
+    .await
+    .expect("live multimedia corruption must fail closed");
 }
 
 async fn assert_identity_present<S>(
@@ -639,8 +657,11 @@ where
     let physical = physical_delta(counters, physical_before);
     let disk_after = directory_bytes(path);
     println!(
-        "forktree_multimedia_phase,backend={},size_mib={SIZE_MIB},family=image,phase={phase},wall_us={wall_us:.3},cpu_ticks={cpu_ticks},cpu_nanos={cpu_nanos},allocated_bytes={allocated_bytes},allocation_calls={allocation_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},peak_rss_bytes={peak_rss},begin_reads={},begin_writes={},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},write_batches={},write_puts={},write_deletes={},write_ranges={},write_bytes={},commits={},slate_read_objects={},slate_read_bytes={},slate_write_objects={},slate_write_bytes={},disk_before_bytes={disk_before},disk_after_bytes={disk_after},disk_growth_bytes={}",
+        "forktree_multimedia_phase,backend={},size_mib={},family={},shape={},phase={phase},wall_us={wall_us:.3},cpu_ticks={cpu_ticks},cpu_nanos={cpu_nanos},allocated_bytes={allocated_bytes},allocation_calls={allocation_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},peak_rss_bytes={peak_rss},begin_reads={},begin_writes={},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},write_batches={},write_puts={},write_deletes={},write_ranges={},write_bytes={},commits={},slate_read_objects={},slate_read_bytes={},slate_write_objects={},slate_write_bytes={},disk_before_bytes={disk_before},disk_after_bytes={disk_after},disk_growth_bytes={}",
         backend.label(),
+        ShapeSpec::from_env().size_mib,
+        ShapeSpec::from_env().family,
+        ShapeSpec::from_env().shape,
         io.begin_reads,
         io.begin_writes,
         io.get_calls,
@@ -682,32 +703,153 @@ fn start_rss_sampler(
     (stop, peak, sampler)
 }
 
-struct PreparedImage {
+#[derive(Clone, Copy)]
+enum MutationKind {
+    Overwrite,
+    Append,
+    Truncate,
+    SparseOverwrite,
+    PrefixInsert,
+}
+
+#[derive(Clone, Copy)]
+struct ShapeSpec {
+    family: &'static str,
+    shape: &'static str,
+    size_mib: usize,
+    mutation_bytes: usize,
+    edit_offset: usize,
+    kind: MutationKind,
+}
+
+impl ShapeSpec {
+    fn from_env() -> Self {
+        match std::env::var("FORKTREE_MEDIA_SHAPE").as_deref() {
+            Ok("audio-middle") => {
+                Self::overwrite("audio", "middle_overwrite", 16, 8 * MIB, 16 * MIB / 100)
+            }
+            Ok("audio-prefix") => {
+                Self::overwrite("audio", "metadata_prefix_overwrite", 16, 0, 64 * 1024)
+            }
+            Ok("archive-append") => {
+                Self::length_change("archive", "append_1pct", 32, MutationKind::Append)
+            }
+            Ok("archive-truncate") => {
+                Self::length_change("archive", "truncate_1pct", 32, MutationKind::Truncate)
+            }
+            Ok("archive-middle") => Self::overwrite(
+                "archive",
+                "middle_replacement",
+                32,
+                16 * MIB,
+                32 * MIB / 100,
+            ),
+            Ok("video-sparse") => Self {
+                family: "video",
+                shape: "sparse_four_region_overwrite",
+                size_mib: 64,
+                mutation_bytes: 4 * 64 * 1024,
+                edit_offset: 8 * MIB,
+                kind: MutationKind::SparseOverwrite,
+            },
+            Ok("video-prefix-insert") => Self {
+                family: "video",
+                shape: "prefix_insert_256k",
+                size_mib: 64,
+                mutation_bytes: 256 * 1024,
+                edit_offset: 0,
+                kind: MutationKind::PrefixInsert,
+            },
+            Ok(other) => panic!("unknown FORKTREE_MEDIA_SHAPE '{other}'"),
+            Err(_) => panic!("FORKTREE_MEDIA_SHAPE is required"),
+        }
+    }
+
+    const fn overwrite(
+        family: &'static str,
+        shape: &'static str,
+        size_mib: usize,
+        edit_offset: usize,
+        mutation_bytes: usize,
+    ) -> Self {
+        Self {
+            family,
+            shape,
+            size_mib,
+            mutation_bytes,
+            edit_offset,
+            kind: MutationKind::Overwrite,
+        }
+    }
+
+    const fn length_change(
+        family: &'static str,
+        shape: &'static str,
+        size_mib: usize,
+        kind: MutationKind,
+    ) -> Self {
+        let size = size_mib * MIB;
+        Self {
+            family,
+            shape,
+            size_mib,
+            mutation_bytes: size / 100,
+            edit_offset: size,
+            kind,
+        }
+    }
+
+    const fn size_bytes(self) -> usize {
+        self.size_mib * MIB
+    }
+
+    const fn minimum_shared_bytes(self) -> u64 {
+        (self.size_bytes() * 3 / 4) as u64
+    }
+
+    fn range_start(self, base_len: usize, edited_len: usize) -> usize {
+        let common_end = base_len.min(edited_len);
+        let preferred = match self.kind {
+            MutationKind::Append | MutationKind::Truncate => {
+                common_end.saturating_sub(2 * RANGE_BYTES)
+            }
+            MutationKind::PrefixInsert => common_end / 2,
+            _ => self.edit_offset.saturating_sub(RANGE_BYTES / 2),
+        };
+        preferred.min(common_end - RANGE_BYTES)
+    }
+}
+
+struct PreparedMedia {
+    spec: ShapeSpec,
     base: Bytes,
     edited: Bytes,
     base_hash: [u8; 32],
     edited_hash: [u8; 32],
     base_range: Vec<u8>,
     edited_range: Vec<u8>,
+    range_start: usize,
 }
 
-impl PreparedImage {
+impl PreparedMedia {
     fn new() -> Self {
-        let base = image_like_bytes(0, SIZE, SEED);
-        let edit = image_like_bytes(EDIT_OFFSET, EDIT_BYTES, SEED ^ 0x6a09_e667_f3bc_c909);
-        let mut edited = base.clone();
-        edited[EDIT_OFFSET..EDIT_OFFSET + EDIT_BYTES].copy_from_slice(&edit);
+        let spec = ShapeSpec::from_env();
+        let base = family_bytes(spec.family, spec.size_bytes(), SEED);
+        let edited = apply_mutation(&base, spec);
+        let range_start = spec.range_start(base.len(), edited.len());
         let base_hash = *blake3::hash(&base).as_bytes();
         let edited_hash = *blake3::hash(&edited).as_bytes();
-        let base_range = base[RANGE_START..RANGE_START + RANGE_BYTES].to_vec();
-        let edited_range = edited[RANGE_START..RANGE_START + RANGE_BYTES].to_vec();
+        let base_range = base[range_start..range_start + RANGE_BYTES].to_vec();
+        let edited_range = edited[range_start..range_start + RANGE_BYTES].to_vec();
         Self {
+            spec,
             base: Bytes::from(base),
             edited: Bytes::from(edited),
             base_hash,
             edited_hash,
             base_range,
             edited_range,
+            range_start,
         }
     }
 }
@@ -736,23 +878,75 @@ impl SegmentedByteSource for SingleSpanSource {
     }
 }
 
-fn image_like_bytes(global_offset: usize, len: usize, seed: u64) -> Vec<u8> {
-    let mut bytes = deterministic_bytes(len, seed ^ 0xbb67_ae85_84ca_a73b ^ global_offset as u64);
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let position = global_offset + index;
-        let block = position / 4096;
-        if block % 4 != 3 {
-            let pixel = (position % 4096) / 4;
-            let channel = position % 4;
-            *byte = match channel {
-                0 => (pixel as u8).wrapping_add(seed as u8),
-                1 => ((pixel / 4) as u8).wrapping_add((seed >> 8) as u8),
-                2 => (block as u8)
-                    .wrapping_mul(3)
-                    .wrapping_add((seed >> 16) as u8),
-                _ => 0xff,
-            };
+fn family_bytes(family: &str, len: usize, seed: u64) -> Vec<u8> {
+    match family {
+        "audio" => audio_like_bytes(len, seed),
+        "archive" => deterministic_bytes(len, seed ^ 0x510e_527f_ade6_82d1),
+        "video" => video_like_bytes(len, seed),
+        _ => unreachable!("shape has an unsupported family"),
+    }
+}
+
+fn apply_mutation(base: &[u8], spec: ShapeSpec) -> Vec<u8> {
+    let replacement_seed = SEED ^ 0x6a09_e667_f3bc_c909;
+    match spec.kind {
+        MutationKind::Overwrite => {
+            let mut edited = base.to_vec();
+            let replacement = deterministic_bytes(spec.mutation_bytes, replacement_seed);
+            edited[spec.edit_offset..spec.edit_offset + spec.mutation_bytes]
+                .copy_from_slice(&replacement);
+            edited
         }
+        MutationKind::Append => {
+            let mut edited = base.to_vec();
+            edited.extend_from_slice(&deterministic_bytes(spec.mutation_bytes, replacement_seed));
+            edited
+        }
+        MutationKind::Truncate => base[..base.len() - spec.mutation_bytes].to_vec(),
+        MutationKind::SparseOverwrite => {
+            let mut edited = base.to_vec();
+            let region_bytes = spec.mutation_bytes / 4;
+            for (index, numerator) in [1_usize, 3, 5, 7].into_iter().enumerate() {
+                let offset = base.len() * numerator / 8;
+                let replacement = deterministic_bytes(
+                    region_bytes,
+                    replacement_seed ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                );
+                edited[offset..offset + region_bytes].copy_from_slice(&replacement);
+            }
+            edited
+        }
+        MutationKind::PrefixInsert => {
+            let mut edited = Vec::with_capacity(base.len() + spec.mutation_bytes);
+            edited.extend_from_slice(&deterministic_bytes(spec.mutation_bytes, replacement_seed));
+            edited.extend_from_slice(base);
+            edited
+        }
+    }
+}
+
+fn audio_like_bytes(len: usize, seed: u64) -> Vec<u8> {
+    const FRAME_BYTES: usize = 16 * 1024;
+    let mut bytes = deterministic_bytes(len, seed ^ 0xa54f_f53a_5f1d_36f1);
+    for (frame, chunk) in bytes.chunks_mut(FRAME_BYTES).enumerate() {
+        let header = [
+            0xff,
+            0xfb,
+            (frame & 0xff) as u8,
+            ((frame >> 8) & 0xff) as u8,
+        ];
+        chunk[..header.len()].copy_from_slice(&header);
+    }
+    bytes
+}
+
+fn video_like_bytes(len: usize, seed: u64) -> Vec<u8> {
+    const GOP_BYTES: usize = 2 * MIB;
+    let gop = deterministic_bytes(GOP_BYTES, seed ^ 0x3c6e_f372_fe94_f82b);
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        let count = (len - bytes.len()).min(GOP_BYTES);
+        bytes.extend_from_slice(&gop[..count]);
     }
     bytes
 }
