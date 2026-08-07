@@ -675,6 +675,30 @@ pub(crate) async fn load_bytes_many(
         full_bytes_by_hash.insert(hash, bytes);
     }
 
+    // Most reads request each full blob exactly once. Transfer that assembled
+    // buffer into its output slot instead of cloning every payload after it
+    // has already been authenticated and assembled. Repeated output slots
+    // still need independent `Vec` ownership, and delta bases must remain
+    // available until every dependent result has been reconstructed.
+    let mut direct_output_counts = HashMap::<BlobId, usize>::new();
+    let mut delta_base_hashes = HashSet::<BlobId>::new();
+    for entry in metadata.iter().flatten() {
+        match &entry.layout {
+            BlobLayout::Delta { base_blob_hash, .. } => {
+                delta_base_hashes.insert(*base_blob_hash);
+            }
+            _ => {
+                *direct_output_counts.entry(entry.hash).or_default() += 1;
+            }
+        }
+    }
+    let movable_full_hashes = direct_output_counts
+        .into_iter()
+        .filter_map(|(hash, count)| {
+            (count == 1 && !delta_base_hashes.contains(&hash)).then_some(hash)
+        })
+        .collect::<HashSet<_>>();
+
     let entries = metadata
         .into_iter()
         .map(|metadata| {
@@ -691,6 +715,17 @@ pub(crate) async fn load_bytes_many(
                         &segments,
                         &full_bytes_by_hash,
                     ),
+                    _ if movable_full_hashes.contains(&metadata.hash) => {
+                        full_bytes_by_hash.remove(&metadata.hash).ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "binary CAS blob '{}' was not assembled",
+                                    metadata.hash.to_hex()
+                                ),
+                            )
+                        })
+                    }
                     _ => full_bytes_by_hash
                         .get(&metadata.hash)
                         .cloned()
