@@ -19,6 +19,7 @@ const ROOT_STATE: &[u8] = b"markdown/root";
 const BLOCKS_STATE: &[u8] = b"markdown/blocks";
 const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts";
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
+const LEXICAL_SOURCE_REQUIRED_FIELD: &str = "lexical_source_required";
 const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB2";
 const BLOCK_INDEX_HEADER_BYTES: u32 = 16;
 const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
@@ -717,6 +718,10 @@ fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Resul
         {
             continue;
         }
+        format
+            .as_object_mut()
+            .expect("validated Markdown root format is an object")
+            .insert(LEXICAL_SOURCE_REQUIRED_FIELD.to_owned(), Value::Bool(true));
         value
             .as_object_mut()
             .expect("validated Markdown wire snapshot is an object")

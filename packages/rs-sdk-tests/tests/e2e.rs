@@ -1220,6 +1220,392 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
     reopened.close().await.unwrap();
 }
 
+fn markdown_byte_roundtrip_fixture() -> Vec<u8> {
+    let mut source = b"---\nDateApproved: 6/10/2020\nOwner: team\n---\n\n# Competitors\n\n*Counter:\n\n(~26 users)\n\nA paragraph directly followed by\n- list item\n\n**knowledge base / shared workspace agents read and\nwrite to.**\n\n```rust\nlet value = *Counter;\n```\n\n".to_vec();
+    for index in 0..24 {
+        source.extend_from_slice(
+            format!(
+                "## Peer {index}\n\nPeer {index} has *single-asterisk emphasis*, Unicode λ 😀, and `code`.\n\n"
+            )
+            .as_bytes(),
+        );
+    }
+    let mut padding_index = 0;
+    while source.len() < 3_210 {
+        source.extend_from_slice(format!("Padding paragraph {padding_index}.\n\n").as_bytes());
+        padding_index += 1;
+    }
+    source
+}
+
+async fn qualify_markdown_semantic_child_edit_after_reopen<S>(lix: &Lix<S>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = "/company/competitors.md";
+    let file_id = file_id_at_path(lix, path).await;
+    let paragraphs = lix
+        .execute(
+            "SELECT id, payload_json FROM markdown_node \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("restored Markdown paragraphs should query");
+    let paragraph_count = paragraphs.rows().len();
+    let edited_id = paragraphs
+        .rows()
+        .iter()
+        .find(|row| {
+            row.get::<String>("payload_json")
+                .is_ok_and(|payload| payload.contains("Peer 12 has"))
+        })
+        .and_then(|row| row.get::<String>("id").ok())
+        .expect("restored Markdown target paragraph");
+    lix.execute(
+        "UPDATE markdown_node SET payload_json = $1 \
+         WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Text(
+                serde_json::json!({
+                    "inline": [{
+                        "type": "text",
+                        "value": "Peer 12 was edited after durable restore."
+                    }]
+                })
+                .to_string(),
+            ),
+            Value::Text(edited_id),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("semantic child edit after durable restore should commit");
+
+    let rendered = String::from_utf8(
+        read_file(lix, path)
+            .await
+            .expect("restored Markdown file should read")
+            .expect("restored Markdown file should exist"),
+    )
+    .expect("rendered Markdown should be UTF-8");
+    assert!(rendered.contains("Peer 12 was edited after durable restore."));
+    for index in (0..24).filter(|index| *index != 12) {
+        assert!(
+            rendered.contains(&format!("Peer {index} has")),
+            "unrelated Peer {index} block was lost"
+        );
+    }
+    let successor_count = lix
+        .execute(
+            "SELECT COUNT(*) AS count FROM markdown_node \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .expect("successor Markdown paragraphs should query")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("successor Markdown paragraph count");
+    assert_eq!(successor_count, paragraph_count as i64);
+}
+
+async fn qualify_markdown_server_style_branch<S>(lix: &Lix<S>, expected: &[u8])
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let main_branch_id = lix.active_branch_id().await.unwrap();
+    let branch = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-0000000005f1".to_owned()),
+            name: "Markdown byte roundtrip branch".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("Markdown branch should create");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: branch.id,
+    })
+    .await
+    .expect("Markdown branch should activate");
+    assert_eq!(
+        read_file(lix, "/company/competitors.md").await.unwrap(),
+        Some(expected.to_vec())
+    );
+    let branch_bytes = b"# Branch\n\nBranch bytes stay exact.\n".to_vec();
+    write_file(lix, "/branch-only.md", branch_bytes.clone())
+        .await
+        .expect("branch Markdown write should commit");
+    assert_eq!(
+        read_file(lix, "/branch-only.md").await.unwrap(),
+        Some(branch_bytes)
+    );
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: main_branch_id,
+    })
+    .await
+    .expect("main Markdown branch should reactivate");
+}
+
+async fn qualify_markdown_byte_roundtrip<S>(lix: &Lix<S>, expected: &[u8], exercise_branch: bool)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = "/company/competitors.md";
+    write_file(lix, path, expected.to_vec())
+        .await
+        .expect("Markdown fixture write should commit");
+    assert_eq!(read_file(lix, path).await.unwrap(), Some(expected.to_vec()));
+    if exercise_branch {
+        let main_branch_id = lix.active_branch_id().await.unwrap();
+        let branch = lix
+            .create_branch(CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-0000000005f1".to_owned()),
+                name: "Markdown byte roundtrip branch".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("Markdown branch should create");
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: branch.id.clone(),
+        })
+        .await
+        .expect("Markdown branch should activate");
+        assert_eq!(read_file(lix, path).await.unwrap(), Some(expected.to_vec()));
+        let branch_path = "/branch-only.md";
+        let branch_bytes = b"# Branch\n\nBranch bytes stay exact.\n".to_vec();
+        write_file(lix, branch_path, branch_bytes.clone())
+            .await
+            .expect("branch Markdown write should commit");
+        assert_eq!(
+            read_file(lix, branch_path).await.unwrap(),
+            Some(branch_bytes)
+        );
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id,
+        })
+        .await
+        .expect("main Markdown branch should reactivate");
+    }
+    lix.create_checkpoint()
+        .await
+        .expect("Markdown checkpoint should commit");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(read_file(lix, path).await.unwrap(), Some(expected.to_vec()));
+
+    let batch = (0..17)
+        .map(|index| {
+            let path = format!("/batch/peer-{index}.md");
+            let content = format!(
+                "# Peer {index}\n\n*Counter:\n\n(~{} users)\n\nparagraph {index}\n- list item\n\n**wrapped strong {index}\nand Unicode λ 😀.**\n",
+                index + 1
+            )
+            .into_bytes();
+            (path, content)
+        })
+        .collect::<Vec<_>>();
+    let mut transaction = lix
+        .begin_transaction()
+        .await
+        .expect("17-file Markdown transaction should open");
+    for (path, content) in &batch {
+        transaction
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.clone()),
+                    Value::Blob(content.clone().into()),
+                ],
+            )
+            .await
+            .expect("17-file Markdown batch row should stage");
+    }
+    transaction
+        .commit()
+        .await
+        .expect("17-file Markdown batch should commit");
+    for (path, content) in &batch {
+        assert_eq!(
+            read_file(lix, path).await.unwrap(),
+            Some(content.clone()),
+            "batch file {path} must not inherit another file's parser state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v3_markdown_byte_roundtrip_rocksdb_lifecycle_and_17_file_batch() {
+    let root = tempfile::tempdir().expect("create RocksDB Markdown roundtrip directory");
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    let expected = markdown_byte_roundtrip_fixture();
+    qualify_markdown_byte_roundtrip(&lix, &expected, true).await;
+    lix.close().await.unwrap();
+
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, "/company/competitors.md")
+            .await
+            .unwrap(),
+        Some(expected)
+    );
+    qualify_markdown_semantic_child_edit_after_reopen(&reopened).await;
+    reopened.close().await.unwrap();
+}
+
+#[test]
+fn v3_markdown_byte_roundtrip_slatedb_lifecycle_and_17_file_batch() {
+    std::thread::Builder::new()
+        .name("markdown-slatedb-roundtrip".to_owned())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build SlateDB Markdown runtime");
+            runtime.block_on(async {
+                let root =
+                    tempfile::tempdir().expect("create SlateDB Markdown roundtrip directory");
+                let lix = open_slatedb_lix(root.path()).await;
+                install_reference_plugin_in_blank_registry(
+                    &lix,
+                    "plugin_markdown",
+                    &build_markdown_plugin_archive(),
+                    &["markdown_node"],
+                )
+                .await;
+                let expected = markdown_byte_roundtrip_fixture();
+                qualify_markdown_byte_roundtrip(&lix, &expected, false).await;
+                lix.close().await.unwrap();
+
+                let reopened = open_slatedb_lix(root.path()).await;
+                assert_eq!(
+                    read_file(&reopened, "/company/competitors.md")
+                        .await
+                        .unwrap(),
+                    Some(expected)
+                );
+                qualify_markdown_semantic_child_edit_after_reopen(&reopened).await;
+                reopened.close().await.unwrap();
+            });
+        })
+        .expect("spawn SlateDB Markdown roundtrip thread")
+        .join()
+        .expect("SlateDB Markdown roundtrip thread should finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_markdown_byte_roundtrip_slatedb_server_style_runtime_stack_guard() {
+    let root = tempfile::tempdir().expect("create diagnostic SlateDB directory");
+    let lix = open_slatedb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    let expected = markdown_byte_roundtrip_fixture();
+    write_file(&lix, "/company/competitors.md", expected.clone())
+        .await
+        .expect("server-style SlateDB Markdown write");
+    assert_eq!(
+        read_file(&lix, "/company/competitors.md").await.unwrap(),
+        Some(expected.clone())
+    );
+    qualify_markdown_server_style_branch(&lix, &expected).await;
+    lix.create_checkpoint()
+        .await
+        .expect("server-style SlateDB branch checkpoint");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    lix.close().await.unwrap();
+
+    let reopened = open_slatedb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, "/company/competitors.md")
+            .await
+            .unwrap(),
+        Some(expected)
+    );
+    qualify_markdown_semantic_child_edit_after_reopen(&reopened).await;
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_markdown_byte_roundtrip_slatedb_server_style_checkpoint_guard() {
+    let root = tempfile::tempdir().expect("create SlateDB checkpoint guard directory");
+    let lix = open_slatedb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    let expected = markdown_byte_roundtrip_fixture();
+    write_file(&lix, "/company/competitors.md", expected.clone())
+        .await
+        .expect("server-style SlateDB Markdown write");
+    lix.create_checkpoint()
+        .await
+        .expect("server-style SlateDB Markdown checkpoint");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        read_file(&lix, "/company/competitors.md").await.unwrap(),
+        Some(expected.clone())
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_slatedb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, "/company/competitors.md")
+            .await
+            .unwrap(),
+        Some(expected)
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_markdown_byte_roundtrip_slatedb_server_style_batch_guard() {
+    let root = tempfile::tempdir().expect("create SlateDB batch guard directory");
+    let lix = open_slatedb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    let expected = markdown_byte_roundtrip_fixture();
+    write_file(&lix, "/company/competitors.md", expected)
+        .await
+        .expect("server-style SlateDB Markdown write");
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    for index in 0..17 {
+        let path = format!("/batch/peer-{index}.md");
+        let content = format!(
+            "# Peer {index}\n\n*Counter:\n\n(~{} users)\n\nparagraph {index}\n- list item\n\n**wrapped strong {index}\nand Unicode λ 😀.**\n",
+            index + 1
+        );
+        transaction
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[Value::Text(path), Value::Blob(content.into_bytes().into())],
+            )
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+    lix.close().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "exact VS Code Docs d5badf Markdown transition benchmark"]
 async fn v3_markdown_vscode_api_exact_transition_benchmark() {
@@ -8362,6 +8748,14 @@ async fn open_filesystem_lix(path: &Path) -> Lix<LocalFilesystem> {
 
 async fn open_rocksdb_lix(path: &Path) -> Lix<RocksDB> {
     let storage = RocksDB::open(path.join(".lix")).expect("open Lix RocksDB storage");
+    open_lix()
+        .with_storage(storage)
+        .await
+        .expect("open Lix workspace")
+}
+
+async fn open_slatedb_lix(path: &Path) -> Lix<SlateDB> {
+    let storage = SlateDB::open(path.join(".lix")).expect("open Lix SlateDB storage");
     open_lix()
         .with_storage(storage)
         .await

@@ -239,12 +239,15 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 						})
 					: Response.json([
 							{
+								statementIndex: 0,
+								label: "first",
 								columns: ["value"],
 								rows: [[{ kind: "int", value: 1 }]],
 								rowsAffected: 0,
 								notices: [],
 							},
 							{
+								statementIndex: 1,
 								columns: ["value"],
 								rows: [[{ kind: "text", value: "two" }]],
 								rowsAffected: 0,
@@ -257,7 +260,7 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 
 	const results = await lix.executeBatch(
 		[
-			{ sql: "SELECT $1 AS value", params: [1] },
+			{ label: "first", sql: "SELECT $1 AS value", params: [1] },
 			{ sql: "SELECT $1 AS value", params: ["two"] },
 		],
 		{ originKey: "batch-test" },
@@ -265,6 +268,10 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	expect(results.map((result) => result.rows[0]?.get("value"))).toEqual([
 		1,
 		"two",
+	]);
+	expect(results.map((result) => [result.statementIndex, result.label])).toEqual([
+		[0, "first"],
+		[1, undefined],
 	]);
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
 		"/@acme/workspace/lix/v1/execute-batch",
@@ -274,7 +281,11 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	);
 	expect(await requests[1]?.json()).toEqual({
 		statements: [
-			{ sql: "SELECT $1 AS value", params: [{ kind: "int", value: 1 }] },
+			{
+				label: "first",
+				sql: "SELECT $1 AS value",
+				params: [{ kind: "int", value: 1 }],
+			},
 			{
 				sql: "SELECT $1 AS value",
 				params: [{ kind: "text", value: "two" }],
@@ -588,7 +599,7 @@ test("remote executeBatch uses blob splices for stable statement slots", async (
 					return new Response(null, { status: 204 });
 				}
 				bodies.push((await requestJson(request)) as Record<string, unknown>);
-				return Response.json([emptyExecuteResponse()]);
+				return Response.json([{ ...emptyExecuteResponse(), statementIndex: 0 }]);
 			},
 		},
 	});

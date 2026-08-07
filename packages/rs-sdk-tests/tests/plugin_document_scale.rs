@@ -79,6 +79,7 @@ async fn sequential_batches_survive_observation_cache_eviction() {
 
     let updates = (0..DOCUMENTS)
         .map(|index| ExecuteBatchStatement {
+            label: None,
             sql: "UPDATE lix_file SET content = $1 WHERE path = $2".to_string(),
             params: vec![
                 Value::Blob(format!("after {index}\n").into_bytes().into()),
@@ -190,7 +191,11 @@ fn file_insert_statement(
         )));
         params.push(Value::Blob(document.into()));
     }
-    ExecuteBatchStatement { sql, params }
+    ExecuteBatchStatement {
+        sql,
+        params,
+        label: None,
+    }
 }
 
 async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
