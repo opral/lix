@@ -6490,7 +6490,9 @@ mod tests {
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
         StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
-    use crate::transaction::types::{PreparedRowFacts, TestPreparedStateRow};
+    use crate::transaction::types::{
+        PreparedRowFacts, TestPreparedStateRow, TransactionFileContent,
+    };
     use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
     macro_rules! prepared_rows {
@@ -8040,6 +8042,164 @@ mod tests {
             change_id("winner-normal-branch-ref-change"),
             "the stale commit must not replace the winner's public branch-ref metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_deduplicated_publication_first_rejects_stale_cas_gc() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let payload = b"ordinary-deduplicated-publication-race";
+        seed_orphan_cas_payload(&storage, payload).await;
+        let sweep_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary stale sweep read should open");
+        let mut publication_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary publication read should open");
+        let (sweep, sweep_preconditions) = stage_low_level_cas_sweep(&storage, &sweep_read).await;
+        let (publication, publication_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut publication_read,
+            prepared_normal_file_commit(
+                payload,
+                "ordinary-publish-row",
+                "ordinary-publish-commit",
+                "ordinary-publish-commit-change",
+                "ordinary-publish-branch-change",
+            ),
+        )
+        .await
+        .expect("fully deduplicated ordinary file publication should stage");
+        drop(sweep_read);
+        drop(publication_read);
+
+        storage
+            .commit_write_set(
+                publication,
+                StorageWriteOptions {
+                    preconditions: publication_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("ordinary publication should win the CAS epoch");
+        let error = storage
+            .commit_write_set(
+                sweep,
+                StorageWriteOptions {
+                    preconditions: sweep_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale GC must lose after ordinary CAS publication");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+        assert_cas_payload(&storage, payload, true).await;
+    }
+
+    #[tokio::test]
+    async fn cas_gc_first_rejects_stale_ordinary_publication_and_retry_restages() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let payload = b"ordinary-deduplicated-publication-race";
+        seed_orphan_cas_payload(&storage, payload).await;
+        let sweep_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary winning sweep read should open");
+        let mut stale_publication_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary stale publication read should open");
+        let (sweep, sweep_preconditions) = stage_low_level_cas_sweep(&storage, &sweep_read).await;
+        let (stale_publication, stale_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut stale_publication_read,
+            prepared_normal_file_commit(
+                payload,
+                "ordinary-stale-row",
+                "ordinary-stale-commit",
+                "ordinary-stale-commit-change",
+                "ordinary-stale-branch-change",
+            ),
+        )
+        .await
+        .expect("stale fully deduplicated ordinary publication should stage");
+        drop(sweep_read);
+        drop(stale_publication_read);
+
+        storage
+            .commit_write_set(
+                sweep,
+                StorageWriteOptions {
+                    preconditions: sweep_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("GC should win the CAS epoch");
+        assert_cas_payload(&storage, payload, false).await;
+        let error = storage
+            .commit_write_set(
+                stale_publication,
+                StorageWriteOptions {
+                    preconditions: stale_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale ordinary publication must lose after GC");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+
+        let mut retry_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary publication retry read should open");
+        let (retry, retry_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut retry_read,
+            prepared_normal_file_commit(
+                payload,
+                "ordinary-retry-row",
+                "ordinary-retry-commit",
+                "ordinary-retry-commit-change",
+                "ordinary-retry-branch-change",
+            ),
+        )
+        .await
+        .expect("fresh ordinary publication retry should restage CAS payload");
+        drop(retry_read);
+        storage
+            .commit_write_set(
+                retry,
+                StorageWriteOptions {
+                    preconditions: retry_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("fresh ordinary publication retry should commit");
+        assert_cas_payload(&storage, payload, true).await;
     }
 
     #[tokio::test]
@@ -10038,6 +10198,114 @@ mod tests {
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
         }
+    }
+
+    fn prepared_normal_file_commit(
+        payload: &[u8],
+        row_change_label: &str,
+        commit_label: &str,
+        commit_change_label: &str,
+        branch_ref_change_label: &str,
+    ) -> PreparedWriteSet {
+        let file_id = "01960000-0000-7000-8000-00000000ca55";
+        let blob_id = crate::binary_cas::BlobId::from_content(payload);
+        let mut row = tracked_global_row(row_change_label);
+        row.entity_pk = EntityPk::single(file_id);
+        row.schema_key = "lix_binary_blob_ref".into();
+        row.file_id = Some(file_id.into());
+        row.snapshot = Some(
+            crate::transaction::types::stage_json_from_value(
+                crate::transaction::types::TransactionJson::from_value_for_test(
+                    serde_json::json!({
+                        "id": file_id,
+                        "blob_hash": blob_id.to_hex(),
+                        "size_bytes": payload.len(),
+                    }),
+                ),
+                "ordinary CAS epoch test blob reference",
+            )
+            .expect("ordinary file blob reference should stage"),
+        );
+        PreparedWriteSet {
+            insert_selection: PreparedInsertSelection::new(),
+            state_rows: prepared_rows![row],
+            commit_change_refs_by_branch: BTreeMap::from([(
+                GLOBAL_BRANCH_ID.to_string(),
+                change_refs_with(
+                    [row_change_label],
+                    commit_label,
+                    commit_change_label,
+                    branch_ref_change_label,
+                ),
+            )]),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: vec![TransactionFileContent::new(
+                file_id.into(),
+                Some("/ordinary-epoch.bin".into()),
+                Some("ordinary-epoch.bin".into()),
+                GLOBAL_BRANCH_ID.into(),
+                true,
+                false,
+                payload.to_vec(),
+            )],
+        }
+    }
+
+    async fn seed_orphan_cas_payload(storage: &StorageAdapter, payload: &[u8]) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan CAS seed read should open");
+        let mut writes = storage.new_write_set();
+        BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut writes)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                payload.to_vec(),
+            ))
+            .await
+            .expect("orphan CAS payload should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("orphan CAS payload should commit");
+    }
+
+    async fn stage_low_level_cas_sweep(
+        storage: &StorageAdapter,
+        read: &impl StorageAdapterRead,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let swept = crate::binary_cas::stage_gc_reclamation(
+            read,
+            &mut writes,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("ordinary race CAS sweep should stage");
+        assert_eq!(swept.reclaimed_chunk_rows, 1);
+        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+            .await
+            .expect("ordinary race sweep epoch should stage");
+        (writes, preconditions)
+    }
+
+    async fn assert_cas_payload(storage: &StorageAdapter, payload: &[u8], expected: bool) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("cold CAS verification read should open");
+        let mut reader = BinaryCasContext::new().reader(read);
+        let loaded = reader
+            .load_bytes_many(&[crate::binary_cas::BlobId::from_content(payload)])
+            .await
+            .expect("cold CAS verification should authenticate");
+        assert_eq!(loaded.into_vec()[0].as_deref(), expected.then_some(payload));
     }
 
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {

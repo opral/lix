@@ -91,26 +91,33 @@ async fn checkpoint_gc_retains_replay_and_selected_owners_after_reopen<S: Reopen
         churn_once(&lix, 1, false).await;
         let _first_head = newest_commit_id(&lix).await;
         churn_once(&lix, 2, true).await;
-        let retired_head = newest_commit_id(&lix).await;
+        let superseded_head = newest_commit_id(&lix).await;
 
         lix.undo().await.expect("undo second churn commit");
         assert_generation(&lix, 1, false).await;
-        lix.redo().await.expect("redo second churn commit");
+        let redo = lix.redo().await.expect("redo second churn commit");
+        assert_eq!(redo.target_commit_id, superseded_head);
+        let replay_owner = redo.replay_commit_id;
         assert_generation(&lix, 2, true).await;
 
-        lix.create_checkpoint()
+        let compacted_owner = lix
+            .create_checkpoint()
             .await
-            .expect("create compacting checkpoint");
+            .expect("create compacting checkpoint")
+            .commit_id;
         for _ in 1..CHECKPOINT_GC_INTERVAL {
             lix.create_checkpoint()
                 .await
                 .expect("advance production checkpoint-GC cadence");
         }
-        // The 64th checkpoint schedules production GC. Its oldest queue batch
-        // must remain blocked while `tracked_generation` and native current
-        // rows still name this commit, so reclamation is not a progress oracle.
+        // The 64th checkpoint schedules production GC. Corrected undo/redo
+        // publishes a new canonical current-state owner, and the first
+        // checkpoint then compacts that replayed state. The pre-undo target and
+        // replay publication may retire; the compacted checkpoint remains an
+        // authenticated history/root owner through the later queue cadence.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_commit_present(&lix, &retired_head).await;
+        assert_ne!(replay_owner, compacted_owner);
+        assert_commit_present(&lix, &compacted_owner).await;
         assert_generation(&lix, 2, true).await;
         assert_history_readable(&lix).await;
 

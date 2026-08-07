@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
-use crate::binary_cas::{BlobChunkReceipt, ChunkHash};
+use crate::binary_cas::{BlobChunkReceipt, BlobId, ChunkHash};
 use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, Storage, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StorageKeyRange, StoragePrecondition, StorageProjectedValue, StorageReadOptions,
@@ -24,6 +25,158 @@ pub const FILE_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const UPLOAD_PART_WINDOW: u32 = 4;
 const UPLOAD_MANIFEST_LEAF_MAGIC: &[u8; 8] = b"LIXUML2\0";
+
+/// Collects active resumable-upload receipt chunks and stages receipt cleanup.
+/// Upload leaves contain hashes and sizes only; they are never a second payload
+/// authority. Open uploads retain their receipt chunks. A completed state is
+/// only an idempotency receipt: the published file reference is the sole blob
+/// root, so a completed state with no live file root can be retired.
+pub(crate) async fn stage_reclaimable_upload_receipts(
+    store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    writes: &mut crate::storage_adapter::StorageWriteSet,
+    live_blob_roots: &BTreeSet<BlobId>,
+) -> Result<BTreeMap<ChunkHash, u64>, LixError> {
+    let mut states = Vec::<(String, UploadState)>::new();
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                UPLOAD_STATE_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: MAX_SCAN_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let upload_id = std::str::from_utf8(&entry.key.0)
+                .map_err(|_| invalid_upload_storage("upload state key is not UTF-8"))?
+                .to_owned();
+            validate_upload_id_for_storage(&upload_id)?;
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(invalid_upload_storage(
+                    "upload state scan omitted its value",
+                ));
+            };
+            let state = serde_json::from_slice(&value)
+                .map_err(|_| invalid_upload_storage("upload state value is invalid JSON"))?;
+            states.push((upload_id, state));
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    let mut open_ids = BTreeSet::new();
+    for (upload_id, state) in states {
+        match state {
+            UploadState::Open(_) => {
+                open_ids.insert(upload_id);
+            }
+            UploadState::Complete(complete) => {
+                if !live_blob_roots.contains(&BlobId::from_bytes(complete.blob_id)) {
+                    writes.delete(UPLOAD_STATE_SPACE, upload_state_key(&upload_id)?);
+                }
+            }
+        }
+    }
+
+    let mut upload_chunks = BTreeMap::new();
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                UPLOAD_MANIFEST_LEAF_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: MAX_SCAN_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let upload_id = decode_upload_manifest_leaf_upload_id(&entry.key)?;
+            if !open_ids.contains(&upload_id) {
+                // Finalized or state-less receipts are not active roots; the
+                // published file snapshot, if any, owns the blob instead.
+                writes.delete(UPLOAD_MANIFEST_LEAF_SPACE, entry.key);
+                continue;
+            }
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(invalid_upload_storage(
+                    "active upload manifest leaf scan omitted its value",
+                ));
+            };
+            let leaf = decode_upload_manifest_leaf(&value)?;
+            for chunk in leaf.chunks {
+                match upload_chunks.entry(chunk.hash) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(chunk.size_bytes);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if *entry.get() != chunk.size_bytes =>
+                    {
+                        return Err(invalid_upload_storage(format!(
+                            "active upload chunk '{}' has conflicting declared sizes {} and {}",
+                            chunk.hash.to_hex(),
+                            entry.get(),
+                            chunk.size_bytes
+                        )));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    Ok(upload_chunks)
+}
+
+fn decode_upload_manifest_leaf_upload_id(key: &StorageKey) -> Result<String, LixError> {
+    if key.0.len() < 2 + 4 {
+        return Err(invalid_upload_storage(
+            "upload manifest leaf key is too short",
+        ));
+    }
+    let id_len = usize::from(u16::from_be_bytes([key.0[0], key.0[1]]));
+    if key.0.len() != 2 + id_len + 4 {
+        return Err(invalid_upload_storage(
+            "upload manifest leaf key has an invalid upload id length",
+        ));
+    }
+    let upload_id = std::str::from_utf8(&key.0[2..2 + id_len])
+        .map_err(|_| invalid_upload_storage("upload manifest leaf id is not UTF-8"))?
+        .to_owned();
+    validate_upload_id_for_storage(&upload_id)?;
+    Ok(upload_id)
+}
+
+fn validate_upload_id_for_storage(upload_id: &str) -> Result<(), LixError> {
+    if upload_id.is_empty() || upload_id.len() > 200 || !upload_id.is_ascii() {
+        return Err(invalid_upload_storage("upload id is not a valid ASCII key"));
+    }
+    Ok(())
+}
+
+fn invalid_upload_storage(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_STORAGE_ERROR, message)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileUploadProgress {
@@ -187,6 +340,7 @@ where
                 }
                 Some(UploadState::Complete(_)) => unreachable!("complete state returned above"),
             }
+            crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions).await?;
             drop(read);
 
             let commit_boundary = self.transaction_commit_boundary();
@@ -754,13 +908,451 @@ fn invalid_upload(message: &'static str) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE;
+    use crate::binary_cas::BINARY_CAS_CHUNK_SPACE;
     use crate::storage_adapter::{
         StorageAdapter, StorageAdapterRead, StorageCoreProjection, StorageKeyRange,
-        StorageScanOptions,
+        StorageScanOptions, StorageWriteOptions, StorageWriteSet,
     };
     use crate::{Memory, engine::Engine};
     use std::ops::Bound;
+
+    async fn seed_orphan_upload_chunk(
+        storage: &StorageAdapter<Memory>,
+        payload: &[u8],
+    ) -> ChunkHash {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan chunk staging read should open");
+        let mut writes = storage.new_write_set();
+        let receipts = crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut writes)
+            .stage_fixed_part(payload)
+            .await
+            .expect("orphan fixed chunk should stage");
+        assert_eq!(receipts.len(), 1);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("orphan fixed chunk should commit");
+        receipts[0].hash
+    }
+
+    async fn stage_deduplicated_receipt_publication(
+        storage: &StorageAdapter<Memory>,
+        read: &impl StorageAdapterRead,
+        upload_id: &str,
+        payload: &[u8],
+        expect_deduplicated: bool,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
+        let mut writes = storage.new_write_set();
+        let chunks = crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(read, &mut writes)
+            .stage_fixed_part(payload)
+            .await
+            .expect("deduplicated receipt chunk should stage");
+        assert_eq!(
+            writes.is_empty(),
+            expect_deduplicated,
+            "receipt payload staging did not match the expected deduplication state"
+        );
+        let leaf_key = upload_manifest_leaf_key(upload_id, 0).unwrap();
+        stage_upload_manifest_leaf(
+            &mut writes,
+            leaf_key.clone(),
+            &UploadManifestLeaf {
+                part_size: payload.len() as u64,
+                chunks,
+            },
+        )
+        .expect("deduplicated receipt leaf should stage");
+        let state_key = upload_state_key(upload_id).unwrap();
+        stage_upload_state(
+            &mut writes,
+            state_key.clone(),
+            &UploadState::Open(UploadOpen {
+                path: format!("/{upload_id}.bin"),
+                total_size: payload.len() as u64 + 1,
+            }),
+        )
+        .expect("deduplicated receipt state should stage");
+        let mut preconditions = vec![
+            StoragePrecondition::KeyAbsent {
+                space: UPLOAD_MANIFEST_LEAF_SPACE,
+                key: leaf_key,
+            },
+            StoragePrecondition::KeyAbsent {
+                space: UPLOAD_STATE_SPACE,
+                key: state_key,
+            },
+        ];
+        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+            .await
+            .expect("deduplicated receipt epoch should stage");
+        (writes, preconditions)
+    }
+
+    async fn stage_cas_sweep(
+        storage: &StorageAdapter<Memory>,
+        read: &impl StorageAdapterRead,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let upload_chunks = stage_reclaimable_upload_receipts(read, &mut writes, &BTreeSet::new())
+            .await
+            .expect("stale sweep upload mark should collect");
+        let swept = crate::binary_cas::stage_gc_reclamation(
+            read,
+            &mut writes,
+            &BTreeSet::new(),
+            &upload_chunks,
+        )
+        .await
+        .expect("stale CAS sweep should stage");
+        assert_eq!(swept.reclaimed_chunk_rows, 1);
+        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+            .await
+            .expect("stale sweep epoch should stage");
+        (writes, preconditions)
+    }
+
+    async fn chunk_exists(storage: &StorageAdapter<Memory>, hash: ChunkHash) -> bool {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("chunk verification read should open");
+        let page = read
+            .scan(
+                BINARY_CAS_CHUNK_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Included(StorageKey(Bytes::copy_from_slice(hash.as_bytes()))),
+                    upper: Bound::Included(StorageKey(Bytes::copy_from_slice(hash.as_bytes()))),
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    limit_rows: 1,
+                    resume_after: None,
+                },
+            )
+            .await
+            .expect("chunk verification scan should succeed");
+        !page.entries.is_empty()
+    }
+
+    #[tokio::test]
+    async fn receipt_first_rejects_stale_gc_deleting_a_deduplicated_chunk() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"deduplicated-upload-race";
+        let hash = seed_orphan_upload_chunk(&storage, payload).await;
+        let sweep_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale sweep read should open");
+        let receipt_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("receipt publication read should open");
+        let (sweep, sweep_preconditions) = stage_cas_sweep(&storage, &sweep_read).await;
+        let (receipt, receipt_preconditions) = stage_deduplicated_receipt_publication(
+            &storage,
+            &receipt_read,
+            "receipt-first",
+            payload,
+            true,
+        )
+        .await;
+        drop(sweep_read);
+        drop(receipt_read);
+
+        storage
+            .commit_write_set(
+                receipt,
+                StorageWriteOptions {
+                    preconditions: receipt_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("receipt should win the publication fence");
+        assert!(
+            storage
+                .commit_write_set(
+                    sweep,
+                    StorageWriteOptions {
+                        preconditions: sweep_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .is_err(),
+            "stale GC must lose after receipt publication",
+        );
+        assert!(chunk_exists(&storage, hash).await);
+    }
+
+    #[tokio::test]
+    async fn gc_first_rejects_stale_receipt_publication_after_payload_deletion() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"deduplicated-upload-race";
+        let hash = seed_orphan_upload_chunk(&storage, payload).await;
+        let sweep_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sweep read should open");
+        let receipt_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale receipt read should open");
+        let (sweep, sweep_preconditions) = stage_cas_sweep(&storage, &sweep_read).await;
+        let (receipt, receipt_preconditions) = stage_deduplicated_receipt_publication(
+            &storage,
+            &receipt_read,
+            "gc-first",
+            payload,
+            true,
+        )
+        .await;
+        drop(sweep_read);
+        drop(receipt_read);
+
+        storage
+            .commit_write_set(
+                sweep,
+                StorageWriteOptions {
+                    preconditions: sweep_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("GC should win the publication fence");
+        assert!(!chunk_exists(&storage, hash).await);
+        assert!(
+            storage
+                .commit_write_set(
+                    receipt,
+                    StorageWriteOptions {
+                        preconditions: receipt_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .is_err(),
+            "stale receipt must not publish after GC deletes its payload",
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("receipt absence verification read should open");
+        assert!(
+            load_upload_state(&read, &upload_state_key("gc-first").unwrap())
+                .await
+                .expect("stale receipt state lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            load_upload_manifest_leaf(&read, &upload_manifest_leaf_key("gc-first", 0).unwrap())
+                .await
+                .expect("stale receipt leaf lookup should succeed")
+                .is_none()
+        );
+        drop(read);
+
+        let retry_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("receipt retry read should open after GC");
+        let (retry, retry_preconditions) = stage_deduplicated_receipt_publication(
+            &storage,
+            &retry_read,
+            "gc-first",
+            payload,
+            false,
+        )
+        .await;
+        drop(retry_read);
+        storage
+            .commit_write_set(
+                retry,
+                StorageWriteOptions {
+                    preconditions: retry_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("fresh receipt retry should restage the deleted payload");
+        assert!(chunk_exists(&storage, hash).await);
+        let cold_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("cold receipt verification read should open");
+        assert!(
+            load_upload_manifest_leaf(
+                &cold_read,
+                &upload_manifest_leaf_key("gc-first", 0).unwrap()
+            )
+            .await
+            .expect("retried receipt leaf lookup should succeed")
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_receipt_without_a_live_file_root_is_reclaimed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let upload_id = "completed-receipt";
+        let mut initial = storage.new_write_set();
+        stage_upload_state(
+            &mut initial,
+            upload_state_key(upload_id).expect("upload state key should encode"),
+            &UploadState::Complete(UploadComplete {
+                path: "/orphaned.bin".to_owned(),
+                total_size: 7,
+                blob_id: BlobId::from_content(b"orphaned").into_bytes(),
+                part_identities: Vec::new(),
+            }),
+        )
+        .expect("completed state should encode");
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("completed receipt should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("receipt read should open");
+        let mut writes = storage.new_write_set();
+        let chunks = stage_reclaimable_upload_receipts(&read, &mut writes, &BTreeSet::new())
+            .await
+            .expect("receipt sweep should succeed");
+        assert!(chunks.is_empty());
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("completed receipt cleanup should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reopened receipt read should open");
+        assert!(
+            load_upload_state(&read, &upload_state_key(upload_id).unwrap())
+                .await
+                .expect("completed receipt lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_receipt_declared_size_must_match_authenticated_chunk_bytes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"active-upload-chunk";
+        let chunk_hash = ChunkHash::from_content(payload);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("active receipt staging read should open");
+        let mut initial = storage.new_write_set();
+        crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut initial)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                payload.to_vec(),
+            ))
+            .await
+            .expect("active receipt chunk should stage");
+        stage_upload_state(
+            &mut initial,
+            upload_state_key("wrong-size-receipt").unwrap(),
+            &UploadState::Open(UploadOpen {
+                path: "/wrong-size.bin".to_owned(),
+                total_size: payload.len() as u64 + 1,
+            }),
+        )
+        .expect("active upload state should stage");
+        stage_upload_manifest_leaf(
+            &mut initial,
+            upload_manifest_leaf_key("wrong-size-receipt", 0).unwrap(),
+            &UploadManifestLeaf {
+                part_size: payload.len() as u64 + 1,
+                chunks: vec![BlobChunkReceipt {
+                    hash: chunk_hash,
+                    size_bytes: payload.len() as u64 + 1,
+                }],
+            },
+        )
+        .expect("wrong-size receipt should stage");
+        drop(read);
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("wrong-size receipt fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("wrong-size receipt GC read should open");
+        let mut sweep = storage.new_write_set();
+        let upload_chunks = stage_reclaimable_upload_receipts(&read, &mut sweep, &BTreeSet::new())
+            .await
+            .expect("active receipt should collect");
+        let error = crate::binary_cas::stage_gc_reclamation(
+            &read,
+            &mut sweep,
+            &BTreeSet::new(),
+            &upload_chunks,
+        )
+        .await
+        .expect_err("wrong declared upload size must fail GC closed");
+        assert!(
+            error.message.contains("expected 20 uncompressed bytes"),
+            "{error:?}"
+        );
+        assert!(sweep.is_empty(), "wrong size must stage no reclamation");
+    }
+
+    #[tokio::test]
+    async fn active_receipts_reject_conflicting_sizes_for_one_chunk() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hash = ChunkHash::from_content(b"shared-active-upload-chunk");
+        let mut initial = storage.new_write_set();
+        for (upload_id, size_bytes) in [("receipt-a", 7), ("receipt-b", 9)] {
+            stage_upload_state(
+                &mut initial,
+                upload_state_key(upload_id).unwrap(),
+                &UploadState::Open(UploadOpen {
+                    path: format!("/{upload_id}.bin"),
+                    total_size: size_bytes,
+                }),
+            )
+            .expect("active upload state should stage");
+            stage_upload_manifest_leaf(
+                &mut initial,
+                upload_manifest_leaf_key(upload_id, 0).unwrap(),
+                &UploadManifestLeaf {
+                    part_size: size_bytes,
+                    chunks: vec![BlobChunkReceipt { hash, size_bytes }],
+                },
+            )
+            .expect("active upload receipt should stage");
+        }
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("conflicting active receipt fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("conflicting receipt read should open");
+        let mut sweep = storage.new_write_set();
+        let error = stage_reclaimable_upload_receipts(&read, &mut sweep, &BTreeSet::new())
+            .await
+            .expect_err("conflicting active receipt sizes must fail closed");
+        assert!(error.message.contains("conflicting declared sizes"));
+        assert!(sweep.is_empty(), "conflict must stage no receipt cleanup");
+    }
 
     #[tokio::test]
     async fn sequential_parts_survive_a_new_session_and_publish_one_file() {
