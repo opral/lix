@@ -175,10 +175,29 @@ async fn load_key_value_row(
             LiveStateReadDomain::Untracked,
         )
         .await?;
-    Ok(rows
-        .row(0)
-        .map(|row| row.to_owned())
-        .filter(|row| row.untracked && !row.deleted))
+    let Some(row) = rows.row(0) else {
+        reader
+            .validate_exact_collection_closure(
+                GLOBAL_BRANCH_ID,
+                control.untracked_generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: KEY_VALUE_SCHEMA_KEY,
+                    file_id: None,
+                },
+                key_refs[0],
+                LiveStateReadDomain::Untracked,
+                control.current_state_revision == 0,
+            )
+            .await?;
+        return Ok(None);
+    };
+    if !row.untracked() || row.deleted() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("deterministic key-value row '{key}' is not a live untracked authority member"),
+        ));
+    }
+    Ok(Some(row.to_owned()))
 }
 
 fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {
@@ -249,7 +268,10 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage_adapter::StorageAdapter;
-    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{
+        Memory, StorageKey, StorageProjectedValue, StorageReadOptions, StorageValue,
+        StorageWriteOptions,
+    };
 
     use super::*;
 
@@ -305,6 +327,7 @@ mod tests {
     #[tokio::test]
     async fn missing_sequence_is_uninitialized() {
         let storage = StorageAdapter::new(Memory::new());
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -315,6 +338,108 @@ mod tests {
             .expect("missing sequence should decode");
 
         assert_eq!(sequence, DeterministicSequence::uninitialized());
+    }
+
+    #[tokio::test]
+    async fn same_count_sequence_substitution_fails_identity_closure() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sequence publication read should open");
+        let mut writes = storage.new_write_set();
+        stage_sequence(
+            &read,
+            &mut writes,
+            DeterministicSequence { highest_seen: 7 },
+            test_timestamp(),
+            ChangeId::for_test_label("sequence-corruption-change"),
+        )
+        .await
+        .expect("sequence should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("sequence should publish");
+
+        let snapshot = memory
+            .export_snapshot()
+            .expect("published sequence storage should snapshot");
+        drop(storage);
+        drop(memory);
+        let storage = StorageAdapter::new(
+            Memory::from_snapshot(&snapshot).expect("published sequence storage should reopen"),
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reopened sequence storage should read");
+        let mut rows = crate::storage_adapter::ScanPlan::prefix(
+            crate::live_state::HOT_ROW_SPACE,
+            crate::storage_adapter::StoragePrefix {
+                bytes: bytes::Bytes::new(),
+            },
+        )
+        .collect(&read, crate::storage_adapter::StorageScanOptions::default())
+        .await
+        .expect("selected HOT members should scan")
+        .value
+        .entries;
+        assert_eq!(
+            rows.len(),
+            1,
+            "fixture should publish only the sequence member"
+        );
+        let sequence_member = rows.pop().expect("one sequence member");
+        let StorageProjectedValue::FullValue(sequence_value) = sequence_member.value else {
+            panic!("sequence fixture should scan the full HOT row value");
+        };
+        let sequence_identity = DETERMINISTIC_SEQUENCE_KEY.as_bytes();
+        let unrelated_identity = b"lix_unrelated_sequence_substitute";
+        assert_eq!(sequence_identity.len(), unrelated_identity.len());
+        let identity_offset = sequence_member
+            .key
+            .0
+            .windows(sequence_identity.len())
+            .position(|candidate| candidate == sequence_identity)
+            .expect("sequence identity should be encoded in its HOT key");
+        let mut unrelated_key = sequence_member.key.0.to_vec();
+        unrelated_key[identity_offset..identity_offset + sequence_identity.len()]
+            .copy_from_slice(unrelated_identity);
+        drop(read);
+
+        let mut corrupt = storage.new_write_set();
+        corrupt.delete(crate::live_state::HOT_ROW_SPACE, sequence_member.key);
+        corrupt.put(
+            crate::live_state::HOT_ROW_SPACE,
+            StorageKey(bytes::Bytes::from(unrelated_key)),
+            StorageValue {
+                bytes: sequence_value,
+            },
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("same-count sequence member substitution should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt sequence storage should read");
+        let error = load_sequence(&read)
+            .await
+            .expect_err("missing selected sequence member must fail closed");
+        assert!(
+            error
+                .message
+                .contains("identity digest does not match its canonical members"),
+            "unexpected closure error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -410,13 +535,20 @@ mod tests {
             .expect("global control should load")
             .expect("global control should exist");
         let snapshot = JsonSlot::from_json(&snapshot_content);
-        let mut working_diff_coverage = crate::live_state::WorkingDiffIndexCoverage::default();
+        let mut next_control = control
+            .next_current_state_revision()
+            .expect("global control revision should advance");
+        let next_generation = untracked_lifecycle_generation(
+            GLOBAL_BRANCH_ID,
+            control.untracked_generation,
+            next_control.current_state_revision,
+        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
+            .stage_untracked_generation(
                 GLOBAL_BRANCH_ID,
-                Some(control.tracked_generation),
-                control.head_commit_id,
+                control.untracked_generation,
+                next_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
@@ -432,13 +564,13 @@ mod tests {
                     columnar_base_coordinate: None,
                 }],
                 &std::collections::BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut working_diff_coverage,
             )
             .await
             .expect("test key-value current row should stage");
+        next_control.untracked_generation = next_generation;
+        next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
+        stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
+            .expect("global control should publish current state");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

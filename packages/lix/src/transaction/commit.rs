@@ -3410,6 +3410,7 @@ async fn stage_tracked_head(
         .collect::<BTreeSet<_>>();
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
+    let mut key_value_control_mutations = BTreeSet::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
 
@@ -3481,6 +3482,15 @@ async fn stage_tracked_head(
         } else {
             None
         };
+        if state_row_indices.iter().any(|&row_index| {
+            let row = state_rows.row(row_index);
+            !row.untracked && row.schema_key == "lix_key_value"
+        }) || selected_materialization
+            .as_ref()
+            .is_some_and(|(rows, _, _)| rows.iter().any(|row| row.schema_key == "lix_key_value"))
+        {
+            key_value_control_mutations.insert(root.branch_id.as_str());
+        }
         let mut untracked_deltas = if certified_columnar_parts.is_some() {
             Vec::new()
         } else {
@@ -4347,6 +4357,44 @@ async fn stage_tracked_head(
                 .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
         );
         insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+    }
+
+    // Bootstrap may initially use one physical generation for both selector
+    // domains. A tracked-only publication mutates that generation in place,
+    // so preserve the complete untracked authority under its own selector
+    // before publishing the updated branch control. Subsequent publications
+    // already have disjoint selectors and pay no copy cost.
+    for (branch_id, control) in &mut controls {
+        if !key_value_control_mutations.contains(branch_id.as_str()) {
+            continue;
+        }
+        let Some(previous) = observations
+            .get(branch_id)
+            .and_then(|observation| observation.control)
+        else {
+            continue;
+        };
+        if control.tracked_generation != control.untracked_generation
+            || control.untracked_generation != previous.untracked_generation
+        {
+            continue;
+        }
+        let next_generation = untracked_lifecycle_generation(
+            branch_id,
+            previous.untracked_generation,
+            control.current_state_revision,
+        );
+        tracked_head
+            .writer(read, writes)
+            .stage_untracked_generation(
+                branch_id,
+                previous.untracked_generation,
+                next_generation,
+                &[],
+                &BTreeSet::new(),
+            )
+            .await?;
+        control.untracked_generation = next_generation;
     }
 
     // An untracked-only transaction touches the same hot rows without

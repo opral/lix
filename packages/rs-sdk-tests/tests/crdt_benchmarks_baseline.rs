@@ -326,6 +326,7 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                         .await
                         .unwrap();
                     let converged = read_file(&lix, path).await;
+                    assert_eq!(converged, br#"{"v":99}"#);
                     for peer in &peers {
                         assert_eq!(read_file(peer, path).await, converged);
                     }
