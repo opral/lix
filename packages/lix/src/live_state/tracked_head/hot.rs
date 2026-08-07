@@ -3929,6 +3929,39 @@ fn merge_ordered_live_batches(
     merged.finish()
 }
 
+/// Removes rows whose identity is already owned by another identity-ordered
+/// authority batch. Both inputs are scan results in canonical identity order,
+/// so one forward cursor replaces a per-row tree lookup and owned identity.
+fn exclude_ordered_live_batch_identities(
+    rows: MaterializedLiveStateBatch,
+    authority: &MaterializedLiveStateBatch,
+) -> MaterializedLiveStateBatch {
+    if rows.is_empty() || authority.is_empty() {
+        return rows;
+    }
+    debug_assert!((1..rows.len()).all(|index| {
+        compare_materialized_live_identity_refs(rows.row(index - 1), rows.row(index)).is_lt()
+    }));
+    debug_assert!((1..authority.len()).all(|index| {
+        compare_materialized_live_identity_refs(authority.row(index - 1), authority.row(index))
+            .is_lt()
+    }));
+    let mut authority_index = 0usize;
+    rows.filter(
+        |row| loop {
+            let Some(authority_row) = authority.get(authority_index) else {
+                return true;
+            };
+            match compare_materialized_live_identity_refs(authority_row, row) {
+                Ordering::Less => authority_index += 1,
+                Ordering::Equal => return false,
+                Ordering::Greater => return true,
+            }
+        },
+        None,
+    )
+}
+
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
     pub(super) store: S,
@@ -4735,20 +4768,8 @@ where
             },
             None,
         );
-        let overlay_commits = rows
-            .iter()
-            .map(|row| {
-                (
-                    (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    ),
-                    row.commit_id(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let packed_limit = if overlay_commits.is_empty() && replaced_generation.is_none() {
+        let has_overlay_rows = !rows.is_empty();
+        let packed_limit = if !has_overlay_rows && replaced_generation.is_none() {
             request.limit.map(|limit| limit.saturating_sub(rows.len()))
         } else {
             None
@@ -4777,60 +4798,7 @@ where
         } else {
             scan_packed_current_base_rows(&self.store, branch_id, generation, request, packed_limit)
                 .await?
-        }
-        .filter(
-            |row| {
-                overlay_commits.is_empty() || {
-                    let identity = (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    );
-                    overlay_commits.get(&identity).is_none_or(|overlay_commit| {
-                        overlay_commit.is_some_and(|overlay_commit| {
-                            row.commit_id()
-                                .is_some_and(|packed_commit| packed_commit > overlay_commit)
-                        })
-                    })
-                }
-            },
-            None,
-        );
-        let packed_commits = if rows.is_empty() {
-            BTreeMap::new()
-        } else {
-            packed_rows
-                .iter()
-                .map(|row| {
-                    (
-                        (
-                            row.schema_key().to_owned(),
-                            row.entity_pk().clone(),
-                            row.file_id().map(str::to_owned),
-                        ),
-                        row.commit_id(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
         };
-        let rows = rows.filter(
-            |row| {
-                packed_commits.is_empty() || {
-                    let identity = (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    );
-                    packed_commits.get(&identity).is_none_or(|packed_commit| {
-                        !packed_commit.is_some_and(|packed_commit| {
-                            row.commit_id()
-                                .is_some_and(|overlay_commit| packed_commit > overlay_commit)
-                        })
-                    })
-                }
-            },
-            None,
-        );
         // Format plugins cannot publish engine-owned schemas. Do not even
         // inspect certified semantic manifests for a scan that can only match
         // engine rows such as file descriptors or blob materializations.
@@ -4848,7 +4816,7 @@ where
                 branch_id,
                 generation,
                 request,
-                if overlay_commits.is_empty() {
+                if !has_overlay_rows {
                     request.limit.map(|limit| limit.saturating_sub(rows.len()))
                 } else {
                     None
@@ -4856,43 +4824,6 @@ where
                 self.transaction_cache.as_deref(),
             )
             .await?
-            .filter(
-                |row| {
-                    overlay_commits.is_empty() || {
-                        let identity = (
-                            row.schema_key().to_owned(),
-                            row.entity_pk().clone(),
-                            row.file_id().map(str::to_owned),
-                        );
-                        !overlay_commits.contains_key(&identity)
-                    }
-                },
-                None,
-            )
-        };
-        let certified_rows = if certified_rows.is_empty() || packed_rows.is_empty() {
-            certified_rows
-        } else {
-            let packed_identities = packed_rows
-                .iter()
-                .map(|row| {
-                    (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    )
-                })
-                .collect::<BTreeSet<_>>();
-            certified_rows.filter(
-                |row| {
-                    !packed_identities.contains(&(
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    ))
-                },
-                None,
-            )
         };
         // A pristine root-backed generation has no possible shadowing winner,
         // so preserve bounded-read behavior by pushing LIMIT into the tracked
@@ -4909,7 +4840,12 @@ where
                 .saturating_add(certified_rows.len()),
         ))
         .await?;
+        // HOT and packed rows carry comparable commit ownership; their
+        // existing ordered merge selects the newest authority directly.
+        // Certified rows remain subordinate to either authority regardless of
+        // commit ID, so exclude their collisions with one linear cursor.
         let combined = merge_ordered_live_batches(rows, packed_rows);
+        let certified_rows = exclude_ordered_live_batch_identities(certified_rows, &combined);
         let combined = merge_ordered_live_batches(combined, root_rows);
         let rows = merge_ordered_live_batches(combined, certified_rows);
         if request.filter.include_tombstones
@@ -11347,6 +11283,34 @@ mod tests {
                 .map(|row| row.entity_pk.as_single_string_owned().expect("single key"))
                 .collect::<Vec<_>>(),
             ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn ordered_authority_exclusion_removes_only_identity_collisions() {
+        let rows = MaterializedLiveStateBatch::from_rows(vec![
+            live_row("a", "candidate-a"),
+            live_row("b", "candidate-b"),
+            live_row("c", "candidate-c"),
+            live_row("d", "candidate-d"),
+        ]);
+        let authority = MaterializedLiveStateBatch::from_rows(vec![
+            live_row("a", "authority-a"),
+            live_row("c", "authority-c"),
+        ]);
+
+        let filtered = exclude_ordered_live_batch_identities(rows, &authority);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| {
+                    row.entity_pk()
+                        .as_single_string_owned()
+                        .expect("single key")
+                })
+                .collect::<Vec<_>>(),
+            ["b", "d"]
         );
     }
 
