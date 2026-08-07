@@ -173,7 +173,28 @@ export function updateCargoToml(root, version) {
 		/(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")[^"]+(")/,
 		`$1${version}$2`,
 	);
+	text = updateWorkspaceVersionedDependencyRequirements(root, text, version);
 	writeText(root, "Cargo.toml", text);
+}
+
+function updateWorkspaceVersionedDependencyRequirements(root, text, version) {
+	return text.replace(
+		/\[workspace\.dependencies\][\s\S]*?(?=\n\[|$)/,
+		(dependencies) =>
+			dependencies.replace(/^[A-Za-z0-9_-]+\s*=\s*\{[^}\n]*\}$/gm, (line) => {
+				const path = line.match(/\bpath\s*=\s*"([^"]+)"/)?.[1];
+				if (!path || !/\bversion\s*=\s*"[^"]+"/.test(line)) return line;
+				const manifestPath = join(root, path, "Cargo.toml");
+				if (!existsSync(manifestPath)) return line;
+				const packageSection = readFileSync(manifestPath, "utf8").match(
+					/\[package\]([\s\S]*?)(?=\n\[|$)/,
+				)?.[1];
+				if (!packageSection || !/^version\.workspace\s*=\s*true\s*$/m.test(packageSection)) {
+					return line;
+				}
+				return line.replace(/(\bversion\s*=\s*")[^"]+(")/, `$1${version}$2`);
+			}),
+	);
 }
 
 export function updatePackageVersion(root, version) {
