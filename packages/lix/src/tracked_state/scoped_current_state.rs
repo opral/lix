@@ -9,7 +9,7 @@ use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor;
 use crate::tracked_state::scoped_range::{
     ScopedRangeCoverageMarker, ScopedRangeRoot, load_scoped_range_coverage,
-    stage_replace_scoped_range, stage_scoped_range_tree,
+    load_scoped_range_coverage_with_staged, stage_replace_scoped_range, stage_scoped_range_tree,
 };
 use crate::tracked_state::types::{
     CommitDeltaReplacementScope, CommitStateManifest, CommitStateMutationInventory,
@@ -695,7 +695,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         });
     }
     let touched_scope_filter =
-        extend_touched_scope_filter(inherited_scope_filter, filter_touched.as_deref())?;
+        extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
 
     if inventory.replacement_generation.is_some() {
         let root = stage_complete_replacement_scoped_range_root(
@@ -779,6 +779,35 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     }
     let mut tree = parent_root.tree.clone();
     for scope in touched {
+        let prefix =
+            crate::tracked_state::current_state_envelope::current_state_scope_prefix(&scope)?;
+        if load_scoped_range_coverage_with_staged(store, writes, &tree, &prefix)
+            .await?
+            .is_none()
+        {
+            if !touched_scope_filter_proves_absent(&inherited_scope_filter, &scope)? {
+                return Ok(CertifiedCommitStatePhysicalPublication {
+                    write_set_id: writes.identity(),
+                    commit_id,
+                    selected_source_commit_id,
+                    root: None,
+                    touched_scope_filter,
+                });
+            }
+            tree = stage_replace_scoped_range(
+                store,
+                writes,
+                &tree,
+                ScopedRangeCoverageMarker {
+                    scope: prefix,
+                    row_count: 0,
+                    part_count: 0,
+                },
+                Vec::new(),
+            )
+            .await?
+            .root;
+        }
         let transient = CurrentStateScopedRangeRoot {
             tree,
             serving_base_commit_id: parent_root.serving_base_commit_id,
@@ -892,9 +921,9 @@ mod tests {
     use crate::tracked_state::codec::encode_key_ref;
     use crate::tracked_state::scoped_range::{
         ScopedRangeCoverageMarker, ScopedRangePart, ScopedRangePartPayload, ScopedRangePrefix,
-        plan_scoped_range_part_splice, route_scoped_range_point, scan_scoped_range_interval,
-        snapshot_staged_scoped_range_nodes, stage_scoped_range_part_splice,
-        stage_scoped_range_tree, validate_scoped_range_tree,
+        load_scoped_range_coverage_with_staged, plan_scoped_range_part_splice,
+        route_scoped_range_point, scan_scoped_range_interval, snapshot_staged_scoped_range_nodes,
+        stage_scoped_range_part_splice, stage_scoped_range_tree, validate_scoped_range_tree,
     };
     use crate::tracked_state::storage::{
         CertifiedCommitStateTopologyParent, CommitDeltaReplacementGeneration,
@@ -1273,6 +1302,107 @@ mod tests {
             vec![(0, 0, 1, true), (0, 2, 1, true), (1, 0, 1, true)],
             "sparse delete/insert must retain two immutable source slices and write only the insert",
         );
+    }
+
+    #[tokio::test]
+    async fn sparse_new_scope_requires_cumulative_absence_proof() {
+        let storage = StorageAdapter::new(Memory::new());
+        let parent_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_3050_0000_7000_8000_0000_0001_0000,
+        ));
+        let parent = publish_replacement_scope(&storage, None, parent_id, "covered-scope").await;
+        let child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_3050_0000_7000_8000_0000_0002_0000,
+        ));
+        let entity = EntityPk::single("entity-000");
+        let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
+        let change = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: "certified-new-scope",
+                file_id: None,
+                entity_pk: &entity,
+                change_id: ChangeId::for_test_label("certified-new-scope-change"),
+                commit_id: child_id,
+                deleted: false,
+                created_at,
+                updated_at,
+            },
+            snapshot: JsonSlotRef::Inline("{\"version\":1}"),
+            metadata: JsonSlotRef::None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("new-scope read should open");
+
+        let mut unproven_parent = (*parent).clone();
+        unproven_parent.touched_scope_filter = CommitStateTouchedScopeFilter::default();
+        let mut fallback_writes = storage.new_write_set();
+        let fallback_stage = stage_ordered_addressable_commit_deltas(
+            &mut fallback_writes,
+            [Ok(change)].into_iter(),
+            true,
+            false,
+        )
+        .expect("unproven sparse mutation should stage")
+        .expect("unproven sparse mutation should be addressable");
+        let fallback = stage_current_state_scoped_ranges(
+            &read,
+            &mut fallback_writes,
+            &[&unproven_parent],
+            None,
+            Some(&unproven_parent),
+            child_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            fallback_stage.mutation_inventory(),
+        )
+        .await
+        .expect("unproven missing scope should fall back without failing the commit");
+        assert!(
+            fallback.root().is_none(),
+            "a missing marker without cumulative absence authority must use canonical replay"
+        );
+
+        let mut certified_writes = storage.new_write_set();
+        let certified_stage = stage_ordered_addressable_commit_deltas(
+            &mut certified_writes,
+            [Ok(change)].into_iter(),
+            true,
+            false,
+        )
+        .expect("certified sparse mutation should stage")
+        .expect("certified sparse mutation should be addressable");
+        let certified = stage_current_state_scoped_ranges_from_published_parent(
+            &read,
+            &mut certified_writes,
+            Some(&parent),
+            child_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            certified_stage.mutation_inventory(),
+        )
+        .await
+        .expect("certified absent scope should seed an authenticated marker");
+        let root = certified
+            .root()
+            .expect("certified scope should keep serving root");
+        let new_scope = crate::tracked_state::current_state_envelope::current_state_scope_prefix(
+            &scope("certified-new-scope"),
+        )
+        .unwrap();
+        let marker = load_scoped_range_coverage_with_staged(
+            &read,
+            &certified_writes,
+            &root.tree,
+            &new_scope,
+        )
+        .await
+        .expect("new-scope marker should authenticate")
+        .expect("new-scope marker should exist");
+        assert_eq!((marker.row_count, marker.part_count), (1, 1));
     }
 
     #[tokio::test]
