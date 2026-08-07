@@ -7,8 +7,8 @@ use crate::branch::{
     stage_branch_head_control,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
-    CommitRecord,
+    COMMIT_RECORD_FORMAT_VERSION, ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext,
+    ChangelogWriter, CommitId, CommitRecord,
 };
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
@@ -42,15 +42,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V59 adds the authenticated root-reachability frontier consumed by ordinary
-/// GC on top of the compact immutable commit-state authority. Semantic commit facts remain
-/// owned exclusively by `changelog.commit`; canonical snapshot metadata stays
-/// inside the immutable physical authority while its content-addressed tree
-/// chunks remain rebuildable.
+/// V61 derives generated commit-envelope change identities from commit ids and
+/// removes both the reverse index and the duplicate persisted identity field.
+/// This is a hard physical cut with no compatibility reader.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v60";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v61";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -115,7 +113,6 @@ pub(crate) struct InitSeedPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedCommit {
     id: CommitId,
-    change_id: ChangeId,
     parent_ids: Vec<CommitId>,
     account_id: String,
     created_at: LixTimestamp,
@@ -170,7 +167,7 @@ pub struct InitReceipt {
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_branch_id = functions.call_uuid_v7().to_string();
     let lix_id = functions.call_uuid_v7().to_string();
-    let initial_commit_id = CommitId::from(functions.call_uuid_v7());
+    let initial_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
@@ -235,7 +232,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let initial_commit = InitSeedCommit {
         id: initial_commit_id,
-        change_id: ChangeId::from(functions.call_uuid_v7()),
         parent_ids: Vec::new(),
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
         created_at: timestamp,
@@ -607,11 +603,10 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 2,
+        format_version: COMMIT_RECORD_FORMAT_VERSION,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
-        change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,
     };
@@ -753,7 +748,13 @@ mod tests {
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
-        assert_eq!(plan.receipt.initial_commit_id, test_uuid(3));
+        assert_eq!(
+            plan.receipt.initial_commit_id,
+            CommitId::with_change_address_space(
+                uuid::Uuid::parse_str(&test_uuid(3)).expect("test commit uuid")
+            )
+            .to_string()
+        );
     }
 
     #[test]
@@ -761,10 +762,11 @@ mod tests {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
         assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
-        assert_eq!(
-            plan.commit.change_id.to_string(),
-            test_uuid(seed_schema_definitions().len() + 10)
-        );
+        let commit_change_id = plan
+            .commit
+            .id
+            .envelope_change_id()
+            .expect("initial commit should own an envelope identity");
         assert!(plan.commit.parent_ids.is_empty());
         assert_eq!(plan.commit.account_id, crate::SYSTEM_ACCOUNT_ID);
         assert_eq!(
@@ -780,7 +782,7 @@ mod tests {
         assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
         let first_seed_change_id = test_uuid(4);
         assert!(change_ids.contains(&first_seed_change_id));
-        assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
+        assert!(!change_ids.contains(&commit_change_id.to_string()));
 
         let registered_schema_change_ids = plan
             .changes
@@ -901,7 +903,10 @@ mod tests {
         };
 
         assert_eq!(record.commit_id, receipt.initial_commit_id);
-        let commit_change_id = record.change_id.clone();
+        let commit_change_id = record
+            .commit_id
+            .envelope_change_id()
+            .expect("initial commit should own an envelope identity");
         let membership_read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await
@@ -912,7 +917,7 @@ mod tests {
                 .expect("initial commit membership should load");
         assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
         assert!(
-            !change_refs.contains(&record.change_id),
+            !change_refs.contains(&commit_change_id),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
         );
 

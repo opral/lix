@@ -76,11 +76,12 @@ where
             .await?;
         records.reserve(batch.entries.len());
         for record in batch.entries {
+            let change_id = record.commit_id.envelope_change_id()?;
             records.insert(
                 record.commit_id,
                 CommitGraphNode {
                     commit_id: record.commit_id,
-                    change_id: record.change_id,
+                    change_id,
                     account_id: record.account_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
@@ -416,7 +417,7 @@ mod tests {
         scan_checkpoint_commit_records,
     };
     use crate::changelog::{
-        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId, CommitRecord,
+        ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId, CommitRecord,
     };
     use crate::common::LixTimestamp;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
@@ -427,11 +428,10 @@ mod tests {
 
     fn commit_record(id: CommitId, generation: u64, parent: Option<CommitId>) -> CommitRecord {
         CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id: id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
-            change_id: ChangeId::for_test_label(&format!("{id}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: timestamp(),
         }

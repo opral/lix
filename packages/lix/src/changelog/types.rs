@@ -18,6 +18,7 @@ pub(crate) struct ChangeId {
 }
 
 const UUID_HYPHENATED_LEN: usize = uuid::fmt::Hyphenated::LENGTH;
+pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 3;
 
 impl CommitId {
     pub(crate) fn new(value: Uuid) -> Self {
@@ -63,11 +64,31 @@ impl CommitId {
         Self::new(Uuid::from_bytes(bytes))
     }
 
+    /// Returns the public change identity of the synthetic commit envelope.
+    ///
+    /// Commit ids reserve their low 32 bits for directly addressable tracked
+    /// changes. A fixed domain-tag xor in the remaining UUIDv7 random field
+    /// preserves timestamp, version, variant, and the zero packed address.
+    /// Applying the same xor again is the inverse, so exact `lix_change`
+    /// lookup needs no durable reverse map. The zero packed address remains
+    /// disjoint from directly addressed tracked changes, whose ordinals start
+    /// at one; explicit identities are protected by collision probes.
+    pub(crate) fn envelope_change_id(self) -> Result<ChangeId, LixError> {
+        if self.uuid.as_bytes()[12..] != [0; 4] {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("commit '{}' has no reserved change address space", self),
+            ));
+        }
+        let mut bytes = *self.uuid.as_bytes();
+        xor_commit_envelope_domain(&mut bytes);
+        Ok(ChangeId::new(Uuid::from_bytes(bytes)))
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) fn for_test_label(value: &str) -> Self {
-        Uuid::parse_str(value)
-            .map(Self::new)
-            .unwrap_or_else(|_| Self::new(test_uuid_from_label(0x43, value)))
+        let uuid = Uuid::parse_str(value).unwrap_or_else(|_| test_uuid_from_label(0x43, value));
+        Self::with_change_address_space(uuid)
     }
 }
 
@@ -100,12 +121,33 @@ impl ChangeId {
         &self.uuid
     }
 
+    /// Inverts [`CommitId::envelope_change_id`] for the only identities that
+    /// can belong to the generated commit-envelope domain.
+    pub(crate) fn envelope_commit_id(self) -> Option<CommitId> {
+        (self.uuid.as_bytes()[12..] == [0; 4]).then(|| {
+            let mut bytes = *self.uuid.as_bytes();
+            xor_commit_envelope_domain(&mut bytes);
+            CommitId::new(Uuid::from_bytes(bytes))
+        })
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) fn for_test_label(value: &str) -> Self {
         Uuid::parse_str(value)
             .map(Self::new)
             .unwrap_or_else(|_| Self::new(test_uuid_from_label(0x68, value)))
     }
+}
+
+fn xor_commit_envelope_domain(bytes: &mut [u8; 16]) {
+    // Keep UUID timestamp/version/variant and the packed tracked-change
+    // address untouched. The nonzero mask is an involutive namespace tag.
+    bytes[6] ^= 0x0d;
+    bytes[7] ^= 0x4c;
+    bytes[8] ^= 0x21;
+    bytes[9] ^= 0x49;
+    bytes[10] ^= 0x58;
+    bytes[11] ^= 0xa5;
 }
 
 fn uuid_text(value: Uuid) -> [u8; UUID_HYPHENATED_LEN] {
@@ -313,14 +355,13 @@ pub(crate) struct ChangelogAppend {
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitRecord {
-    /// Version 2 removes physical replay policy from the semantic commit row.
+    /// Version 3 removes the independently persisted commit-envelope change id.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
     /// smaller generation, enabling bounded priority graph walks.
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
-    pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
 }
@@ -506,7 +547,6 @@ pub(crate) struct GcLiveSet {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcSweepSet {
     pub(crate) commits: Vec<CommitId>,
-    pub(crate) commit_change_ids: Vec<ChangeId>,
     pub(crate) changes: Vec<ChangeId>,
     pub(crate) json_payloads: Vec<JsonRef>,
 }
@@ -533,4 +573,51 @@ pub(crate) fn commit_row_snapshot_json(commit_id: &str) -> Result<String, LixErr
             format!("commit row snapshot serialization failed: {error}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_envelope_identity_is_domain_separated_deterministic_bijection() {
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8123_4567_89ab_cdef,
+        ));
+        let first = commit_id.envelope_change_id().unwrap();
+        let second = commit_id.envelope_change_id().unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first.as_uuid(), commit_id.as_uuid());
+        assert_eq!(first.as_uuid().get_version_num(), 7);
+        assert_eq!(
+            first.as_uuid().get_variant(),
+            commit_id.as_uuid().get_variant()
+        );
+        assert_eq!(
+            &first.as_uuid().as_bytes()[..6],
+            &commit_id.as_uuid().as_bytes()[..6]
+        );
+        assert_eq!(&first.as_uuid().as_bytes()[12..], &[0; 4]);
+        assert_eq!(first.envelope_commit_id(), Some(commit_id));
+    }
+
+    #[test]
+    fn ordinary_change_identity_is_not_misclassified_as_commit_envelope() {
+        let change_id = ChangeId::new(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8123_4567_0000_0001,
+        ));
+        assert_eq!(change_id.envelope_commit_id(), None);
+    }
+
+    #[test]
+    fn commit_without_reserved_address_space_cannot_derive_envelope_identity() {
+        let malformed = CommitId::new(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8123_4567_0000_0001,
+        ));
+        let error = malformed
+            .envelope_change_id()
+            .expect_err("noncanonical commit id must fail closed");
+        assert!(error.message.contains("no reserved change address space"));
+    }
 }

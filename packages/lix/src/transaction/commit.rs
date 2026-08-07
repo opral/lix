@@ -13,9 +13,10 @@ use crate::branch::{
     stage_branch_head_control, stage_delete_branch_head_control, untracked_lifecycle_generation,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
-    ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
-    CommitRecord, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
+    COMMIT_RECORD_FORMAT_VERSION, ChangeId, ChangeLoadRequest, ChangeRecord,
+    ChangeRecordProjection, ChangeScanRequest, ChangelogContext, ChangelogReader, ChangelogWriter,
+    CommitId, CommitLoadRequest as ChangelogCommitLoadRequest, CommitRecord, CommitScanRequest,
+    TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
@@ -30,16 +31,20 @@ use crate::live_state::{
     TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
 };
-use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
+use crate::storage_adapter::{
+    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrecondition,
+    StorageWriteSet,
+};
 #[cfg(test)]
 use crate::tracked_state::stage_commit_state_manifest;
 use crate::tracked_state::{
     CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
-    TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
-    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
-    TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
-    encode_key_ref, load_commit_delta_change_records, load_commit_delta_replay_metadata,
+    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
+    TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
+    TrackedStateScanRequest, TrackedStateSingleStringReplacementRef, encode_key_ref,
+    load_commit_delta_change_records, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
@@ -1164,6 +1169,14 @@ async fn stage_changelog_commits(
     >,
     active_account_id: &str,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
+    validate_commit_envelope_identity_collisions(
+        read,
+        writes,
+        state_rows,
+        branch_head_changes,
+        commit_rows,
+    )
+    .await?;
     let mut commits = Vec::with_capacity(commit_rows.len());
     let staged_commit_ids = commit_rows
         .iter()
@@ -1443,11 +1456,10 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 2,
+            format_version: COMMIT_RECORD_FORMAT_VERSION,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
         };
@@ -1484,6 +1496,150 @@ async fn stage_changelog_commits(
         .await?;
     writer.stage_transaction_append(append)?;
     Ok(staged)
+}
+
+async fn validate_commit_envelope_identity_collisions(
+    read: &mut impl StorageAdapterRead,
+    writes: &StorageWriteSet,
+    state_rows: &PreparedStateBatch,
+    branch_head_changes: &[ChangeRecord],
+    commit_rows: &[FinalizedCommitRow],
+) -> Result<(), LixError> {
+    if commit_rows.is_empty() {
+        return Ok(());
+    }
+
+    let commit_ids = commit_rows
+        .iter()
+        .map(|commit| commit.commit_id)
+        .collect::<BTreeSet<_>>();
+    let envelope_ids = commit_ids
+        .iter()
+        .map(|commit_id| Ok((*commit_id, commit_id.envelope_change_id()?)))
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let envelope_id_set = envelope_ids
+        .iter()
+        .map(|(_, change_id)| *change_id)
+        .collect::<BTreeSet<_>>();
+
+    let local_explicit_ids = state_rows
+        .iter()
+        .filter_map(|row| {
+            ((row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
+                || (!row.untracked && !row.addressable_change_id))
+                .then_some(row.change_id)
+                .flatten()
+        })
+        .chain(branch_head_changes.iter().map(|change| change.change_id))
+        .chain(
+            commit_rows
+                .iter()
+                .flat_map(|commit| selected_changes(&commit.selected_change_batches))
+                .map(|selected| selected.change_id),
+        )
+        .collect::<BTreeSet<_>>();
+
+    if let Some(change_id) = local_explicit_ids
+        .iter()
+        .find(|change_id| envelope_id_set.contains(change_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!("change '{change_id}' collides with a generated commit-envelope identity"),
+        ));
+    }
+
+    for (commit_id, envelope_id) in &envelope_ids {
+        if writes.contains_put(
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            envelope_id.as_uuid().as_bytes(),
+        ) {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "commit '{commit_id}' derived envelope identity '{envelope_id}' collides with a staged tracked change"
+                ),
+            ));
+        }
+    }
+    let envelope_locator_keys = envelope_ids
+        .iter()
+        .map(|(_, envelope_id)| {
+            StorageKey(bytes::Bytes::copy_from_slice(
+                envelope_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let existing_envelope_locators =
+        PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &envelope_locator_keys)
+            .materialize(&*read, StorageGetOptions::default())
+            .await?;
+    for ((commit_id, envelope_id), existing) in
+        envelope_ids.iter().zip(existing_envelope_locators.value)
+    {
+        if existing.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "commit '{commit_id}' derived envelope identity '{envelope_id}' collides with an existing tracked change"
+                ),
+            ));
+        }
+    }
+
+    let envelope_change_ids = envelope_ids
+        .iter()
+        .map(|(_, change_id)| *change_id)
+        .collect::<Vec<_>>();
+    let standalone = ChangelogContext::new()
+        .reader(&mut *read)
+        .load_changes(ChangeLoadRequest {
+            change_ids: &envelope_change_ids,
+        })
+        .await?;
+    if let Some((change_id, _)) = standalone.into_iter().find(|(_, record)| record.is_some()) {
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "generated commit-envelope identity '{change_id}' collides with an existing standalone change"
+            ),
+        ));
+    }
+
+    let existing_commit_claims = local_explicit_ids
+        .iter()
+        .filter_map(|change_id| {
+            change_id
+                .envelope_commit_id()
+                .filter(|commit_id| !commit_ids.contains(commit_id))
+                .map(|commit_id| (*change_id, commit_id))
+        })
+        .collect::<Vec<_>>();
+    let candidate_commit_ids = existing_commit_claims
+        .iter()
+        .map(|(_, commit_id)| *commit_id)
+        .collect::<Vec<_>>();
+    if !candidate_commit_ids.is_empty() {
+        let existing = ChangelogContext::new()
+            .reader(&mut *read)
+            .load_commits(ChangelogCommitLoadRequest {
+                commit_ids: &candidate_commit_ids,
+            })
+            .await?;
+        if let Some(((change_id, commit_id), _)) = existing_commit_claims
+            .iter()
+            .zip(existing.into_iter())
+            .find(|(_, (_, record))| record.is_some())
+        {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "explicit change '{change_id}' collides with commit '{commit_id}' derived envelope identity"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The terminal transaction append deliberately skips the changelog writer's
@@ -6193,7 +6349,6 @@ struct FinalizedCommitRow {
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     created_at: LixTimestamp,
-    change_id: ChangeId,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
     current_state_base_commit_id: Option<CommitId>,
 }
@@ -6222,7 +6377,6 @@ async fn finalize_commit_rows(
         let change_refs = intermediate.change_refs;
         let commit_id = change_refs.commit_id;
         let created_at = change_refs.created_at;
-        let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
@@ -6230,7 +6384,6 @@ async fn finalize_commit_rows(
             commit_id,
             parent_commit_ids: vec![intermediate.parent_commit_id],
             created_at,
-            change_id: commit_change_id,
             selected_change_batches,
             current_state_base_commit_id,
         });
@@ -6250,7 +6403,6 @@ async fn finalize_commit_rows(
         }
 
         let commit_id = change_refs.commit_id;
-        let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
         let current_state_base_commit_id = change_refs.current_state_base_commit_id();
@@ -6284,7 +6436,6 @@ async fn finalize_commit_rows(
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp,
-            change_id: commit_change_id,
             selected_change_batches,
             current_state_base_commit_id,
         });
@@ -6597,6 +6748,43 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[tokio::test]
+    async fn commit_envelope_rejects_staged_explicit_tracked_identity() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8abc_def0_1234_5678,
+        ));
+        let envelope = commit_id.envelope_change_id().unwrap();
+        let mut writes = storage.new_write_set();
+        writes.put(
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            StorageKey(Bytes::copy_from_slice(envelope.as_uuid().as_bytes())),
+            b"staged-explicit-locator".as_slice(),
+        );
+        let commit_rows = [FinalizedCommitRow {
+            commit_id,
+            parent_commit_ids: Vec::new(),
+            created_at: ts("2026-08-07T00:00:00Z"),
+            selected_change_batches: Vec::new(),
+            current_state_base_commit_id: None,
+        }];
+
+        let error = validate_commit_envelope_identity_collisions(
+            &mut read,
+            &writes,
+            &PreparedStateBatch::new(),
+            &[],
+            &commit_rows,
+        )
+        .await
+        .expect_err("staged explicit tracked identity must not mask a commit envelope");
+        assert!(error.message.contains("staged tracked change"));
     }
 
     #[test]
@@ -7172,7 +7360,6 @@ mod tests {
             commit_id,
             parent_commit_ids: Vec::new(),
             created_at: timestamp,
-            change_id: change_id("mixed-certified-commit"),
             selected_change_batches: Vec::new(),
             current_state_base_commit_id: None,
         }];
@@ -7349,7 +7536,10 @@ mod tests {
         let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(record.change_id, change_id("test-uuid-2"));
+        let commit_change_id = record
+            .commit_id
+            .envelope_change_id()
+            .expect("commit should own an envelope identity");
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -7380,7 +7570,7 @@ mod tests {
             .map(|member| &member.change)
             .expect("tracked change should have an authoritative packed payload");
         assert_eq!(change.schema_key, "test_schema");
-        let change_ids = [change_id("change-1"), record.change_id];
+        let change_ids = [change_id("change-1"), commit_change_id];
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &change_ids,
@@ -7438,7 +7628,7 @@ mod tests {
         assert!(
             derived_commit_rows
                 .iter()
-                .any(|row| row.change_id == Some(record.change_id)),
+                .any(|row| row.change_id == Some(commit_change_id)),
             "live state should derive the commit row from changelog.commit"
         );
 
@@ -7834,12 +8024,7 @@ mod tests {
             ],
             commit_change_refs_by_branch: BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
-                change_refs_with(
-                    [row_change],
-                    target_commit,
-                    "same-write-branch-commit-change",
-                    "same-write-global-ref-change",
-                ),
+                change_refs_with([row_change], target_commit, "same-write-global-ref-change"),
             )]),
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
@@ -8062,7 +8247,6 @@ mod tests {
             prepared_normal_global_commit(
                 "stale-normal-change",
                 "stale-normal-commit",
-                "stale-normal-commit-change",
                 "stale-normal-branch-ref-change",
             ),
         )
@@ -8088,7 +8272,6 @@ mod tests {
             prepared_normal_global_commit(
                 "winner-normal-change",
                 "winner-normal-commit",
-                "winner-normal-commit-change",
                 "winner-normal-branch-ref-change",
             ),
         )
@@ -8166,7 +8349,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-first-change"],
                         "rootless-first-commit",
-                        "rootless-first-commit-change",
                         "rootless-first-branch-ref-change",
                     ),
                 )]),
@@ -8219,7 +8401,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-second-change"],
                         "rootless-second-commit",
-                        "rootless-second-commit-change",
                         "rootless-second-branch-ref-change",
                     ),
                 )]),
@@ -8272,7 +8453,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-third-change"],
                         "rootless-third-commit",
-                        "rootless-third-commit-change",
                         "rootless-third-branch-ref-change",
                     ),
                 )]),
@@ -8317,7 +8497,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-delete-change"],
                         "rootless-delete-commit",
-                        "rootless-delete-commit-change",
                         "rootless-delete-branch-ref-change",
                     ),
                 )]),
@@ -8479,7 +8658,6 @@ mod tests {
                     change_refs_with(
                         ["fence-normal-change"],
                         "fence-normal-commit",
-                        "fence-normal-commit-change",
                         "fence-normal-branch-ref-change",
                     ),
                 )]),
@@ -8501,12 +8679,7 @@ mod tests {
             .await
             .expect("normal rootless commit should persist");
 
-        let mut fence_refs = change_refs_with(
-            [],
-            "fence-commit",
-            "fence-commit-change",
-            "fence-branch-ref-change",
-        );
+        let mut fence_refs = change_refs_with([], "fence-commit", "fence-branch-ref-change");
         fence_refs.add_selected_change_batch(selected_change_batch_from(
             "fence-normal-change",
             "entity-1",
@@ -8760,7 +8933,6 @@ mod tests {
                     change_refs_with(
                         ["first-local-change"],
                         "first-local-commit",
-                        "first-local-commit-change",
                         "first-local-branch-ref-change",
                     ),
                 )]),
@@ -8804,7 +8976,6 @@ mod tests {
                     change_refs_with(
                         ["second-local-change"],
                         "second-local-commit",
-                        "second-local-commit-change",
                         "second-local-branch-ref-change",
                     ),
                 )]),
@@ -8857,7 +9028,6 @@ mod tests {
                     change_refs_with(
                         ["epoch-first-change"],
                         "epoch-first-commit",
-                        "epoch-first-commit-change",
                         "epoch-first-branch-ref-change",
                     ),
                 )]),
@@ -8918,7 +9088,6 @@ mod tests {
                     change_refs_with(
                         ["epoch-second-change"],
                         "epoch-second-commit",
-                        "epoch-second-commit-change",
                         "epoch-second-branch-ref-change",
                     ),
                 )]),
@@ -8991,7 +9160,6 @@ mod tests {
                     change_refs_with(
                         ["global-override-change", "global-fallback-change"],
                         "global-head",
-                        "global-head-commit-change",
                         "global-head-ref-change",
                     ),
                 )]),
@@ -9031,7 +9199,6 @@ mod tests {
                     change_refs_with(
                         ["branch-override-change"],
                         "branch-head",
-                        "branch-head-commit-change",
                         "branch-head-ref-change",
                     ),
                 )]),
@@ -9145,7 +9312,6 @@ mod tests {
                     change_refs_with(
                         ["branch-tombstone-change"],
                         "branch-tombstone-head",
-                        "branch-tombstone-head-commit-change",
                         "branch-tombstone-head-ref-change",
                     ),
                 )]),
@@ -9246,7 +9412,6 @@ mod tests {
                 commit_id: CommitId::for_test_label("child-commit"),
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
                 created_at: ts("2026-01-01T00:00:01Z"),
-                change_id: ChangeId::for_test_label("child-commit-change"),
                 selected_change_batches: Vec::new(),
                 current_state_base_commit_id: None,
             },
@@ -9254,7 +9419,6 @@ mod tests {
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                change_id: ChangeId::for_test_label("parent-commit-change"),
                 selected_change_batches: Vec::new(),
                 current_state_base_commit_id: None,
             },
@@ -9392,7 +9556,6 @@ mod tests {
                     .map(|parent| vec![commit_ids[parent]])
                     .unwrap_or_default(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
                 selected_change_batches: Vec::new(),
                 current_state_base_commit_id: None,
             })
@@ -9607,7 +9770,6 @@ mod tests {
                         change_refs_with(
                             ["setup-tracked-change"],
                             "setup-commit",
-                            "setup-commit-change",
                             "setup-branch-ref-change",
                         ),
                     )]),
@@ -9726,7 +9888,15 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id, change_id("test-uuid-2"));
+        assert_eq!(
+            commit
+                .commit_id
+                .envelope_change_id()
+                .expect("commit should own an envelope identity"),
+            commit_id("test-uuid-1")
+                .envelope_change_id()
+                .expect("fixture commit should own an envelope identity")
+        );
         let packed_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -9864,7 +10034,15 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id, change_id("test-uuid-2"));
+        assert_eq!(
+            commit
+                .commit_id
+                .envelope_change_id()
+                .expect("commit should own an envelope identity"),
+            commit_id("test-uuid-1")
+                .envelope_change_id()
+                .expect("fixture commit should own an envelope identity")
+        );
         assert_eq!(
             commit.parent_commit_ids,
             vec![CommitId::for_test_label(
@@ -9920,7 +10098,10 @@ mod tests {
         assert_eq!(rows.tracked_roots.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, commit_id("test-uuid-1"));
-        assert_eq!(row.change_id, change_id("test-uuid-2"));
+        assert_eq!(
+            row.commit_id.envelope_change_id().unwrap(),
+            commit_id("test-uuid-1").envelope_change_id().unwrap()
+        );
         assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.001Z");
         assert_eq!(
             row.parent_commit_ids,
@@ -10117,7 +10298,6 @@ mod tests {
     fn prepared_normal_global_commit(
         row_change_label: &str,
         commit_label: &str,
-        commit_change_label: &str,
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         PreparedWriteSet {
@@ -10125,12 +10305,7 @@ mod tests {
             state_rows: prepared_rows![tracked_global_row(row_change_label)],
             commit_change_refs_by_branch: BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
-                change_refs_with(
-                    [row_change_label],
-                    commit_label,
-                    commit_change_label,
-                    branch_ref_change_label,
-                ),
+                change_refs_with([row_change_label], commit_label, branch_ref_change_label),
             )]),
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
@@ -10141,18 +10316,16 @@ mod tests {
     }
 
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {
-        change_refs_with(change_ids, "test-uuid-1", "test-uuid-2", "test-uuid-3")
+        change_refs_with(change_ids, "test-uuid-1", "test-uuid-3")
     }
 
     fn change_refs_with<const N: usize>(
         change_ids: [&str; N],
         commit_id_label: &str,
-        commit_change_id_label: &str,
         branch_ref_change_id_label: &str,
     ) -> StagedCommitChangeRefs {
         let mut change_refs = StagedCommitChangeRefs::new(
             commit_id(commit_id_label),
-            change_id(commit_change_id_label),
             change_id(branch_ref_change_id_label),
             ts("2026-01-01T00:00:00.001Z"),
         );

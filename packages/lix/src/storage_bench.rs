@@ -553,11 +553,10 @@ where
             .map_or(0, |generation| generation.saturating_add(1));
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
         records.push(crate::changelog::CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id,
             generation,
             parent_commit_ids: parents,
-            change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "merge-base benchmark timestamp",
@@ -867,7 +866,6 @@ pub struct RepositoryGcBenchResult {
     pub deleted_mutation_inventories: usize,
     pub deleted_semantic_commit_projections: usize,
     pub deleted_semantic_change_rows: usize,
-    pub deleted_semantic_reverse_index_rows: usize,
     pub staged_written_bytes: u64,
     pub delete_descriptors: usize,
     pub delete_descriptor_capacity: usize,
@@ -1054,8 +1052,6 @@ where
     );
     let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
     let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
-    let deleted_semantic_reverse_index_rows =
-        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -1084,7 +1080,6 @@ where
         deleted_mutation_inventories,
         deleted_semantic_commit_projections,
         deleted_semantic_change_rows,
-        deleted_semantic_reverse_index_rows,
         staged_written_bytes: stats.written_bytes,
         delete_descriptors: arena.delete_descriptors,
         delete_descriptor_capacity: arena.delete_descriptor_capacity,
@@ -2130,7 +2125,6 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_ID_SPACE,
     ]
 }
 
@@ -2467,8 +2461,7 @@ mod tests {
         assert_eq!(first.deleted_commit_state_manifests, 10);
         assert_eq!(first.deleted_mutation_inventories, 10);
         assert_eq!(first.deleted_semantic_commit_projections, 11);
-        assert_eq!(first.deleted_semantic_change_rows, 21);
-        assert_eq!(first.deleted_semantic_reverse_index_rows, 11);
+        assert_eq!(first.deleted_semantic_change_rows, 10);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
@@ -2485,8 +2478,7 @@ mod tests {
                     10,
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 11), // semantic commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 21), // semantic change facts
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 11), // commit -> change reverse index
+                (crate::changelog::CHANGE_SPACE.id.0, 10), // semantic change facts
             ]
         );
         assert_eq!(

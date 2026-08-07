@@ -7024,11 +7024,10 @@ mod tests {
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
-                    format_version: 2,
+                    format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                     commit_id: commit_a,
                     generation: 2,
                     parent_commit_ids: vec![commit_b],
-                    change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",

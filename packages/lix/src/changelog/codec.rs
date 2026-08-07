@@ -1,6 +1,6 @@
 use super::types::{
-    ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitRecord,
-    TransactionChangeRecordRef,
+    COMMIT_RECORD_FORMAT_VERSION, ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView,
+    CommitRecord, TransactionChangeRecordRef,
 };
 use crate::common::LixError;
 use crate::storage_codec;
@@ -15,6 +15,23 @@ pub(crate) fn append_commit_record(
     record: &CommitRecord,
 ) -> Result<std::ops::Range<usize>, LixError> {
     storage_codec::append("commit record", bytes, record)
+}
+
+pub(crate) fn decode_commit_record(bytes: &[u8]) -> Result<CommitRecord, LixError> {
+    let record: CommitRecord = storage_codec::decode("commit record", bytes)?;
+    if record.format_version != COMMIT_RECORD_FORMAT_VERSION {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit '{}' has unsupported record format {}, expected {}",
+                record.commit_id, record.format_version, COMMIT_RECORD_FORMAT_VERSION
+            ),
+        ));
+    }
+    // Generated envelope identity must remain exactly addressable. Reject a
+    // corrupt/noncanonical commit id before any derived public row is built.
+    record.commit_id.envelope_change_id()?;
+    Ok(record)
 }
 
 #[cfg(test)]

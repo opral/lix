@@ -12641,9 +12641,7 @@ mod tests {
         BINARY_CAS_MANIFEST_SPACE,
     };
     use crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-    use crate::changelog::{
-        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, CommitId, CommitRecord,
-    };
+    use crate::changelog::{CHANGE_SPACE, COMMIT_SPACE, ChangeId, CommitId, CommitRecord};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::gc::{CHECKPOINT_GC_STATE_SPACE, CHECKPOINT_RECOVERY_REF_SPACE};
@@ -13003,11 +13001,10 @@ mod tests {
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::for_test_label(&format!("{commit_id}:fixture-commit")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
@@ -16682,7 +16679,6 @@ mod tests {
             BINARY_CAS_CHUNK_SPACE,
             COMMIT_SPACE,
             CHANGE_SPACE,
-            COMMIT_CHANGE_ID_SPACE,
             CHECKPOINT_RECOVERY_REF_SPACE,
             CHECKPOINT_GC_STATE_SPACE,
         ];

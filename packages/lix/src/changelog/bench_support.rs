@@ -46,6 +46,20 @@ impl BenchAppend {
         self.append.commits.len()
     }
 
+    pub fn first_commit_envelope_change_id(&self) -> Option<String> {
+        self.append
+            .commits
+            .first()
+            .map(|commit| {
+                commit
+                    .commit_id
+                    .envelope_change_id()
+                    .map(|id| id.to_string())
+            })
+            .transpose()
+            .expect("benchmark commit ids must own envelope identities")
+    }
+
     pub fn change_count(&self) -> usize {
         self.append.changes.len()
     }
@@ -228,11 +242,10 @@ pub fn append_ordered_commits(
             .checked_add(offset)
             .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
         append.commits.push(CommitRecord {
-            format_version: 2,
-            commit_id: CommitId::new(ordered_bench_uuid(commit_index, 0)),
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id: CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0)),
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -249,13 +262,12 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     append.commits.reserve(commit_count);
     let mut parent_commit_id = None;
     for commit_index in 0..commit_count {
-        let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
+        let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id,
             generation: u64::try_from(commit_index).expect("benchmark commit index fits u64"),
             parent_commit_ids: parent_commit_id.into_iter().collect(),
-            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -272,7 +284,10 @@ pub fn append_1c_with_commit_change_id(
     commit_change_id: &str,
 ) -> Result<BenchAppend, LixError> {
     let mut append = direct_append_with_shape(name, 1, 1)?;
-    append.append.commits[0].change_id = ChangeId::for_test_label(commit_change_id);
+    let change_id = ChangeId::parse_lix(commit_change_id, "benchmark commit change id")?;
+    append.append.commits[0].commit_id = change_id.envelope_commit_id().ok_or_else(|| {
+        LixError::unknown("benchmark commit change id is outside the envelope identity domain")
+    })?;
     Ok(append)
 }
 
@@ -287,7 +302,7 @@ pub fn append_size_stats(append: &BenchAppend) -> Result<BenchSizeStats, LixErro
     let encoded_append_bytes = encode_bench_append(append)?.len();
     Ok(BenchSizeStats {
         encoded_append_bytes,
-        direct_commit_record_value_bytes: append.commit_count() * 96,
+        direct_commit_record_value_bytes: append.commit_count() * 80,
         direct_change_record_value_bytes: append.change_count() * 96,
         inline_payload_bytes: 0,
     })
@@ -585,7 +600,6 @@ fn direct_append_with_shape(
     let mut next_change = 0usize;
     for commit_index in 0..commit_count {
         let commit_id = format!("{name}-commit-{commit_index}");
-        let commit_change_id = format!("{commit_id}:commit");
         let typed_commit_id = CommitId::for_test_label(&commit_id);
         let remaining = change_count.saturating_sub(next_change);
         let take = remaining.min(changes_per_commit);
@@ -613,11 +627,10 @@ fn direct_append_with_shape(
             next_change += 1;
         }
         append.commits.push(CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id: typed_commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::for_test_label(&commit_change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -805,12 +818,21 @@ mod tests {
 
         assert_eq!(commits.len(), 3);
         assert!(commits.windows(2).all(|pair| {
-            pair[0].commit_id < pair[1].commit_id && pair[0].change_id < pair[1].change_id
+            pair[0].commit_id < pair[1].commit_id
+                && pair[0].commit_id.envelope_change_id().unwrap()
+                    < pair[1].commit_id.envelope_change_id().unwrap()
         }));
         assert!(commits.iter().all(|commit| {
             commit.commit_id.as_uuid().get_version_num() == 7
-                && commit.change_id.as_uuid().get_version_num() == 7
-                && commit.commit_id.as_uuid() != commit.change_id.as_uuid()
+                && commit
+                    .commit_id
+                    .envelope_change_id()
+                    .unwrap()
+                    .as_uuid()
+                    .get_version_num()
+                    == 7
+                && commit.commit_id.as_uuid()
+                    != commit.commit_id.envelope_change_id().unwrap().as_uuid()
         }));
     }
 }

@@ -15,9 +15,8 @@ use crate::branch::BranchHeadControlContext;
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::ChangeScanRequest;
 use crate::changelog::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangelogContext,
-    ChangelogReader, CommitId, CommitLoadRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
-    GcSweepSet, change_key, commit_change_id_key, commit_key,
+    CHANGE_SPACE, COMMIT_SPACE, ChangeId, ChangelogContext, ChangelogReader, CommitId,
+    CommitLoadRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, change_key, commit_key,
 };
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
@@ -1745,7 +1744,6 @@ where
                 },
                 sweep: GcSweepSet {
                     commits: Vec::new(),
-                    commit_change_ids: Vec::new(),
                     changes: Vec::new(),
                     json_payloads: Vec::new(),
                 },
@@ -2073,7 +2071,6 @@ where
             },
             sweep: GcSweepSet {
                 commits: Vec::new(),
-                commit_change_ids: Vec::new(),
                 changes: Vec::new(),
                 json_payloads: Vec::new(),
             },
@@ -2695,11 +2692,11 @@ where
         }
     }
 
-    let (sweep_commits, sweep_commit_change_ids): (Vec<CommitId>, Vec<ChangeId>) = commits
+    let sweep_commits = commits
         .iter()
         .filter(|commit| !live_commits.contains(&commit.commit_id))
-        .map(|commit| (commit.commit_id, commit.change_id))
-        .unzip();
+        .map(|commit| commit.commit_id)
+        .collect::<Vec<_>>();
     let sweep_changes = standalone_changes
         .keys()
         .filter(|change_id| !standalone_root_ids.contains(change_id))
@@ -2822,12 +2819,6 @@ where
         }
     }
     writes.delete_batch(
-        COMMIT_CHANGE_ID_SPACE,
-        sweep_commit_change_ids
-            .iter()
-            .map(|change_id| commit_change_id_key(*change_id)),
-    );
-    writes.delete_batch(
         CHANGE_SPACE,
         sweep_changes.iter().map(|change_id| change_key(*change_id)),
     );
@@ -2848,7 +2839,6 @@ where
         },
         sweep: GcSweepSet {
             commits: sweep_commits,
-            commit_change_ids: sweep_commit_change_ids,
             changes: sweep_changes,
             json_payloads: sweep_json_payloads,
         },
@@ -2860,7 +2850,6 @@ where
 #[derive(Clone, Debug)]
 struct GcCommitInventoryEntry {
     commit_id: CommitId,
-    change_id: ChangeId,
     parent_start: usize,
     parent_len: usize,
 }
@@ -2926,7 +2915,6 @@ where
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
-                change_id: commit.change_id,
                 parent_start,
                 parent_len,
             });
@@ -3036,14 +3024,6 @@ where
         ));
     }
     writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
-    writes.delete(
-        COMMIT_CHANGE_ID_SPACE,
-        StorageKey(Bytes::from(commit_change_id_key(record.change_id))),
-    );
-    writes.delete(
-        CHANGE_SPACE,
-        StorageKey(Bytes::from(change_key(record.change_id))),
-    );
     Ok(())
 }
 
@@ -4132,38 +4112,34 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
@@ -4375,29 +4351,26 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
-                change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label("authority-gc-dead-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
@@ -4811,11 +4784,10 @@ mod tests {
 
     fn gc_authority_record(label: &str) -> CommitRecord {
         CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id: CommitId::for_test_label(label),
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
                 "authority GC record timestamp",

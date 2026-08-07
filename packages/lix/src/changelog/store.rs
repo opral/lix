@@ -9,26 +9,15 @@ use async_trait::async_trait;
 
 pub(crate) const COMMIT_NAMESPACE: &str = "changelog.commit";
 pub(crate) const CHANGE_NAMESPACE: &str = "changelog.change";
-pub(crate) const COMMIT_CHANGE_ID_NAMESPACE: &str = "changelog.commit_change_id";
-
-// Commit-derived change-id keys are always exactly 16 raw UUID bytes. This
-// non-UUID key therefore cannot collide with an identity key in the same
-// space, while keeping the format check in the hot index point-read batch.
-pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_KEY: &[u8] = b"format-v1";
-pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE: &[u8] = b"1";
 
 pub(crate) const COMMIT_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0006_0001), COMMIT_NAMESPACE);
 pub(crate) const CHANGE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0006_0002), CHANGE_NAMESPACE);
-// The former commit-membership storage space is intentionally retired. Packed
-// tracked-state commit deltas are the sole commit-membership authority.
-/// Immutable reverse lookup from a commit-derived change id to its commit id.
-///
-/// The changelog write path uses this to enforce the globally unique
-/// `CommitRecord::change_id` invariant without scanning every commit record.
-pub(crate) const COMMIT_CHANGE_ID_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0006_0004), COMMIT_CHANGE_ID_NAMESPACE);
+// The former commit-membership and commit-change reverse-index spaces are
+// intentionally retired. Packed tracked-state commit deltas are the sole
+// membership authority, while generated commit-envelope change ids are an
+// algebraic function of the commit id.
 
 // Identity keys are the raw 16 UUID bytes. UUIDv7's big-endian byte order
 // matches the lexicographic order of its lowercase hyphenated text, so range
@@ -40,24 +29,6 @@ pub(crate) fn commit_key(commit_id: CommitId) -> Vec<u8> {
 
 pub(crate) fn change_key(change_id: ChangeId) -> Vec<u8> {
     change_id.as_uuid().as_bytes().to_vec()
-}
-
-pub(crate) fn commit_change_id_key(change_id: ChangeId) -> Vec<u8> {
-    change_key(change_id)
-}
-
-#[cfg(test)]
-pub(crate) fn commit_change_id_value(commit_id: CommitId) -> Vec<u8> {
-    commit_key(commit_id)
-}
-
-pub(crate) fn commit_change_id_index_format_key() -> Vec<u8> {
-    COMMIT_CHANGE_ID_INDEX_FORMAT_KEY.to_vec()
-}
-
-#[cfg(test)]
-pub(crate) fn commit_change_id_index_format_value() -> Vec<u8> {
-    COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.to_vec()
 }
 
 pub(crate) fn commit_id_from_key(key: &[u8]) -> Result<CommitId, LixError> {
@@ -124,7 +95,6 @@ mod tests {
     fn namespaces_are_stable() {
         assert_eq!(COMMIT_NAMESPACE, "changelog.commit");
         assert_eq!(CHANGE_NAMESPACE, "changelog.change");
-        assert_eq!(COMMIT_CHANGE_ID_NAMESPACE, "changelog.commit_change_id");
     }
 
     #[test]
@@ -140,27 +110,6 @@ mod tests {
             change_id.as_uuid().as_bytes().to_vec()
         );
         assert_eq!(commit_key(commit_id).len(), 16);
-    }
-
-    #[test]
-    fn commit_change_id_index_uses_raw_identity_bytes() {
-        let commit_id = CommitId::for_test_label("commit-1");
-        let change_id = ChangeId::for_test_label("commit-change-1");
-        assert_eq!(commit_change_id_key(change_id), change_key(change_id));
-        assert_eq!(commit_change_id_value(commit_id), commit_key(commit_id));
-        assert_eq!(commit_change_id_key(change_id).len(), 16);
-        assert_eq!(commit_change_id_value(commit_id).len(), 16);
-    }
-
-    #[test]
-    fn commit_change_id_index_format_key_cannot_collide_with_identity_keys() {
-        let change_id = ChangeId::for_test_label("commit-change-1");
-        assert_ne!(commit_change_id_index_format_key(), change_key(change_id));
-        assert_ne!(
-            commit_change_id_index_format_key().len(),
-            change_key(change_id).len()
-        );
-        assert_eq!(commit_change_id_index_format_value(), b"1");
     }
 
     #[test]

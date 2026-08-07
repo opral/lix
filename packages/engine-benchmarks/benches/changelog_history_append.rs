@@ -462,6 +462,9 @@ where
             first_batch_commits,
         )
         .expect("build first changelog history seed batch");
+        let history_commit_change_id = first_batch
+            .first_commit_envelope_change_id()
+            .expect("first benchmark batch should contain a commit");
         let store = changelog_bench::prepare_store(storage, &first_batch)
             .await
             .expect("seed first changelog history batch");
@@ -489,10 +492,8 @@ where
             _temp_dir: temp_dir,
             stats,
             physical_io,
-            seed_index_mapping_rows: history_commits
-                .try_into()
-                .expect("history commit count should fit in u64"),
-            history_commit_change_id: format!("{first_batch_name}-commit-0:commit"),
+            seed_index_mapping_rows: 0,
+            history_commit_change_id,
             version: 0,
         }
     }

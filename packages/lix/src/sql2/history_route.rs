@@ -1060,7 +1060,7 @@ mod tests {
             Ok(Arc::from([ReachableCommitGraphNode {
                 commit: CommitGraphNode {
                     commit_id: self.start_commit_id,
-                    change_id: ChangeId::for_test_label("commit-change"),
+                    change_id: self.start_commit_id.envelope_change_id().unwrap(),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     generation: 0,
                     parent_commit_ids: Vec::new(),
@@ -1080,7 +1080,7 @@ mod tests {
                 .then(|| ReachableCommitGraphNode {
                     commit: CommitGraphNode {
                         commit_id: self.start_commit_id,
-                        change_id: ChangeId::for_test_label("commit-change"),
+                        change_id: self.start_commit_id.envelope_change_id().unwrap(),
                         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                         generation: 0,
                         parent_commit_ids: Vec::new(),

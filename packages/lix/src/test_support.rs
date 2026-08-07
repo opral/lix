@@ -233,17 +233,9 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         .as_ref()
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_ids,
-        rows,
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_ids, rows, false)
+            .await?;
     let root_deltas = staged
         .change_commit_ids
         .iter()
@@ -328,16 +320,9 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
         .iter()
         .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &format!("{commit_id_text}:commit"),
-        &parent_id_texts,
-        rows,
-        true,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, rows, true)
+            .await?;
     let root_deltas = staged
         .change_commit_ids
         .iter()
@@ -405,17 +390,9 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .iter()
         .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_id_texts,
-        rows,
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, rows, false)
+            .await?;
     let root_deltas = staged
         .change_commit_ids
         .iter()
@@ -569,17 +546,8 @@ pub(crate) async fn stage_empty_changelog_commit(
         .as_ref()
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_ids,
-        &[],
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_ids, &[], false).await?;
     let tracked_state = TrackedStateContext::new();
     let mut root_writer = tracked_state.writer(&*read, writes);
     root_writer
@@ -611,17 +579,9 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         .iter()
         .map(|parent| test_commit_id(parent).to_string())
         .collect::<Vec<_>>();
-    let commit_change_id = format!("{commit_id_text}:commit");
-    let staged = stage_test_changelog_commit(
-        read,
-        writes,
-        &commit_id_text,
-        &commit_change_id,
-        &parent_id_texts,
-        &[],
-        false,
-    )
-    .await?;
+    let staged =
+        stage_test_changelog_commit(read, writes, &commit_id_text, &parent_id_texts, &[], false)
+            .await?;
     let first_parent = parent_id_texts.first().map(String::as_str);
     let tracked_state = TrackedStateContext::new();
     let mut root_writer = tracked_state.writer(&*read, writes);
@@ -646,7 +606,6 @@ async fn stage_test_changelog_commit(
     mut read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: &str,
-    commit_change_id: &str,
     parent_ids: &[String],
     rows: &[MaterializedTrackedStateRow],
     tracked_state_rootless: bool,
@@ -656,7 +615,6 @@ async fn stage_test_changelog_commit(
         .iter()
         .map(|parent| test_commit_id(parent))
         .collect::<Vec<_>>();
-    let typed_commit_change_id = test_change_id(commit_change_id);
     let parent_records = ChangelogContext::new()
         .reader(&mut *read)
         .load_commits(CommitLoadRequest {
@@ -719,11 +677,10 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
-        format_version: 2,
+        format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,
-        change_id: typed_commit_change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
     };

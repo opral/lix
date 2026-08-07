@@ -2790,13 +2790,11 @@ mod tests {
         let mut records = std::collections::BTreeMap::new();
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            let commit_change_id = format!("{commit_id_text}:commit");
             let record = crate::changelog::CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             };
@@ -3025,11 +3023,10 @@ mod tests {
         for (commit_id, generation, parents) in [(parent, 0, Vec::new()), (child, 1, vec![parent])]
         {
             append.commits.push(crate::changelog::CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
-                change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
@@ -3171,7 +3168,6 @@ mod tests {
                 .first()
                 .map(|(change, _, _)| change.created_at)
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
-            let commit_change_id = format!("{commit_id}:commit");
             let generation = if let Some(parent) = parent_ids.first() {
                 let parent_generation = if let Some(generation) = generations.get(parent) {
                     *generation
@@ -3203,11 +3199,10 @@ mod tests {
                 .map(|id| CommitId::for_test_label(id))
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
                 parent_commit_ids: typed_parent_ids,
-                change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: commit_created_at,
             };

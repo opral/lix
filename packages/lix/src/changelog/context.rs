@@ -16,12 +16,10 @@ use bytes::Bytes;
 
 use super::codec::{
     append_change_record, append_commit_record, append_transaction_change_record,
-    decode_change_record,
+    decode_change_record, decode_commit_record,
 };
 use super::store::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_INDEX_FORMAT_KEY, COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE,
-    COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, change_id_from_key, change_key,
-    commit_change_id_index_format_key, commit_change_id_key, commit_id_from_key, commit_key,
+    CHANGE_SPACE, COMMIT_SPACE, change_id_from_key, change_key, commit_id_from_key, commit_key,
 };
 use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
@@ -109,12 +107,6 @@ impl EncodedChangelogBatch {
         let value = encode_value(&mut self.value_bytes)?;
         self.put_range(key, value);
         Ok(())
-    }
-
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        let start = self.value_bytes.len();
-        self.value_bytes.extend_from_slice(value);
-        self.put_range(key, start..self.value_bytes.len());
     }
 
     fn put_range(&mut self, key: &[u8], value: std::ops::Range<usize>) {
@@ -400,8 +392,8 @@ where
 {
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         self.ensure_changelog_mutation_is_allowed()?;
-        let stage_commit_change_id_index_format = self.validate_append(&append).await?;
-        self.stage_append_records(append, stage_commit_change_id_index_format)
+        self.validate_append(&append).await?;
+        self.stage_append_records(append)
     }
 
     async fn stage_delete_standalone_changes(
@@ -453,12 +445,6 @@ where
             commits.len() * 16,
             commits.iter().map(commit_value_capacity).sum(),
         );
-        let mut commit_change_id_batch = EncodedChangelogBatch::with_capacity(
-            commits.len(),
-            commits.len() * 16,
-            commits.len() * 16,
-        );
-
         for change in &changes {
             change_batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
                 append_transaction_change_record(bytes, change)
@@ -468,22 +454,13 @@ where
             commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
                 append_commit_record(bytes, commit)
             })?;
-            commit_change_id_batch.put(
-                commit.change_id.as_uuid().as_bytes(),
-                commit.commit_id.as_uuid().as_bytes(),
-            );
         }
         change_batch.stage(self.writes, CHANGE_SPACE);
         commit_batch.stage(self.writes, COMMIT_SPACE);
-        commit_change_id_batch.stage(self.writes, COMMIT_CHANGE_ID_SPACE);
         Ok(())
     }
 
-    fn stage_append_records(
-        &mut self,
-        append: ChangelogAppend,
-        stage_commit_change_id_index_format: bool,
-    ) -> Result<(), LixError> {
+    fn stage_append_records(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         let ChangelogAppend { commits, changes } = append;
         let mut change_batch = EncodedChangelogBatch::with_capacity(
             changes.len(),
@@ -495,18 +472,6 @@ where
             commits.len() * 16,
             commits.iter().map(commit_value_capacity).sum(),
         );
-        let reverse_count = commits.len() + usize::from(stage_commit_change_id_index_format);
-        let mut commit_change_id_batch = EncodedChangelogBatch::with_capacity(
-            reverse_count,
-            commits.len() * 16 + COMMIT_CHANGE_ID_INDEX_FORMAT_KEY.len(),
-            commits.len() * 16 + COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.len(),
-        );
-        if stage_commit_change_id_index_format {
-            commit_change_id_batch.put(
-                COMMIT_CHANGE_ID_INDEX_FORMAT_KEY,
-                COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE,
-            );
-        }
         for change in &changes {
             change_batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
                 append_change_record(bytes, change)
@@ -516,14 +481,9 @@ where
             commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
                 append_commit_record(bytes, commit)
             })?;
-            commit_change_id_batch.put(
-                commit.change_id.as_uuid().as_bytes(),
-                commit.commit_id.as_uuid().as_bytes(),
-            );
         }
         change_batch.stage(self.writes, CHANGE_SPACE);
         commit_batch.stage(self.writes, COMMIT_SPACE);
-        commit_change_id_batch.stage(self.writes, COMMIT_CHANGE_ID_SPACE);
 
         self.staged_changes.reserve(changes.len());
         self.staged_commits.reserve(commits.len());
@@ -545,7 +505,7 @@ where
         ))
     }
 
-    async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<bool, LixError> {
+    async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<(), LixError> {
         validate_unique(
             append.commits.iter().map(|commit| commit.commit_id),
             "commit_id",
@@ -554,10 +514,12 @@ where
             append.changes.iter().map(|change| change.change_id),
             "change_id",
         )?;
-        validate_unique(
-            append.commits.iter().map(|commit| commit.change_id),
-            "commit change_id",
-        )?;
+        let commit_change_ids = append
+            .commits
+            .iter()
+            .map(|commit| commit.commit_id.envelope_change_id())
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_unique(commit_change_ids.iter().copied(), "commit change_id")?;
 
         let append_commit_ids = append
             .commits
@@ -579,54 +541,55 @@ where
             )));
         }
 
-        let stage_commit_change_id_index_format = self
-            .reject_existing_id_collisions(append, &append_commit_ids, &append_changes)
-            .await?;
+        self.reject_existing_id_collisions(
+            append,
+            &commit_change_ids,
+            &append_commit_ids,
+            &append_changes,
+        )
+        .await?;
         self.validate_parent_commits(append, &append_commit_ids)
             .await?;
 
-        Ok(stage_commit_change_id_index_format)
+        Ok(())
     }
 
     async fn reject_existing_id_collisions(
         &mut self,
         append: &ChangelogAppend,
+        commit_change_ids: &[ChangeId],
         append_commit_ids: &HashSet<CommitId>,
         append_changes: &HashMap<ChangeId, &ChangeRecord>,
-    ) -> Result<bool, LixError> {
+    ) -> Result<(), LixError> {
         let commit_ids = append_commit_ids.iter().copied().collect::<Vec<_>>();
+        let append_change_ids = append_changes.keys().copied().collect::<Vec<_>>();
+        let change_commit_candidates = append_change_ids
+            .iter()
+            .filter_map(|change_id| {
+                change_id
+                    .envelope_commit_id()
+                    .map(|commit_id| (*change_id, commit_id))
+            })
+            .collect::<Vec<_>>();
         let commit_keys = commit_ids
             .iter()
+            .chain(
+                change_commit_candidates
+                    .iter()
+                    .map(|(_, commit_id)| commit_id),
+            )
             .map(|commit_id| commit_key(*commit_id))
             .collect::<Vec<_>>();
-        let commit_change_ids = append
-            .commits
-            .iter()
-            .map(|commit| commit.change_id)
-            .collect::<Vec<_>>();
-        let append_change_ids = append_changes.keys().copied().collect::<Vec<_>>();
         let change_keys = append_change_ids
             .iter()
-            .chain(&commit_change_ids)
+            .chain(commit_change_ids)
             .map(|change_id| change_key(*change_id))
             .collect::<Vec<_>>();
-        let index_format_key = commit_change_id_index_format_key();
-        let index_format_is_staged = self
-            .writes
-            .contains_put(COMMIT_CHANGE_ID_SPACE, &index_format_key);
-        let mut index_keys = Vec::with_capacity(commit_change_ids.len() + 1);
-        index_keys.push(index_format_key);
-        index_keys.extend(
-            commit_change_ids
-                .iter()
-                .map(|change_id| commit_change_id_key(*change_id)),
-        );
         let mut batches = self
             .store
             .changelog_get_many_batch(vec![
                 (COMMIT_SPACE, commit_keys),
                 (CHANGE_SPACE, change_keys),
-                (COMMIT_CHANGE_ID_SPACE, index_keys),
             ])
             .await?
             .into_iter();
@@ -636,13 +599,11 @@ where
         let existing_changes = batches
             .next()
             .expect("change validation batch was requested");
-        let mut index_values = batches
-            .next()
-            .expect("commit change-id validation batch was requested")
-            .into_iter();
         let unexpected_batch = batches.next();
         debug_assert!(unexpected_batch.is_none());
-        for (commit_id, found) in commit_ids.iter().zip(existing_commits) {
+        let (existing_commit_ids, existing_change_commit_candidates) =
+            existing_commits.split_at(commit_ids.len());
+        for (commit_id, found) in commit_ids.iter().zip(existing_commit_ids) {
             if found.is_some() || self.staged_commits.contains_key(commit_id) {
                 return Err(LixError::unknown(format!(
                     "changelog commit '{commit_id}' already exists"
@@ -658,8 +619,18 @@ where
                 )));
             }
         }
-        if append.commits.is_empty() {
-            return Ok(false);
+        for ((change_id, commit_id), found) in change_commit_candidates
+            .iter()
+            .zip(existing_change_commit_candidates)
+        {
+            if found.is_some()
+                || append_commit_ids.contains(commit_id)
+                || self.staged_commits.contains_key(commit_id)
+            {
+                return Err(LixError::unknown(format!(
+                    "changelog change '{change_id}' collides with commit '{commit_id}' derived envelope identity"
+                )));
+            }
         }
         for ((commit, change_id), existing_change) in append
             .commits
@@ -670,55 +641,20 @@ where
             if append_changes.contains_key(change_id)
                 || existing_change.is_some()
                 || self.staged_changes.contains_key(change_id)
-                || self
-                    .staged_commits
-                    .values()
-                    .any(|staged| staged.change_id == *change_id)
+                || self.staged_commits.values().any(|staged| {
+                    staged
+                        .commit_id
+                        .envelope_change_id()
+                        .is_ok_and(|staged_id| staged_id == *change_id)
+                })
             {
                 return Err(LixError::unknown(format!(
                     "changelog commit '{}' derived change_id '{}' collides with an existing change id",
-                    commit.commit_id, commit.change_id
+                    commit.commit_id, change_id
                 )));
             }
         }
-        let stored_format = index_values
-            .next()
-            .expect("commit change-id index format key was requested");
-        let stage_commit_change_id_index_format = match stored_format {
-            Some(value) if value.as_slice() == COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE => false,
-            Some(_) => {
-                return Err(LixError::unknown(
-                    "changelog commit_change_id index has an unsupported format; recreate the repository",
-                ));
-            }
-            None if index_format_is_staged => false,
-            None => {
-                let existing_commits = self
-                    .store
-                    .changelog_scan(
-                        COMMIT_SPACE,
-                        Vec::new(),
-                        None,
-                        1,
-                        StorageCoreProjection::KeyOnly,
-                    )
-                    .await?;
-                if !existing_commits.keys.is_empty() {
-                    return Err(LixError::unknown(
-                        "changelog commit_change_id index is missing for an existing repository; recreate the repository before appending commits",
-                    ));
-                }
-                true
-            }
-        };
-        for (change_id, existing_commit) in commit_change_ids.iter().zip(index_values) {
-            if existing_commit.is_some() {
-                return Err(LixError::unknown(format!(
-                    "changelog commit derived change_id '{change_id}' already exists"
-                )));
-            }
-        }
-        Ok(stage_commit_change_id_index_format)
+        Ok(())
     }
 
     async fn validate_parent_commits(
@@ -746,7 +682,7 @@ where
         {
             let generation = match found {
                 Some(bytes) => {
-                    let record: CommitRecord = storage_codec::decode("commit record", &bytes)?;
+                    let record = decode_commit_record(&bytes)?;
                     record.generation
                 }
                 None => self
@@ -810,7 +746,7 @@ async fn load_commits_from_store<'a>(
             entries.push(None);
             continue;
         };
-        let record = storage_codec::decode("commit record", &value)?;
+        let record = decode_commit_record(&value)?;
         entries.push(Some(record));
     }
     CommitLoadBatch::try_new("changelog commit", request.commit_ids, entries)
@@ -844,7 +780,7 @@ async fn scan_commits_from_store(
         .await?;
     let mut entries = Vec::with_capacity(page.values.len());
     for (key, value) in page.keys.iter().zip(page.values.iter()) {
-        let record: CommitRecord = storage_codec::decode("commit record", value)?;
+        let record = decode_commit_record(value)?;
         if key.as_slice() != commit_key(record.commit_id).as_slice() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1067,4 +1003,211 @@ where
         values,
         resume_after,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::storage_adapter::{Memory, StorageWriteOptions};
+
+    fn commit_record(commit_id: CommitId) -> CommitRecord {
+        CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-08-07T00:00:00Z"),
+        }
+    }
+
+    fn standalone_change(change_id: ChangeId) -> ChangeRecord {
+        ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            schema_key: "test_identity".to_string(),
+            entity_pk: EntityPk::single("entity"),
+            file_id: None,
+            snapshot: crate::json_store::JsonSlot::from_json("{}"),
+            metadata: crate::json_store::JsonSlot::None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-08-07T00:00:00Z"),
+            origin_key: None,
+        }
+    }
+
+    async fn commit_append(
+        storage: &StorageAdapter<Memory>,
+        append: ChangelogAppend,
+    ) -> Result<(), LixError> {
+        let mut read = storage.begin_read(StorageReadOptions::default()).await?;
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(append)
+            .await?;
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+    }
+
+    #[tokio::test]
+    async fn explicit_standalone_identity_remains_byte_stable() {
+        let storage = StorageAdapter::new(Memory::new());
+        let explicit = ChangeId::new(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8abc_def0_1234_5678,
+        ));
+        commit_append(
+            &storage,
+            ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![standalone_change(explicit)],
+            },
+        )
+        .await
+        .expect("explicit standalone change should append");
+
+        let mut reader = ChangelogContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open"),
+        );
+        let loaded = reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &[explicit],
+            })
+            .await
+            .expect("explicit change should load")
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| value)
+            .expect("explicit change should exist");
+        assert_eq!(loaded.change_id, explicit);
+    }
+
+    #[tokio::test]
+    async fn standalone_and_commit_envelope_collisions_fail_in_both_orders() {
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8abc_def0_1234_5678,
+        ));
+        let envelope = commit_id.envelope_change_id().unwrap();
+
+        let commit_first = StorageAdapter::new(Memory::new());
+        commit_append(
+            &commit_first,
+            ChangelogAppend {
+                commits: vec![commit_record(commit_id)],
+                changes: Vec::new(),
+            },
+        )
+        .await
+        .expect("commit should append");
+        let error = commit_append(
+            &commit_first,
+            ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![standalone_change(envelope)],
+            },
+        )
+        .await
+        .expect_err("standalone identity must not mask an existing commit envelope");
+        assert!(error.message.contains("derived envelope identity"));
+
+        let standalone_first = StorageAdapter::new(Memory::new());
+        commit_append(
+            &standalone_first,
+            ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![standalone_change(envelope)],
+            },
+        )
+        .await
+        .expect("standalone change should append");
+        let error = commit_append(
+            &standalone_first,
+            ChangelogAppend {
+                commits: vec![commit_record(commit_id)],
+                changes: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("commit envelope must not mask an existing standalone identity");
+        assert!(
+            error
+                .message
+                .contains("collides with an existing change id")
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_noncanonical_commit_identity_fails_on_read() {
+        let storage = StorageAdapter::new(Memory::new());
+        let malformed = CommitId::new(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8abc_def0_0000_0001,
+        ));
+        let encoded = crate::changelog::encode_commit_record(&commit_record(malformed))
+            .expect("corrupt fixture should encode");
+        let mut writes = storage.new_write_set();
+        writes.put(
+            COMMIT_SPACE,
+            StorageKey(Bytes::from(commit_key(malformed))),
+            encoded,
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corrupt fixture should persist");
+
+        let mut reader = ChangelogContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open"),
+        );
+        let error = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[malformed],
+            })
+            .await
+            .expect_err("noncanonical persisted commit must fail closed");
+        assert!(error.message.contains("no reserved change address space"));
+    }
+
+    #[tokio::test]
+    async fn superseded_commit_record_format_fails_on_read() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("superseded-format");
+        let mut record = commit_record(commit_id);
+        record.format_version = crate::changelog::COMMIT_RECORD_FORMAT_VERSION - 1;
+        let encoded = crate::changelog::encode_commit_record(&record)
+            .expect("superseded fixture should encode");
+        let mut writes = storage.new_write_set();
+        writes.put(
+            COMMIT_SPACE,
+            StorageKey(Bytes::from(commit_key(commit_id))),
+            encoded,
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("superseded fixture should persist");
+
+        let mut reader = ChangelogContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open"),
+        );
+        let error = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[commit_id],
+            })
+            .await
+            .expect_err("superseded record format must fail closed");
+        assert!(error.message.contains("unsupported record format"));
+    }
 }

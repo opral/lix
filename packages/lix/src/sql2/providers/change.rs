@@ -8,8 +8,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::changelog::{
-    COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader,
 };
 use crate::serialize_row_metadata;
 
@@ -21,10 +20,7 @@ use crate::sql2::change_materialization::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-};
-use bytes::Bytes;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -193,6 +189,18 @@ where
         ));
     }
     changes.sort_by_key(LixChangeRow::change_id);
+    if let Some(duplicate) = changes
+        .windows(2)
+        .find(|pair| pair[0].change_id() == pair[1].change_id())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "change '{}' has more than one durable authority",
+                duplicate[0].change_id()
+            ),
+        ));
+    }
     if let Some(limit) = limit {
         changes.truncate(limit);
     }
@@ -257,7 +265,24 @@ async fn load_exact_change<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    let derived_commit = if let Some(commit_id) = change_id.envelope_commit_id() {
+        crate::commit_graph::CommitGraphContext::new()
+            .reader(store.clone())
+            .load_node(&commit_id)
+            .await?
+    } else {
+        None
+    };
     if let Some(change) = crate::tracked_state::load_change_record_by_id(&store, change_id).await? {
+        if let Some(commit) = derived_commit.as_ref() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "change '{change_id}' has both tracked authority and commit '{}' envelope authority",
+                    commit.commit_id
+                ),
+            ));
+        }
         return Ok(Some(LixChangeRow::Direct(change)));
     }
 
@@ -271,37 +296,30 @@ where
         .next()
         .and_then(|(_, value)| value)
     {
+        if let Some(commit) = derived_commit.as_ref() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "change '{change_id}' has both standalone authority and commit '{}' envelope authority",
+                    commit.commit_id
+                ),
+            ));
+        }
         return Ok(Some(LixChangeRow::Direct(change)));
     }
 
-    let index_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
-    let indexed_commit =
-        PointReadPlan::new(COMMIT_CHANGE_ID_SPACE, std::slice::from_ref(&index_key))
-            .materialize(&store, StorageGetOptions::default())
-            .await?
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-    let Some(StorageProjectedValue::FullValue(commit_id)) = indexed_commit else {
+    let Some(commit) = derived_commit else {
         return Ok(None);
     };
-    let commit_id = CommitId::new(uuid::Uuid::from_slice(&commit_id).map_err(|error| {
-        LixError::new(
+    if commit.change_id != change_id {
+        return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("changelog commit change-id index has invalid commit id: {error}"),
-        )
-    })?);
-    let commit = crate::commit_graph::CommitGraphContext::new()
-        .reader(store)
-        .load_node(&commit_id)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog commit change-id index references missing commit '{commit_id}'"),
-            )
-        })?;
+            format!(
+                "commit '{}' derived envelope identity '{}' instead of requested '{change_id}'",
+                commit.commit_id, commit.change_id
+            ),
+        ));
+    }
     Ok(Some(LixChangeRow::DerivedCommit(
         crate::commit_graph::canonical_commit_change(&commit),
     )))
@@ -381,7 +399,10 @@ mod tests {
     use datafusion::arrow::datatypes::Schema;
     use datafusion::logical_expr::{Expr, col, lit};
 
-    use super::{ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema};
+    use super::{
+        ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema,
+        load_exact_change,
+    };
 
     #[test]
     fn identity_projection_skips_json_payloads() {
@@ -425,5 +446,82 @@ mod tests {
             change_scan_route(&[col("schema_key").eq(lit("example"))]),
             ChangeScanRoute::All
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_rejects_corrupt_dual_standalone_and_commit_authority() {
+        use bytes::Bytes;
+
+        use crate::changelog::{
+            CHANGE_SPACE, COMMIT_RECORD_FORMAT_VERSION, ChangeRecord, ChangelogAppend,
+            ChangelogContext, ChangelogWriter, CommitId, CommitRecord, change_key,
+        };
+        use crate::common::LixTimestamp;
+        use crate::entity_pk::EntityPk;
+        use crate::storage_adapter::{
+            Memory, StorageAdapter, StorageKey, StorageReadOptions, StorageWriteOptions,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8abc_def0_1234_5678,
+        ));
+        let change_id = commit_id.envelope_change_id().unwrap();
+        let timestamp = LixTimestamp::expect_parse("created_at", "2026-08-07T00:00:00Z");
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: vec![CommitRecord {
+                    format_version: COMMIT_RECORD_FORMAT_VERSION,
+                    commit_id,
+                    generation: 0,
+                    parent_commit_ids: Vec::new(),
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+                    created_at: timestamp,
+                }],
+                changes: Vec::new(),
+            })
+            .await
+            .expect("commit should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit should persist");
+
+        let corrupt_change = ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            schema_key: "corrupt_duplicate".to_string(),
+            entity_pk: EntityPk::single("duplicate"),
+            file_id: None,
+            snapshot: crate::json_store::JsonSlot::from_json("{}"),
+            metadata: crate::json_store::JsonSlot::None,
+            created_at: timestamp,
+            origin_key: None,
+        };
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            CHANGE_SPACE,
+            StorageKey(Bytes::from(change_key(change_id))),
+            crate::changelog::encode_change_record(&corrupt_change)
+                .expect("corrupt duplicate should encode"),
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("physical corruption should persist");
+
+        let error = load_exact_change(storage, change_id)
+            .await
+            .err()
+            .expect("dual authority must fail closed");
+        assert!(error.message.contains("both standalone authority"));
     }
 }

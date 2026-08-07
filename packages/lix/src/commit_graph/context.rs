@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
-    CommitScanRequest,
+    CommitScanRequest, decode_commit_record,
 };
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_nodes};
 use crate::commit_graph::{
@@ -26,7 +26,6 @@ use crate::storage_adapter::{
     StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
     StorageProjectedValue, exact_get_many,
 };
-use crate::storage_codec;
 use bytes::Bytes;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -148,7 +147,7 @@ where
                     let Some(bytes) = full_value_bytes(value) else {
                         return Ok(None);
                     };
-                    let record = storage_codec::decode("commit record", &bytes)?;
+                    let record = decode_commit_record(&bytes)?;
                     Ok(Some(record))
                 })
                 .collect::<Result<Vec<Option<CommitRecord>>, LixError>>()?;
@@ -536,7 +535,7 @@ fn commit_graph_node_from_authority(
     }
     Ok(Some(CommitGraphNode {
         commit_id: record.commit_id,
-        change_id: record.change_id,
+        change_id: record.commit_id.envelope_change_id()?,
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
@@ -773,7 +772,10 @@ mod tests {
 
         assert_eq!(commit.commit_id, commit_id("commit-1"));
         assert_eq!(commit.parent_commit_ids, commit_ids(["parent-1"]));
-        assert_eq!(commit.change_id, change_id("commit-1-change"));
+        assert_eq!(
+            commit.change_id,
+            commit.commit_id.envelope_change_id().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1088,11 +1090,10 @@ mod tests {
             .stage_append(ChangelogAppend {
                 changes: Vec::new(),
                 commits: vec![CommitRecord {
-                    format_version: 2,
+                    format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
-                    change_id: change_id("selected-tombstone-commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
                 }],
@@ -1462,14 +1463,16 @@ mod tests {
 
     impl TestChange {
         fn commit(
-            change_id: &str,
+            _change_id: &str,
             commit_id: &str,
             change_ids: &[&str],
             parent_commit_ids: &[&str],
         ) -> Self {
             Self {
                 change: CommitGraphChange {
-                    id: ChangeId::for_test_label(change_id),
+                    id: CommitId::for_test_label(commit_id)
+                        .envelope_change_id()
+                        .unwrap(),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
@@ -1587,11 +1590,10 @@ mod tests {
             }
 
             append.commits.push(CommitRecord {
-                format_version: 2,
+                format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
-                change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             });
@@ -1670,13 +1672,11 @@ mod tests {
     }
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
-        let change_id = format!("{commit_id}-change");
         append.commits.push(CommitRecord {
-            format_version: 2,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            change_id: ChangeId::for_test_label(&change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         });
@@ -1714,7 +1714,7 @@ mod tests {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
             commit_id,
-            change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
+            change_id: commit_id.envelope_change_id().unwrap(),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             generation: 0,
             parent_commit_ids: parent_commit_ids
