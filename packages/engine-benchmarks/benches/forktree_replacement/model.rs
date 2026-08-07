@@ -15,7 +15,7 @@ const LEAF_TAG: u8 = 1;
 const INTERNAL_TAG: u8 = 2;
 const DELTA_TAG: u8 = 3;
 const COMMIT_TAG: u8 = 4;
-const VALUE_TAG: u8 = 5;
+const VALUE_PACK_TAG: u8 = 5;
 const LEAF_ROWS: usize = 8;
 const INTERNAL_CHILDREN: usize = 32;
 
@@ -77,7 +77,19 @@ enum Node {
 #[derive(Clone, Debug)]
 struct LeafEntry {
     key: Vec<u8>,
-    value: ObjectId,
+    value: ValueRef,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValueRef {
+    pack: ObjectId,
+    index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedUpdate {
+    key: Vec<u8>,
+    value: ValueRef,
 }
 
 #[derive(Clone, Copy)]
@@ -105,7 +117,11 @@ where
     pub async fn initialize(&self, rows: &[(Vec<u8>, Vec<u8>)]) -> Result<ObjectId, String> {
         validate_sorted_rows(rows)?;
         let mut pending = BTreeMap::new();
-        let root = build_tree(rows, &mut pending)?;
+        let value_pack = stage_object(
+            encode_value_pack(rows.iter().map(|(_, value)| value.as_slice())),
+            &mut pending,
+        );
+        let root = build_tree(rows, value_pack, &mut pending)?;
         let delta = stage_object(
             encode_delta(
                 None,
@@ -186,8 +202,28 @@ where
                 .sum(),
             ..ApplyAccounting::default()
         };
+        let value_pack = stage_object(
+            encode_value_pack(updates.iter().map(|update| update.value.as_slice())),
+            &mut pending,
+        );
+        let resolved_updates = updates
+            .iter()
+            .enumerate()
+            .map(|(index, update)| ResolvedUpdate {
+                key: update.key.clone(),
+                value: ValueRef {
+                    pack: value_pack,
+                    index: u32::try_from(index).expect("ForkTree value-pack index fits u32"),
+                },
+            })
+            .collect::<Vec<_>>();
         let root = self
-            .rewrite_node(commit.root, updates, &mut pending, &mut accounting)
+            .rewrite_node(
+                commit.root,
+                &resolved_updates,
+                &mut pending,
+                &mut accounting,
+            )
             .await?;
         let delta = stage_object(
             encode_delta(
@@ -320,7 +356,7 @@ where
     fn rewrite_node<'a>(
         &'a self,
         id: ObjectId,
-        updates: &'a [Update],
+        updates: &'a [ResolvedUpdate],
         pending: &'a mut BTreeMap<ObjectId, Bytes>,
         accounting: &'a mut ApplyAccounting,
     ) -> BoxFuture<'a, Result<NodeRef, String>> {
@@ -337,7 +373,7 @@ where
                                     String::from_utf8_lossy(&update.key)
                                 )
                             })?;
-                        rows[index].value = stage_object(encode_value(&update.value), pending);
+                        rows[index].value = update.value;
                     }
                     let bytes = encode_leaf(&rows);
                     let id = stage_object(bytes, pending);
@@ -388,10 +424,29 @@ where
         Box::pin(async move {
             match decode_node(&self.load_object(id).await?)? {
                 Node::Leaf(rows) => {
-                    let ids = rows.iter().map(|row| row.value).collect::<Vec<_>>();
-                    let values = self.load_objects(&ids).await?;
-                    for (row, value) in rows.into_iter().zip(values) {
-                        output.push((row.key, decode_value(&value)?));
+                    let ids = rows
+                        .iter()
+                        .map(|row| row.value.pack)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let packs = ids
+                        .iter()
+                        .copied()
+                        .zip(self.load_objects(&ids).await?)
+                        .map(|(id, bytes)| decode_value_pack(&bytes).map(|values| (id, values)))
+                        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                    for row in rows {
+                        let values = packs
+                            .get(&row.value.pack)
+                            .ok_or_else(|| "ForkTree leaf value pack was not loaded".to_string())?;
+                        let value = values
+                            .get(row.value.index as usize)
+                            .ok_or_else(|| {
+                                "ForkTree value-pack index is out of bounds".to_string()
+                            })?
+                            .clone();
+                        output.push((row.key, value));
                     }
                 }
                 Node::Internal(children) => {
@@ -527,6 +582,7 @@ where
 
 fn build_tree(
     rows: &[(Vec<u8>, Vec<u8>)],
+    value_pack: ObjectId,
     pending: &mut BTreeMap<ObjectId, Bytes>,
 ) -> Result<NodeRef, String> {
     if rows.is_empty() {
@@ -534,9 +590,13 @@ fn build_tree(
     }
     let leaf_rows = rows
         .iter()
-        .map(|(key, value)| LeafEntry {
+        .enumerate()
+        .map(|(index, (key, _))| LeafEntry {
             key: key.clone(),
-            value: stage_object(encode_value(value), pending),
+            value: ValueRef {
+                pack: value_pack,
+                index: u32::try_from(index).expect("ForkTree initial value-pack index fits u32"),
+            },
         })
         .collect::<Vec<_>>();
     let mut level = leaf_rows
@@ -615,7 +675,8 @@ fn encode_leaf(rows: &[LeafEntry]) -> Bytes {
     put_u32(&mut body, rows.len());
     for row in rows {
         put_bytes(&mut body, &row.key);
-        body.extend_from_slice(&row.value.0);
+        body.extend_from_slice(&row.value.pack.0);
+        body.extend_from_slice(&row.value.index.to_be_bytes());
     }
     let compressed = zstd::bulk::compress(&body, 1).expect("compress canonical ForkTree leaf");
     let mut bytes = object_prefix(LEAF_TAG);
@@ -624,9 +685,17 @@ fn encode_leaf(rows: &[LeafEntry]) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn encode_value(value: &[u8]) -> Bytes {
-    let mut bytes = object_prefix(VALUE_TAG);
-    put_bytes(&mut bytes, value);
+fn encode_value_pack<'a>(values: impl ExactSizeIterator<Item = &'a [u8]>) -> Bytes {
+    let mut body = Vec::new();
+    put_u32(&mut body, values.len());
+    for value in values {
+        put_bytes(&mut body, value);
+    }
+    let compressed =
+        zstd::bulk::compress(&body, 1).expect("compress canonical ForkTree value pack");
+    let mut bytes = object_prefix(VALUE_PACK_TAG);
+    put_u32(&mut bytes, body.len());
+    bytes.extend_from_slice(&compressed);
     Bytes::from(bytes)
 }
 
@@ -678,7 +747,10 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
             for _ in 0..count {
                 rows.push(LeafEntry {
                     key: body.bytes()?,
-                    value: body.id()?,
+                    value: ValueRef {
+                        pack: body.id()?,
+                        index: body.u32_raw()?,
+                    },
                 });
             }
             body.finish()?;
@@ -713,14 +785,24 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
     }
 }
 
-fn decode_value(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn decode_value_pack(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut decoder = Decoder::new(bytes);
-    if decoder.object_tag()? != VALUE_TAG {
-        return Err("ForkTree leaf does not reference a value object".to_string());
+    if decoder.object_tag()? != VALUE_PACK_TAG {
+        return Err("ForkTree leaf does not reference a value-pack object".to_string());
     }
-    let value = decoder.bytes()?;
+    let decoded_length = decoder.u32()?;
+    let compressed = decoder.remaining();
+    let decoded = zstd::bulk::decompress(compressed, decoded_length)
+        .map_err(|error| format!("decompress ForkTree value pack: {error}"))?;
     decoder.finish()?;
-    Ok(value)
+    let mut body = Decoder::new(&decoded);
+    let count = body.u32()?;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(body.bytes()?);
+    }
+    body.finish()?;
+    Ok(values)
 }
 
 fn decode_commit(bytes: &[u8]) -> Result<Commit, String> {
@@ -847,11 +929,15 @@ impl<'a> Decoder<'a> {
     }
 
     fn u32(&mut self) -> Result<usize, String> {
+        Ok(self.u32_raw()? as usize)
+    }
+
+    fn u32_raw(&mut self) -> Result<u32, String> {
         let encoded: [u8; 4] = self
             .take(4)?
             .try_into()
             .expect("decoder returns exact u32 width");
-        Ok(u32::from_be_bytes(encoded) as usize)
+        Ok(u32::from_be_bytes(encoded))
     }
 
     fn u64(&mut self) -> Result<u64, String> {

@@ -14,10 +14,12 @@ production index and is deliberately not registered with Lix serving paths.
   commit guarded by exact preconditions.
 - Every commit names one tree root and one semantic delta. Nodes use canonical
   encodings and sorted entries. Leaves use deterministic 8-row blocks with
-  level-1 Zstandard packing and store sorted key-to-authenticated-value-object
-  mappings. Values remain in the same object space and reachability graph; they
-  are not a side index or second format. Initial trees are deterministically
-  bulk packed; value-only updates rewrite only touched leaves and ancestor paths.
+  level-1 Zstandard packing and map sorted keys to authenticated `(value-pack
+  hash, slot)` references. Each transaction writes one deterministic value pack
+  for all changed values. Packs remain in the same object space and reachability
+  graph; they are not a side index or second format. Initial trees are
+  deterministically bulk packed; value-only updates rewrite only touched leaves
+  and ancestor paths.
 - Derived caches or indexes are outside the authoritative model and must be
   rebuildable from pinned commit roots.
 
