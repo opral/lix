@@ -1056,6 +1056,15 @@ impl DiffCommitRootValidationCache {
             changelog_first_parents: HashMap::new(),
         }
     }
+
+    /// Retains root authority already loaded for endpoint routing so the
+    /// integrity pass does not fetch the same immutable manifest again.
+    fn seed_authorized_commit_root(&mut self, commit_id: &str, metadata: TrackedStateCommitRoot) {
+        self.commit_roots
+            .insert(commit_id.to_string(), Some(metadata.root_id.clone()));
+        self.commit_root_metadata
+            .insert(commit_id.to_string(), metadata);
+    }
 }
 
 impl<S> TrackedStateStoreReader<S>
@@ -2545,11 +2554,11 @@ where
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
-        let left_root = self.tree.load_root(&self.store, left_commit_id).await?;
+        let left_root = storage::load_snapshot_commit_root(&self.store, left_commit_id).await?;
         let right_root = if left_commit_id == right_commit_id {
             left_root.clone()
         } else {
-            self.tree.load_root(&self.store, right_commit_id).await?
+            storage::load_snapshot_commit_root(&self.store, right_commit_id).await?
         };
         if left_root.is_none() {
             self.load_point_replay_commit(CommitId::parse_lix(
@@ -2565,9 +2574,15 @@ where
             )?)
             .await?;
         }
-        if let (Some(_), Some(_)) = (&left_root, &right_root) {
+        if let (Some(left_root), Some(right_root)) = (left_root, right_root) {
             return self
-                .diff_tree_entries_from_roots(left_commit_id, right_commit_id, request)
+                .diff_tree_entries_from_roots(
+                    left_commit_id,
+                    left_root,
+                    right_commit_id,
+                    right_root,
+                    request,
+                )
                 .await;
         }
         if let Some(entries) = self
@@ -3000,10 +3015,14 @@ where
     async fn diff_tree_entries_from_roots(
         &mut self,
         left_commit_id: &str,
+        left_metadata: TrackedStateCommitRoot,
         right_commit_id: &str,
+        right_metadata: TrackedStateCommitRoot,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
         let mut cache = DiffCommitRootValidationCache::new();
+        cache.seed_authorized_commit_root(left_commit_id, left_metadata);
+        cache.seed_authorized_commit_root(right_commit_id, right_metadata);
         let left_root = self
             .load_validated_diff_root(left_commit_id, &mut cache)
             .await?;
@@ -4917,7 +4936,9 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::ops::Bound;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     use super::*;
@@ -4928,6 +4949,49 @@ mod tests {
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
+
+    struct DiffOwnerCountingRead<R> {
+        inner: R,
+        manifest_key_reads: Arc<AtomicUsize>,
+        commit_record_key_reads: Arc<AtomicUsize>,
+    }
+
+    impl<R> StorageAdapterRead for DiffOwnerCountingRead<R>
+    where
+        R: StorageAdapterRead,
+    {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> impl Future<
+            Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
+        > + Send {
+            for request in requests {
+                if request.space == storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE {
+                    self.manifest_key_reads
+                        .fetch_add(request.keys.len(), Ordering::Relaxed);
+                } else if request.space == crate::changelog::COMMIT_SPACE {
+                    self.commit_record_key_reads
+                        .fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
+            }
+            self.inner.get_many(requests)
+        }
+
+        fn scan(
+            &self,
+            space: crate::storage::StorageSpace,
+            range: crate::storage::KeyRange,
+            opts: crate::storage::ScanOptions,
+        ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
+        {
+            self.inner.scan(space, range, opts)
+        }
+    }
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
@@ -8098,6 +8162,61 @@ mod tests {
         .await
         .expect("source root should write");
         (storage, tracked_state)
+    }
+
+    #[tokio::test]
+    async fn rooted_diff_reuses_each_loaded_endpoint_manifest_for_validation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("base"),
+            &[row_with_value("entity-a", "change-child", "child", "child")],
+        )
+        .await
+        .expect("child root should write");
+
+        let manifest_key_reads = Arc::new(AtomicUsize::new(0));
+        let commit_record_key_reads = Arc::new(AtomicUsize::new(0));
+        let read = DiffOwnerCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open"),
+            manifest_key_reads: Arc::clone(&manifest_key_reads),
+            commit_record_key_reads: Arc::clone(&commit_record_key_reads),
+        };
+        let diff = tracked_state
+            .reader(read)
+            .diff_semantic_tree_entries_at_commits(
+                "base",
+                "child",
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .expect("rooted diff should run");
+
+        assert_eq!(diff.len(), 1);
+        assert_eq!(
+            manifest_key_reads.load(Ordering::Relaxed),
+            2,
+            "each endpoint manifest is authoritative once and must be reused by validation"
+        );
+        assert!(
+            commit_record_key_reads.load(Ordering::Relaxed) <= 4,
+            "endpoint liveness and first-parent validation must not reload root authority"
+        );
     }
 
     fn merge_pick_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
