@@ -39,8 +39,8 @@ use crate::tracked_state::{
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
-    TrackedStateTransientRebuildState, encode_key_ref, load_commit_delta_change_records,
-    load_commit_delta_replay_metadata, stage_addressable_commit_deltas, stage_change_locators,
+    encode_key_ref, load_commit_delta_change_records, load_commit_delta_replay_metadata,
+    stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::staging::{
@@ -5656,61 +5656,22 @@ async fn stage_tracked_roots(
     if root_fence_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
-    // Reconstruct only the bounded rootless suffix in a transient
-    // content-addressed overlay. Rootless ancestors have no immutable root
-    // pointer, so their intermediate chunks must not enter the durable write
-    // set. A rooted descendant promotes only transient chunks reachable from
-    // its final authenticated root.
-    let mut rebuild_state = TrackedStateTransientRebuildState::default();
-    let rebuild_parent_ids = durable_root_rebuild_parents
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    let plans =
-        crate::tracked_state::load_rebuild_plan_frontier(read, &rebuild_parent_ids, true).await?;
-    if let Some(final_plan) = plans.first() {
-        // The durable rootless interval is an ordered sequence of immutable
-        // deltas, but publication only needs its final authenticated state.
-        // Collapse each identity to the last value in parent-first order and
-        // rebuild once from the nearest available rooted parent. This keeps
-        // all semantic history in its immutable authorities while removing
-        // one tree traversal/re-encoding pass per replay-debt commit. The
-        // resulting plan retains the real deepest commit id, so downstream
-        // parent/root metadata remains coherent.
-        let mut final_deltas = BTreeMap::<
-            (String, Option<String>, EntityPk),
-            crate::tracked_state::CommitRootRebuildDelta,
-        >::new();
-        for plan in plans.iter().rev() {
-            for delta in &plan.deltas {
-                final_deltas.insert(
-                    (
-                        delta.schema_key.clone(),
-                        delta.file_id.clone(),
-                        delta.entity_pk.clone(),
-                    ),
-                    delta.clone(),
-                );
-            }
-        }
-        let collapsed_plan = crate::tracked_state::CommitRootRebuildPlan {
-            commit_id: final_plan.commit_id,
-            parent_commit_id: plans.last().and_then(|plan| plan.parent_commit_id),
-            deltas: final_deltas.into_values().collect(),
-        };
-        let previously_known = rebuild_state.chunk_hashes();
-        let mut scratch_writes = StorageWriteSet::new();
-        let mut transient_writer =
-            tracked_state.writer_with_rebuild_state(read, &mut scratch_writes, rebuild_state);
-        crate::tracked_state::stage_rebuild_plan_with_writer(
-            &mut transient_writer,
-            &collapsed_plan,
+    let mut tracked_writer = tracked_state.writer(read, writes);
+    let mut staged_rebuild_plan_ids = BTreeSet::new();
+    for parent_commit_id in durable_root_rebuild_parents {
+        let plans = crate::tracked_state::load_rebuild_plans_to_nearest_available_root(
+            read,
+            &parent_commit_id.to_string(),
+            true,
         )
         .await?;
-        rebuild_state = transient_writer.into_transient_rebuild_state();
-        rebuild_state.mark_new_chunks_transient(&previously_known);
+        for plan in plans.iter().rev() {
+            if staged_rebuild_plan_ids.insert(plan.commit_id) {
+                crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
+                    .await?;
+            }
+        }
     }
-    let mut tracked_writer = tracked_state.writer_with_rebuild_state(read, writes, rebuild_state);
     let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         if !root_fence_ids.contains(&root.commit_id) {
@@ -5788,7 +5749,7 @@ async fn stage_tracked_roots(
                 file_id: first_row.file_id.map(crate::common::SharedStr::as_str),
                 entity_pk: first_row.entity_pk,
             });
-            if let Some(report) = tracked_writer
+            if tracked_writer
                 .try_stage_bulk_parent_root_from_ordered_mutations(
                     &commit_id_text,
                     parent_commit_id_text.as_deref(),
@@ -5798,10 +5759,8 @@ async fn stage_tracked_roots(
                     OrderedStateRowMutations::new(state_row_indices, state_rows, insert_selection),
                 )
                 .await?
+                .is_some()
             {
-                tracked_writer
-                    .promote_reachable_transient_chunks(&report.root_id)
-                    .await?;
                 continue;
             }
         }
@@ -5845,7 +5804,7 @@ async fn stage_tracked_roots(
         // also preserves the one-mutation path for ordinary singleton writes.
         let commit_id_text = root.commit_id.to_string();
         let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
-        let report = tracked_writer
+        tracked_writer
             .stage_commit_root_with_absence_guards(
                 &commit_id_text,
                 parent_commit_id_text.as_deref(),
@@ -5853,9 +5812,6 @@ async fn stage_tracked_roots(
                 &absence_guards,
                 certified_replacement_markers,
             )
-            .await?;
-        tracked_writer
-            .promote_reachable_transient_chunks(&report.root_id)
             .await?;
     }
     Ok(tracked_writer
