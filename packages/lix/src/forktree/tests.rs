@@ -1,14 +1,17 @@
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
-    CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead,
-    MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
+    MemoryRead, MemoryWrite, ProjectedValue as StorageProjectedValue, PutBatch, PutEntry,
+    ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageWrite,
+    StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
@@ -430,6 +433,1003 @@ async fn branch_transition<R: StorageAdapterRead>(
             historical_global_state_root: view.repository_root().global_state_root,
         },
     }
+}
+
+struct CrashOracleAllocator;
+
+static CRASH_ALLOCATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+static CRASH_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static CRASH_ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[global_allocator]
+static CRASH_ORACLE_ALLOCATOR: CrashOracleAllocator = CrashOracleAllocator;
+
+unsafe impl GlobalAlloc for CrashOracleAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if CRASH_ALLOCATIONS_ENABLED.load(Ordering::Relaxed) {
+            CRASH_ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            CRASH_ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: forwards the exact allocation layout to the system allocator.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: `pointer` and `layout` originate from the system allocator above.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if CRASH_ALLOCATIONS_ENABLED.load(Ordering::Relaxed) && new_size > layout.size() {
+            CRASH_ALLOCATED_BYTES.fetch_add((new_size - layout.size()) as u64, Ordering::Relaxed);
+            CRASH_ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: forwards the allocation and both sizes to the system allocator.
+        unsafe { System.realloc(pointer, layout, new_size) }
+    }
+}
+
+fn begin_crash_allocation_profile() {
+    CRASH_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    CRASH_ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    CRASH_ALLOCATIONS_ENABLED.store(true, Ordering::Relaxed);
+}
+
+fn end_crash_allocation_profile() -> (u64, u64) {
+    CRASH_ALLOCATIONS_ENABLED.store(false, Ordering::Relaxed);
+    (
+        CRASH_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        CRASH_ALLOCATION_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectedCrash {
+    BeforeDurableCommit = 1,
+    AfterDurableCommit = 2,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CrashIoSnapshot {
+    begin_reads: u64,
+    begin_writes: u64,
+    get_calls: u64,
+    get_keys: u64,
+    get_value_bytes: u64,
+    scan_calls: u64,
+    scan_entries: u64,
+    scan_value_bytes: u64,
+    durable_commits: u64,
+    put_entries: u64,
+    deleted_entries: u64,
+    written_bytes: u64,
+}
+
+impl CrashIoSnapshot {
+    fn delta(self, before: Self) -> Self {
+        Self {
+            begin_reads: self.begin_reads.saturating_sub(before.begin_reads),
+            begin_writes: self.begin_writes.saturating_sub(before.begin_writes),
+            get_calls: self.get_calls.saturating_sub(before.get_calls),
+            get_keys: self.get_keys.saturating_sub(before.get_keys),
+            get_value_bytes: self.get_value_bytes.saturating_sub(before.get_value_bytes),
+            scan_calls: self.scan_calls.saturating_sub(before.scan_calls),
+            scan_entries: self.scan_entries.saturating_sub(before.scan_entries),
+            scan_value_bytes: self
+                .scan_value_bytes
+                .saturating_sub(before.scan_value_bytes),
+            durable_commits: self.durable_commits.saturating_sub(before.durable_commits),
+            put_entries: self.put_entries.saturating_sub(before.put_entries),
+            deleted_entries: self.deleted_entries.saturating_sub(before.deleted_entries),
+            written_bytes: self.written_bytes.saturating_sub(before.written_bytes),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CrashIoCounters {
+    begin_reads: AtomicU64,
+    begin_writes: AtomicU64,
+    get_calls: AtomicU64,
+    get_keys: AtomicU64,
+    get_value_bytes: AtomicU64,
+    scan_calls: AtomicU64,
+    scan_entries: AtomicU64,
+    scan_value_bytes: AtomicU64,
+    durable_commits: AtomicU64,
+    put_entries: AtomicU64,
+    deleted_entries: AtomicU64,
+    written_bytes: AtomicU64,
+}
+
+impl CrashIoCounters {
+    fn snapshot(&self) -> CrashIoSnapshot {
+        CrashIoSnapshot {
+            begin_reads: self.begin_reads.load(Ordering::Relaxed),
+            begin_writes: self.begin_writes.load(Ordering::Relaxed),
+            get_calls: self.get_calls.load(Ordering::Relaxed),
+            get_keys: self.get_keys.load(Ordering::Relaxed),
+            get_value_bytes: self.get_value_bytes.load(Ordering::Relaxed),
+            scan_calls: self.scan_calls.load(Ordering::Relaxed),
+            scan_entries: self.scan_entries.load(Ordering::Relaxed),
+            scan_value_bytes: self.scan_value_bytes.load(Ordering::Relaxed),
+            durable_commits: self.durable_commits.load(Ordering::Relaxed),
+            put_entries: self.put_entries.load(Ordering::Relaxed),
+            deleted_entries: self.deleted_entries.load(Ordering::Relaxed),
+            written_bytes: self.written_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CrashStorage {
+    inner: Memory,
+    injection: Arc<AtomicU8>,
+    io: Arc<CrashIoCounters>,
+}
+
+#[derive(Clone)]
+struct CrashRead {
+    inner: MemoryRead,
+    io: Arc<CrashIoCounters>,
+}
+
+struct CrashWrite {
+    inner: MemoryWrite,
+    injection: Arc<AtomicU8>,
+    io: Arc<CrashIoCounters>,
+}
+
+impl CrashStorage {
+    fn new() -> Self {
+        Self {
+            inner: Memory::new(),
+            injection: Arc::new(AtomicU8::new(0)),
+            io: Arc::new(CrashIoCounters::default()),
+        }
+    }
+
+    fn reopen(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            injection: Arc::new(AtomicU8::new(0)),
+            io: self.io.clone(),
+        }
+    }
+
+    fn inject_once(&self, crash: InjectedCrash) {
+        assert_eq!(
+            self.injection.swap(crash as u8, Ordering::SeqCst),
+            0,
+            "one crash may be armed at a time"
+        );
+    }
+
+    fn io_snapshot(&self) -> CrashIoSnapshot {
+        self.io.snapshot()
+    }
+}
+
+impl StorageRead for CrashRead {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    async fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> Result<GetManyResult, StorageError> {
+        self.io.get_calls.fetch_add(1, Ordering::Relaxed);
+        self.io.get_keys.fetch_add(
+            requests
+                .iter()
+                .map(|request| request.keys.len() as u64)
+                .sum(),
+            Ordering::Relaxed,
+        );
+        let result = self.inner.get_many(requests).await?;
+        self.io.get_value_bytes.fetch_add(
+            result
+                .values
+                .iter()
+                .filter_map(|value| match value {
+                    Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.len() as u64),
+                    _ => None,
+                })
+                .sum(),
+            Ordering::Relaxed,
+        );
+        Ok(result)
+    }
+
+    async fn scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        options: ScanOptions,
+    ) -> Result<ScanChunk, StorageError> {
+        self.io.scan_calls.fetch_add(1, Ordering::Relaxed);
+        let chunk = self.inner.scan(space, range, options).await?;
+        self.io
+            .scan_entries
+            .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
+        self.io.scan_value_bytes.fetch_add(
+            chunk
+                .entries
+                .iter()
+                .map(|entry| match &entry.value {
+                    StorageProjectedValue::KeyOnly => 0,
+                    StorageProjectedValue::FullValue(bytes) => bytes.len() as u64,
+                })
+                .sum(),
+            Ordering::Relaxed,
+        );
+        Ok(chunk)
+    }
+}
+
+impl StorageWrite for CrashWrite {
+    async fn put_many(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.inner.put_many(space, entries).await
+    }
+
+    async fn delete_many(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        keys: &[Key],
+    ) -> Result<(), StorageError> {
+        self.inner.delete_many(space, keys).await
+    }
+
+    async fn delete_range(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_range(space, range).await
+    }
+
+    async fn commit(self) -> Result<CommitResult, StorageError> {
+        let crash = self.injection.swap(0, Ordering::SeqCst);
+        if crash == InjectedCrash::BeforeDurableCommit as u8 {
+            self.inner.rollback().await?;
+            return Err(StorageError::Io(
+                "injected crash before durable adapter commit".to_string(),
+            ));
+        }
+        let committed = self.inner.commit().await?;
+        self.io.durable_commits.fetch_add(1, Ordering::Relaxed);
+        self.io
+            .put_entries
+            .fetch_add(committed.stats.put_entries, Ordering::Relaxed);
+        self.io
+            .deleted_entries
+            .fetch_add(committed.stats.deleted_entries, Ordering::Relaxed);
+        self.io
+            .written_bytes
+            .fetch_add(committed.stats.written_bytes, Ordering::Relaxed);
+        if crash == InjectedCrash::AfterDurableCommit as u8 {
+            return Err(StorageError::Io(
+                "injected crash after durable adapter commit".to_string(),
+            ));
+        }
+        Ok(committed)
+    }
+
+    async fn rollback(self) -> Result<(), StorageError> {
+        self.inner.rollback().await
+    }
+}
+
+impl Storage for CrashStorage {
+    type Read<'a> = CrashRead;
+    type Write<'a> = CrashWrite;
+
+    async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        self.io.begin_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(CrashRead {
+            inner: self.inner.begin_read(options).await?,
+            io: self.io.clone(),
+        })
+    }
+
+    async fn begin_write(&self, options: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        self.io.begin_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(CrashWrite {
+            inner: self.inner.begin_write(options).await?,
+            injection: self.injection.clone(),
+            io: self.io.clone(),
+        })
+    }
+}
+
+async fn seed_crash_storage(storage: &CrashStorage, seed: &SeedData) {
+    seed_storage(storage, seed).await;
+}
+
+async fn raw_selector<S: Storage>(storage: &S, key: Bytes) -> Option<Bytes> {
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("selector read");
+    let keys = [Key(key)];
+    let result = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("selector point");
+    match result.values.as_slice() {
+        [Some(StorageProjectedValue::FullValue(bytes))] => Some(bytes.clone()),
+        [None] => None,
+        other => panic!("unexpected selector projection: {other:?}"),
+    }
+}
+
+async fn prepare_state_publication(
+    storage: &CrashStorage,
+    identity: u8,
+    primary_key: &str,
+    cell: &str,
+) -> (PreparedPublication, Vec<u8>) {
+    let view = open_coherent_view(storage, build_seed().branch_id)
+        .await
+        .expect("publication view");
+    let (key, value) = state_entry(primary_key, StateCellRef::Value(cell), identity, &[]);
+    let mutation = if state_point(&view, &key, false)
+        .await
+        .expect("existing point")
+        .is_some()
+    {
+        StateTreeMutation::update(key.clone(), value)
+    } else {
+        StateTreeMutation::insert(key.clone(), value)
+    };
+    let edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![mutation],
+        view.read(),
+    )
+    .await
+    .expect("state path copy");
+    let transition = branch_transition(&view, edit, identity).await;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("state transition");
+    drop(view);
+    (publication, key)
+}
+
+fn current_rss_bytes() -> u64 {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(pages) = statm.split_whitespace().nth(1) else {
+        return 0;
+    };
+    pages.parse::<u64>().unwrap_or(0).saturating_mul(4096)
+}
+
+fn process_cpu_ticks() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0;
+    };
+    let Some(after_name) = stat.rsplit_once(')').map(|(_, tail)| tail) else {
+        return 0;
+    };
+    let mut fields = after_name.split_whitespace();
+    let user = fields.nth(11).and_then(|value| value.parse::<u64>().ok());
+    let system = fields.next().and_then(|value| value.parse::<u64>().ok());
+    user.unwrap_or(0).saturating_add(system.unwrap_or(0))
+}
+
+fn print_recovery_profile(
+    phase: &str,
+    crash: InjectedCrash,
+    wall_micros: u128,
+    cpu_ticks: u64,
+    allocations: (u64, u64),
+    rss_before: u64,
+    rss_after: u64,
+    io: CrashIoSnapshot,
+) {
+    println!(
+        "forktree_crash_recovery,phase={phase},crash={crash:?},wall_us={wall_micros},cpu_ticks={cpu_ticks},alloc_bytes={},alloc_calls={},rss_before_bytes={rss_before},rss_after_bytes={rss_after},begin_reads={},begin_writes={},get_calls={},get_keys={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},durable_commits={},put_entries={},deleted_entries={},written_bytes={},disk_bytes=0",
+        allocations.0,
+        allocations.1,
+        io.begin_reads,
+        io.begin_writes,
+        io.get_calls,
+        io.get_keys,
+        io.get_value_bytes,
+        io.scan_calls,
+        io.scan_entries,
+        io.scan_value_bytes,
+        io.durable_commits,
+        io.put_entries,
+        io.deleted_entries,
+        io.written_bytes,
+    );
+}
+
+async fn prepare_snapshot_publication(
+    storage: &CrashStorage,
+    role: SnapshotRole,
+    selector_id: SnapshotSelectorId,
+) -> (PreparedPublication, ObjectId) {
+    let seed = build_seed();
+    let view = open_coherent_view(storage, seed.branch_id)
+        .await
+        .expect("snapshot view");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("snapshot");
+    let target_id = publication
+        .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
+        .expect("snapshot pin");
+    drop(view);
+    (publication, target_id)
+}
+
+async fn prepare_upload_completion_publication(
+    storage: &CrashStorage,
+    upload: &UploadData,
+) -> (PreparedPublication, Vec<u8>, ObjectId) {
+    let seed = build_seed();
+    let view = open_coherent_view(storage, seed.branch_id)
+        .await
+        .expect("completion view");
+    let completion = prepare_upload_completion(
+        &view,
+        &upload.upload_id,
+        UploadBindingRef {
+            repository_identity: b"repository",
+            path: b"/blob.bin",
+            payload_domain: b"file",
+            declared_total_size: 4,
+            declared_final_hash: Some(*blake3::hash(b"data").as_bytes()),
+        },
+    )
+    .await
+    .expect("completion proof");
+    let manifest = BlobManifestV1 {
+        logical_bytes: 4,
+        ordered_chunks: upload.part.ordered_chunks.clone(),
+        content_digest: *blake3::hash(b"data").as_bytes(),
+    };
+    let (manifest_id, _) = manifest.encode().expect("manifest");
+    let (key, value) = state_entry(
+        "crash-blob",
+        StateCellRef::Value("blob"),
+        0xa0,
+        &[manifest_id],
+    );
+    let edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![StateTreeMutation::insert(key.clone(), value)],
+        view.read(),
+    )
+    .await
+    .expect("blob state edit");
+    let transition = branch_transition(&view, edit, 0xa0).await;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("completion");
+    publication
+        .publish_completed_upload(&view, completion, transition)
+        .await
+        .expect("completion handoff");
+    drop(view);
+    (publication, key, manifest_id)
+}
+
+async fn prepare_upload_abort_publication(
+    storage: &CrashStorage,
+    upload: &UploadData,
+) -> PreparedPublication {
+    let seed = build_seed();
+    let view = open_coherent_view(storage, seed.branch_id)
+        .await
+        .expect("abort view");
+    let raw = raw_selector(
+        storage,
+        upload_selector_key(&upload.upload_id).expect("upload key"),
+    )
+    .await
+    .expect("upload selector");
+    let mut publication = PreparedPublication::from_global_epoch(&view).expect("abort");
+    publication
+        .abort_upload(&upload.selector, raw)
+        .expect("abort selector");
+    drop(view);
+    publication
+}
+
+async fn assert_profiled_reopen(
+    storage: &CrashStorage,
+    phase: &str,
+    crash: InjectedCrash,
+    state: Option<(&[u8], Option<&str>)>,
+) {
+    let before_io = storage.io_snapshot();
+    let rss_before = current_rss_bytes();
+    let cpu_before = process_cpu_ticks();
+    begin_crash_allocation_profile();
+    let started = Instant::now();
+    let reopened = storage.reopen();
+    let view = open_coherent_view(&reopened, build_seed().branch_id)
+        .await
+        .expect("recovery coherent view");
+    if let Some((key, expected)) = state {
+        let actual = state_point(&view, key, false)
+            .await
+            .expect("recovery point")
+            .map(|row| row.value.cell);
+        match (actual, expected) {
+            (None, None) => {}
+            (Some(StateCell::Value(actual)), Some(expected)) => assert_eq!(actual, expected),
+            other => panic!("unexpected recovered state: {other:?}"),
+        }
+    }
+    drop(view);
+    let wall_micros = started.elapsed().as_micros();
+    let allocations = end_crash_allocation_profile();
+    let cpu_ticks = process_cpu_ticks().saturating_sub(cpu_before);
+    let rss_after = current_rss_bytes();
+    let io = storage.io_snapshot().delta(before_io);
+    print_recovery_profile(
+        phase,
+        crash,
+        wall_micros,
+        cpu_ticks,
+        allocations,
+        rss_before,
+        rss_after,
+        io,
+    );
+}
+
+#[tokio::test]
+async fn deterministic_crash_recovery_publication_oracle() {
+    let seed = build_seed();
+    for crash in [
+        InjectedCrash::BeforeDurableCommit,
+        InjectedCrash::AfterDurableCommit,
+    ] {
+        let storage = CrashStorage::new();
+        seed_crash_storage(&storage, &seed).await;
+        let old_global = raw_selector(&storage, global_selector_key())
+            .await
+            .expect("old global");
+        let old_branch = raw_selector(&storage, branch_selector_key(seed.branch_id))
+            .await
+            .expect("old branch");
+        let (publication, key) =
+            prepare_state_publication(&storage, 0x70, "crash-row", "new").await;
+        let (stale, _) = prepare_state_publication(&storage, 0x70, "crash-row", "new").await;
+        storage.inject_once(crash);
+        assert!(publication.commit(&storage).await.is_err());
+
+        let reopened = storage.reopen();
+        let global = raw_selector(&reopened, global_selector_key())
+            .await
+            .expect("reopened global");
+        let branch = raw_selector(&reopened, branch_selector_key(seed.branch_id))
+            .await
+            .expect("reopened branch");
+        let is_new = crash == InjectedCrash::AfterDurableCommit;
+        assert_eq!(global == old_global, !is_new);
+        assert_eq!(branch == old_branch, !is_new);
+        assert_eq!(
+            global == old_global,
+            branch == old_branch,
+            "selector pair mixed"
+        );
+
+        let view = open_coherent_view(&reopened, seed.branch_id)
+            .await
+            .expect("reopened graph");
+        assert_eq!(
+            load_commit(&view, CommitId::from_bytes(raw_id(0x70)))
+                .await
+                .expect("commit lookup")
+                .is_some(),
+            is_new
+        );
+        assert_eq!(
+            load_change(&view, ChangeId::from_bytes(raw_id(0x71)))
+                .await
+                .expect("change lookup")
+                .is_some(),
+            is_new
+        );
+        drop(view);
+        assert_profiled_reopen(
+            &storage,
+            "transaction_catalog_selector_pair",
+            crash,
+            Some((&key, is_new.then_some("new"))),
+        )
+        .await;
+
+        let stale_result = stale.commit(&storage).await;
+        if is_new {
+            assert!(matches!(
+                stale_result,
+                Err(StorageError::PreconditionFailed(_))
+            ));
+        } else {
+            stale_result.expect("old view remains a valid exact-CAS writer");
+        }
+    }
+
+    for (index, (phase, role)) in [
+        ("checkpoint", SnapshotRole::Checkpoint),
+        ("restore", SnapshotRole::Recovery),
+        ("undo", SnapshotRole::Undo),
+        ("redo", SnapshotRole::Redo),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for crash in [
+            InjectedCrash::BeforeDurableCommit,
+            InjectedCrash::AfterDurableCommit,
+        ] {
+            let storage = CrashStorage::new();
+            seed_crash_storage(&storage, &seed).await;
+            let selector_id = SnapshotSelectorId::from_bytes(raw_id(0xb0 + index as u8));
+            let selector_key = snapshot_selector_key(role, selector_id);
+            let old_global = raw_selector(&storage, global_selector_key())
+                .await
+                .expect("old global");
+            let (publication, target_id) =
+                prepare_snapshot_publication(&storage, role, selector_id).await;
+            let (stale, _) = prepare_snapshot_publication(&storage, role, selector_id).await;
+            storage.inject_once(crash);
+            assert!(publication.commit(&storage).await.is_err());
+            let is_new = crash == InjectedCrash::AfterDurableCommit;
+            assert_eq!(
+                raw_selector(&storage.reopen(), selector_key)
+                    .await
+                    .is_some(),
+                is_new
+            );
+            assert_eq!(
+                raw_selector(&storage.reopen(), global_selector_key())
+                    .await
+                    .expect("global")
+                    == old_global,
+                !is_new
+            );
+            assert_eq!(object_present(&storage.reopen(), target_id).await, is_new);
+            assert_profiled_reopen(&storage, phase, crash, None).await;
+            let stale_result = stale.commit(&storage).await;
+            if is_new {
+                assert!(matches!(
+                    stale_result,
+                    Err(StorageError::PreconditionFailed(_))
+                ));
+            } else {
+                stale_result.expect("pre-crash role publication retry");
+            }
+        }
+    }
+
+    for (phase, replay_redo) in [
+        ("restore_state_transition", false),
+        ("undo_state_transition", false),
+        ("redo_state_transition", true),
+    ] {
+        for crash in [
+            InjectedCrash::BeforeDurableCommit,
+            InjectedCrash::AfterDurableCommit,
+        ] {
+            let storage = CrashStorage::new();
+            seed_crash_storage(&storage, &seed).await;
+            let (first, key) = prepare_state_publication(&storage, 0x80, "history-row", "v1").await;
+            first.commit(&storage).await.expect("publish v1");
+            let (second, _) = prepare_state_publication(&storage, 0x82, "history-row", "v2").await;
+            second.commit(&storage).await.expect("publish v2");
+            if replay_redo {
+                let (undo, _) =
+                    prepare_state_publication(&storage, 0x84, "history-row", "v1").await;
+                undo.commit(&storage).await.expect("publish undo baseline");
+            }
+            let before = if replay_redo { "v1" } else { "v2" };
+            let after = if replay_redo { "v2" } else { "v1" };
+            let (replay, _) = prepare_state_publication(&storage, 0x86, "history-row", after).await;
+            storage.inject_once(crash);
+            assert!(replay.commit(&storage).await.is_err());
+            let expected = if crash == InjectedCrash::AfterDurableCommit {
+                after
+            } else {
+                before
+            };
+            assert_profiled_reopen(&storage, phase, crash, Some((&key, Some(expected)))).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn deterministic_crash_recovery_upload_and_gc_oracle() {
+    let seed = build_seed();
+    for crash in [
+        InjectedCrash::BeforeDurableCommit,
+        InjectedCrash::AfterDurableCommit,
+    ] {
+        let upload = make_upload();
+        let storage = CrashStorage::new();
+        seed_crash_storage(&storage, &seed).await;
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("upload view");
+        let mut publication = PreparedPublication::from_global_epoch(&view).expect("upload");
+        stage_upload(&mut publication, &upload);
+        drop(view);
+        storage.inject_once(crash);
+        assert!(publication.commit(&storage).await.is_err());
+        let is_new = crash == InjectedCrash::AfterDurableCommit;
+        assert_eq!(
+            raw_selector(
+                &storage.reopen(),
+                upload_selector_key(&upload.upload_id).expect("upload key")
+            )
+            .await
+            .is_some(),
+            is_new
+        );
+        assert_eq!(
+            object_present(&storage.reopen(), upload.progress_id).await,
+            is_new
+        );
+        assert_profiled_reopen(&storage, "upload_part", crash, None).await;
+    }
+
+    for crash in [
+        InjectedCrash::BeforeDurableCommit,
+        InjectedCrash::AfterDurableCommit,
+    ] {
+        let upload = make_upload();
+        let storage = CrashStorage::new();
+        seed_crash_storage(&storage, &seed).await;
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("upload view");
+        let mut initial = PreparedPublication::from_global_epoch(&view).expect("upload");
+        stage_upload(&mut initial, &upload);
+        drop(view);
+        initial.commit(&storage).await.expect("upload seed");
+        let (completion, key, manifest_id) =
+            prepare_upload_completion_publication(&storage, &upload).await;
+        storage.inject_once(crash);
+        assert!(completion.commit(&storage).await.is_err());
+        let is_new = crash == InjectedCrash::AfterDurableCommit;
+        assert_eq!(
+            raw_selector(
+                &storage.reopen(),
+                upload_selector_key(&upload.upload_id).expect("upload key")
+            )
+            .await
+            .is_none(),
+            is_new
+        );
+        assert_eq!(object_present(&storage.reopen(), manifest_id).await, is_new);
+        assert_profiled_reopen(
+            &storage,
+            "upload_completion",
+            crash,
+            Some((&key, is_new.then_some("blob"))),
+        )
+        .await;
+    }
+
+    for crash in [
+        InjectedCrash::BeforeDurableCommit,
+        InjectedCrash::AfterDurableCommit,
+    ] {
+        let upload = make_upload();
+        let storage = CrashStorage::new();
+        seed_crash_storage(&storage, &seed).await;
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("upload view");
+        let mut initial = PreparedPublication::from_global_epoch(&view).expect("upload");
+        stage_upload(&mut initial, &upload);
+        drop(view);
+        initial.commit(&storage).await.expect("upload seed");
+        let abort = prepare_upload_abort_publication(&storage, &upload).await;
+        storage.inject_once(crash);
+        assert!(abort.commit(&storage).await.is_err());
+        let is_new = crash == InjectedCrash::AfterDurableCommit;
+        assert_eq!(
+            raw_selector(
+                &storage.reopen(),
+                upload_selector_key(&upload.upload_id).expect("upload key")
+            )
+            .await
+            .is_none(),
+            is_new
+        );
+        assert_profiled_reopen(&storage, "upload_abort", crash, None).await;
+    }
+
+    for crash in [
+        InjectedCrash::BeforeDurableCommit,
+        InjectedCrash::AfterDurableCommit,
+    ] {
+        let storage = CrashStorage::new();
+        seed_crash_storage(&storage, &seed).await;
+        let target = SnapshotTargetV1 {
+            role: SnapshotRole::Checkpoint,
+            selector_id: SnapshotSelectorId::from_bytes(raw_id(0xc0)),
+            branch_id: seed.branch_id,
+            branch_snapshot_object_id: seed.branch_snapshot_id,
+            semantic_commit_object_id: seed.commit_object_id,
+        };
+        let (target_id, _) = target.encode().expect("orphan target");
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("orphan view");
+        let mut orphan = PreparedPublication::from_global_epoch(&view).expect("orphan");
+        orphan.stage_snapshot_target(target).expect("stage orphan");
+        drop(view);
+        orphan.commit(&storage).await.expect("orphan seed");
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("GC view");
+        let plan = discover_sweep_plan(&view).await.expect("GC plan");
+        assert!(plan.orphan_object_ids.contains(&target_id));
+        let old_global = view.raw_global_selector().clone();
+        let mut gc = PreparedPublication::from_global_epoch(&view).expect("GC");
+        gc.apply_sweep_plan(plan).expect("GC proof");
+        drop(view);
+        storage.inject_once(crash);
+        assert!(gc.commit(&storage).await.is_err());
+        let is_new = crash == InjectedCrash::AfterDurableCommit;
+        assert_eq!(object_present(&storage.reopen(), target_id).await, !is_new);
+        assert_eq!(
+            raw_selector(&storage.reopen(), global_selector_key())
+                .await
+                .expect("global")
+                == old_global,
+            !is_new
+        );
+        assert_profiled_reopen(&storage, "gc_epoch_handoff", crash, None).await;
+    }
+}
+
+#[tokio::test]
+async fn deterministic_crash_recovery_corruption_oracle() {
+    let seed = build_seed();
+
+    let missing = Memory::new();
+    seed_storage(&missing, &seed).await;
+    let mut write = missing
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("missing-object write");
+    write
+        .delete_many(
+            OBJECT_SPACE,
+            &[Key(Bytes::copy_from_slice(
+                seed.semantic_change_object_id.as_bytes(),
+            ))],
+        )
+        .await
+        .expect("delete selected member");
+    write.commit().await.expect("commit missing object");
+    assert!(open_coherent_view(&missing, seed.branch_id).await.is_err());
+
+    let malformed = Memory::new();
+    seed_storage(&malformed, &seed).await;
+    let mut write = malformed
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("malformed-selector write");
+    write
+        .put_many(
+            SELECTOR_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: Key(global_selector_key()),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"malformed"),
+                    },
+                }],
+            },
+        )
+        .await
+        .expect("malformed selector");
+    write.commit().await.expect("commit malformed selector");
+    assert!(
+        open_coherent_view(&malformed, seed.branch_id)
+            .await
+            .is_err()
+    );
+
+    let mut forged = build_seed();
+    let wrong_entry = CommitCatalogEntry {
+        commit_object_id: forged.semantic_change_object_id,
+    };
+    let catalog = build_commit_catalog(&[(forged.commit_id, wrong_entry)])
+        .expect("syntactically valid forged catalog");
+    forged
+        .objects
+        .extend(catalog.objects)
+        .expect("forged catalog");
+    let repository = RepositoryRootV1 {
+        commit_catalog_root: catalog.root.object_id,
+        ..RepositoryRootV1::decode(
+            seed.repository_root_id,
+            seed.objects
+                .get(seed.repository_root_id)
+                .expect("seed root"),
+        )
+        .expect("seed repository")
+    };
+    let (repository_id, repository_bytes) = repository.encode().expect("forged root");
+    forged.repository_root_id = repository_id;
+    forged
+        .objects
+        .insert(repository_id, repository_bytes)
+        .expect("forged root object");
+    forged.global_selector.repository_root = repository_id;
+    forged.global_selector.selector_generation += 1;
+    let back_edge = Memory::new();
+    seed_storage(&back_edge, &forged).await;
+    assert!(
+        open_coherent_view(&back_edge, seed.branch_id)
+            .await
+            .is_err()
+    );
+
+    let mut domain = build_seed();
+    let bad_ref = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0xd0)),
+        branch_id: domain.branch_id,
+        before_semantic_head_commit_object_id: Some(domain.semantic_change_object_id),
+        after_semantic_head_commit_object_id: Some(domain.commit_object_id),
+        previous_ref_change_object_id: domain.branch_snapshot_id.into(),
+        payload: b"wrong-domain".to_vec(),
+    };
+    let (bad_ref_id, bad_ref_bytes) = bad_ref.encode().expect("bad ref");
+    domain
+        .objects
+        .insert(bad_ref_id, bad_ref_bytes)
+        .expect("bad ref object");
+    let bad_snapshot = BranchSnapshotV1 {
+        latest_ref_change_object_id: Some(bad_ref_id),
+        ..BranchSnapshotV1::decode(
+            domain.branch_snapshot_id,
+            domain
+                .objects
+                .get(domain.branch_snapshot_id)
+                .expect("snapshot"),
+        )
+        .expect("snapshot")
+    };
+    let (bad_snapshot_id, bad_snapshot_bytes) = bad_snapshot.encode().expect("bad snapshot");
+    domain
+        .objects
+        .insert(bad_snapshot_id, bad_snapshot_bytes)
+        .expect("bad snapshot object");
+    domain.branch_snapshot_id = bad_snapshot_id;
+    domain.branch_selector.branch_snapshot_object_id = bad_snapshot_id;
+    domain.branch_selector.selector_generation += 1;
+    let wrong_domain = Memory::new();
+    seed_storage(&wrong_domain, &domain).await;
+    assert!(
+        open_coherent_view(&wrong_domain, seed.branch_id)
+            .await
+            .is_err()
+    );
 }
 
 #[test]
