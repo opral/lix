@@ -72,3 +72,27 @@ test("stored client state rejects a corrupt v1 header without resetting storage"
 	expect(save).not.toHaveBeenCalled();
 	expect(snapshot).toEqual(original);
 });
+
+test("stored client state rejects invalid utf-8 without resetting storage", async () => {
+	const prefix = new TextEncoder().encode('lix-client-state-v1\n[["key","');
+	const suffix = new TextEncoder().encode('"]]');
+	const snapshot = new Uint8Array(prefix.length + 1 + suffix.length);
+	snapshot.set(prefix);
+	snapshot[prefix.length] = 0xff;
+	snapshot.set(suffix, prefix.length + 1);
+	const original = snapshot.slice();
+	const save = vi.fn(async () => undefined);
+	const storage: LixSnapshotStorage = {
+		load: async () => snapshot,
+		save,
+	};
+
+	await expect(
+		openStoredClientState({
+			storage,
+			namespace: "remote:https://example.com/workspace",
+		}),
+	).rejects.toThrow("Stored Lix client state is invalid");
+	expect(save).not.toHaveBeenCalled();
+	expect(snapshot).toEqual(original);
+});

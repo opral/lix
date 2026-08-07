@@ -356,7 +356,9 @@ function decodeStoredClientState(
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(
-			new TextDecoder().decode(snapshot.subarray(header.length)),
+			new TextDecoder("utf-8", { fatal: true }).decode(
+				snapshot.subarray(header.length),
+			),
 		);
 	} catch (error) {
 		throw new Error("Stored Lix client state is invalid", { cause: error });
