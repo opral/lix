@@ -72,6 +72,14 @@ fn validate_directory_selector(
     Ok(())
 }
 
+fn select_child_index(children: &[ChildSelector], key: [u8; HISTORY_KEY_BYTES]) -> Option<usize> {
+    children
+        .iter()
+        .position(|child| child.first <= key && key <= child.last)
+        .or_else(|| children.iter().position(|child| key < child.first))
+        .or_else(|| children.len().checked_sub(1))
+}
+
 struct SemanticTreeEditor<'a, S: ?Sized> {
     store: &'a mut S,
     writes: &'a mut StorageWriteSet,
@@ -195,23 +203,9 @@ where
             if let Some(selector) = expected_selector.take() {
                 Self::validate_node_selector(&selector, &node)?;
             }
-            let (index, child) = node
-                .children
-                .iter()
-                .enumerate()
-                .find(|(_, child)| child.first <= key && key <= child.last)
-                .map(|(index, child)| (index, child.clone()))
-                .or_else(|| {
-                    if key < node.children[0].first {
-                        Some((0, node.children[0].clone()))
-                    } else {
-                        node.children
-                            .last()
-                            .cloned()
-                            .map(|child| (node.children.len() - 1, child))
-                    }
-                })
+            let index = select_child_index(&node.children, key)
                 .ok_or_else(|| corruption("semantic-history directory has no children"))?;
+            let child = node.children[index].clone();
             path.push((node_key.clone(), index));
             if node.level == 0 {
                 return Ok(Some((path, child)));
@@ -467,6 +461,241 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::semantic_history::LEAF_KEY_PREFIX;
+    use super::*;
+    use crate::changelog::{
+        ChangeLoadRequest, ChangeRecord, ChangelogReader, CommitLoadRequest, CommitRecord,
+        TransactionChangeRecordRef, TransactionChangelogAppend,
+    };
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::json_store::JsonSlot;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    fn selector(first: u8, last: u8) -> ChildSelector {
+        let mut first_key = [0; HISTORY_KEY_BYTES];
+        first_key[0] = COMMIT_RECORD_KIND;
+        first_key[HISTORY_KEY_BYTES - 1] = first;
+        let mut last_key = [0; HISTORY_KEY_BYTES];
+        last_key[0] = COMMIT_RECORD_KIND;
+        last_key[HISTORY_KEY_BYTES - 1] = last;
+        ChildSelector {
+            first: first_key,
+            last: last_key,
+            key: vec![LEAF_KEY_PREFIX; 33],
+            record_count: 1,
+            byte_len: 1,
+            digest: [0; 32],
+        }
+    }
+
+    #[test]
+    fn identity_gap_selects_next_child_not_last_child() {
+        let children = [selector(10, 15), selector(30, 35), selector(50, 55)];
+        let mut key = [0; HISTORY_KEY_BYTES];
+        key[0] = COMMIT_RECORD_KIND;
+        key[HISTORY_KEY_BYTES - 1] = 20;
+
+        assert_eq!(select_child_index(&children, key), Some(1));
+    }
+
+    fn test_commit(label: &str, change_id: ChangeId) -> CommitRecord {
+        CommitRecord {
+            format_version: 2,
+            commit_id: CommitId::for_test_label(label),
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "semantic-history test timestamp",
+                "2026-01-01T00:00:00.000Z",
+            ),
+        }
+    }
+
+    fn test_change(change_id: ChangeId) -> ChangeRecord {
+        ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            schema_key: "semantic_history_test".to_string(),
+            entity_pk: EntityPk::single("entity"),
+            file_id: None,
+            snapshot: JsonSlot::None,
+            metadata: JsonSlot::None,
+            created_at: LixTimestamp::expect_parse(
+                "semantic-history test timestamp",
+                "2026-01-01T00:00:00.000Z",
+            ),
+            origin_key: None,
+        }
+    }
+
+    async fn append_test_records(
+        storage: &StorageAdapter<Memory>,
+        commits: Vec<CommitRecord>,
+        changes: &[ChangeRecord],
+    ) {
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("semantic-history test read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_transaction_append(TransactionChangelogAppend {
+                commits,
+                changes: changes
+                    .iter()
+                    .map(TransactionChangeRecordRef::from)
+                    .collect(),
+            })
+            .await
+            .expect("semantic-history test append should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("semantic-history test append should commit");
+    }
+
+    #[tokio::test]
+    async fn semantic_gc_retires_envelope_only_and_persisted_change_records() {
+        let storage = StorageAdapter::new(Memory::new());
+        let envelope_change = ChangeId::for_test_label("semantic-envelope-only-change");
+        let persisted_change = ChangeId::for_test_label("semantic-persisted-change");
+        let retained_change = ChangeId::for_test_label("semantic-retained-change");
+        let envelope_commit = test_commit("semantic-envelope-only-commit", envelope_change);
+        let persisted_commit = test_commit("semantic-persisted-change-commit", persisted_change);
+        let retained_commit = test_commit("semantic-retained-commit", retained_change);
+        let persisted_change_record = test_change(persisted_change);
+        append_test_records(
+            &storage,
+            vec![
+                envelope_commit.clone(),
+                persisted_commit.clone(),
+                retained_commit.clone(),
+            ],
+            std::slice::from_ref(&persisted_change_record),
+        )
+        .await;
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("semantic-history retirement read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_delete_records(
+                &[envelope_commit.commit_id, persisted_commit.commit_id],
+                &[],
+            )
+            .await
+            .expect("envelope-only retirement should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("semantic-history retirement should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reopened semantic-history read should open");
+        let mut reader = ChangelogContext::new().reader(read);
+        assert!(
+            reader
+                .load_commits(CommitLoadRequest {
+                    commit_ids: &[
+                        envelope_commit.commit_id,
+                        persisted_commit.commit_id,
+                        retained_commit.commit_id,
+                    ],
+                })
+                .await
+                .expect("retired commits should load")
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>()
+                .as_slice()
+                == [None, None, Some(retained_commit.clone())]
+        );
+        assert!(
+            reader
+                .load_changes(ChangeLoadRequest {
+                    change_ids: &[persisted_change],
+                })
+                .await
+                .expect("retired persisted change should load")
+                .into_iter()
+                .all(|(_, record)| record.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_gc_rejects_malformed_present_change_records() {
+        let storage = StorageAdapter::new(Memory::new());
+        let change_id = ChangeId::for_test_label("semantic-malformed-change");
+        let commit = test_commit("semantic-malformed-commit", change_id);
+        let change = test_change(change_id);
+        append_test_records(
+            &storage,
+            vec![commit.clone()],
+            std::slice::from_ref(&change),
+        )
+        .await;
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("semantic-history corruption read should open");
+        let root_bytes = exactly_one_get(
+            read.changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![ROOT_KEY.to_vec()])
+                .await
+                .expect("semantic-history root should read"),
+            "test root read",
+        )
+        .expect("semantic-history root read should succeed")
+        .expect("semantic-history root should exist");
+        let root = decode_root(&root_bytes).expect("semantic-history root should decode");
+        let node_bytes = exactly_one_get(
+            read.changelog_get_many(
+                SEMANTIC_HISTORY_SPACE,
+                vec![root.target.expect("root target should exist").key],
+            )
+            .await
+            .expect("semantic-history node should read"),
+            "test node read",
+        )
+        .expect("semantic-history node read should succeed")
+        .expect("semantic-history node should exist");
+        let node = decode_directory(&node_bytes).expect("semantic-history node should decode");
+        let leaf_key = node.children[0].key.clone();
+        drop(read);
+
+        let mut writes = storage.new_write_set();
+        writes.put(SEMANTIC_HISTORY_SPACE, leaf_key, b"malformed".to_vec());
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("semantic-history corruption should commit");
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("semantic-history malformed read should open");
+        let mut writes = storage.new_write_set();
+        let error = ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_delete_records(&[commit.commit_id], &[])
+            .await
+            .expect_err("malformed semantic-history records must fail closed");
+        assert!(error.message.contains("semantic-history"));
     }
 }
 
@@ -783,18 +1012,55 @@ where
                 continue;
             };
             let record: CommitRecord = storage_codec::decode("commit record", &value)?;
+            // The terminal transaction writer publishes this reverse membership
+            // with every commit; unlike the envelope change id, it is mandatory.
+            let membership = semantic_load_record(
+                self.store,
+                MEMBERSHIP_RECORD_KIND,
+                *record.change_id.as_uuid().as_bytes(),
+            )
+            .await?
+            .ok_or_else(|| corruption("semantic-history commit membership is missing"))?;
+            let membership_commit = uuid::Uuid::from_slice(&membership).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("semantic-history membership has invalid commit id: {error}"),
+                )
+            })?;
+            if membership_commit != *commit_id.as_uuid() {
+                return Err(corruption(
+                    "semantic-history membership references the wrong commit",
+                ));
+            }
             removals.push((COMMIT_RECORD_KIND, *commit_id.as_uuid().as_bytes()));
             removals.push((
                 MEMBERSHIP_RECORD_KIND,
                 *record.change_id.as_uuid().as_bytes(),
             ));
-            removals.push((CHANGE_RECORD_KIND, *record.change_id.as_uuid().as_bytes()));
+            if let Some(change) = semantic_load_record(
+                self.store,
+                CHANGE_RECORD_KIND,
+                *record.change_id.as_uuid().as_bytes(),
+            )
+            .await?
+            {
+                decode_change_record(&change, record.change_id)?;
+                removals.push((CHANGE_RECORD_KIND, *record.change_id.as_uuid().as_bytes()));
+            }
         }
-        removals.extend(
-            change_ids
-                .iter()
-                .map(|change_id| (CHANGE_RECORD_KIND, *change_id.as_uuid().as_bytes())),
-        );
+        for change_id in change_ids {
+            let Some(change) = semantic_load_record(
+                self.store,
+                CHANGE_RECORD_KIND,
+                *change_id.as_uuid().as_bytes(),
+            )
+            .await?
+            else {
+                return Err(corruption("semantic-history standalone change is missing"));
+            };
+            decode_change_record(&change, *change_id)?;
+            removals.push((CHANGE_RECORD_KIND, *change_id.as_uuid().as_bytes()));
+        }
         // A committed change is owned by its semantic commit. Callers may
         // also pass the same change id in `change_ids`; canonicalize the
         // retirement frontier before applying it so one physical record is
