@@ -158,6 +158,7 @@ fn seeded_wide_transition_storage(
         let after = "a".repeat(256);
         let updates = (0..transition_width)
             .map(|index| ExecuteBatchStatement {
+                label: None,
                 sql: format!(
                     "UPDATE lix_key_value SET value = '{after}' WHERE key = 'transition-{index}'"
                 ),

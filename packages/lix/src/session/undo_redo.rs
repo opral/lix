@@ -856,10 +856,12 @@ mod tests {
         session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: "INSERT INTO lix_key_value (key, value) VALUES ('left', '1')".into(),
                     params: vec![],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: "INSERT INTO lix_key_value (key, value) VALUES ('right', '2')".into(),
                     params: vec![],
                 },
@@ -980,14 +982,17 @@ mod tests {
         session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES ('deleted-state', 'restore-me', $1)".to_string(),
                     params: vec![Value::Text(deleted_file_id)],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES ('unrelated-state', 'keep-me', $1)".to_string(),
                     params: vec![Value::Text(unrelated_file_id)],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: "INSERT INTO lix_key_value (key, value) VALUES ('global-state', 'keep-me')"
                         .to_string(),
                     params: vec![],

@@ -893,6 +893,7 @@ async fn update_commit<StorageImpl>(
                 Shape::Disjoint => (commit_index * changes_per_commit + offset) % row_count,
             };
             ExecuteBatchStatement {
+                label: None,
                 sql: "UPDATE working_diff_row SET value = $1 WHERE id = $2".to_string(),
                 params: vec![
                     Value::Text(format!("commit-{commit_index:05}")),
@@ -924,6 +925,7 @@ async fn update_commit_range<StorageImpl>(
         .map(|offset| {
             let row_index = row_offset + commit_index * changes_per_commit + offset;
             ExecuteBatchStatement {
+                label: None,
                 sql: "UPDATE working_diff_row SET value = $1 WHERE id = $2".to_string(),
                 params: vec![
                     Value::Text(format!("{value_prefix}-{commit_index:05}")),

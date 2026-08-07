@@ -1086,6 +1086,7 @@ where
                     &statements
                         .iter()
                         .map(|sql| ExecuteBatchStatement {
+                            label: None,
                             sql: sql.clone(),
                             params: Vec::new(),
                         })
@@ -1717,6 +1718,7 @@ fn prepared_update_rows(rows: &[WorkloadRow]) -> SharedParameterBatch {
 fn parameterized_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
     rows.iter()
         .map(|row| ExecuteBatchStatement {
+            label: None,
             sql: BOUND_UPDATE_ALL_SQL.to_string(),
             params: vec![
                 Value::Text(row.updated_value_json.clone()),
@@ -1729,6 +1731,7 @@ fn parameterized_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement
 fn literal_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
     rows.iter()
         .map(|row| ExecuteBatchStatement {
+            label: None,
             sql: update_row_sql(row),
             params: Vec::new(),
         })

@@ -1,5 +1,5 @@
 import { fromNativeValue, type NativeLixValue, Value } from "./value.js";
-import type { ExecuteResult, LixValue } from "./types.js";
+import type { ExecuteBatchResult, ExecuteResult, LixValue } from "./types.js";
 
 export class Row {
 	constructor(
@@ -55,6 +55,23 @@ export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult {
 		rows: result.rows.map((row) =>
 			Row.fromRaw(result.columns, row.map(fromNativeValue)),
 		),
+	};
+}
+
+export function wrapExecuteBatchResult(
+	result: NativeExecuteResult,
+): ExecuteBatchResult {
+	const statementIndex = result.statementIndex;
+	if (
+		typeof statementIndex !== "number" ||
+		!Number.isSafeInteger(statementIndex) ||
+		statementIndex < 0
+	) {
+		throw new Error("executeBatch result is missing a valid statementIndex");
+	}
+	return {
+		...wrapExecuteResult(result),
+		statementIndex,
 	};
 }
 

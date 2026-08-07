@@ -685,7 +685,17 @@ fn batch_statements_from_js(value: JsValue) -> Result<Vec<RsExecuteBatchStatemen
             } else {
                 values_from_js(params)?
             };
-            Ok(RsExecuteBatchStatement { sql, params })
+            let label = Reflect::get(&statement, &JsValue::from_str("label"))?;
+            let label = if label.is_undefined() {
+                None
+            } else {
+                Some(label.as_string().ok_or_else(|| {
+                    lix_error_to_js(invalid_param(format!(
+                        "executeBatch statement at index {index} label must be a string"
+                    )))
+                })?)
+            };
+            Ok(RsExecuteBatchStatement { sql, params, label })
         })
         .collect()
 }
@@ -754,6 +764,10 @@ impl TryFrom<&Value> for LixValueDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecuteResultDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statement_index: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     columns: Vec<String>,
     rows: Vec<Vec<LixValueDto>>,
     rows_affected: f64,
@@ -775,6 +789,8 @@ impl TryFrom<RsExecuteResult> for ExecuteResultDto {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            statement_index: result.statement_index().map(js_index),
+            label: result.label().map(str::to_owned),
             columns: result.columns().to_vec(),
             rows,
             rows_affected: js_number(result.rows_affected()),
@@ -816,6 +832,14 @@ fn execute_result_to_js(result: RsExecuteResult) -> Result<JsValue, JsValue> {
     reason = "the public JavaScript SDK represents counts and sequences as numbers"
 )]
 fn js_number(value: u64) -> f64 {
+    value as f64
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "WASM32 statement indexes are exactly representable as JavaScript numbers"
+)]
+fn js_index(value: usize) -> f64 {
     value as f64
 }
 

@@ -23,6 +23,7 @@ import type {
 } from "../types.js";
 import type { NativeLixValue } from "../value.js";
 import {
+	decodeExecuteBatchResult,
 	decodeExecuteResult,
 	decodeHandshake,
 	decodeObserveEvent,
@@ -203,11 +204,13 @@ class RemoteLixBinding implements LixBinding {
 		const snapshot = statements.map((statement) => ({
 			sql: statement.sql,
 			params: snapshotParams(statement.params),
+			...(statement.label === undefined ? {} : { label: statement.label }),
 		}));
 		return this.#enqueue(async () => {
 			const preparedStatements = await Promise.all(
 				snapshot.map(async (statement, statementIndex) => ({
 					sql: statement.sql,
+					label: statement.label,
 					prepared: await this.#prepareParams(statement.params, (paramIndex) =>
 						requestBlobSlot(
 							"batch",
@@ -231,6 +234,9 @@ class RemoteLixBinding implements LixBinding {
 					body: JSON.stringify({
 						statements: preparedStatements.map((statement) => ({
 							sql: statement.sql,
+							...(statement.label === undefined
+								? {}
+								: { label: statement.label }),
 							params: full
 								? statement.prepared.fullParams()
 								: statement.prepared.params,
@@ -246,7 +252,7 @@ class RemoteLixBinding implements LixBinding {
 			if (!Array.isArray(value)) {
 				throw protocolError("execute batch response must be an array");
 			}
-			const results = value.map(decodeExecuteResult);
+			const results = value.map(decodeExecuteBatchResult);
 			this.#commitRequestBlobBases(
 				preparedStatements.flatMap(
 					(statement) => statement.prepared.cacheUpdates,
