@@ -1,0 +1,7 @@
+rustc --edition=2024 -D warnings packages/lix/tests/forktree_stage2_oracle/main.rs -o /tmp/forktree-stage2-residue-oracle
+/tmp/forktree-stage2-residue-oracle self-test
+/tmp/forktree-stage2-residue-oracle audit /absolute/path/to/candidate
+
+# This command MUST fail for the first runnable hard-cut head. Resolve the
+# exact candidate rlib path first; do not use a stale target directory.
+rustc --edition=2024 -D warnings packages/lix/tests/forktree_stage2_oracle/space_forge_rejection.rs --extern lix=/absolute/path/to/exact/candidate/liblix.rlib

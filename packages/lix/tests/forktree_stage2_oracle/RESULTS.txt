@@ -1,0 +1,39 @@
+ForkTree Stage-2 residue oracle frozen results
+
+Provenance:
+  f77 head  f77f5b9e2ff582f749d1c487d95e6c0e8e4d3662
+  f77 tree  597b98f80dad062b4c0b244f2e59fa489a9d4ce9
+  Stage-1 head 4b7b3aa25ebed5f022ed258c172c27e4dc64753d
+  Stage-1 tree 5cafd24b60112220e86c5bccaf5fb382416f2666
+
+Standalone compile:
+  rustc --edition=2024 -D warnings main.rs
+  PASS
+
+Self-test:
+  SELF_TEST_OK legacy_spaces=41 retained=6 rebuildable=2 delete_modules=14 required_owner_tokens=17
+
+Exact f77 audit (expected pre-cut BLOCKED, exit 1):
+  STAGE2_RESIDUE_BLOCKED findings=107
+  legacy-space                  41 tokens / 651 occurrences
+  legacy-owner-api             29 tokens / 503 occurrences
+  unsealed-or-unbounded-owner   6 tokens / 8 occurrences
+  missing-required-owner       17 tokens
+  superseded-module            14 paths
+
+Frozen unwired Stage-1 audit (expected pre-cut BLOCKED, exit 1):
+  STAGE2_RESIDUE_BLOCKED findings=100
+  legacy-space                  41 tokens / 651 occurrences
+  legacy-owner-api             29 tokens / 503 occurrences
+  unsealed-or-unbounded-owner   9 tokens / 37 occurrences
+  missing-required-owner        7 bounded-GC tokens
+  superseded-module            14 paths
+
+Interpretation:
+  Stage 1 supplies the accepted object/selector/catalog/state/upload owner
+  vocabulary but intentionally connects no production reader or writer. It
+  also still has the independently blocked V1/unbounded GC discovery and raw
+  StorageSpace descriptor surface. The first runnable hard cut must reduce
+  all categories to zero and make space_forge_rejection.rs fail to compile.
+
+No production compile, benchmark, source edit, or execution occurred.
