@@ -412,6 +412,10 @@ async fn main() {
         branch_diff_scaling::run().await;
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("branch-diff-corruption") {
+        branch_diff_scaling::run_corruption().await;
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("multimedia-fanout") {
         multimedia_fanout::run().await;
         return;

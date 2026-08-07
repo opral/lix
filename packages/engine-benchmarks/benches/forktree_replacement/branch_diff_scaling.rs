@@ -105,6 +105,86 @@ pub(super) async fn run() {
     }
 }
 
+pub(super) async fn run_corruption() {
+    let args = std::env::args().collect::<Vec<_>>();
+    let backend = Backend::parse(args.get(2).map(String::as_str).unwrap_or("rocksdb"));
+    match backend {
+        Backend::RocksDb => {
+            let directory = tempfile::tempdir().expect("create ForkTree diff corruption RocksDB");
+            let (base, after) = {
+                let database = RocksDB::open(directory.path()).expect("open corruption RocksDB");
+                let (storage, _) = CountingStorage::new(database.clone());
+                let tree = ForkTree::new(storage);
+                let base = tree
+                    .initialize(&initial_rows(128))
+                    .await
+                    .expect("initialize corruption tree");
+                let (after, _) = tree
+                    .apply_sorted_mutations(&[Mutation::Update {
+                        key: row_key(64),
+                        value: branch_value(0),
+                    }])
+                    .await
+                    .expect("edit corruption tree");
+                database.flush().expect("flush corruption RocksDB");
+                (base, after)
+            };
+            let database = RocksDB::open(directory.path()).expect("reopen corruption RocksDB");
+            let (storage, _) = CountingStorage::new(database);
+            verify_cold_diff_corruption(ForkTree::new(storage), base, after, backend).await;
+        }
+        Backend::SlateDb => {
+            let directory = tempfile::tempdir().expect("create ForkTree diff corruption SlateDB");
+            let (base, after) = {
+                let database = SlateDB::open(directory.path()).expect("open corruption SlateDB");
+                let (storage, _) = CountingStorage::new(database.clone());
+                let tree = ForkTree::new(storage);
+                let base = tree
+                    .initialize(&initial_rows(128))
+                    .await
+                    .expect("initialize corruption tree");
+                let (after, _) = tree
+                    .apply_sorted_mutations(&[Mutation::Update {
+                        key: row_key(64),
+                        value: branch_value(0),
+                    }])
+                    .await
+                    .expect("edit corruption tree");
+                database
+                    .flush_memtable_for_diagnostics()
+                    .await
+                    .expect("flush corruption SlateDB");
+                (base, after)
+            };
+            let database = SlateDB::open(directory.path()).expect("reopen corruption SlateDB");
+            let (storage, _) = CountingStorage::new(database);
+            verify_cold_diff_corruption(ForkTree::new(storage), base, after, backend).await;
+        }
+    }
+}
+
+async fn verify_cold_diff_corruption<S>(
+    tree: ForkTree<CountingStorage<S>>,
+    base: ObjectId,
+    after: ObjectId,
+    backend: Backend,
+) where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let healthy = tree
+        .diff_commits(base, after)
+        .await
+        .expect("healthy cold diff after reopen");
+    assert_eq!(healthy, vec![row_key(64)]);
+    tree.verify_diff_corruption_fail_closed(base, after)
+        .await
+        .expect("corrupt cold diff fails closed");
+    println!(
+        "branch_diff_corruption,backend={},healthy_changes=1,cold_reopen=pass,corrupt_diff_rejected=1",
+        backend.label()
+    );
+}
+
 #[derive(Clone)]
 struct CurrentOracle {
     base_commit: String,
@@ -683,6 +763,19 @@ async fn forktree_reopen<S>(
             accounting.changes += one.changes;
             accounting.hash_pruned_nodes += one.hash_pruned_nodes;
             accounting.decoded_nodes += one.decoded_nodes;
+            accounting.commit_batches += one.commit_batches;
+            accounting.commit_objects += one.commit_objects;
+            accounting.node_batches += one.node_batches;
+            accounting.node_objects += one.node_objects;
+            accounting.value_batches += one.value_batches;
+            accounting.value_references += one.value_references;
+            accounting.unique_value_packs += one.unique_value_packs;
+            accounting.authenticated_bytes += one.authenticated_bytes;
+            accounting.commit_read_nanos += one.commit_read_nanos;
+            accounting.node_read_nanos += one.node_read_nanos;
+            accounting.node_decode_nanos += one.node_decode_nanos;
+            accounting.value_read_nanos += one.value_read_nanos;
+            accounting.value_decode_nanos += one.value_decode_nanos;
         }
         Ok::<_, String>((changes, accounting))
     })
@@ -690,7 +783,7 @@ async fn forktree_reopen<S>(
     .expect("cold diff ForkTree branches");
     assert_eq!(changes, parameters.edits * parameters.rows_per_edit);
     println!(
-        "branch_diff_pruning,backend={},layout={},rows={},branches={},edit_percent={},diffs={},changes={},hash_pruned_nodes={},decoded_nodes={}",
+        "branch_diff_pruning,backend={},layout={},rows={},branches={},edit_percent={},diffs={},changes={},hash_pruned_nodes={},decoded_nodes={},commit_batches={},commit_objects={},node_batches={},node_objects={},value_batches={},value_references={},unique_value_packs={},authenticated_bytes={},commit_read_nanos={},node_read_nanos={},node_decode_nanos={},value_read_nanos={},value_decode_nanos={}",
         parameters.backend.label(),
         parameters.layout.label(),
         parameters.rows,
@@ -700,6 +793,19 @@ async fn forktree_reopen<S>(
         changes,
         accounting.hash_pruned_nodes,
         accounting.decoded_nodes,
+        accounting.commit_batches,
+        accounting.commit_objects,
+        accounting.node_batches,
+        accounting.node_objects,
+        accounting.value_batches,
+        accounting.value_references,
+        accounting.unique_value_packs,
+        accounting.authenticated_bytes,
+        accounting.commit_read_nanos,
+        accounting.node_read_nanos,
+        accounting.node_decode_nanos,
+        accounting.value_read_nanos,
+        accounting.value_decode_nanos,
     );
 
     let merge_targets =

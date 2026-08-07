@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
+use std::time::Instant as DiffInstant;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
@@ -231,6 +232,19 @@ pub struct DiffAccounting {
     pub changes: u64,
     pub hash_pruned_nodes: u64,
     pub decoded_nodes: u64,
+    pub commit_batches: u64,
+    pub commit_objects: u64,
+    pub node_batches: u64,
+    pub node_objects: u64,
+    pub value_batches: u64,
+    pub value_references: u64,
+    pub unique_value_packs: u64,
+    pub authenticated_bytes: u64,
+    pub commit_read_nanos: u64,
+    pub node_read_nanos: u64,
+    pub node_decode_nanos: u64,
+    pub value_read_nanos: u64,
+    pub value_decode_nanos: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -354,6 +368,19 @@ struct RowChange {
     key: Vec<u8>,
     before: Option<RelationalValue>,
     after: Option<RelationalValue>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRowChange {
+    key: Vec<u8>,
+    before: Option<ValueRef>,
+    after: Option<ValueRef>,
+}
+
+struct DiffForestState {
+    before: Vec<NodeRef>,
+    after: Vec<NodeRef>,
+    loaded: Option<(Vec<Node>, Vec<Node>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1116,6 +1143,41 @@ where
             changes.into_iter().map(|change| change.key).collect(),
             accounting,
         ))
+    }
+
+    pub async fn verify_diff_corruption_fail_closed(
+        &self,
+        before: ObjectId,
+        after: ObjectId,
+    ) -> Result<(), String> {
+        let commit = self.load_commit(after).await?;
+        let mut corrupted = self.load_object(commit.root).await?.to_vec();
+        corrupted[0] ^= 0x80;
+        let mut pending = BTreeMap::new();
+        pending.insert(commit.root, Bytes::from(corrupted));
+        let overwrite = async {
+            let mut write = self
+                .storage
+                .begin_write(WriteOptions::default())
+                .await
+                .map_err(storage_error)?;
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+            write.commit().await.map_err(storage_error)
+        }
+        .await;
+        if overwrite.is_err() {
+            return Ok(());
+        }
+        match self.diff_commits(before, after).await {
+            Err(error) if error.contains("failed authentication") => Ok(()),
+            Err(error) => Err(format!(
+                "ForkTree corrupt diff failed at a non-authentication boundary: {error}"
+            )),
+            Ok(_) => Err("ForkTree diff accepted a corrupt authenticated node".to_string()),
+        }
     }
 
     pub async fn shared_object_inventory(
@@ -2853,10 +2915,6 @@ where
         Ok(nodes)
     }
 
-    async fn node_max_key(&self, id: ObjectId) -> Result<Vec<u8>, String> {
-        Ok(node_max_key(&decode_node(&self.load_object(id).await?)?))
-    }
-
     fn find_value<'a>(
         &'a self,
         id: ObjectId,
@@ -2988,22 +3046,57 @@ where
             accounting.hash_pruned_nodes = 1;
             return Ok((Vec::new(), accounting));
         }
-        let before = self.load_commit(before).await?;
-        let after = self.load_commit(after).await?;
-        let mut output = Vec::new();
+        let commit_started = DiffInstant::now();
+        let commit_bytes = self.load_objects(&[before, after]).await?;
+        accounting.commit_read_nanos = elapsed_nanos(commit_started);
+        accounting.commit_batches = 1;
+        accounting.commit_objects = 2;
+        accounting.authenticated_bytes += commit_bytes.iter().map(Bytes::len).sum::<usize>() as u64;
+        let mut commits = commit_bytes
+            .iter()
+            .map(|bytes| decode_commit(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let after = commits.pop().expect("two commits include an after commit");
+        let before = commits.pop().expect("two commits include a before commit");
+        if before.root == after.root {
+            accounting.hash_pruned_nodes = 1;
+            return Ok((Vec::new(), accounting));
+        }
+
+        let root_ids = [before.root, after.root];
+        let root_started = DiffInstant::now();
+        let root_bytes = self.load_objects(&root_ids).await?;
+        accounting.node_read_nanos += elapsed_nanos(root_started);
+        accounting.node_batches += 1;
+        accounting.node_objects += 2;
+        accounting.authenticated_bytes += root_bytes.iter().map(Bytes::len).sum::<usize>() as u64;
+        let decode_started = DiffInstant::now();
+        let mut root_nodes = root_bytes
+            .iter()
+            .map(|bytes| decode_node(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        accounting.node_decode_nanos += elapsed_nanos(decode_started);
+        accounting.decoded_nodes += 2;
+        let after_node = root_nodes.pop().expect("two roots include an after root");
+        let before_node = root_nodes.pop().expect("two roots include a before root");
+        let mut pending = Vec::new();
         self.diff_forests(
             vec![NodeRef {
                 id: before.root,
-                max_key: self.node_max_key(before.root).await?,
+                max_key: node_max_key(&before_node),
             }],
             vec![NodeRef {
                 id: after.root,
-                max_key: self.node_max_key(after.root).await?,
+                max_key: node_max_key(&after_node),
             }],
-            &mut output,
+            Some((vec![before_node], vec![after_node])),
+            &mut pending,
             &mut accounting,
         )
         .await?;
+        let mut output = self
+            .materialize_row_changes(pending, &mut accounting)
+            .await?;
         output.sort_by(|left, right| left.key.cmp(&right.key));
         if output.windows(2).any(|pair| pair[0].key >= pair[1].key) {
             return Err("ForkTree diff emitted duplicate identities".to_string());
@@ -3012,144 +3105,131 @@ where
         Ok((output, accounting))
     }
 
-    fn diff_forests<'a>(
-        &'a self,
+    async fn diff_forests(
+        &self,
         before: Vec<NodeRef>,
         after: Vec<NodeRef>,
-        output: &'a mut Vec<RowChange>,
-        accounting: &'a mut DiffAccounting,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            if before.is_empty() && after.is_empty() {
-                return Ok(());
-            }
-            let after_positions = after
-                .iter()
-                .enumerate()
-                .map(|(index, node)| (node.id, index))
-                .collect::<BTreeMap<_, _>>();
-            let mut before_start = 0;
-            let mut after_start = 0;
-            let mut found_common = false;
-            for (before_index, node) in before.iter().enumerate() {
-                let Some(&after_index) = after_positions.get(&node.id) else {
-                    continue;
-                };
-                if before_index < before_start || after_index < after_start {
+        loaded: Option<(Vec<Node>, Vec<Node>)>,
+        output: &mut Vec<PendingRowChange>,
+        accounting: &mut DiffAccounting,
+    ) -> Result<(), String> {
+        let mut frontier = vec![DiffForestState {
+            before,
+            after,
+            loaded,
+        }];
+        while !frontier.is_empty() {
+            let mut ready = Vec::new();
+            let mut unloaded = Vec::new();
+            for state in frontier {
+                if let Some(nodes) = state.loaded {
+                    ready.push((state.before, state.after, nodes.0, nodes.1));
                     continue;
                 }
-                found_common = true;
-                accounting.hash_pruned_nodes += 1;
-                self.diff_forests(
-                    before[before_start..before_index].to_vec(),
-                    after[after_start..after_index].to_vec(),
-                    output,
-                    accounting,
-                )
-                .await?;
-                before_start = before_index + 1;
-                after_start = after_index + 1;
-            }
-            if found_common {
-                return self
-                    .diff_forests(
-                        before[before_start..].to_vec(),
-                        after[after_start..].to_vec(),
-                        output,
-                        accounting,
-                    )
-                    .await;
-            }
-
-            let mut before_nodes = Vec::with_capacity(before.len());
-            for node in &before {
-                before_nodes.push(decode_node(&self.load_object(node.id).await?)?);
-            }
-            let mut after_nodes = Vec::with_capacity(after.len());
-            for node in &after {
-                after_nodes.push(decode_node(&self.load_object(node.id).await?)?);
-            }
-            accounting.decoded_nodes += (before_nodes.len() + after_nodes.len()) as u64;
-            let before_leaves = before_nodes
-                .iter()
-                .all(|node| matches!(node, Node::Leaf(_)));
-            let after_leaves = after_nodes.iter().all(|node| matches!(node, Node::Leaf(_)));
-            if before_leaves && after_leaves {
-                let mut before_rows = Vec::new();
-                for node in before_nodes {
-                    let Node::Leaf(mut rows) = node else {
-                        unreachable!();
-                    };
-                    before_rows.append(&mut rows);
-                }
-                let mut after_rows = Vec::new();
-                for node in after_nodes {
-                    let Node::Leaf(mut rows) = node else {
-                        unreachable!();
-                    };
-                    after_rows.append(&mut rows);
-                }
-                let mut before_index = 0;
-                let mut after_index = 0;
-                while before_index < before_rows.len() || after_index < after_rows.len() {
-                    match (before_rows.get(before_index), after_rows.get(after_index)) {
-                        (Some(left), Some(right)) if left.key == right.key => {
-                            if left.value != right.value {
-                                let before_value = self.load_relational_value(left.value).await?;
-                                let after_value = self.load_relational_value(right.value).await?;
-                                if before_value != after_value {
-                                    output.push(RowChange {
-                                        key: left.key.clone(),
-                                        before: Some(before_value),
-                                        after: Some(after_value),
-                                    });
-                                }
-                            }
-                            before_index += 1;
-                            after_index += 1;
-                        }
-                        (Some(left), Some(right)) if left.key < right.key => {
-                            output.push(RowChange {
-                                key: left.key.clone(),
-                                before: Some(self.load_relational_value(left.value).await?),
-                                after: None,
-                            });
-                            before_index += 1;
-                        }
-                        (Some(_), Some(right)) => {
-                            output.push(RowChange {
-                                key: right.key.clone(),
-                                before: None,
-                                after: Some(self.load_relational_value(right.value).await?),
-                            });
-                            after_index += 1;
-                        }
-                        (Some(left), None) => {
-                            output.push(RowChange {
-                                key: left.key.clone(),
-                                before: Some(self.load_relational_value(left.value).await?),
-                                after: None,
-                            });
-                            before_index += 1;
-                        }
-                        (None, Some(right)) => {
-                            output.push(RowChange {
-                                key: right.key.clone(),
-                                before: None,
-                                after: Some(self.load_relational_value(right.value).await?),
-                            });
-                            after_index += 1;
-                        }
-                        (None, None) => break,
+                for (before, after) in
+                    unmatched_forest_segments(state.before, state.after, accounting)
+                {
+                    if !before.is_empty() || !after.is_empty() {
+                        unloaded.push((before, after));
                     }
                 }
-                return Ok(());
             }
 
-            let before = expand_forest(before, before_nodes);
-            let after = expand_forest(after, after_nodes);
-            self.diff_forests(before, after, output, accounting).await
-        })
+            if !unloaded.is_empty() {
+                let ids = unloaded
+                    .iter()
+                    .flat_map(|(before, after)| before.iter().chain(after))
+                    .map(|node| node.id)
+                    .collect::<Vec<_>>();
+                let read_started = DiffInstant::now();
+                let bytes = self.load_objects(&ids).await?;
+                accounting.node_read_nanos += elapsed_nanos(read_started);
+                accounting.node_batches += 1;
+                accounting.node_objects += ids.len() as u64;
+                accounting.authenticated_bytes +=
+                    bytes.iter().map(Bytes::len).sum::<usize>() as u64;
+                let decode_started = DiffInstant::now();
+                let mut nodes = bytes
+                    .iter()
+                    .map(|bytes| decode_node(bytes))
+                    .collect::<Result<VecDeque<_>, _>>()?;
+                accounting.node_decode_nanos += elapsed_nanos(decode_started);
+                accounting.decoded_nodes += nodes.len() as u64;
+                for (before, after) in unloaded {
+                    let before_nodes = nodes.drain(..before.len()).collect::<Vec<_>>();
+                    let after_nodes = nodes.drain(..after.len()).collect::<Vec<_>>();
+                    ready.push((before, after, before_nodes, after_nodes));
+                }
+                if !nodes.is_empty() {
+                    return Err("ForkTree diff node batch was not consumed exactly".to_string());
+                }
+            }
+
+            let mut next = Vec::new();
+            for (before, after, before_nodes, after_nodes) in ready {
+                let before_leaves = before_nodes
+                    .iter()
+                    .all(|node| matches!(node, Node::Leaf(_)));
+                let after_leaves = after_nodes.iter().all(|node| matches!(node, Node::Leaf(_)));
+                if before_leaves && after_leaves {
+                    append_pending_leaf_changes(before_nodes, after_nodes, output);
+                } else {
+                    next.push(DiffForestState {
+                        before: expand_forest(before, before_nodes),
+                        after: expand_forest(after, after_nodes),
+                        loaded: None,
+                    });
+                }
+            }
+            frontier = next;
+        }
+        Ok(())
+    }
+
+    async fn materialize_row_changes(
+        &self,
+        pending: Vec<PendingRowChange>,
+        accounting: &mut DiffAccounting,
+    ) -> Result<Vec<RowChange>, String> {
+        let value_references = pending
+            .iter()
+            .flat_map(|change| change.before.into_iter().chain(change.after))
+            .collect::<Vec<_>>();
+        let ids = value_references
+            .iter()
+            .map(|value| value.pack)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        accounting.value_references += value_references.len() as u64;
+        accounting.unique_value_packs += ids.len() as u64;
+        let mut packs = BTreeMap::new();
+        if !ids.is_empty() {
+            let read_started = DiffInstant::now();
+            let bytes = self.load_objects(&ids).await?;
+            accounting.value_read_nanos += elapsed_nanos(read_started);
+            accounting.value_batches += 1;
+            accounting.authenticated_bytes += bytes.iter().map(Bytes::len).sum::<usize>() as u64;
+            let decode_started = DiffInstant::now();
+            for (id, bytes) in ids.into_iter().zip(bytes) {
+                packs.insert(id, decode_value_pack(&bytes)?);
+            }
+            accounting.value_decode_nanos += elapsed_nanos(decode_started);
+        }
+
+        let mut output = Vec::with_capacity(pending.len());
+        for change in pending {
+            let before = materialize_value_ref(change.before, &packs)?;
+            let after = materialize_value_ref(change.after, &packs)?;
+            if before != after {
+                output.push(RowChange {
+                    key: change.key,
+                    before,
+                    after,
+                });
+            }
+        }
+        Ok(output)
     }
 
     async fn object_closure(
@@ -3724,6 +3804,131 @@ fn expand_forest(refs: Vec<NodeRef>, nodes: Vec<Node>) -> Vec<NodeRef> {
             Node::Internal(children) => children,
         })
         .collect()
+}
+
+fn unmatched_forest_segments(
+    before: Vec<NodeRef>,
+    after: Vec<NodeRef>,
+    accounting: &mut DiffAccounting,
+) -> Vec<(Vec<NodeRef>, Vec<NodeRef>)> {
+    let after_positions = after
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut output = Vec::new();
+    let mut before_start = 0;
+    let mut after_start = 0;
+    for (before_index, node) in before.iter().enumerate() {
+        let Some(&after_index) = after_positions.get(&node.id) else {
+            continue;
+        };
+        if before_index < before_start || after_index < after_start {
+            continue;
+        }
+        accounting.hash_pruned_nodes += 1;
+        output.push((
+            before[before_start..before_index].to_vec(),
+            after[after_start..after_index].to_vec(),
+        ));
+        before_start = before_index + 1;
+        after_start = after_index + 1;
+    }
+    output.push((
+        before[before_start..].to_vec(),
+        after[after_start..].to_vec(),
+    ));
+    output
+}
+
+fn append_pending_leaf_changes(
+    before_nodes: Vec<Node>,
+    after_nodes: Vec<Node>,
+    output: &mut Vec<PendingRowChange>,
+) {
+    let before_rows = before_nodes
+        .into_iter()
+        .flat_map(|node| match node {
+            Node::Leaf(rows) => rows,
+            Node::Internal(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let after_rows = after_nodes
+        .into_iter()
+        .flat_map(|node| match node {
+            Node::Leaf(rows) => rows,
+            Node::Internal(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let mut before_index = 0;
+    let mut after_index = 0;
+    while before_index < before_rows.len() || after_index < after_rows.len() {
+        match (before_rows.get(before_index), after_rows.get(after_index)) {
+            (Some(left), Some(right)) if left.key == right.key => {
+                if left.value != right.value {
+                    output.push(PendingRowChange {
+                        key: left.key.clone(),
+                        before: Some(left.value),
+                        after: Some(right.value),
+                    });
+                }
+                before_index += 1;
+                after_index += 1;
+            }
+            (Some(left), Some(right)) if left.key < right.key => {
+                output.push(PendingRowChange {
+                    key: left.key.clone(),
+                    before: Some(left.value),
+                    after: None,
+                });
+                before_index += 1;
+            }
+            (Some(_), Some(right)) => {
+                output.push(PendingRowChange {
+                    key: right.key.clone(),
+                    before: None,
+                    after: Some(right.value),
+                });
+                after_index += 1;
+            }
+            (Some(left), None) => {
+                output.push(PendingRowChange {
+                    key: left.key.clone(),
+                    before: Some(left.value),
+                    after: None,
+                });
+                before_index += 1;
+            }
+            (None, Some(right)) => {
+                output.push(PendingRowChange {
+                    key: right.key.clone(),
+                    before: None,
+                    after: Some(right.value),
+                });
+                after_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+}
+
+fn materialize_value_ref(
+    value: Option<ValueRef>,
+    packs: &BTreeMap<ObjectId, Vec<RelationalValue>>,
+) -> Result<Option<RelationalValue>, String> {
+    value
+        .map(|value| {
+            packs
+                .get(&value.pack)
+                .and_then(|values| values.get(value.index as usize))
+                .cloned()
+                .ok_or_else(|| "ForkTree value-pack reference is invalid".to_string())
+        })
+        .transpose()
+}
+
+fn elapsed_nanos(started: DiffInstant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn validate_sorted_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
