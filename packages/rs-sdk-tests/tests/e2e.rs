@@ -1,7 +1,10 @@
 mod benchmark_metrics;
 
 use bytes::Bytes;
-use lix::storage::Storage;
+use lix::storage::{
+    CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions,
+    SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+};
 use lix::wasm::{
     WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
     WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
@@ -23,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7187,6 +7191,311 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         2
     );
     reopened.close().await.unwrap();
+}
+
+const CERTIFIED_ENTITY_BATCH_TEST_SPACE: StorageSpace =
+    StorageSpace::mutable(SpaceId(0x0004_001f), "live_state.certified_entity_batch.v1");
+const CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE: StorageSpace = StorageSpace::mutable(
+    SpaceId(0x0004_0022),
+    "live_state.certified_entity_batch_page.v1",
+);
+const CEB2_FIXTURE_PATH: &str = "/ceb2-hard-cut.excalidraw";
+const CEB2_FIXTURE_BYTES: &[u8] = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#;
+
+async fn storage_space_entries<StorageImpl>(
+    storage: &StorageImpl,
+    space: StorageSpace,
+) -> Vec<(Key, Bytes)>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("open raw certified storage read");
+    let mut entries = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = read
+            .scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                ScanOptions {
+                    projection: CoreProjection::FullValue,
+                    limit_rows: usize::MAX,
+                    resume_after,
+                },
+            )
+            .await
+            .expect("scan raw certified storage space");
+        let has_more = page.has_more;
+        resume_after = page.entries.last().map(|entry| entry.key.clone());
+        entries.extend(page.entries.into_iter().map(|entry| {
+            let ProjectedValue::FullValue(bytes) = entry.value else {
+                panic!("full certified storage projection must return bytes");
+            };
+            (entry.key, bytes)
+        }));
+        if !has_more {
+            return entries;
+        }
+        assert!(
+            resume_after.is_some(),
+            "paginated certified scan must provide a resume key"
+        );
+    }
+}
+
+async fn write_and_verify_ceb2_fixture<StorageImpl>(storage: &StorageImpl)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open CEB2 fixture workspace");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+    write_file(&lix, CEB2_FIXTURE_PATH, CEB2_FIXTURE_BYTES.to_vec())
+        .await
+        .expect("write CEB2 fixture");
+    assert_eq!(
+        read_file(&lix, CEB2_FIXTURE_PATH).await.unwrap(),
+        Some(CEB2_FIXTURE_BYTES.to_vec())
+    );
+    assert_eq!(
+        lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+            .await
+            .expect("read CEB2 semantic row")
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        1
+    );
+    lix.close().await.expect("close CEB2 fixture workspace");
+
+    let contents = storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_TEST_SPACE).await;
+    assert!(
+        !contents.is_empty(),
+        "writer must publish a certified batch"
+    );
+    assert!(
+        contents.iter().all(|(_, value)| value.starts_with(b"CEB2")),
+        "current writers must emit only CEB2"
+    );
+    assert!(
+        !storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE)
+            .await
+            .is_empty(),
+        "CEB2 writer must publish external pages"
+    );
+}
+
+async fn verify_reopened_ceb2_fixture<StorageImpl>(storage: &StorageImpl)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("reopen CEB2 fixture workspace");
+    assert_eq!(
+        read_file(&lix, CEB2_FIXTURE_PATH).await.unwrap(),
+        Some(CEB2_FIXTURE_BYTES.to_vec())
+    );
+    assert_eq!(
+        lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+            .await
+            .expect("read reopened CEB2 semantic row")
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        1
+    );
+    lix.close().await.expect("close reopened CEB2 workspace");
+}
+
+async fn corrupt_first_ceb2_page<StorageImpl>(storage: &StorageImpl)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut pages = storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE).await;
+    let (key, mut bytes) = pages
+        .drain(..)
+        .next()
+        .expect("CEB2 fixture must own an external page");
+    assert!(bytes.len() > 1, "CEB2 fixture page must be non-empty");
+    bytes.truncate(bytes.len() - 1);
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("open CEB2 corruption write");
+    write
+        .put_many(
+            CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: StoredValue { bytes },
+                }],
+            },
+        )
+        .await
+        .expect("stage corrupt CEB2 page");
+    write.commit().await.expect("commit corrupt CEB2 page");
+}
+
+async fn verify_corrupt_ceb2_fails_closed<StorageImpl>(storage: &StorageImpl)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("reopen corrupt CEB2 workspace");
+    let error = lix
+        .execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+        .await
+        .expect_err("corrupt CEB2 page must fail closed");
+    assert!(
+        error.to_string().contains("certified entity batch"),
+        "unexpected CEB2 corruption error: {error}"
+    );
+    lix.close().await.expect("close corrupt CEB2 workspace");
+}
+
+#[tokio::test]
+async fn v3_ceb2_roundtrip_corruption_and_reopen_memory() {
+    let storage = lix::Memory::new();
+    write_and_verify_ceb2_fixture(&storage).await;
+    verify_reopened_ceb2_fixture(&storage).await;
+    corrupt_first_ceb2_page(&storage).await;
+    verify_corrupt_ceb2_fails_closed(&storage).await;
+}
+
+#[tokio::test]
+async fn v3_ceb2_roundtrip_corruption_and_reopen_rocksdb() {
+    let root = tempfile::tempdir().expect("create CEB2 RocksDB directory");
+    let path = root.path().join("ceb2.rocksdb");
+    {
+        let storage = RocksDB::open(&path).expect("open CEB2 RocksDB storage");
+        write_and_verify_ceb2_fixture(&storage).await;
+        storage.flush().expect("flush CEB2 RocksDB write");
+    }
+    {
+        let storage = RocksDB::open(&path).expect("reopen CEB2 RocksDB storage");
+        verify_reopened_ceb2_fixture(&storage).await;
+        corrupt_first_ceb2_page(&storage).await;
+        storage.flush().expect("flush corrupt CEB2 RocksDB page");
+    }
+    let storage = RocksDB::open(&path).expect("reopen corrupt CEB2 RocksDB storage");
+    verify_corrupt_ceb2_fails_closed(&storage).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_ceb2_roundtrip_corruption_and_reopen_slatedb() {
+    let root = tempfile::tempdir().expect("create CEB2 SlateDB directory");
+    let path = root.path().join("ceb2.slatedb");
+    {
+        let storage = SlateDB::open(&path).expect("open CEB2 SlateDB storage");
+        write_and_verify_ceb2_fixture(&storage).await;
+        storage.flush().await.expect("flush CEB2 SlateDB write");
+    }
+    {
+        let storage = SlateDB::open(&path).expect("reopen CEB2 SlateDB storage");
+        verify_reopened_ceb2_fixture(&storage).await;
+        corrupt_first_ceb2_page(&storage).await;
+        storage
+            .flush()
+            .await
+            .expect("flush corrupt CEB2 SlateDB page");
+    }
+    let storage = SlateDB::open(&path).expect("reopen corrupt CEB2 SlateDB storage");
+    verify_corrupt_ceb2_fails_closed(&storage).await;
+}
+
+#[tokio::test]
+#[ignore = "focused CEB2 certified-row read benchmark probe"]
+async fn v3_ceb2_certified_row_read_benchmark() {
+    const READS_PER_SAMPLE: usize = 100;
+    const SAMPLES: usize = 9;
+    let lix = open_lix().await.expect("open CEB2 benchmark workspace");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+    write_file(
+        &lix,
+        "/ceb2-benchmark.excalidraw",
+        br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#
+            .to_vec(),
+    )
+    .await
+    .expect("write certified CEB2 benchmark fixture");
+
+    let mut measurements = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        let allocation_scope = AllocationScope::start();
+        let started = Instant::now();
+        for _ in 0..READS_PER_SAMPLE {
+            let result = lix
+                .execute(
+                    "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
+                    &[],
+                )
+                .await
+                .expect("read one certified CEB2 row");
+            black_box(result.rows()[0].get::<String>("element_json").unwrap());
+        }
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        eprintln!(
+            "CEB2_READ_SAMPLE sample={sample} reads={READS_PER_SAMPLE} elapsed_ms={} allocations={} allocated_bytes={} peak_live_bytes={}",
+            measurement.elapsed_ms,
+            measurement.allocations.allocation_count,
+            measurement.allocations.allocated_bytes,
+            measurement.allocations.peak_live_bytes_delta,
+        );
+        measurements.push(measurement);
+    }
+    let mut elapsed = measurements
+        .iter()
+        .map(|measurement| measurement.elapsed_ms)
+        .collect::<Vec<_>>();
+    elapsed.sort_by(f64::total_cmp);
+    let mut allocations = measurements
+        .iter()
+        .map(|measurement| measurement.allocations.allocation_count)
+        .collect::<Vec<_>>();
+    allocations.sort_unstable();
+    let mut allocated_bytes = measurements
+        .iter()
+        .map(|measurement| measurement.allocations.allocated_bytes)
+        .collect::<Vec<_>>();
+    allocated_bytes.sort_unstable();
+    let mut peak_live = measurements
+        .iter()
+        .map(|measurement| measurement.allocations.peak_live_bytes_delta)
+        .collect::<Vec<_>>();
+    peak_live.sort_unstable();
+    eprintln!(
+        "CEB2_READ_SUMMARY samples={SAMPLES} reads_per_sample={READS_PER_SAMPLE} elapsed_ms_p50={} allocations_p50={} allocated_bytes_p50={} peak_live_bytes_p50={}",
+        elapsed[SAMPLES / 2],
+        allocations[SAMPLES / 2],
+        allocated_bytes[SAMPLES / 2],
+        peak_live[SAMPLES / 2],
+    );
+    lix.close().await.expect("close CEB2 benchmark workspace");
 }
 
 #[tokio::test]
