@@ -528,8 +528,9 @@ async fn assert_identity_present<S>(
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut ids = vec![blob.manifest_object_id];
-    ids.extend(blob.chunks.iter().map(|chunk| chunk.object_id));
+    let mut unique = BTreeSet::from([blob.manifest_object_id]);
+    unique.extend(blob.chunks.iter().map(|chunk| chunk.object_id));
+    let ids = unique.into_iter().collect::<Vec<_>>();
     let present = tree
         .present_object_ids(&ids)
         .await
