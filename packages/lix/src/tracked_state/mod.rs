@@ -25,12 +25,10 @@ mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
-    CommitRootRebuildDelta, CommitRootRebuildPlan, load_rebuild_plan_frontier,
-    stage_rebuild_plan_with_writer,
+    load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
 };
 pub(crate) use context::{
-    TrackedStateContext, TrackedStateStoreReader, TrackedStateTransientRebuildState,
-    descriptor_dependency_cascade_file_ids,
+    TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
 #[cfg(test)]
 pub(crate) use current_state_data_part::decode_current_state_data_part_refs;
