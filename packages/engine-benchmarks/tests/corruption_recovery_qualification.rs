@@ -254,16 +254,12 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .expect("cold reopen healthy tracked tree");
     let healthy = lix
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_key_value WHERE key LIKE 'tree-%'",
+            "SELECT key, value FROM lix_key_value WHERE key LIKE 'tree-%' ORDER BY key",
             &[],
         )
         .await
         .expect("healthy tracked tree should survive cold reopen");
-    assert_eq!(
-        healthy.rows()[0].get::<i64>("count").unwrap(),
-        8,
-        "healthy tracked tree row count"
-    );
+    assert_eq!(healthy.rows().len(), 8, "healthy tracked tree row count");
     lix.close()
         .await
         .expect("close healthy tracked-tree reopen");
@@ -276,7 +272,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         Ok(lix) => {
             let result = lix
                 .execute(
-                    "SELECT COUNT(*) AS count FROM lix_key_value WHERE key LIKE 'tree-%'",
+                    "SELECT key, value FROM lix_key_value WHERE key LIKE 'tree-%' ORDER BY key",
                     &[],
                 )
                 .await;
