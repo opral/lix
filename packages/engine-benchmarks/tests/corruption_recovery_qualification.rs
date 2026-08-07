@@ -7,10 +7,9 @@ use lix::storage_adapter::{
 use lix::storage_bench::{
     MergeBaseBenchScenario, layout_space_catalog, load_seeded_branch_plugin_checkpoint_for_bench,
     merge_base_for_bench, prepare_merge_for_bench, read_binary_cas_for_bench,
-    scan_tracked_commit_for_bench, seed_branch_plugin_checkpoints_for_bench,
-    seed_merge_base_fixture_for_bench, space_inventory, write_binary_cas_for_bench,
+    seed_branch_plugin_checkpoints_for_bench, seed_merge_base_fixture_for_bench, space_inventory,
+    write_binary_cas_for_bench,
 };
-use lix::tracked_state::bench::{BenchTrackedFixture, BenchTrackedRow};
 use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -227,47 +226,63 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     let directory = tempfile::tempdir().expect("create tracked-tree corruption fixture");
     let path = directory.path();
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let rows = (0..8)
-        .map(|index| BenchTrackedRow {
-            schema_key: "corruption_tree_probe".to_owned(),
-            file_id: None,
-            entity_pk: format!("row-{index}"),
-            value: format!("{{\"value\":{index}}}").into_bytes(),
-            updated_value: format!("{{\"value\":{}}}", index + 1).into_bytes(),
-        })
-        .collect();
-    let mut fixture = BenchTrackedFixture::new(storage.clone(), rows);
-    assert_eq!(fixture.seed().await, 8);
-    let commit_id = fixture.current_commit_id().to_owned();
-    drop(fixture);
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("open tracked-tree fixture");
+    for index in 0..8 {
+        lix.execute(
+            &format!(
+                "INSERT INTO lix_key_value (key, value) VALUES ('tree-{index}', 'value-{index}')"
+            ),
+            &[],
+        )
+        .await
+        .expect("insert tracked-tree fixture row");
+    }
+    lix.create_checkpoint()
+        .await
+        .expect("checkpoint tracked-tree fixture");
+    lix.close().await.expect("close tracked-tree fixture");
     database.flush_all().await;
-    drop(storage);
     drop(database);
 
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("cold reopen healthy tracked tree");
+    let healthy = lix
+        .execute("SELECT COUNT(*) AS count FROM lix_key_value", &[])
+        .await
+        .expect("healthy tracked tree should survive cold reopen");
     assert_eq!(
-        scan_tracked_commit_for_bench(&storage, &commit_id)
-            .await
-            .expect("healthy tracked tree should survive cold reopen"),
-        8
+        healthy.rows()[0].get::<i64>("count").unwrap(),
+        8,
+        "healthy tracked tree row count"
     );
+    lix.close()
+        .await
+        .expect("close healthy tracked-tree reopen");
     corrupt_every_mutable_value(&database, TREE_CHUNK_SPACE, 0).await;
     database.flush_all().await;
-    drop(storage);
     drop(database);
 
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let error = scan_tracked_commit_for_bench(&storage, &commit_id)
-        .await
-        .expect_err("corrupt tracked tree chunk must fail closed");
+    let error = match open_lix().with_storage(database.clone()).await {
+        Ok(lix) => {
+            let result = lix
+                .execute("SELECT COUNT(*) AS count FROM lix_key_value", &[])
+                .await;
+            let _ = lix.close().await;
+            result.expect_err("corrupt tracked tree chunk must fail on first read")
+        }
+        Err(error) => error,
+    };
     assert!(
         error.to_string().contains("digest") || error.to_string().contains("tree"),
         "unexpected tree corruption error: {error}"
     );
-    drop(storage);
     drop(database);
 }
 

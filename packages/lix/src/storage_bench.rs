@@ -1258,25 +1258,6 @@ where
     reader.has_durable_commit_root(commit_id).await
 }
 
-/// Scans one historical tracked commit through the production reader.
-pub async fn scan_tracked_commit_for_bench<StorageImpl>(
-    storage: &StorageAdapter<StorageImpl>,
-    commit_id: &str,
-) -> Result<usize, crate::LixError>
-where
-    StorageImpl: Storage,
-{
-    let read = storage.begin_read(ReadOptions::default()).await?;
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(read);
-    reader
-        .scan_batch_at_commit(
-            commit_id,
-            &crate::tracked_state::TrackedStateScanRequest::default(),
-        )
-        .await
-        .map(|rows| rows.len())
-}
-
 pub fn reset_binary_cas_write_accounting() {
     crate::binary_cas::metrics::reset_binary_cas_write_metrics();
 }
