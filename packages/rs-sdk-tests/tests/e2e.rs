@@ -2,8 +2,9 @@ mod benchmark_metrics;
 
 use bytes::Bytes;
 use lix::storage::{
-    CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions,
-    SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+    BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
+    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    WriteOptions,
 };
 use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
@@ -7364,25 +7365,26 @@ where
         .await
         .expect("open raw certified storage read");
     let mut entries = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin raw certified storage scan");
     loop {
-        let page = read
-            .scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                ScanOptions {
-                    projection: CoreProjection::FullValue,
-                    limit_rows: usize::MAX,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(usize::MAX)
             .await
             .expect("scan raw certified storage space");
         let has_more = page.has_more;
-        resume_after = page.entries.last().map(|entry| entry.key.clone());
         entries.extend(page.entries.into_iter().map(|entry| {
             let ProjectedValue::FullValue(bytes) = entry.value else {
                 panic!("full certified storage projection must return bytes");
@@ -7392,10 +7394,6 @@ where
         if !has_more {
             return entries;
         }
-        assert!(
-            resume_after.is_some(),
-            "paginated certified scan must provide a resume key"
-        );
     }
 }
 

@@ -247,7 +247,7 @@ mod tests {
                 };
 
                 let result = run(&context, args);
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_dir_all(&path);
                 assert!(
                     result.is_ok(),
                     "expected sql execute to succeed: {result:?}"

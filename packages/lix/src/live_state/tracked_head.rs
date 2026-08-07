@@ -56,8 +56,8 @@ use crate::live_state::{
     MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
@@ -800,26 +800,23 @@ async fn stage_active_working_diff_scopes<S>(
 where
     S: StorageAdapterRead + Clone,
 {
-    let plan = ScanPlan::prefix(
-        TRACKED_WORKING_DIFF_MARKER_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
     let mut active = BTreeMap::new();
-    let mut resume_after = None;
+    let mut cursor = store
+        .begin_scan(
+            TRACKED_WORKING_DIFF_MARKER_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
+        for entry in page.entries {
             let key: BranchRefKey = match storage_codec::decode(
                 "tracked working-diff marker key",
                 entry.key.0.as_ref(),
@@ -860,7 +857,7 @@ where
                 },
             );
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
@@ -2259,6 +2256,25 @@ mod tests {
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::json_store::{JsonWritePlacementRef, NormalizedJsonRef};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    async fn scan_test_space(
+        read: &(impl StorageAdapterRead + ?Sized),
+        space: StorageSpace,
+    ) -> crate::storage_adapter::StorageScanChunk {
+        let range = StoragePrefix {
+            bytes: Bytes::new(),
+        }
+        .to_range()
+        .expect("valid empty prefix");
+        let mut cursor = read
+            .begin_scan(space, range, StorageBeginScanOptions::default())
+            .await
+            .expect("begin test scan");
+        cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await
+            .expect("read test scan page")
+    }
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("test timestamp", value)
@@ -3866,17 +3882,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file schema marker verification read");
-        let projection_rows = ScanPlan::prefix(
-            HOT_FILE_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&projection_read, StorageScanOptions::default())
-        .await
-        .expect("file schema markers should scan")
-        .value
-        .entries;
+        let projection_rows = scan_test_space(&projection_read, HOT_FILE_SPACE)
+            .await
+            .entries;
         assert_eq!(
             projection_rows.len(),
             1,
@@ -4459,17 +4467,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file-schema marker verification read");
-        let projections = ScanPlan::prefix(
-            HOT_FILE_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("scan file-schema markers")
-        .value
-        .entries;
+        let projections = scan_test_space(&read, HOT_FILE_SPACE).await.entries;
         assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {
@@ -4524,24 +4522,17 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open corruption fixture read");
-        let unrelated_key = ScanPlan::prefix(
-            HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("scan hot rows for fixture")
-        .value
-        .entries
-        .into_iter()
-        .find_map(|entry| {
-            let value = full_value_bytes(entry.value).ok()?;
-            let value = decode_head_value(&value).ok()?;
-            (value.change_id == Some(ChangeId::for_test_label("unrelated"))).then_some(entry.key)
-        })
-        .expect("find unrelated row key");
+        let unrelated_key = scan_test_space(&read, HOT_ROW_SPACE)
+            .await
+            .entries
+            .into_iter()
+            .find_map(|entry| {
+                let value = full_value_bytes(entry.value).ok()?;
+                let value = decode_head_value(&value).ok()?;
+                (value.change_id == Some(ChangeId::for_test_label("unrelated")))
+                    .then_some(entry.key)
+            })
+            .expect("find unrelated row key");
         drop(read);
         let mut corrupt_writes = StorageWriteSet::new();
         corrupt_writes.put(
@@ -5182,17 +5173,7 @@ mod tests {
             ("primary hot row", HOT_ROW_SPACE),
             ("file-schema hot markers", HOT_FILE_SPACE),
         ] {
-            let entries = ScanPlan::prefix(
-                space,
-                StoragePrefix {
-                    bytes: Bytes::new(),
-                },
-            )
-            .collect(&read, StorageScanOptions::default())
-            .await
-            .expect("scan current-state hot storage")
-            .value
-            .entries;
+            let entries = scan_test_space(&read, space).await.entries;
             assert_eq!(entries.len(), 1, "only active {label} survives GC");
             let encoded =
                 full_value_bytes(entries.into_iter().next().expect("one hot value").value)

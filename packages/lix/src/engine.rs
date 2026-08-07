@@ -19,8 +19,8 @@ use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    ScanPlan, SharedStorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageReadOptions,
-    StorageScanOptions, StorageWriteOptions,
+    SharedStorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StoragePrefix,
+    StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
@@ -466,24 +466,21 @@ where
 async fn repository_has_changelog_commit(
     read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
 ) -> Result<bool, LixError> {
-    Ok(!ScanPlan::prefix(
-        COMMIT_SPACE,
-        StoragePrefix {
-            bytes: bytes::Bytes::new(),
-        },
-    )
-    .collect(
-        read,
-        StorageScanOptions {
-            projection: StorageCoreProjection::KeyOnly,
-            limit_rows: 1,
-            ..StorageScanOptions::default()
-        },
-    )
-    .await?
-    .value
-    .entries
-    .is_empty())
+    let range = StoragePrefix {
+        bytes: bytes::Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            COMMIT_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    Ok(!cursor.next_page(1).await?.entries.is_empty())
 }
 
 fn not_initialized_error() -> LixError {
@@ -500,9 +497,28 @@ mod tests {
 
     use super::*;
     use crate::storage_adapter::{
-        Memory, PointReadPlan, ScanPlan, StorageGetOptions, StorageKey, StoragePrefix,
-        StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+        Memory, PointReadPlan, StorageBeginScanOptions, StorageGetOptions, StorageKey,
+        StoragePrefix, StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue,
     };
+
+    async fn scan_test_space(
+        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+        space: StorageSpace,
+    ) -> crate::storage_adapter::StorageScanChunk {
+        let range = StoragePrefix {
+            bytes: Bytes::new(),
+        }
+        .to_range()
+        .expect("valid empty prefix");
+        let mut cursor = read
+            .begin_scan(space, range, StorageBeginScanOptions::default())
+            .await
+            .expect("begin test scan");
+        cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await
+            .expect("read test scan page")
+    }
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
         let schema = json!({
@@ -1441,26 +1457,11 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("working-diff inventory read should open");
-        let before_sparse = ScanPlan::prefix(
-            crate::live_state::HOT_DIFF_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("working-diff inventory should scan");
-        let before_packed = ScanPlan::prefix(
-            crate::live_state::PACKED_CURRENT_BASE_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("packed working-diff inventory should scan");
+        let before_sparse = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let before_packed =
+            scan_test_space(&read, crate::live_state::PACKED_CURRENT_BASE_SPACE).await;
         assert!(
-            !before_sparse.value.entries.is_empty() || !before_packed.value.entries.is_empty(),
+            !before_sparse.entries.is_empty() || !before_packed.entries.is_empty(),
             "tracked mutation must persist a sparse or packed physical dirty epoch"
         );
         drop(read);
@@ -1474,17 +1475,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("post-checkpoint inventory read should open");
-        let after = ScanPlan::prefix(
-            crate::live_state::HOT_DIFF_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("post-checkpoint working-diff inventory should scan");
+        let after = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
         assert!(
-            after.value.entries.is_empty(),
+            after.entries.is_empty(),
             "superseded sparse dirty keys must not remain until repository GC"
         );
         let logical = session
@@ -1582,17 +1575,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read initialized hot rows");
-        let hot_rows = ScanPlan::prefix(
-            crate::live_state::HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("scan initialized hot rows")
-        .value
-        .entries;
+        let hot_rows = scan_test_space(&read, crate::live_state::HOT_ROW_SPACE)
+            .await
+            .entries;
         assert!(
             !hot_rows.is_empty(),
             "initialized repository must have hot rows"

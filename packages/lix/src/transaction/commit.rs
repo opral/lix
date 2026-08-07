@@ -6531,8 +6531,8 @@ mod tests {
         LiveStateProjection, LiveStateRowRequest, PACKED_CURRENT_BASE_SPACE,
     };
     use crate::storage::{
-        CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, SpaceId, Storage,
-        StorageError, StorageRead, StorageWrite,
+        BeginScanOptions, CommitResult, GetManyResult, KeyRange, PutBatch, ScanCursor, SpaceId,
+        Storage, StorageError, StorageRead, StorageWrite,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
@@ -7003,12 +7003,12 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: StorageSpace,
             range: KeyRange,
-            opts: ScanOptions,
-        ) -> Result<ScanChunk, StorageError> {
+            opts: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
             if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
@@ -7022,7 +7022,7 @@ mod tests {
                     .commit_root_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.scan(space, range, opts).await
+            self.inner.begin_scan(space, range, opts).await
         }
     }
 

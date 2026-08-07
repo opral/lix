@@ -5,8 +5,6 @@
 
 const READ_MANY_PK_COUNT: usize = 4;
 
-#[path = "../benches/tracked_state_crud/raw_sqlite.rs"]
-mod raw_sqlite;
 #[path = "../benches/tracked_state_crud/sql_session.rs"]
 mod sql_session;
 #[path = "../benches/tracked_state_crud/storage.rs"]
@@ -123,10 +121,7 @@ fn typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations(
 
 async fn validate_post_update_olap_shapes() {
     let rows = workload::fixture_rows(2_048);
-    for &profile in storage::STORAGE_PROFILES
-        .iter()
-        .filter(|profile| profile.name() != "lix_sqlite")
-    {
+    for &profile in storage::STORAGE_PROFILES {
         for mutation_profile in [
             sql_session::OlapMutationProfile::Sparse,
             sql_session::OlapMutationProfile::Moderate,
@@ -138,69 +133,6 @@ async fn validate_post_update_olap_shapes() {
                 fixture.read_olap(shape).await;
             }
         }
-    }
-}
-
-#[test]
-fn standalone_sqlite_public_results_match_every_lix_adapter() {
-    std::thread::Builder::new()
-        .name("tracked-state-public-result".to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build parity-test runtime")
-                .block_on(async {
-                    let _test_guard = serialized_public_result_test().await;
-                    standalone_sqlite_public_results_match_every_lix_adapter_async().await;
-                });
-        })
-        .expect("spawn parity-test thread")
-        .join()
-        .expect("join parity-test thread");
-}
-
-async fn standalone_sqlite_public_results_match_every_lix_adapter_async() {
-    let rows = [
-        WorkloadRow {
-            path: "/alpha".to_string(),
-            value_json: r#"{"enabled":true}"#.to_string(),
-            updated_value_json: r#"{"enabled":false}"#.to_string(),
-        },
-        WorkloadRow {
-            path: "/beta".to_string(),
-            value_json: r"[1,2,3]".to_string(),
-            updated_value_json: r"[4,5,6]".to_string(),
-        },
-        WorkloadRow {
-            path: "/null".to_string(),
-            value_json: "null".to_string(),
-            updated_value_json: r#"{"updated":true}"#.to_string(),
-        },
-        WorkloadRow {
-            path: "/text".to_string(),
-            value_json: r#""hello""#.to_string(),
-            updated_value_json: r#""updated""#.to_string(),
-        },
-    ];
-    for &profile in storage::STORAGE_PROFILES {
-        let mut raw = raw_sqlite::seeded_fixture(&rows);
-        let lix = sql_session::seeded_fixture(profile, &rows).await;
-
-        assert_eq!(raw.read_all_public_result(), lix.read_all_result().await);
-        assert_eq!(
-            raw.read_one_by_pk_public_result(),
-            lix.read_one_by_pk_result().await
-        );
-        assert_eq!(
-            raw.read_many_by_pk_public_result(READ_MANY_PK_COUNT),
-            lix.read_many_by_pk_result().await
-        );
-
-        assert_eq!(raw.update_all_literal(), rows.len());
-        assert_eq!(lix.update_all_bound().await, rows.len());
-        assert_eq!(raw.read_all_public_result(), lix.read_all_result().await);
     }
 }
 
@@ -236,13 +168,13 @@ async fn certified_insert_counter_deltas_are_isolated_across_sequential_fixtures
         updated_value_json: r#"{"enabled":false}"#.to_string(),
     }];
 
-    let sqlite = sql_session::empty_fixture_with_read_many_pk_count(
-        storage::StorageProfile::SQLite,
+    let rocksdb = sql_session::empty_fixture_with_read_many_pk_count(
+        storage::StorageProfile::RocksDB,
         &rows,
         1,
     )
     .await;
-    assert_eq!(sqlite.insert_all().await, 1);
+    assert_eq!(rocksdb.insert_all().await, 1);
 
     let slatedb = sql_session::empty_fixture_with_read_many_pk_count(
         storage::StorageProfile::SlateDB,
@@ -261,11 +193,11 @@ async fn certified_insert_counter_deltas_are_isolated_for_concurrent_fixtures() 
         updated_value_json: r#"{"enabled":false}"#.to_string(),
     }];
 
-    let (sqlite, slatedb) = tokio::join!(
-        insert_one_counter_fixture(storage::StorageProfile::SQLite, &rows),
+    let (rocksdb, slatedb) = tokio::join!(
+        insert_one_counter_fixture(storage::StorageProfile::RocksDB, &rows),
         insert_one_counter_fixture(storage::StorageProfile::SlateDB, &rows),
     );
-    assert_eq!(sqlite, 1);
+    assert_eq!(rocksdb, 1);
     assert_eq!(slatedb, 1);
 }
 
@@ -324,7 +256,7 @@ fn slatedb_is_not_routed_through_the_unsupported_kv_layer() {
             .iter()
             .map(|profile| profile.name())
             .collect::<Vec<_>>(),
-        vec!["lix_sqlite", "lix_rocksdb"]
+        vec!["lix_rocksdb"]
     );
     #[cfg(feature = "slatedb")]
     assert!(

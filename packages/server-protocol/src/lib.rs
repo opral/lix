@@ -3963,8 +3963,8 @@ mod tests {
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix::storage::{
-        CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, MemoryRead, MemoryWrite,
-        PutBatch, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead,
+        BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, MemoryRead,
+        MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError, StorageRead,
         StorageSpace, StorageWrite, WriteOptions,
     };
     use lix::telemetry::TracingTelemetrySink;
@@ -4432,13 +4432,13 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: StorageSpace,
             range: KeyRange,
-            options: ScanOptions,
-        ) -> Result<ScanChunk, StorageError> {
-            self.inner.scan(space, range, options).await
+            options: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
+            self.inner.begin_scan(space, range, options).await
         }
     }
 

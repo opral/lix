@@ -8,6 +8,7 @@
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,9 +17,9 @@ use std::time::{Duration, Instant};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead, StorageSpace, StorageWrite,
-    WriteOptions,
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
+    PutBatch, ReadOptions, ScanChunk, ScanCursor, StorageError, StorageRead, StorageScanSource,
+    StorageSpace, StorageWrite, WriteOptions,
 };
 use lix::storage_bench::{
     CRUD_OWNERSHIP_ADAPTER, CRUD_OWNERSHIP_AUTHORITY, CRUD_OWNERSHIP_ROOT_PUBLICATION,
@@ -219,25 +220,51 @@ impl<R: StorageRead> StorageRead for CountingRead<R> {
         self.inner.get_many(requests).await
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let order = opts.order;
         self.stats.lock().expect("I/O stats mutex").scan_calls += 1;
-        let chunk = self.inner.scan(space, range, opts).await?;
-        let mut stats = self.stats.lock().expect("I/O stats mutex");
-        stats.scan_rows += chunk.entries.len() as u64;
-        stats.scan_value_bytes += chunk
-            .entries
-            .iter()
-            .map(|entry| match &entry.value {
-                ProjectedValue::KeyOnly => 0,
-                ProjectedValue::FullValue(value) => value.len() as u64,
-            })
-            .sum::<u64>();
-        Ok(chunk)
+        let inner = self.inner.begin_scan(space, range.clone(), opts).await?;
+        ScanCursor::from_source(
+            range,
+            order,
+            CountingScanSource {
+                inner,
+                stats: Arc::clone(&self.stats),
+            },
+        )
+    }
+}
+
+struct CountingScanSource<'a> {
+    inner: ScanCursor<'a>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl StorageScanSource for CountingScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let chunk = self.inner.next_page(limit_rows).await?;
+            let mut stats = self.stats.lock().expect("I/O stats mutex");
+            stats.scan_rows += chunk.entries.len() as u64;
+            stats.scan_value_bytes += chunk
+                .entries
+                .iter()
+                .map(|entry| match &entry.value {
+                    ProjectedValue::KeyOnly => 0,
+                    ProjectedValue::FullValue(value) => value.len() as u64,
+                })
+                .sum::<u64>();
+            drop(stats);
+            Ok(chunk)
+        })
     }
 }
 

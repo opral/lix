@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::future::Future;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,24 +16,22 @@ use std::alloc::GlobalAlloc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-    WriteOptions,
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
+    PutBatch, ReadOptions, ScanChunk, ScanCursor, SpaceId, Storage, StorageError, StorageRead,
+    StorageScanSource, StorageWrite, WriteOptions,
 };
 use lix::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
-    StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
-    StorageWriteOptions,
+    PointReadPlan, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions,
+    StorageCoreProjection, StorageGetOptions, StoragePrefix, StorageReadOptions, StorageSpace,
+    StorageValue, StorageWriteOptions,
 };
 use lix::{PreparedDmlParameterBatch, Value};
 use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
 use lix_storage_slatedb::SlateDB;
-use lix_storage_sqlite::SQLite;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -151,25 +150,6 @@ struct BenchRow {
     key: Key,
     value: StorageValue,
     updated_value: StorageValue,
-}
-
-#[derive(Clone)]
-struct RawUntrackedRow {
-    branch_id: String,
-    schema_key: String,
-    entity_pk: String,
-    file_id: String,
-    snapshot_content: String,
-    updated_snapshot_content: String,
-    metadata: Option<String>,
-    created_at: String,
-    updated_at: String,
-    global: bool,
-}
-
-struct RawSQLiteFixture {
-    conn: Connection,
-    _dir: TempDir,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -350,18 +330,41 @@ where
         Ok(result)
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let order = opts.order;
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_entry_calls += 1;
         }
-        let chunk = self.inner.scan(space, range, opts).await?;
-        {
+        let inner = self.inner.begin_scan(space, range.clone(), opts).await?;
+        ScanCursor::from_source(
+            range,
+            order,
+            CountingScanSource {
+                inner,
+                stats: Arc::clone(&self.stats),
+            },
+        )
+    }
+}
+
+struct CountingScanSource<'a> {
+    inner: ScanCursor<'a>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl StorageScanSource for CountingScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let chunk = self.inner.next_page(limit_rows).await?;
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_entries += chunk.entries.len();
             stats.scan_entry_key_bytes += chunk
@@ -374,8 +377,9 @@ where
                 .iter()
                 .map(|entry| projected_value_len(&entry.value))
                 .sum::<usize>();
-        }
-        Ok(chunk)
+            drop(stats);
+            Ok(chunk)
+        })
     }
 }
 
@@ -442,26 +446,20 @@ where
 
 #[derive(Clone, Copy)]
 enum LixStorageProfile {
-    SQLite,
     RocksDB,
     #[cfg(feature = "slatedb")]
     SlateDB,
 }
 
 #[cfg(not(feature = "slatedb"))]
-const LIX_STORAGE_PROFILES: &[LixStorageProfile] =
-    &[LixStorageProfile::SQLite, LixStorageProfile::RocksDB];
+const LIX_STORAGE_PROFILES: &[LixStorageProfile] = &[LixStorageProfile::RocksDB];
 #[cfg(feature = "slatedb")]
-const LIX_STORAGE_PROFILES: &[LixStorageProfile] = &[
-    LixStorageProfile::SQLite,
-    LixStorageProfile::RocksDB,
-    LixStorageProfile::SlateDB,
-];
+const LIX_STORAGE_PROFILES: &[LixStorageProfile] =
+    &[LixStorageProfile::RocksDB, LixStorageProfile::SlateDB];
 
 impl LixStorageProfile {
     fn name(self) -> &'static str {
         match self {
-            Self::SQLite => "lix_sqlite",
             Self::RocksDB => "lix_rocksdb",
             #[cfg(feature = "slatedb")]
             Self::SlateDB => "lix_slatedb",
@@ -488,10 +486,8 @@ fn untracked_state_crud_benches(c: &mut Criterion) {
     }
     maybe_print_io_report(&runtime, &rows);
 
-    bench_raw_sqlite(c, &rows, SMOKE_ROWS, "smoke");
     bench_lix(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_session_execute_untracked_insert(c, &runtime, &rows, SMOKE_ROWS, "smoke");
-    bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_lix(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_session_execute_untracked_insert(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
 }
@@ -685,89 +681,6 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
     println!();
 }
 
-fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize, label: &str) {
-    let rows = raw_rows(&all_rows[..row_count]);
-    let mut group = c.benchmark_group(format!("untracked_state_crud/raw_sqlite/{label}"));
-    configure_group(&mut group, row_count);
-
-    group.bench_function(format!("insert_all_rows/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            prepare_raw_sqlite_empty,
-            |fixture| black_box(raw_sqlite_insert_all(fixture, &rows)),
-            BatchSize::LargeInput,
-        );
-    });
-    group.bench_function(
-        format!(
-            "insert_all_rows_unprepared_per_row/{}",
-            row_label(row_count)
-        ),
-        |b| {
-            b.iter_batched(
-                prepare_raw_sqlite_empty,
-                |fixture| black_box(raw_sqlite_insert_all_unprepared_per_row(fixture, &rows)),
-                BatchSize::LargeInput,
-            );
-        },
-    );
-    group.bench_function(
-        format!(
-            "insert_all_rows_unprepared_chunked/{}",
-            row_label(row_count)
-        ),
-        |b| {
-            b.iter_batched(
-                prepare_raw_sqlite_empty,
-                |fixture| black_box(raw_sqlite_insert_all_unprepared_chunked(fixture, &rows)),
-                BatchSize::LargeInput,
-            );
-        },
-    );
-    group.bench_function(format!("select_all_rows/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || prepare_raw_sqlite_seeded(&rows),
-            |fixture| black_box(raw_sqlite_select_all(fixture, row_count)),
-            BatchSize::LargeInput,
-        );
-    });
-    group.bench_function(format!("select_one_by_pk/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || prepare_raw_sqlite_seeded(&rows),
-            |fixture| black_box(raw_sqlite_select_one_by_pk(fixture, pick_pk_row(&rows))),
-            BatchSize::LargeInput,
-        );
-    });
-    group.bench_function(format!("update_all_rows/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || prepare_raw_sqlite_seeded(&rows),
-            |fixture| black_box(raw_sqlite_update_all(fixture, &rows)),
-            BatchSize::LargeInput,
-        );
-    });
-    group.bench_function(format!("update_one_by_pk/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || prepare_raw_sqlite_seeded(&rows),
-            |fixture| black_box(raw_sqlite_update_one_by_pk(fixture, pick_pk_row(&rows))),
-            BatchSize::LargeInput,
-        );
-    });
-    group.bench_function(format!("delete_all_rows/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || prepare_raw_sqlite_seeded(&rows),
-            |fixture| black_box(raw_sqlite_delete_all(fixture, row_count)),
-            BatchSize::LargeInput,
-        );
-    });
-    group.bench_function(format!("delete_one_by_pk/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || prepare_raw_sqlite_seeded(&rows),
-            |fixture| black_box(raw_sqlite_delete_one_by_pk(fixture, pick_pk_row(&rows))),
-            BatchSize::LargeInput,
-        );
-    });
-    group.finish();
-}
-
 fn bench_lix(
     c: &mut Criterion,
     runtime: &Runtime,
@@ -933,7 +846,6 @@ fn retain_fixture<I, O>(fixture: I, routine: impl FnOnce(&I) -> O) -> (O, I) {
 
 async fn measure_lix_io(profile: LixStorageProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
     match profile {
-        LixStorageProfile::SQLite => measure_lix_io_for_storage(sqlite(), operation, rows).await,
         LixStorageProfile::RocksDB => measure_lix_io_for_storage(rocksdb(), operation, rows).await,
         #[cfg(feature = "slatedb")]
         LixStorageProfile::SlateDB => measure_lix_io_for_storage(slatedb(), operation, rows).await,
@@ -1074,24 +986,26 @@ where
         .begin_read(StorageReadOptions::default())
         .await
         .expect("begin read");
-    let plan = ScanPlan::prefix(
-        ROW_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let page = plan
-        .collect(
-            &read,
-            StorageScanOptions {
+    let mut cursor = read
+        .begin_scan(
+            ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()
+            .expect("empty prefix range"),
+            StorageBeginScanOptions {
                 projection,
-                limit_rows: expected_rows + 1,
-                ..StorageScanOptions::default()
+                ..StorageBeginScanOptions::default()
             },
         )
         .await
+        .expect("begin row scan");
+    let page = cursor
+        .next_page(expected_rows + 1)
+        .await
         .expect("scan rows");
-    assert_eq!(page.value.entries.len(), expected_rows);
+    assert_eq!(page.entries.len(), expected_rows);
     expected_rows
 }
 
@@ -1124,7 +1038,6 @@ async fn prepare_lix_seeded(profile: LixStorageProfile, rows: &[BenchRow]) -> Pr
 
 fn profile_storage(profile: LixStorageProfile) -> ProfileStorage {
     match profile {
-        LixStorageProfile::SQLite => ProfileStorage::SQLite(StorageAdapter::new(sqlite())),
         LixStorageProfile::RocksDB => ProfileStorage::RocksDB(StorageAdapter::new(rocksdb())),
         #[cfg(feature = "slatedb")]
         LixStorageProfile::SlateDB => ProfileStorage::SlateDB(StorageAdapter::new(slatedb())),
@@ -1132,14 +1045,12 @@ fn profile_storage(profile: LixStorageProfile) -> ProfileStorage {
 }
 
 enum ProfileStorage {
-    SQLite(StorageAdapter<TempStorage<SQLite>>),
     RocksDB(StorageAdapter<TempStorage<RocksDB>>),
     #[cfg(feature = "slatedb")]
     SlateDB(StorageAdapter<TempStorage<SlateDB>>),
 }
 
 enum ProfileSession {
-    SQLite(SessionContext<TempStorage<SQLite>>),
     RocksDB(SessionContext<TempStorage<RocksDB>>),
     #[cfg(feature = "slatedb")]
     SlateDB(SessionContext<TempStorage<SlateDB>>),
@@ -1147,7 +1058,6 @@ enum ProfileSession {
 
 async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSession {
     match profile {
-        LixStorageProfile::SQLite => ProfileSession::SQLite(prepare_session_empty(sqlite()).await),
         LixStorageProfile::RocksDB => {
             ProfileSession::RocksDB(prepare_session_empty(rocksdb()).await)
         }
@@ -1277,7 +1187,6 @@ where
 impl ProfileStorage {
     async fn insert_all(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::SQLite(storage) => lix_insert_all(storage, rows).await,
             Self::RocksDB(storage) => lix_insert_all(storage, rows).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(storage) => lix_insert_all(storage, rows).await,
@@ -1286,7 +1195,6 @@ impl ProfileStorage {
 
     async fn update_all(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::SQLite(storage) => lix_update_all(storage, rows).await,
             Self::RocksDB(storage) => lix_update_all(storage, rows).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(storage) => lix_update_all(storage, rows).await,
@@ -1295,7 +1203,6 @@ impl ProfileStorage {
 
     async fn delete_one(&self, row: &BenchRow) -> usize {
         match self {
-            Self::SQLite(storage) => lix_delete_one(storage, row).await,
             Self::RocksDB(storage) => lix_delete_one(storage, row).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(storage) => lix_delete_one(storage, row).await,
@@ -1304,7 +1211,6 @@ impl ProfileStorage {
 
     async fn delete_all(&self) -> usize {
         match self {
-            Self::SQLite(storage) => lix_delete_all(storage).await,
             Self::RocksDB(storage) => lix_delete_all(storage).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(storage) => lix_delete_all(storage).await,
@@ -1313,7 +1219,6 @@ impl ProfileStorage {
 
     async fn select_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
         match self {
-            Self::SQLite(storage) => lix_select_all(storage, expected_rows, projection).await,
             Self::RocksDB(storage) => lix_select_all(storage, expected_rows, projection).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(storage) => lix_select_all(storage, expected_rows, projection).await,
@@ -1322,7 +1227,6 @@ impl ProfileStorage {
 
     async fn select_points(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::SQLite(storage) => lix_select_points(storage, rows).await,
             Self::RocksDB(storage) => lix_select_points(storage, rows).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(storage) => lix_select_points(storage, rows).await,
@@ -1333,7 +1237,6 @@ impl ProfileStorage {
 impl ProfileSession {
     async fn insert_untracked_json_pointer_rows(&self, rows: &[PointerRow]) {
         match self {
-            Self::SQLite(session) => insert_untracked_json_pointer_rows(session, rows).await,
             Self::RocksDB(session) => insert_untracked_json_pointer_rows(session, rows).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(session) => insert_untracked_json_pointer_rows(session, rows).await,
@@ -1342,9 +1245,6 @@ impl ProfileSession {
 
     async fn insert_untracked_json_pointer_rows_homogeneous(&self, rows: &[PointerRow]) {
         match self {
-            Self::SQLite(session) => {
-                insert_untracked_json_pointer_rows_homogeneous(session, rows).await;
-            }
             Self::RocksDB(session) => {
                 insert_untracked_json_pointer_rows_homogeneous(session, rows).await;
             }
@@ -1357,7 +1257,6 @@ impl ProfileSession {
 
     async fn update_untracked_json_pointer_rows(&self, rows: &[PointerRow]) {
         match self {
-            Self::SQLite(session) => update_untracked_json_pointer_rows(session, rows).await,
             Self::RocksDB(session) => update_untracked_json_pointer_rows(session, rows).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(session) => update_untracked_json_pointer_rows(session, rows).await,
@@ -1366,18 +1265,11 @@ impl ProfileSession {
 
     async fn delete_untracked_json_pointer_rows(&self) -> usize {
         match self {
-            Self::SQLite(session) => delete_untracked_json_pointer_rows(session).await,
             Self::RocksDB(session) => delete_untracked_json_pointer_rows(session).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(session) => delete_untracked_json_pointer_rows(session).await,
         }
     }
-}
-
-fn sqlite() -> TempStorage<SQLite> {
-    let dir = TempDir::new().expect("create sqlite storage tempdir");
-    let path = dir.path().join("bench.sqlite");
-    TempStorage::new(SQLite::open(path).expect("open sqlite storage"), dir)
 }
 
 fn rocksdb() -> TempStorage<RocksDB> {
@@ -1469,26 +1361,6 @@ fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
         .collect()
 }
 
-fn raw_rows(rows: &[PointerRow]) -> Vec<RawUntrackedRow> {
-    rows.iter()
-        .map(|row| RawUntrackedRow {
-            branch_id: "bench-branch".to_string(),
-            schema_key: "json_pointer".to_string(),
-            entity_pk: entity_pk(row),
-            file_id: String::new(),
-            snapshot_content: snapshot_value(row.path.as_str(), row.value_json.as_str()),
-            updated_snapshot_content: snapshot_value(
-                row.path.as_str(),
-                row.updated_value_json.as_str(),
-            ),
-            metadata: None,
-            created_at: "2026-01-01T00:00:00.000Z".to_string(),
-            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
-            global: false,
-        })
-        .collect()
-}
-
 fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
     let mut sql = String::from("INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ");
     for (index, row) in rows.iter().enumerate() {
@@ -1544,306 +1416,6 @@ fn json_string(value: &str) -> String {
 
 fn sql_string(value: &str) -> String {
     value.replace('\'', "''")
-}
-
-fn optional_sql_string(value: Option<&str>) -> String {
-    value.map_or_else(
-        || "NULL".to_string(),
-        |value| format!("'{}'", sql_string(value)),
-    )
-}
-
-fn prepare_raw_sqlite_empty() -> RawSQLiteFixture {
-    let dir = TempDir::new().expect("create raw sqlite tempdir");
-    let conn =
-        Connection::open(dir.path().join("untracked_state.sqlite")).expect("open raw sqlite db");
-    conn.execute_batch(
-        "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA temp_store = MEMORY;
-        PRAGMA foreign_keys = ON;
-        CREATE TABLE untracked_state (
-            branch_id TEXT NOT NULL,
-            schema_key TEXT NOT NULL,
-            entity_pk TEXT NOT NULL,
-            file_id TEXT NOT NULL,
-            snapshot_content TEXT,
-            metadata TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            global INTEGER NOT NULL,
-            PRIMARY KEY (branch_id, schema_key, entity_pk, file_id)
-        ) WITHOUT ROWID;
-        ",
-    )
-    .expect("create raw sqlite table");
-    RawSQLiteFixture { conn, _dir: dir }
-}
-
-fn prepare_raw_sqlite_seeded(rows: &[RawUntrackedRow]) -> RawSQLiteFixture {
-    raw_sqlite_insert_all(prepare_raw_sqlite_empty(), rows)
-}
-
-fn raw_sqlite_insert_all(
-    mut fixture: RawSQLiteFixture,
-    rows: &[RawUntrackedRow],
-) -> RawSQLiteFixture {
-    let tx = fixture.conn.transaction().expect("begin raw sqlite insert");
-    {
-        let mut statement = tx
-            .prepare_cached(
-                "
-                INSERT INTO untracked_state (
-                    branch_id, schema_key, entity_pk, file_id, snapshot_content,
-                    metadata, created_at, updated_at, global
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ",
-            )
-            .expect("prepare raw sqlite insert");
-        for row in rows {
-            statement
-                .execute(params![
-                    row.branch_id,
-                    row.schema_key,
-                    row.entity_pk,
-                    row.file_id,
-                    row.snapshot_content,
-                    row.metadata,
-                    row.created_at,
-                    row.updated_at,
-                    i64::from(row.global),
-                ])
-                .expect("execute raw sqlite insert");
-        }
-    }
-    tx.commit().expect("commit raw sqlite insert");
-    fixture
-}
-
-fn raw_sqlite_insert_all_unprepared_per_row(
-    mut fixture: RawSQLiteFixture,
-    rows: &[RawUntrackedRow],
-) -> RawSQLiteFixture {
-    let tx = fixture
-        .conn
-        .transaction()
-        .expect("begin raw sqlite unprepared insert");
-    let mut affected = 0usize;
-    for row in rows {
-        let mut sql = String::from(
-            "
-            INSERT INTO untracked_state (
-                branch_id, schema_key, entity_pk, file_id, snapshot_content,
-                metadata, created_at, updated_at, global
-            )
-            VALUES ",
-        );
-        append_raw_sqlite_insert_values_tuple(&mut sql, row);
-        affected += tx
-            .execute(&sql, [])
-            .expect("execute raw sqlite unprepared insert");
-    }
-    assert_eq!(affected, rows.len());
-    tx.commit().expect("commit raw sqlite unprepared insert");
-    fixture
-}
-
-fn raw_sqlite_insert_all_unprepared_chunked(
-    mut fixture: RawSQLiteFixture,
-    rows: &[RawUntrackedRow],
-) -> RawSQLiteFixture {
-    let tx = fixture
-        .conn
-        .transaction()
-        .expect("begin raw sqlite chunked unprepared insert");
-    let mut affected = 0usize;
-    for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
-        let mut sql = String::from(
-            "
-            INSERT INTO untracked_state (
-                branch_id, schema_key, entity_pk, file_id, snapshot_content,
-                metadata, created_at, updated_at, global
-            )
-            VALUES ",
-        );
-        for (index, row) in chunk.iter().enumerate() {
-            if index > 0 {
-                sql.push_str(", ");
-            }
-            append_raw_sqlite_insert_values_tuple(&mut sql, row);
-        }
-        affected += tx
-            .execute(&sql, [])
-            .expect("execute raw sqlite chunked unprepared insert");
-    }
-    assert_eq!(affected, rows.len());
-    tx.commit()
-        .expect("commit raw sqlite chunked unprepared insert");
-    fixture
-}
-
-fn append_raw_sqlite_insert_values_tuple(sql: &mut String, row: &RawUntrackedRow) {
-    write!(
-        sql,
-        "('{}', '{}', '{}', '{}', '{}', {}, '{}', '{}', {})",
-        sql_string(row.branch_id.as_str()),
-        sql_string(row.schema_key.as_str()),
-        sql_string(row.entity_pk.as_str()),
-        sql_string(row.file_id.as_str()),
-        sql_string(row.snapshot_content.as_str()),
-        optional_sql_string(row.metadata.as_deref()),
-        sql_string(row.created_at.as_str()),
-        sql_string(row.updated_at.as_str()),
-        i64::from(row.global),
-    )
-    .expect("write raw sqlite insert tuple SQL");
-}
-
-fn raw_sqlite_select_all(fixture: RawSQLiteFixture, expected_rows: usize) -> usize {
-    let mut statement = fixture
-        .conn
-        .prepare_cached(
-            "
-            SELECT branch_id, schema_key, entity_pk, file_id, snapshot_content, metadata,
-                   created_at, updated_at, global
-            FROM untracked_state
-            ORDER BY branch_id, schema_key, entity_pk, file_id
-            ",
-        )
-        .expect("prepare raw sqlite select all");
-    let mut rows = statement.query([]).expect("execute raw sqlite select all");
-    let mut count = 0;
-    let mut materialized_bytes = 0usize;
-    while let Some(row) = rows.next().expect("read raw sqlite row") {
-        let branch_id: String = row.get(0).expect("read branch_id");
-        let schema_key: String = row.get(1).expect("read schema_key");
-        let entity_pk: String = row.get(2).expect("read entity_pk");
-        let file_id: String = row.get(3).expect("read file_id");
-        let snapshot_content: String = row.get(4).expect("read snapshot_content");
-        let metadata: Option<String> = row.get(5).expect("read metadata");
-        let created_at: String = row.get(6).expect("read created_at");
-        let updated_at: String = row.get(7).expect("read updated_at");
-        let global: i64 = row.get(8).expect("read global");
-        materialized_bytes += branch_id.len()
-            + schema_key.len()
-            + entity_pk.len()
-            + file_id.len()
-            + snapshot_content.len()
-            + metadata.as_ref().map_or(0, String::len)
-            + created_at.len()
-            + updated_at.len()
-            + usize::from(global != 0);
-        count += 1;
-    }
-    assert_eq!(count, expected_rows);
-    assert!(expected_rows == 0 || materialized_bytes > 0);
-    count
-}
-
-fn raw_sqlite_select_one_by_pk(fixture: RawSQLiteFixture, row: &RawUntrackedRow) -> usize {
-    let found = fixture
-        .conn
-        .query_row(
-            "
-            SELECT snapshot_content
-            FROM untracked_state
-            WHERE branch_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
-            ",
-            params![row.branch_id, row.schema_key, row.entity_pk, row.file_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .expect("execute raw sqlite select one")
-        .is_some();
-    assert!(found);
-    usize::from(found)
-}
-
-fn raw_sqlite_update_all(mut fixture: RawSQLiteFixture, rows: &[RawUntrackedRow]) -> usize {
-    let tx = fixture
-        .conn
-        .transaction()
-        .expect("begin raw sqlite update all");
-    let mut affected = 0;
-    {
-        let mut statement = tx
-            .prepare_cached(
-                "
-                UPDATE untracked_state
-                SET snapshot_content = ?5, updated_at = ?6
-                WHERE branch_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
-                ",
-            )
-            .expect("prepare raw sqlite update all");
-        for row in rows {
-            affected += statement
-                .execute(params![
-                    row.branch_id,
-                    row.schema_key,
-                    row.entity_pk,
-                    row.file_id,
-                    row.updated_snapshot_content,
-                    row.updated_at,
-                ])
-                .expect("execute raw sqlite update all");
-        }
-    }
-    tx.commit().expect("commit raw sqlite update all");
-    assert_eq!(affected, rows.len());
-    affected
-}
-
-fn raw_sqlite_update_one_by_pk(fixture: RawSQLiteFixture, row: &RawUntrackedRow) -> usize {
-    let affected = fixture
-        .conn
-        .execute(
-            "
-            UPDATE untracked_state
-            SET snapshot_content = ?5, updated_at = ?6
-            WHERE branch_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
-            ",
-            params![
-                row.branch_id,
-                row.schema_key,
-                row.entity_pk,
-                row.file_id,
-                row.updated_snapshot_content,
-                row.updated_at,
-            ],
-        )
-        .expect("execute raw sqlite update one");
-    assert_eq!(affected, 1);
-    affected
-}
-
-fn raw_sqlite_delete_all(fixture: RawSQLiteFixture, expected_rows: usize) -> usize {
-    let affected = fixture
-        .conn
-        .execute("DELETE FROM untracked_state", [])
-        .expect("execute raw sqlite delete all");
-    assert_eq!(affected, expected_rows);
-    affected
-}
-
-fn raw_sqlite_delete_one_by_pk(fixture: RawSQLiteFixture, row: &RawUntrackedRow) -> usize {
-    let affected = fixture
-        .conn
-        .execute(
-            "
-            DELETE FROM untracked_state
-            WHERE branch_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
-            ",
-            params![row.branch_id, row.schema_key, row.entity_pk, row.file_id],
-        )
-        .expect("execute raw sqlite delete one");
-    assert_eq!(affected, 1);
-    affected
-}
-
-fn pick_pk_row(rows: &[RawUntrackedRow]) -> &RawUntrackedRow {
-    &rows[rows.len() / 2]
 }
 
 fn operation_logical_rows(operation: &str, row_count: usize) -> usize {

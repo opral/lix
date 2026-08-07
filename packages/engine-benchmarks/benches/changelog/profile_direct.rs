@@ -100,7 +100,6 @@ async fn run(storage: ChangelogBenchStorage, op: &str, duration: Duration) -> Re
 fn storage_label(storage: ChangelogBenchStorage) -> &'static str {
     match storage {
         ChangelogBenchStorage::Unit => "mem_unit",
-        ChangelogBenchStorage::SQLiteTempfile => "sqlite_tempfile",
         ChangelogBenchStorage::RocksDBTempdir => "rocksdb_tempdir",
     }
 }
@@ -108,10 +107,9 @@ fn storage_label(storage: ChangelogBenchStorage) -> &'static str {
 fn parse_storage(value: &str) -> Result<ChangelogBenchStorage, LixError> {
     match value {
         "unit" | "mem" | "mem_unit" => Ok(ChangelogBenchStorage::Unit),
-        "sqlite" | "sqlite_tempfile" => Ok(ChangelogBenchStorage::SQLiteTempfile),
         "rocksdb" | "rocksdb_tempdir" => Ok(ChangelogBenchStorage::RocksDBTempdir),
         _ => Err(LixError::unknown(format!(
-            "unknown changelog direct profile storage '{value}', expected unit, sqlite, or rocksdb"
+            "unknown changelog direct profile storage '{value}', expected unit or rocksdb"
         ))),
     }
 }

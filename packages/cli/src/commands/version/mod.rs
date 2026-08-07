@@ -4,7 +4,7 @@ mod switch;
 
 use crate::app::AppContext;
 use crate::cli::version::{VersionCommand, VersionSubcommand};
-use crate::db::FileLix;
+use crate::db::LocalLix;
 use crate::error::CliError;
 use crate::hints::CommandOutput;
 use lix::{ExecuteResult, Row as LixRow, Value};
@@ -30,7 +30,7 @@ pub fn run(context: &AppContext, command: VersionCommand) -> Result<CommandOutpu
 }
 
 pub(super) fn resolve_version_ref(
-    lix: &FileLix,
+    lix: &LocalLix,
     lookup: VersionLookup<'_>,
 ) -> Result<ResolvedVersionRef, CliError> {
     match lookup {
@@ -39,13 +39,13 @@ pub(super) fn resolve_version_ref(
     }
 }
 
-pub(super) fn resolve_active_version_ref(lix: &FileLix) -> Result<ResolvedVersionRef, CliError> {
+pub(super) fn resolve_active_version_ref(lix: &LocalLix) -> Result<ResolvedVersionRef, CliError> {
     let active_id = crate::db::block_on(lix.active_branch_id())
         .map_err(|error| CliError::msg(error.to_string()))?;
     resolve_version_by_id(lix, &active_id)
 }
 
-fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
+fn resolve_version_by_id(lix: &LocalLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_branch WHERE id = $1 LIMIT 1",
         &[Value::Text(id.to_string())],
@@ -62,7 +62,7 @@ fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, 
     })
 }
 
-fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
+fn resolve_version_by_name(lix: &LocalLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_branch WHERE name = $1 ORDER BY id",
         &[Value::Text(name.to_string())],
@@ -129,10 +129,7 @@ mod tests {
     }
 
     fn cleanup_lix_path(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
-        let _ = std::fs::remove_file(format!("{}-journal", path.display()));
+        let _ = std::fs::remove_dir_all(path);
     }
 
     fn text_at(result: &ExecuteResult, row: usize, col: usize) -> String {

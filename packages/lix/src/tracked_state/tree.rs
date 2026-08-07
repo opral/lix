@@ -2732,8 +2732,8 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::storage::{
-        GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanOptions, Storage, StorageError,
-        StorageRead,
+        BeginScanOptions, GetManyResult, KeyRange, ProjectedValue, ScanCursor, Storage,
+        StorageError, StorageRead,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
@@ -2768,13 +2768,13 @@ mod tests {
             self.read.get_many(requests)
         }
 
-        fn scan(
+        fn begin_scan(
             &self,
             space: crate::storage::StorageSpace,
             range: KeyRange,
-            opts: ScanOptions,
-        ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-            self.read.scan(space, range, opts)
+            opts: BeginScanOptions,
+        ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+            self.read.begin_scan(space, range, opts)
         }
     }
 
@@ -2808,12 +2808,12 @@ mod tests {
             }
         }
 
-        fn scan(
+        fn begin_scan(
             &self,
             _space: crate::storage::StorageSpace,
             _range: KeyRange,
-            _opts: ScanOptions,
-        ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+            _opts: BeginScanOptions,
+        ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
             async { unreachable!("tracked-state node cache test only performs point reads") }
         }
     }

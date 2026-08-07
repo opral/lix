@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[command(name = "lix")]
 #[command(about = "Lix command line interface")]
 pub struct Cli {
-    /// Path to the .lix file (required when multiple .lix files exist).
+    /// Path to the .lix store (required when multiple .lix stores exist).
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub path: Option<PathBuf>,
 

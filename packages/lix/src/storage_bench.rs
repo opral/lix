@@ -5,8 +5,8 @@ use bytes::Bytes;
 use crate::storage::{ReadOptions, WriteOptions};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
-    StorageProjectedValue, StorageScanOptions, StorageWriteOptions, StorageWriteSet,
+    StorageAdapter, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StoragePrefix, StorageProjectedValue, StorageWriteOptions, StorageWriteSet,
     StorageWriteSetError,
 };
 
@@ -2252,12 +2252,11 @@ async fn scan_layout_space<R>(
 where
     R: StorageAdapterRead,
 {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()
+    .expect("valid empty storage layout prefix");
     let mut accounting = StorageLayoutAccounting {
         space_id: space.id.0,
         space: space.name,
@@ -2265,22 +2264,24 @@ where
         key_bytes: 0,
         value_bytes: 0,
     };
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin storage bench layout scan");
     loop {
-        let result = plan
-            .collect(
-                read,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    resume_after,
-                    ..StorageScanOptions::default()
-                },
-            )
+        let result = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan complete storage bench layout space");
-        let has_more = result.value.has_more;
-        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
-        for entry in result.value.entries {
+        let has_more = result.has_more;
+        for entry in result.entries {
             accounting.rows = accounting
                 .rows
                 .checked_add(1)
@@ -2300,10 +2301,6 @@ where
         if !has_more {
             return accounting;
         }
-        assert!(
-            resume_after.is_some(),
-            "storage scan reported more rows without a resume key"
-        );
     }
 }
 
@@ -2314,36 +2311,33 @@ async fn scan_layout_entries<R>(
 where
     R: StorageAdapterRead,
 {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()
+    .expect("valid empty storage layout prefix");
     let mut entries = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin storage bench layout scan");
     loop {
-        let result = plan
-            .collect(
-                read,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    resume_after,
-                    ..StorageScanOptions::default()
-                },
-            )
+        let result = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan complete storage bench layout space");
-        let has_more = result.value.has_more;
-        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
-        entries.extend(result.value.entries);
+        let has_more = result.has_more;
+        entries.extend(result.entries);
         if !has_more {
             return entries;
         }
-        assert!(
-            resume_after.is_some(),
-            "storage scan reported more rows without a resume key"
-        );
     }
 }
 

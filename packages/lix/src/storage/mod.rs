@@ -1,6 +1,7 @@
 //! Primary storage API.
 
 pub mod conformance;
+mod cursor;
 mod error;
 #[doc(hidden)]
 pub mod immutable;
@@ -10,6 +11,7 @@ mod traits;
 mod types;
 
 pub use crate::handle::open_storage_engine as open_engine;
+pub use cursor::{ScanCursor, StorageScanSource};
 pub use error::{
     Capability, Precondition, PreconditionFailure, PreconditionItemSupport,
     PreconditionSupportReport, StorageError,
@@ -21,9 +23,9 @@ pub use predicate::{
 };
 pub use traits::{Storage, StorageRead, StorageWrite};
 pub use types::{
-    BufferRange, CommitResult, CoreProjection, EncodedMutationBatch, EncodedMutationBatchError,
-    EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-    Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SnapshotRef, SpaceId, StorageSpace, StoredValue,
-    ValueSemantics, WriteOptions, WriteStats,
+    BeginScanOptions, BufferRange, CommitResult, CoreProjection, EncodedMutationBatch,
+    EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,
+    KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency,
+    ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SnapshotRef, SpaceId,
+    StorageSpace, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };

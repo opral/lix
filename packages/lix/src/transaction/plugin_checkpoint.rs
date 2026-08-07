@@ -2,8 +2,8 @@ use bytes::Bytes;
 
 use crate::binary_cas::BlobId;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::{Blob, LixError};
@@ -107,29 +107,27 @@ pub(crate) async fn stage_delete_branch_plugin_checkpoints(
             format!("plugin checkpoint branch id is not a UUID: {error}"),
         )
     })?;
-    let plan = ScanPlan::prefix(
-        PLUGIN_CHECKPOINT_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(branch_id.as_bytes()),
-        },
-    );
-    let mut resume_after = None;
+    let range = StoragePrefix {
+        bytes: Bytes::copy_from_slice(branch_id.as_bytes()),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            PLUGIN_CHECKPOINT_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let chunk = plan
-            .collect(
-                read,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?
-            .value;
+        let chunk = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?;
         if chunk.entries.is_empty() {
             break;
         }
-        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
         writes.delete_batch(
             PLUGIN_CHECKPOINT_SPACE,
             chunk.entries.into_iter().map(|entry| entry.key),

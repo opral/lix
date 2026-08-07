@@ -12,6 +12,11 @@ pub(crate) struct PersistentMap<K, V> {
     len: usize,
 }
 
+pub(crate) struct PersistentMapRangeCursor<'a, K, V> {
+    stack: Vec<&'a Node<K, V>>,
+    upper: std::ops::Bound<K>,
+}
+
 #[derive(Debug)]
 struct Node<K, V> {
     key: K,
@@ -132,6 +137,56 @@ where
         let mut entries = Vec::with_capacity(limit.min(self.len));
         collect_entries_range(self.root.as_deref(), lower, upper, limit, &mut entries);
         entries
+    }
+
+    pub(crate) fn range_cursor(
+        &self,
+        lower: std::ops::Bound<K>,
+        upper: std::ops::Bound<K>,
+    ) -> PersistentMapRangeCursor<'_, K, V> {
+        let mut stack = Vec::new();
+        let mut current = self.root.as_deref();
+        while let Some(node) = current {
+            let before_lower = match &lower {
+                std::ops::Bound::Included(lower) => &node.key < lower,
+                std::ops::Bound::Excluded(lower) => &node.key <= lower,
+                std::ops::Bound::Unbounded => false,
+            };
+            if before_lower {
+                current = node.right.as_deref();
+            } else {
+                stack.push(node);
+                current = node.left.as_deref();
+            }
+        }
+        PersistentMapRangeCursor { stack, upper }
+    }
+}
+
+impl<K, V> Iterator for PersistentMapRangeCursor<'_, K, V>
+where
+    K: Clone + Ord,
+    V: Clone,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.stack.pop()?;
+        let before_upper = match &self.upper {
+            std::ops::Bound::Included(upper) => &node.key <= upper,
+            std::ops::Bound::Excluded(upper) => &node.key < upper,
+            std::ops::Bound::Unbounded => true,
+        };
+        if !before_upper {
+            self.stack.clear();
+            return None;
+        }
+        let mut current = node.right.as_deref();
+        while let Some(next) = current {
+            self.stack.push(next);
+            current = next.left.as_deref();
+        }
+        Some((node.key.clone(), node.value.clone()))
     }
 }
 
@@ -455,6 +510,12 @@ mod tests {
             changed
                 .entries_range(Bound::Unbounded, Bound::Unbounded, 0)
                 .is_empty()
+        );
+        assert_eq!(
+            changed
+                .range_cursor(Bound::Included(48), Bound::Excluded(53))
+                .collect::<Vec<_>>(),
+            vec![(48, 480), (49, 490), (50, 999), (51, 510), (52, 520)]
         );
     }
 }

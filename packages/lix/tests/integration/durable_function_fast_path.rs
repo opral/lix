@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use lix::Value;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite, ReadOptions,
-    ScanChunk, ScanOptions, Storage, StorageError, StorageRead, WriteOptions,
+    BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
+    ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
 
 #[derive(Clone, Default)]
@@ -75,14 +75,14 @@ impl StorageRead for CountingRead {
         self.inner.get_many(requests).await
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: lix::storage::StorageSpace,
         range: KeyRange,
-        options: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        options: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
         self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan(space, range, options).await
+        self.inner.begin_scan(space, range, options).await
     }
 }
 

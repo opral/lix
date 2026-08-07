@@ -10,20 +10,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use bytes::{Buf, Bytes};
+#[cfg(test)]
+use bytes::Buf as _;
+use bytes::Bytes;
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::validate_immutable_batch;
 use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
+    KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
+    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
+    WriteOptions, WriteStats,
 };
-use rocksdb::Snapshot;
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
     WriteBatch,
 };
+use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -228,7 +231,7 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
             Precondition::RangeEmpty { space, range } => {
-                let bounds = EncodedBounds::new(physical_range(space.id, range.clone()), None);
+                let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
                 range_is_empty(db, column_family(db, *space), &bounds)?
             }
             Precondition::BranchEquals { ref_key, expected } => db
@@ -364,83 +367,91 @@ impl StorageRead for RocksDBRead<'_> {
         }
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         async move {
-            if opts.page_size() == 0 {
-                return Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                });
+            ScanCursor::validate_range(&range)?;
+            if opts.order == ScanOrder::Descending {
+                return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let resume_after = opts
-                .resume_after
-                .as_ref()
-                .map(|key| physical_key(space.id, key));
-            let bounds = EncodedBounds::new(physical_range(space.id, range), resume_after.as_ref());
-            let mut entries = Vec::with_capacity(opts.page_size());
-            let cf = column_family(self.db, space);
-            match opts.projection {
-                CoreProjection::KeyOnly => {
-                    let mut iterator = self.snapshot.raw_iterator_cf(cf);
-                    iterator.seek(&bounds.lower_seek);
-                    while let Some(encoded_key) = iterator.key() {
-                        if bounds.after_lower(encoded_key) {
-                            if !bounds.before_upper(encoded_key) {
-                                break;
-                            }
-                            if entries.len() == opts.page_size() {
-                                return Ok(ScanChunk {
-                                    entries,
-                                    has_more: true,
-                                });
-                            }
-                            entries.push(ReadEntry {
-                                key: logical_key_from_physical(
-                                    encoded_key.to_vec().into_boxed_slice(),
-                                ),
-                                value: ProjectedValue::KeyOnly,
-                            });
-                        }
-                        iterator.next();
-                    }
-                    iterator.status().map_err(rocksdb_error)?;
-                }
-                CoreProjection::FullValue => {
-                    for item in self.snapshot.iterator_cf(
-                        cf,
-                        IteratorMode::From(&bounds.lower_seek, Direction::Forward),
-                    ) {
-                        let (encoded_key, value) = item.map_err(rocksdb_error)?;
-                        if !bounds.after_lower(encoded_key.as_ref()) {
-                            continue;
-                        }
-                        if !bounds.before_upper(encoded_key.as_ref()) {
-                            break;
-                        }
-                        if entries.len() == opts.page_size() {
-                            return Ok(ScanChunk {
-                                entries,
-                                has_more: true,
-                            });
-                        }
-                        entries.push(ReadEntry {
-                            key: logical_key_from_physical(encoded_key),
-                            value: project_owned_value(value, opts.projection),
-                        });
-                    }
-                }
-            }
-            Ok(ScanChunk {
-                entries,
-                has_more: false,
-            })
+            let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
+            let mut iterator = self.snapshot.raw_iterator_cf(column_family(self.db, space));
+            iterator.seek(&bounds.lower_seek);
+            iterator.status().map_err(rocksdb_error)?;
+            ScanCursor::from_source(
+                range,
+                opts.order,
+                RocksDBScanSource {
+                    iterator,
+                    bounds,
+                    projection: opts.projection,
+                    space,
+                },
+            )
         }
     }
+}
+
+struct RocksDBScanSource<'a> {
+    iterator: DBRawIteratorWithThreadMode<'a, DB>,
+    bounds: EncodedBounds,
+    projection: CoreProjection,
+    space: StorageSpace,
+}
+
+impl StorageScanSource for RocksDBScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut entries = Vec::with_capacity(limit_rows);
+            while entries.len() < limit_rows {
+                let Some(encoded_key) = self.iterator.key() else {
+                    break;
+                };
+                if !self.bounds.after_lower(encoded_key) {
+                    self.iterator.next();
+                    continue;
+                }
+                if !self.bounds.before_upper(encoded_key) {
+                    break;
+                }
+                let key = decode_rocksdb_scan_key(self.space, encoded_key)?;
+                let value = match self.projection {
+                    CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                    CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(
+                        self.iterator.value().ok_or_else(|| {
+                            StorageError::Corruption(
+                                "RocksDB scan key had no corresponding value".to_string(),
+                            )
+                        })?,
+                    )),
+                };
+                entries.push(ReadEntry { key, value });
+                self.iterator.next();
+            }
+            self.iterator.status().map_err(rocksdb_error)?;
+            let has_more = self
+                .iterator
+                .key()
+                .is_some_and(|key| self.bounds.before_upper(key));
+            Ok(ScanChunk { entries, has_more })
+        })
+    }
+}
+
+fn decode_rocksdb_scan_key(space: StorageSpace, encoded_key: &[u8]) -> Result<Key, StorageError> {
+    if encoded_key.len() < 4 || encoded_key[..4] != space.id.0.to_be_bytes() {
+        return Err(StorageError::Corruption(
+            "RocksDB scan key escaped its storage space".to_string(),
+        ));
+    }
+    Ok(Key(Bytes::copy_from_slice(&encoded_key[4..])))
 }
 
 impl StorageWrite for RocksDBWrite {
@@ -539,7 +550,7 @@ impl StorageWrite for RocksDBWrite {
                 self.batch
                     .delete_range_cf(cf, lower.as_slice(), upper.as_slice());
             } else {
-                let bounds = EncodedBounds::new(range, None);
+                let bounds = EncodedBounds::new(range);
                 for item in self.inner.db.iterator_cf(
                     cf,
                     IteratorMode::From(&bounds.lower_seek, Direction::Forward),
@@ -583,17 +594,11 @@ struct EncodedBounds {
 }
 
 impl EncodedBounds {
-    fn new(range: KeyRange, resume_after: Option<&Key>) -> Self {
-        let range_lower = match range.lower {
+    fn new(range: KeyRange) -> Self {
+        let lower = match range.lower {
             Bound::Included(key) => Bound::Included(key.0.to_vec()),
             Bound::Excluded(key) => Bound::Excluded(key.0.to_vec()),
             Bound::Unbounded => Bound::Unbounded,
-        };
-        let lower = match resume_after {
-            Some(resume_after) => {
-                max_lower_bound(range_lower, Bound::Excluded(resume_after.0.to_vec()))
-            }
-            None => range_lower,
         };
 
         let upper = match range.upper {
@@ -627,32 +632,6 @@ impl EncodedBounds {
             Bound::Included(upper) => encoded_key <= upper.as_slice(),
             Bound::Excluded(upper) => encoded_key < upper.as_slice(),
             Bound::Unbounded => true,
-        }
-    }
-}
-
-fn max_lower_bound(left: Bound<Vec<u8>>, right: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
-    match (left, right) {
-        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
-        (Bound::Included(left), Bound::Included(right)) => {
-            Bound::Included(if left >= right { left } else { right })
-        }
-        (Bound::Included(left), Bound::Excluded(right)) => {
-            if left > right {
-                Bound::Included(left)
-            } else {
-                Bound::Excluded(right)
-            }
-        }
-        (Bound::Excluded(left), Bound::Included(right)) => {
-            if left >= right {
-                Bound::Excluded(left)
-            } else {
-                Bound::Included(right)
-            }
-        }
-        (Bound::Excluded(left), Bound::Excluded(right)) => {
-            Bound::Excluded(if left >= right { left } else { right })
         }
     }
 }
@@ -790,12 +769,14 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
 
 /// Reclaims the iterator-owned physical key and removes its four-byte space
 /// prefix without copying its logical-key bytes.
+#[cfg(test)]
 fn logical_key_from_physical(encoded_key: Box<[u8]>) -> Key {
     let mut key = Bytes::from(encoded_key);
     key.advance(4);
     Key(key)
 }
 
+#[cfg(test)]
 fn project_owned_value<T>(value: T, projection: CoreProjection) -> ProjectedValue
 where
     Bytes: From<T>,

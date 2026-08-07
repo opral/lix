@@ -15,12 +15,10 @@ use crate::binary_cas::{
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
+use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, StorageWriteSet};
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
-};
-use crate::storage_adapter::{
-    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition,
-    StorageProjectedValue, StorageScanOptions, StorageSpaceId, StorageValue,
+    StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
+    StoragePrecondition, StorageProjectedValue, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -200,23 +198,23 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     // work after corruption is reported.
     verify_live_chunk_presence(store, &live_chunks).await?;
 
-    let mut resume_after = None;
+    let mut manifest_cursor = store
+        .begin_scan(
+            BINARY_CAS_MANIFEST_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                BINARY_CAS_MANIFEST_SPACE,
-                StorageKeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: CAS_RECLAIM_MANIFEST_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                },
-            )
+        let page = manifest_cursor
+            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
             .await?;
-        let last_key = page.entries.last().map(|entry| entry.key.clone());
         for entry in page.entries {
             let blob_id = BlobId::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
@@ -241,29 +239,28 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 validate_live_manifest_identity(blob_id, &manifest)?;
             }
         }
-        if !page.has_more || last_key.is_none() {
+        if !page.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
-    let mut resume_after = None;
+    let mut manifest_chunk_cursor = store
+        .begin_scan(
+            BINARY_CAS_MANIFEST_CHUNK_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                BINARY_CAS_MANIFEST_CHUNK_SPACE,
-                StorageKeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: CAS_RECLAIM_MANIFEST_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                },
-            )
+        let page = manifest_chunk_cursor
+            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
             .await?;
-        let last_key = page.entries.last().map(|entry| entry.key.clone());
         for entry in page.entries {
             let (blob_id, ordinal) = decode_manifest_chunk_key(&entry.key)?;
             let keep = live_manifest_chunk_counts
@@ -274,29 +271,26 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 result.reclaimed_manifest_chunk_rows += 1;
             }
         }
-        if !page.has_more || last_key.is_none() {
+        if !page.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
-    let mut resume_after = None;
+    let mut chunk_cursor = store
+        .begin_scan(
+            BINARY_CAS_CHUNK_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                BINARY_CAS_CHUNK_SPACE,
-                StorageKeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: CAS_RECLAIM_CHUNK_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                },
-            )
-            .await?;
-        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        let page = chunk_cursor.next_page(CAS_RECLAIM_CHUNK_PAGE_ROWS).await?;
         for entry in page.entries {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
@@ -332,29 +326,28 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                     )
                 })?;
         }
-        if !page.has_more || last_key.is_none() {
+        if !page.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
-    let mut resume_after = None;
+    let mut presence_cursor = store
+        .begin_scan(
+            BINARY_CAS_CHUNK_PRESENCE_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                BINARY_CAS_CHUNK_PRESENCE_SPACE,
-                StorageKeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: CAS_RECLAIM_MANIFEST_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                },
-            )
+        let page = presence_cursor
+            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
             .await?;
-        let last_key = page.entries.last().map(|entry| entry.key.clone());
         for entry in page.entries {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
@@ -367,10 +360,9 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 writes.delete(BINARY_CAS_CHUNK_PRESENCE_SPACE, entry.key);
             }
         }
-        if !page.has_more || last_key.is_none() {
+        if !page.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
     Ok(result)
@@ -761,8 +753,7 @@ async fn load_declared_manifest_chunks(
             u64::from(chunk_count),
         )))),
     };
-    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
-    scan_all_values_for_plan(store, &plan)
+    scan_all_values_for_range(store, BINARY_CAS_MANIFEST_CHUNK_SPACE, range)
         .await?
         .into_iter()
         .map(|value| {
@@ -794,8 +785,7 @@ async fn load_declared_manifest_chunk_range(
             blob_hash, end_index,
         )))),
     };
-    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
-    scan_all_values_for_plan(store, &plan)
+    scan_all_values_for_range(store, BINARY_CAS_MANIFEST_CHUNK_SPACE, range)
         .await?
         .into_iter()
         .map(|value| {
@@ -1035,40 +1025,33 @@ async fn scan_all_values(
     space: StorageSpace,
     prefix: Vec<u8>,
 ) -> Result<Vec<Vec<u8>>, LixError> {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::from(prefix),
-        },
-    );
-    scan_all_values_for_plan(store, &plan).await
+    let range = StoragePrefix {
+        bytes: Bytes::from(prefix),
+    }
+    .to_range()?;
+    scan_all_values_for_range(store, space, range).await
 }
 
-async fn scan_all_values_for_plan(
+async fn scan_all_values_for_range(
     store: &(impl StorageAdapterRead + ?Sized),
-    plan: &ScanPlan,
+    space: StorageSpace,
+    range: StorageKeyRange,
 ) -> Result<Vec<Vec<u8>>, LixError> {
     let mut values = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = store
+        .begin_scan(space, range, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         values.extend(
-            page.value
-                .entries
+            page.entries
                 .into_iter()
                 .filter_map(|entry| full_value(entry.value))
                 .map(|bytes| bytes.to_vec()),
         );
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
@@ -2696,7 +2679,7 @@ mod tests {
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
         Memory, StorageError, StorageGetManyResult, StorageKeyRange, StorageReadOptions,
-        StorageScanChunk, StorageWriteOptions, StorageWriteSet,
+        StorageScanCursor, StorageWriteOptions, StorageWriteSet,
     };
 
     #[tokio::test]
@@ -2796,12 +2779,12 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
-            opts: StorageScanOptions,
-        ) -> Result<StorageScanChunk, StorageError> {
+            opts: StorageBeginScanOptions,
+        ) -> Result<StorageScanCursor<'_>, StorageError> {
             let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE;
             let manifest_hash = if is_manifest_scan {
                 manifest_hash_from_range(&range)
@@ -2823,7 +2806,7 @@ mod tests {
                     tokio::time::sleep(self.default_manifest_delay).await;
                 }
             }
-            let result = self.inner.scan(space, range, opts).await;
+            let result = self.inner.begin_scan(space, range, opts).await;
             if is_manifest_scan {
                 self.active_manifest_scans.fetch_sub(1, Ordering::Relaxed);
                 if let Some(manifest_hash) = manifest_hash {

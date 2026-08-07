@@ -5,10 +5,10 @@ use std::ops::Bound;
 
 use crate::binary_cas::{BlobChunkReceipt, BlobId, ChunkHash};
 use crate::storage_adapter::{
-    MAX_SCAN_PAGE_ROWS, Storage, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
-    StorageKey, StorageKeyRange, StoragePrecondition, StorageProjectedValue, StorageReadOptions,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteOptions,
-    exact_get_many,
+    MAX_SCAN_PAGE_ROWS, Storage, StorageBeginScanOptions, StorageCoreProjection,
+    StorageGetManyRequest, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition,
+    StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteOptions, exact_get_many,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError};
@@ -37,23 +37,21 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
     live_blob_roots: &BTreeSet<BlobId>,
 ) -> Result<BTreeMap<ChunkHash, u64>, LixError> {
     let mut states = Vec::<(String, UploadState)>::new();
-    let mut resume_after = None;
+    let mut state_cursor = store
+        .begin_scan(
+            UPLOAD_STATE_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                UPLOAD_STATE_SPACE,
-                StorageKeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                },
-            )
-            .await?;
-        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        let page = state_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
         for entry in page.entries {
             let upload_id = std::str::from_utf8(&entry.key.0)
                 .map_err(|_| invalid_upload_storage("upload state key is not UTF-8"))?
@@ -68,10 +66,9 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 .map_err(|_| invalid_upload_storage("upload state value is invalid JSON"))?;
             states.push((upload_id, state));
         }
-        if !page.has_more || last_key.is_none() {
+        if !page.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
     let mut open_ids = BTreeSet::new();
@@ -89,23 +86,21 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
     }
 
     let mut upload_chunks = BTreeMap::new();
-    let mut resume_after = None;
+    let mut leaf_cursor = store
+        .begin_scan(
+            UPLOAD_MANIFEST_LEAF_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                UPLOAD_MANIFEST_LEAF_SPACE,
-                StorageKeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                },
-            )
-            .await?;
-        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        let page = leaf_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
         for entry in page.entries {
             let upload_id = decode_upload_manifest_leaf_upload_id(&entry.key)?;
             if !open_ids.contains(&upload_id) {
@@ -139,10 +134,9 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 }
             }
         }
-        if !page.has_more || last_key.is_none() {
+        if !page.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
     Ok(upload_chunks)
@@ -731,19 +725,18 @@ async fn load_upload_progress(
 ) -> Result<FileUploadProgress, LixError> {
     let range = upload_manifest_leaf_range(upload_id)?;
     let mut expected_part = 0_u32;
-    let mut resume_after = None;
+    let mut cursor = store
+        .begin_scan(
+            UPLOAD_MANIFEST_LEAF_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     'pages: loop {
-        let page = store
-            .scan(
-                UPLOAD_MANIFEST_LEAF_SPACE,
-                range.clone(),
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
-            .await?;
+        let page = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
         for entry in &page.entries {
             let part_number = decode_upload_manifest_leaf_part_number(upload_id, &entry.key)?;
             if part_number != expected_part {
@@ -755,13 +748,6 @@ async fn load_upload_progress(
         }
         if !page.has_more {
             break;
-        }
-        resume_after = page.entries.last().map(|entry| entry.key.clone());
-        if resume_after.is_none() {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "upload manifest leaf scan returned an empty partial page",
-            ));
         }
     }
     let next_offset = u64::from(expected_part)
@@ -784,19 +770,18 @@ async fn load_upload_manifest_leaves(
     let mut receipts = Vec::new();
     let mut part_identities = Vec::new();
     let mut next_part = 0_u32;
-    let mut resume_after = None;
+    let mut cursor = store
+        .begin_scan(
+            UPLOAD_MANIFEST_LEAF_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = store
-            .scan(
-                UPLOAD_MANIFEST_LEAF_SPACE,
-                range.clone(),
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
-            .await?;
+        let page = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
         for entry in &page.entries {
             let part_number = decode_upload_manifest_leaf_part_number(upload_id, &entry.key)?;
             if part_number != next_part {
@@ -828,18 +813,6 @@ async fn load_upload_manifest_leaves(
         if !page.has_more {
             break;
         }
-        resume_after = Some(
-            page.entries
-                .last()
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        "upload manifest leaf scan returned an empty partial page",
-                    )
-                })?
-                .key
-                .clone(),
-        );
     }
     if next_part != expected_leaf_count {
         return Err(LixError::new(
@@ -910,8 +883,8 @@ mod tests {
     use super::*;
     use crate::binary_cas::BINARY_CAS_CHUNK_SPACE;
     use crate::storage_adapter::{
-        StorageAdapter, StorageAdapterRead, StorageCoreProjection, StorageKeyRange,
-        StorageScanOptions, StorageWriteOptions, StorageWriteSet,
+        StorageAdapter, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+        StorageKeyRange, StorageWriteOptions, StorageWriteSet,
     };
     use crate::{Memory, engine::Engine};
     use std::ops::Bound;
@@ -1022,21 +995,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("chunk verification read should open");
-        let page = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 BINARY_CAS_CHUNK_SPACE,
                 StorageKeyRange {
                     lower: Bound::Included(StorageKey(Bytes::copy_from_slice(hash.as_bytes()))),
                     upper: Bound::Included(StorageKey(Bytes::copy_from_slice(hash.as_bytes()))),
                 },
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: 1,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await
             .expect("chunk verification scan should succeed");
+        let page = cursor
+            .next_page(1)
+            .await
+            .expect("chunk verification page should succeed");
         !page.entries.is_empty()
     }
 
@@ -1422,22 +1398,26 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open upload cleanup read");
-        let temporary_receipts = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 UPLOAD_MANIFEST_LEAF_SPACE,
                 upload_manifest_leaf_range("movie-proxy-1").expect("upload leaf range"),
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
+            .await
+            .expect("begin temporary upload receipt scan");
+        let temporary_receipts = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan temporary upload receipts");
         assert!(
             temporary_receipts.entries.is_empty(),
             "publication must atomically remove temporary chunk receipts",
         );
+        drop(cursor);
         drop(read);
         let published_commit_id = resumed_session
             .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
@@ -1508,19 +1488,22 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open CAS accounting read");
-        let chunks = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 BINARY_CAS_CHUNK_SPACE,
                 StorageKeyRange {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
                 },
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
+            .await
+            .expect("begin CAS chunk scan");
+        let chunks = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan CAS chunks");
         assert!(!chunks.has_more);
@@ -1574,16 +1557,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read upload leaves");
-        let leaves = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 UPLOAD_MANIFEST_LEAF_SPACE,
                 upload_manifest_leaf_range("windowed-proxy").expect("leaf range"),
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     projection: StorageCoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
+            .await
+            .expect("begin upload leaf scan");
+        let leaves = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan upload leaves");
         assert_eq!(leaves.entries.len(), 3);
@@ -1594,6 +1580,7 @@ mod tests {
             let leaf = decode_upload_manifest_leaf(&value).expect("decode manifest leaf");
             assert_eq!(leaf.chunks.len(), FILE_UPLOAD_PART_BYTES / (1024 * 1024));
         }
+        drop(cursor);
         drop(read);
 
         let outside_window = session

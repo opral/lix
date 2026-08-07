@@ -35,9 +35,9 @@ use crate::live_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::live_state::stage_collect_stale_working_diff_indexes;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
-    StorageKey, StorageKeyRange, StoragePrecondition, StoragePrefix, StorageProjectedValue,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition, StoragePrefix,
+    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -832,34 +832,31 @@ async fn scan_tree_sweep_marks<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plan = ScanPlan::prefix(
-        GC_TREE_SWEEP_MARK_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
     let mut previous_key = None;
     let mut current = BTreeSet::new();
     let mut all = BTreeSet::new();
+    let mut cursor = store
+        .begin_scan(
+            GC_TREE_SWEEP_MARK_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: GC_TREE_SWEEP_PAGE_ROWS,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        if page.value.has_more && page.value.entries.is_empty() {
+        let page = cursor.next_page(GC_TREE_SWEEP_PAGE_ROWS).await?;
+        if page.has_more && page.entries.is_empty() {
             return Err(tree_sweep_error(
                 "tree sweep mark scan reported has_more with an empty page",
             ));
         }
-        for entry in &page.value.entries {
+        for entry in &page.entries {
             if entry.key.0.len() != 32
                 || previous_key
                     .as_ref()
@@ -895,17 +892,15 @@ where
             }
             previous_key = Some(entry.key.clone());
         }
-        let Some(last) = page.value.entries.last() else {
-            if page.value.has_more {
+        if page.entries.is_empty() {
+            if page.has_more {
                 return Err(tree_sweep_error(
                     "tree sweep mark scan has_more without a resume key",
                 ));
             }
             break;
-        };
-        if page.value.has_more {
-            resume_after = Some(last.key.clone());
-        } else {
+        }
+        if !page.has_more {
             break;
         }
     }
@@ -1146,36 +1141,35 @@ where
             "tree sweep root publication advanced during an active epoch",
         ));
     }
-    let plan = ScanPlan::range(
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    );
-    let page = plan
-        .collect(
-            store,
-            StorageScanOptions {
+    let range = StorageKeyRange {
+        lower: session
+            .cursor
+            .last_key
+            .as_ref()
+            .map_or(Bound::Unbounded, |key| {
+                Bound::Excluded(StorageKey(Bytes::copy_from_slice(key)))
+            }),
+        upper: Bound::Unbounded,
+    };
+    let mut cursor = store
+        .begin_scan(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            range,
+            StorageBeginScanOptions {
                 projection: StorageCoreProjection::FullValue,
-                limit_rows: GC_TREE_SWEEP_PAGE_ROWS,
-                resume_after: session
-                    .cursor
-                    .last_key
-                    .as_ref()
-                    .map(|key| StorageKey(Bytes::copy_from_slice(key))),
-                ..StorageScanOptions::default()
+                ..StorageBeginScanOptions::default()
             },
         )
         .await?;
-    if page.value.has_more && page.value.entries.is_empty() {
+    let page = cursor.next_page(GC_TREE_SWEEP_PAGE_ROWS).await?;
+    if page.has_more && page.entries.is_empty() {
         return Err(tree_sweep_error(
             "tree sweep tree-chunk scan reported has_more with an empty page",
         ));
     }
     let previous = session.cursor.last_key.as_deref();
-    let mut hashes = Vec::with_capacity(page.value.entries.len());
-    for entry in &page.value.entries {
+    let mut hashes = Vec::with_capacity(page.entries.len());
+    for entry in &page.entries {
         if entry.key.0.len() != 32
             || previous.is_some_and(|previous| entry.key.0.as_ref() <= previous)
             || hashes
@@ -1260,7 +1254,7 @@ where
     // still has its physical chunk before any delete is staged.  This catches
     // a live chunk deleted between epoch creation and the final page (the
     // mark inventory alone cannot distinguish that from a clean sweep).
-    if !page.value.has_more {
+    if !page.has_more {
         let live_keys = session
             .live_chunks
             .iter()
@@ -1303,7 +1297,7 @@ where
     let next_cursor = StoredTreeSweepCursor {
         format_version: GC_TREE_SWEEP_FORMAT_VERSION,
         epoch_id: session.epoch.epoch_id,
-        last_key: page.value.entries.last().map(|entry| entry.key.0.to_vec()),
+        last_key: page.entries.last().map(|entry| entry.key.0.to_vec()),
         scanned_rows: session
             .cursor
             .scanned_rows
@@ -1312,7 +1306,7 @@ where
             .cursor
             .deleted_rows
             .saturating_add(deletes.len() as u64),
-        complete: !page.value.has_more,
+        complete: !page.has_more,
     };
     let next_raw = Bytes::from(storage_codec::encode("tree sweep cursor", &next_cursor)?);
     writes.put(
@@ -1429,26 +1423,23 @@ where
 pub(crate) async fn load_recovery_refs(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<CheckpointRecoveryRef>, LixError> {
-    let plan = ScanPlan::prefix(
-        CHECKPOINT_RECOVERY_REF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
     let mut refs = BTreeMap::new();
-    let mut resume_after = None;
+    let mut cursor = store
+        .begin_scan(
+            CHECKPOINT_RECOVERY_REF_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
+        for entry in page.entries {
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1486,7 +1477,7 @@ pub(crate) async fn load_recovery_refs(
                 },
             );
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
@@ -1500,26 +1491,25 @@ async fn stage_sweep_unreachable_content_nodes(
     space: StorageSpace,
     live: &BTreeSet<[u8; 32]>,
 ) -> Result<(), LixError> {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            space,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
+        for entry in page.entries {
             let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1533,7 +1523,7 @@ async fn stage_sweep_unreachable_content_nodes(
                 writes.delete(space, entry.key);
             }
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }

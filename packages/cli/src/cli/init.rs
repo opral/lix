@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub struct InitCommand {
-    /// Path to the .lix file to initialize.
+    /// Path to the directory-backed .lix store to initialize.
     #[arg(value_hint = ValueHint::FilePath)]
     pub path: PathBuf,
 }

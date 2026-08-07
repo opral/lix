@@ -284,11 +284,26 @@ pub struct GetOptions {
     pub projection: CoreProjection,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanOptions {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScanOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeginScanOptions {
     pub projection: CoreProjection,
-    pub limit_rows: usize,
-    pub resume_after: Option<Key>,
+    pub order: ScanOrder,
+}
+
+impl Default for BeginScanOptions {
+    fn default() -> Self {
+        Self {
+            projection: CoreProjection::FullValue,
+            order: ScanOrder::Ascending,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,43 +461,41 @@ impl GetManyResult {
     }
 }
 
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            projection: CoreProjection::FullValue,
-            limit_rows: 1024,
-            resume_after: None,
-        }
-    }
-}
-
-impl ScanOptions {
-    pub fn page_size(&self) -> usize {
-        self.limit_rows.min(MAX_SCAN_PAGE_ROWS)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCAN_PAGE_ROWS, ScanOptions};
+    use super::*;
 
     #[test]
-    fn scan_page_size_is_bounded() {
-        assert_eq!(
-            ScanOptions {
-                limit_rows: usize::MAX,
-                ..ScanOptions::default()
+    fn prefix_ranges_cover_exact_lexicographic_edges() {
+        let cases = [
+            (
+                &[][..],
+                Bound::Included(Key(Bytes::new())),
+                Bound::Unbounded,
+            ),
+            (
+                &[0x61][..],
+                Bound::Included(Key(Bytes::from_static(&[0x61]))),
+                Bound::Excluded(Key(Bytes::from_static(&[0x62]))),
+            ),
+            (
+                &[0x61, 0xff][..],
+                Bound::Included(Key(Bytes::from_static(&[0x61, 0xff]))),
+                Bound::Excluded(Key(Bytes::from_static(&[0x62]))),
+            ),
+            (
+                &[0xff, 0xff][..],
+                Bound::Included(Key(Bytes::from_static(&[0xff, 0xff]))),
+                Bound::Unbounded,
+            ),
+        ];
+        for (bytes, lower, upper) in cases {
+            let actual = Prefix {
+                bytes: Bytes::copy_from_slice(bytes),
             }
-            .page_size(),
-            MAX_SCAN_PAGE_ROWS
-        );
-        assert_eq!(
-            ScanOptions {
-                limit_rows: 17,
-                ..ScanOptions::default()
-            }
-            .page_size(),
-            17
-        );
+            .to_range()
+            .expect("prefix range should be valid");
+            assert_eq!(actual, KeyRange { lower, upper });
+        }
     }
 }

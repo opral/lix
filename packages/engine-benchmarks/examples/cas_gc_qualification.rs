@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use lix::Value;
 use lix::integration::{Engine, SessionContext};
-use lix::storage::{CoreProjection, KeyRange, ReadOptions, ScanOptions, Storage, StorageRead};
+use lix::storage::{
+    BeginScanOptions, CoreProjection, KeyRange, MAX_SCAN_PAGE_ROWS, ReadOptions, Storage,
+    StorageRead,
+};
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
     CrudPhysicalWriteAccounting, RepositoryGcCommitBenchResult, collect_repository_gc_for_bench,
@@ -780,21 +783,23 @@ async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -
         rows: 0,
         value_bytes: 0,
     };
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin CAS stats scan");
     loop {
-        let page = read
-            .scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                ScanOptions {
-                    projection: CoreProjection::FullValue,
-                    resume_after,
-                    ..ScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan CAS stats");
         stats.rows += page.entries.len() as u64;
@@ -809,7 +814,6 @@ async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -
         if !page.has_more {
             break;
         }
-        resume_after = page.entries.last().map(|entry| entry.key.clone());
     }
     stats
 }

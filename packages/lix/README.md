@@ -23,4 +23,4 @@ let lix = open_lix().with_storage(storage).await?;
 
 Storage adapters implement the public `lix::storage` contract and release on
 their own cadence. The official packages are `lix-storage-rocksdb`,
-`lix-storage-slatedb`, `lix-storage-sqlite`, and `lix-storage-filesystem`.
+`lix-storage-rocksdb`, `lix-storage-slatedb`, and `lix-storage-filesystem`.

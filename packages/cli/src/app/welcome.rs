@@ -79,7 +79,7 @@ fn describe_lix_state(explicit: Option<&Path>) -> String {
         }
     }
     match lix_files.len() {
-        0 => "no .lix file detected · run `lix init <path>`".to_string(),
+        0 => "no .lix store detected · run `lix init <path>`".to_string(),
         1 => {
             let name = lix_files[0]
                 .file_name()
@@ -87,6 +87,6 @@ fn describe_lix_state(explicit: Option<&Path>) -> String {
                 .unwrap_or_default();
             format!("detected {name}")
         }
-        n => format!("{n} .lix files · pass --path <path>"),
+        n => format!("{n} .lix stores · pass --path <path>"),
     }
 }

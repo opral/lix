@@ -9,7 +9,7 @@ use crate::storage_adapter::{
 };
 #[cfg(test)]
 use crate::storage_adapter::{
-    ScanPlan, StorageCoreProjection, StorageKey, StoragePrefix, StorageScanOptions,
+    StorageBeginScanOptions, StorageCoreProjection, StorageKey, StoragePrefix,
 };
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -83,27 +83,26 @@ impl JsonStoreContext {
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
     ) -> Result<Vec<UntrackedJsonReclaimCandidate>, LixError> {
-        let plan = ScanPlan::prefix(
-            UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        );
+        let range = StoragePrefix {
+            bytes: Bytes::new(),
+        }
+        .to_range()?;
         let mut candidates = Vec::new();
-        let mut resume_after = None;
+        let mut cursor = store
+            .begin_scan(
+                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
         loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        projection: StorageCoreProjection::KeyOnly,
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            candidates.extend(page.value.entries.into_iter().map(|entry| {
+            candidates.extend(page.entries.into_iter().map(|entry| {
                 let json_ref = <[u8; 32]>::try_from(entry.key.0.as_ref())
                     .ok()
                     .map(JsonRef::from_hash_bytes);
@@ -112,7 +111,7 @@ impl JsonStoreContext {
                     json_ref,
                 }
             }));
-            if !page.value.has_more || resume_after.is_none() {
+            if !page.has_more {
                 break;
             }
         }

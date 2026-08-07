@@ -14,11 +14,10 @@ use crate::changelog::{ChangelogContext, ChangelogReader, CommitId, CommitLoadRe
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapterRead,
-    StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
-    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
-    exact_get_many,
+    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapterRead,
+    StorageBeginScanOptions, StorageCoreProjection, StorageError, StorageGetManyRequest,
+    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
+    StorageScanCursor, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet, exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -9660,31 +9659,26 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
     mut visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
 ) -> Result<usize, LixError> {
-    let plan = ScanPlan::range(
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    );
-    let mut resume_after = None;
+    let range = StorageKeyRange {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    };
     let mut emitted = 0usize;
+    let mut cursor = store
+        .begin_scan(
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry_batch in page
-            .value
-            .entries
-            .chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS)
-        {
+        for entry_batch in page.entries.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
             let commit_ids = entry_batch
                 .iter()
                 .map(|entry| commit_id_from_delta_key(&entry.key))
@@ -9771,10 +9765,9 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 }
             }
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
     validate_no_orphan_commit_delta_segments(store).await?;
     Ok(emitted)
@@ -9835,30 +9828,29 @@ async fn visit_columnar_mutation_change_records(
 async fn validate_no_orphan_commit_delta_segments(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<(), LixError> {
-    let plan = ScanPlan::range(
-        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    );
-    let mut resume_after = None;
+    let range = StorageKeyRange {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    };
+    let mut cursor = store
+        .begin_scan(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        if page.value.entries.is_empty() {
+        if page.entries.is_empty() {
             break;
         }
         let mut commit_ids = Vec::new();
-        for entry in &page.value.entries {
+        for entry in &page.entries {
             if entry.key.0.len() != 20 && entry.key.0.len() != 52 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -9875,7 +9867,7 @@ async fn validate_no_orphan_commit_delta_segments(
             .into_iter()
             .zip(manifests)
             .collect::<BTreeMap<_, _>>();
-        for entry in &page.value.entries {
+        for entry in &page.entries {
             let commit_id = commit_id_from_delta_key(&entry.key)?;
             let segment_index = usize::try_from(u32::from_be_bytes(
                 entry.key.0[16..20]
@@ -9913,10 +9905,9 @@ async fn validate_no_orphan_commit_delta_segments(
                 ));
             }
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
     Ok(())
 }
@@ -10368,36 +10359,34 @@ async fn scan_full_space(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
 ) -> Result<Vec<(StorageKey, Bytes)>, LixError> {
-    let plan = ScanPlan::range(
-        space,
-        StorageKeyRange {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    );
-    let mut resume_after = None;
+    let range = StorageKeyRange {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    };
     let mut rows = Vec::new();
+    let mut cursor = store
+        .begin_scan(
+            space,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry in &page.value.entries {
+        for entry in &page.entries {
             let StorageProjectedValue::FullValue(bytes) = &entry.value else {
                 unreachable!("full commit-delta scan returned a key-only row");
             };
             rows.push((entry.key.clone(), bytes.clone()));
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
     Ok(rows)
 }
@@ -12134,19 +12123,19 @@ where
         Ok(result)
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: StorageKeyRange,
-        opts: StorageScanOptions,
-    ) -> Result<StorageScanChunk, StorageError> {
+        opts: StorageBeginScanOptions,
+    ) -> Result<StorageScanCursor<'_>, StorageError> {
         if space == TRACKED_STATE_TREE_CHUNK_SPACE {
             return Err(StorageError::Io(
                 "tracked-state staged audit supports point reads only for overlay spaces"
                     .to_string(),
             ));
         }
-        self.store.scan(space, range, opts).await
+        self.store.begin_scan(space, range, opts).await
     }
 }
 
@@ -13303,14 +13292,15 @@ mod tests {
             self.inner.get_many(requests)
         }
 
-        fn scan(
+        fn begin_scan(
             &self,
             space: StorageSpace,
             range: crate::storage::KeyRange,
-            opts: crate::storage::ScanOptions,
-        ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
-        {
-            self.inner.scan(space, range, opts)
+            opts: crate::storage::BeginScanOptions,
+        ) -> impl Future<
+            Output = Result<crate::storage::ScanCursor<'_>, crate::storage::StorageError>,
+        > + Send {
+            self.inner.begin_scan(space, range, opts)
         }
     }
 
