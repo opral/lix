@@ -90,6 +90,11 @@ path = "tests/certified_replacement_delete_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
 
 [[test]]
+name = "checkpoint_gc_replay_reopen"
+path = "tests/checkpoint_gc_replay_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
 name = "tpch_overlay_helpers"
 path = "tests/tpch_overlay_helpers.rs"
 

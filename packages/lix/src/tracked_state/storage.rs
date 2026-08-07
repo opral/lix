@@ -7562,6 +7562,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             &state,
             schema_keys,
             max_segment_count,
+            true,
         )
         .await?
     else {
@@ -7587,6 +7588,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         &source,
         schema_keys,
         max_segment_count.saturating_sub(local_segment_count),
+        true,
     )
     .await?
     else {
@@ -7600,11 +7602,197 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     Ok(Some(merge_selected_source_members(members, local)))
 }
 
+/// Resolves the immutable owners of finite selected members in one commit.
+///
+/// Whole-source aliases are already named by the authenticated manifest and
+/// are deliberately excluded here. Ordinary GC uses this bounded local
+/// inventory walk to retain canonical locator owners without scanning any
+/// repository-global change or commit space.
+pub(crate) async fn load_local_selected_change_owner_commit_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let state = load_point_replay_commit_state(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            replacement_payload_error(&format!(
+                "selected-owner dependency commit '{commit_id}' has no physical authority"
+            ))
+        })?;
+    let Some((members, _)) = load_authenticated_local_commit_delta_members_for_schemas(
+        store,
+        &state,
+        &[],
+        usize::MAX,
+        false,
+    )
+    .await?
+    else {
+        unreachable!("unbounded selected-owner inventory cannot exceed its segment limit")
+    };
+    let selected = members
+        .into_iter()
+        .filter(|member| !member.authored && !member.selected_tombstone)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    // Explicit locators are the canonical route for random change IDs. Probe
+    // them in one batch before trying the packed direct-address convention;
+    // otherwise each random UUID looks like a distinct speculative commit and
+    // turns one finite selection into one manifest probe per row.
+    let locator_keys = selected
+        .iter()
+        .map(|member| {
+            StorageKey(Bytes::copy_from_slice(
+                member.value.change_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let locator_values = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &locator_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let explicit_locators = selected
+        .iter()
+        .zip(locator_values.value)
+        .map(|(member, value)| {
+            value
+                .and_then(full_value_bytes)
+                .map(|bytes| decode_change_locator(member.value.change_id, &bytes))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let direct_locators = selected
+        .iter()
+        .map(|member| direct_change_locator(member.value.change_id))
+        .collect::<Vec<_>>();
+
+    // Direct addressing remains canonical when its physical commit really
+    // owns the coordinate. Probe all syntactic candidates in one request so
+    // random explicit IDs cannot reintroduce one backend request per row.
+    let direct_candidate_ids = direct_locators
+        .iter()
+        .flatten()
+        .map(|locator| locator.commit_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let direct_candidate_manifests =
+        load_commit_state_manifests(store, &direct_candidate_ids).await?;
+    let present_direct_candidates = direct_candidate_ids
+        .into_iter()
+        .zip(direct_candidate_manifests)
+        .filter_map(|(commit_id, manifest)| manifest.map(|_| commit_id))
+        .collect::<BTreeSet<_>>();
+
+    let mut direct_by_commit = BTreeMap::<
+        CommitId,
+        (
+            Arc<AuthenticatedReplayCommitStateManifest>,
+            Vec<(usize, CommitDeltaChangeLocator)>,
+        ),
+    >::new();
+    let mut non_owning_direct_candidates = BTreeSet::new();
+    let mut explicit_indices = BTreeSet::new();
+    for (index, locator) in direct_locators.iter().copied().enumerate() {
+        let Some(locator) =
+            locator.filter(|locator| present_direct_candidates.contains(&locator.commit_id))
+        else {
+            explicit_indices.insert(index);
+            continue;
+        };
+        if let Some((_, requests)) = direct_by_commit.get_mut(&locator.commit_id) {
+            requests.push((index, locator));
+            continue;
+        }
+        if non_owning_direct_candidates.contains(&locator.commit_id) {
+            explicit_indices.insert(index);
+            continue;
+        }
+        match load_direct_change_authority(store, locator.commit_id).await? {
+            DirectChangeAuthority::Candidate(authority) => {
+                direct_by_commit
+                    .entry(locator.commit_id)
+                    .or_insert_with(|| (authority, Vec::new()))
+                    .1
+                    .push((index, locator));
+            }
+            DirectChangeAuthority::NotOwned(_) => {
+                non_owning_direct_candidates.insert(locator.commit_id);
+                explicit_indices.insert(index);
+            }
+        }
+    }
+
+    let mut owners = BTreeSet::new();
+    for (commit_id, (authority, requests)) in direct_by_commit {
+        let locators = requests
+            .iter()
+            .map(|(_, locator)| *locator)
+            .collect::<Vec<_>>();
+        let routes = route_direct_change_records_for_state(store, &authority, &locators).await?;
+        for ((index, _), route) in requests.into_iter().zip(routes) {
+            match route {
+                DirectChangeRecordRoute::Owned(record) => {
+                    validate_selected_owner_record(&selected[index], &record)?;
+                    owners.insert(commit_id);
+                }
+                DirectChangeRecordRoute::NotOwned(_) => {
+                    explicit_indices.insert(index);
+                }
+            }
+        }
+    }
+
+    let explicit = explicit_indices
+        .into_iter()
+        .map(|index| {
+            explicit_locators[index]
+                .map(|locator| (index, locator))
+                .ok_or_else(|| {
+                    replacement_payload_error(&format!(
+                        "selected change '{}' has no authoritative locator",
+                        selected[index].value.change_id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let locators = explicit
+        .iter()
+        .map(|(_, locator)| *locator)
+        .collect::<Vec<_>>();
+    let records = load_explicit_change_records_at_locators(store, &locators).await?;
+    for ((index, locator), record) in explicit.into_iter().zip(records) {
+        validate_selected_owner_record(&selected[index], &record)?;
+        owners.insert(locator.commit_id);
+    }
+    Ok(owners)
+}
+
+fn validate_selected_owner_record(
+    member: &CommitDeltaMember,
+    record: &crate::changelog::ChangeRecord,
+) -> Result<(), LixError> {
+    if record.change_id != member.value.change_id
+        || record.schema_key != member.key.schema_key
+        || record.file_id != member.key.file_id
+        || record.entity_pk != member.key.entity_pk
+    {
+        return Err(replacement_payload_error(&format!(
+            "selected change '{}' references canonical authority for a different identity",
+            member.value.change_id
+        )));
+    }
+    Ok(())
+}
+
 async fn load_authenticated_local_commit_delta_members_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
     max_segment_count: usize,
+    hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let Some(root) = state.mutation_directory_root.as_ref() else {
         let manifest = commit_delta_manifest_from_commit_state(state);
@@ -7613,8 +7801,14 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             return Ok(None);
         }
         return Ok(Some((
-            load_commit_delta_members_from_manifest(store, state.commit_id, &manifest, schema_keys)
-                .await?,
+            load_commit_delta_members_from_manifest(
+                store,
+                state.commit_id,
+                &manifest,
+                schema_keys,
+                hydrate_selected_payloads,
+            )
+            .await?,
             segment_count,
         )));
     };
@@ -7626,14 +7820,21 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             state,
             schema_keys,
             max_segment_count,
+            hydrate_selected_payloads,
         )
         .await;
     }
     if root.layout == super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY {
         let manifest = commit_delta_manifest_from_commit_state(state);
         return Ok(Some((
-            load_commit_delta_members_from_manifest(store, state.commit_id, &manifest, schema_keys)
-                .await?,
+            load_commit_delta_members_from_manifest(
+                store,
+                state.commit_id,
+                &manifest,
+                schema_keys,
+                hydrate_selected_payloads,
+            )
+            .await?,
             0,
         )));
     }
@@ -7678,8 +7879,14 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     let manifest = expanded_commit_delta_manifest_from_commit_state(store, &expanded_state).await?;
     validate_commit_delta_manifest(&manifest)?;
     Ok(Some((
-        load_commit_delta_members_from_manifest(store, state.commit_id, &manifest, schema_keys)
-            .await?,
+        load_commit_delta_members_from_manifest(
+            store,
+            state.commit_id,
+            &manifest,
+            schema_keys,
+            hydrate_selected_payloads,
+        )
+        .await?,
         segment_count,
     )))
 }
@@ -7689,6 +7896,7 @@ async fn load_bounded_commit_delta_members_for_schemas(
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
     max_segment_count: usize,
+    hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded payload scan omitted its mutation-directory root")
@@ -7780,7 +7988,9 @@ async fn load_bounded_commit_delta_members_for_schemas(
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
-    hydrate_selected_members(store, &mut members).await?;
+    if hydrate_selected_payloads {
+        hydrate_selected_members(store, &mut members).await?;
+    }
     validate_commit_delta_member_order_and_ids(state.commit_id, &members)?;
     Ok(Some((members, segment_count)))
 }
@@ -7827,6 +8037,7 @@ async fn load_commit_delta_members_from_manifest(
     commit_id: CommitId,
     manifest: &CommitDeltaManifest,
     schema_keys: &[String],
+    hydrate_selected_payloads: bool,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     if let Some(parts) = manifest.columnar_parts.as_ref() {
         if !schema_keys.is_empty() && !schema_keys.iter().any(|schema| schema == &parts.schema_key)
@@ -7887,7 +8098,9 @@ async fn load_commit_delta_members_from_manifest(
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
-    hydrate_selected_members(store, &mut members).await?;
+    if hydrate_selected_payloads {
+        hydrate_selected_members(store, &mut members).await?;
+    }
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
     Ok(members)
 }
@@ -9394,7 +9607,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     continue;
                 }
                 let members =
-                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[])
+                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[], true)
                         .await?;
                 for member in members {
                     if member.authored {

@@ -10,8 +10,8 @@ pub(crate) use context::BranchContext;
 pub(crate) use control::BRANCH_HEAD_CONTROL_SPACE;
 pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
-    BranchHeadControlReader, branch_head_control_precondition, stage_branch_head_control,
-    stage_delete_branch_head_control, untracked_lifecycle_generation,
+    BranchHeadControlReader, BranchHeadTrackedReachability, branch_head_control_precondition,
+    stage_branch_head_control, stage_delete_branch_head_control, untracked_lifecycle_generation,
 };
 pub(crate) use lifecycle::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 pub(crate) use stage_rows::{

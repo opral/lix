@@ -61,7 +61,42 @@ pub(crate) struct BranchHeadControl {
     pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
 }
 
+/// Canonical classification of one authenticated branch control for
+/// destructive reachability work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BranchHeadTrackedReachability {
+    /// Semantic chronology roots. These must have commit graph and physical
+    /// manifest authority.
+    pub(crate) chronology_roots: [Option<CommitId>; 2],
+    /// Current-serving selector. This UUID is interpreted only with the
+    /// branch id through `TrackedHead`; it is not itself a semantic commit.
+    pub(crate) serving_generation: CommitId,
+    /// Checkpoint context required to interpret the serving generation's
+    /// sparse working-diff visibility. This is already a chronology root
+    /// above; carrying it here prevents serving-owner readers from selecting
+    /// control fields independently.
+    pub(crate) serving_checkpoint_commit_id: Option<CommitId>,
+}
+
 impl BranchHeadControl {
+    /// Canonical tracked projection for destructive reachability work.
+    ///
+    /// `tracked_generation` is the atomic serving selector, not chronology.
+    /// Its row/scoped owners are resolved through the authenticated
+    /// `TrackedHead` reader before GC evaluates retirement.
+    /// `untracked_generation` is intentionally absent: it names current-only
+    /// physical state and is not a semantic commit dependency.
+    pub(crate) fn tracked_reachability(self) -> BranchHeadTrackedReachability {
+        BranchHeadTrackedReachability {
+            chronology_roots: [
+                Some(self.head_commit_id),
+                self.working_diff_checkpoint_commit_id,
+            ],
+            serving_generation: self.tracked_generation,
+            serving_checkpoint_commit_id: self.working_diff_checkpoint_commit_id,
+        }
+    }
+
     /// Returns the same public branch ref with a fresh private current-state
     /// revision. A mutable hot-row write must publish this alongside its exact
     /// control precondition; otherwise two writers could both compare the
