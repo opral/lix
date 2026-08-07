@@ -19,11 +19,14 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v10";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
+const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC1";
+const BRANCH_HEAD_CONTROL_DIGEST_BYTES: usize = 32;
+const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
 
 /// The one mutable publication record for a branch.
 ///
@@ -61,7 +64,42 @@ pub(crate) struct BranchHeadControl {
     pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
 }
 
+/// Canonical classification of one authenticated branch control for
+/// destructive reachability work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BranchHeadTrackedReachability {
+    /// Semantic chronology roots. These must have commit graph and physical
+    /// manifest authority.
+    pub(crate) chronology_roots: [Option<CommitId>; 2],
+    /// Current-serving selector. This UUID is interpreted only with the
+    /// branch id through `TrackedHead`; it is not itself a semantic commit.
+    pub(crate) serving_generation: CommitId,
+    /// Checkpoint context required to interpret the serving generation's
+    /// sparse working-diff visibility. This is already a chronology root
+    /// above; carrying it here prevents serving-owner readers from selecting
+    /// control fields independently.
+    pub(crate) serving_checkpoint_commit_id: Option<CommitId>,
+}
+
 impl BranchHeadControl {
+    /// Canonical tracked projection for destructive reachability work.
+    ///
+    /// `tracked_generation` is the atomic serving selector, not chronology.
+    /// Its row/scoped owners are resolved through the authenticated
+    /// `TrackedHead` reader before GC evaluates retirement.
+    /// `untracked_generation` is intentionally absent: it names current-only
+    /// physical state and is not a semantic commit dependency.
+    pub(crate) fn tracked_reachability(self) -> BranchHeadTrackedReachability {
+        BranchHeadTrackedReachability {
+            chronology_roots: [
+                Some(self.head_commit_id),
+                self.working_diff_checkpoint_commit_id,
+            ],
+            serving_generation: self.tracked_generation,
+            serving_checkpoint_commit_id: self.working_diff_checkpoint_commit_id,
+        }
+    }
+
     /// Returns the same public branch ref with a fresh private current-state
     /// revision. A mutable hot-row write must publish this alongside its exact
     /// control precondition; otherwise two writers could both compare the
@@ -194,18 +232,20 @@ where
             .iter()
             .map(|branch_id| Ok(StorageKey(Bytes::from(encode_key(branch_id)?))))
             .collect::<Result<Vec<_>, LixError>>()?;
-        PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &keys)
+        let values = PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &keys)
             .materialize(&self.store, StorageGetOptions::default())
             .await?
-            .value
+            .value;
+        branch_ids
             .into_iter()
-            .map(|value| match value {
+            .zip(values)
+            .map(|(branch_id, value)| match value {
                 None => Ok(BranchHeadControlObservation {
                     control: None,
                     raw_token: None,
                 }),
                 Some(StorageProjectedValue::FullValue(bytes)) => {
-                    let control = storage_codec::decode("branch-head control", &bytes)?;
+                    let control = decode_control(branch_id, &bytes)?;
                     Ok(BranchHeadControlObservation {
                         control: Some(control),
                         raw_token: Some(bytes),
@@ -245,7 +285,7 @@ where
                     "branch-head control key",
                     entry.key.0.as_ref(),
                 )?;
-                let control = decode_projected_value(entry.value)?;
+                let control = decode_projected_value(&key.branch_id, entry.value)?;
                 rows.push((key.branch_id, control));
             }
             if !page.value.has_more || resume_after.is_none() {
@@ -284,7 +324,7 @@ pub(crate) fn stage_branch_head_control(
         BRANCH_HEAD_CONTROL_SPACE,
         StorageKey(Bytes::from(encode_key(branch_id)?)),
         StorageValue {
-            bytes: Bytes::from(storage_codec::encode("branch-head control", &control)?),
+            bytes: Bytes::from(encode_control(branch_id, &control)?),
         },
     );
     Ok(())
@@ -329,14 +369,61 @@ fn encode_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     )
 }
 
-fn decode_projected_value(value: StorageProjectedValue) -> Result<BranchHeadControl, LixError> {
+fn encode_control(branch_id: &str, control: &BranchHeadControl) -> Result<Vec<u8>, LixError> {
+    let payload = storage_codec::encode("branch-head control", control)?;
+    let mut encoded = Vec::with_capacity(
+        BRANCH_HEAD_CONTROL_MAGIC.len() + payload.len() + BRANCH_HEAD_CONTROL_DIGEST_BYTES,
+    );
+    encoded.extend_from_slice(BRANCH_HEAD_CONTROL_MAGIC);
+    encoded.extend_from_slice(&payload);
+    encoded.extend_from_slice(&control_digest(branch_id, &encoded));
+    Ok(encoded)
+}
+
+fn decode_control(branch_id: &str, bytes: &[u8]) -> Result<BranchHeadControl, LixError> {
+    let payload_end = bytes
+        .len()
+        .checked_sub(BRANCH_HEAD_CONTROL_DIGEST_BYTES)
+        .filter(|payload_end| *payload_end >= BRANCH_HEAD_CONTROL_MAGIC.len())
+        .ok_or_else(branch_head_control_corruption)?;
+    let (authenticated, stored_digest) = bytes.split_at(payload_end);
+    if !authenticated.starts_with(BRANCH_HEAD_CONTROL_MAGIC)
+        || stored_digest != control_digest(branch_id, authenticated)
+    {
+        return Err(branch_head_control_corruption());
+    }
+    storage_codec::decode(
+        "branch-head control",
+        &authenticated[BRANCH_HEAD_CONTROL_MAGIC.len()..],
+    )
+}
+
+fn control_digest(branch_id: &str, authenticated: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(BRANCH_HEAD_CONTROL_DIGEST_CONTEXT);
+    hasher.update(&(branch_id.len() as u64).to_be_bytes());
+    hasher.update(branch_id.as_bytes());
+    hasher.update(authenticated);
+    *hasher.finalize().as_bytes()
+}
+
+fn branch_head_control_corruption() -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        "branch-head control authentication digest mismatch",
+    )
+}
+
+fn decode_projected_value(
+    branch_id: &str,
+    value: StorageProjectedValue,
+) -> Result<BranchHeadControl, LixError> {
     let StorageProjectedValue::FullValue(bytes) = value else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "branch-head control read unexpectedly omitted its value",
         ));
     };
-    storage_codec::decode("branch-head control", &bytes)
+    decode_control(branch_id, &bytes)
 }
 
 #[cfg(test)]
@@ -453,5 +540,44 @@ mod tests {
                 crate::storage_adapter::StorageError::PreconditionFailed(_)
             )
         ));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corruption read should open");
+        let mut corrupted = BranchHeadControlContext::new()
+            .reader(read)
+            .load_observed(std::slice::from_ref(&branch_a))
+            .await
+            .expect("winner control should load")
+            .pop()
+            .and_then(|observation| observation.raw_token)
+            .expect("winner control should have authenticated bytes")
+            .to_vec();
+        let payload_byte = BRANCH_HEAD_CONTROL_MAGIC.len();
+        corrupted[payload_byte] ^= 1;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            BRANCH_HEAD_CONTROL_SPACE,
+            StorageKey(Bytes::from(encode_key(&branch_a).unwrap())),
+            StorageValue {
+                bytes: Bytes::from(corrupted),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mutable control corruption fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt control read should open");
+        let error = BranchHeadControlContext::new()
+            .reader(read)
+            .load(&branch_a)
+            .await
+            .expect_err("corrupt branch control must fail closed");
+        assert!(error.to_string().contains("authentication digest mismatch"));
     }
 }

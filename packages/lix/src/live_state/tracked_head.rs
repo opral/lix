@@ -43,7 +43,7 @@ use crate::LixError;
 use crate::NullableKeyFilter;
 #[cfg(test)]
 use crate::branch::stage_branch_head_control;
-use crate::branch::{BranchHeadControl, BranchHeadControlContext};
+use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;

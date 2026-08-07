@@ -5,6 +5,10 @@ use lix::storage::{
     CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions,
     SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
+use lix::storage_adapter::{
+    StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
+};
+use lix::storage_bench::{layout_space_catalog, space_inventory};
 use lix::wasm::{
     WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
     WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
@@ -5073,6 +5077,152 @@ async fn v3_json_reopen_uses_one_export_for_cold_successor() {
         .unwrap();
     assert_eq!(rows.rows()[0].get::<String>("scalar_json").unwrap(), "3");
     reopened.close().await.unwrap();
+}
+
+#[async_trait::async_trait]
+trait CurrentPluginCheckpointCorruptionBackend:
+    Storage + Clone + Send + Sync + Sized + 'static
+{
+    fn open_checkpoint_fixture(path: &Path) -> Self;
+    async fn flush_checkpoint_fixture(&self);
+}
+
+#[async_trait::async_trait]
+impl CurrentPluginCheckpointCorruptionBackend for RocksDB {
+    fn open_checkpoint_fixture(path: &Path) -> Self {
+        Self::open(path).expect("open RocksDB plugin-checkpoint corruption fixture")
+    }
+
+    async fn flush_checkpoint_fixture(&self) {
+        self.flush()
+            .expect("flush RocksDB plugin-checkpoint corruption fixture");
+    }
+}
+
+#[async_trait::async_trait]
+impl CurrentPluginCheckpointCorruptionBackend for SlateDB {
+    fn open_checkpoint_fixture(path: &Path) -> Self {
+        Self::open(path).expect("open SlateDB plugin-checkpoint corruption fixture")
+    }
+
+    async fn flush_checkpoint_fixture(&self) {
+        self.flush_memtable_for_diagnostics()
+            .await
+            .expect("flush SlateDB plugin-checkpoint corruption fixture");
+    }
+}
+
+#[tokio::test]
+async fn rocksdb_corrupt_current_plugin_checkpoint_fails_public_actor_path() {
+    qualify_corrupt_current_plugin_checkpoint::<RocksDB>().await;
+}
+
+#[tokio::test]
+async fn slatedb_corrupt_current_plugin_checkpoint_fails_public_actor_path() {
+    qualify_corrupt_current_plugin_checkpoint::<SlateDB>().await;
+}
+
+async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCorruptionBackend>() {
+    const FILE_ID: &str = "01920000-0000-7000-8000-0000000000c1";
+    const PATH: &str = "/authenticated-checkpoint.json";
+    const CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
+
+    let directory = tempfile::tempdir().expect("create plugin-checkpoint corruption fixture");
+    let storage_path = directory.path().join(".lix");
+    let database = B::open_checkpoint_fixture(&storage_path);
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("open plugin-checkpoint corruption fixture");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(FILE_ID.to_owned()),
+            Value::Text(PATH.to_owned()),
+            Value::Blob(br#"{"before":1}"#.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("materialize plugin file and its durable checkpoint");
+    let branch_id = lix
+        .active_branch_id()
+        .await
+        .expect("load plugin-checkpoint branch owner");
+    database.flush_checkpoint_fixture().await;
+    lix.close()
+        .await
+        .expect("close healthy plugin-checkpoint fixture");
+    drop(database);
+
+    let database = B::open_checkpoint_fixture(&storage_path);
+    let storage = StorageAdapter::new(database.clone());
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("open plugin-checkpoint corruption read");
+    let branch_id_bytes =
+        uuid::Uuid::parse_str(&branch_id).expect("plugin-checkpoint branch owner is a UUID");
+    let file_id_bytes =
+        uuid::Uuid::parse_str(FILE_ID).expect("plugin-checkpoint file owner is a UUID");
+    let mut expected_key = Vec::with_capacity(32);
+    expected_key.extend_from_slice(branch_id_bytes.as_bytes());
+    expected_key.extend_from_slice(file_id_bytes.as_bytes());
+    let entries = space_inventory(&read, CHECKPOINT_SPACE).await;
+    drop(read);
+    let (_, mut value) = entries
+        .into_iter()
+        .find(|(key, _)| key == &expected_key)
+        .expect("real plugin operation must persist its current checkpoint");
+    assert!(
+        value.len() > 92,
+        "checkpoint payload must include authenticated bytes"
+    );
+    value[92] ^= 1;
+    let (space_id, canonical_name) = layout_space_catalog()
+        .into_iter()
+        .find(|(_, name)| *name == CHECKPOINT_SPACE)
+        .expect("plugin current-checkpoint space must be catalogued");
+    let mut writes = storage.new_write_set();
+    writes.put(
+        StorageSpace::mutable(SpaceId(space_id), canonical_name),
+        StorageKey(Bytes::from(expected_key)),
+        StorageValue {
+            bytes: Bytes::from(value),
+        },
+    );
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("commit physical plugin-checkpoint corruption fixture");
+    database.flush_checkpoint_fixture().await;
+    drop(storage);
+    drop(database);
+
+    let database = B::open_checkpoint_fixture(&storage_path);
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("cold reopen plugin-checkpoint corruption fixture");
+    let error = write_file(&lix, PATH, br#"{"before":2}"#.to_vec())
+        .await
+        .expect_err("public plugin actor path must reject corrupt current checkpoint");
+    assert!(
+        error
+            .to_string()
+            .contains("plugin current checkpoint authentication digest mismatch"),
+        "unexpected public plugin-checkpoint corruption error: {error}"
+    );
+    lix.close()
+        .await
+        .expect("close rejected plugin-checkpoint fixture");
+    drop(database);
 }
 
 #[tokio::test]

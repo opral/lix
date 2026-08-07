@@ -3475,6 +3475,7 @@ dependencies = [
  "datafusion",
  "duckdb",
  "futures-util",
+ "libc",
  "lix",
  "lix-storage-rocksdb",
  "lix-storage-slatedb",
@@ -3493,6 +3494,7 @@ dependencies = [
  "tpchgen",
  "tracing-subscriber",
  "ulid",
+ "uuid",
  "xxhash-rust",
  "zstd",
 ]

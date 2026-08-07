@@ -11,7 +11,10 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::branch::BranchHeadControlContext;
+use crate::branch::{
+    BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
+    branch_head_control_precondition,
+};
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::ChangeScanRequest;
 use crate::changelog::{
@@ -28,7 +31,6 @@ use crate::json_store::JsonRef;
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
 };
-#[cfg(test)]
 use crate::live_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::live_state::stage_collect_stale_working_diff_indexes;
@@ -85,6 +87,82 @@ const GC_TREE_SWEEP_CURSOR_KEY: &[u8] = b"cursor";
 const GC_TREE_SWEEP_FORMAT_VERSION: u32 = 1;
 #[allow(dead_code)]
 const GC_TREE_SWEEP_PAGE_ROWS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedControlCommitReachability {
+    chronology_roots: BTreeSet<CommitId>,
+    serving_dependencies: BTreeSet<CommitId>,
+    history_dependencies: BTreeSet<CommitId>,
+}
+
+async fn authenticated_control_commit_reachability<S>(
+    store: &S,
+    controls: &[(String, BranchHeadControl)],
+) -> Result<AuthenticatedControlCommitReachability, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let projections = controls
+        .iter()
+        .map(|(branch_id, control)| (branch_id.clone(), control.tracked_reachability()))
+        .collect::<Vec<(String, BranchHeadTrackedReachability)>>();
+    let chronology_roots = projections
+        .iter()
+        .flat_map(|(_, projection)| projection.chronology_roots)
+        .flatten()
+        .collect();
+    let serving_dependencies = TrackedHeadContext::new()
+        .reader(store)
+        .tracked_serving_commit_dependencies(&projections)
+        .await?;
+    let mut history_dependencies = BTreeSet::new();
+    for (branch_id, projection) in &projections {
+        let head = projection.chronology_roots[0].ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("branch '{branch_id}' has no authenticated history head"),
+            )
+        })?;
+        let floor = projection.serving_checkpoint_commit_id;
+        let mut graph = CommitGraphContext::new().reader(store);
+        let mut current = head;
+        let mut visited = BTreeSet::new();
+        while Some(current) != floor {
+            if !visited.insert(current) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "branch '{branch_id}' has a cycle in its retained undo interval at '{current}'"
+                    ),
+                ));
+            }
+            let node = graph.load_node(&current).await?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "branch '{branch_id}' retained undo interval references missing commit '{current}'"
+                    ),
+                )
+            })?;
+            let Some(parent) = node.parent_commit_ids.first().copied() else {
+                let Some(checkpoint) = floor else { break };
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "branch '{branch_id}' retained undo interval does not reach checkpoint '{checkpoint}'"
+                    ),
+                ));
+            };
+            history_dependencies.insert(parent);
+            current = parent;
+        }
+    }
+    Ok(AuthenticatedControlCommitReachability {
+        chronology_roots,
+        serving_dependencies,
+        history_dependencies,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointRecoveryRef {
@@ -168,9 +246,9 @@ struct StoredRootReachabilityDelta {
     #[musli(with = storage_codec::option)]
     new_root: Option<CommitId>,
     #[musli(with = storage_codec::option)]
-    old_control: Option<crate::branch::BranchHeadControl>,
+    old_control: Option<BranchHeadControl>,
     #[musli(with = storage_codec::option)]
-    new_control: Option<crate::branch::BranchHeadControl>,
+    new_control: Option<BranchHeadControl>,
     old_control_digest: [u8; 32],
     new_control_digest: [u8; 32],
 }
@@ -263,8 +341,8 @@ pub(crate) struct RootReachabilityDelta {
     pub(crate) branch_id: String,
     pub(crate) old_root: Option<CommitId>,
     pub(crate) new_root: Option<CommitId>,
-    pub(crate) old_control: Option<crate::branch::BranchHeadControl>,
-    pub(crate) new_control: Option<crate::branch::BranchHeadControl>,
+    pub(crate) old_control: Option<BranchHeadControl>,
+    pub(crate) new_control: Option<BranchHeadControl>,
     pub(crate) old_control_digest: [u8; 32],
     pub(crate) new_control_digest: [u8; 32],
 }
@@ -465,7 +543,7 @@ fn validate_stored_root_reachability_delta(
 }
 
 pub(crate) fn root_control_digest_for_control(
-    control: Option<&crate::branch::BranchHeadControl>,
+    control: Option<&BranchHeadControl>,
 ) -> Result<[u8; 32], LixError> {
     let Some(control) = control else {
         return Ok(root_control_digest(None));
@@ -499,6 +577,10 @@ pub(crate) async fn stage_reachability_delta_batch(
     checkpoint_roots: &[CommitId],
     preconditions: &mut Vec<StoragePrecondition>,
 ) -> Result<(), LixError> {
+    // This is the central authenticated root-publication boundary. Rotate the
+    // binary-CAS epoch in this same atomic write even when the transition only
+    // revives an existing commit and stages no blob bytes.
+    crate::binary_cas::stage_mutation_epoch(read, writes, preconditions).await?;
     if deltas.is_empty() && checkpoint_roots.is_empty() {
         return Ok(());
     }
@@ -561,50 +643,103 @@ async fn load_reachability_batches(
     store: &(impl StorageAdapterRead + ?Sized),
     queue: &StoredReachabilityQueue,
 ) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError> {
-    if queue.head_sequence == 0 {
-        return Ok(Vec::new());
+    fold_reachability_batches(
+        store,
+        queue,
+        Some(GC_REACHABILITY_BATCH_LIMIT),
+        Vec::new(),
+        |batches, sequence, batch| {
+            batches.push((sequence, batch));
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Authenticates and consumes a contiguous prefix of the queue in bounded
+/// pages. This is the single queue-row decoder for ordinary retirement,
+/// repository CAS marking, and tree-sweep root closure; the callback owns all
+/// domain-specific accumulation.
+///
+/// For `N` selected batches this performs `O(N)` row/decoding work and keeps
+/// `O(GC_REACHABILITY_BATCH_LIMIT + accumulator)` memory. `None` consumes the
+/// complete queue snapshot; `Some(limit)` consumes at most that many rows.
+/// The caller must bind publication to the raw queue token loaded alongside
+/// `queue` when the accumulated result can authorize deletion.
+async fn fold_reachability_batches<S, A, F>(
+    store: &S,
+    queue: &StoredReachabilityQueue,
+    limit: Option<usize>,
+    mut accumulator: A,
+    mut consume: F,
+) -> Result<A, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+    F: FnMut(&mut A, u64, StoredRootReachabilityBatch) -> Result<(), LixError>,
+{
+    if queue.head_sequence == 0 || limit == Some(0) {
+        return Ok(accumulator);
     }
-    let end = queue
-        .head_sequence
-        .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
-        .min(queue.tail_sequence.saturating_add(1));
-    let keys = (queue.head_sequence..end)
-        .map(reachability_sequence_key)
-        .collect::<Vec<_>>();
-    let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    let mut batches = Vec::with_capacity(keys.len());
-    for (sequence, value) in (queue.head_sequence..end).zip(result.value) {
-        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("GC reachability delta {sequence} is missing"),
-            ));
-        };
-        let batch: StoredRootReachabilityBatch =
-            storage_codec::decode("GC reachability delta", &bytes)?;
-        if batch.format_version != GC_REACHABILITY_FORMAT_VERSION || batch.sequence != sequence {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("GC reachability delta {sequence} has invalid identity"),
-            ));
+    let queue_end = queue.tail_sequence.saturating_add(1);
+    let selected_end = limit.map_or(queue_end, |limit| {
+        queue
+            .head_sequence
+            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+            .min(queue_end)
+    });
+    let mut sequence = queue.head_sequence;
+    while sequence < selected_end {
+        let page_end = sequence
+            .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
+            .min(selected_end);
+        let keys = (sequence..page_end)
+            .map(reachability_sequence_key)
+            .collect::<Vec<_>>();
+        let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+        for (expected_sequence, value) in (sequence..page_end).zip(result.value) {
+            let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("GC reachability delta {expected_sequence} is missing"),
+                ));
+            };
+            consume(
+                &mut accumulator,
+                expected_sequence,
+                decode_reachability_batch(expected_sequence, &bytes)?,
+            )?;
         }
-        let (body, digest) = encode_reachability_batch_body(
-            batch.sequence,
-            batch.deltas.clone(),
-            batch.checkpoint_roots.clone(),
-        )?;
-        let _ = body;
-        if digest != batch.digest {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("GC reachability delta {sequence} digest mismatch"),
-            ));
-        }
-        batches.push((sequence, batch));
+        sequence = page_end;
     }
-    Ok(batches)
+    Ok(accumulator)
+}
+
+fn decode_reachability_batch(
+    expected_sequence: u64,
+    bytes: &[u8],
+) -> Result<StoredRootReachabilityBatch, LixError> {
+    let batch: StoredRootReachabilityBatch = storage_codec::decode("GC reachability delta", bytes)?;
+    if batch.format_version != GC_REACHABILITY_FORMAT_VERSION || batch.sequence != expected_sequence
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("GC reachability delta {expected_sequence} has invalid identity"),
+        ));
+    }
+    let (_, digest) = encode_reachability_batch_body(
+        batch.sequence,
+        batch.deltas.clone(),
+        batch.checkpoint_roots.clone(),
+    )?;
+    if digest != batch.digest {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("GC reachability delta {expected_sequence} digest mismatch"),
+        ));
+    }
+    Ok(batch)
 }
 
 #[allow(dead_code)]
@@ -621,59 +756,24 @@ fn tree_sweep_digest(hashes: &BTreeSet<[u8; 32]>) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-#[allow(dead_code)]
-async fn load_all_reachability_batches_for_tree_sweep<S>(
+async fn collect_all_reachability_checkpoint_roots<S>(
     store: &S,
     queue: &StoredReachabilityQueue,
-) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError>
+) -> Result<BTreeSet<CommitId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    if queue.head_sequence == 0 {
-        return Ok(Vec::new());
-    }
-    let mut sequence = queue.head_sequence;
-    let mut batches = Vec::new();
-    while sequence <= queue.tail_sequence {
-        let end = sequence
-            .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
-            .min(queue.tail_sequence.saturating_add(1));
-        let keys = (sequence..end)
-            .map(reachability_sequence_key)
-            .collect::<Vec<_>>();
-        let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-        for (expected_sequence, value) in (sequence..end).zip(result.value) {
-            let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                return Err(tree_sweep_error(format!(
-                    "GC tree sweep reachability delta {expected_sequence} is missing"
-                )));
-            };
-            let batch: StoredRootReachabilityBatch =
-                storage_codec::decode("GC tree sweep reachability delta", &bytes)?;
-            if batch.format_version != GC_REACHABILITY_FORMAT_VERSION
-                || batch.sequence != expected_sequence
-            {
-                return Err(tree_sweep_error(format!(
-                    "GC tree sweep reachability delta {expected_sequence} has invalid identity"
-                )));
-            }
-            let (_, digest) = encode_reachability_batch_body(
-                batch.sequence,
-                batch.deltas.clone(),
-                batch.checkpoint_roots.clone(),
-            )?;
-            if digest != batch.digest {
-                return Err(tree_sweep_error(format!(
-                    "GC tree sweep reachability delta {expected_sequence} digest mismatch"
-                )));
-            }
-            batches.push((expected_sequence, batch));
-        }
-        sequence = end;
-    }
-    Ok(batches)
+    fold_reachability_batches(
+        store,
+        queue,
+        None,
+        BTreeSet::new(),
+        |checkpoint_roots, _, batch| {
+            checkpoint_roots.extend(batch.checkpoint_roots);
+            Ok(())
+        },
+    )
+    .await
 }
 
 #[allow(dead_code)]
@@ -687,49 +787,10 @@ where
         .reader(store.clone())
         .scan()
         .await?;
-    let recovery_refs = load_recovery_refs(store).await?;
     let (queue, raw_queue) = load_reachability_queue(store).await?;
-    let batches = load_all_reachability_batches_for_tree_sweep(store, &queue).await?;
-    let mut commits = controls
-        .iter()
-        .flat_map(|(_, control)| {
-            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
-        })
-        .collect::<BTreeSet<_>>();
-    commits.extend(recovery_refs.iter().flat_map(|recovery| {
-        [
-            recovery.recovered_head_commit_id,
-            recovery.checkpoint_commit_id,
-        ]
-    }));
-    commits.extend(
-        batches
-            .iter()
-            .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
-    );
-    if commits.is_empty() {
-        return Err(tree_sweep_error(
-            "tree sweep authenticated root set is empty",
-        ));
-    }
-
-    let mut pending = commits.iter().copied().collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
+    let closure = load_authenticated_repository_retention(store, &controls, &queue).await?;
     let mut roots = BTreeSet::new();
-    while let Some(commit_id) = pending.pop() {
-        if !visited.insert(commit_id) {
-            continue;
-        }
-        let manifest = crate::tracked_state::load_commit_state_manifest(store, commit_id)
-            .await?
-            .ok_or_else(|| {
-                tree_sweep_error(format!(
-                    "tree sweep root '{commit_id}' has no authenticated physical manifest"
-                ))
-            })?;
-        if let Some(source) = manifest.mutations.selected_source_commit_id() {
-            pending.push(source);
-        }
+    for manifest in closure.manifests.values() {
         if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
             roots.insert(*snapshot_root.root_id.as_bytes());
             for parent in &snapshot_root.parent_roots {
@@ -1281,12 +1342,12 @@ where
 /// currently known for each one. This is benchmark-only attribution: the
 /// ordinary collector never scans CHANGE_SPACE, and this helper is called
 /// outside the measured planner phase.
-#[cfg(feature = "storage-benches")]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn audit_repository_gc_standalone_refs<S>(
     store: &S,
 ) -> Result<Vec<String>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead + Clone + Send + Sync,
 {
     let controls = BranchHeadControlContext::new().reader(store).scan().await?;
     let active_refs = controls
@@ -1295,68 +1356,14 @@ where
         .collect::<BTreeSet<_>>();
     let (queue, _) = load_reachability_queue(store).await?;
     let batches = load_reachability_batches(store, &queue).await?;
-    let mut active_root_ids = controls
-        .iter()
-        .flat_map(|(_, control)| {
-            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
-        })
+    let closure = load_authenticated_repository_retention(store, &controls, &queue).await?;
+    let active_root_ids = closure.chronology_roots;
+    let active_dependency_ids = closure
+        .physical_authorities
+        .union(&closure.physical_dependencies)
+        .copied()
+        .chain(closure.semantic_dependencies.iter().copied())
         .collect::<BTreeSet<_>>();
-    active_root_ids.extend(
-        load_recovery_refs(store)
-            .await?
-            .into_iter()
-            .map(|recovery| recovery.recovered_head_commit_id),
-    );
-    active_root_ids.extend(
-        batches
-            .iter()
-            .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
-    );
-    let mut active_dependency_ids = BTreeSet::new();
-    let mut pending = active_root_ids.iter().copied().collect::<Vec<_>>();
-    let mut replay_debt_ids = Vec::new();
-    let mut seen_manifests = BTreeSet::new();
-    while let Some(commit_id) = pending.pop() {
-        if !seen_manifests.insert(commit_id) {
-            continue;
-        }
-        let Some(manifest) =
-            crate::tracked_state::load_commit_state_manifest(store, commit_id).await?
-        else {
-            continue;
-        };
-        if let Some(source) = manifest.mutations.selected_source_commit_id() {
-            active_dependency_ids.insert(source);
-            pending.push(source);
-        }
-        if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-            if let Some(base) = root.serving_base_commit_id {
-                active_dependency_ids.insert(base);
-            }
-        }
-        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
-            active_dependency_ids.extend(
-                snapshot_root
-                    .parent_roots
-                    .iter()
-                    .map(|parent| parent.commit_id),
-            );
-        }
-        if manifest.replay_debt.depth != 0 {
-            replay_debt_ids.push(commit_id);
-        }
-    }
-    if !replay_debt_ids.is_empty() {
-        let replay_nodes = CommitGraphContext::new()
-            .reader(store)
-            .load_nodes(&replay_debt_ids)
-            .await?;
-        for (_, node) in replay_nodes {
-            if let Some(node) = node {
-                active_dependency_ids.extend(node.parent_commit_ids);
-            }
-        }
-    }
     let mut retired_refs = BTreeMap::new();
     for (_, batch) in batches {
         for delta in batch.deltas {
@@ -1644,6 +1651,7 @@ fn validate_stored_recovery_ref(
 pub(crate) struct RepositoryGcSweep {
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
+    pub(crate) binary_cas: crate::binary_cas::BinaryCasGcSweep,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1661,6 +1669,427 @@ pub(crate) struct RepositoryGcProfile {
     pub(crate) total_us: u64,
 }
 
+/// Extends the existing retirement proof with every commit the point reader
+/// can still visit from an active logical root.
+///
+/// Semantic first-parent edges come only from the commit graph. A replacement
+/// generation may substitute its authenticated physical fallback, exactly as
+/// `TrackedStateStoreReader::point_replay_interval` does. Physical serving
+/// owners are retained directly by their authenticated inventory and do not
+/// acquire point-replay chronology merely because their original manifest had
+/// replay debt. Malformed debt, missing state, or a cycle aborts the complete
+/// GC transaction before any sweep is staged.
+async fn collect_active_point_replay_dependencies<S>(
+    store: &S,
+    active_manifests: &BTreeMap<CommitId, crate::tracked_state::CommitStateManifest>,
+    logical_start_ids: &BTreeSet<CommitId>,
+    physical_dependencies: &mut BTreeSet<CommitId>,
+    semantic_dependencies: &mut BTreeSet<CommitId>,
+    cas_logical_dependencies: &mut BTreeSet<CommitId>,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let mut graph = CommitGraphContext::new().reader(store.clone());
+    let mut completed = BTreeSet::new();
+    let mut loaded_manifests = active_manifests.clone();
+    let mut discovered_physical = BTreeSet::new();
+    let mut discovered_semantic = BTreeSet::new();
+    let mut discovered_cas_logical = BTreeSet::new();
+
+    for (start_commit_id, start_manifest) in active_manifests {
+        if start_manifest.replay_debt.depth == 0 || !logical_start_ids.contains(start_commit_id) {
+            continue;
+        }
+        let start_commit_id = *start_commit_id;
+        discovered_semantic.insert(start_commit_id);
+        let mut current_commit_id = start_commit_id;
+        let mut path = Vec::new();
+        let mut seen = BTreeSet::new();
+        loop {
+            if completed.contains(&current_commit_id) {
+                break;
+            }
+            if !seen.insert(current_commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "active GC point-replay dependency cycle from '{start_commit_id}' includes '{current_commit_id}'"
+                    ),
+                ));
+            }
+            path.push(current_commit_id);
+
+            let node = graph
+                .load_node(&current_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "active GC point-replay commit '{current_commit_id}' has no authenticated graph node"
+                        ),
+                    )
+                })?;
+            let manifest = match loaded_manifests.get(&current_commit_id) {
+                Some(manifest) => manifest.clone(),
+                None => {
+                    let manifest = crate::tracked_state::load_commit_state_manifest(
+                        store,
+                        current_commit_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "active GC point-replay commit '{current_commit_id}' has no authenticated physical manifest"
+                            ),
+                        )
+                    })?;
+                    loaded_manifests.insert(current_commit_id, manifest.clone());
+                    manifest
+                }
+            };
+            if manifest.replay_debt.depth == 0 {
+                break;
+            }
+
+            let replacement_fallback = manifest
+                .mutations
+                .replacement_generation
+                .as_ref()
+                .filter(|_| manifest.mutations.member_count != 0)
+                .map(|generation| {
+                    generation
+                        .fallback_commit_id
+                        .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes)))
+                });
+            let uses_replacement_fallback = replacement_fallback.is_some();
+            if uses_replacement_fallback && manifest.replay_debt.depth != 1 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "active GC replacement replay commit '{current_commit_id}' has malformed replay debt"
+                    ),
+                ));
+            }
+            let next_commit_id =
+                replacement_fallback.unwrap_or_else(|| node.parent_commit_ids.first().copied());
+            let Some(next_commit_id) = next_commit_id else {
+                if manifest.replay_debt.depth != 1 {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "active GC point-replay commit '{current_commit_id}' has unresolved replay debt"
+                        ),
+                    ));
+                }
+                break;
+            };
+
+            let next_manifest = match loaded_manifests.get(&next_commit_id) {
+                Some(manifest) => manifest.clone(),
+                None => {
+                    let manifest = crate::tracked_state::load_commit_state_manifest(
+                        store,
+                        next_commit_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "active GC point-replay dependency '{next_commit_id}' has no authenticated physical manifest"
+                            ),
+                        )
+                    })?;
+                    loaded_manifests.insert(next_commit_id, manifest.clone());
+                    manifest
+                }
+            };
+            if !uses_replacement_fallback
+                && next_manifest.replay_debt.depth + 1 != manifest.replay_debt.depth
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "active GC point-replay debt disagrees across '{current_commit_id}' -> '{next_commit_id}'"
+                    ),
+                ));
+            }
+
+            discovered_physical.insert(next_commit_id);
+            discovered_semantic.insert(next_commit_id);
+            discovered_cas_logical.insert(next_commit_id);
+            current_commit_id = next_commit_id;
+        }
+        completed.extend(path);
+    }
+    physical_dependencies.extend(discovered_physical);
+    semantic_dependencies.extend(discovered_semantic);
+    cas_logical_dependencies.extend(discovered_cas_logical);
+    Ok(())
+}
+
+/// One authenticated retained-root closure shared by every GC planner and
+/// audit consumer. Chronology remains owned by branch controls, recovery refs,
+/// and checkpoint pins. The remaining sets are derived serving authorities,
+/// never additional roots.
+#[derive(Debug)]
+struct AuthenticatedServingDependencyClosure {
+    chronology_roots: BTreeSet<CommitId>,
+    physical_authorities: BTreeSet<CommitId>,
+    physical_dependencies: BTreeSet<CommitId>,
+    semantic_dependencies: BTreeSet<CommitId>,
+    cas_logical_dependencies: BTreeSet<CommitId>,
+    manifests: BTreeMap<CommitId, crate::tracked_state::CommitStateManifest>,
+    mutation_nodes: BTreeSet<[u8; 32]>,
+    scoped_nodes: BTreeSet<[u8; 32]>,
+    native_parts: BTreeSet<[u8; 32]>,
+}
+
+async fn load_authenticated_serving_dependency_closure<S>(
+    store: &S,
+    chronology_roots: BTreeSet<CommitId>,
+    serving_dependencies: BTreeSet<CommitId>,
+    history_dependencies: BTreeSet<CommitId>,
+) -> Result<AuthenticatedServingDependencyClosure, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    if chronology_roots.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "authenticated GC active-root set is empty",
+        ));
+    }
+
+    let replay_start_ids = chronology_roots
+        .iter()
+        .chain(serving_dependencies.iter())
+        .chain(history_dependencies.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut physical_authorities = chronology_roots.clone();
+    let mut physical_dependencies = serving_dependencies.clone();
+    physical_dependencies.extend(history_dependencies.iter().copied());
+    let mut semantic_dependencies = serving_dependencies;
+    semantic_dependencies.extend(history_dependencies.iter().copied());
+    let mut cas_logical_dependencies = history_dependencies;
+    let mut manifests = BTreeMap::new();
+    let mut pending = chronology_roots.iter().copied().collect::<Vec<_>>();
+    while let Some(commit_id) = pending.pop() {
+        if manifests.contains_key(&commit_id) {
+            continue;
+        }
+        let manifest = crate::tracked_state::load_commit_state_manifest(store, commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "active GC root or authority '{commit_id}' has no authenticated physical manifest"
+                    ),
+                )
+            })?;
+        if let Some(source) = manifest.mutations.selected_source_commit_id() {
+            physical_authorities.insert(source);
+            pending.push(source);
+        }
+        if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+            if let Some(base) = root.serving_base_commit_id {
+                physical_dependencies.insert(base);
+            }
+        }
+        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+            physical_dependencies.extend(
+                snapshot_root
+                    .parent_roots
+                    .iter()
+                    .map(|parent| parent.commit_id),
+            );
+        }
+        manifests.insert(commit_id, manifest);
+    }
+
+    let mut scoped_nodes = BTreeSet::new();
+    let mut native_parts = BTreeSet::new();
+    let scoped_roots = manifests
+        .values()
+        .filter_map(|manifest| {
+            manifest
+                .current_state_scoped_ranges
+                .as_ref()
+                .map(|root| root.tree.clone())
+        })
+        .collect::<Vec<_>>();
+    if !scoped_roots.is_empty() {
+        let reachable =
+            crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
+        scoped_nodes.extend(reachable.node_ids);
+        for part in reachable.parts {
+            let descriptor =
+                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
+            match descriptor.source_kind {
+                0 | 2 => {
+                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
+                        descriptor.owner_commit_id,
+                    )));
+                }
+                1 => {
+                    native_parts.insert(descriptor.content_digest);
+                }
+                _ => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "active current-state scoped range has an unknown source kind",
+                    ));
+                }
+            }
+        }
+    }
+    let native_commit_dependencies = validate_live_native_parts(store, &native_parts).await?;
+    physical_dependencies.extend(native_commit_dependencies.iter().copied());
+    semantic_dependencies.extend(native_commit_dependencies);
+
+    let missing_dependency_ids = physical_dependencies
+        .iter()
+        .filter(|commit_id| !manifests.contains_key(commit_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let missing_dependency_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &missing_dependency_ids).await?;
+    for (commit_id, manifest) in missing_dependency_ids
+        .into_iter()
+        .zip(missing_dependency_manifests)
+    {
+        let manifest = manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "active GC serving dependency '{commit_id}' has no authenticated physical manifest"
+                ),
+            )
+        })?;
+        manifests.insert(commit_id, manifest);
+    }
+    collect_active_point_replay_dependencies(
+        store,
+        &manifests,
+        &replay_start_ids,
+        &mut physical_dependencies,
+        &mut semantic_dependencies,
+        &mut cas_logical_dependencies,
+    )
+    .await?;
+    semantic_dependencies.extend(cas_logical_dependencies.iter().copied());
+
+    let selected_owner_sources = physical_authorities
+        .union(&physical_dependencies)
+        .copied()
+        .collect::<Vec<_>>();
+    let selected_owner_source_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &selected_owner_sources).await?;
+    for (commit_id, manifest) in selected_owner_sources
+        .iter()
+        .copied()
+        .zip(selected_owner_source_manifests)
+    {
+        let manifest = manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "active GC dependency '{commit_id}' has no authenticated physical manifest"
+                ),
+            )
+        })?;
+        let may_contain_finite_selected_members =
+            manifest.mutations.may_contain_finite_selected_members();
+        manifests.insert(commit_id, manifest);
+        if may_contain_finite_selected_members {
+            physical_authorities.extend(
+                crate::tracked_state::load_local_selected_change_owner_commit_ids(store, commit_id)
+                    .await?,
+            );
+        }
+    }
+
+    let retained_physical_ids = physical_authorities
+        .union(&physical_dependencies)
+        .copied()
+        .collect::<Vec<_>>();
+    let retained_physical_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &retained_physical_ids).await?;
+    for (commit_id, manifest) in retained_physical_ids
+        .iter()
+        .copied()
+        .zip(retained_physical_manifests)
+    {
+        let manifest = manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "active GC dependency '{commit_id}' has no authenticated physical manifest"
+                ),
+            )
+        })?;
+        manifests.insert(commit_id, manifest);
+    }
+
+    let mut mutation_nodes = BTreeSet::new();
+    let mutation_roots =
+        crate::tracked_state::load_commit_mutation_directory_roots(store, &retained_physical_ids)
+            .await?;
+    for root in mutation_roots.into_iter().flatten() {
+        mutation_nodes
+            .extend(crate::tracked_state::collect_mutation_directory_node_ids(store, &root).await?);
+    }
+
+    Ok(AuthenticatedServingDependencyClosure {
+        chronology_roots,
+        physical_authorities,
+        physical_dependencies,
+        semantic_dependencies,
+        cas_logical_dependencies,
+        manifests,
+        mutation_nodes,
+        scoped_nodes,
+        native_parts,
+    })
+}
+
+async fn load_authenticated_repository_retention<S>(
+    store: &S,
+    controls: &[(String, BranchHeadControl)],
+    queue: &StoredReachabilityQueue,
+) -> Result<AuthenticatedServingDependencyClosure, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let control_reachability = authenticated_control_commit_reachability(store, controls).await?;
+    let mut chronology_roots = control_reachability.chronology_roots;
+    chronology_roots.extend(
+        load_recovery_refs(store)
+            .await?
+            .into_iter()
+            .flat_map(|recovery| {
+                [
+                    recovery.recovered_head_commit_id,
+                    recovery.checkpoint_commit_id,
+                ]
+            }),
+    );
+    chronology_roots.extend(collect_all_reachability_checkpoint_roots(store, queue).await?);
+    load_authenticated_serving_dependency_closure(
+        store,
+        chronology_roots,
+        control_reachability.serving_dependencies,
+        control_reachability.history_dependencies,
+    )
+    .await
+}
+
 /// Plans and stages logical repository GC against one pinned read.
 ///
 /// The caller must serialize this operation with repository writes and commit
@@ -1669,10 +2098,10 @@ pub(crate) struct RepositoryGcProfile {
 /// Content-addressed tree/CAS orphan repair is intentionally an offline path;
 /// out-of-band JSON is reclaimed here only from explicit ownership-loss
 /// candidates.
-/// Ordinary GC consumes only authenticated publication deltas.  Branch-head
+/// Ordinary GC consumes only authenticated publication deltas. Branch-head
 /// controls and checkpoint recovery refs are the complete active-root set;
-/// no semantic parent walk or full-space inventory discovery is permitted on
-/// this path.
+/// the only semantic walk permitted here is the exact point-replay dependency
+/// closure of those roots. Full-space inventory discovery remains forbidden.
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn stage_repository_gc<S>(
     store: S,
@@ -1694,43 +2123,119 @@ where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
     let started = Instant::now();
+    let mut staged_preconditions = Vec::new();
     let controls = BranchHeadControlContext::new()
         .reader(store.clone())
         .scan()
         .await?;
-    let recovery_refs = load_recovery_refs(&store).await?;
-    let mut active_roots = controls
+    let branch_ids = controls
         .iter()
-        .flat_map(|(_, control)| {
-            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
-        })
-        .collect::<BTreeSet<_>>();
-    active_roots.extend(recovery_refs.iter().flat_map(|recovery| {
-        [
-            recovery.recovered_head_commit_id,
-            recovery.checkpoint_commit_id,
-        ]
-    }));
-    if active_roots.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "authenticated GC active-root set is empty",
-        ));
+        .map(|(branch_id, _)| branch_id.clone())
+        .collect::<Vec<_>>();
+    let observed_controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .load_observed(&branch_ids)
+        .await?;
+    for ((branch_id, control), observed) in controls.iter().zip(observed_controls) {
+        if observed.control != Some(*control) {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("branch '{branch_id}' changed while GC roots were being observed"),
+            ));
+        }
+        staged_preconditions.push(branch_head_control_precondition(
+            branch_id,
+            observed.raw_token,
+        )?);
+    }
+    let (queue, raw_queue) = load_reachability_queue(&store).await?;
+    // Every repository sweep publishes against the exact queue snapshot used
+    // for root discovery, even when the bounded retirement window is empty or
+    // blocked and no queue row is consumed.
+    staged_preconditions.push(StoragePrecondition::KeyValueEquals {
+        space: GC_REACHABILITY_QUEUE_SPACE,
+        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
+        expected: raw_queue,
+    });
+    let batches = load_reachability_batches(&store, &queue).await?;
+    let AuthenticatedServingDependencyClosure {
+        chronology_roots: active_roots,
+        physical_authorities: active_authority_ids,
+        physical_dependencies: active_dependency_ids,
+        semantic_dependencies: active_semantic_dependency_ids,
+        cas_logical_dependencies: active_cas_dependency_ids,
+        manifests: _,
+        mutation_nodes: active_mutation_nodes,
+        scoped_nodes: active_scoped_nodes,
+        native_parts: active_current_parts,
+    } = load_authenticated_repository_retention(&store, &controls, &queue).await?;
+
+    // Derive both physical retirement and logical CAS retention from the one
+    // authenticated serving closure. In particular, do not perform a second
+    // replay-graph walk for CAS: a queue-old root is retained exactly when it
+    // is already a dependency of the active closure. This makes the retained
+    // owner set deterministic and prevents a separately reconstructed CAS
+    // authority from racing semantic projection retirement.
+    let mut blocked_sequences = BTreeSet::new();
+    let mut blocked_physical_dependency_ids = BTreeSet::new();
+    let mut blocked_history_dependency_ids = BTreeSet::new();
+    for (sequence, batch) in &batches {
+        for delta in &batch.deltas {
+            validate_stored_root_reachability_delta(delta)?;
+            let Some(old_root) = delta.old_root else {
+                continue;
+            };
+            if !retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_authority_ids,
+                &active_dependency_ids,
+            ) {
+                blocked_sequences.insert(*sequence);
+                blocked_physical_dependency_ids.insert(old_root);
+            }
+            if !retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_roots,
+                &active_cas_dependency_ids,
+            ) {
+                blocked_history_dependency_ids.insert(old_root);
+            }
+        }
     }
 
-    let (queue, raw_queue) = load_reachability_queue(&store).await?;
-    let batches = load_reachability_batches(&store, &queue).await?;
-    // Checkpoint pins carried by the authenticated batches are folded into
-    // the same active-root set before any retirement candidate is evaluated.
-    // Recovery refs normally provide the same roots; retaining both proofs
-    // makes a torn ref rotation fail closed instead of silently reclaiming a
-    // checkpoint-only authority.
-    active_roots.extend(
-        batches
-            .iter()
-            .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
+    // Physical selected-source/current-base owners remain manifest authority,
+    // while CAS marking receives only logical chronology and authenticated
+    // history/undo/replay dependencies. Feeding physical selected sources to
+    // CAS directly would resurrect rows masked by the logical retained root.
+    let retained_root_ids = active_authority_ids
+        .union(&active_dependency_ids)
+        .copied()
+        .chain(blocked_physical_dependency_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let retained_cas_root_ids = active_roots
+        .iter()
+        .copied()
+        .chain(active_cas_dependency_ids.iter().copied())
+        .chain(blocked_history_dependency_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut blob_roots =
+        crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
+            .await?;
+    blob_roots.extend(
+        crate::plugin::collect_gc_wasm_blob_roots(&store, &controls, &retained_cas_root_ids)
+            .await?,
     );
+    let upload_chunks =
+        crate::session::stage_reclaimable_upload_receipts(&store, writes, &blob_roots).await?;
+    let binary_cas =
+        crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
+            .await?;
+    crate::binary_cas::stage_mutation_epoch(&store, writes, &mut staged_preconditions).await?;
+
     if batches.is_empty() {
+        preconditions.extend(staged_preconditions);
         return Ok(RepositoryGcPlan {
             changelog: GcPlan {
                 roots: active_roots
@@ -1739,7 +2244,7 @@ where
                     .map(GcRoot::BranchHead)
                     .collect(),
                 live: GcLiveSet {
-                    commits: active_roots.iter().copied().collect(),
+                    commits: retained_root_ids.into_iter().collect(),
                     changes: Vec::new(),
                     payloads: Vec::new(),
                 },
@@ -1754,6 +2259,7 @@ where
             sweep: RepositoryGcSweep {
                 tracked_commit_roots: Vec::new(),
                 standalone_changes: Vec::new(),
+                binary_cas,
             },
             profile: RepositoryGcProfile {
                 root_discovery_us: elapsed_micros(started),
@@ -1763,97 +2269,6 @@ where
             },
         });
     }
-    let mut active_authority_ids = active_roots.clone();
-    let mut active_dependency_ids = BTreeSet::new();
-    let mut active_semantic_dependency_ids = BTreeSet::new();
-    let mut active_manifests = BTreeMap::new();
-    let mut pending = active_roots.iter().copied().collect::<Vec<_>>();
-    while let Some(commit_id) = pending.pop() {
-        if active_manifests.contains_key(&commit_id) {
-            continue;
-        }
-        let manifest = crate::tracked_state::load_commit_state_manifest(&store, commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("active GC root '{commit_id}' has no authenticated physical manifest"),
-                )
-            })?;
-        if let Some(source) = manifest.mutations.selected_source_commit_id() {
-            active_authority_ids.insert(source);
-            pending.push(source);
-        }
-        if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-            if let Some(base) = root.serving_base_commit_id {
-                active_dependency_ids.insert(base);
-            }
-        }
-        if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
-            active_dependency_ids.extend(
-                snapshot_root
-                    .parent_roots
-                    .iter()
-                    .map(|parent| parent.commit_id),
-            );
-        }
-        active_manifests.insert(commit_id, manifest);
-    }
-
-    let mut active_mutation_nodes = BTreeSet::new();
-    let mut active_scoped_nodes = BTreeSet::new();
-    let mut active_current_parts = BTreeSet::new();
-    let replay_debt_ids = active_manifests
-        .iter()
-        .filter_map(|(commit_id, manifest)| (manifest.replay_debt.depth != 0).then_some(*commit_id))
-        .collect::<Vec<_>>();
-    // Rootless active commits retain their semantic parents for bounded replay,
-    // but unrelated retired roots must not be blocked by a repository-global
-    // replay-debt flag. Resolve only the direct parent closure of the active
-    // replay-debt roots; this is bounded by active roots and preserves the
-    // history dependency proof without a changelog sweep.
-    if !replay_debt_ids.is_empty() {
-        let replay_nodes = CommitGraphContext::new()
-            .reader(store.clone())
-            .load_nodes(&replay_debt_ids)
-            .await?;
-        for (_, node) in replay_nodes.iter() {
-            if let Some(node) = node {
-                active_dependency_ids.extend(node.parent_commit_ids.iter().copied());
-                active_semantic_dependency_ids.extend(node.parent_commit_ids.iter().copied());
-            }
-        }
-    }
-    let scoped_roots = active_manifests
-        .values()
-        .filter_map(|manifest| {
-            manifest
-                .current_state_scoped_ranges
-                .as_ref()
-                .map(|root| root.tree.clone())
-        })
-        .collect::<Vec<_>>();
-    if !scoped_roots.is_empty() {
-        let reachable =
-            crate::tracked_state::validate_scoped_range_trees(&store, &scoped_roots).await?;
-        active_scoped_nodes.extend(reachable.node_ids);
-        for part in reachable.parts {
-            let descriptor =
-                crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-            if descriptor.source_kind == 1 {
-                active_current_parts.insert(descriptor.content_digest);
-            }
-        }
-    }
-    validate_live_native_parts(&store, &active_current_parts).await?;
-    let active_ids = active_manifests.keys().copied().collect::<Vec<_>>();
-    let mutation_roots =
-        crate::tracked_state::load_commit_mutation_directory_roots(&store, &active_ids).await?;
-    for root in mutation_roots.into_iter().flatten() {
-        active_mutation_nodes.extend(
-            crate::tracked_state::collect_mutation_directory_node_ids(&store, &root).await?,
-        );
-    }
 
     // A delta is a candidate until every active history/checkpoint/replay
     // dependency releases the old root.  Never consume a batch containing a
@@ -1861,30 +2276,12 @@ where
     // unreclaimable after the pin is later released.  The whole batch remains
     // at the queue head; this intentionally delays later deltas but preserves
     // the authenticated publication order and retry semantics.
-    let mut blocked_sequences = BTreeSet::new();
-    for (sequence, batch) in &batches {
-        for delta in &batch.deltas {
-            validate_stored_root_reachability_delta(delta)?;
-            let Some(old_root) = delta.old_root else {
-                continue;
-            };
-            if !retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_authority_ids,
-                &active_dependency_ids,
-            ) || replay_debt_ids.contains(&old_root)
-            {
-                blocked_sequences.insert(*sequence);
-            }
-        }
-    }
-
     let mut next_queue = queue;
     let queue_head = next_queue.head_sequence;
     let mut consumed_through = queue_head;
     let mut queue_open = true;
-    let mut reclaimed_commits = Vec::new();
+    let mut reclaimed_commits = BTreeSet::new();
+    let mut reclaimed_semantic_commits = BTreeSet::new();
     let mut reclaimed_standalone_changes = BTreeSet::new();
     let mut reclaimed_checkpoint_branches = BTreeSet::new();
     for (sequence, batch) in batches {
@@ -1923,79 +2320,81 @@ where
                 delta.new_root,
                 &active_authority_ids,
                 &active_dependency_ids,
-            ) && !replay_debt_ids.contains(&old_root);
+            );
             let semantic_retirement = retirement_is_proven(
                 old_root,
                 delta.new_root,
                 &active_roots,
                 &active_semantic_dependency_ids,
             );
-            if semantic_retirement {
+            if semantic_retirement && reclaimed_semantic_commits.insert(old_root) {
                 stage_delete_semantic_commit_projection(&store, writes, old_root).await?;
             }
             if !physical_retirement {
                 continue;
             }
-            let manifest = crate::tracked_state::load_commit_state_manifest(&store, old_root)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("retired GC root '{old_root}' has no authenticated manifest"),
-                    )
-                })?;
-            let retired_root =
-                crate::tracked_state::load_commit_mutation_directory_roots(&store, &[old_root])
+            if reclaimed_commits.insert(old_root) {
+                let manifest = crate::tracked_state::load_commit_state_manifest(&store, old_root)
                     .await?
-                    .into_iter()
-                    .next()
-                    .flatten();
-            if let Some(root) = retired_root {
-                let nodes =
-                    crate::tracked_state::collect_mutation_directory_node_ids(&store, &root)
-                        .await?;
-                for node_id in nodes.difference(&active_mutation_nodes) {
-                    writes.delete(
-                        crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
-                        StorageKey(Bytes::copy_from_slice(node_id)),
-                    );
-                }
-            }
-            if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
-                let reachable = crate::tracked_state::validate_scoped_range_trees(
-                    &store,
-                    std::slice::from_ref(&root.tree),
-                )
-                .await?;
-                for node_id in reachable.node_ids.difference(&active_scoped_nodes) {
-                    writes.delete(
-                        crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-                        StorageKey(Bytes::copy_from_slice(node_id)),
-                    );
-                }
-                for part in reachable.parts {
-                    let descriptor =
-                        crate::tracked_state::current_state_descriptor_from_scoped_range_part(
-                            &part,
-                        )?;
-                    if descriptor.source_kind == 1
-                        && !active_current_parts.contains(&descriptor.content_digest)
-                    {
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("retired GC root '{old_root}' has no authenticated manifest"),
+                        )
+                    })?;
+                let retired_root =
+                    crate::tracked_state::load_commit_mutation_directory_roots(&store, &[old_root])
+                        .await?
+                        .into_iter()
+                        .next()
+                        .flatten();
+                if let Some(root) = retired_root {
+                    let nodes =
+                        crate::tracked_state::collect_mutation_directory_node_ids(&store, &root)
+                            .await?;
+                    for node_id in nodes.difference(&active_mutation_nodes) {
                         writes.delete(
-                            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-                            StorageKey(Bytes::copy_from_slice(&descriptor.content_digest)),
-                        );
-                        writes.delete(
-                            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-                            StorageKey(Bytes::copy_from_slice(&descriptor.payload_refs_digest)),
+                            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+                            StorageKey(Bytes::copy_from_slice(node_id)),
                         );
                     }
                 }
+                if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
+                    let reachable = crate::tracked_state::validate_scoped_range_trees(
+                        &store,
+                        std::slice::from_ref(&root.tree),
+                    )
+                    .await?;
+                    for node_id in reachable.node_ids.difference(&active_scoped_nodes) {
+                        writes.delete(
+                            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+                            StorageKey(Bytes::copy_from_slice(node_id)),
+                        );
+                    }
+                    for part in reachable.parts {
+                        let descriptor =
+                            crate::tracked_state::current_state_descriptor_from_scoped_range_part(
+                                &part,
+                            )?;
+                        if descriptor.source_kind == 1
+                            && !active_current_parts.contains(&descriptor.content_digest)
+                        {
+                            writes.delete(
+                                crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+                                StorageKey(Bytes::copy_from_slice(&descriptor.content_digest)),
+                            );
+                            writes.delete(
+                                crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+                                StorageKey(Bytes::copy_from_slice(&descriptor.payload_refs_digest)),
+                            );
+                        }
+                    }
+                }
+                crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
+                    &store, writes, old_root, &manifest,
+                )
+                .await?;
             }
-            crate::tracked_state::stage_delete_commit_state_manifest_for_gc(
-                &store, writes, old_root, &manifest,
-            )
-            .await?;
             if let Some(control) = delta.old_control.as_ref() {
                 if !controls
                     .iter()
@@ -2022,7 +2421,6 @@ where
                     reclaimed_standalone_changes.insert(control.ref_change_id);
                 }
             }
-            reclaimed_commits.push(old_root);
         }
     }
 
@@ -2049,16 +2447,10 @@ where
                 bytes: Bytes::from(storage_codec::encode("GC reachability queue", &next_queue)?),
             },
         );
-        // The queue CAS is the publication/consumption fence.  The caller
-        // carries this exact read token into the backend write options.
-        preconditions.push(StoragePrecondition::KeyValueEquals {
-            space: GC_REACHABILITY_QUEUE_SPACE,
-            key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-            expected: raw_queue,
-        });
         writes.seal_changelog_gc();
     }
 
+    preconditions.extend(staged_preconditions);
     Ok(RepositoryGcPlan {
         changelog: GcPlan {
             roots: active_roots
@@ -2067,7 +2459,7 @@ where
                 .map(GcRoot::BranchHead)
                 .collect(),
             live: GcLiveSet {
-                commits: active_authority_ids.into_iter().collect(),
+                commits: retained_root_ids.into_iter().collect(),
                 changes: Vec::new(),
                 payloads: Vec::new(),
             },
@@ -2080,8 +2472,9 @@ where
             repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
-            tracked_commit_roots: reclaimed_commits,
+            tracked_commit_roots: reclaimed_commits.into_iter().collect(),
             standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
+            binary_cas,
         },
         profile: RepositoryGcProfile {
             root_discovery_us: elapsed_micros(started),
@@ -2100,36 +2493,33 @@ where
 async fn validate_live_native_parts<S>(
     store: &S,
     digests: &BTreeSet<[u8; 32]>,
-) -> Result<(), LixError>
+) -> Result<BTreeSet<CommitId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
     if digests.is_empty() {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
     let keys = digests
         .iter()
         .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
         .collect::<Vec<_>>();
-    let presence = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
-        .materialize(
-            store,
-            StorageGetOptions {
-                projection: StorageCoreProjection::KeyOnly,
-            },
-        )
+    let loaded = PointReadPlan::new(crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
         .await?;
-    if presence
-        .value
-        .into_iter()
-        .any(|value| !matches!(value, Some(StorageProjectedValue::KeyOnly)))
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "live current-state directory references a missing native data part",
-        ));
+    let mut commit_ids = BTreeSet::new();
+    for (digest, value) in digests.iter().zip(loaded.value) {
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "live current-state directory references a missing native data part",
+            ));
+        };
+        commit_ids.extend(
+            crate::tracked_state::decode_current_state_data_part_commit_ids(digest, &bytes)?,
+        );
     }
-    Ok(())
+    Ok(commit_ids)
 }
 
 /// Recovery-only verifier retained for explicit rebuild tooling and tests.
@@ -2254,6 +2644,7 @@ where
         sweep: RepositoryGcSweep {
             tracked_commit_roots: swept_snapshot_authorities,
             standalone_changes: Vec::new(),
+            binary_cas: Default::default(),
         },
         profile: RepositoryGcProfile {
             root_discovery_us,
@@ -3050,9 +3441,16 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(feature = "default_wasm_runtime")]
+    use std::io::{Cursor, Write as _};
+    #[cfg(feature = "default_wasm_runtime")]
+    use std::path::Path;
     use std::sync::Arc;
 
-    use crate::branch::{BranchHeadControl, BranchHeadControlContext, stage_branch_head_control};
+    use crate::branch::{
+        BranchHeadControl, BranchHeadControlContext, branch_head_control_precondition,
+        stage_branch_head_control,
+    };
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
@@ -3060,23 +3458,26 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::json_store::{
-        JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
+        JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
     };
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions,
+        StorageWriteOptions, StorageWriteSet,
     };
     use crate::storage_codec;
     use crate::tracked_state::{
+        CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
         TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
-        TrackedStateContext, TrackedStateDeltaRef, TrackedStateRootId, load_change_record_by_id,
+        TrackedStateContext, TrackedStateDeltaRef, TrackedStateIndexValue, TrackedStateRootId,
+        TrackedStateSingleStringReplacementRef, load_change_record_by_id,
         scan_change_records_from_commit_deltas, scan_commit_delta_inventory,
         stage_addressable_commit_deltas_with_selected_source, stage_change_locators,
         stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
+        stage_ordered_addressable_replacement_parts,
     };
     use crate::{GLOBAL_BRANCH_ID, Value, engine::Engine};
     use bytes::Bytes;
@@ -3085,14 +3486,1271 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, GC_TREE_SWEEP_FORMAT_VERSION,
-        GC_TREE_SWEEP_MARK_SPACE, RootReachabilityDelta, StoredTreeSweepMark,
-        begin_tree_sweep_epoch, load_checkpoint_gc_state, load_reachability_batches,
-        load_reachability_queue, load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch,
-        retirement_is_proven, root_control_digest_for_control, stage_checkpoint_gc_state,
-        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
-        stage_tree_sweep_epoch_page,
+        CheckpointGcState, CheckpointRecoveryRef, GC_REACHABILITY_DELTA_SPACE,
+        GC_REACHABILITY_QUEUE_SPACE, GC_TREE_SWEEP_FORMAT_VERSION, GC_TREE_SWEEP_MARK_SPACE,
+        RootReachabilityDelta, StoredTreeSweepMark, authenticated_control_commit_reachability,
+        begin_tree_sweep_epoch, collect_all_reachability_checkpoint_roots,
+        load_checkpoint_gc_state, load_reachability_batches, load_reachability_queue,
+        load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch, retirement_is_proven,
+        root_control_digest_for_control, stage_checkpoint_gc_state, stage_reachability_delta_batch,
+        stage_reachability_queue_seed, stage_recovery_ref_rotation, stage_tree_sweep_epoch_page,
     };
+
+    async fn append_checkpoint_batch(
+        storage: &StorageAdapter<Memory>,
+        checkpoint_roots: &[CommitId],
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("queue append read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            &[],
+            checkpoint_roots,
+            &mut preconditions,
+        )
+        .await
+        .expect("checkpoint batch should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("checkpoint batch should commit");
+    }
+
+    #[tokio::test]
+    async fn destructive_consumers_share_the_complete_tracked_control_projection() {
+        let head = CommitId::with_change_address_space(
+            *CommitId::for_test_label("control-projection-head").as_uuid(),
+        );
+        let tracked_generation = CommitId::for_test_label("control-projection-tracked");
+        let untracked_generation = CommitId::for_test_label("control-projection-untracked");
+        let working_diff = CommitId::with_change_address_space(
+            *CommitId::for_test_label("control-projection-working-diff").as_uuid(),
+        );
+        let timestamp =
+            LixTimestamp::expect_parse("control projection timestamp", "2026-01-01T00:00:00Z");
+        let controls = vec![(
+            "main".to_owned(),
+            BranchHeadControl {
+                head_commit_id: head,
+                tracked_generation,
+                untracked_generation,
+                current_state_revision: 7,
+                working_diff_checkpoint_commit_id: Some(working_diff),
+                created_at: timestamp,
+                updated_at: timestamp,
+                ref_change_id: ChangeId::for_test_label("control-projection-ref"),
+                schema_presence_bloom: [u64::MAX; 4],
+            },
+        )];
+
+        let projection = controls[0].1.tracked_reachability();
+        assert_eq!(
+            projection.chronology_roots,
+            [Some(head), Some(working_diff)]
+        );
+        assert_eq!(projection.serving_generation, tracked_generation);
+        assert_eq!(projection.serving_checkpoint_commit_id, Some(working_diff));
+
+        // A valid empty generation has no commit-state manifest because the
+        // selector UUID is not chronology. Its serving dependency projection
+        // is simply empty, while the semantic roots remain explicit.
+        let storage = StorageAdapter::new(Memory::new());
+        let checkpoint_record =
+            replay_commit_record("control-projection-working-diff", 0, None, timestamp);
+        let head_record = replay_commit_record(
+            "control-projection-head",
+            1,
+            Some(checkpoint_record.commit_id),
+            timestamp,
+        );
+        assert_eq!(checkpoint_record.commit_id, working_diff);
+        assert_eq!(head_record.commit_id, head);
+        persist_replay_closure_fixture(
+            &storage,
+            storage.new_write_set(),
+            &[checkpoint_record, head_record],
+            &[],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("control projection read should open");
+        let reachability = authenticated_control_commit_reachability(&read, &controls)
+            .await
+            .expect("rootless serving generation should be valid");
+        assert_eq!(
+            reachability.chronology_roots,
+            BTreeSet::from([head, working_diff])
+        );
+        assert!(reachability.serving_dependencies.is_empty());
+        assert!(!reachability.chronology_roots.contains(&tracked_generation));
+        assert!(
+            !reachability
+                .chronology_roots
+                .contains(&untracked_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_gc_accepts_rootless_tracked_serving_generation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp = LixTimestamp::expect_parse(
+            "rootless serving generation timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        let old_root = replay_commit_record("rootless-serving-old", 0, None, timestamp);
+        let active = replay_commit_record(
+            "rootless-serving-active",
+            1,
+            Some(old_root.commit_id),
+            timestamp,
+        );
+        let mut old_manifest =
+            test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
+        old_manifest.replay_debt = CommitStateReplayDebt::default();
+        old_manifest.snapshot_root = Some(Box::new(test_snapshot_root(old_root.commit_id)));
+        let mut active_manifest =
+            test_commit_state_manifest(&active, CommitStateMutationInventory::default());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
+
+        let control_ref = ChangeId::for_test_label("rootless-serving-control");
+        let old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
+        let serving_generation = CommitId::for_test_label("rootless-serving-generation");
+        let mut active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
+        active_control.tracked_generation = serving_generation;
+
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("rootless serving queue should seed");
+        stage_branch_head_control(&mut writes, "main", active_control)
+            .expect("rootless serving control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[old_root.clone(), active.clone()],
+            &[old_manifest, active_manifest],
+        )
+        .await;
+        stage_replay_root_delta(
+            &storage,
+            RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(old_root.commit_id),
+                new_root: Some(active.commit_id),
+                old_control: Some(old_control),
+                new_control: Some(active_control),
+                old_control_digest: root_control_digest_for_control(Some(&old_control))
+                    .expect("old rootless serving control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&active_control))
+                    .expect("active rootless serving control should encode"),
+            },
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rootless serving manifest read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, serving_generation)
+                .await
+                .expect("rootless serving manifest absence should load")
+                .is_none()
+        );
+        drop(read);
+
+        let plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            plan.sweep
+                .tracked_commit_roots
+                .contains(&old_root.commit_id)
+        );
+        assert!(
+            !plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&serving_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_point_replay_closure_uses_replacement_fallback_and_fails_closed() {
+        let timestamp =
+            LixTimestamp::expect_parse("replay closure timestamp", "2026-01-01T00:00:00Z");
+
+        // A certified replacement fallback is reader-equivalent chronology.
+        // A logical history/undo root retains both its physical and semantic
+        // dependency instead of the graph parent used by first-parent replay.
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("replay-fallback-root", 0, None, timestamp);
+        let fallback =
+            replay_commit_record("replay-fallback-base", 1, Some(root.commit_id), timestamp);
+        let active =
+            replay_commit_record("replay-fallback-active", 1, Some(root.commit_id), timestamp);
+        let mut writes = storage.new_write_set();
+        let active_inventory = stage_replacement_inventory(
+            &mut writes,
+            active.commit_id,
+            Some(fallback.commit_id),
+            "replay-fallback",
+            timestamp,
+        );
+        let mut root_manifest =
+            test_commit_state_manifest(&root, CommitStateMutationInventory::default());
+        root_manifest.replay_debt = CommitStateReplayDebt::default();
+        root_manifest.snapshot_root = Some(Box::new(test_snapshot_root(root.commit_id)));
+        let mut fallback_manifest =
+            test_commit_state_manifest(&fallback, CommitStateMutationInventory::default());
+        fallback_manifest.replay_debt = CommitStateReplayDebt::default();
+        fallback_manifest.snapshot_root = Some(Box::new(test_snapshot_root(fallback.commit_id)));
+        let active_manifest = test_commit_state_manifest(&active, active_inventory);
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[root.clone(), fallback.clone(), active.clone()],
+            &[root_manifest, fallback_manifest, active_manifest.clone()],
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("replacement replay read should open"),
+        );
+        let mut physical = BTreeSet::new();
+        let mut semantic = BTreeSet::new();
+        let mut cas = BTreeSet::new();
+        let active_manifests = BTreeMap::from([(active.commit_id, active_manifest)]);
+        super::collect_active_point_replay_dependencies(
+            &read,
+            &active_manifests,
+            &BTreeSet::from([active.commit_id]),
+            &mut physical,
+            &mut semantic,
+            &mut cas,
+        )
+        .await
+        .expect("authenticated replacement fallback should close");
+        assert_eq!(physical, BTreeSet::from([fallback.commit_id]));
+        assert_eq!(
+            semantic,
+            BTreeSet::from([active.commit_id, fallback.commit_id])
+        );
+        assert_eq!(cas, BTreeSet::from([fallback.commit_id]));
+
+        // The same bytes reached only through a selected physical owner are
+        // retained directly by that manifest and its mutation inventory. They
+        // do not enter point replay or acquire semantic/CAS chronology after
+        // recovery and undo roots release the interval.
+        let mut physical_only = BTreeSet::new();
+        let mut semantic_only = BTreeSet::new();
+        let mut cas_only = BTreeSet::new();
+        super::collect_active_point_replay_dependencies(
+            &read,
+            &active_manifests,
+            &BTreeSet::new(),
+            &mut physical_only,
+            &mut semantic_only,
+            &mut cas_only,
+        )
+        .await
+        .expect("authenticated physical-only fallback should close");
+        assert!(physical_only.is_empty());
+        assert!(semantic_only.is_empty());
+        assert!(cas_only.is_empty());
+
+        // A rootless physical owner without a public graph projection remains
+        // valid serving authority. Its authenticated manifest and mutation
+        // inventory are consumed directly; replay debt from its former
+        // logical role must not promote it back into chronology.
+        let storage = StorageAdapter::new(Memory::new());
+        let missing_graph = replay_commit_record("replay-missing-graph", 1, None, timestamp);
+        let missing_graph_manifest =
+            test_commit_state_manifest(&missing_graph, CommitStateMutationInventory::default());
+        let mut writes = storage.new_write_set();
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+            &mut writes,
+            &missing_graph_manifest,
+        )
+        .expect("missing-graph physical manifest should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("missing-graph fixture should commit");
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("missing-graph replay read should open"),
+        );
+        let mut physical_only = BTreeSet::new();
+        let mut semantic_only = BTreeSet::new();
+        let mut cas_only = BTreeSet::new();
+        super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(missing_graph.commit_id, missing_graph_manifest.clone())]),
+            &BTreeSet::new(),
+            &mut physical_only,
+            &mut semantic_only,
+            &mut cas_only,
+        )
+        .await
+        .expect("physical-only owner must not require semantic graph chronology");
+        assert!(physical_only.is_empty());
+        assert!(semantic_only.is_empty());
+        assert!(cas_only.is_empty());
+
+        // The identical bytes named by a logical history/undo/root role do
+        // require public chronology and must still fail closed.
+        let error = super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(missing_graph.commit_id, missing_graph_manifest)]),
+            &BTreeSet::from([missing_graph.commit_id]),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("missing semantic graph node must fail closed");
+        assert!(error.message.contains("no authenticated graph node"));
+
+        // The inverse omission is equally fatal: semantic chronology cannot
+        // authorize point replay through a missing physical manifest.
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("replay-missing-manifest-root", 0, None, timestamp);
+        let child = replay_commit_record(
+            "replay-missing-manifest-child",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let child_manifest =
+            test_commit_state_manifest(&child, CommitStateMutationInventory::default());
+        persist_replay_closure_fixture(
+            &storage,
+            storage.new_write_set(),
+            &[root, child.clone()],
+            std::slice::from_ref(&child_manifest),
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("missing-manifest replay read should open"),
+        );
+        let mut physical = BTreeSet::new();
+        let mut semantic = BTreeSet::new();
+        let error = super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(child.commit_id, child_manifest)]),
+            &BTreeSet::from([child.commit_id]),
+            &mut physical,
+            &mut semantic,
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("missing physical replay manifest must fail closed");
+        assert!(error.message.contains("no authenticated physical manifest"));
+        assert!(physical.is_empty());
+        assert!(semantic.is_empty());
+
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("replay-malformed-root", 0, None, timestamp);
+        let fallback = replay_commit_record(
+            "replay-malformed-fallback",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let active = replay_commit_record(
+            "replay-malformed-replacement",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let mut writes = storage.new_write_set();
+        let inventory = stage_replacement_inventory(
+            &mut writes,
+            active.commit_id,
+            Some(fallback.commit_id),
+            "replay-malformed-replacement",
+            timestamp,
+        );
+        let mut root_manifest =
+            test_commit_state_manifest(&root, CommitStateMutationInventory::default());
+        root_manifest.replay_debt = CommitStateReplayDebt::default();
+        root_manifest.snapshot_root = Some(Box::new(test_snapshot_root(root.commit_id)));
+        let mut fallback_manifest =
+            test_commit_state_manifest(&fallback, CommitStateMutationInventory::default());
+        fallback_manifest.replay_debt = CommitStateReplayDebt::default();
+        fallback_manifest.snapshot_root = Some(Box::new(test_snapshot_root(fallback.commit_id)));
+        let mut active_manifest = test_commit_state_manifest(&active, inventory);
+        active_manifest.replay_debt.depth = 2;
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[root, fallback, active.clone()],
+            &[root_manifest, fallback_manifest, active_manifest.clone()],
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("malformed replacement read should open"),
+        );
+        let error = super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(active.commit_id, active_manifest)]),
+            &BTreeSet::from([active.commit_id]),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("replacement replay depth other than one must fail closed");
+        assert!(error.message.contains("malformed replay debt"));
+
+        // Non-decreasing ordinary replay debt is malformed. Detection occurs
+        // before either dependency set can authorize a retirement.
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("replay-debt-root", 0, None, timestamp);
+        let child = replay_commit_record("replay-debt-child", 1, Some(root.commit_id), timestamp);
+        let mut root_manifest =
+            test_commit_state_manifest(&root, CommitStateMutationInventory::default());
+        root_manifest.replay_debt = CommitStateReplayDebt::default();
+        root_manifest.snapshot_root = Some(Box::new(test_snapshot_root(root.commit_id)));
+        let mut child_manifest =
+            test_commit_state_manifest(&child, CommitStateMutationInventory::default());
+        child_manifest.replay_debt.depth = 2;
+        persist_replay_closure_fixture(
+            &storage,
+            storage.new_write_set(),
+            &[root.clone(), child.clone()],
+            &[root_manifest, child_manifest.clone()],
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("malformed replay read should open"),
+        );
+        let mut physical = BTreeSet::new();
+        let mut semantic = BTreeSet::new();
+        let error = super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(child.commit_id, child_manifest)]),
+            &BTreeSet::from([child.commit_id]),
+            &mut physical,
+            &mut semantic,
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("non-decreasing replay debt must fail closed");
+        assert!(error.message.contains("replay debt disagrees"));
+        assert!(physical.is_empty());
+        assert!(semantic.is_empty());
+
+        // Replacement fallbacks are authenticated physical links, but they
+        // are not allowed to form a second cyclic chronology.
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("replay-cycle-root", 0, None, timestamp);
+        let left = replay_commit_record("replay-cycle-left", 1, Some(root.commit_id), timestamp);
+        let right = replay_commit_record("replay-cycle-right", 1, Some(root.commit_id), timestamp);
+        let mut writes = storage.new_write_set();
+        let left_inventory = stage_replacement_inventory(
+            &mut writes,
+            left.commit_id,
+            Some(right.commit_id),
+            "replay-cycle-left",
+            timestamp,
+        );
+        let right_inventory = stage_replacement_inventory(
+            &mut writes,
+            right.commit_id,
+            Some(left.commit_id),
+            "replay-cycle-right",
+            timestamp,
+        );
+        let mut root_manifest =
+            test_commit_state_manifest(&root, CommitStateMutationInventory::default());
+        root_manifest.replay_debt = CommitStateReplayDebt::default();
+        root_manifest.snapshot_root = Some(Box::new(test_snapshot_root(root.commit_id)));
+        let left_manifest = test_commit_state_manifest(&left, left_inventory);
+        let right_manifest = test_commit_state_manifest(&right, right_inventory);
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[root, left.clone(), right.clone()],
+            &[root_manifest, left_manifest.clone(), right_manifest],
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("cyclic replay read should open"),
+        );
+        let error = super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(left.commit_id, left_manifest)]),
+            &BTreeSet::from([left.commit_id]),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .await
+        .expect_err("replacement fallback cycle must fail closed");
+        assert!(error.message.contains("dependency cycle"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_closure_accepts_rootless_selected_owner_without_semantic_projection() {
+        let timestamp =
+            LixTimestamp::expect_parse("rootless selected owner timestamp", "2026-01-01T00:00:00Z");
+        let owner = replay_commit_record("rootless-selected-owner", 1, None, timestamp);
+        let active = replay_commit_record("rootless-selected-alias", 0, None, timestamp);
+
+        let selected_change = packed_change(
+            "rootless-selected-owner-change",
+            "rootless-selected-owner-row",
+            JsonSlot::Inline(r#"{"selected":true}"#.into()),
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        let owner_deltas =
+            commit_delta_refs(owner.commit_id, std::slice::from_ref(&selected_change));
+        let owner_stage = stage_commit_deltas_for_commit_state(&mut writes, &owner_deltas)
+            .expect("rootless selected-owner payload should stage");
+        let mut alias_deltas =
+            commit_delta_refs(active.commit_id, std::slice::from_ref(&selected_change));
+        alias_deltas[0].authored = false;
+        let alias_stage = stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &alias_deltas,
+            &[false],
+            owner.commit_id,
+        )
+        .expect("rootless selected alias should stage");
+        let owner_manifest =
+            test_commit_state_manifest(&owner, owner_stage.mutation_inventory().clone());
+        let mut active_manifest =
+            test_commit_state_manifest(&active, alias_stage.mutation_inventory().clone());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
+
+        // The owner's semantic projection has already retired. The active
+        // alias still authenticates the owner's immutable mutation inventory,
+        // exactly like a selected current-state generation in production.
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            std::slice::from_ref(&active),
+            &[owner_manifest, active_manifest],
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rootless selected-owner read should open"),
+        );
+        let closure = super::load_authenticated_serving_dependency_closure(
+            &read,
+            BTreeSet::from([active.commit_id]),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        )
+        .await
+        .expect("rootless selected owner must remain valid physical authority");
+        assert!(closure.physical_authorities.contains(&owner.commit_id));
+        assert!(!closure.semantic_dependencies.contains(&owner.commit_id));
+        assert!(!closure.cas_logical_dependencies.contains(&owner.commit_id));
+    }
+
+    #[tokio::test]
+    async fn ordinary_gc_releases_finite_selected_owner_only_after_checkpoint_release() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("selected owner timestamp", "2026-01-01T00:00:00Z");
+        let owner = replay_commit_record("selected-owner-source", 0, None, timestamp);
+        let checkpoint = replay_commit_record(
+            "selected-owner-checkpoint",
+            1,
+            Some(owner.commit_id),
+            timestamp,
+        );
+        let released = replay_commit_record(
+            "selected-owner-released",
+            2,
+            Some(checkpoint.commit_id),
+            timestamp,
+        );
+        let selected_change = packed_change(
+            "selected-owner-change",
+            "selected-owner-row",
+            JsonSlot::Inline(r#"{"selected":true}"#.into()),
+        );
+
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("selected-owner queue should seed");
+        let owner_deltas =
+            commit_delta_refs(owner.commit_id, std::slice::from_ref(&selected_change));
+        let owner_stage = stage_commit_deltas_for_commit_state(&mut writes, &owner_deltas)
+            .expect("selected owner payload should stage");
+        stage_change_locators(&mut writes, &owner_stage.locators);
+        let mut checkpoint_deltas =
+            commit_delta_refs(checkpoint.commit_id, std::slice::from_ref(&selected_change));
+        checkpoint_deltas[0].authored = false;
+        let checkpoint_stage =
+            stage_commit_deltas_for_commit_state(&mut writes, &checkpoint_deltas)
+                .expect("finite selected checkpoint member should stage");
+
+        let mut owner_manifest =
+            test_commit_state_manifest(&owner, owner_stage.mutation_inventory().clone());
+        owner_manifest.replay_debt = CommitStateReplayDebt::default();
+        owner_manifest.snapshot_root = Some(Box::new(test_snapshot_root(owner.commit_id)));
+        let mut checkpoint_manifest =
+            test_commit_state_manifest(&checkpoint, checkpoint_stage.mutation_inventory().clone());
+        checkpoint_manifest.replay_debt = CommitStateReplayDebt::default();
+        checkpoint_manifest.snapshot_root =
+            Some(Box::new(test_snapshot_root(checkpoint.commit_id)));
+        let mut released_manifest =
+            test_commit_state_manifest(&released, CommitStateMutationInventory::default());
+        released_manifest.replay_debt = CommitStateReplayDebt::default();
+        released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
+
+        let control_ref = ChangeId::for_test_label("selected-owner-control");
+        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let checkpoint_control =
+            replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        stage_branch_head_control(&mut writes, "main", checkpoint_control)
+            .expect("checkpoint control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[owner.clone(), checkpoint.clone(), released.clone()],
+            &[owner_manifest, checkpoint_manifest, released_manifest],
+        )
+        .await;
+        stage_replay_root_delta(
+            &storage,
+            RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(owner.commit_id),
+                new_root: Some(checkpoint.commit_id),
+                old_control: Some(owner_control),
+                new_control: Some(checkpoint_control),
+                old_control_digest: root_control_digest_for_control(Some(&owner_control))
+                    .expect("owner control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
+                    .expect("checkpoint control should encode"),
+            },
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected-owner dependency read should open");
+        assert_eq!(
+            crate::tracked_state::load_local_selected_change_owner_commit_ids(
+                &read,
+                checkpoint.commit_id,
+            )
+            .await
+            .expect("selected owner should resolve"),
+            BTreeSet::from([owner.commit_id])
+        );
+        drop(read);
+        let closure = load_audited_repository_retention(&storage).await;
+        assert!(closure.physical_authorities.contains(&owner.commit_id));
+
+        let retained_plan = run_ordinary_repository_gc(&storage).await;
+        assert!(retained_plan.sweep.tracked_commit_roots.is_empty());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retained selected-owner read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
+                .await
+                .expect("retained selected owner should load")
+                .is_some(),
+            "the finite selected locator keeps its physical owner live"
+        );
+        drop(read);
+
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, "main", released_control)
+            .expect("released control should stage");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected-owner release read should open");
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            &[RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(checkpoint.commit_id),
+                new_root: Some(released.commit_id),
+                old_control: Some(checkpoint_control),
+                new_control: Some(released_control),
+                old_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
+                    .expect("checkpoint control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&released_control))
+                    .expect("released control should encode"),
+            }],
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("selected-owner release delta should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("selected-owner release should publish atomically");
+
+        let released_plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&owner.commit_id)
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("released selected-owner read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
+                .await
+                .expect("released owner absence should load")
+                .is_none(),
+            "the owner is reclaimable after the final checkpoint releases the selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_gc_releases_scoped_descriptor_owner_only_after_root_release() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("scoped owner timestamp", "2026-01-01T00:00:00Z");
+        let owner = replay_commit_record("scoped-part-owner", 0, None, timestamp);
+        let checkpoint = replay_commit_record(
+            "scoped-part-checkpoint",
+            1,
+            Some(owner.commit_id),
+            timestamp,
+        );
+        let released = replay_commit_record(
+            "scoped-part-released",
+            2,
+            Some(checkpoint.commit_id),
+            timestamp,
+        );
+        let scope = CommitDeltaReplacementScope {
+            schema_key: "scoped_part_owner".to_owned(),
+            file_id: None,
+        };
+        let entity_pk = EntityPk::single("row");
+        let encoded_key =
+            crate::tracked_state::encode_key_ref(crate::tracked_state::TrackedStateKeyRef {
+                schema_key: &scope.schema_key,
+                file_id: None,
+                entity_pk: &entity_pk,
+            });
+
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("scoped owner queue should seed");
+        let owner_inventory = stage_replacement_inventory(
+            &mut writes,
+            owner.commit_id,
+            None,
+            &scope.schema_key,
+            timestamp,
+        );
+        let descriptor = crate::tracked_state::CurrentStatePartDescriptor {
+            first_key: encoded_key.clone(),
+            last_key: encoded_key,
+            content_digest: owner_inventory.replacement_part_digests[0],
+            payload_refs_digest: [0; 32],
+            source_kind: 0,
+            source_id: [0; 16],
+            owner_commit_id: *owner.commit_id.as_uuid().as_bytes(),
+            part_index: 0,
+            source_page_index: 0,
+            source_row_offset: 0,
+            row_count: 1,
+            fragmented: false,
+            uniform_created_at: timestamp,
+            uniform_updated_at: timestamp,
+        };
+        let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
+            &scope,
+            &descriptor,
+        )
+        .expect("scoped owner descriptor should encode");
+        let marker = crate::tracked_state::scoped_range::ScopedRangeCoverageMarker {
+            scope: part.scope.clone(),
+            row_count: 1,
+            part_count: 1,
+        };
+        let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
+            &mut writes,
+            [(marker, vec![part])],
+        )
+        .expect("scoped owner tree should stage");
+        let checkpoint_inventory = CommitStateMutationInventory::default();
+        let scoped_root = crate::tracked_state::attest_scoped_range_root(
+            checkpoint.commit_id,
+            None,
+            &checkpoint_inventory,
+            tree,
+        )
+        .expect("scoped owner root should attest");
+
+        let mut owner_manifest = test_commit_state_manifest(&owner, owner_inventory);
+        owner_manifest.replay_debt = CommitStateReplayDebt::default();
+        owner_manifest.snapshot_root = Some(Box::new(test_snapshot_root(owner.commit_id)));
+        let mut checkpoint_manifest = test_commit_state_manifest(&checkpoint, checkpoint_inventory);
+        checkpoint_manifest.replay_debt = CommitStateReplayDebt::default();
+        checkpoint_manifest.snapshot_root =
+            Some(Box::new(test_snapshot_root(checkpoint.commit_id)));
+        checkpoint_manifest.current_state_scoped_ranges = Some(Box::new(scoped_root));
+        let mut released_manifest =
+            test_commit_state_manifest(&released, CommitStateMutationInventory::default());
+        released_manifest.replay_debt = CommitStateReplayDebt::default();
+        released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
+
+        let control_ref = ChangeId::for_test_label("scoped-owner-control");
+        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let checkpoint_control =
+            replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        stage_branch_head_control(&mut writes, "main", checkpoint_control)
+            .expect("scoped owner checkpoint control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[owner.clone(), checkpoint.clone(), released.clone()],
+            &[owner_manifest, checkpoint_manifest, released_manifest],
+        )
+        .await;
+        stage_replay_root_delta(
+            &storage,
+            RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(owner.commit_id),
+                new_root: Some(checkpoint.commit_id),
+                old_control: Some(owner_control),
+                new_control: Some(checkpoint_control),
+                old_control_digest: root_control_digest_for_control(Some(&owner_control))
+                    .expect("scoped owner control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
+                    .expect("scoped checkpoint control should encode"),
+            },
+        )
+        .await;
+
+        let closure = load_audited_repository_retention(&storage).await;
+        assert!(closure.physical_authorities.contains(&owner.commit_id));
+
+        assert!(
+            run_ordinary_repository_gc(&storage)
+                .await
+                .sweep
+                .tracked_commit_roots
+                .is_empty()
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retained scoped owner read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
+                .await
+                .expect("retained scoped owner should load")
+                .is_some()
+        );
+        drop(read);
+
+        publish_replay_root_release(&storage, "main", checkpoint_control, released_control).await;
+        let released_plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&owner.commit_id)
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("released scoped owner read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
+                .await
+                .expect("released scoped owner absence should load")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_gc_releases_native_row_owner_only_after_scoped_root_release() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("native row owner timestamp", "2026-01-01T00:00:00Z");
+        let owner = replay_commit_record("native-row-owner", 0, None, timestamp);
+        let checkpoint =
+            replay_commit_record("native-row-checkpoint", 1, Some(owner.commit_id), timestamp);
+        let released = replay_commit_record(
+            "native-row-released",
+            2,
+            Some(checkpoint.commit_id),
+            timestamp,
+        );
+        let row = crate::tracked_state::CurrentStateDataRow {
+            encoded_key: b"native-row".to_vec(),
+            value: TrackedStateIndexValue {
+                change_id: ChangeId::for_test_label("native-row-change"),
+                commit_id: owner.commit_id,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            snapshot: JsonSlot::Inline(r#"{"native":true}"#.into()),
+            metadata: JsonSlot::None,
+        };
+        let encoded = crate::tracked_state::encode_current_state_data_part(
+            std::slice::from_ref(&row),
+            &mut None,
+        )
+        .expect("native row part should encode");
+        let scope = CommitDeltaReplacementScope {
+            schema_key: "native_row_owner".to_owned(),
+            file_id: None,
+        };
+        let descriptor = crate::tracked_state::CurrentStatePartDescriptor {
+            first_key: encoded.first_key.clone(),
+            last_key: encoded.last_key.clone(),
+            content_digest: encoded.digest,
+            payload_refs_digest: encoded.refs_digest,
+            source_kind: 1,
+            source_id: [0; 16],
+            owner_commit_id: [0; 16],
+            part_index: 0,
+            source_page_index: 0,
+            source_row_offset: 0,
+            row_count: encoded.row_count,
+            fragmented: false,
+            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+        };
+        let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
+            &scope,
+            &descriptor,
+        )
+        .expect("native row descriptor should encode");
+        let marker = crate::tracked_state::scoped_range::ScopedRangeCoverageMarker {
+            scope: part.scope.clone(),
+            row_count: 1,
+            part_count: 1,
+        };
+
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("native row queue should seed");
+        writes.put(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            StorageKey(Bytes::copy_from_slice(&encoded.digest)),
+            StorageValue {
+                bytes: encoded.bytes.clone(),
+            },
+        );
+        writes.put(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+            StorageKey(Bytes::copy_from_slice(&encoded.refs_digest)),
+            StorageValue {
+                bytes: encoded.refs_bytes,
+            },
+        );
+        let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
+            &mut writes,
+            [(marker, vec![part])],
+        )
+        .expect("native row scoped tree should stage");
+        let snapshot_entity_pk = EntityPk::single("native-row");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("native serving snapshot read should open");
+        let tracked_state = TrackedStateContext::new();
+        let mut snapshot_writer = tracked_state.writer(&read, &mut writes);
+        snapshot_writer
+            .stage_commit_root(
+                &checkpoint.commit_id.to_string(),
+                None,
+                [TrackedStateDeltaRef {
+                    schema_key: &scope.schema_key,
+                    file_id: None,
+                    entity_pk: &snapshot_entity_pk,
+                    change_id: row.value.change_id,
+                    commit_id: row.value.commit_id,
+                    deleted: false,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                }],
+            )
+            .await
+            .expect("native serving snapshot should stage");
+        let checkpoint_snapshot_root = snapshot_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == checkpoint.commit_id)
+            .cloned()
+            .expect("native serving snapshot metadata should stage");
+        drop(snapshot_writer);
+        drop(read);
+        let inventory = CommitStateMutationInventory::default();
+        let scoped_root = crate::tracked_state::attest_scoped_range_root(
+            checkpoint.commit_id,
+            None,
+            &inventory,
+            tree,
+        )
+        .expect("native row scoped root should attest");
+
+        let mut owner_manifest =
+            test_commit_state_manifest(&owner, CommitStateMutationInventory::default());
+        owner_manifest.replay_debt = CommitStateReplayDebt::default();
+        owner_manifest.snapshot_root = Some(Box::new(test_snapshot_root(owner.commit_id)));
+        let mut checkpoint_manifest = test_commit_state_manifest(&checkpoint, inventory);
+        checkpoint_manifest.replay_debt = CommitStateReplayDebt::default();
+        checkpoint_manifest.snapshot_root = Some(Box::new(checkpoint_snapshot_root));
+        checkpoint_manifest.current_state_scoped_ranges = Some(Box::new(scoped_root));
+        let mut released_manifest =
+            test_commit_state_manifest(&released, CommitStateMutationInventory::default());
+        released_manifest.replay_debt = CommitStateReplayDebt::default();
+        released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
+
+        let control_ref = ChangeId::for_test_label("native-row-control");
+        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let mut checkpoint_control =
+            replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
+        let serving_generation = CommitId::for_test_label("native-row-serving-generation");
+        checkpoint_control.tracked_generation = serving_generation;
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("native serving-base read should open");
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_root_current_base("main", serving_generation, checkpoint.commit_id);
+        drop(read);
+        stage_branch_head_control(&mut writes, "main", checkpoint_control)
+            .expect("native row checkpoint control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[owner.clone(), checkpoint.clone(), released.clone()],
+            &[owner_manifest, checkpoint_manifest, released_manifest],
+        )
+        .await;
+        stage_replay_root_delta(
+            &storage,
+            RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(owner.commit_id),
+                new_root: Some(checkpoint.commit_id),
+                old_control: Some(owner_control),
+                new_control: Some(checkpoint_control),
+                old_control_digest: root_control_digest_for_control(Some(&owner_control))
+                    .expect("native owner control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
+                    .expect("native checkpoint control should encode"),
+            },
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("native dependency read should open");
+        assert_eq!(
+            super::validate_live_native_parts(&read, &BTreeSet::from([encoded.digest]))
+                .await
+                .expect("native owner should decode"),
+            BTreeSet::from([owner.commit_id])
+        );
+        drop(read);
+        let closure = load_audited_repository_retention(&storage).await;
+        assert!(closure.physical_dependencies.contains(&owner.commit_id));
+
+        // A present native part is authenticated content, not presence-only
+        // liveness. Corrupt bytes must abort the complete plan before any
+        // queue consumption or retirement mutation is staged.
+        let native_key = StorageKey(Bytes::copy_from_slice(&encoded.digest));
+        let mut remove = storage.new_write_set();
+        remove.delete(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            native_key.clone(),
+        );
+        storage
+            .commit_write_set(remove, StorageWriteOptions::default())
+            .await
+            .expect("native part removal should commit");
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            native_key.clone(),
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed-native-current-state-part"),
+            },
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("malformed native part should commit");
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("malformed native GC read should open"),
+        );
+        let mut failed_writes = storage.new_write_set();
+        let mut failed_preconditions = Vec::new();
+        super::stage_repository_gc_with_preconditions(
+            read,
+            &mut failed_writes,
+            &mut failed_preconditions,
+        )
+        .await
+        .expect_err("malformed native owner must fail the whole GC plan");
+        assert!(failed_writes.is_empty());
+        assert!(failed_preconditions.is_empty());
+
+        let mut remove = storage.new_write_set();
+        remove.delete(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            native_key.clone(),
+        );
+        storage
+            .commit_write_set(remove, StorageWriteOptions::default())
+            .await
+            .expect("malformed native part removal should commit");
+        let mut restore = storage.new_write_set();
+        restore.put(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            native_key,
+            StorageValue {
+                bytes: encoded.bytes.clone(),
+            },
+        );
+        storage
+            .commit_write_set(restore, StorageWriteOptions::default())
+            .await
+            .expect("authenticated native part restoration should commit");
+
+        assert!(
+            run_ordinary_repository_gc(&storage)
+                .await
+                .sweep
+                .tracked_commit_roots
+                .is_empty()
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retained native owner read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
+                .await
+                .expect("retained native owner should load")
+                .is_some()
+        );
+        drop(read);
+
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, "main", released_control)
+            .expect("native released control should stage");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("native release read should open");
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            &[RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(checkpoint.commit_id),
+                new_root: Some(released.commit_id),
+                old_control: Some(checkpoint_control),
+                new_control: Some(released_control),
+                old_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
+                    .expect("native checkpoint control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&released_control))
+                    .expect("native released control should encode"),
+            }],
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("native owner release should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("native owner release should publish");
+
+        let released_plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&owner.commit_id)
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("released native owner read should open");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, owner.commit_id)
+                .await
+                .expect("released native owner absence should load")
+                .is_none()
+        );
+    }
 
     async fn tree_sweep_fixture() -> (
         StorageAdapter<Memory>,
@@ -3134,7 +4792,7 @@ mod tests {
             tracked_generation: commit_id,
             untracked_generation: commit_id,
             current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
+            working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("tree-sweep-ref"),
@@ -3160,6 +4818,195 @@ mod tests {
             .await
             .expect("tree sweep fixture should commit");
         (storage, commit_id, root_hash, dead_hash, dead_hash_two)
+    }
+
+    #[tokio::test]
+    async fn gc_sweep_branch_guard_rejects_concurrent_publication() {
+        let (storage, commit_id, _root_hash, _dead_hash, _dead_hash_two) =
+            tree_sweep_fixture().await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fixture read should open");
+        let observed = BranchHeadControlContext::new()
+            .reader(&read)
+            .load_observed(&["main".to_owned()])
+            .await
+            .expect("branch control should load")
+            .pop()
+            .expect("branch control observation should exist");
+        let guard = branch_head_control_precondition("main", observed.raw_token)
+            .expect("branch control guard should encode");
+        drop(read);
+
+        let mut concurrent = storage.new_write_set();
+        let mut advanced = observed.control.expect("fixture control should exist");
+        advanced.head_commit_id = CommitId::for_test_label("concurrent-head");
+        advanced.tracked_generation = advanced.head_commit_id;
+        advanced.untracked_generation = advanced.head_commit_id;
+        advanced.current_state_revision = advanced.current_state_revision.saturating_add(1);
+        stage_branch_head_control(&mut concurrent, "main", advanced)
+            .expect("concurrent control should stage");
+        storage
+            .commit_write_set(concurrent, StorageWriteOptions::default())
+            .await
+            .expect("concurrent publication should commit");
+
+        let mut stale_sweep = storage.new_write_set();
+        stale_sweep.put(
+            GC_REACHABILITY_QUEUE_SPACE,
+            StorageKey(Bytes::from_static(b"stale-sweep-marker")),
+            StorageValue {
+                bytes: Bytes::from_static(b"stale-sweep-marker"),
+            },
+        );
+        let error = storage
+            .commit_write_set(
+                stale_sweep,
+                StorageWriteOptions {
+                    preconditions: vec![guard],
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale GC publication must be rejected");
+        assert!(error.to_string().contains("precondition"));
+        assert_ne!(advanced.head_commit_id, commit_id);
+    }
+
+    #[tokio::test]
+    async fn offline_sweep_and_audit_share_retained_physical_owner_closure() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("shared offline owner timestamp", "2026-01-01T00:00:00Z");
+        let owner = CommitId::for_test_label("shared-offline-physical-owner");
+        let active = CommitId::for_test_label("shared-offline-active-root");
+        let retired_ref = ChangeId::for_test_label("shared-offline-retired-ref");
+        let active_ref = ChangeId::for_test_label("shared-offline-active-ref");
+        let (owner_hash, owner_bytes) =
+            crate::tracked_state::test_gc_leaf_chunk(b"shared-offline-owner");
+        let (active_hash, active_bytes) =
+            crate::tracked_state::test_gc_leaf_chunk(b"shared-offline-active");
+        let owner_root = TrackedStateCommitRoot {
+            commit_id: owner,
+            root_id: TrackedStateRootId::new(owner_hash),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: owner_bytes.len() as u64,
+        };
+        let active_root = TrackedStateCommitRoot {
+            commit_id: active,
+            root_id: TrackedStateRootId::new(active_hash),
+            parent_roots: vec![TrackedStateCommitRootParent {
+                commit_id: owner,
+                root_id: owner_root.root_id.clone(),
+            }],
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: active_bytes.len() as u64,
+        };
+        let manifest = |commit_id, snapshot_root| CommitStateManifest {
+            commit_id,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            replay_debt: CommitStateReplayDebt::default(),
+            mutations: CommitStateMutationInventory::default(),
+            touched_scope_filter: Default::default(),
+            current_state_scoped_ranges: None,
+            snapshot_root: Some(Box::new(snapshot_root)),
+        };
+        let owner_control = replay_branch_control(owner, retired_ref, timestamp);
+        let active_control = replay_branch_control(active, active_ref, timestamp);
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("shared offline queue should seed");
+        stage_branch_head_control(&mut writes, "main", active_control)
+            .expect("shared offline control should stage");
+        stage_commit_state_manifest(&mut writes, &manifest(owner, owner_root))
+            .expect("shared offline owner manifest should stage");
+        stage_commit_state_manifest(&mut writes, &manifest(active, active_root))
+            .expect("shared offline active manifest should stage");
+        for (hash, bytes) in [(owner_hash, owner_bytes), (active_hash, active_bytes)] {
+            writes.put(
+                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                StorageKey(Bytes::copy_from_slice(&hash)),
+                StorageValue { bytes },
+            );
+        }
+        let mut retired_change = packed_change(
+            "shared-offline-retired-ref",
+            "shared-offline-retired-row",
+            JsonSlot::Inline(r#"{"retained":true}"#.into()),
+        );
+        retired_change.change_id = retired_ref;
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("shared offline changelog read should open");
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![retired_change],
+            })
+            .await
+            .expect("shared offline retired ref should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("shared offline fixture should commit");
+        stage_replay_root_delta(
+            &storage,
+            RootReachabilityDelta {
+                branch_id: "main".to_owned(),
+                old_root: Some(owner),
+                new_root: Some(active),
+                old_control: Some(owner_control),
+                new_control: Some(active_control),
+                old_control_digest: root_control_digest_for_control(Some(&owner_control))
+                    .expect("shared offline old control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&active_control))
+                    .expect("shared offline active control should encode"),
+            },
+        )
+        .await;
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("shared offline consumer read should open"),
+        );
+        let controls = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .scan()
+            .await
+            .expect("shared offline controls should load");
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("shared offline queue should load");
+        let closure = super::load_authenticated_repository_retention(&read, &controls, &queue)
+            .await
+            .expect("shared offline owner closure should authenticate");
+        assert!(closure.physical_dependencies.contains(&owner));
+        let (_, _, _, live_chunks) = super::load_tree_sweep_root_closure(&read)
+            .await
+            .expect("offline sweep should retain the physical owner tree");
+        assert_eq!(live_chunks, BTreeSet::from([owner_hash, active_hash]));
+        let audit = super::audit_repository_gc_standalone_refs(&read)
+            .await
+            .expect("standalone audit should consume the same closure");
+        assert_eq!(
+            audit,
+            vec![format!(
+                "{}:retired_delta_old_control:history_dependency_pin:old_root={owner}",
+                retired_ref
+            )]
+        );
     }
 
     #[tokio::test]
@@ -3554,6 +5401,859 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].1.checkpoint_roots, vec![new_root]);
         assert_eq!(batches[0].1.deltas[0].old_root, Some(old_root));
+    }
+
+    #[tokio::test]
+    async fn authenticated_queue_fold_streams_beyond_one_page_and_fails_closed_on_corruption() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("queue seed should commit");
+        let roots = (0..65)
+            .map(|index| CommitId::for_test_label(&format!("queue-root-{index}")))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            append_checkpoint_batch(&storage, std::slice::from_ref(root)).await;
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("full queue read should open");
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("queue should load");
+        assert_eq!(
+            load_reachability_batches(&read, &queue)
+                .await
+                .expect("bounded retirement batches should load")
+                .len(),
+            64
+        );
+        assert_eq!(
+            collect_all_reachability_checkpoint_roots(&read, &queue)
+                .await
+                .expect("full root fold should load"),
+            roots.iter().copied().collect()
+        );
+        drop(read);
+
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            GC_REACHABILITY_DELTA_SPACE,
+            super::reachability_sequence_key(65),
+            StorageValue {
+                bytes: Bytes::from_static(b"corrupt-authenticated-queue-batch"),
+            },
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("queue corruption fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt queue read should open");
+        assert!(
+            collect_all_reachability_checkpoint_roots(&read, &queue)
+                .await
+                .is_err(),
+            "the shared decoder must authenticate every page"
+        );
+    }
+
+    async fn stage_root_only_branch_publication(
+        storage: &StorageAdapter<Memory>,
+        new_control: BranchHeadControl,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("new branch publication read should open");
+        let mut publication = storage.new_write_set();
+        stage_branch_head_control(&mut publication, "queue-race-branch", new_control)
+            .expect("new branch control should stage");
+        let delta = RootReachabilityDelta {
+            branch_id: "queue-race-branch".to_owned(),
+            old_root: None,
+            new_root: Some(new_control.head_commit_id),
+            old_control: None,
+            new_control: Some(new_control),
+            old_control_digest: root_control_digest_for_control(None).unwrap(),
+            new_control_digest: root_control_digest_for_control(Some(&new_control)).unwrap(),
+        };
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(&read, &mut publication, &[delta], &[], &mut preconditions)
+            .await
+            .expect("new branch queue batch should stage");
+        (publication, preconditions)
+    }
+
+    async fn queue_publication_race_rejects_stale_peer(blocked_queue: bool, gc_first: bool) {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("race repository should initialize");
+        let storage = StorageAdapter::new(backend);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan staging read should open");
+        let mut orphan_writes = storage.new_write_set();
+        let orphan = crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                b"queue-race-orphan".to_vec(),
+            ))
+            .await
+            .expect("orphan payload should stage");
+        drop(read);
+        storage
+            .commit_write_set(orphan_writes, StorageWriteOptions::default())
+            .await
+            .expect("orphan payload should commit");
+
+        let (main_branch_id, main_control) = BranchHeadControlContext::new()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("main control read should open"),
+            )
+            .scan()
+            .await
+            .expect("branch controls should load")
+            .into_iter()
+            .find(|(branch_id, _)| branch_id != GLOBAL_BRANCH_ID)
+            .expect("workspace branch control should exist");
+        if blocked_queue {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("blocked batch read should open");
+            let mut writes = storage.new_write_set();
+            let mut preconditions = Vec::new();
+            let delta = RootReachabilityDelta {
+                branch_id: main_branch_id,
+                old_root: Some(main_control.head_commit_id),
+                new_root: Some(main_control.head_commit_id),
+                old_control: Some(main_control),
+                new_control: Some(main_control),
+                old_control_digest: root_control_digest_for_control(Some(&main_control)).unwrap(),
+                new_control_digest: root_control_digest_for_control(Some(&main_control)).unwrap(),
+            };
+            stage_reachability_delta_batch(&read, &mut writes, &[delta], &[], &mut preconditions)
+                .await
+                .expect("blocked batch should stage");
+            drop(read);
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("blocked batch should commit");
+        }
+
+        let stale_read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("stale sweep read should open"),
+        );
+        let mut stale_writes = storage.new_write_set();
+        let mut stale_preconditions = Vec::new();
+        let plan = super::stage_repository_gc_with_preconditions(
+            stale_read,
+            &mut stale_writes,
+            &mut stale_preconditions,
+        )
+        .await
+        .expect("stale sweep should stage");
+        assert_eq!(plan.sweep.binary_cas.reclaimed_chunk_rows, 1);
+
+        let mut new_control = main_control;
+        new_control.ref_change_id = ChangeId::for_test_label("queue-race-new-branch-ref");
+        let (publication, publication_preconditions) =
+            stage_root_only_branch_publication(&storage, new_control).await;
+        if gc_first {
+            storage
+                .commit_write_set(
+                    stale_writes,
+                    StorageWriteOptions {
+                        preconditions: stale_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("GC should win the root-publication epoch");
+            let error = storage
+                .commit_write_set(
+                    publication,
+                    StorageWriteOptions {
+                        preconditions: publication_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect_err("stale root-only publication must lose after GC");
+            assert!(error.to_string().contains("precondition"));
+            let (retry, retry_preconditions) =
+                stage_root_only_branch_publication(&storage, new_control).await;
+            storage
+                .commit_write_set(
+                    retry,
+                    StorageWriteOptions {
+                        preconditions: retry_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("fresh root-only publication retry should commit");
+            let control = BranchHeadControlContext::new()
+                .reader(
+                    storage
+                        .begin_read(StorageReadOptions::default())
+                        .await
+                        .expect("root-only retry verification read should open"),
+                )
+                .load("queue-race-branch")
+                .await
+                .expect("root-only retry control should load");
+            assert_eq!(control, Some(new_control));
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("GC-first orphan verification read should open");
+            let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
+            assert!(
+                reader
+                    .load_bytes_many(&[orphan.hash])
+                    .await
+                    .expect("GC-first orphan verification should load")
+                    .into_vec()[0]
+                    .is_none()
+            );
+            return;
+        }
+        storage
+            .commit_write_set(
+                publication,
+                StorageWriteOptions {
+                    preconditions: publication_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("new branch publication should commit");
+
+        let error = storage
+            .commit_write_set(
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: stale_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale sweep must not commit after queue publication");
+        assert!(error.to_string().contains("precondition"));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan verification read should open");
+        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
+        assert!(
+            reader
+                .load_bytes_many(&[orphan.hash])
+                .await
+                .expect("orphan should remain readable")
+                .into_vec()[0]
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_gc_epoch_serializes_root_only_publication_in_both_orders() {
+        queue_publication_race_rejects_stale_peer(false, false).await;
+        queue_publication_race_rejects_stale_peer(true, false).await;
+        queue_publication_race_rejects_stale_peer(false, true).await;
+        queue_publication_race_rejects_stale_peer(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn repository_gc_marks_binary_roots_from_checkpoint_batches_beyond_retirement_window() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("full-queue repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("full-queue repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("full-queue session should open");
+        let live_bytes = b"checkpoint-batch-65-live-blob";
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/queued.bin', $1)",
+                &[Value::Blob(live_bytes.to_vec().into())],
+            )
+            .await
+            .expect("queued file should publish");
+        let retained_commit = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .expect("retained commit should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("retained commit id should exist");
+        let retained_commit = CommitId::parse_lix(&retained_commit, "retained queued commit")
+            .expect("retained commit id should parse");
+        session
+            .execute("DELETE FROM lix_file WHERE path = '/queued.bin'", &[])
+            .await
+            .expect("queued file should retire from current state");
+        let current_commit = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .expect("current commit should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("current commit id should exist");
+        let current_commit = CommitId::parse_lix(&current_commit, "current queued commit")
+            .expect("current commit id should parse");
+
+        let storage = StorageAdapter::new(backend.clone());
+        loop {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("queue length read should open");
+            let (queue, _) = load_reachability_queue(&read)
+                .await
+                .expect("queue length should load");
+            let pending = if queue.head_sequence == 0 {
+                0
+            } else {
+                queue.tail_sequence - queue.head_sequence + 1
+            };
+            drop(read);
+            if pending >= 64 {
+                break;
+            }
+            append_checkpoint_batch(&storage, &[current_commit]).await;
+        }
+        append_checkpoint_batch(&storage, &[retained_commit]).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan staging read should open");
+        let mut orphan_writes = storage.new_write_set();
+        let orphan = crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                b"unrelated-full-queue-orphan".to_vec(),
+            ))
+            .await
+            .expect("unrelated orphan should stage");
+        drop(read);
+        storage
+            .commit_write_set(orphan_writes, StorageWriteOptions::default())
+            .await
+            .expect("unrelated orphan should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("repository sweep read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let plan =
+            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
+                .await
+                .expect("full-queue repository sweep should stage");
+        assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("full-queue repository sweep should commit");
+
+        drop(session);
+        drop(engine);
+        let _reopened = Engine::new(backend.clone())
+            .await
+            .expect("repository should reopen after full-queue sweep");
+        let read = StorageAdapter::new(backend)
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("cold CAS read should open");
+        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
+        let blobs = reader
+            .load_bytes_many(&[
+                crate::binary_cas::BlobId::from_content(live_bytes),
+                orphan.hash,
+            ])
+            .await
+            .expect("cold CAS read should succeed")
+            .into_vec();
+        assert_eq!(blobs[0].as_deref(), Some(live_bytes.as_slice()));
+        assert!(
+            blobs[1].is_none(),
+            "unrelated CAS garbage must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_gc_keeps_current_untracked_file_blob_across_cold_reopen() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("untracked-file repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("untracked-file repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("untracked-file session should open");
+        let live_bytes = b"current-only-untracked-file-blob";
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content, lixcol_untracked) \
+                 VALUES ('/current-only.bin', $1, true)",
+                &[Value::Blob(live_bytes.to_vec().into())],
+            )
+            .await
+            .expect("untracked file should publish");
+
+        let storage = StorageAdapter::new(backend.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("unrelated orphan staging read should open");
+        let mut orphan_writes = storage.new_write_set();
+        let orphan = crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                b"untracked-file-unrelated-orphan".to_vec(),
+            ))
+            .await
+            .expect("unrelated orphan should stage");
+        drop(read);
+        storage
+            .commit_write_set(orphan_writes, StorageWriteOptions::default())
+            .await
+            .expect("unrelated orphan should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("untracked-file GC read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let plan =
+            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
+                .await
+                .expect("untracked-file GC should stage");
+        assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("untracked-file GC should commit");
+
+        drop(session);
+        drop(engine);
+        let reopened = Engine::new(backend.clone())
+            .await
+            .expect("repository should cold reopen after untracked-file GC");
+        let reopened_session = reopened
+            .open_workspace_session()
+            .await
+            .expect("cold untracked-file session should open");
+        let content = reopened_session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/current-only.bin'",
+                &[],
+            )
+            .await
+            .expect("cold untracked file should read");
+        assert_eq!(
+            content.rows()[0].get::<Vec<u8>>("content").unwrap(),
+            live_bytes
+        );
+
+        let read = StorageAdapter::new(backend)
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan verification read should open");
+        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
+        assert!(
+            reader
+                .load_bytes_many(&[orphan.hash])
+                .await
+                .expect("orphan verification should load")
+                .into_vec()[0]
+                .is_none(),
+            "unrelated binary-CAS garbage must still be reclaimed"
+        );
+    }
+
+    #[cfg(feature = "default_wasm_runtime")]
+    #[tokio::test]
+    async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("plugin-GC repository should initialize");
+        let engine = Engine::new_with_wasm_runtime(
+            backend.clone(),
+            crate::default_wasm_runtime::runtime().expect("WASM runtime should initialize"),
+        )
+        .await
+        .expect("plugin-GC repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("plugin-GC session should open");
+        let (archive, wasm) = gc_csv_plugin_archive();
+        let wasm_hash = crate::binary_cas::BlobId::from_content(&wasm);
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES \
+                 ('/.lix/plugins/plugin_csv.lixplugin', $1)",
+                &[Value::Blob(archive.into())],
+            )
+            .await
+            .expect("CSV plugin should install");
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/owned.csv', $1)",
+                &[Value::Blob(b"before,gc\n".to_vec().into())],
+            )
+            .await
+            .expect("installed plugin should execute before GC");
+
+        let storage = StorageAdapter::new(backend.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("plugin-GC orphan read should open");
+        let mut orphan_writes = storage.new_write_set();
+        let orphan = crate::binary_cas::BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                b"plugin-gc-unrelated-orphan".to_vec(),
+            ))
+            .await
+            .expect("plugin-GC orphan should stage");
+        drop(read);
+        storage
+            .commit_write_set(orphan_writes, StorageWriteOptions::default())
+            .await
+            .expect("plugin-GC orphan should commit");
+
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, wasm_hash, true).await;
+        assert_binary_cas_presence(&storage, orphan.hash, false).await;
+
+        // A new Engine owns an empty runtime-host factory/actor cache. Updating
+        // the semantic file therefore has to cold-load the registry-owned WASM
+        // from binary CAS and execute it after the sweep.
+        drop(session);
+        drop(engine);
+        let engine = Engine::new_with_wasm_runtime(
+            backend.clone(),
+            crate::default_wasm_runtime::runtime().expect("cold WASM runtime should initialize"),
+        )
+        .await
+        .expect("plugin-GC repository should cold reopen");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("cold plugin-GC session should open");
+        session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = '/owned.csv'",
+                &[Value::Blob(b"after,gc\n".to_vec().into())],
+            )
+            .await
+            .expect("cold plugin runtime should load and execute after GC");
+        let content = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/owned.csv'",
+                &[],
+            )
+            .await
+            .expect("cold plugin output should remain readable");
+        assert_eq!(
+            content.rows()[0].get::<Vec<u8>>("content").unwrap(),
+            b"after,gc\n"
+        );
+        assert_binary_cas_presence(&storage, wasm_hash, true).await;
+    }
+
+    #[cfg(feature = "default_wasm_runtime")]
+    #[tokio::test]
+    async fn repository_gc_reclaims_plugin_wasm_only_after_final_registry_root_releases() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("shared-plugin repository should initialize");
+        let engine = Engine::new_with_wasm_runtime(
+            backend.clone(),
+            crate::default_wasm_runtime::runtime().expect("WASM runtime should initialize"),
+        )
+        .await
+        .expect("shared-plugin repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("shared-plugin session should open");
+        let (archive, wasm) = gc_csv_plugin_archive();
+        let wasm_hash = crate::binary_cas::BlobId::from_content(&wasm);
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES \
+                 ('/.lix/plugins/plugin_csv.lixplugin', $1)",
+                &[Value::Blob(archive.into())],
+            )
+            .await
+            .expect("shared CSV plugin should install");
+        let storage = StorageAdapter::new(backend);
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, wasm_hash, true).await;
+        let branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-000000000035".to_owned()),
+                name: "plugin-gc-retained".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("retained plugin branch should create");
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, wasm_hash, true).await;
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
+                &[],
+            )
+            .await
+            .expect("plugin should uninstall from main");
+        session
+            .create_checkpoint()
+            .await
+            .expect("uninstalled main should release its undo interval");
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, wasm_hash, true).await;
+
+        session
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch.id)],
+            )
+            .await
+            .expect("final plugin registry branch should retire");
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, wasm_hash, false).await;
+    }
+
+    #[tokio::test]
+    async fn repository_gc_fails_closed_on_corrupt_current_plugin_registry() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("corrupt-registry repository should initialize");
+        let storage = StorageAdapter::new(backend.clone());
+        let corrupt_registry = serde_json::json!({
+            "key": crate::plugin::PLUGIN_REGISTRY_KEY,
+            "value": {
+                "version": 1,
+                "plugin_count": 1,
+                "generation": "corrupt",
+                "plugins": [],
+            },
+        })
+        .to_string();
+        let corrupt_snapshot = stage_bare_json(&backend, &corrupt_registry).await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt-registry control read should open");
+        let (branch_id, control) = BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .expect("corrupt-registry controls should load")
+            .into_iter()
+            .find(|(branch_id, _)| branch_id != GLOBAL_BRANCH_ID)
+            .expect("workspace branch control should exist");
+        let timestamp =
+            LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
+        let entity_pk = EntityPk::single(crate::plugin::PLUGIN_REGISTRY_KEY);
+        let mut writes = storage.new_write_set();
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_current_state_with_working_diff(
+                &branch_id,
+                Some(control.tracked_generation),
+                control.tracked_generation,
+                &[CurrentStateDeltaRef {
+                    schema_key: "lix_key_value",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: Some(ChangeId::for_test_label("corrupt-plugin-registry")),
+                    commit_id: Some(control.head_commit_id),
+                    untracked: false,
+                    deleted: false,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    snapshot: JsonSlot::Ref(corrupt_snapshot).as_ref_slot(),
+                    metadata: JsonSlotRef::None,
+                    columnar_base_coordinate: None,
+                }],
+                &BTreeSet::new(),
+                None,
+                None,
+                None,
+                &mut coverage,
+            )
+            .await
+            .expect("corrupt registry row should stage");
+        stage_branch_head_control(
+            &mut writes,
+            &branch_id,
+            control
+                .next_current_state_revision()
+                .expect("corrupt-registry control should advance"),
+        )
+        .expect("corrupt-registry control should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corrupt-registry fixture should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("corrupt-registry GC read should open"),
+        );
+        let mut sweep = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let error =
+            super::stage_repository_gc_with_preconditions(read, &mut sweep, &mut preconditions)
+                .await
+                .expect_err("corrupt current plugin registry must fail GC closed");
+        assert!(error.message.contains("unsupported version"), "{error:?}");
+        assert!(sweep.is_empty(), "corruption must stage no GC mutations");
+    }
+
+    #[cfg(feature = "default_wasm_runtime")]
+    fn gc_csv_plugin_archive() -> (Vec<u8>, Vec<u8>) {
+        let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")))
+            .expect("CSV plugin WASM should read");
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (path, bytes) in [
+            (
+                "manifest.json",
+                include_str!("../../../plugins/csv/manifest.json").as_bytes(),
+            ),
+            (
+                "schema/csv_table.json",
+                include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
+            ),
+            (
+                "schema/csv_row.json",
+                include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
+            ),
+            ("plugin.wasm", wasm.as_slice()),
+        ] {
+            writer
+                .start_file(path, options)
+                .expect("plugin archive entry should start");
+            writer
+                .write_all(bytes)
+                .expect("plugin archive entry should write");
+        }
+        (
+            writer
+                .finish()
+                .expect("plugin archive should finish")
+                .into_inner(),
+            wasm,
+        )
+    }
+
+    async fn run_binary_repository_gc(storage: &StorageAdapter<Memory>) {
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("binary repository-GC read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
+            .await
+            .expect("binary repository GC should stage");
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("binary repository GC should commit");
+    }
+
+    async fn assert_binary_cas_presence(
+        storage: &StorageAdapter<Memory>,
+        hash: crate::binary_cas::BlobId,
+        expected: bool,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("binary-CAS presence read should open");
+        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
+        let present = reader
+            .load_bytes_many(&[hash])
+            .await
+            .expect("binary-CAS presence should load")
+            .into_vec()[0]
+            .is_some();
+        assert_eq!(present, expected);
     }
 
     #[test]
@@ -3962,6 +6662,157 @@ mod tests {
         assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
         session.undo().await.expect("active undo should survive GC");
         session.redo().await.expect("active redo should survive GC");
+    }
+
+    #[tokio::test]
+    async fn repository_gc_retains_historical_file_blob_until_replay_dependency_releases() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("historical blob repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("historical blob repository should open");
+        let main = engine
+            .open_workspace_session()
+            .await
+            .expect("historical blob main session should open");
+        let branch = main
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-00000000000a".to_owned()),
+                name: "gc-history-disposable".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("historical disposable branch should create");
+        let branch_id = branch.id;
+        let session = engine
+            .open_session(branch_id.clone())
+            .await
+            .expect("historical disposable session should open");
+        let v1 = b"historical-file-v1";
+        let v2 = vec![0xa5; 256];
+        let v1_hash = crate::binary_cas::BlobId::from_content(v1);
+        let v2_hash = crate::binary_cas::BlobId::from_content(&v2);
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)",
+                &[Value::Blob(v1.to_vec().into())],
+            )
+            .await
+            .expect("historical file v1 should publish");
+        let root_a = session
+            .execute(
+                "SELECT commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id.clone())],
+            )
+            .await
+            .expect("historical root A should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("historical root A should exist");
+        session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = '/history.bin'",
+                &[Value::Blob(v2.clone().into())],
+            )
+            .await
+            .expect("historical file v2 should publish");
+        let root_b = session
+            .execute(
+                "SELECT commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id.clone())],
+            )
+            .await
+            .expect("historical root B should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("historical root B should exist");
+        let storage = StorageAdapter::new(backend.clone());
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, v1_hash, true).await;
+        assert_binary_cas_presence(&storage, v2_hash, true).await;
+
+        drop(session);
+        drop(main);
+        drop(engine);
+        let reopened = Engine::new(backend.clone())
+            .await
+            .expect("historical blob repository should cold reopen");
+        let session = reopened
+            .open_session(branch_id.clone())
+            .await
+            .expect("historical disposable branch should cold reopen");
+        let diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'lix_binary_blob_ref'",
+                &[Value::Text(root_a), Value::Text(root_b)],
+            )
+            .await
+            .expect("historical blob diff should remain authenticated");
+        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
+        session
+            .undo()
+            .await
+            .expect("historical blob undo should remain available");
+        let undone = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/history.bin'",
+                &[],
+            )
+            .await
+            .expect("historical v1 should read after undo");
+        assert_eq!(undone.rows()[0].get::<Vec<u8>>("content").unwrap(), v1);
+        session
+            .redo()
+            .await
+            .expect("historical blob redo should remain available");
+        let redone = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/history.bin'",
+                &[],
+            )
+            .await
+            .expect("historical v2 should read after redo");
+        assert_eq!(redone.rows()[0].get::<Vec<u8>>("content").unwrap(), v2);
+        drop(session);
+
+        let main = reopened
+            .open_workspace_session()
+            .await
+            .expect("historical main session should reopen");
+        main.execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id.clone())],
+        )
+        .await
+        .expect("historical disposable branch should delete");
+        drop(main);
+        drop(reopened);
+
+        // Deletion publishes the authenticated B -> None retirement frontier.
+        // This fixture is below the queue page limit, so one production sweep
+        // must consume that frontier without creating a checkpoint alias for A.
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, v1_hash, false).await;
+        assert_binary_cas_presence(&storage, v2_hash, false).await;
+
+        let final_engine = Engine::new(backend)
+            .await
+            .expect("historical repository should reopen after branch retirement");
+        let final_main = final_engine
+            .open_workspace_session()
+            .await
+            .expect("historical main should open after branch retirement");
+        let branches = final_main
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id)],
+            )
+            .await
+            .expect("retired branch absence should read");
+        assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     }
 
     #[tokio::test]
@@ -4714,7 +7565,7 @@ mod tests {
                     created_at: timestamp,
                     updated_at: timestamp,
                     snapshot: snapshot_slot.as_ref_slot(),
-                    metadata: crate::json_store::JsonSlotRef::None,
+                    metadata: JsonSlotRef::None,
                     columnar_base_coordinate: None,
                 }],
                 &BTreeSet::new(),
@@ -4824,6 +7675,257 @@ mod tests {
         }
     }
 
+    fn replay_commit_record(
+        label: &str,
+        generation: u64,
+        parent: Option<CommitId>,
+        created_at: LixTimestamp,
+    ) -> CommitRecord {
+        let commit_id =
+            CommitId::with_change_address_space(*CommitId::for_test_label(label).as_uuid());
+        CommitRecord {
+            format_version: 2,
+            commit_id,
+            generation,
+            parent_commit_ids: parent.into_iter().collect(),
+            change_id: ChangeId::for_test_label(&format!("{label}-header")),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at,
+        }
+    }
+
+    fn replay_branch_control(
+        commit_id: CommitId,
+        ref_change_id: ChangeId,
+        timestamp: LixTimestamp,
+    ) -> BranchHeadControl {
+        BranchHeadControl {
+            head_commit_id: commit_id,
+            tracked_generation: commit_id,
+            untracked_generation: commit_id,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: Some(commit_id),
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id,
+            schema_presence_bloom: [0; 4],
+        }
+    }
+
+    fn stage_replacement_inventory(
+        writes: &mut StorageWriteSet,
+        commit_id: CommitId,
+        fallback_commit_id: Option<CommitId>,
+        schema_key: &str,
+        timestamp: LixTimestamp,
+    ) -> CommitStateMutationInventory {
+        let scope = CommitDeltaReplacementScope {
+            schema_key: schema_key.to_owned(),
+            file_id: None,
+        };
+        let generation = CommitDeltaReplacementGeneration {
+            scope: scope.clone(),
+            fallback_commit_id,
+            lifecycle_summary: CommitDeltaLifecycleSummary {
+                scope,
+                ordered_identity_digest: *blake3::hash(schema_key.as_bytes()).as_bytes(),
+                uniform_created_at: timestamp,
+            },
+        };
+        let staged = stage_ordered_addressable_replacement_parts(
+            writes,
+            std::iter::once(Ok(TrackedStateSingleStringReplacementRef {
+                schema_key,
+                file_id: None,
+                entity_pk: "row",
+                commit_id,
+                created_at: timestamp,
+                updated_at: timestamp,
+                snapshot: JsonSlotRef::Inline("{}"),
+                metadata: JsonSlotRef::None,
+            })),
+            &generation,
+        )
+        .expect("replacement replay inventory should stage");
+        let mut inventory = staged.mutation_inventory().clone();
+        inventory.parts.clear();
+        inventory
+    }
+
+    async fn persist_replay_closure_fixture(
+        storage: &StorageAdapter<Memory>,
+        mut writes: StorageWriteSet,
+        records: &[CommitRecord],
+        manifests: &[CommitStateManifest],
+    ) {
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replay fixture read should open");
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: records.to_vec(),
+                changes: Vec::new(),
+            })
+            .await
+            .expect("replay fixture commits should stage");
+        for manifest in manifests {
+            crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+                &mut writes,
+                manifest,
+            )
+            .expect("replay fixture manifest should stage");
+            if let Some(root) = manifest.snapshot_root.as_ref() {
+                let (hash, bytes) = test_snapshot_chunk(manifest.commit_id);
+                if root.root_id.as_bytes() == &hash {
+                    writes.put(
+                        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                        StorageKey(Bytes::copy_from_slice(&hash)),
+                        StorageValue { bytes },
+                    );
+                }
+            }
+        }
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("replay fixture should commit");
+    }
+
+    async fn stage_replay_root_delta(
+        storage: &StorageAdapter<Memory>,
+        delta: RootReachabilityDelta,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replay delta read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            std::slice::from_ref(&delta),
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("replay delta should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("replay delta should commit");
+    }
+
+    async fn publish_replay_root_release(
+        storage: &StorageAdapter<Memory>,
+        branch_id: &str,
+        old_control: BranchHeadControl,
+        new_control: BranchHeadControl,
+    ) {
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, branch_id, new_control)
+            .expect("released replay control should stage");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replay release read should open");
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            &[RootReachabilityDelta {
+                branch_id: branch_id.to_owned(),
+                old_root: Some(old_control.head_commit_id),
+                new_root: Some(new_control.head_commit_id),
+                old_control: Some(old_control),
+                new_control: Some(new_control),
+                old_control_digest: root_control_digest_for_control(Some(&old_control))
+                    .expect("old replay control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&new_control))
+                    .expect("new replay control should encode"),
+            }],
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("replay release delta should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("replay release should publish");
+    }
+
+    async fn run_ordinary_repository_gc(
+        storage: &StorageAdapter<Memory>,
+    ) -> super::RepositoryGcPlan {
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("ordinary GC read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let plan =
+            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
+                .await
+                .expect("ordinary GC should stage");
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("ordinary GC should commit");
+        plan
+    }
+
+    async fn load_audited_repository_retention(
+        storage: &StorageAdapter<Memory>,
+    ) -> super::AuthenticatedServingDependencyClosure {
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("audited retention read should open"),
+        );
+        let controls = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .scan()
+            .await
+            .expect("audited retention controls should load");
+        let (queue, _) = load_reachability_queue(&read)
+            .await
+            .expect("audited retention queue should load");
+        let closure = super::load_authenticated_repository_retention(&read, &controls, &queue)
+            .await
+            .expect("serving-dependency closure should authenticate");
+        super::audit_repository_gc_standalone_refs(&read)
+            .await
+            .expect("standalone audit should consume the same closure");
+        closure
+    }
+
     fn commit_delta_refs<'a>(
         commit_id: CommitId,
         changes: &'a [ChangeRecord],
@@ -4869,19 +7971,178 @@ mod tests {
         }
     }
 
+    fn test_snapshot_chunk(commit_id: CommitId) -> ([u8; 32], Bytes) {
+        crate::tracked_state::test_gc_leaf_chunk(commit_id.as_uuid().as_bytes())
+    }
+
     fn test_snapshot_root(commit_id: CommitId) -> TrackedStateCommitRoot {
+        let (root_hash, root_bytes) = test_snapshot_chunk(commit_id);
         TrackedStateCommitRoot {
             commit_id,
-            root_id: TrackedStateRootId::new(
-                *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
-            ),
+            root_id: TrackedStateRootId::new(root_hash),
             parent_roots: Vec::new(),
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
             primary_chunk_count: 1,
-            primary_chunk_bytes: 64,
+            primary_chunk_bytes: root_bytes.len() as u64,
         }
+    }
+
+    async fn assert_offline_sweep_and_audit_fail_closed(
+        storage: &StorageAdapter<Memory>,
+        expected_message: &str,
+    ) {
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("offline authority read should open"),
+        );
+        let sweep_error = super::load_tree_sweep_root_closure(&read)
+            .await
+            .expect_err("offline tree sweep must fail closed");
+        let audit_error = super::audit_repository_gc_standalone_refs(&read)
+            .await
+            .expect_err("standalone audit must fail closed");
+        assert_eq!(sweep_error.message, audit_error.message);
+        assert!(
+            sweep_error.message.contains(expected_message),
+            "unexpected shared authority error: {}",
+            sweep_error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_sweep_and_audit_reject_missing_and_malformed_required_authority() {
+        const MUTABLE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
+            "tracked_state.commit_state_manifest.v7",
+        );
+
+        let (storage, commit_id, _, _, _) = tree_sweep_fixture().await;
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            MUTABLE_MANIFEST_SPACE,
+            crate::tracked_state::commit_state_authority_key(commit_id),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("required manifest removal should commit");
+        assert_offline_sweep_and_audit_fail_closed(&storage, "incomplete split physical authority")
+            .await;
+
+        let (storage, commit_id, _, _, _) = tree_sweep_fixture().await;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            MUTABLE_MANIFEST_SPACE,
+            crate::tracked_state::commit_state_authority_key(commit_id),
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed-commit-state-authority"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("malformed manifest should commit");
+        assert_offline_sweep_and_audit_fail_closed(&storage, "unsupported format").await;
+    }
+
+    #[tokio::test]
+    async fn offline_sweep_and_audit_reject_non_decreasing_and_cyclic_replay_authority() {
+        let timestamp = LixTimestamp::expect_parse(
+            "offline replay authority timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("offline-replay-debt-root", 0, None, timestamp);
+        let child = replay_commit_record(
+            "offline-replay-debt-child",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let mut root_manifest =
+            test_commit_state_manifest(&root, CommitStateMutationInventory::default());
+        root_manifest.replay_debt.depth = 2;
+        let mut child_manifest =
+            test_commit_state_manifest(&child, CommitStateMutationInventory::default());
+        child_manifest.replay_debt.depth = 2;
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("replay-debt queue should seed");
+        stage_branch_head_control(
+            &mut writes,
+            "main",
+            replay_branch_control(
+                child.commit_id,
+                ChangeId::for_test_label("offline-replay-debt-ref"),
+                timestamp,
+            ),
+        )
+        .expect("replay-debt control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[root, child],
+            &[root_manifest, child_manifest],
+        )
+        .await;
+        assert_offline_sweep_and_audit_fail_closed(&storage, "replay debt disagrees").await;
+
+        let storage = StorageAdapter::new(Memory::new());
+        let root = replay_commit_record("offline-replay-cycle-root", 0, None, timestamp);
+        let left = replay_commit_record(
+            "offline-replay-cycle-left",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let right = replay_commit_record(
+            "offline-replay-cycle-right",
+            1,
+            Some(root.commit_id),
+            timestamp,
+        );
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("replay-cycle queue should seed");
+        let left_inventory = stage_replacement_inventory(
+            &mut writes,
+            left.commit_id,
+            Some(right.commit_id),
+            "offline-replay-cycle-left",
+            timestamp,
+        );
+        let right_inventory = stage_replacement_inventory(
+            &mut writes,
+            right.commit_id,
+            Some(left.commit_id),
+            "offline-replay-cycle-right",
+            timestamp,
+        );
+        stage_branch_head_control(
+            &mut writes,
+            "main",
+            replay_branch_control(
+                left.commit_id,
+                ChangeId::for_test_label("offline-replay-cycle-ref"),
+                timestamp,
+            ),
+        )
+        .expect("replay-cycle control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[root.clone(), left.clone(), right.clone()],
+            &[
+                test_commit_state_manifest(&root, CommitStateMutationInventory::default()),
+                test_commit_state_manifest(&left, left_inventory),
+                test_commit_state_manifest(&right, right_inventory),
+            ],
+        )
+        .await;
+        assert_offline_sweep_and_audit_fail_closed(&storage, "dependency cycle").await;
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {
