@@ -1702,11 +1702,15 @@ where
         }
         let start_commit_id = *start_commit_id;
         let logical_path = logical_start_ids.contains(&start_commit_id);
-        // A retained physical replay authority still needs its authenticated
-        // semantic topology on the next sweep. Keeping the start node here
-        // prevents GC itself from manufacturing a missing-graph state while
-        // CAS marking remains limited to logical roots below.
-        discovered_semantic.insert(start_commit_id);
+        // Every retained replay authority needs its authenticated graph and
+        // physical manifests, but only a logical history/undo/root role owns
+        // the public semantic projection. A checkpoint-selected source may
+        // remain physical serving authority after its recovery interval has
+        // expired; promoting that role to semantic liveness would retain the
+        // expired auto-commit indefinitely.
+        if logical_path {
+            discovered_semantic.insert(start_commit_id);
+        }
         let mut current_commit_id = start_commit_id;
         let mut path = Vec::new();
         let mut seen = BTreeSet::new();
@@ -1826,8 +1830,8 @@ where
             }
 
             discovered_physical.insert(next_commit_id);
-            discovered_semantic.insert(next_commit_id);
             if logical_path {
+                discovered_semantic.insert(next_commit_id);
                 discovered_cas_logical.insert(next_commit_id);
             }
             current_commit_id = next_commit_id;
@@ -3702,9 +3706,9 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("replay closure timestamp", "2026-01-01T00:00:00Z");
 
-        // A certified replacement fallback is reader-equivalent chronology:
-        // retain that physical and semantic dependency instead of the graph
-        // parent used by ordinary first-parent replay.
+        // A certified replacement fallback is reader-equivalent chronology.
+        // A logical history/undo root retains both its physical and semantic
+        // dependency instead of the graph parent used by first-parent replay.
         let storage = StorageAdapter::new(Memory::new());
         let root = replay_commit_record("replay-fallback-root", 0, None, timestamp);
         let fallback =
@@ -3744,9 +3748,10 @@ mod tests {
         let mut physical = BTreeSet::new();
         let mut semantic = BTreeSet::new();
         let mut cas = BTreeSet::new();
+        let active_manifests = BTreeMap::from([(active.commit_id, active_manifest)]);
         super::collect_active_point_replay_dependencies(
             &read,
-            &BTreeMap::from([(active.commit_id, active_manifest)]),
+            &active_manifests,
             &BTreeSet::from([active.commit_id]),
             &mut physical,
             &mut semantic,
@@ -3760,6 +3765,27 @@ mod tests {
             BTreeSet::from([active.commit_id, fallback.commit_id])
         );
         assert_eq!(cas, BTreeSet::from([fallback.commit_id]));
+
+        // The same bytes reached only through a checkpoint-selected physical
+        // source still require graph/manifests for serving validation, but do
+        // not own semantic history or binary-CAS chronology after recovery
+        // and undo roots release the interval.
+        let mut physical_only = BTreeSet::new();
+        let mut semantic_only = BTreeSet::new();
+        let mut cas_only = BTreeSet::new();
+        super::collect_active_point_replay_dependencies(
+            &read,
+            &active_manifests,
+            &BTreeSet::new(),
+            &mut physical_only,
+            &mut semantic_only,
+            &mut cas_only,
+        )
+        .await
+        .expect("authenticated physical-only fallback should close");
+        assert_eq!(physical_only, BTreeSet::from([fallback.commit_id]));
+        assert!(semantic_only.is_empty());
+        assert!(cas_only.is_empty());
 
         // A physical root without its semantic graph node cannot silently
         // become a root commit; the external retained-history oracle depends

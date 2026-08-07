@@ -214,22 +214,58 @@ simulation_test!(
             .await
             .expect("other interval write should succeed");
         let other_auto_commit = branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
-        other
+        let other_recovery_alias = other
             .create_checkpoint()
             .await
-            .expect("other checkpoint should retain its interval");
-        other
+            .expect("other checkpoint should retain its interval")
+            .commit_id;
+        let other_serving_checkpoint = other
             .create_checkpoint()
             .await
-            .expect("other recovery root should rotate");
+            .expect("other recovery root should rotate")
+            .commit_id;
+        other
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('gc-other-active', 'active')",
+                &[],
+            )
+            .await
+            .expect("other active undo interval write should succeed");
+        let other_active_history =
+            branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
 
-        assert_commits(&main, &[&main_auto_commit, &other_auto_commit], true).await;
+        assert_commits(
+            &main,
+            &[
+                &main_auto_commit,
+                &other_auto_commit,
+                &other_recovery_alias,
+                &other_serving_checkpoint,
+                &other_active_history,
+            ],
+            true,
+        )
+        .await;
         for _ in 4..CHECKPOINT_GC_INTERVAL {
             main.create_checkpoint()
                 .await
                 .expect("global GC padding checkpoint should succeed");
         }
         wait_for_commits(&main, &[&main_auto_commit, &other_auto_commit], false).await;
+        // The other branch's current recovery alias, serving checkpoint
+        // floor, and active undo/history interval remain distinct logical
+        // roots even though both branches' expired auto-commit intervals are
+        // now reclaimable.
+        assert_commits(
+            &main,
+            &[
+                &other_recovery_alias,
+                &other_serving_checkpoint,
+                &other_active_history,
+            ],
+            true,
+        )
+        .await;
     }
 );
 
