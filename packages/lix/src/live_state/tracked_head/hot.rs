@@ -12005,7 +12005,7 @@ mod tests {
                     HOT_COLLECTION_CONTROL_SPACE,
                     control_key,
                     StorageValue {
-                        bytes: Bytes::from_static(b"malformed-control"),
+                        bytes: Bytes::from_static(b"\0"),
                     },
                 ),
                 "stale" => stage_hot_collection_control(
