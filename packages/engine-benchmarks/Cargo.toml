@@ -50,6 +50,7 @@ bytes = "1"
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libc = "0.2"
 sha2 = "0.10"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
@@ -273,3 +274,9 @@ harness = false
 name = "registered_entity_returning"
 path = "benches/registered_entity_returning.rs"
 harness = false
+
+[[bench]]
+name = "forktree_olap_current"
+path = "benches/forktree_olap_current.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
