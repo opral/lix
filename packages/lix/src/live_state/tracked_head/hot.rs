@@ -1032,7 +1032,6 @@ async fn scan_certified_entity_batch_rows(
         .await?
         .value;
     let content_count = contents.iter().flatten().count();
-    let decode_limit = (content_count <= 1).then_some(limit).flatten();
     let needs_snapshot = request.read_columns.columns.is_empty()
         || request
             .read_columns
@@ -1082,16 +1081,13 @@ async fn scan_certified_entity_batch_rows(
             request,
             &filter_index,
             needs_snapshot,
-            decode_limit,
+            None,
             &mut builder,
         )?;
-        if decode_limit.is_some_and(|limit| builder.len() >= limit) {
-            break;
-        }
     }
     let batch = builder.finish();
     if content_count <= 1 {
-        return Ok(batch);
+        return canonicalize_single_certified_batch(batch, limit);
     }
     let mut winners = BTreeMap::new();
     for row in batch.into_rows() {
@@ -3826,7 +3822,6 @@ async fn load_packed_current_base_exact_entries(
     Ok(winners)
 }
 
-#[cfg(test)]
 fn compare_materialized_live_identities(
     left: &MaterializedLiveStateRow,
     right: &MaterializedLiveStateRow,
@@ -3835,6 +3830,54 @@ fn compare_materialized_live_identities(
         .cmp(&right.schema_key)
         .then_with(|| left.entity_pk.cmp(&right.entity_pk))
         .then_with(|| left.file_id.cmp(&right.file_id))
+}
+
+/// Restores the identity-order contract at the producer boundary for one
+/// certified content object.
+///
+/// Certified packet order is plugin-defined and therefore cannot be used for
+/// SQL order or LIMIT. The common already-ordered batch remains borrowed and
+/// allocation-free. Only a noncanonical batch expands into owned rows for one
+/// sort. Repeated identities are valid only when every materialized payload
+/// byte and authority field is identical.
+fn canonicalize_single_certified_batch(
+    batch: MaterializedLiveStateBatch,
+    limit: Option<usize>,
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    let already_strictly_ordered = (1..batch.len()).all(|index| {
+        compare_materialized_live_identity_refs(batch.row(index - 1), batch.row(index)).is_lt()
+    });
+    if already_strictly_ordered {
+        return Ok(if limit.is_some_and(|limit| batch.len() > limit) {
+            batch.filter(|_| true, limit)
+        } else {
+            batch
+        });
+    }
+
+    let mut rows = batch.into_rows();
+    rows.sort_unstable_by(compare_materialized_live_identities);
+    let mut canonical = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(previous) = canonical.last() else {
+            canonical.push(row);
+            continue;
+        };
+        if compare_materialized_live_identities(previous, &row).is_ne() {
+            canonical.push(row);
+            continue;
+        }
+        if previous != &row {
+            return Err(head_value_error(format!(
+                "duplicate certified authority for schema '{}' entity_pk {:?} file_id {:?} has conflicting row bytes or authority evidence",
+                row.schema_key, row.entity_pk, row.file_id,
+            )));
+        }
+    }
+    if let Some(limit) = limit {
+        canonical.truncate(limit);
+    }
+    Ok(MaterializedLiveStateBatch::from_rows(canonical))
 }
 
 #[cfg(test)]
@@ -11380,6 +11423,49 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             ["b", "d"]
+        );
+    }
+
+    #[test]
+    fn single_certified_batch_canonicalizes_before_limit_and_validates_duplicates() {
+        let mut root = live_row("root", "certified-order");
+        root.schema_key = "json_root".to_owned();
+        let mut member = live_row("member", "certified-order");
+        member.schema_key = "json_object_member".to_owned();
+
+        let canonical = canonicalize_single_certified_batch(
+            MaterializedLiveStateBatch::from_rows(vec![
+                root.clone(),
+                member.clone(),
+                member.clone(),
+            ]),
+            None,
+        )
+        .expect("identical duplicate certified rows should collapse");
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(canonical.row(0).schema_key(), "json_object_member");
+        assert_eq!(canonical.row(1).schema_key(), "json_root");
+
+        let limited = canonicalize_single_certified_batch(
+            MaterializedLiveStateBatch::from_rows(vec![root.clone(), member.clone()]),
+            Some(1),
+        )
+        .expect("LIMIT should follow certified identity canonicalization");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited.row(0).schema_key(), "json_object_member");
+
+        let mut conflicting = member.clone();
+        conflicting.metadata = Some(SharedStr::from("{\"conflict\":true}"));
+        let error = canonicalize_single_certified_batch(
+            MaterializedLiveStateBatch::from_rows(vec![member, conflicting]),
+            None,
+        )
+        .expect_err("conflicting duplicate certified authority must fail closed");
+        assert!(
+            error
+                .message
+                .contains("duplicate certified authority for schema 'json_object_member'"),
+            "unexpected duplicate-authority error: {error:?}"
         );
     }
 
