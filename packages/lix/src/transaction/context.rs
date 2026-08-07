@@ -1370,7 +1370,7 @@ where
     }
 
     /// Opens an execution-scoped staging area for SQL/provider hooks.
-    async fn open(
+    async fn open<T, F>(
         mode: &SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
@@ -1382,7 +1382,11 @@ where
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         session_file_views: SessionFileViews,
-    ) -> Result<OpenTransaction<StorageImpl>, LixError> {
+        runtime_boundary: F,
+    ) -> Result<(OpenTransaction<StorageImpl>, T), LixError>
+    where
+        F: for<'runtime> AsyncFnOnce(&'runtime FunctionContext) -> Result<T, LixError>,
+    {
         let storage = Arc::new(storage);
         let read = storage.begin_read(StorageReadOptions::default()).await?;
         // SAFETY: `storage` is retained in the transaction behind an `Arc` and
@@ -1396,6 +1400,7 @@ where
                 resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
                     .await?;
             let runtime_functions = FunctionContext::prepare(&read).await?;
+            let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
@@ -1440,6 +1445,7 @@ where
                 opening_tracked_mutation_revision,
                 opening_active_branch_head,
                 opening_global_branch_head,
+                runtime_boundary_result,
             ))
         }
         .await;
@@ -1452,6 +1458,7 @@ where
             opening_tracked_mutation_revision,
             opening_active_branch_head,
             opening_global_branch_head,
+            runtime_boundary_result,
         ) = match setup_result {
             Ok(result) => result,
             Err(error) => {
@@ -1469,52 +1476,55 @@ where
             tracked_schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
-        Ok(OpenTransaction {
-            transaction: Self {
-                active_branch_id,
-                active_account_id,
-                live_state,
-                tracked_state,
-                binary_cas,
-                plugin_host,
-                branch_ctx,
-                schema_resolver,
-                sql_schema_snapshot: sql_schema_catalog,
-                sql_planning_cache,
-                prepared_mutation_program: None,
-                prepared_mutation_membership: PreparedMutationMembership::Unprepared,
-                prepared_mutation_overlay_empty: false,
-                prepared_mutation_timestamp: None,
-                mutation_journal: None,
-                mutation_journal_compressor: None,
-                mutation_journal_sealed_rows: 0,
-                mutation_journal_seal_prefix_open: true,
-                mutation_journal_terminal_error: None,
-                staged_writes,
-                filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
-                filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
-                branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
-                opening_read,
-                storage,
-                functions,
-                opening_tracked_mutation_revision,
-                opening_active_branch_head,
-                opening_global_branch_head,
-                commit_boundary: None,
-                trust_filesystem_planner: false,
-                origin_key: None,
-                idempotency_receipt: None,
-                atomic_metadata_writes: None,
-                atomic_metadata_preconditions: Vec::new(),
-                await_durable_commit: false,
-                session_file_views,
-                pending_file_view_mutations: BTreeMap::new(),
-                pending_plugin_actor_publications: Vec::new(),
-                plugin_generation_read_guard: None,
-                plugin_generation_upgrade_guard: None,
+        Ok((
+            OpenTransaction {
+                transaction: Self {
+                    active_branch_id,
+                    active_account_id,
+                    live_state,
+                    tracked_state,
+                    binary_cas,
+                    plugin_host,
+                    branch_ctx,
+                    schema_resolver,
+                    sql_schema_snapshot: sql_schema_catalog,
+                    sql_planning_cache,
+                    prepared_mutation_program: None,
+                    prepared_mutation_membership: PreparedMutationMembership::Unprepared,
+                    prepared_mutation_overlay_empty: false,
+                    prepared_mutation_timestamp: None,
+                    mutation_journal: None,
+                    mutation_journal_compressor: None,
+                    mutation_journal_sealed_rows: 0,
+                    mutation_journal_seal_prefix_open: true,
+                    mutation_journal_terminal_error: None,
+                    staged_writes,
+                    filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
+                    filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
+                    branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
+                    opening_read,
+                    storage,
+                    functions,
+                    opening_tracked_mutation_revision,
+                    opening_active_branch_head,
+                    opening_global_branch_head,
+                    commit_boundary: None,
+                    trust_filesystem_planner: false,
+                    origin_key: None,
+                    idempotency_receipt: None,
+                    atomic_metadata_writes: None,
+                    atomic_metadata_preconditions: Vec::new(),
+                    await_durable_commit: false,
+                    session_file_views,
+                    pending_file_view_mutations: BTreeMap::new(),
+                    pending_plugin_actor_publications: Vec::new(),
+                    plugin_generation_read_guard: None,
+                    plugin_generation_upgrade_guard: None,
+                },
+                runtime_functions,
             },
-            runtime_functions,
-        })
+            runtime_boundary_result,
+        ))
     }
 
     /// Commits prepared writes, runtime function state, and the storage transaction.
@@ -8689,6 +8699,42 @@ pub(crate) async fn open_transaction<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    let (opened, ()) = Transaction::open(
+        mode,
+        active_account_id,
+        storage,
+        live_state,
+        tracked_state,
+        binary_cas,
+        plugin_host,
+        branch_ctx,
+        catalog_context,
+        sql_planning_cache,
+        session_file_views,
+        async |_| Ok(()),
+    )
+    .await?;
+    Ok(opened)
+}
+
+pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
+    mode: &SessionMode,
+    active_account_id: String,
+    storage: StorageAdapter<StorageImpl>,
+    live_state: Arc<LiveStateContext>,
+    tracked_state: Arc<TrackedStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    plugin_host: PluginRuntimeHost,
+    branch_ctx: Arc<BranchContext>,
+    catalog_context: Arc<CatalogContext>,
+    sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
+    session_file_views: SessionFileViews,
+    runtime_boundary: F,
+) -> Result<(OpenTransaction<StorageImpl>, T), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    F: for<'runtime> AsyncFnOnce(&'runtime FunctionContext) -> Result<T, LixError>,
+{
     Transaction::open(
         mode,
         active_account_id,
@@ -8701,6 +8747,7 @@ where
         catalog_context,
         sql_planning_cache,
         session_file_views,
+        runtime_boundary,
     )
     .await
 }
