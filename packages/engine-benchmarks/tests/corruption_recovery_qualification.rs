@@ -27,6 +27,13 @@ const BINARY_CHUNK_SPACE: &str = "binary_cas.chunk";
 trait DurableBackend: Storage + Clone + Send + Sync + 'static {
     fn open(path: &Path) -> Self;
     async fn flush_all(&self);
+    async fn corrupt_binary_chunk(
+        &self,
+        path: &Path,
+        target_key: &[u8],
+        target_value: &[u8],
+        offset: usize,
+    );
 }
 
 #[async_trait]
@@ -37,6 +44,17 @@ impl DurableBackend for RocksDB {
 
     async fn flush_all(&self) {
         self.flush().expect("flush RocksDB corruption fixture");
+    }
+
+    async fn corrupt_binary_chunk(
+        &self,
+        _path: &Path,
+        target_key: &[u8],
+        _target_value: &[u8],
+        offset: usize,
+    ) {
+        replace_immutable_value_with_corruption(self, BINARY_CHUNK_SPACE, target_key, offset).await;
+        self.flush().expect("flush corrupt RocksDB binary chunk");
     }
 }
 
@@ -50,6 +68,16 @@ impl DurableBackend for SlateDB {
         self.flush_memtable_for_diagnostics()
             .await
             .expect("flush SlateDB corruption fixture");
+    }
+
+    async fn corrupt_binary_chunk(
+        &self,
+        path: &Path,
+        _target_key: &[u8],
+        target_value: &[u8],
+        offset: usize,
+    ) {
+        corrupt_slatedb_immutable_sidecar(path, target_value, offset);
     }
 }
 
@@ -341,8 +369,9 @@ async fn qualify_binary_payload_chunk<B: DurableBackend>() {
     );
     let chunks = inventory(&database, BINARY_CHUNK_SPACE).await;
     let target = chunks.first().expect("binary payload should own a chunk");
-    replace_immutable_value_with_corruption(&database, BINARY_CHUNK_SPACE, &target.0, 0).await;
-    database.flush_all().await;
+    database
+        .corrupt_binary_chunk(path, &target.0, &target.1, 0)
+        .await;
     drop(storage);
     drop(database);
 
@@ -461,4 +490,60 @@ async fn replace_immutable_value_with_corruption<B: Storage + Clone>(
         .commit_write_set(replacement, StorageWriteOptions::default())
         .await
         .expect("replace immutable corruption target");
+}
+
+fn corrupt_slatedb_immutable_sidecar(path: &Path, target_value: &[u8], offset: usize) {
+    const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXIVS1\0";
+    const IMMUTABLE_VALUE_HEADER_BYTES: usize = 16;
+
+    let directory = path.join("db").join("lix-immutable-value-segment-v1");
+    let mut matches = 0usize;
+    for entry in std::fs::read_dir(&directory).expect("list SlateDB immutable sidecars") {
+        let path = entry.expect("read SlateDB immutable sidecar entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let mut bytes = std::fs::read(&path).expect("read SlateDB immutable sidecar");
+        let mut cursor = 0usize;
+        let mut changed = false;
+        while cursor < bytes.len() {
+            let header_end = cursor
+                .checked_add(IMMUTABLE_VALUE_HEADER_BYTES)
+                .expect("SlateDB immutable sidecar header offset");
+            assert!(
+                header_end <= bytes.len()
+                    && &bytes[cursor..cursor + IMMUTABLE_VALUE_MAGIC.len()]
+                        == IMMUTABLE_VALUE_MAGIC,
+                "invalid SlateDB immutable sidecar envelope"
+            );
+            let value_len = usize::try_from(u64::from_le_bytes(
+                bytes[cursor + IMMUTABLE_VALUE_MAGIC.len()..header_end]
+                    .try_into()
+                    .expect("fixed SlateDB immutable sidecar length"),
+            ))
+            .expect("SlateDB immutable sidecar value length");
+            let value_end = header_end
+                .checked_add(value_len)
+                .expect("SlateDB immutable sidecar value offset");
+            assert!(
+                value_end <= bytes.len(),
+                "truncated SlateDB immutable sidecar envelope"
+            );
+            if &bytes[header_end..value_end] == target_value {
+                assert!(offset < value_len, "SlateDB immutable corruption offset");
+                bytes[header_end + offset] ^= 1;
+                matches += 1;
+                changed = true;
+            }
+            cursor = value_end;
+        }
+        if changed {
+            std::fs::write(&path, bytes).expect("write corrupt SlateDB immutable sidecar");
+            std::fs::File::open(&path)
+                .expect("open corrupt SlateDB immutable sidecar")
+                .sync_all()
+                .expect("sync corrupt SlateDB immutable sidecar");
+        }
+    }
+    assert_eq!(matches, 1, "exactly one SlateDB immutable payload target");
 }
