@@ -1518,7 +1518,7 @@ where
         format!("tracked-crud-commit-{}", self.next_commit_index)
     }
 
-    fn current_commit_id(&self) -> &str {
+    pub fn current_commit_id(&self) -> &str {
         self.current_commit_id
             .as_deref()
             .expect("tracked-state fixture should be seeded")
