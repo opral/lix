@@ -818,10 +818,10 @@ where
             .id
             .0,
     );
-    let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
-    let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
-    let deleted_semantic_reverse_index_rows =
-        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
+    let deleted_semantic_commit_projections =
+        delete_count(crate::changelog::SEMANTIC_HISTORY_SPACE.id.0);
+    let deleted_semantic_change_rows = 0;
+    let deleted_semantic_reverse_index_rows = 0;
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -1894,9 +1894,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::COMMIT_SPACE,
-        crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_ID_SPACE,
+        crate::changelog::SEMANTIC_HISTORY_SPACE,
     ]
 }
 
@@ -2051,11 +2049,12 @@ mod tests {
             .await
             .expect("begin layout accounting read");
 
-        let inventory = super::space_inventory(&read, crate::changelog::COMMIT_SPACE.name).await;
+        let inventory =
+            super::space_inventory(&read, crate::changelog::SEMANTIC_HISTORY_SPACE.name).await;
         let accounting = super::layout_accounting(&read)
             .await
             .into_iter()
-            .find(|space| space.space == crate::changelog::COMMIT_SPACE.name)
+            .find(|space| space.space == crate::changelog::SEMANTIC_HISTORY_SPACE.name)
             .expect("commit space is accounted");
         assert_eq!(accounting.rows, inventory.len() as u64);
         assert_eq!(

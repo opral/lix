@@ -7,12 +7,19 @@ use crate::common::{ExactBatch, SharedStr};
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
 };
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageProjectedValue,
-};
+#[cfg(test)]
+use crate::storage_adapter::PointReadPlan;
+use crate::storage_adapter::StorageAdapterRead;
+#[cfg(test)]
+use crate::storage_adapter::StorageProjectedValue;
 
-use super::{CHANGE_SPACE, ChangeId, ChangeRecord, decode_change_record};
+#[cfg(test)]
+use super::CHANGE_SPACE;
+#[cfg(test)]
+use super::decode_change_record;
+use super::{ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader};
 
+#[cfg(test)]
 const CHANGE_STORAGE_KEY_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,12 +119,13 @@ where
     if unique.is_empty() {
         return ExactBatch::try_new("change materialization", unique, Vec::new());
     }
-    let keys = change_storage_keys(unique)?;
-    let plan = PointReadPlan::from_unique_keys(CHANGE_SPACE, keys);
-    let result = plan.collect(store, StorageGetOptions::default()).await?;
-    decode_change_records_in_order(unique, result.value.unique_values)
+    let mut reader = ChangelogContext::new().reader(store);
+    reader
+        .load_changes(ChangeLoadRequest { change_ids: unique })
+        .await
 }
 
+#[cfg(test)]
 fn decode_change_records_in_order(
     unique: &[ChangeId],
     values: Vec<Option<StorageProjectedValue>>,
@@ -142,6 +150,7 @@ fn decode_change_records_in_order(
     ExactBatch::try_new("change materialization", unique, records)
 }
 
+#[cfg(test)]
 fn change_storage_keys(
     unique: &[ChangeId],
 ) -> Result<Vec<crate::storage_adapter::StorageKey>, LixError> {

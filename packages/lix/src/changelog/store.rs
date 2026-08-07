@@ -1,24 +1,41 @@
+#[cfg(test)]
+use super::types::CommitId;
 use super::types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeScanBatch, ChangeScanRequest,
-    ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitScanBatch,
-    CommitScanRequest,
+    ChangelogAppend, CommitLoadBatch, CommitLoadRequest, CommitScanBatch, CommitScanRequest,
 };
 use crate::common::LixError;
 use crate::storage_adapter::{StorageSpace, StorageSpaceId};
 use async_trait::async_trait;
 
+#[cfg(test)]
 pub(crate) const COMMIT_NAMESPACE: &str = "changelog.commit";
+#[cfg(test)]
 pub(crate) const CHANGE_NAMESPACE: &str = "changelog.change";
+#[cfg(test)]
 pub(crate) const COMMIT_CHANGE_ID_NAMESPACE: &str = "changelog.commit_change_id";
+pub(crate) const SEMANTIC_HISTORY_NAMESPACE: &str = "changelog.semantic_history.v1";
+
+/// Single append-only semantic-history owner. Commit, change, and reverse
+/// membership facts are records in authenticated directory/leaf segments under this
+/// space. The former three spaces below exist only under `cfg(test)` for
+/// negative-format fixtures; production registration and all production
+/// readers/writers use this space exclusively.
+pub(crate) const SEMANTIC_HISTORY_SPACE: StorageSpace =
+    StorageSpace::mutable(StorageSpaceId(0x0006_0005), SEMANTIC_HISTORY_NAMESPACE);
 
 // Commit-derived change-id keys are always exactly 16 raw UUID bytes. This
 // non-UUID key therefore cannot collide with an identity key in the same
 // space, while keeping the format check in the hot index point-read batch.
+#[cfg(test)]
 pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_KEY: &[u8] = b"format-v1";
+#[cfg(test)]
 pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE: &[u8] = b"1";
 
+#[cfg(test)]
 pub(crate) const COMMIT_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0006_0001), COMMIT_NAMESPACE);
+#[cfg(test)]
 pub(crate) const CHANGE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0006_0002), CHANGE_NAMESPACE);
 // The former commit-membership storage space is intentionally retired. Packed
@@ -27,6 +44,7 @@ pub(crate) const CHANGE_SPACE: StorageSpace =
 ///
 /// The changelog write path uses this to enforce the globally unique
 /// `CommitRecord::change_id` invariant without scanning every commit record.
+#[cfg(test)]
 pub(crate) const COMMIT_CHANGE_ID_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0006_0004), COMMIT_CHANGE_ID_NAMESPACE);
 
@@ -34,14 +52,17 @@ pub(crate) const COMMIT_CHANGE_ID_SPACE: StorageSpace =
 // matches the lexicographic order of its lowercase hyphenated text, so range
 // scans and resume tokens behave identically to the former text keys at
 // 20 fewer bytes per key.
+#[cfg(test)]
 pub(crate) fn commit_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
 }
 
+#[cfg(test)]
 pub(crate) fn change_key(change_id: ChangeId) -> Vec<u8> {
     change_id.as_uuid().as_bytes().to_vec()
 }
 
+#[cfg(test)]
 pub(crate) fn commit_change_id_key(change_id: ChangeId) -> Vec<u8> {
     change_key(change_id)
 }
@@ -51,6 +72,7 @@ pub(crate) fn commit_change_id_value(commit_id: CommitId) -> Vec<u8> {
     commit_key(commit_id)
 }
 
+#[cfg(test)]
 pub(crate) fn commit_change_id_index_format_key() -> Vec<u8> {
     COMMIT_CHANGE_ID_INDEX_FORMAT_KEY.to_vec()
 }
@@ -60,14 +82,17 @@ pub(crate) fn commit_change_id_index_format_value() -> Vec<u8> {
     COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.to_vec()
 }
 
+#[cfg(test)]
 pub(crate) fn commit_id_from_key(key: &[u8]) -> Result<CommitId, LixError> {
     uuid_from_key(key, "commit").map(CommitId::new)
 }
 
+#[cfg(test)]
 pub(crate) fn change_id_from_key(key: &[u8]) -> Result<ChangeId, LixError> {
     uuid_from_key(key, "change").map(ChangeId::new)
 }
 
+#[cfg(test)]
 fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
     uuid::Uuid::from_slice(key).map_err(|error| {
         LixError::new(

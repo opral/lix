@@ -16785,6 +16785,7 @@ mod tests {
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
             BINARY_CAS_CHUNK_PRESENCE_SPACE,
             BINARY_CAS_CHUNK_SPACE,
+            crate::changelog::SEMANTIC_HISTORY_SPACE,
             COMMIT_SPACE,
             CHANGE_SPACE,
             COMMIT_CHANGE_ID_SPACE,

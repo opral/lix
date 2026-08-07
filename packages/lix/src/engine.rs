@@ -4,7 +4,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
-use crate::changelog::COMMIT_SPACE;
+use crate::changelog::SEMANTIC_HISTORY_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
@@ -467,9 +467,9 @@ async fn repository_has_changelog_commit(
     read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
 ) -> Result<bool, LixError> {
     Ok(!ScanPlan::prefix(
-        COMMIT_SPACE,
+        SEMANTIC_HISTORY_SPACE,
         StoragePrefix {
-            bytes: bytes::Bytes::new(),
+            bytes: bytes::Bytes::from_static(&[0]),
         },
     )
     .collect(

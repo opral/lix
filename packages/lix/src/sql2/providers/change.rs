@@ -8,8 +8,8 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::changelog::{
-    COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogContext,
+    ChangelogReader, load_commit_id_for_change,
 };
 use crate::serialize_row_metadata;
 
@@ -21,10 +21,7 @@ use crate::sql2::change_materialization::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-};
-use bytes::Bytes;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -274,24 +271,9 @@ where
         return Ok(Some(LixChangeRow::Direct(change)));
     }
 
-    let index_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
-    let indexed_commit =
-        PointReadPlan::new(COMMIT_CHANGE_ID_SPACE, std::slice::from_ref(&index_key))
-            .materialize(&store, StorageGetOptions::default())
-            .await?
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-    let Some(StorageProjectedValue::FullValue(commit_id)) = indexed_commit else {
+    let Some(commit_id) = load_commit_id_for_change(&store, change_id).await? else {
         return Ok(None);
     };
-    let commit_id = CommitId::new(uuid::Uuid::from_slice(&commit_id).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog commit change-id index has invalid commit id: {error}"),
-        )
-    })?);
     let commit = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
         .load_node(&commit_id)

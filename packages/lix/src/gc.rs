@@ -15,9 +15,8 @@ use crate::branch::BranchHeadControlContext;
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::ChangeScanRequest;
 use crate::changelog::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangelogContext,
-    ChangelogReader, CommitId, CommitLoadRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
-    GcSweepSet, change_key, commit_change_id_key, commit_key,
+    ChangeId, ChangelogContext, ChangelogReader, CommitId, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
+    GcSweepSet,
 };
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
@@ -1262,7 +1261,7 @@ where
 
 /// Returns the exact standalone semantic facts and the authenticated reason
 /// currently known for each one. This is benchmark-only attribution: the
-/// ordinary collector never scans CHANGE_SPACE, and this helper is called
+/// ordinary collector never scans semantic-history segments, and this helper is called
 /// outside the measured planner phase.
 #[cfg(feature = "storage-benches")]
 pub(crate) async fn audit_repository_gc_standalone_refs<S>(
@@ -1869,6 +1868,7 @@ where
     let mut queue_open = true;
     let mut reclaimed_commits = Vec::new();
     let mut reclaimed_standalone_changes = BTreeSet::new();
+    let mut reclaimed_semantic_commits = BTreeSet::new();
     let mut reclaimed_checkpoint_branches = BTreeSet::new();
     for (sequence, batch) in batches {
         if queue_open && blocked_sequences.contains(&sequence) {
@@ -1914,7 +1914,7 @@ where
                 &active_semantic_dependency_ids,
             );
             if semantic_retirement {
-                stage_delete_semantic_commit_projection(&store, writes, old_root).await?;
+                reclaimed_semantic_commits.insert(old_root);
             }
             if !physical_retirement {
                 continue;
@@ -1984,14 +1984,16 @@ where
                     .iter()
                     .any(|(_, active)| active.ref_change_id == control.ref_change_id)
                 {
-                    let key = StorageKey(Bytes::from(change_key(control.ref_change_id)));
-                    let existing = PointReadPlan::new(CHANGE_SPACE, std::slice::from_ref(&key))
-                        .materialize(&store, StorageGetOptions::default())
+                    let change_ids = [control.ref_change_id];
+                    let existing = ChangelogContext::new()
+                        .reader(&store)
+                        .load_changes(crate::changelog::ChangeLoadRequest {
+                            change_ids: &change_ids,
+                        })
                         .await?
-                        .value
                         .into_iter()
                         .next()
-                        .flatten();
+                        .and_then(|(_, record)| record);
                     if existing.is_none() {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
@@ -2001,7 +2003,6 @@ where
                             ),
                         ));
                     }
-                    writes.delete(CHANGE_SPACE, key);
                     reclaimed_standalone_changes.insert(control.ref_change_id);
                 }
             }
@@ -2039,8 +2040,24 @@ where
             key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
             expected: raw_queue,
         });
-        writes.seal_changelog_gc();
     }
+
+    if !reclaimed_semantic_commits.is_empty() || !reclaimed_standalone_changes.is_empty() {
+        let commit_ids = reclaimed_semantic_commits
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let change_ids = reclaimed_standalone_changes
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut semantic_store = store.clone();
+        ChangelogContext::new()
+            .writer(&mut semantic_store, writes)
+            .stage_delete_records(&commit_ids, &change_ids)
+            .await?;
+    }
+    writes.seal_changelog_gc();
 
     Ok(RepositoryGcPlan {
         changelog: GcPlan {
@@ -2752,10 +2769,6 @@ where
         .collect::<Vec<_>>();
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
-    writes.delete_batch(
-        COMMIT_SPACE,
-        sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
-    );
     stage_sweep_unreachable_content_nodes(
         store,
         writes,
@@ -2804,16 +2817,13 @@ where
             )?;
         }
     }
-    writes.delete_batch(
-        COMMIT_CHANGE_ID_SPACE,
-        sweep_commit_change_ids
-            .iter()
-            .map(|change_id| commit_change_id_key(*change_id)),
-    );
-    writes.delete_batch(
-        CHANGE_SPACE,
-        sweep_changes.iter().map(|change_id| change_key(*change_id)),
-    );
+    let mut retired_changes = sweep_changes.clone();
+    retired_changes.extend(sweep_commit_change_ids.iter().copied());
+    let mut semantic_store = store.clone();
+    ChangelogContext::new()
+        .writer(&mut semantic_store, writes)
+        .stage_delete_records(&sweep_commits, &retired_changes)
+        .await?;
     JsonStoreContext::new()
         .writer()
         .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
@@ -2980,54 +2990,6 @@ fn retirement_is_proven(
     new_root != Some(old_root)
         && !active_authority_ids.contains(&old_root)
         && !active_dependency_ids.contains(&old_root)
-}
-
-/// Removes the semantic commit projection once its root interval is no longer
-/// reachable. Physical tracked-state authority may remain alive as a selected
-/// source or serving dependency, so this decision is intentionally separate
-/// from manifest/CAS retirement.
-async fn stage_delete_semantic_commit_projection<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    commit_id: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let commit_ids = [commit_id];
-    let record = ChangelogContext::new()
-        .reader(store)
-        .load_commits(CommitLoadRequest {
-            commit_ids: &commit_ids,
-        })
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, record)| record);
-    let Some(record) = record else {
-        // A prior GC pass may already have removed the semantic projection
-        // while its physical authority remained pinned.
-        return Ok(());
-    };
-    if record.commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit projection key for '{commit_id}' contains '{}'",
-                record.commit_id
-            ),
-        ));
-    }
-    writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
-    writes.delete(
-        COMMIT_CHANGE_ID_SPACE,
-        StorageKey(Bytes::from(commit_change_id_key(record.change_id))),
-    );
-    writes.delete(
-        CHANGE_SPACE,
-        StorageKey(Bytes::from(change_key(record.change_id))),
-    );
-    Ok(())
 }
 
 #[cfg(test)]

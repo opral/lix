@@ -1306,13 +1306,13 @@ async fn stage_changelog_commits(
                 .and_then(CommitStateMutationInventory::selected_source_commit_id)
                 .is_some();
         let first_parent = commit.parent_commit_ids.first().copied();
-        let parent_rootless_depth = first_parent
+        let parent_rootless_depth: u16 = first_parent
             .and_then(|parent| rootless_depths.get(&parent).copied())
             .unwrap_or(0);
-        let parent_rootless_rows = first_parent
+        let parent_rootless_rows: u64 = first_parent
             .and_then(|parent| rootless_rows.get(&parent).copied())
             .unwrap_or(0);
-        let parent_rootless_bytes = first_parent
+        let parent_rootless_bytes: u64 = first_parent
             .and_then(|parent| rootless_bytes.get(&parent).copied())
             .unwrap_or(0);
         let next_rootless_rows = parent_rootless_rows
@@ -1482,7 +1482,7 @@ async fn stage_changelog_commits(
     writer
         .stage_delete_standalone_changes(compact_change_ids)
         .await?;
-    writer.stage_transaction_append(append)?;
+    writer.stage_transaction_append(append).await?;
     Ok(staged)
 }
 

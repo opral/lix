@@ -18,28 +18,457 @@ use super::codec::{
     append_change_record, append_commit_record, append_transaction_change_record,
     decode_change_record,
 };
-use super::store::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_INDEX_FORMAT_KEY, COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE,
-    COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, change_id_from_key, change_key,
-    commit_change_id_index_format_key, commit_change_id_key, commit_id_from_key, commit_key,
+use super::semantic_history::{
+    CHANGE_RECORD_KIND, COMMIT_RECORD_KIND, ChildSelector, DIRECTORY_FANOUT, HISTORY_KEY_BYTES,
+    LEAF_MAX_RECORDS, MEMBERSHIP_RECORD_KIND, NODE_KEY_PREFIX, ROOT_KEY, SemanticHistoryDirectory,
+    SemanticHistoryRecord, SemanticHistoryRoot, SemanticHistorySegment, decode_directory,
+    decode_root, decode_segment, encode_directory, encode_root, encode_segment, leaf_key, node_key,
+    record_key, record_sort_key, selector_for_leaf, selector_for_node,
 };
+use super::store::SEMANTIC_HISTORY_SPACE;
 use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, ChangelogReader, ChangelogWriter, CommitId, CommitLoadBatch,
     CommitLoadRequest, CommitRecord, CommitScanBatch, CommitScanRequest,
     TransactionChangelogAppend,
 };
-use crate::json_store::JsonSlotRef;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapter,
-    StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions, StorageScanOptions,
-    StorageSpace, StorageWriteSet, exact_get_many,
+    PointReadPlan, StorageAdapter, StorageAdapterRead, StorageGetOptions, StorageKey,
+    StorageProjectedValue, StorageReadOptions, StorageSpace, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
 const SCAN_PAGE_LIMIT: usize = 1024;
+
+fn exactly_one_get(values: Vec<Option<Vec<u8>>>, what: &str) -> Result<Option<Vec<u8>>, LixError> {
+    let mut values = values.into_iter();
+    let value = values.next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("semantic-history {what} returned no result slot"),
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("semantic-history {what} returned extra result slots"),
+        ));
+    }
+    Ok(value)
+}
+
+fn corruption(message: &str) -> LixError {
+    LixError::new(LixError::CODE_INTERNAL_ERROR, message)
+}
+
+fn validate_directory_selector(
+    selector: &ChildSelector,
+    node: &SemanticHistoryDirectory,
+) -> Result<(), LixError> {
+    if selector_for_node(node)? != *selector {
+        return Err(corruption("semantic-history directory selector mismatch"));
+    }
+    Ok(())
+}
+
+struct SemanticTreeEditor<'a, S: ?Sized> {
+    store: &'a mut S,
+    writes: &'a mut StorageWriteSet,
+    root: SemanticHistoryRoot,
+    observed_root: Option<Bytes>,
+    nodes: HashMap<Vec<u8>, SemanticHistoryDirectory>,
+    leaves: HashMap<Vec<u8>, SemanticHistorySegment>,
+    new_objects: HashMap<Vec<u8>, Vec<u8>>,
+    retired: HashSet<Vec<u8>>,
+}
+
+impl<'a, S> SemanticTreeEditor<'a, S>
+where
+    S: ChangelogStorageRead + Send + ?Sized,
+{
+    fn new(
+        store: &'a mut S,
+        writes: &'a mut StorageWriteSet,
+        root: SemanticHistoryRoot,
+        observed_root: Option<Bytes>,
+    ) -> Self {
+        Self {
+            store,
+            writes,
+            root,
+            observed_root,
+            nodes: HashMap::new(),
+            leaves: HashMap::new(),
+            new_objects: HashMap::new(),
+            retired: HashSet::new(),
+        }
+    }
+
+    async fn read_object(&mut self, key: &[u8]) -> Result<Vec<u8>, LixError> {
+        exactly_one_get(
+            self.store
+                .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![key.to_vec()])
+                .await?,
+            "content object read",
+        )?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "semantic-history root references a missing content object",
+            )
+        })
+    }
+
+    async fn load_node(&mut self, key: &[u8]) -> Result<SemanticHistoryDirectory, LixError> {
+        if key.first() != Some(&NODE_KEY_PREFIX) || key.len() != 33 {
+            return Err(corruption("semantic-history node locator is malformed"));
+        }
+        if let Some(node) = self.nodes.get(key) {
+            return Ok(node.clone());
+        }
+        let node = if let Some(bytes) = self.new_objects.get(key) {
+            decode_directory(bytes)?
+        } else {
+            decode_directory(&self.read_object(key).await?)?
+        };
+        if node.digest != key[1..] {
+            return Err(corruption(
+                "semantic-history node digest does not match locator",
+            ));
+        }
+        self.nodes.insert(key.to_vec(), node.clone());
+        Ok(node)
+    }
+
+    fn validate_node_selector(
+        selector: &ChildSelector,
+        node: &SemanticHistoryDirectory,
+    ) -> Result<(), LixError> {
+        let expected = selector_for_node(node)?;
+        if expected != *selector {
+            return Err(corruption("semantic-history directory selector mismatch"));
+        }
+        Ok(())
+    }
+
+    async fn load_leaf(
+        &mut self,
+        selector: &ChildSelector,
+    ) -> Result<SemanticHistorySegment, LixError> {
+        if selector.key.first() != Some(&crate::changelog::semantic_history::LEAF_KEY_PREFIX)
+            || selector.key.len() != 33
+        {
+            return Err(corruption("semantic-history leaf locator is malformed"));
+        }
+        if let Some(segment) = self.leaves.get(&selector.key) {
+            return Ok(segment.clone());
+        }
+        let segment = if let Some(bytes) = self.new_objects.get(&selector.key) {
+            decode_segment(bytes)?
+        } else {
+            decode_segment(&self.read_object(&selector.key).await?)?
+        };
+        if segment.digest != selector.digest
+            || segment.min_key != selector.first
+            || segment.max_key != selector.last
+            || segment.records.len() != selector.record_count as usize
+        {
+            return Err(corruption("semantic-history leaf selector mismatch"));
+        }
+        self.leaves.insert(selector.key.clone(), segment.clone());
+        Ok(segment)
+    }
+
+    async fn locate(
+        &mut self,
+        key: [u8; HISTORY_KEY_BYTES],
+    ) -> Result<Option<(Vec<(Vec<u8>, usize)>, ChildSelector)>, LixError> {
+        let Some(target) = self.root.target.clone() else {
+            return Ok(None);
+        };
+        let mut node_key = target.key.clone();
+        let mut expected_selector = Some(target);
+        let mut path = Vec::new();
+        loop {
+            let node = self.load_node(&node_key).await?;
+            if let Some(selector) = expected_selector.take() {
+                Self::validate_node_selector(&selector, &node)?;
+            }
+            let (index, child) = node
+                .children
+                .iter()
+                .enumerate()
+                .find(|(_, child)| child.first <= key && key <= child.last)
+                .map(|(index, child)| (index, child.clone()))
+                .or_else(|| {
+                    if key < node.children[0].first {
+                        Some((0, node.children[0].clone()))
+                    } else {
+                        node.children
+                            .last()
+                            .cloned()
+                            .map(|child| (node.children.len() - 1, child))
+                    }
+                })
+                .ok_or_else(|| corruption("semantic-history directory has no children"))?;
+            path.push((node_key.clone(), index));
+            if node.level == 0 {
+                return Ok(Some((path, child)));
+            }
+            if child.key.first() != Some(&NODE_KEY_PREFIX) {
+                return Err(corruption(
+                    "semantic-history directory child level mismatch",
+                ));
+            }
+            node_key = child.key.clone();
+            expected_selector = Some(child);
+        }
+    }
+
+    async fn apply(
+        &mut self,
+        additions: Vec<SemanticHistoryRecord>,
+        removals: &[(u8, [u8; 16])],
+    ) -> Result<SemanticHistoryRoot, LixError> {
+        let next_generation = self.root.generation.checked_add(1).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "semantic-history generation overflow",
+            )
+        })?;
+        let mut groups = HashMap::<
+            Option<Vec<u8>>,
+            (Vec<SemanticHistoryRecord>, Vec<[u8; HISTORY_KEY_BYTES]>),
+        >::new();
+        for record in additions {
+            let key = record_sort_key(&record);
+            let leaf = self.locate(key).await?.map(|(_, selector)| selector.key);
+            groups.entry(leaf).or_default().0.push(record);
+        }
+        for (kind, id) in removals {
+            let key = record_key(*kind, *id);
+            let Some((_, selector)) = self.locate(key).await? else {
+                return Err(corruption(
+                    "semantic-history delete references a missing record",
+                ));
+            };
+            groups.entry(Some(selector.key)).or_default().1.push(key);
+        }
+        let mut group_keys = groups.keys().cloned().collect::<Vec<_>>();
+        group_keys.sort();
+        for leaf_key in group_keys {
+            let (additions, removals) = groups.remove(&leaf_key).expect("group key exists");
+            let (path, selector, mut records) = if let Some(_leaf_key) = leaf_key {
+                let key = additions
+                    .first()
+                    .map(record_sort_key)
+                    .or_else(|| removals.first().copied())
+                    .ok_or_else(|| corruption("empty semantic-history mutation group"))?;
+                let (path, selector) = self
+                    .locate(key)
+                    .await?
+                    .ok_or_else(|| corruption("semantic-history leaf disappeared"))?;
+                let records = self.load_leaf(&selector).await?.records;
+                (Some(path), Some(selector), records)
+            } else {
+                (None, None, Vec::new())
+            };
+            for key in removals {
+                let before = records.len();
+                records.retain(|record| record_sort_key(record) != key);
+                if records.len() == before {
+                    return Err(corruption(
+                        "semantic-history delete references a missing record",
+                    ));
+                }
+            }
+            records.extend(additions);
+            records.sort_by_key(record_sort_key);
+            for pair in records.windows(2) {
+                if record_sort_key(&pair[0]) == record_sort_key(&pair[1]) {
+                    return Err(corruption("semantic-history duplicate record"));
+                }
+            }
+            let replacements = self.make_leaf_selectors(next_generation, records)?;
+            if let Some(path) = path {
+                let old_leaf = selector.expect("path has leaf");
+                self.retired.insert(old_leaf.key.clone());
+                let root_key = self
+                    .root
+                    .target
+                    .as_ref()
+                    .expect("path has root")
+                    .key
+                    .clone();
+                let selectors = self.replace_node_sync(root_key, &path, replacements)?;
+                self.root.target = self.promote_root(selectors)?;
+            } else {
+                let selectors = self.make_directory_selectors(0, replacements)?;
+                self.root.target = self.promote_root(selectors)?;
+            }
+            self.root.record_count = self
+                .root
+                .target
+                .as_ref()
+                .map_or(0, |target| target.record_count as u64);
+        }
+        self.root.generation = next_generation;
+        self.stage_reachable_objects()?;
+        self.root.clone().seal()
+    }
+
+    fn promote_root(
+        &mut self,
+        mut selectors: Vec<ChildSelector>,
+    ) -> Result<Option<ChildSelector>, LixError> {
+        if selectors.is_empty() {
+            return Ok(None);
+        }
+        let mut level = self
+            .nodes
+            .values()
+            .map(|node| node.level)
+            .max()
+            .unwrap_or(0);
+        while selectors.len() > 1 {
+            level = level.saturating_add(1);
+            selectors = self.make_directory_selectors(level, selectors)?;
+        }
+        Ok(selectors.pop())
+    }
+
+    fn make_leaf_selectors(
+        &mut self,
+        generation: u64,
+        records: Vec<SemanticHistoryRecord>,
+    ) -> Result<Vec<ChildSelector>, LixError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        let mut current = Vec::new();
+        for record in records {
+            current.push(record);
+            if current.len() == LEAF_MAX_RECORDS {
+                output.push(self.seal_leaf(generation, std::mem::take(&mut current))?);
+            } else if SemanticHistorySegment::seal(generation, current.clone()).is_err()
+                && current.len() > 1
+            {
+                let last = current.pop().expect("current is non-empty");
+                output.push(self.seal_leaf(generation, std::mem::take(&mut current))?);
+                current.push(last);
+            }
+        }
+        if !current.is_empty() {
+            output.push(self.seal_leaf(generation, current)?);
+        }
+        Ok(output)
+    }
+
+    fn seal_leaf(
+        &mut self,
+        generation: u64,
+        records: Vec<SemanticHistoryRecord>,
+    ) -> Result<ChildSelector, LixError> {
+        let segment = SemanticHistorySegment::seal(generation, records)?;
+        let key = leaf_key(segment.digest);
+        self.leaves.insert(key.clone(), segment.clone());
+        self.new_objects.insert(key, encode_segment(&segment)?);
+        selector_for_leaf(&segment)
+    }
+
+    fn make_directory_selectors(
+        &mut self,
+        level: u8,
+        children: Vec<ChildSelector>,
+    ) -> Result<Vec<ChildSelector>, LixError> {
+        children
+            .chunks(DIRECTORY_FANOUT)
+            .map(|chunk| {
+                let node = SemanticHistoryDirectory::seal(level, chunk.to_vec())?;
+                let key = node_key(node.digest);
+                self.new_objects
+                    .insert(key.clone(), encode_directory(&node)?);
+                self.nodes.insert(key, node.clone());
+                selector_for_node(&node)
+            })
+            .collect()
+    }
+
+    fn replace_node_sync(
+        &mut self,
+        node_key: Vec<u8>,
+        path: &[(Vec<u8>, usize)],
+        replacements: Vec<ChildSelector>,
+    ) -> Result<Vec<ChildSelector>, LixError> {
+        let node = self
+            .nodes
+            .get(&node_key)
+            .cloned()
+            .ok_or_else(|| corruption("semantic-history path node was not loaded"))?;
+        let index = path
+            .iter()
+            .find(|(key, _)| key == &node_key)
+            .map(|(_, index)| *index)
+            .ok_or_else(|| corruption("semantic-history path index missing"))?;
+        let children = if node.level == 0 {
+            let mut children = node.children;
+            children.splice(index..=index, replacements);
+            children
+        } else {
+            let child_key = node.children[index].key.clone();
+            let child_replacements = self.replace_node_sync(child_key, path, replacements)?;
+            let mut children = node.children;
+            children.splice(index..=index, child_replacements);
+            children
+        };
+        self.retired.insert(node_key);
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.make_directory_selectors(node.level, children)
+    }
+
+    fn stage_reachable_objects(&mut self) -> Result<(), LixError> {
+        let mut reachable = HashSet::new();
+        if let Some(target) = &self.root.target {
+            self.collect_new_keys(&target.key, &mut reachable)?;
+        }
+        for (key, bytes) in self.new_objects.clone() {
+            if reachable.contains(&key) {
+                self.writes.put(SEMANTIC_HISTORY_SPACE, key, bytes);
+            }
+        }
+        for key in self.retired.drain() {
+            if !reachable.contains(&key) {
+                self.new_objects.remove(&key);
+                self.writes.delete(SEMANTIC_HISTORY_SPACE, key);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_new_keys(
+        &self,
+        key: &[u8],
+        reachable: &mut HashSet<Vec<u8>>,
+    ) -> Result<(), LixError> {
+        if !self.new_objects.contains_key(key) || !reachable.insert(key.to_vec()) {
+            return Ok(());
+        }
+        if key.first() == Some(&NODE_KEY_PREFIX) {
+            let node = self
+                .nodes
+                .get(key)
+                .ok_or_else(|| corruption("new directory missing"))?;
+            for child in &node.children {
+                self.collect_new_keys(&child.key, reachable)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ChangelogContext;
@@ -86,97 +515,6 @@ pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
     staged_change_deletes: HashSet<ChangeId>,
 }
 
-struct EncodedChangelogBatch {
-    key_bytes: Vec<u8>,
-    value_bytes: Vec<u8>,
-    puts: Vec<EncodedPut>,
-}
-
-impl EncodedChangelogBatch {
-    fn with_capacity(puts: usize, key_bytes: usize, value_bytes: usize) -> Self {
-        Self {
-            key_bytes: Vec::with_capacity(key_bytes),
-            value_bytes: Vec::with_capacity(value_bytes),
-            puts: Vec::with_capacity(puts),
-        }
-    }
-
-    fn try_put(
-        &mut self,
-        key: &[u8],
-        encode_value: impl FnOnce(&mut Vec<u8>) -> Result<std::ops::Range<usize>, LixError>,
-    ) -> Result<(), LixError> {
-        let value = encode_value(&mut self.value_bytes)?;
-        self.put_range(key, value);
-        Ok(())
-    }
-
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        let start = self.value_bytes.len();
-        self.value_bytes.extend_from_slice(value);
-        self.put_range(key, start..self.value_bytes.len());
-    }
-
-    fn put_range(&mut self, key: &[u8], value: std::ops::Range<usize>) {
-        let key_start = self.key_bytes.len();
-        self.key_bytes.extend_from_slice(key);
-        self.puts.push(EncodedPut {
-            key: BufferRange::new(key_start, self.key_bytes.len() - key_start),
-            value: BufferRange::new(value.start, value.end - value.start),
-        });
-    }
-
-    fn stage(self, writes: &mut StorageWriteSet, space: StorageSpace) {
-        if self.puts.is_empty() {
-            return;
-        }
-        let batch = EncodedMutationBatch::try_new(
-            Bytes::from(self.key_bytes),
-            Bytes::from(self.value_bytes),
-            self.puts,
-            Vec::new(),
-        )
-        .expect("changelog ranges originate in the supplied encoded buffers");
-        writes.stage_encoded_batch(space, batch);
-    }
-}
-
-fn transaction_change_value_capacity(
-    change: &crate::changelog::TransactionChangeRecordRef<'_>,
-) -> usize {
-    96usize
-        .saturating_add(change.schema_key.len())
-        .saturating_add(change.entity_pk.estimated_heap_bytes())
-        .saturating_add(change.file_id.map_or(0, str::len))
-        .saturating_add(change.origin_key.map_or(0, str::len))
-        .saturating_add(json_slot_ref_value_capacity(change.snapshot))
-        .saturating_add(json_slot_ref_value_capacity(change.metadata))
-}
-
-fn change_value_capacity(change: &ChangeRecord) -> usize {
-    let change = crate::changelog::TransactionChangeRecordRef::from(change);
-    transaction_change_value_capacity(&change)
-}
-
-fn json_slot_ref_value_capacity(slot: JsonSlotRef<'_>) -> usize {
-    match slot {
-        JsonSlotRef::None => 1,
-        JsonSlotRef::Ref(_) => 33,
-        JsonSlotRef::Inline(json) => json.len().saturating_add(9),
-    }
-}
-
-fn commit_value_capacity(commit: &CommitRecord) -> usize {
-    96usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
-}
-
-#[derive(Debug)]
-pub(crate) struct ChangelogScanPage {
-    pub(super) keys: Vec<Vec<u8>>,
-    pub(super) values: Vec<Vec<u8>>,
-    pub(super) resume_after: Option<Vec<u8>>,
-}
-
 #[async_trait]
 pub(crate) trait ChangelogStorageRead {
     async fn changelog_get_many(
@@ -184,20 +522,6 @@ pub(crate) trait ChangelogStorageRead {
         space: StorageSpace,
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError>;
-
-    async fn changelog_get_many_batch(
-        &mut self,
-        requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError>;
-
-    async fn changelog_scan(
-        &mut self,
-        space: StorageSpace,
-        prefix: Vec<u8>,
-        after: Option<Vec<u8>>,
-        limit: usize,
-        projection: StorageCoreProjection,
-    ) -> Result<ChangelogScanPage, LixError>;
 }
 
 #[async_trait]
@@ -211,24 +535,6 @@ where
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
         native_get_many(self, space, keys).await
-    }
-
-    async fn changelog_get_many_batch(
-        &mut self,
-        requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError> {
-        native_get_many_batch(self, requests).await
-    }
-
-    async fn changelog_scan(
-        &mut self,
-        space: StorageSpace,
-        prefix: Vec<u8>,
-        after: Option<Vec<u8>>,
-        limit: usize,
-        projection: StorageCoreProjection,
-    ) -> Result<ChangelogScanPage, LixError> {
-        native_scan(self, space, prefix, after, limit, projection).await
     }
 }
 
@@ -244,26 +550,6 @@ where
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
         let mut read = self.begin_read(StorageReadOptions::default()).await?;
         native_get_many(&mut read, space, keys).await
-    }
-
-    async fn changelog_get_many_batch(
-        &mut self,
-        requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError> {
-        let mut read = self.begin_read(StorageReadOptions::default()).await?;
-        native_get_many_batch(&mut read, requests).await
-    }
-
-    async fn changelog_scan(
-        &mut self,
-        space: StorageSpace,
-        prefix: Vec<u8>,
-        after: Option<Vec<u8>>,
-        limit: usize,
-        projection: StorageCoreProjection,
-    ) -> Result<ChangelogScanPage, LixError> {
-        let mut read = self.begin_read(StorageReadOptions::default()).await?;
-        native_scan(&mut read, space, prefix, after, limit, projection).await
     }
 }
 
@@ -400,8 +686,8 @@ where
 {
     async fn stage_append(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         self.ensure_changelog_mutation_is_allowed()?;
-        let stage_commit_change_id_index_format = self.validate_append(&append).await?;
-        self.stage_append_records(append, stage_commit_change_id_index_format)
+        self.validate_append(&append).await?;
+        self.stage_append_records(append).await
     }
 
     async fn stage_delete_standalone_changes(
@@ -419,7 +705,9 @@ where
         }
         for change_id in change_ids {
             if self.staged_change_deletes.insert(change_id) {
-                self.writes.delete(CHANGE_SPACE, change_key(change_id));
+                // The terminal transaction append coalesces these removals
+                // with its additions into one root publication. This writer
+                // is not otherwise used for standalone deletion.
             }
         }
         Ok(())
@@ -430,6 +718,92 @@ impl<S> ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
+    async fn semantic_root_observed(
+        &mut self,
+    ) -> Result<(SemanticHistoryRoot, Option<Bytes>), LixError> {
+        let value = exactly_one_get(
+            self.store
+                .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![ROOT_KEY.to_vec()])
+                .await?,
+            "root read",
+        )?;
+        value.map_or_else(
+            || Ok((SemanticHistoryRoot::empty(), None)),
+            |bytes| decode_root(&bytes).map(|root| (root, Some(Bytes::from(bytes)))),
+        )
+    }
+
+    async fn stage_semantic_records(
+        &mut self,
+        additions: Vec<SemanticHistoryRecord>,
+        removals: &[(u8, [u8; 16])],
+    ) -> Result<(), LixError> {
+        if additions.is_empty() && removals.is_empty() {
+            return Ok(());
+        }
+        let (root, observed_root) = self.semantic_root_observed().await?;
+        let mut editor = SemanticTreeEditor::new(self.store, self.writes, root, observed_root);
+        let root = editor.apply(additions, removals).await?;
+        let root_precondition = editor.observed_root.map_or_else(
+            || crate::storage::Precondition::KeyAbsent {
+                space: SEMANTIC_HISTORY_SPACE,
+                key: crate::storage::Key(Bytes::copy_from_slice(ROOT_KEY)),
+            },
+            |expected| crate::storage::Precondition::KeyValueEquals {
+                space: SEMANTIC_HISTORY_SPACE,
+                key: crate::storage::Key(Bytes::copy_from_slice(ROOT_KEY)),
+                expected,
+            },
+        );
+        editor.writes.add_precondition(root_precondition);
+        editor
+            .writes
+            .put(SEMANTIC_HISTORY_SPACE, ROOT_KEY, encode_root(&root)?);
+        Ok(())
+    }
+
+    /// Removes semantic records through the same owner used for appends. The
+    /// selector is rewritten once for the complete retirement set, so GC
+    /// cannot leave a change row and its reverse membership in different
+    /// physical authorities.
+    pub(crate) async fn stage_delete_records(
+        &mut self,
+        commit_ids: &[CommitId],
+        change_ids: &[ChangeId],
+    ) -> Result<(), LixError> {
+        let mut removals = Vec::with_capacity(commit_ids.len() * 2 + change_ids.len());
+        for commit_id in commit_ids {
+            let Some(value) = semantic_load_record(
+                self.store,
+                COMMIT_RECORD_KIND,
+                *commit_id.as_uuid().as_bytes(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            let record: CommitRecord = storage_codec::decode("commit record", &value)?;
+            removals.push((COMMIT_RECORD_KIND, *commit_id.as_uuid().as_bytes()));
+            removals.push((
+                MEMBERSHIP_RECORD_KIND,
+                *record.change_id.as_uuid().as_bytes(),
+            ));
+            removals.push((CHANGE_RECORD_KIND, *record.change_id.as_uuid().as_bytes()));
+        }
+        removals.extend(
+            change_ids
+                .iter()
+                .map(|change_id| (CHANGE_RECORD_KIND, *change_id.as_uuid().as_bytes())),
+        );
+        // A committed change is owned by its semantic commit. Callers may
+        // also pass the same change id in `change_ids`; canonicalize the
+        // retirement frontier before applying it so one physical record is
+        // never removed twice.
+        removals.sort_unstable();
+        removals.dedup();
+        self.stage_semantic_records(Vec::new(), &removals).await
+    }
+
     /// Stages a terminal append assembled from already-prepared transaction rows.
     ///
     /// The transaction owns ID generation, parent selection, and change-ref
@@ -437,93 +811,74 @@ where
     /// dropped immediately after the append, so retaining a second owned copy
     /// of every row would only add allocation and drop work. Direct changelog
     /// callers continue to use `stage_append`.
-    pub(crate) fn stage_transaction_append(
+    pub(crate) async fn stage_transaction_append(
         &mut self,
         append: TransactionChangelogAppend<'_>,
     ) -> Result<(), LixError> {
         self.ensure_changelog_mutation_is_allowed()?;
         let TransactionChangelogAppend { commits, changes } = append;
-        let mut change_batch = EncodedChangelogBatch::with_capacity(
-            changes.len(),
-            changes.len() * 16,
-            changes.iter().map(transaction_change_value_capacity).sum(),
-        );
-        let mut commit_batch = EncodedChangelogBatch::with_capacity(
-            commits.len(),
-            commits.len() * 16,
-            commits.iter().map(commit_value_capacity).sum(),
-        );
-        let mut commit_change_id_batch = EncodedChangelogBatch::with_capacity(
-            commits.len(),
-            commits.len() * 16,
-            commits.len() * 16,
-        );
-
+        let mut records = Vec::with_capacity(commits.len() + changes.len() * 2);
         for change in &changes {
-            change_batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
-                append_transaction_change_record(bytes, change)
-            })?;
+            let mut value = Vec::new();
+            append_transaction_change_record(&mut value, change)?;
+            records.push(SemanticHistoryRecord {
+                kind: CHANGE_RECORD_KIND,
+                id: *change.change_id.as_uuid().as_bytes(),
+                value,
+            });
         }
         for commit in &commits {
-            commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
-                append_commit_record(bytes, commit)
-            })?;
-            commit_change_id_batch.put(
-                commit.change_id.as_uuid().as_bytes(),
-                commit.commit_id.as_uuid().as_bytes(),
-            );
+            let mut value = Vec::new();
+            append_commit_record(&mut value, commit)?;
+            records.push(SemanticHistoryRecord {
+                kind: COMMIT_RECORD_KIND,
+                id: *commit.commit_id.as_uuid().as_bytes(),
+                value,
+            });
+            records.push(SemanticHistoryRecord {
+                kind: MEMBERSHIP_RECORD_KIND,
+                id: *commit.change_id.as_uuid().as_bytes(),
+                value: commit.commit_id.as_uuid().as_bytes().to_vec(),
+            });
         }
-        change_batch.stage(self.writes, CHANGE_SPACE);
-        commit_batch.stage(self.writes, COMMIT_SPACE);
-        commit_change_id_batch.stage(self.writes, COMMIT_CHANGE_ID_SPACE);
+        let removals = self
+            .staged_change_deletes
+            .iter()
+            .map(|change_id| (CHANGE_RECORD_KIND, *change_id.as_uuid().as_bytes()))
+            .collect::<Vec<_>>();
+        self.stage_semantic_records(records, &removals).await?;
         Ok(())
     }
 
-    fn stage_append_records(
-        &mut self,
-        append: ChangelogAppend,
-        stage_commit_change_id_index_format: bool,
-    ) -> Result<(), LixError> {
+    async fn stage_append_records(&mut self, append: ChangelogAppend) -> Result<(), LixError> {
         let ChangelogAppend { commits, changes } = append;
-        let mut change_batch = EncodedChangelogBatch::with_capacity(
-            changes.len(),
-            changes.len() * 16,
-            changes.iter().map(change_value_capacity).sum(),
-        );
-        let mut commit_batch = EncodedChangelogBatch::with_capacity(
-            commits.len(),
-            commits.len() * 16,
-            commits.iter().map(commit_value_capacity).sum(),
-        );
-        let reverse_count = commits.len() + usize::from(stage_commit_change_id_index_format);
-        let mut commit_change_id_batch = EncodedChangelogBatch::with_capacity(
-            reverse_count,
-            commits.len() * 16 + COMMIT_CHANGE_ID_INDEX_FORMAT_KEY.len(),
-            commits.len() * 16 + COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.len(),
-        );
-        if stage_commit_change_id_index_format {
-            commit_change_id_batch.put(
-                COMMIT_CHANGE_ID_INDEX_FORMAT_KEY,
-                COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE,
-            );
-        }
+        let mut records = Vec::with_capacity(commits.len() + changes.len() * 2);
         for change in &changes {
-            change_batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
-                append_change_record(bytes, change)
-            })?;
+            let mut value = Vec::new();
+            append_change_record(&mut value, change)?;
+            records.push(SemanticHistoryRecord {
+                kind: CHANGE_RECORD_KIND,
+                id: *change.change_id.as_uuid().as_bytes(),
+                value,
+            });
         }
         for commit in &commits {
-            commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
-                append_commit_record(bytes, commit)
-            })?;
-            commit_change_id_batch.put(
-                commit.change_id.as_uuid().as_bytes(),
-                commit.commit_id.as_uuid().as_bytes(),
-            );
+            let mut value = Vec::new();
+            append_commit_record(&mut value, commit)?;
+            records.push(SemanticHistoryRecord {
+                kind: COMMIT_RECORD_KIND,
+                id: *commit.commit_id.as_uuid().as_bytes(),
+                value,
+            });
+            records.push(SemanticHistoryRecord {
+                kind: MEMBERSHIP_RECORD_KIND,
+                id: *commit.change_id.as_uuid().as_bytes(),
+                value: commit.commit_id.as_uuid().as_bytes().to_vec(),
+            });
         }
-        change_batch.stage(self.writes, CHANGE_SPACE);
-        commit_batch.stage(self.writes, COMMIT_SPACE);
-        commit_change_id_batch.stage(self.writes, COMMIT_CHANGE_ID_SPACE);
+        // The semantic segment owner is the only writer.  The old per-family
+        // batches above are intentionally no longer staged.
+        self.stage_semantic_records(records, &[]).await?;
 
         self.staged_changes.reserve(changes.len());
         self.staged_commits.reserve(commits.len());
@@ -545,7 +900,7 @@ where
         ))
     }
 
-    async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<bool, LixError> {
+    async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<(), LixError> {
         validate_unique(
             append.commits.iter().map(|commit| commit.commit_id),
             "commit_id",
@@ -579,13 +934,12 @@ where
             )));
         }
 
-        let stage_commit_change_id_index_format = self
-            .reject_existing_id_collisions(append, &append_commit_ids, &append_changes)
+        self.reject_existing_id_collisions(append, &append_commit_ids, &append_changes)
             .await?;
         self.validate_parent_commits(append, &append_commit_ids)
             .await?;
 
-        Ok(stage_commit_change_id_index_format)
+        Ok(())
     }
 
     async fn reject_existing_id_collisions(
@@ -593,132 +947,72 @@ where
         append: &ChangelogAppend,
         append_commit_ids: &HashSet<CommitId>,
         append_changes: &HashMap<ChangeId, &ChangeRecord>,
-    ) -> Result<bool, LixError> {
-        let commit_ids = append_commit_ids.iter().copied().collect::<Vec<_>>();
-        let commit_keys = commit_ids
-            .iter()
-            .map(|commit_id| commit_key(*commit_id))
-            .collect::<Vec<_>>();
-        let commit_change_ids = append
-            .commits
-            .iter()
-            .map(|commit| commit.change_id)
-            .collect::<Vec<_>>();
-        let append_change_ids = append_changes.keys().copied().collect::<Vec<_>>();
-        let change_keys = append_change_ids
-            .iter()
-            .chain(&commit_change_ids)
-            .map(|change_id| change_key(*change_id))
-            .collect::<Vec<_>>();
-        let index_format_key = commit_change_id_index_format_key();
-        let index_format_is_staged = self
-            .writes
-            .contains_put(COMMIT_CHANGE_ID_SPACE, &index_format_key);
-        let mut index_keys = Vec::with_capacity(commit_change_ids.len() + 1);
-        index_keys.push(index_format_key);
-        index_keys.extend(
-            commit_change_ids
-                .iter()
-                .map(|change_id| commit_change_id_key(*change_id)),
-        );
-        let mut batches = self
-            .store
-            .changelog_get_many_batch(vec![
-                (COMMIT_SPACE, commit_keys),
-                (CHANGE_SPACE, change_keys),
-                (COMMIT_CHANGE_ID_SPACE, index_keys),
-            ])
+    ) -> Result<(), LixError> {
+        for commit_id in append_commit_ids {
+            if semantic_load_record(
+                self.store,
+                COMMIT_RECORD_KIND,
+                *commit_id.as_uuid().as_bytes(),
+            )
             .await?
-            .into_iter();
-        let existing_commits = batches
-            .next()
-            .expect("commit validation batch was requested");
-        let existing_changes = batches
-            .next()
-            .expect("change validation batch was requested");
-        let mut index_values = batches
-            .next()
-            .expect("commit change-id validation batch was requested")
-            .into_iter();
-        let unexpected_batch = batches.next();
-        debug_assert!(unexpected_batch.is_none());
-        for (commit_id, found) in commit_ids.iter().zip(existing_commits) {
-            if found.is_some() || self.staged_commits.contains_key(commit_id) {
+            .is_some()
+                || self.staged_commits.contains_key(commit_id)
+            {
                 return Err(LixError::unknown(format!(
                     "changelog commit '{commit_id}' already exists"
                 )));
             }
         }
-        let (existing_append_changes, existing_commit_changes) =
-            existing_changes.split_at(append_change_ids.len());
-        for (change_id, found) in append_change_ids.iter().zip(existing_append_changes) {
-            if found.is_some() || self.staged_changes.contains_key(change_id) {
+        for change_id in append_changes.keys() {
+            if semantic_load_record(
+                self.store,
+                CHANGE_RECORD_KIND,
+                *change_id.as_uuid().as_bytes(),
+            )
+            .await?
+            .is_some()
+                || self.staged_changes.contains_key(&change_id)
+            {
                 return Err(LixError::unknown(format!(
                     "changelog change '{change_id}' already exists"
                 )));
             }
         }
-        if append.commits.is_empty() {
-            return Ok(false);
-        }
-        for ((commit, change_id), existing_change) in append
-            .commits
-            .iter()
-            .zip(commit_change_ids.iter())
-            .zip(existing_commit_changes)
-        {
-            if append_changes.contains_key(change_id)
-                || existing_change.is_some()
-                || self.staged_changes.contains_key(change_id)
+        for commit in &append.commits {
+            let change_id = commit.change_id;
+            if append_changes.contains_key(&change_id)
+                || semantic_load_record(
+                    self.store,
+                    CHANGE_RECORD_KIND,
+                    *change_id.as_uuid().as_bytes(),
+                )
+                .await?
+                .is_some()
+                || self.staged_changes.contains_key(&change_id)
                 || self
                     .staged_commits
                     .values()
-                    .any(|staged| staged.change_id == *change_id)
+                    .any(|staged| staged.change_id == change_id)
             {
                 return Err(LixError::unknown(format!(
                     "changelog commit '{}' derived change_id '{}' collides with an existing change id",
                     commit.commit_id, commit.change_id
                 )));
             }
-        }
-        let stored_format = index_values
-            .next()
-            .expect("commit change-id index format key was requested");
-        let stage_commit_change_id_index_format = match stored_format {
-            Some(value) if value.as_slice() == COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE => false,
-            Some(_) => {
-                return Err(LixError::unknown(
-                    "changelog commit_change_id index has an unsupported format; recreate the repository",
-                ));
-            }
-            None if index_format_is_staged => false,
-            None => {
-                let existing_commits = self
-                    .store
-                    .changelog_scan(
-                        COMMIT_SPACE,
-                        Vec::new(),
-                        None,
-                        1,
-                        StorageCoreProjection::KeyOnly,
-                    )
-                    .await?;
-                if !existing_commits.keys.is_empty() {
-                    return Err(LixError::unknown(
-                        "changelog commit_change_id index is missing for an existing repository; recreate the repository before appending commits",
-                    ));
-                }
-                true
-            }
-        };
-        for (change_id, existing_commit) in commit_change_ids.iter().zip(index_values) {
-            if existing_commit.is_some() {
+            if semantic_load_record(
+                self.store,
+                MEMBERSHIP_RECORD_KIND,
+                *change_id.as_uuid().as_bytes(),
+            )
+            .await?
+            .is_some()
+            {
                 return Err(LixError::unknown(format!(
                     "changelog commit derived change_id '{change_id}' already exists"
                 )));
             }
         }
-        Ok(stage_commit_change_id_index_format)
+        Ok(())
     }
 
     async fn validate_parent_commits(
@@ -735,15 +1029,14 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         parent_ids.sort_unstable();
-        let keys = parent_ids
-            .iter()
-            .map(|id| commit_key(*id))
-            .collect::<Vec<_>>();
         let mut parent_generations = HashMap::<CommitId, u64>::new();
-        for (parent_id, found) in parent_ids
-            .iter()
-            .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
-        {
+        for parent_id in &parent_ids {
+            let found = semantic_load_record(
+                self.store,
+                COMMIT_RECORD_KIND,
+                *parent_id.as_uuid().as_bytes(),
+            )
+            .await?;
             let generation = match found {
                 Some(bytes) => {
                     let record: CommitRecord = storage_codec::decode("commit record", &bytes)?;
@@ -794,18 +1087,216 @@ where
     }
 }
 
+async fn semantic_load_record(
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+    kind: u8,
+    id: [u8; 16],
+) -> Result<Option<Vec<u8>>, LixError> {
+    let root_bytes = exactly_one_get(
+        store
+            .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![ROOT_KEY.to_vec()])
+            .await?,
+        "root read",
+    )?;
+    let Some(root_bytes) = root_bytes else {
+        return Ok(None);
+    };
+    let root = decode_root(&root_bytes)?;
+    let Some(target) = root.target else {
+        return Ok(None);
+    };
+    let requested = record_key(kind, id);
+    let mut node_key = target.key.clone();
+    let mut expected_selector = Some(target);
+    loop {
+        let bytes = exactly_one_get(
+            store
+                .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![node_key.clone()])
+                .await?,
+            "directory read",
+        )?
+        .ok_or_else(|| corruption("semantic-history root references missing directory"))?;
+        let node = decode_directory(&bytes)?;
+        if node.digest != node_key[1..] {
+            return Err(corruption("semantic-history directory digest mismatch"));
+        }
+        if let Some(selector) = expected_selector.take() {
+            validate_directory_selector(&selector, &node)?;
+        }
+        let Some(selector) = node
+            .children
+            .iter()
+            .find(|child| child.first <= requested && requested <= child.last)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if node.level > 0 {
+            if selector.key.first() != Some(&NODE_KEY_PREFIX) {
+                return Err(corruption(
+                    "semantic-history directory child level mismatch",
+                ));
+            }
+            node_key = selector.key.clone();
+            expected_selector = Some(selector);
+            continue;
+        }
+        let bytes = exactly_one_get(
+            store
+                .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![selector.key.clone()])
+                .await?,
+            "leaf read",
+        )?
+        .ok_or_else(|| corruption("semantic-history directory references missing leaf"))?;
+        let segment = decode_segment(&bytes)?;
+        if segment.digest != selector.digest
+            || segment.min_key != selector.first
+            || segment.max_key != selector.last
+            || segment.records.len() != selector.record_count as usize
+        {
+            return Err(corruption("semantic-history leaf selector mismatch"));
+        }
+        return Ok(segment
+            .records
+            .into_iter()
+            .find(|record| record.kind == kind && record.id == id)
+            .map(|record| record.value));
+    }
+}
+
+/// Resolves the reverse commit membership from the same authenticated
+/// semantic-history segment as the direct commit/change records.
+pub(crate) async fn load_commit_id_for_change<S>(
+    store: &S,
+    change_id: ChangeId,
+) -> Result<Option<CommitId>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut store = store;
+    let Some(bytes) = semantic_load_record(
+        &mut store,
+        MEMBERSHIP_RECORD_KIND,
+        *change_id.as_uuid().as_bytes(),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let uuid = uuid::Uuid::from_slice(&bytes).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("semantic-history membership has invalid commit id: {error}"),
+        )
+    })?;
+    Ok(Some(CommitId::new(uuid)))
+}
+
+async fn semantic_scan_records(
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+    kind: u8,
+    start_after: Option<[u8; HISTORY_KEY_BYTES]>,
+    limit: usize,
+) -> Result<Vec<SemanticHistoryRecord>, LixError> {
+    let root_bytes = exactly_one_get(
+        store
+            .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![ROOT_KEY.to_vec()])
+            .await?,
+        "root read",
+    )?;
+    let Some(root_bytes) = root_bytes else {
+        return Ok(Vec::new());
+    };
+    let root = decode_root(&root_bytes)?;
+    let Some(target) = root.target else {
+        return Ok(Vec::new());
+    };
+    let mut node_keys = vec![(target.key.clone(), Some(target))];
+    let mut leaf_selectors = Vec::new();
+    let mut records = Vec::new();
+    while let Some((node_key, expected_selector)) = node_keys.pop() {
+        let bytes = exactly_one_get(
+            store
+                .changelog_get_many(SEMANTIC_HISTORY_SPACE, vec![node_key.clone()])
+                .await?,
+            "directory read",
+        )?
+        .ok_or_else(|| corruption("semantic-history root references missing directory"))?;
+        let node = decode_directory(&bytes)?;
+        if node.digest != node_key[1..] {
+            return Err(corruption("semantic-history directory digest mismatch"));
+        }
+        if let Some(selector) = expected_selector {
+            validate_directory_selector(&selector, &node)?;
+        }
+        if node.level == 0 {
+            leaf_selectors.extend(
+                node.children
+                    .into_iter()
+                    .filter(|selector| start_after.is_none_or(|after| selector.last > after)),
+            );
+        } else {
+            for selector in node.children.into_iter().rev() {
+                if selector.key.first() != Some(&NODE_KEY_PREFIX) {
+                    return Err(corruption(
+                        "semantic-history directory child level mismatch",
+                    ));
+                }
+                if start_after.is_none_or(|after| selector.last > after) {
+                    node_keys.push((selector.key.clone(), Some(selector)));
+                }
+            }
+        }
+        if leaf_selectors.len() >= 32 || (node_keys.is_empty() && !leaf_selectors.is_empty()) {
+            let values = store
+                .changelog_get_many(
+                    SEMANTIC_HISTORY_SPACE,
+                    leaf_selectors
+                        .iter()
+                        .map(|selector| selector.key.clone())
+                        .collect(),
+                )
+                .await?;
+            if values.len() != leaf_selectors.len() {
+                return Err(corruption(
+                    "semantic-history leaf batch returned an incomplete result",
+                ));
+            }
+            for (selector, value) in leaf_selectors.drain(..).zip(values) {
+                let value = value.ok_or_else(|| {
+                    corruption("semantic-history directory references missing leaf")
+                })?;
+                let segment = decode_segment(&value)?;
+                if segment.digest != selector.digest
+                    || segment.min_key != selector.first
+                    || segment.max_key != selector.last
+                    || segment.records.len() != selector.record_count as usize
+                {
+                    return Err(corruption("semantic-history leaf selector mismatch"));
+                }
+                records.extend(segment.records.into_iter().filter(|record| {
+                    record.kind == kind
+                        && start_after.is_none_or(|after| record_sort_key(record) > after)
+                }));
+            }
+            if records.len() >= limit {
+                break;
+            }
+        }
+    }
+    records.truncate(limit);
+    Ok(records)
+}
+
 async fn load_commits_from_store<'a>(
     store: &mut (impl ChangelogStorageRead + ?Sized),
     request: CommitLoadRequest<'a>,
 ) -> Result<CommitLoadBatch<'a>, LixError> {
-    let keys = request
-        .commit_ids
-        .iter()
-        .map(|commit_id| commit_key(*commit_id))
-        .collect::<Vec<_>>();
-    let commit_values = get_many(store, COMMIT_SPACE, keys).await?;
     let mut entries = Vec::with_capacity(request.commit_ids.len());
-    for value in commit_values {
+    for commit_id in request.commit_ids {
+        let value =
+            semantic_load_record(store, COMMIT_RECORD_KIND, *commit_id.as_uuid().as_bytes())
+                .await?;
         let Some(value) = value else {
             entries.push(None);
             continue;
@@ -830,36 +1321,24 @@ async fn scan_commits_from_store(
                 .transpose()?,
         });
     }
-    let page = store
-        .changelog_scan(
-            COMMIT_SPACE,
-            Vec::new(),
-            request
-                .start_after
-                .map(|id| CommitId::parse_lix(id, "commit scan start_after").map(commit_key))
-                .transpose()?,
-            limit,
-            StorageCoreProjection::FullValue,
-        )
-        .await?;
-    let mut entries = Vec::with_capacity(page.values.len());
-    for (key, value) in page.keys.iter().zip(page.values.iter()) {
-        let record: CommitRecord = storage_codec::decode("commit record", value)?;
-        if key.as_slice() != commit_key(record.commit_id).as_slice() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "changelog commit scan key does not match decoded commit_id '{}'",
-                    record.commit_id
-                ),
-            ));
-        }
-        entries.push(record);
-    }
-    let next_start_after = page
-        .resume_after
-        .map(|key| commit_id_from_key(&key))
+    let start_after = request
+        .start_after
+        .map(|id| CommitId::parse_lix(id, "commit scan start_after"))
         .transpose()?;
+    let start_key = start_after.map(|id| record_key(COMMIT_RECORD_KIND, *id.as_uuid().as_bytes()));
+    let records = semantic_scan_records(
+        store,
+        COMMIT_RECORD_KIND,
+        start_key,
+        limit.saturating_add(1),
+    )
+    .await?;
+    let mut entries = records
+        .into_iter()
+        .map(|record| storage_codec::decode("commit record", &record.value))
+        .collect::<Result<Vec<CommitRecord>, _>>()?;
+    let next_start_after = (entries.len() > limit).then(|| entries[limit - 1].commit_id);
+    entries.truncate(limit);
     Ok(CommitScanBatch {
         entries,
         next_start_after,
@@ -870,22 +1349,17 @@ async fn load_changes_from_store<'a>(
     store: &mut (impl ChangelogStorageRead + ?Sized),
     request: ChangeLoadRequest<'a>,
 ) -> Result<ChangeLoadBatch<'a>, LixError> {
-    let keys = request
-        .change_ids
-        .iter()
-        .map(|change_id| change_key(*change_id))
-        .collect::<Vec<_>>();
-    let entries = get_many(store, CHANGE_SPACE, keys)
-        .await?
-        .into_iter()
-        .zip(request.change_ids.iter())
-        .map(|(value, change_id)| {
+    let mut entries = Vec::with_capacity(request.change_ids.len());
+    for change_id in request.change_ids {
+        let value =
+            semantic_load_record(store, CHANGE_RECORD_KIND, *change_id.as_uuid().as_bytes())
+                .await?;
+        entries.push(
             value
-                .as_deref()
-                .map(|value| decode_change_record(value, *change_id))
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
+                .map(|value| decode_change_record(&value, *change_id))
+                .transpose()?,
+        );
+    }
     ChangeLoadBatch::try_new("changelog change", request.change_ids, entries)
 }
 
@@ -903,28 +1377,29 @@ async fn scan_changes_from_store(
                 .transpose()?,
         });
     }
-    let page = store
-        .changelog_scan(
-            CHANGE_SPACE,
-            Vec::new(),
-            request
-                .start_after
-                .map(|id| ChangeId::parse_lix(id, "change scan start_after").map(change_key))
-                .transpose()?,
-            limit,
-            StorageCoreProjection::FullValue,
-        )
-        .await?;
-    let mut entries = Vec::with_capacity(page.values.len());
-    for (key, value) in page.keys.iter().zip(page.values.iter()) {
-        // change_id lives in the key; the stored value omits it.
-        let change_id = change_id_from_key(key)?;
-        entries.push(decode_change_record(value, change_id)?);
-    }
-    let next_start_after = page
-        .resume_after
-        .map(|key| change_id_from_key(&key))
+    let start_after = request
+        .start_after
+        .map(|id| ChangeId::parse_lix(id, "change scan start_after"))
         .transpose()?;
+    let start_key = start_after.map(|id| record_key(CHANGE_RECORD_KIND, *id.as_uuid().as_bytes()));
+    let records = semantic_scan_records(
+        store,
+        CHANGE_RECORD_KIND,
+        start_key,
+        limit.saturating_add(1),
+    )
+    .await?;
+    let mut entries = records
+        .into_iter()
+        .map(|record| {
+            decode_change_record(
+                &record.value,
+                ChangeId::new(uuid::Uuid::from_bytes(record.id)),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_start_after = (entries.len() > limit).then(|| entries[limit - 1].change_id);
+    entries.truncate(limit);
     Ok(ChangeScanBatch {
         entries,
         next_start_after,
@@ -944,17 +1419,6 @@ where
         }
     }
     Ok(())
-}
-
-async fn get_many(
-    store: &mut (impl ChangelogStorageRead + ?Sized),
-    space: StorageSpace,
-    keys: Vec<Vec<u8>>,
-) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    store.changelog_get_many(space, keys).await
 }
 
 async fn native_get_many<R>(
@@ -981,90 +1445,4 @@ where
             None => None,
         })
         .collect())
-}
-
-async fn native_get_many_batch<R>(
-    read: &mut R,
-    requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
-) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let owned_requests = requests
-        .into_iter()
-        .map(|(space, keys)| {
-            (
-                space,
-                keys.into_iter()
-                    .map(|key| StorageKey(Bytes::from(key)))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let requests = owned_requests
-        .iter()
-        .map(|(space, keys)| StorageGetManyRequest {
-            space: *space,
-            keys,
-            opts: StorageGetOptions::default(),
-        })
-        .collect::<Vec<_>>();
-    let mut values = exact_get_many(read, &requests).await?.values.into_iter();
-    Ok(requests
-        .iter()
-        .map(|request| {
-            values
-                .by_ref()
-                .take(request.keys.len())
-                .map(|value| match value {
-                    Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
-                    Some(StorageProjectedValue::KeyOnly) => Some(Vec::new()),
-                    None => None,
-                })
-                .collect()
-        })
-        .collect())
-}
-
-async fn native_scan<R>(
-    read: &mut R,
-    space: StorageSpace,
-    prefix: Vec<u8>,
-    after: Option<Vec<u8>>,
-    limit: usize,
-    projection: StorageCoreProjection,
-) -> Result<ChangelogScanPage, LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let after_key = after.map(|key| StorageKey(Bytes::from(key)));
-    let opts = StorageScanOptions {
-        projection,
-        limit_rows: limit,
-        resume_after: after_key,
-    };
-    let chunk = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::from(prefix),
-        },
-    )
-    .collect(read, opts)
-    .await?
-    .value;
-    let has_more = chunk.has_more;
-    let mut keys = Vec::with_capacity(chunk.entries.len());
-    let mut values = Vec::with_capacity(chunk.entries.len());
-    for entry in chunk.entries {
-        keys.push(entry.key.0.to_vec());
-        if let StorageProjectedValue::FullValue(bytes) = entry.value {
-            values.push(bytes.to_vec());
-        }
-    }
-    let resume_after = has_more.then(|| keys.last().cloned()).flatten();
-    Ok(ChangelogScanPage {
-        keys,
-        values,
-        resume_after,
-    })
 }

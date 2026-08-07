@@ -82,6 +82,7 @@ pub struct StorageWriteSet {
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
     exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
     deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
+    preconditions: Vec<crate::storage::Precondition>,
     stats: StorageWriteSetStats,
     // Domain stores can seal a write lane after planning a destructive sweep.
     // The flag carries no storage representation; it only prevents a later
@@ -101,6 +102,7 @@ impl fmt::Debug for StorageWriteSet {
                 &self.deferred_final_puts.len(),
             )
             .field("stats", &self.stats)
+            .field("preconditions", &self.preconditions)
             .field("changelog_gc_sealed", &self.changelog_gc_sealed)
             .finish_non_exhaustive()
     }
@@ -255,6 +257,7 @@ impl StorageWriteSet {
             ),
             exclusive_range_deletes: Vec::new(),
             deferred_final_puts: Vec::new(),
+            preconditions: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
@@ -269,8 +272,19 @@ impl StorageWriteSet {
                 .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
+    /// Adds an atomic backend precondition to this write set. Domain owners
+    /// use this for their single selector/CAS publication fence; the
+    /// precondition is evaluated in the same transaction as all staged puts.
+    pub(crate) fn add_precondition(&mut self, precondition: crate::storage::Precondition) {
+        self.preconditions.push(precondition);
+    }
+
     pub(crate) fn identity(&self) -> u64 {
         self.identity
+    }
+
+    pub(crate) fn preconditions(&self) -> &[crate::storage::Precondition] {
+        &self.preconditions
     }
 
     /// Conservative encoded-size hint for contiguous backend write batches.
@@ -1051,6 +1065,7 @@ impl Default for StorageWriteSet {
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
             exclusive_range_deletes: Vec::new(),
             deferred_final_puts: Vec::new(),
+            preconditions: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }

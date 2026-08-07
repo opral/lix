@@ -91,6 +91,8 @@ where
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
+        opts.preconditions
+            .extend(write_set.preconditions().iter().cloned());
         let mut write = self
             .storage
             .begin_write(opts)
