@@ -1596,6 +1596,23 @@ pub(crate) async fn load_scoped_range_coverage(
     }
 }
 
+/// Resolves one exact marker while accepting immutable nodes staged by the
+/// same physical publication.
+pub(crate) async fn load_scoped_range_coverage_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &StorageWriteSet,
+    root: &ScopedRangeRoot,
+    scope: &ScopedRangePrefix,
+) -> Result<Option<ScopedRangeCoverageMarker>, LixError> {
+    match find_exact_with_staged(store, writes, root, &marker_route(scope)).await? {
+        Some(ScopedRangeEntry::Marker(marker)) if marker.scope == *scope => Ok(Some(marker)),
+        Some(ScopedRangeEntry::Marker(_)) | None => Ok(None),
+        Some(ScopedRangeEntry::Part(_)) => {
+            Err(scoped_range_error("scope marker route resolved a part"))
+        }
+    }
+}
+
 /// Returns every part in one exact scope without inventing a sentinel entity
 /// key. The synthetic route kind sorts after all part starts in that scope.
 #[cfg(any(test, feature = "storage-benches"))]
@@ -1951,7 +1968,7 @@ async fn find_exact(
     root: &ScopedRangeRoot,
     route: &ScopedRangeRoute,
 ) -> Result<Option<ScopedRangeEntry>, LixError> {
-    let leaf = load_routed_leaf(store, root, route).await?;
+    let leaf = load_routed_leaf_with_staged(store, None, root, route).await?;
     Ok(leaf
         .entries
         .binary_search_by_key(route, ScopedRangeEntry::route)
@@ -1959,15 +1976,36 @@ async fn find_exact(
         .map(|index| leaf.entries[index].clone()))
 }
 
-async fn load_routed_leaf(
+async fn find_exact_with_staged(
     store: &(impl StorageAdapterRead + ?Sized),
+    writes: &StorageWriteSet,
+    root: &ScopedRangeRoot,
+    route: &ScopedRangeRoute,
+) -> Result<Option<ScopedRangeEntry>, LixError> {
+    let leaf = load_routed_leaf_with_staged(store, Some(writes), root, route).await?;
+    Ok(leaf
+        .entries
+        .binary_search_by_key(route, ScopedRangeEntry::route)
+        .ok()
+        .map(|index| leaf.entries[index].clone()))
+}
+
+async fn load_routed_leaf_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: Option<&StorageWriteSet>,
     root: &ScopedRangeRoot,
     route: &ScopedRangeRoute,
 ) -> Result<ScopedRangeNode, LixError> {
     let mut node_id = root.root_id;
     let mut expected = None;
     loop {
-        let node = load_node(store, node_id).await?;
+        let node = match writes
+            .map(|writes| staged_node(writes, node_id))
+            .transpose()?
+        {
+            Some(Some(node)) => node,
+            Some(None) | None => load_node(store, node_id).await?,
+        };
         let summary = authenticated_node_summary(&node, node_id)?;
         if let Some(expected) = expected.take() {
             if summary != expected {

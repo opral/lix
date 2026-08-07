@@ -8,7 +8,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
@@ -108,14 +108,23 @@ impl TableSpec for BranchSpec {
         Some(self)
     }
 
+    fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        if exact_canonical_branch_ids_from_filters(std::slice::from_ref(filter)).is_some() {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
+    }
+
     async fn plan_scan(
         &self,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&lix_branch_schema(), projection);
+        let descriptor_scope = BranchDescriptorScope::from_read_filters(filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -126,11 +135,17 @@ impl TableSpec for BranchSpec {
                     Arc::clone(&self.branch_ref),
                     schema,
                     self.head_read_strategy,
+                    descriptor_scope,
                 ),
-                |(live_state, branch_ref, schema, head_read_strategy)| async move {
-                    let rows = load_branch_rows(live_state, branch_ref, head_read_strategy)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                |(live_state, branch_ref, schema, head_read_strategy, descriptor_scope)| async move {
+                    let rows = load_branch_rows_scoped(
+                        live_state,
+                        branch_ref,
+                        head_read_strategy,
+                        descriptor_scope,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
                     LIX_BRANCH_COLS
                         .build(schema, &rows)
                         .map_err(branch_batch_error)
@@ -413,7 +428,7 @@ impl TableSpec for BranchSpec {
 impl BranchSpec {
     /// Unprojected row source used as the UPDATE/DELETE candidate set.
     fn write_row_source(&self, filters: &[Expr]) -> super::spec::RowSource {
-        let descriptor_scope = BranchDescriptorScope::from_write_filters(filters);
+        let descriptor_scope = BranchDescriptorScope::from_filters(filters);
         row_source(
             (
                 Arc::clone(&self.live_state),
@@ -677,8 +692,12 @@ enum BranchDescriptorScope {
 }
 
 impl BranchDescriptorScope {
-    fn from_write_filters(filters: &[Expr]) -> Self {
-        exact_branch_ids_from_write_filters(filters).map_or(Self::All, Self::Ids)
+    fn from_read_filters(filters: &[Expr]) -> Self {
+        exact_canonical_branch_ids_from_filters(filters).map_or(Self::All, Self::Ids)
+    }
+
+    fn from_filters(filters: &[Expr]) -> Self {
+        exact_branch_ids_from_filters(filters).map_or(Self::All, Self::Ids)
     }
 }
 
@@ -755,13 +774,13 @@ async fn load_branch_rows_scoped(
     }
 }
 
-fn exact_branch_ids_from_write_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
+fn exact_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
     if filters.is_empty() {
         return None;
     }
     let mut ids = None::<BTreeSet<String>>;
     for filter in filters {
-        let filter_ids = exact_branch_ids_from_write_filter(filter)?;
+        let filter_ids = exact_branch_ids_from_filter(filter)?;
         ids = Some(match ids {
             Some(ids) => ids.intersection(&filter_ids).cloned().collect(),
             None => filter_ids,
@@ -770,11 +789,18 @@ fn exact_branch_ids_from_write_filters(filters: &[Expr]) -> Option<BTreeSet<Stri
     ids
 }
 
-fn exact_branch_ids_from_write_filter(filter: &Expr) -> Option<BTreeSet<String>> {
+fn exact_canonical_branch_ids_from_filters(filters: &[Expr]) -> Option<BTreeSet<String>> {
+    let ids = exact_branch_ids_from_filters(filters)?;
+    ids.iter()
+        .all(|id| EntityPk::uuid_from_canonical(id).is_ok())
+        .then_some(ids)
+}
+
+fn exact_branch_ids_from_filter(filter: &Expr) -> Option<BTreeSet<String>> {
     match filter {
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-            let left = exact_branch_ids_from_write_filter(&binary_expr.left)?;
-            let right = exact_branch_ids_from_write_filter(&binary_expr.right)?;
+            let left = exact_branch_ids_from_filter(&binary_expr.left)?;
+            let right = exact_branch_ids_from_filter(&binary_expr.right)?;
             Some(left.intersection(&right).cloned().collect())
         }
         // Even an OR made only from id equalities falls back to the full
@@ -1453,6 +1479,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_read_id_filter_routes_descriptor_and_head_point_reads() {
+        let (mut spec, live_state, branch_ref) = routing_spec();
+        spec.head_read_strategy = BranchHeadReadStrategy::Batch;
+        let filter = eq_filter("id", "01920000-0000-7000-8000-0000000000b1");
+        assert_eq!(
+            spec.filter_pushdown(&filter),
+            TableProviderFilterPushDown::Exact
+        );
+
+        let planned = spec
+            .plan_scan(None, &[filter], None, &ExecutionProps::new())
+            .await
+            .unwrap();
+        let batch = planned.source.load_single_batch().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        let requests = live_state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![
+                EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
+                    .expect("fixture branch ID")
+            ]
+        );
+        assert_eq!(
+            branch_ref.point_read_ids.lock().unwrap().as_slice(),
+            &["01920000-0000-7000-8000-0000000000b1".to_string()]
+        );
+    }
+
+    #[test]
+    fn branch_read_filter_pushdown_rejects_non_id_and_noncanonical_filters() {
+        let (spec, _, _) = routing_spec();
+        assert_eq!(
+            spec.filter_pushdown(&eq_filter("name", "Branch A")),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            spec.filter_pushdown(&eq_filter("id", "not-a-branch-id")),
+            TableProviderFilterPushDown::Unsupported
+        );
+    }
+
+    #[tokio::test]
     async fn branch_write_or_filter_falls_back_to_full_candidate_source() {
         let (spec, live_state, branch_ref) = routing_spec();
         let filter = Expr::BinaryExpr(BinaryExpr::new(
@@ -1489,7 +1560,7 @@ mod tests {
             false,
         ));
         assert_eq!(
-            exact_branch_ids_from_write_filters(&[in_filter]),
+            exact_branch_ids_from_filters(&[in_filter]),
             Some(BTreeSet::from([
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 "01920000-0000-7000-8000-0000000000b1".to_string(),
@@ -1501,12 +1572,9 @@ mod tests {
             Operator::Eq,
             Box::new(column("name")),
         ));
+        assert_eq!(exact_branch_ids_from_filters(&[expression_filter]), None);
         assert_eq!(
-            exact_branch_ids_from_write_filters(&[expression_filter]),
-            None
-        );
-        assert_eq!(
-            exact_branch_ids_from_write_filters(&[eq_filter("name", "Branch A")]),
+            exact_branch_ids_from_filters(&[eq_filter("name", "Branch A")]),
             None
         );
     }

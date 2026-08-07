@@ -42,6 +42,71 @@ simulation_test!(lix_branch_lists_descriptors_with_refs, |sim| async move {
 });
 
 simulation_test!(
+    lix_branch_exact_id_read_filters_preserve_semantics,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let global_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+        let main_id = sim.main_branch_id().to_string();
+
+        let exact = session
+            .execute(
+                "SELECT id, name FROM lix_branch WHERE id = ?",
+                &[Value::Text(main_id.clone())],
+            )
+            .await
+            .expect("exact branch ID should read");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(
+            exact.rows()[0].values(),
+            &[
+                Value::Text(main_id.clone()),
+                Value::Text("main".to_string())
+            ]
+        );
+
+        let in_list = session
+            .execute(
+                "SELECT id FROM lix_branch WHERE id IN (?, ?) ORDER BY id",
+                &[
+                    Value::Text(global_id.to_string()),
+                    Value::Text(main_id.clone()),
+                ],
+            )
+            .await
+            .expect("branch ID list should read");
+        assert_eq!(in_list.len(), 2);
+        assert_eq!(
+            in_list
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("id").expect("id should be text"))
+                .collect::<Vec<_>>(),
+            {
+                let mut ids = vec![global_id.to_string(), main_id];
+                ids.sort();
+                ids
+            }
+        );
+
+        let invalid = session
+            .execute(
+                "SELECT id FROM lix_branch WHERE id = ?",
+                &[Value::Text("not-a-branch-id".to_string())],
+            )
+            .await
+            .expect("a noncanonical branch ID should remain a no-match query");
+        assert_eq!(invalid.len(), 0);
+    }
+);
+
+simulation_test!(
     lix_branch_count_star_handles_empty_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
