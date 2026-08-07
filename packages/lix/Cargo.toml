@@ -105,6 +105,7 @@ paste = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 wasm-encoder = "0.248"
 wit-parser = "0.247"
 

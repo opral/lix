@@ -3356,6 +3356,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "plugin_csv",
+ "plugin_json",
  "ruzstd",
  "serde",
  "serde_json",
