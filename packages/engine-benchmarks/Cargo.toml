@@ -154,6 +154,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "forktree_stage2_acceptance"
+path = "benches/forktree_stage2_acceptance.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "slatedb_file_api"
 path = "benches/slatedb_file_api.rs"
 harness = false
