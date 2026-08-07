@@ -7,6 +7,11 @@ rustc --edition=2024 -D warnings "$ORACLE/main.rs" -o "$EVIDENCE/residue-oracle"
 "$EVIDENCE/residue-oracle" self-test
 bash "$ORACLE/verify_landed_1258_map.sh" "$PWD"
 
+# The mutable H4 checkpoint is expected red. The immutable cursor head and
+# post-cursor main must be green before Stage 2 starts.
+"$EVIDENCE/residue-oracle" cursor-baseline /absolute/path/to/cursor-checkpoint
+"$EVIDENCE/residue-oracle" cursor-audit /absolute/path/to/immutable-cursor-head
+
 # Pinned inputs must be red; this records rather than accepts their residue.
 "$EVIDENCE/residue-oracle" baseline /absolute/path/to/main-b5e
 "$EVIDENCE/residue-oracle" baseline /absolute/path/to/stage1-138b
@@ -23,6 +28,14 @@ if rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps"
 rg 'E0423|E0624|private|cannot initialize|not found' "$EVIDENCE/space-forge.stderr"
 if rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps" "$ORACLE/old_scan_compile_rejection.rs" --extern "lix=$LIX_RLIB" -o "$EVIDENCE/old-scan" 2>"$EVIDENCE/old-scan.stderr"; then exit 1; fi
 rg 'E0432|E0599|unresolved import|no method named' "$EVIDENCE/old-scan.stderr"
+
+# The sole positive cursor API and authenticated restart shape must compile.
+rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps" "$ORACLE/cursor_begin_scan_compile.rs" --extern "lix=$LIX_RLIB" -o "$EVIDENCE/cursor-begin-scan"
+rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps" "$ORACLE/cursor_restart_key_compile.rs" --extern "lix=$LIX_RLIB" -o "$EVIDENCE/cursor-restart-key"
+
+# Caller-owned continuation state must remain unrepresentable.
+if rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps" "$ORACLE/cursor_resume_field_rejection.rs" --extern "lix=$LIX_RLIB" -o "$EVIDENCE/cursor-resume" 2>"$EVIDENCE/cursor-resume.stderr"; then exit 1; fi
+rg 'E0560|has no field|unknown field' "$EVIDENCE/cursor-resume.stderr"
 
 # Only after zero residue and both expected compile failures:
 CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo check -p lix --all-features
