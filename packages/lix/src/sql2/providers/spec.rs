@@ -10,7 +10,7 @@
 //! per row, so the indirection has no effect on scan or write throughput.
 
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -22,11 +22,10 @@ use datafusion::arrow::compute::{SortOptions, and, filter_record_batch, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result, SchemaExt, not_impl_err};
+use datafusion::common::{DFSchema, DataFusionError, Result, SchemaExt};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{
@@ -510,7 +509,16 @@ pub(super) fn register_spec_table(
     spec: Arc<dyn TableSpec>,
     write_access: WriteAccess,
 ) -> Result<(), LixError> {
-    let provider = Arc::new(SpecTableProvider::new(spec, write_access));
+    if let Some(write_ctx) = write_access.into_write_context() {
+        write_ctx.write_targets()?.register(
+            surface_name,
+            Arc::new(SpecWriteTarget::new(
+                Arc::clone(&spec),
+                write_ctx.into_physical_target(),
+            )),
+        )?;
+    }
+    let provider = Arc::new(SpecTableProvider::new(spec));
     if let Some(anchor_column) = provider.history_anchor_column() {
         return super::history_table_function::register_history_table_function(
             session,
@@ -529,27 +537,158 @@ pub(super) struct SpecTableProvider {
     provider_id: u64,
     spec: Arc<dyn TableSpec>,
     schema: SchemaRef,
-    write_access: WriteAccess,
 }
 
 impl SpecTableProvider {
-    pub(super) fn new(spec: Arc<dyn TableSpec>, write_access: WriteAccess) -> Self {
+    pub(super) fn new(spec: Arc<dyn TableSpec>) -> Self {
         static NEXT_PROVIDER_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             provider_id: NEXT_PROVIDER_ID.fetch_add(1, AtomicOrdering::Relaxed),
             schema: spec.schema(),
             spec,
-            write_access,
         }
     }
 
     pub(super) fn history_anchor_column(&self) -> Option<&'static str> {
         self.spec.history_anchor_column()
     }
+}
 
-    #[cfg(test)]
-    pub(super) fn is_write(&self) -> bool {
-        self.write_access.is_write()
+/// Transaction-scoped physical targets selected by Lix's bound write plan.
+///
+/// DataFusion table providers never receive this registry and therefore cannot
+/// acquire mutation authority through the public `TableProvider` boundary.
+#[derive(Default)]
+pub(crate) struct WriteTargetRegistry {
+    targets: Mutex<BTreeMap<String, Arc<SpecWriteTarget>>>,
+}
+
+impl WriteTargetRegistry {
+    fn register(&self, name: &str, target: Arc<SpecWriteTarget>) -> Result<(), LixError> {
+        let mut targets = self.targets.lock().map_err(|_| {
+            LixError::unknown("SQL physical write-target registry lock was poisoned")
+        })?;
+        if targets.insert(name.to_string(), target).is_some() {
+            return Err(LixError::unknown(format!(
+                "SQL physical write target '{name}' was registered more than once"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn target(&self, name: &str) -> Result<Arc<SpecWriteTarget>, LixError> {
+        self.targets
+            .lock()
+            .map_err(|_| LixError::unknown("SQL physical write-target registry lock was poisoned"))?
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    format!("SQL table '{name}' is not a writable Lix surface"),
+                )
+            })
+    }
+}
+
+/// The physical mutation capability behind one bound Lix SQL surface.
+///
+/// RETURNING and ON CONFLICT semantics remain in Lix's bound executor; this
+/// target only plans and stages the selected surface's physical operation.
+pub(crate) struct SpecWriteTarget {
+    spec: Arc<dyn TableSpec>,
+    schema: SchemaRef,
+    write_ctx: SqlWriteContext,
+}
+
+impl SpecWriteTarget {
+    fn new(spec: Arc<dyn TableSpec>, write_ctx: SqlWriteContext) -> Self {
+        Self {
+            schema: spec.schema(),
+            spec,
+            write_ctx,
+        }
+    }
+
+    pub(crate) async fn insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self.spec.table_name();
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+        let omitted_insert_columns = self.write_ctx.explicit_insert_columns().map_or_else(
+            || InsertColumnIntents::from_input(&input).omitted_columns(self.schema.as_ref()),
+            |explicit_columns| {
+                self.schema
+                    .fields()
+                    .iter()
+                    .filter(|field| !explicit_columns.contains(field.name().as_str()))
+                    .map(|field| field.name().clone())
+                    .collect()
+            },
+        );
+        let sink: Arc<dyn InsertSink> = match self
+            .spec
+            .plan_insert(self.write_ctx.clone(), &input)
+            .await?
+        {
+            Some(apply) => Arc::new(PlannedInsertSink {
+                table: table.into(),
+                apply,
+                omitted_insert_columns,
+            }),
+            None => Arc::new(SpecInsertSink {
+                spec: Arc::clone(&self.spec),
+                write_ctx: self.write_ctx.clone(),
+                omitted_insert_columns,
+            }),
+        };
+        Ok(Arc::new(InsertExec::new(input, sink)))
+    }
+
+    pub(crate) async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self.spec.table_name();
+        self.spec.validate_update_assignments(&assignments)?;
+        let filters = self.spec.prepare_write_filters(filters)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+        let planned = self
+            .spec
+            .plan_update(self.write_ctx.clone(), physical_assignments, &filters)
+            .await?;
+        Ok(Arc::new(SpecDmlExec::new(
+            table.into(),
+            "UPDATE",
+            planned,
+            physical_filters,
+            None,
+        )))
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.delete_impl(state, filters, None).await
     }
 
     /// Execute an `INSERT ... ON CONFLICT` against this table. The conflict
@@ -562,8 +701,8 @@ impl SpecTableProvider {
         target_columns: &[String],
         action: &upsert::UpsertAction,
     ) -> Result<u64> {
-        let (write_ctx, support, target) = self.validate_upsert(input, target_columns).await?;
-        upsert::execute_upsert(support, &write_ctx, proposed_batches, &target, action).await
+        let (support, target) = self.validate_upsert(input, target_columns).await?;
+        upsert::execute_upsert(support, &self.write_ctx, proposed_batches, &target, action).await
     }
 
     /// Execute an `INSERT ... ON CONFLICT ... RETURNING` through the shared
@@ -577,10 +716,10 @@ impl SpecTableProvider {
         action: &upsert::UpsertAction,
         returning: DmlReturning,
     ) -> Result<u64> {
-        let (write_ctx, support, target) = self.validate_upsert(input, target_columns).await?;
+        let (support, target) = self.validate_upsert(input, target_columns).await?;
         upsert::execute_upsert_with_returning(
             support,
-            &write_ctx,
+            &self.write_ctx,
             proposed_batches,
             &target,
             action,
@@ -589,27 +728,28 @@ impl SpecTableProvider {
         .await
     }
 
-    pub(crate) async fn validate_upsert(
+    async fn validate_upsert(
         &self,
         input: &Arc<dyn ExecutionPlan>,
         target_columns: &[String],
-    ) -> Result<(
-        SqlWriteContext,
-        &dyn upsert::UpsertSupport,
-        upsert::UpsertConflictTarget,
-    )> {
+    ) -> Result<(&dyn upsert::UpsertSupport, upsert::UpsertConflictTarget)> {
         let table = self.spec.table_name();
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("INSERT into {table}"))?;
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
         let support = self.spec.upsert_support().ok_or_else(|| {
             DataFusionError::Execution(format!("INSERT ON CONFLICT is not supported on {table}"))
         })?;
         let target = support.resolve_conflict_target(table, target_columns)?;
-        self.spec.plan_insert(write_ctx.clone(), input).await?;
-        Ok((write_ctx, support, target))
+        self.spec.plan_insert(self.write_ctx.clone(), input).await?;
+        Ok((support, target))
+    }
+
+    pub(crate) async fn validate_upsert_target(
+        &self,
+        input: &Arc<dyn ExecutionPlan>,
+        target_columns: &[String],
+    ) -> Result<()> {
+        self.validate_upsert(input, target_columns).await.map(drop)
     }
 
     pub(crate) async fn delete_with_returning(
@@ -632,12 +772,9 @@ impl SpecTableProvider {
         returning: DmlReturning,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let table = self.spec.table_name();
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("INSERT into {table}"))?;
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
-        let omitted_insert_columns = write_ctx.explicit_insert_columns().map_or_else(
+        let omitted_insert_columns = self.write_ctx.explicit_insert_columns().map_or_else(
             || InsertColumnIntents::from_input(&input).omitted_columns(self.schema.as_ref()),
             |explicit_columns| {
                 self.schema
@@ -650,7 +787,7 @@ impl SpecTableProvider {
         );
         let apply = self
             .spec
-            .plan_insert_with_returning(write_ctx, &input, returning)
+            .plan_insert_with_returning(self.write_ctx.clone(), &input, returning)
             .await?;
         let sink: Arc<dyn InsertSink> = Arc::new(PlannedInsertSink {
             table: table.into(),
@@ -671,9 +808,6 @@ impl SpecTableProvider {
         returning: DmlReturning,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let table = self.spec.table_name();
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("UPDATE {table}"))?;
         self.spec.validate_update_assignments(&assignments)?;
         let filters = self.spec.prepare_write_filters(filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
@@ -692,7 +826,12 @@ impl SpecTableProvider {
             .collect::<Result<Vec<_>>>()?;
         let planned = self
             .spec
-            .plan_update_with_returning(write_ctx, physical_assignments, &filters, returning)
+            .plan_update_with_returning(
+                self.write_ctx.clone(),
+                physical_assignments,
+                &filters,
+                returning,
+            )
             .await?;
         Ok(Arc::new(SpecDmlExec::new(
             table.into(),
@@ -710,15 +849,12 @@ impl SpecTableProvider {
         returning: Option<DmlReturning>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let table = self.spec.table_name();
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("DELETE FROM {table}"))?;
         let filters = self.spec.prepare_write_filters(filters)?;
         let physical_filters = physical_filters(&self.schema, &filters, state)?;
         let planned = self
             .spec
             .plan_delete_with_options(
-                write_ctx,
+                self.write_ctx.clone(),
                 &filters,
                 DmlPlanOptions::from_returning(returning.as_ref()),
             )
@@ -737,7 +873,6 @@ impl std::fmt::Debug for SpecTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpecTableProvider")
             .field("table", &self.spec.table_name())
-            .field("write", &self.write_access.is_write())
             .finish_non_exhaustive()
     }
 }
@@ -801,95 +936,6 @@ impl TableProvider for SpecTableProvider {
             state.config().target_partitions(),
             statement_cache_key,
             physical_cache_key,
-        )))
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table = self.spec.table_name();
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for {table} yet");
-        }
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("INSERT into {table}"))?;
-        self.schema
-            .logically_equivalent_names_and_types(&input.schema())?;
-        let omitted_insert_columns = write_ctx.explicit_insert_columns().map_or_else(
-            || InsertColumnIntents::from_input(&input).omitted_columns(self.schema.as_ref()),
-            |explicit_columns| {
-                self.schema
-                    .fields()
-                    .iter()
-                    .filter(|field| !explicit_columns.contains(field.name().as_str()))
-                    .map(|field| field.name().clone())
-                    .collect()
-            },
-        );
-        let sink: Arc<dyn InsertSink> =
-            match self.spec.plan_insert(write_ctx.clone(), &input).await? {
-                Some(apply) => Arc::new(PlannedInsertSink {
-                    table: table.into(),
-                    apply,
-                    omitted_insert_columns,
-                }),
-                None => Arc::new(SpecInsertSink {
-                    spec: Arc::clone(&self.spec),
-                    write_ctx,
-                    omitted_insert_columns,
-                }),
-            };
-        Ok(Arc::new(InsertExec::new(input, sink)))
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.delete_impl(state, filters, None).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table = self.spec.table_name();
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("UPDATE {table}"))?;
-        self.spec.validate_update_assignments(&assignments)?;
-        let filters = self.spec.prepare_write_filters(filters)?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let planned = self
-            .spec
-            .plan_update(write_ctx, physical_assignments, &filters)
-            .await?;
-        Ok(Arc::new(SpecDmlExec::new(
-            table.into(),
-            "UPDATE",
-            planned,
-            physical_filters,
-            None,
         )))
     }
 }
@@ -1576,10 +1622,7 @@ mod scan_source_tests {
         });
         let session = crate::sql2::session::new_sql_session_context();
         session
-            .register_table(
-                "counted",
-                Arc::new(SpecTableProvider::new(spec, WriteAccess::read_only())),
-            )
+            .register_table("counted", Arc::new(SpecTableProvider::new(spec)))
             .expect("counted test table should register");
         let dataframe = session
             .sql(

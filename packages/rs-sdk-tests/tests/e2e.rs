@@ -18,9 +18,9 @@ use lix::wasm::{
     WasmTransitionLimits,
 };
 use lix::{
-    CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError,
-    MergeBranchOptions, MergeBranchPreviewOptions, MergeConflictChangeKind, MutationIdentity,
-    RequestBlobSpliceProvenance, SwitchBranchOptions, VerifiedRequestBlob,
+    CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteStatementMetadata, Lix,
+    LixError, MergeBranchOptions, MergeBranchPreviewOptions, MergeConflictChangeKind,
+    MutationIdentity, RequestBlobSpliceProvenance, SwitchBranchOptions, VerifiedRequestBlob,
 };
 use lix::{Value, open_lix};
 use lix_storage_filesystem::LocalFilesystem;
@@ -8910,6 +8910,242 @@ async fn open_slatedb_lix(path: &Path) -> Lix<SlateDB> {
         .with_storage(storage)
         .await
         .expect("open Lix workspace")
+}
+
+async fn qualify_lix_owned_sql_write_semantics<S>(lix: &Lix<S>, prefix: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        &[Value::Text(
+            r#"{"x-lix-key":"write_owner_task","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string","x-lix-default":"lix_uuid_v7()"},"title":{"type":"string"}},"required":["id","title"],"additionalProperties":false}"#.to_string(),
+        )],
+    )
+    .await
+    .expect("register generated-default write-owner schema");
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1)), (lix_json($2))",
+        &[
+            Value::Text(
+                r#"{"x-lix-key":"write_owner_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.to_string(),
+            ),
+            Value::Text(
+                r#"{"x-lix-key":"write_owner_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"write_owner_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}"#.to_string(),
+            ),
+        ],
+    )
+    .await
+    .expect("register foreign-key write-owner schemas");
+
+    let inserted = lix
+        .execute(
+            "INSERT INTO write_owner_task (title) VALUES ($1) RETURNING id, title",
+            &[Value::Text(format!("{prefix}-inserted"))],
+        )
+        .await
+        .expect("INSERT RETURNING with generated default");
+    assert_eq!(inserted.rows_affected(), 1);
+    let id = inserted.rows()[0]
+        .get::<String>("id")
+        .expect("generated RETURNING id");
+
+    let updated = lix
+        .execute(
+            "UPDATE write_owner_task SET title = $1 WHERE id = $2 RETURNING id, title",
+            &[
+                Value::Text(format!("{prefix}-updated")),
+                Value::Text(id.clone()),
+            ],
+        )
+        .await
+        .expect("UPDATE RETURNING");
+    assert_eq!(updated.rows_affected(), 1);
+
+    let upserted = lix
+        .execute(
+            "INSERT INTO write_owner_task (id, title) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET title = excluded.title RETURNING id, title",
+            &[
+                Value::Text(id.clone()),
+                Value::Text(format!("{prefix}-upserted")),
+            ],
+        )
+        .await
+        .expect("ON CONFLICT RETURNING");
+    assert_eq!(upserted.rows_affected(), 1);
+    assert_eq!(
+        upserted.rows()[0].get::<String>("title").unwrap(),
+        format!("{prefix}-upserted")
+    );
+
+    let deleted = lix
+        .execute(
+            "DELETE FROM write_owner_task WHERE id = $1 RETURNING id, title",
+            &[Value::Text(id)],
+        )
+        .await
+        .expect("DELETE RETURNING");
+    assert_eq!(deleted.rows_affected(), 1);
+    assert_eq!(deleted.rows().len(), 1);
+
+    let fk_error = lix
+        .execute(
+            "INSERT INTO write_owner_child (id, parent_id) VALUES ($1, $2)",
+            &[
+                Value::Text(format!("{prefix}-child")),
+                Value::Text(format!("{prefix}-missing-parent")),
+            ],
+        )
+        .await
+        .expect_err("missing foreign-key owner must fail");
+    assert_eq!(fk_error.code, LixError::CODE_FOREIGN_KEY);
+
+    let batch_key = format!("{prefix}-batch");
+    let batch = lix
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                label: Some("write".to_string()),
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) RETURNING key, value"
+                    .to_string(),
+                params: vec![
+                    Value::Text(batch_key.clone()),
+                    Value::Text("one".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                label: Some("upsert".to_string()),
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
+                      ON CONFLICT (key) DO UPDATE SET value = excluded.value RETURNING key, value"
+                    .to_string(),
+                params: vec![
+                    Value::Text(batch_key.clone()),
+                    Value::Text("two".to_string()),
+                ],
+            },
+        ])
+        .await
+        .expect("execute_batch write semantics");
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].statement_index(), Some(0));
+    assert_eq!(batch[0].label(), Some("write"));
+    assert_eq!(batch[1].statement_index(), Some(1));
+    assert_eq!(batch[1].label(), Some("upsert"));
+
+    let rollback_key = format!("{prefix}-rollback");
+    let mut rollback = lix.begin_transaction().await.expect("begin rollback tx");
+    rollback
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'rollback') RETURNING key",
+            &[Value::Text(rollback_key.clone())],
+        )
+        .await
+        .expect("stage rollback RETURNING");
+    rollback
+        .rollback()
+        .await
+        .expect("rollback write transaction");
+    assert!(
+        lix.execute(
+            "SELECT key FROM lix_key_value WHERE key = $1",
+            &[Value::Text(rollback_key)],
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+}
+
+async fn qualify_stale_sql_write_owner<S>(stale_lix: &Lix<S>, winner_lix: &Lix<S>, prefix: &str)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let stale_key = format!("{prefix}-stale");
+    let mut stale = stale_lix.begin_transaction().await.expect("begin stale tx");
+    stale
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'stale')",
+            &[Value::Text(stale_key.clone())],
+        )
+        .await
+        .expect("stage stale owner");
+    winner_lix
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'winner')",
+            &[Value::Text(stale_key)],
+        )
+        .await
+        .expect("publish winner owner");
+    assert_eq!(
+        stale
+            .commit()
+            .await
+            .expect_err("stale owner must conflict")
+            .code,
+        LixError::CODE_UNIQUE
+    );
+}
+
+#[tokio::test]
+async fn lix_owned_sql_write_semantics_rocksdb_reopen() {
+    let root = tempfile::tempdir().expect("create SQL write-owner RocksDB directory");
+    let lix = open_rocksdb_lix(root.path()).await;
+    qualify_lix_owned_sql_write_semantics(&lix, "rocks").await;
+    let winner = lix
+        .open_workspace_session()
+        .await
+        .expect("open winner RocksDB session");
+    qualify_stale_sql_write_owner(&lix, &winner, "rocks").await;
+    winner.close().await.expect("close winner RocksDB handle");
+    lix.close().await.expect("close SQL write-owner RocksDB");
+    let reopened = open_rocksdb_lix(root.path()).await;
+    let result = reopened
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'rocks-batch'",
+            &[],
+        )
+        .await
+        .expect("read SQL write-owner RocksDB after reopen");
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("two")
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn lix_owned_sql_write_semantics_slatedb_reopen() {
+    let root = tempfile::tempdir().expect("create SQL write-owner SlateDB directory");
+    let storage = SlateDB::open(root.path().join(".lix")).expect("open SQL write-owner SlateDB");
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open SQL write-owner workspace");
+    qualify_lix_owned_sql_write_semantics(&lix, "slate").await;
+    let winner = lix
+        .open_workspace_session()
+        .await
+        .expect("open winner SlateDB session");
+    qualify_stale_sql_write_owner(&lix, &winner, "slate").await;
+    winner.close().await.expect("close winner SlateDB handle");
+    storage
+        .flush()
+        .await
+        .expect("flush SQL write-owner SlateDB before reopen");
+    lix.close().await.expect("close SQL write-owner SlateDB");
+    let reopened = open_slatedb_lix(root.path()).await;
+    let result = reopened
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'slate-batch'",
+            &[],
+        )
+        .await
+        .expect("read SQL write-owner SlateDB after reopen");
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("two")
+    );
+    reopened.close().await.unwrap();
 }
 
 fn p50_ms(sorted: &[f64]) -> f64 {

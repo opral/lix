@@ -2,6 +2,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use std::collections::BTreeSet;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::LixError;
@@ -134,14 +135,37 @@ pub(crate) struct SqlWriteSessionOptions {
     pub(crate) explicit_insert_columns: Option<BTreeSet<String>>,
 }
 
+pub(crate) struct SqlWriteSession {
+    datafusion: SessionContext,
+    write_targets: Arc<providers::WriteTargetRegistry>,
+}
+
+impl SqlWriteSession {
+    pub(crate) fn write_target(
+        &self,
+        table_name: &str,
+    ) -> Result<Arc<providers::SpecWriteTarget>, LixError> {
+        self.write_targets.target(table_name)
+    }
+}
+
+impl Deref for SqlWriteSession {
+    type Target = SessionContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.datafusion
+    }
+}
+
 pub(crate) async fn build_write_session_with_options(
     ctx: &mut dyn SqlWriteExecutionContext,
     options: SqlWriteSessionOptions,
     provider_selection: &providers::ProviderSelection,
-) -> Result<SessionContext, LixError> {
+) -> Result<SqlWriteSession, LixError> {
     let session = ctx.datafusion_session();
     let write_ctx = SqlWriteContext::new(ctx)
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
+    let write_targets = write_ctx.write_targets()?;
     let active_branch_id = write_ctx.active_branch_id();
     let branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(Arc::new(
         super::WriteContextBranchRefReader::new(write_ctx.clone()),
@@ -166,7 +190,10 @@ pub(crate) async fn build_write_session_with_options(
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
-    Ok(session)
+    Ok(SqlWriteSession {
+        datafusion: session,
+        write_targets,
+    })
 }
 
 pub(crate) fn new_sql_session_context() -> SessionContext {
