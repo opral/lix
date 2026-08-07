@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 mod model;
+mod olap;
 mod relational;
 mod vertical;
 mod workload;
@@ -302,6 +303,7 @@ enum Scenario {
     Blob,
     BlobProfile,
     Relational,
+    Olap,
 }
 
 impl Scenario {
@@ -311,6 +313,7 @@ impl Scenario {
             Some("blob") => (Self::Blob, 1),
             Some("blob-profile") => (Self::BlobProfile, 1),
             Some("relational") => (Self::Relational, 1),
+            Some("olap") => (Self::Olap, 1),
             _ => (Self::Apply, 0),
         }
     }
@@ -408,6 +411,10 @@ async fn main() {
     let parameters = Parameters::parse();
     if parameters.scenario == Scenario::Relational {
         relational::run(parameters).await;
+        return;
+    }
+    if parameters.scenario == Scenario::Olap {
+        olap::run(parameters).await;
         return;
     }
     if parameters.scenario != Scenario::Apply {
