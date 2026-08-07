@@ -91,6 +91,7 @@ export type ExecuteOptions = {
 export type LixBatchStatement = {
 	sql: string;
 	params?: readonly SqlParam[];
+	label?: string;
 };
 
 export type LixBatchOptions = {
@@ -100,6 +101,8 @@ export type LixBatchOptions = {
 };
 
 export type ExecuteResult = {
+	statementIndex?: number;
+	label?: string;
 	columns: string[];
 	rows: RowLike[];
 	rowsAffected: number;
@@ -108,6 +111,10 @@ export type ExecuteResult = {
 		message: string;
 		hint?: string;
 	}>;
+};
+
+export type ExecuteBatchResult = ExecuteResult & {
+	statementIndex: number;
 };
 
 export type ObserveEvent = {

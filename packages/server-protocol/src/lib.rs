@@ -1811,6 +1811,7 @@ where
                 ExecuteBatchStatement {
                     sql: required_non_empty(statement.sql, "statements[].sql")?,
                     params: decoded.values,
+                    label: statement.label,
                 },
                 decoded.metadata,
             ))
@@ -3302,6 +3303,8 @@ struct ExecuteBatchStatementRequest {
     sql: Option<String>,
     #[serde(default)]
     params: Vec<RequestWireValue>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3309,6 +3312,7 @@ struct ExecuteFingerprint<'a> {
     sql: &'a str,
     params: &'a [Value],
     origin_key: Option<&'a str>,
+    label: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -3333,6 +3337,7 @@ fn execute_idempotency(
             sql,
             params,
             origin_key,
+            label: None,
         },
     )?;
     Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
@@ -3356,6 +3361,7 @@ fn execute_batch_idempotency(
                     sql: &statement.sql,
                     params: &statement.params,
                     origin_key: None,
+                    label: statement.label.as_deref(),
                 })
                 .collect(),
             origin_key,
@@ -3441,6 +3447,10 @@ enum RequestBlobSpliceKind {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecuteResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statement_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     columns: Vec<String>,
     rows: Vec<Vec<WireValue>>,
     rows_affected: u64,
@@ -3462,6 +3472,8 @@ impl TryFrom<ExecuteResult> for ExecuteResponse {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            statement_index: result.statement_index(),
+            label: result.label().map(str::to_owned),
             columns: result.columns().to_vec(),
             rows,
             rows_affected: result.rows_affected(),
@@ -3959,6 +3971,7 @@ mod tests {
     use lix_collaboration_test_support::{
         CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
     };
+    use lix_storage_rocksdb::RocksDB;
     use lix_storage_slatedb::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
     use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
@@ -7120,6 +7133,110 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn execute_batch_metadata_and_returning_work_on_all_storage_adapters() {
+        assert_execute_batch_metadata(Memory::default()).await;
+
+        let rocks_root = tempfile::tempdir().expect("create RocksDB test directory");
+        assert_execute_batch_metadata(
+            RocksDB::open(rocks_root.path().join(".lix")).expect("open RocksDB test storage"),
+        )
+        .await;
+
+        assert_execute_batch_metadata(PostCommitUnknownSlateDB::new()).await;
+    }
+
+    async fn assert_execute_batch_metadata<S>(storage: S)
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        let router = router_with_storage(storage).await;
+        let (session_id, _) = new_session(&router).await;
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    {
+                        "label": "same-label",
+                        "sql": "INSERT INTO lix_key_value (key, value) VALUES ('adapter-batch', 'one') RETURNING key, value",
+                        "params": []
+                    },
+                    {
+                        "label": "same-label",
+                        "sql": "UPDATE lix_key_value SET value = 'two' WHERE key = 'adapter-batch' RETURNING key, value",
+                        "params": []
+                    },
+                    {
+                        "sql": "SELECT value FROM lix_key_value WHERE key = 'adapter-batch'",
+                        "params": []
+                    }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["statementIndex"], 0);
+        assert_eq!(body[1]["statementIndex"], 1);
+        assert_eq!(body[2]["statementIndex"], 2);
+        assert_eq!(body[0]["label"], "same-label");
+        assert_eq!(body[1]["label"], "same-label");
+        assert!(body[2].get("label").is_none());
+        assert_eq!(body[0]["rowsAffected"], 1);
+        assert_eq!(
+            body[0]["rows"][0][1],
+            json!({ "kind": "json", "value": "one" })
+        );
+        assert_eq!(
+            body[1]["rows"][0][1],
+            json!({ "kind": "json", "value": "two" })
+        );
+        assert_eq!(
+            body[2]["rows"][0][0],
+            json!({ "kind": "json", "value": "two" })
+        );
+
+        let failed = request(
+            &router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    {
+                        "sql": "INSERT INTO lix_key_value (key, value) VALUES ('adapter-rollback', 'written')",
+                        "params": []
+                    },
+                    { "sql": "SELECT id FROM lix_file_history('one', 'two')", "params": [] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(failed).await["error"]["details"]["statementIndex"],
+            1
+        );
+        let persisted = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'adapter-rollback'"
+            })),
+        )
+        .await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(persisted).await["rows"][0][0],
+            json!({ "kind": "int", "value": 0 })
+        );
     }
 
     #[tokio::test]

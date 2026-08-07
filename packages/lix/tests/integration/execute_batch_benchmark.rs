@@ -164,6 +164,7 @@ async fn run_case(
     let statements = statements
         .iter()
         .map(|statement| ExecuteBatchStatement {
+            label: None,
             sql: statement.sql.to_string(),
             params: statement.params.clone(),
         })

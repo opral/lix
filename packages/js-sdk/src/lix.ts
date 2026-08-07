@@ -11,7 +11,11 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 } from "./binding-types.js";
-import { normalizeOptionals, wrapExecuteResult } from "./result.js";
+import {
+	normalizeOptionals,
+	wrapExecuteBatchResult,
+	wrapExecuteResult,
+} from "./result.js";
 import { isSnapshotPersistenceAfterCommitError } from "./snapshot-persistence.js";
 import { normalizeParam, toNativeValue } from "./value.js";
 import type {
@@ -21,6 +25,7 @@ import type {
 	RedoReceipt,
 	ExecuteOptions,
 	ExecuteResult,
+	ExecuteBatchResult,
 	LixBatchOptions,
 	LixBatchStatement,
 	MergeBranchOptions,
@@ -106,14 +111,14 @@ export class Lix {
 	async executeBatch(
 		statements: readonly LixBatchStatement[],
 		options?: LixBatchOptions,
-	): Promise<readonly ExecuteResult[]> {
+	): Promise<readonly ExecuteBatchResult[]> {
 		const normalizedStatements = normalizeBatchStatements(statements, options);
 		return this.#runOperation(async () => {
 			const results = await this.binding.executeBatch(
 				normalizedStatements,
 				options,
 			);
-			return results.map(wrapExecuteResult);
+			return results.map(wrapExecuteBatchResult);
 		});
 	}
 
@@ -537,11 +542,23 @@ function normalizeBatchStatements(
 					typeof params,
 				);
 			}
+			if (
+				statement.label !== undefined &&
+				typeof statement.label !== "string"
+			) {
+				throw invalidArgument(
+					"executeBatch",
+					`statements[${statementIndex}].label`,
+					"string",
+					typeof statement.label,
+				);
+			}
 			return {
 				sql: statement.sql,
 				params: params.map((param, parameterIndex) =>
 					toNativeValue(normalizeParam(param, parameterIndex)),
 				),
+				...(statement.label === undefined ? {} : { label: statement.label }),
 			};
 		} catch (error) {
 			throw withBatchStatementIndex(error, statementIndex);

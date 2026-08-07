@@ -81,6 +81,8 @@ impl LiteralParameterBuilder {
 /// so observation fanout does not copy large blob values per subscriber.
 #[derive(Debug, Clone)]
 pub struct ExecuteResult {
+    statement_index: Option<usize>,
+    statement_label: Option<String>,
     /// Mutation results without RETURNING carry no row backing. Keeping the
     /// empty case inline avoids one Arc clone/drop pair for every scalar write.
     backing: Option<Arc<ExecuteResultBacking>>,
@@ -107,7 +109,9 @@ struct ColumnarResult {
 
 impl PartialEq for ExecuteResult {
     fn eq(&self, other: &Self) -> bool {
-        self.rows_affected == other.rows_affected
+        self.statement_index == other.statement_index
+            && self.statement_label == other.statement_label
+            && self.rows_affected == other.rows_affected
             && (matches!(
                 (&self.backing, &other.backing),
                 (Some(left), Some(right)) if Arc::ptr_eq(left, right)
@@ -162,6 +166,20 @@ impl FileRead {
 }
 
 impl ExecuteResult {
+    pub fn statement_index(&self) -> Option<usize> {
+        self.statement_index
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.statement_label.as_deref()
+    }
+
+    fn with_batch_metadata(mut self, statement_index: usize, label: Option<String>) -> Self {
+        self.statement_index = Some(statement_index);
+        self.statement_label = label;
+        self
+    }
+
     pub(crate) fn from_session_read_result(result: sql2::SessionReadSqlResult) -> Self {
         match result.query {
             sql2::SessionReadResult::Rows(result) => Self::from_sql_query_result(result),
@@ -202,6 +220,8 @@ impl ExecuteResult {
 
     pub fn from_rows_affected(rows_affected: u64) -> Self {
         Self {
+            statement_index: None,
+            statement_label: None,
             backing: None,
             rows_affected,
         }
@@ -235,6 +255,8 @@ impl ExecuteResult {
             })
             .collect();
         Self {
+            statement_index: None,
+            statement_label: None,
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
                 rows: OnceLock::from(rows),
@@ -257,6 +279,8 @@ impl ExecuteResult {
             .collect::<Vec<_>>()
             .into();
         Self {
+            statement_index: None,
+            statement_label: None,
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
                 rows: OnceLock::new(),
@@ -592,6 +616,32 @@ pub enum ExecutionDisposition {
 pub struct ExecuteBatchStatement {
     pub sql: String,
     pub params: Vec<Value>,
+    /// Opaque caller metadata echoed by the corresponding batch result.
+    /// Labels need not be unique; `statement_index` is the unique identity.
+    pub label: Option<String>,
+}
+
+fn annotate_batch_results(
+    statements: &[ExecuteBatchStatement],
+    results: Vec<ExecuteResult>,
+) -> Result<Vec<ExecuteResult>, LixError> {
+    if results.len() != statements.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "execute batch produced a result count different from its statement count",
+        )
+        .with_details(serde_json::json!({
+            "statementCount": statements.len(),
+            "resultCount": results.len(),
+        })));
+    }
+    Ok(results
+        .into_iter()
+        .enumerate()
+        .map(|(statement_index, result)| {
+            result.with_batch_metadata(statement_index, statements[statement_index].label.clone())
+        })
+        .collect())
 }
 
 enum ExecuteBatchExecution {
@@ -1580,14 +1630,15 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        Box::pin(self.execute_batch_with_options_and_metadata_inner(
+        let results = Box::pin(self.execute_batch_with_options_and_metadata_inner(
             statements,
             options,
             statement_metadata,
             None,
             false,
         ))
-        .await
+        .await?;
+        annotate_batch_results(statements, results)
     }
 
     async fn execute_batch_with_options_and_metadata_inner(
@@ -1636,14 +1687,16 @@ where
         // references and every storage transaction is Send.
         unsafe {
             super::AssumeSendFuture::new(async move {
-                self.execute_batch_with_options_and_metadata_inner(
-                    &statements,
-                    options,
-                    statement_metadata,
-                    idempotency,
-                    true,
-                )
-                .await
+                let results = self
+                    .execute_batch_with_options_and_metadata_inner(
+                        &statements,
+                        options,
+                        statement_metadata,
+                        idempotency,
+                        true,
+                    )
+                    .await?;
+                annotate_batch_results(&statements, results)
             })
         }
     }
@@ -4619,6 +4672,7 @@ mod tests {
 
     fn batch_statement(sql: &str) -> ExecuteBatchStatement {
         ExecuteBatchStatement {
+            label: None,
             sql: sql.to_string(),
             params: Vec::new(),
         }
@@ -5165,10 +5219,12 @@ mod tests {
         let results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: Some("first".to_string()),
                     sql: "SELECT $1 AS value".to_string(),
                     params: vec![Value::Integer(11)],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: "SELECT $1 AS value".to_string(),
                     params: vec![Value::Integer(22)],
                 },
@@ -5178,6 +5234,50 @@ mod tests {
 
         assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 11);
         assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 22);
+        assert_eq!(results[0].statement_index(), Some(0));
+        assert_eq!(results[0].label(), Some("first"));
+        assert_eq!(results[1].statement_index(), Some(1));
+        assert_eq!(results[1].label(), None);
+    }
+
+    #[tokio::test]
+    async fn execute_batch_metadata_preserves_returning_rows_and_duplicate_labels() {
+        let session = open_session().await;
+        let results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    label: Some("write".to_string()),
+                    sql: "INSERT INTO lix_key_value (key, value) VALUES ('batch-metadata', 'one') RETURNING key, value".to_string(),
+                    params: Vec::new(),
+                },
+                ExecuteBatchStatement {
+                    label: Some("write".to_string()),
+                    sql: "UPDATE lix_key_value SET value = 'two' WHERE key = 'batch-metadata' RETURNING key, value".to_string(),
+                    params: Vec::new(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].statement_index(), Some(0));
+        assert_eq!(results[1].statement_index(), Some(1));
+        assert_eq!(results[0].label(), Some("write"));
+        assert_eq!(results[1].label(), Some("write"));
+        assert_eq!(results[0].columns(), ["key", "value"]);
+        assert_eq!(results[0].rows_affected(), 1);
+        assert_eq!(
+            results[0].rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("one")
+        );
+        assert_eq!(
+            results[1].rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("two")
+        );
     }
 
     #[tokio::test]
@@ -5251,6 +5351,7 @@ mod tests {
         let results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -5258,6 +5359,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -5293,6 +5395,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("c".to_string()),
@@ -5300,6 +5403,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -5329,6 +5433,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -5336,6 +5441,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![Value::Text("d".to_string()), Value::Text("x".to_string())],
                 },
@@ -5415,6 +5521,7 @@ mod tests {
         let sql = "INSERT INTO ordered_packed_insert_probe (id, value) VALUES ($1, $2)";
         let statements = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -5493,6 +5600,7 @@ mod tests {
         let sql = "INSERT INTO rootless_ordered_insert_probe (id, value) VALUES ($1, $2)";
         let inserts = (0..ROW_COUNT)
             .map(|index| ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_owned(),
                 params: vec![
                     Value::Text(format!("{index:05}")),
@@ -5725,6 +5833,7 @@ mod tests {
         assert_eq!(deleted.rows_affected(), ROW_COUNT as u64);
         let reinserts = (0..ROW_COUNT)
             .map(|index| ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_owned(),
                 params: vec![
                     Value::Text(format!("{index:05}")),
@@ -5901,6 +6010,7 @@ mod tests {
             let first = generation * BATCH_ROWS;
             let inserts = (first..first + BATCH_ROWS)
                 .map(|row_index| ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_owned(),
                     params: vec![
                         Value::Text(format!("{row_index:04}")),
@@ -5985,6 +6095,7 @@ mod tests {
         let insert_sql = "INSERT INTO columnar_lifecycle_probe (id, value) VALUES ($1, $2)";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: insert_sql.to_owned(),
                 params: vec![
                     Value::Text(format!("{row_index:05}")),
@@ -6435,6 +6546,7 @@ mod tests {
             "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, lix_json($2))";
         let insert_statements = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: insert_sql.to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -6450,6 +6562,7 @@ mod tests {
         for version in 1..=2 {
             let update_statements = (0..ROW_COUNT)
                 .map(|row_index| ExecuteBatchStatement {
+                    label: None,
                     sql: update_sql.to_string(),
                     params: vec![
                         Value::Text(format!("\"updated-{version}-{row_index:04}\"")),
@@ -6509,6 +6622,7 @@ mod tests {
 
         let partial_update_statements = (0..PARTIAL_ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: update_sql.to_string(),
                 params: vec![
                     Value::Text(format!("\"partial-{row_index:04}\"")),
@@ -6601,6 +6715,7 @@ mod tests {
             session
                 .execute_batch(&[
                     ExecuteBatchStatement {
+                        label: None,
                         sql: update_sql.to_string(),
                         params: vec![
                             Value::Text(version.to_string()),
@@ -6608,6 +6723,7 @@ mod tests {
                         ],
                     },
                     ExecuteBatchStatement {
+                        label: None,
                         sql: update_sql.to_string(),
                         params: vec![
                             Value::Text(version.to_string()),
@@ -6683,6 +6799,7 @@ mod tests {
         let sql = "INSERT INTO amended_parameter_insert_probe (id, value) VALUES ($1, $2)";
         let statements = (0..ROW_COUNT)
             .map(|index| ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text(format!("entity-{index:05}")),
@@ -6793,6 +6910,7 @@ mod tests {
         let sql = "UPDATE amended_parameter_update_probe SET value = lix_json($1) WHERE path = $2";
         let statements = [
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("\"updated-a\"".to_string()),
@@ -6800,6 +6918,7 @@ mod tests {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("\"updated-b\"".to_string()),
@@ -6892,6 +7011,7 @@ mod tests {
         let sql = "INSERT INTO concurrent_parameter_insert_probe (id, value) VALUES ($1, $2)";
         let first_statements = [
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("first-only".to_string()),
@@ -6899,6 +7019,7 @@ mod tests {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("shared".to_string()),
@@ -6930,6 +7051,7 @@ mod tests {
         second
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("second-only".to_string()),
@@ -6937,6 +7059,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("shared".to_string()),
@@ -6996,6 +7119,7 @@ mod tests {
         let sql = "INSERT INTO consecutive_parameter_insert_probe (id, value) VALUES ($1, $2)";
         let first_statements = [
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("a".to_string()),
@@ -7003,6 +7127,7 @@ mod tests {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("b".to_string()),
@@ -7012,6 +7137,7 @@ mod tests {
         ];
         let second_statements = [
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("c".to_string()),
@@ -7019,6 +7145,7 @@ mod tests {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: sql.to_string(),
                 params: vec![
                     Value::Text("z".to_string()),
@@ -7108,6 +7235,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -7115,6 +7243,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -7160,6 +7289,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -7167,6 +7297,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -7216,6 +7347,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -7223,6 +7355,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -7230,6 +7363,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![Value::Text("b".to_string()), Value::Text(String::new())],
                 },
@@ -7284,6 +7418,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -7292,6 +7427,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -7348,6 +7484,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("a".to_string()),
@@ -7356,6 +7493,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("b".to_string()),
@@ -7418,6 +7556,7 @@ mod tests {
         let results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-a".to_string()),
@@ -7425,6 +7564,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-b".to_string()),
@@ -7813,6 +7953,7 @@ mod tests {
         let missing_results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("invalid-missing-1".to_string()),
@@ -7820,6 +7961,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("invalid-missing-2".to_string()),
@@ -7840,6 +7982,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("not-json".to_string()),
@@ -7847,6 +7990,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text(r#"{"later":"valid"}"#.to_string()),
@@ -7861,6 +8005,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("invalid-b".to_string()),
@@ -7868,6 +8013,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("invalid-a".to_string()),
@@ -7883,6 +8029,7 @@ mod tests {
         let results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text(r#"{"nested":[1,true,"x"]}"#.to_string()),
@@ -7890,6 +8037,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text(r#"{"missing":1}"#.to_string()),
@@ -7897,6 +8045,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("null".to_string()),
@@ -7904,6 +8053,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text(r#"{"final":"b"}"#.to_string()),
@@ -7911,6 +8061,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text(r#"{"missing":2}"#.to_string()),
@@ -7977,6 +8128,7 @@ mod tests {
             "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, lix_json($2))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: insert_sql.to_string(),
                 params: vec![
                     Value::Text(format!("/{row_index:05}")),
@@ -7992,6 +8144,7 @@ mod tests {
         let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: update_sql.to_string(),
                 params: vec![
                     Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
@@ -8142,6 +8295,7 @@ mod tests {
         crate::transaction::take_rootless_replacement_generation_publications();
         let second_updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: update_sql.to_string(),
                 params: vec![
                     Value::Text(format!(r#"{{"second":{row_index}}}"#)),
@@ -8459,6 +8613,7 @@ mod tests {
         crate::transaction::take_rootless_replacement_generation_publications();
         let post_reinsert_updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: update_sql.to_string(),
                 params: vec![
                     Value::Text(format!(r#"{{"post_reinsert":{row_index}}}"#)),
@@ -8621,6 +8776,7 @@ mod tests {
             "INSERT INTO staged_generation_probe (path, value) VALUES ($1, lix_json($2))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: insert_sql.to_string(),
                 params: vec![
                     Value::Text(format!("/{row_index:04}")),
@@ -8642,6 +8798,7 @@ mod tests {
         let update_sql = "UPDATE staged_generation_probe SET value = lix_json($1) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: update_sql.to_string(),
                 params: vec![
                     Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
@@ -8716,6 +8873,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: insert_sql.to_string(),
                     params: vec![
                         Value::Text("duplicate".to_string()),
@@ -8723,6 +8881,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: insert_sql.to_string(),
                     params: vec![
                         Value::Text("duplicate".to_string()),
@@ -8750,6 +8909,7 @@ mod tests {
         session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("first".to_string()),
@@ -8757,6 +8917,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("second".to_string()),
@@ -8877,6 +9038,7 @@ mod tests {
         session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: insert_sql.to_string(),
                     params: vec![
                         Value::Text("c".to_string()),
@@ -8884,6 +9046,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: insert_sql.to_string(),
                     params: vec![
                         Value::Text("d".to_string()),
@@ -8903,6 +9066,7 @@ mod tests {
         session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-a".to_string()),
@@ -8910,6 +9074,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-b".to_string()),
@@ -8959,6 +9124,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("\"new-a\"".to_string()),
@@ -8966,6 +9132,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("not-json".to_string()),
@@ -9016,6 +9183,7 @@ mod tests {
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-a".to_string()),
@@ -9024,6 +9192,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-b".to_string()),
@@ -9075,6 +9244,7 @@ mod tests {
         session
             .execute_batch(&[
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-a".to_string()),
@@ -9082,6 +9252,7 @@ mod tests {
                     ],
                 },
                 ExecuteBatchStatement {
+                    label: None,
                     sql: sql.to_string(),
                     params: vec![
                         Value::Text("new-b".to_string()),
@@ -9986,6 +10157,7 @@ mod tests {
             .expect("overlay probe schema should register");
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, lix_json($2))"
                     .to_string(),
                 params: vec![
@@ -10117,6 +10289,7 @@ mod tests {
             .expect("stale replacement schema should register");
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, lix_json($2))"
                     .to_string(),
                 params: vec![
@@ -10238,6 +10411,7 @@ mod tests {
             .expect("direct journal schema should register");
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
+                label: None,
                 sql:
                     "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, lix_json($2))"
                         .to_string(),
@@ -10364,6 +10538,7 @@ mod tests {
             .execute_batch(
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
+                        label: None,
                         sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
@@ -10537,6 +10712,7 @@ mod tests {
             .execute_batch(
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
+                        label: None,
                         sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),

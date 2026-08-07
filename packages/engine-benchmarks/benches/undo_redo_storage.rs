@@ -519,6 +519,7 @@ where
     }
     let statements = (0..width)
         .map(|index| ExecuteBatchStatement {
+            label: None,
             sql: "UPDATE undo_bench_row SET value = $1 WHERE id = $2".to_string(),
             params: vec![
                 Value::Text("after".to_string()),

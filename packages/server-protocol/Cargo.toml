@@ -44,6 +44,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 lix_collaboration_test_support = { path = "../collaboration-test-support" }
 lix_storage_slatedb = { workspace = true }
+lix_storage_rocksdb = { workspace = true }
 object_store = { version = "0.14", default-features = false }
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 tempfile = "3"

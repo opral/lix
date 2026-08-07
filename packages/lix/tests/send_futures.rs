@@ -12,6 +12,7 @@ async fn public_execution_and_observation_futures_are_send() {
 
     assert_send(lix.execute("SELECT 1", &[]));
     assert_send(lix.execute_batch(&[ExecuteBatchStatement {
+        label: None,
         sql: "SELECT 1".to_owned(),
         params: Vec::new(),
     }]));

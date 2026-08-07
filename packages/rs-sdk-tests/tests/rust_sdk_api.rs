@@ -554,6 +554,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
     let results = lix
         .execute_batch(&[
             ExecuteBatchStatement {
+                label: None,
                 sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
                 params: vec![
                     Value::Text("batch-rs-a".to_string()),
@@ -561,6 +562,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
                 params: vec![
                     Value::Text("batch-rs-b".to_string()),
@@ -568,6 +570,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key"
                     .to_string(),
                 params: vec![
@@ -579,6 +582,14 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
         .await
         .unwrap();
     assert_eq!(results.len(), 3);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.statement_index())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    assert_eq!(results[0].label(), None);
     assert_eq!(results[0].rows_affected(), 1);
     assert_eq!(results[1].rows_affected(), 1);
     assert_eq!(
@@ -602,6 +613,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
     let error = lix
         .execute_batch(&[
             ExecuteBatchStatement {
+                label: None,
                 sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
                 params: vec![
                     Value::Text("batch-rs-rollback".to_string()),
@@ -609,6 +621,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
                 ],
             },
             ExecuteBatchStatement {
+                label: None,
                 sql: "SELECT id FROM lix_file_history('one', 'two')".to_string(),
                 params: Vec::new(),
             },
@@ -638,6 +651,39 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
         .await
         .expect_err("empty batch should be rejected");
     assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_batch_indexes_all_eighteen_writes_and_echoes_labels() {
+    let lix = open_lix().await.unwrap();
+    let statements = (0..18)
+        .map(|index| ExecuteBatchStatement {
+            label: Some(format!("file-{index}")),
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+            params: vec![
+                Value::Text(format!("batch-eighteen-{index}")),
+                Value::Text(index.to_string()),
+            ],
+        })
+        .collect::<Vec<_>>();
+
+    let results = lix.execute_batch(&statements).await.unwrap();
+    assert_eq!(results.len(), 18);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.statement_index())
+            .collect::<Vec<_>>(),
+        (0..18).map(Some).collect::<Vec<_>>()
+    );
+    let expected_labels = (0..18)
+        .map(|index| format!("file-{index}"))
+        .collect::<Vec<_>>();
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result.label(), Some(expected_labels[index].as_str()));
+    }
+    assert!(results.iter().all(|result| result.rows_affected() == 1));
     lix.close().await.unwrap();
 }
 

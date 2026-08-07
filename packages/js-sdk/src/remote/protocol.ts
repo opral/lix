@@ -47,7 +47,11 @@ export type RemoteExecuteRequest = {
 };
 
 export type RemoteExecuteBatchRequest = {
-	statements: Array<{ sql: string; params: WireRequestValue[] }>;
+	statements: Array<{
+		sql: string;
+		params: WireRequestValue[];
+		label?: string;
+	}>;
 	options?: { originKey?: string };
 	cacheBlobs?: true;
 };
@@ -57,6 +61,11 @@ export type RemoteExecuteResponse = {
 	rows: WireValue[][];
 	rowsAffected: number;
 	notices: Array<{ code: string; message: string; hint?: string }>;
+};
+
+export type RemoteExecuteBatchResponse = RemoteExecuteResponse & {
+	statementIndex: number;
+	label?: string;
 };
 
 export type RemoteObserveRequest = {
@@ -221,6 +230,22 @@ export function decodeExecuteResult(value: unknown): BindingExecuteResult {
 		};
 	});
 	return { columns, rows, rowsAffected: result.rowsAffected, notices };
+}
+
+export function decodeExecuteBatchResult(value: unknown): BindingExecuteResult {
+	const result = record(value, "execute batch result");
+	const statementIndex = nonNegativeSafeInteger(
+		result.statementIndex,
+		"execute batch result statementIndex",
+	);
+	if (result.label !== undefined && typeof result.label !== "string") {
+		throw protocolError("execute batch result label must be a string when present");
+	}
+	return {
+		...decodeExecuteResult(value),
+		statementIndex,
+		...(result.label === undefined ? {} : { label: result.label }),
+	};
 }
 
 export function decodeHandshake(value: unknown): RemoteHandshake {

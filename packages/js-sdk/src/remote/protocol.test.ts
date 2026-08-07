@@ -1,10 +1,32 @@
 import { expect, test, vi } from "vitest";
 import {
+	decodeExecuteBatchResult,
 	decodeExecuteResult,
 	decodeHandshake,
 	decodeObserveEvent,
 	encodeWireValue,
 } from "./protocol.js";
+
+test("remote executeBatch requires positional metadata and preserves labels", () => {
+	const result = decodeExecuteBatchResult({
+		statementIndex: 7,
+		label: "same-label",
+		columns: [],
+		rows: [],
+		rowsAffected: 1,
+		notices: [],
+	});
+	expect(result.statementIndex).toBe(7);
+	expect(result.label).toBe("same-label");
+	expect(() =>
+		decodeExecuteBatchResult({
+			columns: [],
+			rows: [],
+			rowsAffected: 1,
+			notices: [],
+		}),
+	).toThrow("statementIndex must be a non-negative safe integer");
+});
 
 test("remote blobs use native typed-array base64 when available", () => {
 	const prototype = Uint8Array.prototype as Uint8Array & {
