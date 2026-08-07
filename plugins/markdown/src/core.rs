@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub(crate) const PARSED_ROOT_ID: &str = "parsed-markdown-root";
 pub const NODE_SCHEMA_KEY: &str = crate::schemas::NODE_SCHEMA_KEY;
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
+const LEXICAL_SOURCE_REQUIRED_FIELD: &str = "lexical_source_required";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PluginError {
@@ -202,46 +203,51 @@ fn retain_noncanonical_source(
             "stable Markdown parse is missing its canonical render for lexical fallback".into(),
         )
     })?;
-    if canonical == source {
-        return Ok(());
-    }
     let format = parsed.root.node.format.as_object_mut().ok_or_else(|| {
         PluginError::Internal("Markdown document format must be an object".into())
     })?;
+    if canonical == source {
+        format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
+        return Ok(());
+    }
     format.insert(
         LEXICAL_FALLBACK_FIELD.to_owned(),
         serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(source)),
+    );
+    format.insert(
+        LEXICAL_SOURCE_REQUIRED_FIELD.to_owned(),
+        serde_json::Value::Bool(true),
     );
     Ok(())
 }
 
 fn render_tree_with_lexical_fallback(root: &NodeTree) -> Result<Vec<u8>, PluginError> {
-    let canonical = render_tree(root)?;
-    let Some(encoded) = root
+    if let Some(encoded) = root
         .node
         .format
         .get(LEXICAL_FALLBACK_FIELD)
         .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(canonical);
-    };
-    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return Ok(canonical);
-    };
-    let Ok(parsed_raw) = parse_file(&File {
-        filename: None,
-        content: raw.clone(),
-    }) else {
-        return Ok(canonical);
-    };
-    let Ok(raw_canonical) = render_tree(&parsed_raw.root) else {
-        return Ok(canonical);
-    };
-    if raw_canonical == canonical {
-        Ok(raw)
-    } else {
-        Ok(canonical)
+    {
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| {
+                PluginError::InvalidInput(format!(
+                    "Markdown lexical source fallback is not valid base64: {error}"
+                ))
+            });
     }
+    if root
+        .node
+        .format
+        .get(LEXICAL_SOURCE_REQUIRED_FIELD)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(PluginError::InvalidInput(
+            "Markdown restore requires accepted file bytes for this noncanonical source".into(),
+        ));
+    }
+    render_tree(root)
 }
 
 fn detect_changes_for_markdown(
@@ -1571,6 +1577,10 @@ impl PersistentTree {
             .or_else(|| self.base.children.get(index))
     }
 
+    fn top_level_len(&self) -> usize {
+        self.base.children.len()
+    }
+
     fn replace_top_level_node(&self, index: usize, node: NodeSnapshot) -> Self {
         let mut tree = self
             .top_level_tree(index)
@@ -1965,6 +1975,20 @@ fn projection_after_detected_changes(
     changes: &[DetectedChange],
 ) -> Result<Projection, PluginError> {
     let mut nodes_by_id = flatten_tree(root);
+    if !changes.is_empty()
+        && let Some(document) = nodes_by_id
+            .values_mut()
+            .find(|node| node.kind == NodeKind::Document)
+    {
+        let format = document.format.as_object_mut().ok_or_else(|| {
+            PluginError::Internal("Markdown document format must be an object".into())
+        })?;
+        // The accepted source is valid only for the unchanged semantic tree.
+        // A semantic successor must render from its derived state instead of
+        // accidentally reusing the predecessor's raw bytes.
+        format.remove(LEXICAL_FALLBACK_FIELD);
+        format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
+    }
     for change in changes {
         let id = change.entity_pk.first().ok_or_else(|| {
             PluginError::InvalidInput("Markdown entity_pk must contain one id".into())
@@ -2074,11 +2098,39 @@ impl Document {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let projection = Projection::from_entity_state(state.iter().cloned())?;
-        let root = projection.to_tree()?;
-        let restored = accepted.is_some();
-        let bytes = match accepted {
-            Some(bytes) => bytes,
-            None => render_tree_with_lexical_fallback(&root)?,
+        let mut root = projection.to_tree()?;
+        let source_required = root
+            .node
+            .format
+            .get(LEXICAL_SOURCE_REQUIRED_FIELD)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let (bytes, restored) = match accepted {
+            Some(bytes) => {
+                let format = root.node.format.as_object_mut().ok_or_else(|| {
+                    PluginError::InvalidInput("Markdown document format must be an object".into())
+                })?;
+                format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
+                // The file bytes are the durable authority. This in-memory
+                // copy is only a source-preservation cache for the actor;
+                // arena_state strips it before semantic state is persisted.
+                format.insert(
+                    LEXICAL_FALLBACK_FIELD.to_owned(),
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    ),
+                );
+                (bytes, true)
+            }
+            None => {
+                if source_required {
+                    return Err(PluginError::InvalidInput(
+                        "Markdown restore requires accepted file bytes for this noncanonical source"
+                            .into(),
+                    ));
+                }
+                (render_tree_with_lexical_fallback(&root)?, false)
+            }
         };
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
         let edits = if restored || bytes.is_empty() {
@@ -2111,10 +2163,11 @@ impl Document {
         let mut root: NodeSnapshot = serde_json::from_slice(root_json).map_err(|error| {
             PluginError::InvalidInput(format!("invalid Markdown arena root: {error}"))
         })?;
+        let format = root.format.as_object_mut().ok_or_else(|| {
+            PluginError::InvalidInput("Markdown arena root format must be an object".to_owned())
+        })?;
+        format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
         if fallback_flag != 0 {
-            let format = root.format.as_object_mut().ok_or_else(|| {
-                PluginError::InvalidInput("Markdown arena root format must be an object".to_owned())
-            })?;
             format.insert(
                 LEXICAL_FALLBACK_FIELD.to_owned(),
                 serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
@@ -2161,13 +2214,26 @@ impl Document {
             PluginError::Internal("Markdown document format must be an object".to_owned())
         })?;
         let had_lexical_fallback = format.remove(LEXICAL_FALLBACK_FIELD).is_some();
+        format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
         let mut root_json = vec![u8::from(had_lexical_fallback)];
         root_json.extend(serde_json::to_vec(&root).map_err(|error| {
             PluginError::Internal(format!("serialize Markdown arena root: {error}"))
         })?);
-        let mut blocks = Vec::with_capacity(self.top_level_ranges.len());
+        let top_level_len = self.tree.top_level_len();
+        let ranges_are_addressable = self.top_level_ranges.len() == top_level_len;
+        let mut blocks = Vec::with_capacity(top_level_len);
         let bytes_len = self.bytes.len;
-        for (index, range) in self.top_level_ranges.iter().enumerate() {
+        for index in 0..top_level_len {
+            // Accepted noncanonical bytes are the only lexical authority, so
+            // restore cannot derive source ranges by parsing or rendering.
+            // Keep every semantic child with an empty, non-addressable range;
+            // sparse edit lookup will decline it and use the full correctness
+            // path with the accepted bytes and complete semantic tree.
+            let range = if ranges_are_addressable {
+                self.top_level_ranges[index].clone()
+            } else {
+                0..0
+            };
             let tree = self.tree.top_level_tree(index).ok_or_else(|| {
                 PluginError::Internal("Markdown arena range has no matching block".to_owned())
             })?;
@@ -2851,4 +2917,198 @@ fn chars_to_string(base: &[char], edits: &[TextReplacement]) -> Option<String> {
     }
     output.extend(base[cursor..].iter());
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn semantic_records_without_raw_source(source: Vec<u8>) -> Vec<EntityRecord> {
+        let (_, mut changes) = Document::open_file(
+            source,
+            Some("competitors.md"),
+            IdNamespace::from_halves(7, 11),
+        )
+        .expect("parse Markdown source");
+        for change in &mut changes {
+            let Some(snapshot) = &change.snapshot else {
+                continue;
+            };
+            let mut node: NodeSnapshot = serde_json::from_str(
+                &wire_to_logical(snapshot).expect("decode logical Markdown snapshot"),
+            )
+            .expect("logical Markdown snapshot");
+            if node.kind != NodeKind::Document {
+                continue;
+            }
+            let format = node.format.as_object_mut().expect("document format object");
+            format.remove(LEXICAL_FALLBACK_FIELD);
+            format.insert(
+                LEXICAL_SOURCE_REQUIRED_FIELD.to_owned(),
+                serde_json::Value::Bool(true),
+            );
+            change.snapshot = Some(
+                logical_to_wire(&serde_json::to_string(&node).expect("encode logical snapshot"))
+                    .expect("encode wire Markdown snapshot"),
+            );
+        }
+        changes
+            .into_iter()
+            .filter_map(|change| {
+                change.snapshot.map(|snapshot| EntityRecord {
+                    schema_key: change.schema_key,
+                    entity_pk: change.entity_pk,
+                    snapshot,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stripping_fallback_from_semantic_snapshots_requires_accepted_bytes() {
+        let source = br#"# Competitors
+
+*Counter:
+
+(~26 users)
+
+A paragraph directly followed by
+- list item
+
+**knowledge base / shared workspace agents read and
+write to.**
+
+The remaining document keeps the same ordinary prose shape while making
+the source large enough to exercise the full-document serializer.
+
+Another paragraph with *single-asterisk emphasis* and `inline code`.
+"#
+        .to_vec();
+        let (document, _) = Document::open_file(
+            source.clone(),
+            Some("competitors.md"),
+            IdNamespace::from_halves(7, 11),
+        )
+        .expect("parse reported Markdown constructs");
+        let rendered = render_tree(&document.tree.materialize()).expect("render document tree");
+        assert_ne!(
+            rendered, source,
+            "the fixture must take the noncanonical source path"
+        );
+        let records = semantic_records_without_raw_source(source.clone());
+        let error = Document::open_entities(records.clone(), None)
+            .expect_err("a noncanonical restore without accepted bytes must fail closed");
+        assert!(
+            matches!(error, PluginError::InvalidInput(message) if message.contains("accepted file bytes"))
+        );
+        let (restored, edits) =
+            Document::open_entities(records, Some(source.clone())).expect("accepted bytes restore");
+        assert!(edits.is_empty());
+        assert_eq!(restored.bytes.materialize(), source);
+    }
+
+    #[test]
+    fn accepted_restore_is_byte_idempotent_across_markdown_corpus() {
+        let corpus = [
+            "*Counter:\n\n(~26 users)\n\nA paragraph directly followed by\n- list item\n\n**wrapped strong / shared workspace agents read and\nwrite to.**\n",
+            "---\nDateApproved: 6/10/2020\n---\n\n# Unicode 😀\n\nRésumé — naïve café\n",
+            "```rust\nlet value = *Counter;\n```\n\nAn unmatched *marker and [unfinished link\n",
+            "# CRLF\r\n\r\nA paragraph with *emphasis* and `code`.\r\n",
+        ];
+        for source in corpus {
+            let source = source.as_bytes().to_vec();
+            let records = semantic_records_without_raw_source(source.clone());
+            let (first, first_edits) =
+                Document::open_entities(records.clone(), Some(source.clone()))
+                    .expect("first accepted restore");
+            assert!(first_edits.is_empty());
+            let (first_root, first_blocks) = first.arena_state().expect("first arena state");
+            let second =
+                Document::open_arena(source.clone(), &first_root, first_blocks).expect("reopen");
+            assert_eq!(second.bytes.materialize(), source);
+            let (second_root, second_blocks) = second.arena_state().expect("second arena state");
+            let third = Document::open_arena(source.clone(), &second_root, second_blocks)
+                .expect("second reopen");
+            assert_eq!(third.bytes.materialize(), source);
+        }
+    }
+
+    #[test]
+    fn accepted_restore_preserves_semantic_children_for_reopen_and_edit() {
+        let source = br#"# Competitors
+
+*Counter:
+
+(~26 users)
+
+The remaining document keeps every semantic block.
+
+Another paragraph must survive an unrelated semantic edit.
+"#
+        .to_vec();
+        let records = semantic_records_without_raw_source(source.clone());
+        let (restored, edits) =
+            Document::open_entities(records, Some(source.clone())).expect("accepted bytes restore");
+        assert!(edits.is_empty());
+        let expected_tree = restored.tree.materialize();
+        let expected_child_count = expected_tree.children.len();
+        assert!(expected_child_count > 1, "fixture needs unrelated blocks");
+
+        let (root, blocks) = restored.arena_state().expect("restored arena state");
+        assert_eq!(blocks.len(), expected_child_count);
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.start == 0 && block.end == 0),
+            "restored lexical ranges must be explicitly non-addressable"
+        );
+        let reopened = Document::open_arena(source, &root, blocks).expect("arena reopen");
+        assert_eq!(reopened.tree.materialize(), expected_tree);
+
+        let mut edited = expected_tree
+            .children
+            .iter()
+            .find(|child| {
+                serde_json::to_string(&child.node.payload)
+                    .is_ok_and(|payload| payload.contains("remaining document"))
+            })
+            .expect("editable paragraph")
+            .node
+            .clone();
+        let payload = serde_json::to_string(&edited.payload).expect("paragraph payload");
+        let successor_payload = payload.replacen("remaining document", "retained document", 1);
+        assert_ne!(successor_payload, payload);
+        edited.payload = serde_json::from_str(&successor_payload).expect("edited payload");
+        let edited_id = edited.id.clone();
+        let snapshot = logical_to_wire(
+            &serde_json::to_string(&edited).expect("edited logical Markdown snapshot"),
+        )
+        .expect("edited wire Markdown snapshot");
+        let (successor, _) = reopened
+            .entities_changed(vec![EntityChange {
+                schema_key: NODE_SCHEMA_KEY.to_owned(),
+                entity_pk: vec![edited_id.clone()],
+                snapshot: Some(snapshot),
+                effect: ChangeEffect::Content,
+            }])
+            .expect("semantic child edit after restore");
+        let successor_tree = successor.tree.materialize();
+        assert_eq!(successor_tree.children.len(), expected_child_count);
+        for (before, after) in expected_tree.children.iter().zip(&successor_tree.children) {
+            if before.node.id != edited_id {
+                assert_eq!(after, before, "unrelated semantic block changed");
+            }
+        }
+        assert!(
+            successor_tree
+                .node
+                .format
+                .get(LEXICAL_FALLBACK_FIELD)
+                .is_none(),
+            "semantic successor must clear the lexical fallback"
+        );
+        let rendered = String::from_utf8(successor.bytes()).expect("rendered Markdown is UTF-8");
+        assert!(rendered.contains("retained document"));
+        assert!(rendered.contains("Another paragraph must survive"));
+    }
 }
