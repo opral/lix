@@ -3717,9 +3717,10 @@ mod tests {
                 )))],
             ))
             .expect("reopened Git-text rows should query");
-            assert!(
-                !semantic_rows.rows().is_empty(),
-                "text semantic rows should persist for {path}"
+            assert_eq!(
+                semantic_rows.rows().len(),
+                1,
+                "exactly one text semantic row should persist for {path}"
             );
         }
         db::block_on(lix.close()).expect("reopened Lix should close");
