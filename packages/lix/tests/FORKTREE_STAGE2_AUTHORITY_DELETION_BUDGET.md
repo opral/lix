@@ -11,9 +11,9 @@ cursor, adapter, or ForkTree source.
   tree `26a3e6ead4d690bf1fe2ebca1e2da7d597256b84`;
 - later main `e8713ed191e05d29c44dbc8e7ce1d6b1a11695e7`, tree
   `ce241a0af016cadcb0c21d2d754eb3d4291cf79c`;
-- prospective e871 + #1260 tree
-  `2ae6ffd8faef595ca9bf2e60447ef31a8922b92f` from #1260 head
-  `7061aad7f4b14e611b32bbe5493f39253b826378`;
+- landed current main `803d19ec0b67fb4b759aceab7ceb74650d9d894f`,
+  tree `2ae6ffd8faef595ca9bf2e60447ef31a8922b92f` (the modeled e871 +
+  #1260 tree matched exactly);
 - landed #1258 map: 21 production paths and 39 physical CAS/retention
   symbols, all still mechanically verified.
 
@@ -27,7 +27,7 @@ the first runnable Stage-2 zero-residue gate; they are not accepted failures.
 | b5 | 42 / 699 | 151 / 2,585 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
 | Stage1 138b | 42 / 657 | 151 / 2,210 | 23 / 23 | 7 / 619; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 524 | 1 / 19 | 233 |
 | e871 | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
-| post-1260 tree | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
+| main 803d | 42 / 702 | 151 / 2,594 | 23 / 23 | 7 / 655; 13 / 19 | 4 / 24 | 5 / 38; present | 17 / 0 | 1 / 19 | 295 |
 
 The corrected 42nd durable space is
 `BINARY_CAS_MUTATION_EPOCH_SPACE`; it contributes six of b5's exact 699
@@ -67,7 +67,7 @@ It masks comments/literals, removes only exact item-scoped `#[cfg(test)]`
 items/methods, and continues scanning declarations and reconstruction loops
 after interleaved test blocks. `#[cfg(not(test))]` and potentially production
 `#[cfg(any(test, ...))]` items remain visible. Frozen ledgers contain 1,658 b5,
-1,622 Stage1, and 1,669 e871/post-1260 declaration rows after the TSV header.
+1,622 Stage1, and 1,669 e871/main-803d declaration rows after the TSV header.
 
 The 19 semantic allowlist rows are executable rules, not string exceptions.
 Each value/facade/relation must exist. Facades and relations must have a
@@ -120,17 +120,17 @@ also reject. Every probe uses an rlib built from the exact tree under review.
 - dependency source: `eb11912d9b8ed8b7222ee98792f00c2614373ff615d22c221f00a3ebeeb413e3`;
 - dependency binary: `1f1eadf3e0c8a1aeca8e8a4fc31cb4492f988dbe12d72c3832c223e522a8ae81`;
 - semantic allowlist: `1a70be6bf43e3f93bc57c0c5a8aec813757187484e3b1f4c45218621d0e79021`;
-- b5/Stage1/e871/post-1260 budgets:
+- b5/Stage1/e871/main-803d budgets:
   `0d232b5eb18cf9ad409b2623d25ddb86fa83d3c1781e978fac5b36cde96503e6`,
   `e2ae8494a2e47946c5625f00823508bc50e8cf154704f288cff61e4940e989dc`,
   `224965d21b84c6171b0440122e0a223a16c07b7141ec019a408ae8e7bf2d117c`,
   `0c00637446c057ecd2fe7717fcd61d2366fe679c2bc925eafa9d80e149db7ad7`;
-- b5/Stage1/e871/post-1260 declaration ledgers:
+- b5/Stage1/e871/main-803d declaration ledgers:
   `a6a7dbce81a6f2737474be309aed14dcddc28f28c29166ae63764be5c96baebf`,
   `17a71d6305963b7cc55ae522ce318c83031aa10b0c71d94e3742f6dd5a6740c5`,
   `90950db072d2ef516460ececa2404c0a05cd9542dec605da5216ce586e4d05bb`,
   `8144809e65f453667bba2b4b3c6dddab385cd94b81bd02e47cb7e1399470aa05`;
-- b5/Stage1/e871/post-1260 baseline logs:
+- b5/Stage1/e871/main-803d baseline logs:
   `5ac2e8c6ef3734d6b621694df9d0e5aee7f9bb9eb82051f7f3ff12fd2693ad3c`,
   `626d6b80e35991e0b8cf576c50eae26a6835d9c90ee1f2d1e8fade03962958f9`,
   `41f88b2aebc4333cd4ede6a7f43ff7a9a7fb86ec721ddeee036e1be5d36190c4`,

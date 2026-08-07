@@ -14,7 +14,7 @@ for SPEC in \
   b5:/absolute/path/to/main-b5e \
   stage1:/absolute/path/to/stage1-138b \
   e871:/absolute/path/to/main-e871 \
-  post1260:/absolute/path/to/post1260-tree
+  main803d:/absolute/path/to/main-803d
 do
   NAME=${SPEC%%:*}
   ROOT=${SPEC#*:}
@@ -29,12 +29,12 @@ diff -u "$ORACLE/PRE_CUT_STAGE1_BUDGET.tsv" "$EVIDENCE/stage1-budget.tsv"
 diff -u "$ORACLE/PRE_CUT_STAGE1_DELETED_MODULE_DEFINITIONS.tsv" "$EVIDENCE/stage1-definitions.tsv"
 diff -u "$ORACLE/PRE_CUT_E871_BUDGET.tsv" "$EVIDENCE/e871-budget.tsv"
 diff -u "$ORACLE/PRE_CUT_E871_DELETED_MODULE_DEFINITIONS.tsv" "$EVIDENCE/e871-definitions.tsv"
-diff -u "$ORACLE/PRE_CUT_POST1260_BUDGET.tsv" "$EVIDENCE/post1260-budget.tsv"
-diff -u "$ORACLE/PRE_CUT_POST1260_DELETED_MODULE_DEFINITIONS.tsv" "$EVIDENCE/post1260-definitions.tsv"
+diff -u "$ORACLE/PRE_CUT_MAIN803D_BUDGET.tsv" "$EVIDENCE/main803d-budget.tsv"
+diff -u "$ORACLE/PRE_CUT_MAIN803D_DELETED_MODULE_DEFINITIONS.tsv" "$EVIDENCE/main803d-definitions.tsv"
 diff -u "$ORACLE/PRE_CUT_B5E_BASELINE.txt" "$EVIDENCE/b5-baseline.txt"
 diff -u "$ORACLE/PRE_CUT_STAGE1_BASELINE.txt" "$EVIDENCE/stage1-baseline.txt"
 diff -u "$ORACLE/PRE_CUT_E871_BASELINE.txt" "$EVIDENCE/e871-baseline.txt"
-diff -u "$ORACLE/PRE_CUT_POST1260_BASELINE.txt" "$EVIDENCE/post1260-baseline.txt"
+diff -u "$ORACLE/PRE_CUT_MAIN803D_BASELINE.txt" "$EVIDENCE/main803d-baseline.txt"
 
 # The immutable cursor successor must be green before Stage 2 starts.
 "$EVIDENCE/residue-oracle" cursor-audit /absolute/path/to/immutable-cursor-head

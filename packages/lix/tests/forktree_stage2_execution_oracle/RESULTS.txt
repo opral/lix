@@ -18,7 +18,8 @@ Exact red calibration totals
 - b5e78190: 295 findings; 42 spaces / 699 occurrences
 - Stage1 138b55e1: 233 findings; 42 spaces / 657 occurrences
 - e8713ed1: 295 findings; 42 spaces / 702 occurrences
-- e871 + #1260 tree 2ae6ffd8: 295 findings; 42 spaces / 702 occurrences
+- landed main 803d19ec/tree 2ae6ffd8: 295 findings; 42 spaces / 702
+  occurrences (identical to the modeled post-#1260 tree)
 
 Boundary
 - packages/sqlite-storage and all runtime/dependency selectors: delete
