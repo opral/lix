@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 mod model;
+mod vertical;
 mod workload;
 
 use std::alloc::GlobalAlloc;
@@ -293,6 +294,23 @@ enum Layout {
     ForkTree,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scenario {
+    Apply,
+    History,
+    Blob,
+}
+
+impl Scenario {
+    fn parse(value: Option<&str>) -> (Self, usize) {
+        match value {
+            Some("history") => (Self::History, 1),
+            Some("blob") => (Self::Blob, 1),
+            _ => (Self::Apply, 0),
+        }
+    }
+}
+
 impl Layout {
     fn parse(value: &str) -> Self {
         match value {
@@ -312,6 +330,7 @@ impl Layout {
 
 #[derive(Clone, Copy)]
 struct Parameters {
+    scenario: Scenario,
     backend: Backend,
     layout: Layout,
     rows: usize,
@@ -324,17 +343,27 @@ struct Parameters {
 impl Parameters {
     fn parse() -> Self {
         let args = std::env::args().collect::<Vec<_>>();
-        let rows = parse_positive(args.get(3), "rows", 1_000);
-        let updates = parse_positive(args.get(4), "updates", 32);
+        let (scenario, offset) = Scenario::parse(args.get(1).map(String::as_str));
+        let rows = parse_positive(args.get(3 + offset), "rows", 1_000);
+        let updates = parse_positive(args.get(4 + offset), "updates", 32);
         assert!(updates <= rows, "updates must not exceed rows");
         Self {
-            backend: Backend::parse(args.get(1).map(String::as_str).unwrap_or("rocksdb")),
-            layout: Layout::parse(args.get(2).map(String::as_str).unwrap_or("forktree")),
+            scenario,
+            backend: Backend::parse(
+                args.get(1 + offset)
+                    .map(String::as_str)
+                    .unwrap_or("rocksdb"),
+            ),
+            layout: Layout::parse(
+                args.get(2 + offset)
+                    .map(String::as_str)
+                    .unwrap_or("forktree"),
+            ),
             rows,
             updates,
-            samples: parse_positive(args.get(5), "samples", 7),
-            warmups: parse_nonnegative(args.get(6), "warmups", 2),
-            iterations: parse_positive(args.get(7), "iterations", 20),
+            samples: parse_positive(args.get(5 + offset), "samples", 7),
+            warmups: parse_nonnegative(args.get(6 + offset), "warmups", 2),
+            iterations: parse_positive(args.get(7 + offset), "iterations", 20),
         }
     }
 }
@@ -372,6 +401,10 @@ struct Sample {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let parameters = Parameters::parse();
+    if parameters.scenario != Scenario::Apply {
+        vertical::run(parameters).await;
+        return;
+    }
     match parameters.backend {
         Backend::RocksDb => run_rocksdb(parameters).await,
         Backend::SlateDb => run_slatedb(parameters).await,

@@ -16,6 +16,8 @@ const INTERNAL_TAG: u8 = 2;
 const DELTA_TAG: u8 = 3;
 const COMMIT_TAG: u8 = 4;
 const VALUE_PACK_TAG: u8 = 5;
+const BLOB_CHUNK_TAG: u8 = 6;
+const BLOB_MANIFEST_TAG: u8 = 7;
 const LEAF_ROWS: usize = 8;
 const INTERNAL_CHILDREN: usize = 8;
 
@@ -25,6 +27,9 @@ pub const REF_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x00f0_0002), 
 
 const MAIN_REF_KEY: &[u8] = b"branch/main";
 const EPOCH_KEY: &[u8] = b"epoch";
+const BRANCH_PREFIX: &[u8] = b"branch/";
+const CHECKPOINT_PREFIX: &[u8] = b"checkpoint/";
+const REDO_PREFIX: &[u8] = b"redo/";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ObjectId([u8; 32]);
@@ -33,6 +38,35 @@ pub struct ObjectId([u8; 32]);
 pub struct Update {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlobAccounting {
+    pub chunks: u64,
+    pub reused_chunks: u64,
+    pub object_writes: u64,
+    pub object_bytes: u64,
+    pub logical_bytes: u64,
+    pub chunking_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlobDiff {
+    pub before_chunks: u64,
+    pub after_chunks: u64,
+    pub shared_chunks: u64,
+    pub changed_chunks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReclaimAccounting {
+    pub roots: u64,
+    pub reachable_objects: u64,
+    pub scanned_objects: u64,
+    pub reclaimed_objects: u64,
+    pub reclaimed_bytes: u64,
+    pub pages: u64,
+    pub peak_frontier: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -87,7 +121,7 @@ struct LeafEntry {
     value: ValueRef,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ValueRef {
     pack: ObjectId,
     index: u32,
@@ -101,9 +135,22 @@ struct ResolvedUpdate {
 
 #[derive(Clone, Copy)]
 struct Commit {
-    parent: Option<ObjectId>,
+    parents: [Option<ObjectId>; 2],
     root: ObjectId,
     delta: ObjectId,
+    blob: Option<ObjectId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlobChunkRef {
+    id: ObjectId,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct BlobManifest {
+    logical_bytes: u64,
+    chunks: Vec<BlobChunkRef>,
 }
 
 struct Head {
@@ -124,17 +171,14 @@ where
     pub async fn initialize(&self, rows: &[(Vec<u8>, Vec<u8>)]) -> Result<ObjectId, String> {
         validate_sorted_rows(rows)?;
         let mut pending = BTreeMap::new();
-        let value_pack = stage_object(
-            encode_value_pack(rows.iter().map(|(_, value)| value.as_slice())),
-            &mut pending,
-        );
-        let root = build_tree(rows, value_pack, &mut pending)?;
+        let root = build_tree(rows, &mut pending)?;
         let delta = stage_object(encode_initial_delta(root.id, rows.len()), &mut pending);
         let commit = stage_object(
             encode_commit(Commit {
-                parent: None,
+                parents: [None, None],
                 root: root.id,
                 delta,
+                blob: None,
             }),
             &mut pending,
         );
@@ -191,8 +235,182 @@ where
         &self,
         updates: &[Update],
     ) -> Result<(ObjectId, ApplyAccounting), String> {
+        self.apply_sorted_updates_on("main", updates).await
+    }
+
+    /// Publishes a new branch selector and rotates the one mutable epoch in the
+    /// same adapter commit. No immutable object is copied or rewritten.
+    pub async fn create_branch(
+        &self,
+        name: &str,
+        from: Option<ObjectId>,
+    ) -> Result<ObjectId, String> {
+        let source = match from {
+            Some(commit) => commit,
+            None => self.load_head_at_key(MAIN_REF_KEY).await?.commit,
+        };
+        self.put_new_selector(selector_key(BRANCH_PREFIX, name), source)
+            .await?;
+        Ok(source)
+    }
+
+    /// Pins an existing commit as a checkpoint using only the ref/epoch plane.
+    pub async fn create_checkpoint(&self, name: &str, commit: ObjectId) -> Result<(), String> {
+        self.put_new_selector(selector_key(CHECKPOINT_PREFIX, name), commit)
+            .await
+    }
+
+    pub async fn delete_branch(&self, name: &str) -> Result<(), String> {
+        self.delete_selector(selector_key(BRANCH_PREFIX, name))
+            .await
+    }
+
+    pub async fn delete_checkpoint(&self, name: &str) -> Result<(), String> {
+        self.delete_selector(selector_key(CHECKPOINT_PREFIX, name))
+            .await
+    }
+
+    /// Moves the branch selector to its first parent and retains the old head
+    /// in a redo selector. Both selector changes and the epoch rotate atomically.
+    pub async fn undo(&self, branch: &str) -> Result<ObjectId, String> {
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let redo_key = selector_key(REDO_PREFIX, branch);
+        let head = self.load_head_at_key(&branch_key).await?;
+        let parent = self.load_commit(head.commit).await?.parents[0]
+            .ok_or_else(|| "ForkTree root commit cannot be undone".to_string())?;
+        let parent_ref = encode_ref(parent);
+        let redo_ref = encode_ref(head.commit);
+        let next_epoch = encode_epoch(head.epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&branch_key),
+                        expected: head.raw_ref,
+                    },
+                    Precondition::KeyAbsent {
+                        space: REF_SPACE,
+                        key: key(&redo_key),
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: head.raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: parent_ref.len() + redo_ref.len() + next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&branch_key),
+                            value: StoredValue { bytes: parent_ref },
+                        },
+                        PutEntry {
+                            key: key(&redo_key),
+                            value: StoredValue { bytes: redo_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(parent)
+    }
+
+    pub async fn redo(&self, branch: &str) -> Result<ObjectId, String> {
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let redo_key = selector_key(REDO_PREFIX, branch);
+        let head = self.load_head_at_key(&branch_key).await?;
+        let redo_raw = self
+            .load_raw_selector(&redo_key)
+            .await?
+            .ok_or_else(|| "ForkTree branch has no redo selector".to_string())?;
+        let redo = decode_ref(&redo_raw)?;
+        let next_ref = encode_ref(redo);
+        let next_epoch = encode_epoch(head.epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&branch_key),
+                        expected: head.raw_ref,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&redo_key),
+                        expected: redo_raw,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: head.raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: next_ref.len() + next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&branch_key),
+                            value: StoredValue { bytes: next_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write
+            .delete_many(REF_SPACE, &[key(&redo_key)])
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(redo)
+    }
+
+    pub async fn apply_sorted_updates_on(
+        &self,
+        branch: &str,
+        updates: &[Update],
+    ) -> Result<(ObjectId, ApplyAccounting), String> {
+        self.apply_sorted_updates_with_merge_parent(branch, updates, None)
+            .await
+    }
+
+    async fn apply_sorted_updates_with_merge_parent(
+        &self,
+        branch: &str,
+        updates: &[Update],
+        merge_parent: Option<ObjectId>,
+    ) -> Result<(ObjectId, ApplyAccounting), String> {
         validate_sorted_updates(updates)?;
-        let head = self.load_head().await?;
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let head = self.load_head_at_key(&branch_key).await?;
         let commit = self.load_commit(head.commit).await?;
         let mut pending = BTreeMap::new();
         let mut accounting = ApplyAccounting {
@@ -234,9 +452,10 @@ where
         );
         let next_commit = stage_object(
             encode_commit(Commit {
-                parent: Some(head.commit),
+                parents: [Some(head.commit), merge_parent],
                 root: root.id,
                 delta,
+                blob: commit.blob,
             }),
             &mut pending,
         );
@@ -270,7 +489,7 @@ where
             preconditions: vec![
                 Precondition::KeyValueEquals {
                     space: REF_SPACE,
-                    key: key(MAIN_REF_KEY),
+                    key: key(&branch_key),
                     expected: head.raw_ref,
                 },
                 Precondition::KeyValueEquals {
@@ -301,7 +520,7 @@ where
                 PutBatch {
                     entries: vec![
                         PutEntry {
-                            key: key(MAIN_REF_KEY),
+                            key: key(&branch_key),
                             value: StoredValue { bytes: next_ref },
                         },
                         PutEntry {
@@ -317,8 +536,612 @@ where
         Ok((next_commit, accounting))
     }
 
+    pub async fn branch_head(&self, branch: &str) -> Result<ObjectId, String> {
+        self.load_head_at_key(&selector_key(BRANCH_PREFIX, branch))
+            .await
+            .map(|head| head.commit)
+    }
+
+    pub async fn checkpoint_head(&self, name: &str) -> Result<ObjectId, String> {
+        self.load_head_at_key(&selector_key(CHECKPOINT_PREFIX, name))
+            .await
+            .map(|head| head.commit)
+    }
+
+    pub async fn read_point(&self, branch: &str, key: &[u8]) -> Result<Vec<u8>, String> {
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        let value = self.find_value(commit.root, key).await?;
+        self.load_value(value).await
+    }
+
+    pub async fn read_range(
+        &self,
+        branch: &str,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        if start > end {
+            return Err("ForkTree range start exceeds end".to_string());
+        }
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        let mut entries = Vec::new();
+        self.collect_range_entries(commit.root, start, end, &mut entries)
+            .await?;
+        let mut output = Vec::with_capacity(entries.len());
+        for entry in entries {
+            output.push((entry.key, self.load_value(entry.value).await?));
+        }
+        Ok(output)
+    }
+
+    pub async fn diff_commits(
+        &self,
+        before: ObjectId,
+        after: ObjectId,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if before == after {
+            return Ok(Vec::new());
+        }
+        let before = self.load_commit(before).await?;
+        let after = self.load_commit(after).await?;
+        let mut changed = Vec::new();
+        self.diff_nodes(before.root, after.root, &mut changed)
+            .await?;
+        Ok(changed)
+    }
+
+    pub async fn merge_branches(
+        &self,
+        target: &str,
+        source: &str,
+        base: ObjectId,
+    ) -> Result<(ObjectId, ApplyAccounting), String> {
+        let target_head = self.branch_head(target).await?;
+        let source_head = self.branch_head(source).await?;
+        let source_changes = self.diff_commits(base, source_head).await?;
+        let target_changes = self.diff_commits(base, target_head).await?;
+        let target_keys = target_changes
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if source_changes.iter().any(|key| target_keys.contains(key)) {
+            return Err("ForkTree prototype merge has a semantic conflict".to_string());
+        }
+        let mut updates = Vec::with_capacity(source_changes.len());
+        for key in source_changes {
+            let source_commit = self.load_commit(source_head).await?;
+            let value = self.find_value(source_commit.root, &key).await?;
+            updates.push(Update {
+                key,
+                value: self.load_value(value).await?,
+            });
+        }
+        self.apply_sorted_updates_with_merge_parent(target, &updates, Some(source_head))
+            .await
+    }
+
+    /// Chunks and authenticates one blob into the same immutable object space,
+    /// then atomically publishes a commit/root selector and epoch. Existing
+    /// chunk IDs are referenced and never rewritten.
+    pub async fn ingest_blob(
+        &self,
+        branch: &str,
+        payload: &[u8],
+    ) -> Result<(ObjectId, BlobAccounting), String> {
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let head = self.load_head_at_key(&branch_key).await?;
+        let current = self.load_commit(head.commit).await?;
+        let chunking_started = std::time::Instant::now();
+        let ranges =
+            fastcdc::v2020::FastCDC::new(payload, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)
+                .map(|chunk| (chunk.offset, chunk.offset + chunk.length))
+                .collect::<Vec<_>>();
+        let chunking_us = chunking_started.elapsed().as_micros() as u64;
+        let chunks = ranges
+            .iter()
+            .map(|&(start, end)| BlobChunkRef {
+                id: blob_chunk_id(&payload[start..end]),
+                bytes: (end - start) as u64,
+            })
+            .collect::<Vec<_>>();
+        let manifest = BlobManifest {
+            logical_bytes: payload.len() as u64,
+            chunks,
+        };
+        let mut pending = BTreeMap::new();
+        let manifest_id = stage_object(encode_blob_manifest(&manifest), &mut pending);
+        let delta = stage_object(encode_blob_delta(current.blob, manifest_id), &mut pending);
+        let next_commit = stage_object(
+            encode_commit(Commit {
+                parents: [Some(head.commit), None],
+                root: current.root,
+                delta,
+                blob: Some(manifest_id),
+            }),
+            &mut pending,
+        );
+        self.remove_existing_objects(&mut pending).await?;
+
+        let chunk_ids = manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.id)
+            .collect::<Vec<_>>();
+        let existing = self.existing_object_ids(&chunk_ids).await?;
+        let mut unique = std::collections::BTreeSet::new();
+        let mut accounting = BlobAccounting {
+            chunks: manifest.chunks.len() as u64,
+            logical_bytes: payload.len() as u64,
+            chunking_us,
+            ..BlobAccounting::default()
+        };
+        let missing_bytes = manifest
+            .chunks
+            .iter()
+            .filter(|chunk| !existing.contains(&chunk.id) && unique.insert(chunk.id))
+            .map(|chunk| chunk.bytes + 13)
+            .sum::<u64>();
+        accounting.reused_chunks = manifest.chunks.len() as u64 - unique.len() as u64
+            + unique.iter().filter(|id| existing.contains(id)).count() as u64;
+        accounting.object_writes =
+            unique.iter().filter(|id| !existing.contains(id)).count() as u64 + pending.len() as u64;
+        accounting.object_bytes = missing_bytes
+            + pending
+                .values()
+                .map(|bytes| bytes.len() as u64)
+                .sum::<u64>();
+
+        let next_ref = encode_ref(next_commit);
+        let next_epoch = encode_epoch(head.epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&branch_key),
+                        expected: head.raw_ref,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: head.raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: usize::try_from(accounting.object_bytes)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(next_ref.len() + next_epoch.len()),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        let mut staged = std::collections::BTreeSet::new();
+        for ((start, end), chunk) in ranges.iter().copied().zip(&manifest.chunks) {
+            if existing.contains(&chunk.id) || !staged.insert(chunk.id) {
+                continue;
+            }
+            let bytes = encode_blob_chunk(&payload[start..end]);
+            authenticate(chunk.id, &bytes)?;
+            write
+                .put_many(
+                    OBJECT_SPACE,
+                    PutBatch {
+                        entries: vec![PutEntry {
+                            key: key(&chunk.id.0),
+                            value: StoredValue { bytes },
+                        }],
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+        }
+        if !pending.is_empty() {
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+        }
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&branch_key),
+                            value: StoredValue { bytes: next_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok((next_commit, accounting))
+    }
+
+    pub async fn read_blob(&self, branch: &str) -> Result<Vec<u8>, String> {
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        let manifest_id = commit
+            .blob
+            .ok_or_else(|| "ForkTree branch has no blob root".to_string())?;
+        let manifest = decode_blob_manifest(&self.load_object(manifest_id).await?)?;
+        self.read_blob_manifest_range(&manifest, 0, manifest.logical_bytes)
+            .await
+    }
+
+    pub async fn read_blob_range(
+        &self,
+        branch: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, String> {
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        let manifest_id = commit
+            .blob
+            .ok_or_else(|| "ForkTree branch has no blob root".to_string())?;
+        let manifest = decode_blob_manifest(&self.load_object(manifest_id).await?)?;
+        self.read_blob_manifest_range(&manifest, start, end).await
+    }
+
+    pub async fn diff_blob_commits(
+        &self,
+        before: ObjectId,
+        after: ObjectId,
+    ) -> Result<BlobDiff, String> {
+        let before = self.load_commit(before).await?;
+        let after = self.load_commit(after).await?;
+        let before = self.load_blob_manifest(before.blob).await?;
+        let after = self.load_blob_manifest(after.blob).await?;
+        let before_ids = before
+            .chunks
+            .iter()
+            .map(|chunk| chunk.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let after_ids = after
+            .chunks
+            .iter()
+            .map(|chunk| chunk.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let shared = before_ids.intersection(&after_ids).count() as u64;
+        Ok(BlobDiff {
+            before_chunks: before.chunks.len() as u64,
+            after_chunks: after.chunks.len() as u64,
+            shared_chunks: shared,
+            changed_chunks: before_ids.symmetric_difference(&after_ids).count() as u64,
+        })
+    }
+
+    pub async fn merge_blob_branches(
+        &self,
+        target: &str,
+        source: &str,
+        base: ObjectId,
+    ) -> Result<(ObjectId, BlobAccounting), String> {
+        let target_key = selector_key(BRANCH_PREFIX, target);
+        let target_head = self.load_head_at_key(&target_key).await?;
+        let source_head = self.branch_head(source).await?;
+        let base_commit = self.load_commit(base).await?;
+        let target_commit = self.load_commit(target_head.commit).await?;
+        let source_commit = self.load_commit(source_head).await?;
+        if target_commit.blob != base_commit.blob {
+            return Err("ForkTree blob merge target changed from its base".to_string());
+        }
+        let source_blob = source_commit
+            .blob
+            .ok_or_else(|| "ForkTree blob merge source has no blob".to_string())?;
+        let mut pending = BTreeMap::new();
+        let delta = stage_object(
+            encode_blob_delta(target_commit.blob, source_blob),
+            &mut pending,
+        );
+        let next_commit = stage_object(
+            encode_commit(Commit {
+                parents: [Some(target_head.commit), Some(source_head)],
+                root: target_commit.root,
+                delta,
+                blob: Some(source_blob),
+            }),
+            &mut pending,
+        );
+        self.remove_existing_objects(&mut pending).await?;
+        let accounting = BlobAccounting {
+            object_writes: pending.len() as u64,
+            object_bytes: pending.values().map(|bytes| bytes.len() as u64).sum(),
+            ..BlobAccounting::default()
+        };
+        let next_ref = encode_ref(next_commit);
+        let next_epoch = encode_epoch(target_head.epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&target_key),
+                        expected: target_head.raw_ref,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: target_head.raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: accounting.object_bytes as usize
+                    + next_ref.len()
+                    + next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        if !pending.is_empty() {
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+        }
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&target_key),
+                            value: StoredValue { bytes: next_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok((next_commit, accounting))
+    }
+
+    /// Marks from every authenticated selector and sweeps the one immutable
+    /// object space in bounded pages. Each deleting page rotates the same epoch
+    /// used by all publications, so stale publication and stale sweep commits
+    /// cannot both succeed.
+    pub async fn reclaim_unreachable(&self) -> Result<ReclaimAccounting, String> {
+        const PAGE: usize = 512;
+        let mut accounting = ReclaimAccounting::default();
+        // Fence root discovery before opening its read snapshot. A publication
+        // racing anywhere after this load rotates the epoch and invalidates the
+        // first deleting page; loading the epoch after discovery could instead
+        // pair stale roots with the publisher's new epoch.
+        let (mut epoch, mut raw_epoch) = self.load_epoch().await?;
+        let mut roots = Vec::new();
+        let selector_read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut resume_after = None;
+        loop {
+            let page = selector_read
+                .scan(
+                    REF_SPACE,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: PAGE,
+                        resume_after: resume_after.clone(),
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            for entry in &page.entries {
+                if entry.key.0.as_ref() == EPOCH_KEY {
+                    continue;
+                }
+                roots.push(decode_ref(projected_bytes(&entry.value)?)?);
+            }
+            if !page.has_more {
+                break;
+            }
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+        }
+        accounting.roots = roots.len() as u64;
+
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut frontier = roots;
+        while !frontier.is_empty() {
+            accounting.peak_frontier = accounting.peak_frontier.max(frontier.len() as u64);
+            let mut ids = Vec::with_capacity(PAGE);
+            while ids.len() < PAGE {
+                let Some(id) = frontier.pop() else {
+                    break;
+                };
+                if reachable.insert(id) {
+                    ids.push(id);
+                }
+            }
+            if ids.is_empty() {
+                continue;
+            }
+            let objects = self.load_objects(&ids).await?;
+            for bytes in objects {
+                let edges = object_edges(&bytes)?;
+                reachable.extend(edges.terminal);
+                for edge in edges.traverse {
+                    if !reachable.contains(&edge) {
+                        frontier.push(edge);
+                    }
+                }
+            }
+        }
+        accounting.reachable_objects = reachable.len() as u64;
+
+        let object_read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut resume_after = None;
+        loop {
+            let page = object_read
+                .scan(
+                    OBJECT_SPACE,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::KeyOnly,
+                        limit_rows: PAGE,
+                        resume_after: resume_after.clone(),
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            accounting.pages += 1;
+            accounting.scanned_objects += page.entries.len() as u64;
+            let mut deletes = Vec::new();
+            let mut orphan_ids = Vec::new();
+            for entry in &page.entries {
+                let id = object_id_from_key(&entry.key)?;
+                if !reachable.contains(&id) {
+                    accounting.reclaimed_objects += 1;
+                    deletes.push(entry.key.clone());
+                    orphan_ids.push(id);
+                }
+            }
+            if !deletes.is_empty() {
+                accounting.reclaimed_bytes += self
+                    .load_objects(&orphan_ids)
+                    .await?
+                    .iter()
+                    .map(|bytes| bytes.len() as u64)
+                    .sum::<u64>();
+                let next_epoch = encode_epoch(epoch.saturating_add(1));
+                let mut write = self
+                    .storage
+                    .begin_write(WriteOptions {
+                        preconditions: vec![Precondition::KeyValueEquals {
+                            space: REF_SPACE,
+                            key: key(EPOCH_KEY),
+                            expected: raw_epoch,
+                        }],
+                        batch_capacity_hint_bytes: next_epoch.len(),
+                        ..WriteOptions::default()
+                    })
+                    .await
+                    .map_err(storage_error)?;
+                write
+                    .delete_many(OBJECT_SPACE, &deletes)
+                    .await
+                    .map_err(storage_error)?;
+                write
+                    .put_many(
+                        REF_SPACE,
+                        PutBatch {
+                            entries: vec![PutEntry {
+                                key: key(EPOCH_KEY),
+                                value: StoredValue {
+                                    bytes: next_epoch.clone(),
+                                },
+                            }],
+                        },
+                    )
+                    .await
+                    .map_err(storage_error)?;
+                write.commit().await.map_err(storage_error)?;
+                epoch = epoch.saturating_add(1);
+                raw_epoch = next_epoch;
+            }
+            if !page.has_more {
+                break;
+            }
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+        }
+        Ok(accounting)
+    }
+
+    /// Publishes an authenticated retention boundary with the same state and
+    /// blob roots but no historical parents. Existing checkpoint selectors can
+    /// continue to pin the old chain until their independent release.
+    pub async fn compact_history(&self, branch: &str) -> Result<ObjectId, String> {
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let head = self.load_head_at_key(&branch_key).await?;
+        let current = self.load_commit(head.commit).await?;
+        let mut pending = BTreeMap::new();
+        let delta = stage_object(
+            encode_retention_delta(current.root, current.blob),
+            &mut pending,
+        );
+        let next_commit = stage_object(
+            encode_commit(Commit {
+                parents: [None, None],
+                root: current.root,
+                delta,
+                blob: current.blob,
+            }),
+            &mut pending,
+        );
+        self.remove_existing_objects(&mut pending).await?;
+        let next_ref = encode_ref(next_commit);
+        let next_epoch = encode_epoch(head.epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&branch_key),
+                        expected: head.raw_ref,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: head.raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: pending.values().map(Bytes::len).sum::<usize>()
+                    + next_ref.len()
+                    + next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        if !pending.is_empty() {
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+        }
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&branch_key),
+                            value: StoredValue { bytes: next_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(next_commit)
+    }
+
     pub async fn read_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        let head = self.load_head().await?;
+        let head = self.load_head_at_key(MAIN_REF_KEY).await?;
         let commit = self.load_commit(head.commit).await?;
         let mut rows = Vec::new();
         self.collect_rows(commit.root, &mut rows).await?;
@@ -423,6 +1246,171 @@ where
         })
     }
 
+    fn find_value<'a>(
+        &'a self,
+        id: ObjectId,
+        key: &'a [u8],
+    ) -> BoxFuture<'a, Result<ValueRef, String>> {
+        Box::pin(async move {
+            match decode_node(&self.load_object(id).await?)? {
+                Node::Leaf(rows) => rows
+                    .binary_search_by(|row| row.key.as_slice().cmp(key))
+                    .map(|index| rows[index].value)
+                    .map_err(|_| "ForkTree point key is absent".to_string()),
+                Node::Internal(children) => {
+                    let child = children
+                        .iter()
+                        .find(|child| key <= child.max_key.as_slice())
+                        .ok_or_else(|| "ForkTree point key exceeds root maximum".to_string())?;
+                    self.find_value(child.id, key).await
+                }
+            }
+        })
+    }
+
+    fn collect_range_entries<'a>(
+        &'a self,
+        id: ObjectId,
+        start: &'a [u8],
+        end: &'a [u8],
+        output: &'a mut Vec<LeafEntry>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            match decode_node(&self.load_object(id).await?)? {
+                Node::Leaf(rows) => output.extend(
+                    rows.into_iter()
+                        .filter(|row| row.key.as_slice() >= start && row.key.as_slice() <= end),
+                ),
+                Node::Internal(children) => {
+                    for child in children {
+                        if child.max_key.as_slice() < start {
+                            continue;
+                        }
+                        self.collect_range_entries(child.id, start, end, output)
+                            .await?;
+                        if end <= child.max_key.as_slice() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn diff_nodes<'a>(
+        &'a self,
+        before: ObjectId,
+        after: ObjectId,
+        output: &'a mut Vec<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if before == after {
+                return Ok(());
+            }
+            let objects = self.load_objects(&[before, after]).await?;
+            let before = decode_node(&objects[0])?;
+            let after = decode_node(&objects[1])?;
+            match (before, after) {
+                (Node::Leaf(before), Node::Leaf(after)) => {
+                    if before.len() != after.len()
+                        || before
+                            .iter()
+                            .zip(&after)
+                            .any(|(left, right)| left.key != right.key)
+                    {
+                        return Err(
+                            "ForkTree focused diff encountered a key-set layout change".to_string()
+                        );
+                    }
+                    output.extend(before.into_iter().zip(after).filter_map(|(left, right)| {
+                        (left.value != right.value).then_some(left.key)
+                    }));
+                }
+                (Node::Internal(before), Node::Internal(after)) => {
+                    if before.len() != after.len()
+                        || before
+                            .iter()
+                            .zip(&after)
+                            .any(|(left, right)| left.max_key != right.max_key)
+                    {
+                        return Err(
+                            "ForkTree focused diff encountered an internal layout change"
+                                .to_string(),
+                        );
+                    }
+                    for (left, right) in before.into_iter().zip(after) {
+                        if left.id != right.id {
+                            self.diff_nodes(left.id, right.id, output).await?;
+                        }
+                    }
+                }
+                _ => return Err("ForkTree diff encountered mismatched node kinds".to_string()),
+            }
+            Ok(())
+        })
+    }
+
+    async fn load_value(&self, value: ValueRef) -> Result<Vec<u8>, String> {
+        decode_value_pack(&self.load_object(value.pack).await?)?
+            .get(value.index as usize)
+            .cloned()
+            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
+    }
+
+    async fn load_blob_manifest(&self, id: Option<ObjectId>) -> Result<BlobManifest, String> {
+        match id {
+            Some(id) => decode_blob_manifest(&self.load_object(id).await?),
+            None => Ok(BlobManifest {
+                logical_bytes: 0,
+                chunks: Vec::new(),
+            }),
+        }
+    }
+
+    async fn read_blob_manifest_range(
+        &self,
+        manifest: &BlobManifest,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, String> {
+        if start > end || end > manifest.logical_bytes {
+            return Err("ForkTree blob range is out of bounds".to_string());
+        }
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let mut offset = 0_u64;
+        let mut selected = Vec::new();
+        for chunk in &manifest.chunks {
+            let chunk_start = offset;
+            let chunk_end = offset.saturating_add(chunk.bytes);
+            offset = chunk_end;
+            if chunk_end <= start || chunk_start >= end {
+                continue;
+            }
+            selected.push((*chunk, chunk_start));
+        }
+        let ids = selected
+            .iter()
+            .map(|(chunk, _)| chunk.id)
+            .collect::<Vec<_>>();
+        let objects = self.load_objects(&ids).await?;
+        let mut output = Vec::with_capacity((end - start) as usize);
+        for ((chunk, chunk_start), object) in selected.into_iter().zip(objects) {
+            let payload = decode_blob_chunk(&object, chunk.bytes)?;
+            let local_start = start.saturating_sub(chunk_start) as usize;
+            let local_end = end
+                .min(chunk_start + chunk.bytes)
+                .saturating_sub(chunk_start) as usize;
+            output.extend_from_slice(&payload[local_start..local_end]);
+        }
+        if output.len() as u64 != end - start {
+            return Err("ForkTree blob manifest has a discontinuous layout".to_string());
+        }
+        Ok(output)
+    }
+
     fn collect_rows<'a>(
         &'a self,
         id: ObjectId,
@@ -466,8 +1454,133 @@ where
         })
     }
 
-    async fn load_head(&self) -> Result<Head, String> {
-        let keys = [key(MAIN_REF_KEY), key(EPOCH_KEY)];
+    async fn put_new_selector(&self, selector: Vec<u8>, commit: ObjectId) -> Result<(), String> {
+        self.load_commit(commit).await?;
+        let (epoch, raw_epoch) = self.load_epoch().await?;
+        let raw_ref = encode_ref(commit);
+        let next_epoch = encode_epoch(epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyAbsent {
+                        space: REF_SPACE,
+                        key: key(&selector),
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: raw_ref.len() + next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: key(&selector),
+                            value: StoredValue { bytes: raw_ref },
+                        },
+                        PutEntry {
+                            key: key(EPOCH_KEY),
+                            value: StoredValue { bytes: next_epoch },
+                        },
+                    ],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn delete_selector(&self, selector: Vec<u8>) -> Result<(), String> {
+        let raw_ref = self
+            .load_raw_selector(&selector)
+            .await?
+            .ok_or_else(|| "ForkTree selector does not exist".to_string())?;
+        let (epoch, raw_epoch) = self.load_epoch().await?;
+        let next_epoch = encode_epoch(epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(&selector),
+                        expected: raw_ref,
+                    },
+                    Precondition::KeyValueEquals {
+                        space: REF_SPACE,
+                        key: key(EPOCH_KEY),
+                        expected: raw_epoch,
+                    },
+                ],
+                batch_capacity_hint_bytes: next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .delete_many(REF_SPACE, &[key(&selector)])
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key(EPOCH_KEY),
+                        value: StoredValue { bytes: next_epoch },
+                    }],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn load_raw_selector(&self, selector: &[u8]) -> Result<Option<Bytes>, String> {
+        let selector_key = key(selector);
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let result = read
+            .get_many(&[GetManyRequest {
+                space: REF_SPACE,
+                keys: std::slice::from_ref(&selector_key),
+                opts: GetOptions::default(),
+            }])
+            .await
+            .map_err(storage_error)?;
+        result
+            .values
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|value| projected_bytes(&value).cloned())
+            .transpose()
+    }
+
+    async fn load_epoch(&self) -> Result<(u64, Bytes), String> {
+        let raw = self
+            .load_raw_selector(EPOCH_KEY)
+            .await?
+            .ok_or_else(|| "missing ForkTree epoch".to_string())?;
+        Ok((decode_epoch(&raw)?, raw))
+    }
+
+    async fn load_head_at_key(&self, selector: &[u8]) -> Result<Head, String> {
+        let keys = [key(selector), key(EPOCH_KEY)];
         let read = self
             .storage
             .begin_read(ReadOptions::default())
@@ -585,34 +1698,70 @@ where
         }
         Ok(())
     }
+
+    async fn existing_object_ids(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<std::collections::BTreeSet<ObjectId>, String> {
+        if ids.is_empty() {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        let keys = ids.iter().map(|id| key(&id.0)).collect::<Vec<_>>();
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let result = read
+            .get_many(&[GetManyRequest {
+                space: OBJECT_SPACE,
+                keys: &keys,
+                opts: GetOptions {
+                    projection: CoreProjection::KeyOnly,
+                },
+            }])
+            .await
+            .map_err(storage_error)?;
+        let mut existing = std::collections::BTreeSet::new();
+        for (&id, value) in ids.iter().zip(result.values) {
+            let Some(_value) = value else {
+                continue;
+            };
+            existing.insert(id);
+        }
+        Ok(existing)
+    }
 }
 
 fn build_tree(
     rows: &[(Vec<u8>, Vec<u8>)],
-    value_pack: ObjectId,
     pending: &mut BTreeMap<ObjectId, Bytes>,
 ) -> Result<NodeRef, String> {
     if rows.is_empty() {
         return Err("ForkTree requires at least one row".to_string());
     }
-    let leaf_rows = rows
-        .iter()
-        .enumerate()
-        .map(|(index, (key, _))| LeafEntry {
-            key: key.clone(),
-            value: ValueRef {
-                pack: value_pack,
-                index: u32::try_from(index).expect("ForkTree initial value-pack index fits u32"),
-            },
-        })
-        .collect::<Vec<_>>();
-    let mut level = leaf_rows
+    let mut level = rows
         .chunks(LEAF_ROWS)
         .map(|chunk| {
-            let id = stage_object(encode_leaf(chunk), pending);
+            let value_pack = stage_object(
+                encode_value_pack(chunk.iter().map(|(_, value)| value.as_slice())),
+                pending,
+            );
+            let leaf = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, (key, _))| LeafEntry {
+                    key: key.clone(),
+                    value: ValueRef {
+                        pack: value_pack,
+                        index: index as u32,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let id = stage_object(encode_leaf(&leaf), pending);
             NodeRef {
                 id,
-                max_key: chunk.last().expect("leaf chunk is nonempty").key.clone(),
+                max_key: chunk.last().expect("leaf chunk is nonempty").0.clone(),
             }
         })
         .collect::<Vec<_>>();
@@ -741,11 +1890,56 @@ fn encode_delta<'a>(value_pack: ObjectId, keys: impl ExactSizeIterator<Item = &'
     Bytes::from(bytes)
 }
 
+fn encode_blob_delta(before: Option<ObjectId>, after: ObjectId) -> Bytes {
+    let mut bytes = object_prefix(DELTA_TAG);
+    bytes.push(2);
+    put_optional_id(&mut bytes, before);
+    bytes.extend_from_slice(&after.0);
+    Bytes::from(bytes)
+}
+
+fn encode_retention_delta(root: ObjectId, blob: Option<ObjectId>) -> Bytes {
+    let mut bytes = object_prefix(DELTA_TAG);
+    bytes.push(3);
+    bytes.extend_from_slice(&root.0);
+    put_optional_id(&mut bytes, blob);
+    Bytes::from(bytes)
+}
+
+fn encode_blob_chunk(payload: &[u8]) -> Bytes {
+    let mut bytes = object_prefix(BLOB_CHUNK_TAG);
+    put_u64(&mut bytes, payload.len() as u64);
+    bytes.extend_from_slice(payload);
+    Bytes::from(bytes)
+}
+
+fn blob_chunk_id(payload: &[u8]) -> ObjectId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OBJECT_MAGIC);
+    hasher.update(&[BLOB_CHUNK_TAG]);
+    hasher.update(&(payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    ObjectId(*hasher.finalize().as_bytes())
+}
+
+fn encode_blob_manifest(manifest: &BlobManifest) -> Bytes {
+    let mut bytes = object_prefix(BLOB_MANIFEST_TAG);
+    put_u64(&mut bytes, manifest.logical_bytes);
+    put_u32(&mut bytes, manifest.chunks.len());
+    for chunk in &manifest.chunks {
+        bytes.extend_from_slice(&chunk.id.0);
+        put_u64(&mut bytes, chunk.bytes);
+    }
+    Bytes::from(bytes)
+}
+
 fn encode_commit(commit: Commit) -> Bytes {
     let mut bytes = object_prefix(COMMIT_TAG);
-    put_optional_id(&mut bytes, commit.parent);
+    put_optional_id(&mut bytes, commit.parents[0]);
+    put_optional_id(&mut bytes, commit.parents[1]);
     bytes.extend_from_slice(&commit.root.0);
     bytes.extend_from_slice(&commit.delta.0);
+    put_optional_id(&mut bytes, commit.blob);
     Bytes::from(bytes)
 }
 
@@ -831,18 +2025,185 @@ fn decode_value_pack(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(values)
 }
 
+fn decode_blob_chunk(bytes: &[u8], expected_bytes: u64) -> Result<Vec<u8>, String> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.object_tag()? != BLOB_CHUNK_TAG {
+        return Err("ForkTree blob manifest does not reference a chunk".to_string());
+    }
+    let declared = decoder.u64()?;
+    if declared != expected_bytes {
+        return Err("ForkTree blob chunk declared size mismatch".to_string());
+    }
+    let payload = decoder.remaining().to_vec();
+    decoder.finish()?;
+    if payload.len() as u64 != declared {
+        return Err("ForkTree blob chunk payload size mismatch".to_string());
+    }
+    Ok(payload)
+}
+
+fn decode_blob_manifest(bytes: &[u8]) -> Result<BlobManifest, String> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.object_tag()? != BLOB_MANIFEST_TAG {
+        return Err("ForkTree commit does not reference a blob manifest".to_string());
+    }
+    let logical_bytes = decoder.u64()?;
+    let count = decoder.u32()?;
+    let mut chunks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = decoder.id()?;
+        let bytes = decoder.u64()?;
+        if bytes == 0 {
+            return Err("ForkTree blob manifest contains an empty chunk".to_string());
+        }
+        chunks.push(BlobChunkRef { id, bytes });
+    }
+    decoder.finish()?;
+    if chunks.iter().map(|chunk| chunk.bytes).sum::<u64>() != logical_bytes {
+        return Err("ForkTree blob manifest logical size mismatch".to_string());
+    }
+    Ok(BlobManifest {
+        logical_bytes,
+        chunks,
+    })
+}
+
 fn decode_commit(bytes: &[u8]) -> Result<Commit, String> {
     let mut decoder = Decoder::new(bytes);
     if decoder.object_tag()? != COMMIT_TAG {
         return Err("ForkTree head does not name a commit object".to_string());
     }
     let commit = Commit {
-        parent: decoder.optional_id()?,
+        parents: [decoder.optional_id()?, decoder.optional_id()?],
         root: decoder.id()?,
         delta: decoder.id()?,
+        blob: decoder.optional_id()?,
     };
     decoder.finish()?;
     Ok(commit)
+}
+
+struct ObjectEdges {
+    traverse: Vec<ObjectId>,
+    terminal: Vec<ObjectId>,
+}
+
+impl ObjectEdges {
+    fn traverse(ids: impl IntoIterator<Item = ObjectId>) -> Self {
+        Self {
+            traverse: ids.into_iter().collect(),
+            terminal: Vec::new(),
+        }
+    }
+
+    fn terminal(ids: impl IntoIterator<Item = ObjectId>) -> Self {
+        Self {
+            traverse: Vec::new(),
+            terminal: ids.into_iter().collect(),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            traverse: Vec::new(),
+            terminal: Vec::new(),
+        }
+    }
+}
+
+fn object_edges(bytes: &[u8]) -> Result<ObjectEdges, String> {
+    match object_tag(bytes)? {
+        LEAF_TAG => match decode_node(bytes)? {
+            Node::Leaf(rows) => Ok(ObjectEdges::terminal(
+                rows.into_iter().map(|row| row.value.pack),
+            )),
+            Node::Internal(_) => unreachable!(),
+        },
+        INTERNAL_TAG => match decode_node(bytes)? {
+            Node::Internal(children) => Ok(ObjectEdges::traverse(
+                children.into_iter().map(|child| child.id),
+            )),
+            Node::Leaf(_) => unreachable!(),
+        },
+        VALUE_PACK_TAG => {
+            decode_value_pack(bytes)?;
+            Ok(ObjectEdges::empty())
+        }
+        DELTA_TAG => {
+            let mut decoder = Decoder::new(bytes);
+            let _ = decoder.object_tag()?;
+            match decoder.take(1)?[0] {
+                0 => {
+                    let root = decoder.id()?;
+                    let _rows = decoder.u32()?;
+                    decoder.finish()?;
+                    Ok(ObjectEdges::traverse([root]))
+                }
+                1 => {
+                    let pack = decoder.id()?;
+                    let count = decoder.u32()?;
+                    for _ in 0..count {
+                        let _ = decoder.bytes()?;
+                    }
+                    decoder.finish()?;
+                    Ok(ObjectEdges::terminal([pack]))
+                }
+                2 => {
+                    let before = decoder.optional_id()?;
+                    let after = decoder.id()?;
+                    decoder.finish()?;
+                    Ok(ObjectEdges::traverse(
+                        before.into_iter().chain(std::iter::once(after)),
+                    ))
+                }
+                3 => {
+                    let root = decoder.id()?;
+                    let blob = decoder.optional_id()?;
+                    decoder.finish()?;
+                    Ok(ObjectEdges::traverse(std::iter::once(root).chain(blob)))
+                }
+                mode => Err(format!("unknown ForkTree delta mode {mode}")),
+            }
+        }
+        COMMIT_TAG => {
+            let commit = decode_commit(bytes)?;
+            Ok(ObjectEdges::traverse(
+                commit
+                    .parents
+                    .into_iter()
+                    .flatten()
+                    .chain([commit.root, commit.delta])
+                    .chain(commit.blob),
+            ))
+        }
+        BLOB_MANIFEST_TAG => Ok(ObjectEdges::terminal(
+            decode_blob_manifest(bytes)?
+                .chunks
+                .into_iter()
+                .map(|chunk| chunk.id),
+        )),
+        BLOB_CHUNK_TAG => {
+            let mut decoder = Decoder::new(bytes);
+            let _ = decoder.object_tag()?;
+            let declared = decoder.u64()?;
+            let payload = decoder.remaining();
+            decoder.finish()?;
+            if payload.len() as u64 != declared {
+                return Err("ForkTree blob chunk payload size mismatch".to_string());
+            }
+            Ok(ObjectEdges::empty())
+        }
+        tag => Err(format!("unknown ForkTree object tag {tag}")),
+    }
+}
+
+fn object_id_from_key(key: &Key) -> Result<ObjectId, String> {
+    let id: [u8; 32] = key
+        .0
+        .as_ref()
+        .try_into()
+        .map_err(|_| "ForkTree object key is not a BLAKE3 digest".to_string())?;
+    Ok(ObjectId(id))
 }
 
 fn object_tag(bytes: &[u8]) -> Result<u8, String> {
@@ -901,6 +2262,10 @@ fn put_u32(bytes: &mut Vec<u8>, value: usize) {
     );
 }
 
+fn put_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
 fn put_bytes(output: &mut Vec<u8>, value: &[u8]) {
     put_u32(output, value.len());
     output.extend_from_slice(value);
@@ -908,6 +2273,13 @@ fn put_bytes(output: &mut Vec<u8>, value: &[u8]) {
 
 fn key(value: &[u8]) -> Key {
     Key(Bytes::copy_from_slice(value))
+}
+
+fn selector_key(prefix: &[u8], name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + name.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(name.as_bytes());
+    key
 }
 
 fn authenticate(id: ObjectId, bytes: &[u8]) -> Result<(), String> {
@@ -964,6 +2336,14 @@ impl<'a> Decoder<'a> {
             .try_into()
             .expect("decoder returns exact u32 width");
         Ok(u32::from_be_bytes(encoded))
+    }
+
+    fn u64(&mut self) -> Result<u64, String> {
+        let encoded: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .expect("decoder returns exact u64 width");
+        Ok(u64::from_be_bytes(encoded))
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, String> {

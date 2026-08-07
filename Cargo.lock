@@ -3474,6 +3474,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "datafusion",
  "duckdb",
+ "fastcdc",
  "futures-util",
  "lix",
  "lix-storage-rocksdb",
