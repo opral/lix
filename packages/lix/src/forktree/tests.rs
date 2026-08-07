@@ -1432,6 +1432,240 @@ async fn deterministic_crash_recovery_corruption_oracle() {
     );
 }
 
+/// Reader safe-point contract.
+///
+/// Removing the final durable selector makes an object logically unreachable
+/// at epoch E. A sweep derived from that exact selector view may commit the
+/// deletion only under the raw E selector CAS, rotating to E+1. Physical
+/// reclamation is safe after that delete is durable and the adapter's active
+/// read low-watermark is newer than the delete commit: every `StorageRead`
+/// that could still expose the retired bytes has dropped. There is no clock
+/// grace and no persisted adapter snapshot token. Cross-reopen retention is
+/// represented only by authenticated owner selectors; process-local readers
+/// pin their adapter snapshots by lifetime.
+#[tokio::test]
+async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
+    let seed = build_seed();
+
+    // Publication first, deletion second. A checkpoint target is selected,
+    // observed by an old coherent read, released after a branch publication,
+    // then reclaimed by a GC commit whose acknowledgement is lost.
+    let storage = CrashStorage::new();
+    seed_crash_storage(&storage, &seed).await;
+    let checkpoint_id = SnapshotSelectorId::from_bytes(raw_id(0xe0));
+    let (checkpoint, target_id) =
+        prepare_snapshot_publication(&storage, SnapshotRole::Checkpoint, checkpoint_id).await;
+    checkpoint.commit(&storage).await.expect("checkpoint pin");
+
+    let old_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("old coherent reader");
+    let old_catalog_root = old_view.repository_root().change_catalog_root;
+    let old_resume = old_view.bind_resume_key(old_catalog_root, seed.semantic_change_id.as_bytes());
+    assert_eq!(
+        old_view
+            .validate_resume_key(old_catalog_root, &old_resume)
+            .expect("old cursor"),
+        seed.semantic_change_id.as_bytes()
+    );
+    assert!(old_view.load_object_bytes(target_id).await.is_ok());
+
+    let (branch_publication, new_key) =
+        prepare_state_publication(&storage, 0xe2, "safe-point", "new").await;
+    branch_publication
+        .commit(&storage)
+        .await
+        .expect("advance branch and global selectors");
+    let current = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("current view");
+    assert!(matches!(
+        current.validate_resume_key(old_catalog_root, &old_resume),
+        Err(StorageError::InvalidCursor)
+    ));
+    let snapshot_key = snapshot_selector_key(SnapshotRole::Checkpoint, checkpoint_id);
+    let raw_checkpoint = raw_selector(&storage, snapshot_key)
+        .await
+        .expect("checkpoint selector");
+    let checkpoint_selector = SnapshotSelectorV1::decode(&raw_checkpoint).expect("checkpoint");
+    let mut release = PreparedPublication::from_global_epoch(&current).expect("release");
+    release
+        .release_snapshot_pin(checkpoint_selector, raw_checkpoint)
+        .expect("release checkpoint pin");
+    drop(current);
+    release.commit(&storage).await.expect("release commit");
+
+    let gc_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("GC view");
+    let plan = discover_sweep_plan(&gc_view).await.expect("GC plan");
+    assert!(plan.orphan_object_ids.contains(&target_id));
+    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC publication");
+    gc.apply_sweep_plan(plan).expect("GC proof");
+    drop(gc_view);
+    storage.inject_once(InjectedCrash::AfterDurableCommit);
+    assert!(gc.commit(&storage).await.is_err());
+
+    let reopened = storage.reopen();
+    assert!(!object_present(&reopened, target_id).await);
+    assert_profiled_reopen(
+        &storage,
+        "reader_pin_publication_then_delete",
+        InjectedCrash::AfterDurableCommit,
+        Some((&new_key, Some("new"))),
+    )
+    .await;
+    assert!(
+        old_view.load_object_bytes(target_id).await.is_ok(),
+        "the old StorageRead snapshot must retain bytes deleted from the current view"
+    );
+    assert_eq!(
+        old_view
+            .validate_resume_key(old_catalog_root, &old_resume)
+            .expect("bound old cursor remains valid while its view lives"),
+        seed.semantic_change_id.as_bytes()
+    );
+    drop(old_view);
+    let reopened_view = open_coherent_view(&reopened, seed.branch_id)
+        .await
+        .expect("post-safe-point reopen");
+    assert!(matches!(
+        reopened_view.validate_resume_key(old_catalog_root, &old_resume),
+        Err(StorageError::InvalidCursor)
+    ));
+
+    // Deletion first, publication second. An abandoned object is visible to
+    // an old reader but is not a root. GC wins the epoch CAS; the stale branch
+    // publication must fail, then retry from the reopened view.
+    let storage = CrashStorage::new();
+    seed_crash_storage(&storage, &seed).await;
+    let abandoned = SnapshotTargetV1 {
+        role: SnapshotRole::Checkpoint,
+        selector_id: SnapshotSelectorId::from_bytes(raw_id(0xe4)),
+        branch_id: seed.branch_id,
+        branch_snapshot_object_id: seed.branch_snapshot_id,
+        semantic_commit_object_id: seed.commit_object_id,
+    };
+    let (abandoned_id, _) = abandoned.encode().expect("abandoned target");
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("abandoned-object view");
+    let mut stage = PreparedPublication::from_global_epoch(&view).expect("stage orphan");
+    stage
+        .stage_snapshot_target(abandoned)
+        .expect("stage abandoned object");
+    drop(view);
+    stage.commit(&storage).await.expect("durable orphan");
+
+    let old_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("old orphan reader");
+    assert!(old_view.load_object_bytes(abandoned_id).await.is_ok());
+    let (stale_publication, stale_key) =
+        prepare_state_publication(&storage, 0xe6, "delete-first", "new").await;
+    let gc_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("delete-first GC view");
+    let plan = discover_sweep_plan(&gc_view)
+        .await
+        .expect("delete-first plan");
+    assert!(plan.orphan_object_ids.contains(&abandoned_id));
+    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("delete-first GC");
+    gc.apply_sweep_plan(plan).expect("delete-first proof");
+    drop(gc_view);
+    storage.inject_once(InjectedCrash::AfterDurableCommit);
+    assert!(gc.commit(&storage).await.is_err());
+    assert!(matches!(
+        stale_publication.commit(&storage).await,
+        Err(StorageError::PreconditionFailed(_))
+    ));
+    assert!(!object_present(&storage.reopen(), abandoned_id).await);
+    assert!(old_view.load_object_bytes(abandoned_id).await.is_ok());
+    drop(old_view);
+    let (retry, _) = prepare_state_publication(&storage, 0xe6, "delete-first", "new").await;
+    retry.commit(&storage).await.expect("retry after GC epoch");
+    assert_profiled_reopen(
+        &storage,
+        "reader_pin_delete_then_publication",
+        InjectedCrash::AfterDurableCommit,
+        Some((&stale_key, Some("new"))),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deterministic_durable_branch_upload_and_unpublished_pin_oracle() {
+    let storage = CrashStorage::new();
+    let (seed, child_branch, _) = seed_with_disposable_branch(&storage).await;
+    let child_view = open_coherent_view(&storage, child_branch)
+        .await
+        .expect("child branch view");
+    let child_snapshot_id = child_view.branch_selector().branch_snapshot_object_id;
+    drop(child_view);
+
+    let upload = make_upload();
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("upload view");
+    let mut upload_publication = PreparedPublication::from_global_epoch(&view).expect("upload");
+    stage_upload(&mut upload_publication, &upload);
+    drop(view);
+    upload_publication
+        .commit(&storage)
+        .await
+        .expect("open upload");
+
+    let abandoned = SnapshotTargetV1 {
+        role: SnapshotRole::Checkpoint,
+        selector_id: SnapshotSelectorId::from_bytes(raw_id(0xea)),
+        branch_id: seed.branch_id,
+        branch_snapshot_object_id: seed.branch_snapshot_id,
+        semantic_commit_object_id: seed.commit_object_id,
+    };
+    let (abandoned_id, _) = abandoned.encode().expect("abandoned target");
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("abandoned view");
+    let mut stage = PreparedPublication::from_global_epoch(&view).expect("stage abandoned");
+    stage
+        .stage_snapshot_target(abandoned)
+        .expect("stage abandoned target");
+    drop(view);
+    stage.commit(&storage).await.expect("abandoned object");
+
+    sweep(&storage, seed.branch_id).await;
+    let reopened = storage.reopen();
+    let child = open_coherent_view(&reopened, child_branch)
+        .await
+        .expect("selected child closure survives");
+    assert_eq!(
+        child.branch_selector().branch_snapshot_object_id,
+        child_snapshot_id
+    );
+    drop(child);
+    assert!(object_present(&reopened, child_snapshot_id).await);
+    assert!(object_present(&reopened, upload.progress_id).await);
+    assert!(object_present(&reopened, upload.chunk_id).await);
+    assert!(!object_present(&reopened, abandoned_id).await);
+
+    let upload_view = open_coherent_view(&reopened, seed.branch_id)
+        .await
+        .expect("upload closure view");
+    prepare_upload_completion(
+        &upload_view,
+        &upload.upload_id,
+        UploadBindingRef {
+            repository_identity: b"repository",
+            path: b"/blob.bin",
+            payload_domain: b"file",
+            declared_total_size: 4,
+            declared_final_hash: Some(*blake3::hash(b"data").as_bytes()),
+        },
+    )
+    .await
+    .expect("open upload selector pins its complete authenticated receipt closure");
+}
+
 #[test]
 fn immutable_objects_and_typed_state_codecs_fail_closed() {
     let seed = build_seed();
@@ -2342,7 +2576,9 @@ async fn delete_untracked(storage: &Memory, seed: &SeedData, primary_key: &str) 
     publication.commit(storage).await.expect("delete commit");
 }
 
-async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBranchId, ChangeId) {
+async fn seed_with_disposable_branch<S: Storage>(
+    storage: &S,
+) -> (SeedData, CanonicalBranchId, ChangeId) {
     let mut seed = build_seed();
     let disposable = CanonicalBranchId::from_bytes(raw_id(0x12));
     let disposable_ref_id = ChangeId::from_bytes(raw_id(0x32));
