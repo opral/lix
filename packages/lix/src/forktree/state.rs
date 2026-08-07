@@ -30,7 +30,7 @@ const ENTITY_PK_BYTES: u8 = 0x03;
 /// Mutable authority retained only for rows whose schema explicitly declares
 /// them untracked. Tracked rows, selectors, catalogs, and roots are forbidden
 /// from this space.
-pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::engine_declared(
+pub(super) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::engine_declared(
     0x0009_0003,
     "forktree.untracked_row.v1",
     crate::storage::ValueSemantics::Mutable,
