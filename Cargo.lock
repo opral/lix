@@ -3500,12 +3500,12 @@ name = "lix_cli"
 version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
- "bytes",
  "clap",
  "comfy-table",
  "lix",
  "lix-storage-rocksdb",
  "lix-storage-slatedb",
+ "lix-storage-sqlite",
  "mimalloc",
  "plugin_csv",
  "plugin_excalidraw",

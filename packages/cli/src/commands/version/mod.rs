@@ -4,7 +4,7 @@ mod switch;
 
 use crate::app::AppContext;
 use crate::cli::version::{VersionCommand, VersionSubcommand};
-use crate::db::FileLix;
+use crate::db::SqliteLix;
 use crate::error::CliError;
 use crate::hints::CommandOutput;
 use lix::{ExecuteResult, Row as LixRow, Value};
@@ -30,7 +30,7 @@ pub fn run(context: &AppContext, command: VersionCommand) -> Result<CommandOutpu
 }
 
 pub(super) fn resolve_version_ref(
-    lix: &FileLix,
+    lix: &SqliteLix,
     lookup: VersionLookup<'_>,
 ) -> Result<ResolvedVersionRef, CliError> {
     match lookup {
@@ -39,13 +39,13 @@ pub(super) fn resolve_version_ref(
     }
 }
 
-pub(super) fn resolve_active_version_ref(lix: &FileLix) -> Result<ResolvedVersionRef, CliError> {
+pub(super) fn resolve_active_version_ref(lix: &SqliteLix) -> Result<ResolvedVersionRef, CliError> {
     let active_id = crate::db::block_on(lix.active_branch_id())
         .map_err(|error| CliError::msg(error.to_string()))?;
     resolve_version_by_id(lix, &active_id)
 }
 
-fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
+fn resolve_version_by_id(lix: &SqliteLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_branch WHERE id = $1 LIMIT 1",
         &[Value::Text(id.to_string())],
@@ -62,7 +62,7 @@ fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, 
     })
 }
 
-fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
+fn resolve_version_by_name(lix: &SqliteLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_branch WHERE name = $1 ORDER BY id",
         &[Value::Text(name.to_string())],

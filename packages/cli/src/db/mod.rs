@@ -1,27 +1,12 @@
-#![allow(
-    clippy::manual_async_fn,
-    reason = "explicit future signatures mirror Storage traits and keep Send guarantees visible"
-)]
-
 use crate::app::AppContext;
 use crate::error::CliError;
-use base64::Engine as _;
-use bytes::Bytes;
-use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
-    PutBatch, ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
-    StorageError, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions, WriteStats,
-};
-use lix::{Lix, LixError, open_lix};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use lix::{Lix, open_lix};
+use lix_storage_sqlite::SQLite;
 use std::fs;
 use std::future::{Future, IntoFuture};
-use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-pub type FileLix = Lix<FileStorage>;
+pub type SqliteLix = Lix<SQLite>;
 
 pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
     if let Some(path) = &context.lix_path {
@@ -59,8 +44,10 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
     Ok(candidates.remove(0))
 }
 
-pub fn open_lix_at(path: &Path) -> Result<FileLix, CliError> {
-    let storage = FileStorage::from_path(path)?;
+pub fn open_lix_at(path: &Path) -> Result<SqliteLix, CliError> {
+    let storage = SQLite::open(path).map_err(|error| {
+        CliError::msg(format!("failed to open lix at {}: {error}", path.display()))
+    })?;
 
     block_on(open_lix().with_storage(storage))
         .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
@@ -180,415 +167,11 @@ fn remove_sidecar(path: &Path, suffix: &str) -> Result<(), CliError> {
     }
 }
 
-type KvMap = BTreeMap<Vec<u8>, Vec<u8>>;
-
-// TODO: Replace this custom whole-file KV storage with SQLite for the CLI.
-// This storage exists only as a transitional local `.lix` file adapter. It
-// snapshots the entire file into memory and rewrites it on commit, so it is not
-// a real concurrent storage implementation. The instance-local write gate below only
-// rejects overlapping writes through the same opened handle; separate handles
-// or processes can still overwrite each other. SQLite should own CLI durability
-// and write concurrency instead.
-#[derive(Clone)]
-#[expect(missing_debug_implementations)]
-pub struct FileStorage {
-    path: Arc<PathBuf>,
-    kv: Arc<Mutex<KvMap>>,
-    write_active: Arc<Mutex<bool>>,
-}
-
-impl FileStorage {
-    fn from_path(path: &Path) -> Result<Self, CliError> {
-        let kv = read_kv_file(path)?;
-        Ok(Self {
-            path: Arc::new(path.to_path_buf()),
-            kv: Arc::new(Mutex::new(kv)),
-            write_active: Arc::new(Mutex::new(false)),
-        })
-    }
-}
-
-#[derive(Clone)]
-#[expect(missing_debug_implementations)]
-pub struct FileStorageRead {
-    kv: KvMap,
-}
-
-#[allow(missing_debug_implementations)]
-pub struct FileStorageWrite {
-    path: Arc<PathBuf>,
-    parent: Arc<Mutex<KvMap>>,
-    write_active: Arc<Mutex<bool>>,
-    kv: KvMap,
-    stats: WriteStats,
-    closed: bool,
-}
-
-impl Storage for FileStorage {
-    type Read<'a>
-        = FileStorageRead
-    where
-        Self: 'a;
-
-    type Write<'a>
-        = FileStorageWrite
-    where
-        Self: 'a;
-    fn begin_read(
-        &self,
-        opts: ReadOptions,
-    ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
-        async move {
-            if opts.durability == ReadDurability::Durable {
-                return Err(StorageError::Durability);
-            }
-            Ok(FileStorageRead {
-                kv: self
-                    .kv
-                    .lock()
-                    .map_err(|_| storage_lock_error("cli file storage kv"))?
-                    .clone(),
-            })
-        }
-    }
-
-    fn begin_write(
-        &self,
-        _opts: WriteOptions,
-    ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
-        async move {
-            {
-                let mut active = self
-                    .write_active
-                    .lock()
-                    .map_err(|_| storage_lock_error("cli file storage write gate"))?;
-                if *active {
-                    return Err(StorageError::Io(
-                        "cli file storage write transaction already active".to_string(),
-                    ));
-                }
-                *active = true;
-            }
-            let kv = match self
-                .kv
-                .lock()
-                .map_err(|_| storage_lock_error("cli file storage kv"))
-                .map(|parent| parent.clone())
-            {
-                Ok(kv) => kv,
-                Err(error) => {
-                    self.clear_write_active();
-                    return Err(error);
-                }
-            };
-            Ok(FileStorageWrite {
-                path: Arc::clone(&self.path),
-                parent: Arc::clone(&self.kv),
-                write_active: Arc::clone(&self.write_active),
-                kv,
-                stats: WriteStats::default(),
-                closed: false,
-            })
-        }
-    }
-}
-
-impl FileStorage {
-    fn clear_write_active(&self) {
-        if let Ok(mut active) = self.write_active.lock() {
-            *active = false;
-        }
-    }
-}
-
-/// The CLI file storage keeps one flat map; spaces are scoped by prefixing
-/// the 4-byte big-endian space id internally. Reads return logical keys.
-fn physical_key(space: SpaceId, key: &Key) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
-    bytes.extend_from_slice(&key.0);
-    bytes
-}
-
-fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
-    let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
-        Bound::Included(key) => Bound::Included(Key(Bytes::from(physical_key(space, &key)))),
-        Bound::Excluded(key) => Bound::Excluded(Key(Bytes::from(physical_key(space, &key)))),
-        Bound::Unbounded => unbounded,
-    };
-    KeyRange {
-        lower: map(
-            range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
-        ),
-        upper: map(
-            range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
-                Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
-            }),
-        ),
-    }
-}
-
-impl StorageRead for FileStorageRead {
-    fn get_many(
-        &self,
-        requests: &[GetManyRequest<'_>],
-    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        async move {
-            Ok(GetManyResult::new(
-                requests
-                    .iter()
-                    .flat_map(|request| {
-                        request.keys.iter().map(|key| {
-                            self.kv
-                                .get(physical_key(request.space.id, key).as_slice())
-                                .map(|value| project_value(value, request.opts.projection))
-                        })
-                    })
-                    .collect(),
-            ))
-        }
-    }
-
-    fn scan(
-        &self,
-        space: StorageSpace,
-        range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        async move {
-            if opts.page_size() == 0 {
-                return Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                });
-            }
-            let range = physical_range(space.id, range);
-            let resume_after = opts
-                .resume_after
-                .as_ref()
-                .map(|key| Key(Bytes::from(physical_key(space.id, key))));
-            let mut rows = self
-                .kv
-                .iter()
-                .filter(|(key, _)| key_matches_range(key, &range, resume_after.as_ref()));
-            let entries = rows
-                .by_ref()
-                .take(opts.page_size())
-                .map(|(key, value)| ReadEntry {
-                    key: Key(Bytes::copy_from_slice(&key[4..])),
-                    value: project_value(value, opts.projection),
-                })
-                .collect();
-            Ok(ScanChunk {
-                entries,
-                has_more: rows.next().is_some(),
-            })
-        }
-    }
-}
-
-impl StorageWrite for FileStorageWrite {
-    fn put_many(
-        &mut self,
-        space: StorageSpace,
-        entries: PutBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            for entry in entries.entries {
-                self.stats.put_entries += 1;
-                self.stats.written_bytes += entry.value.bytes.len() as u64;
-                self.kv.insert(
-                    physical_key(space.id, &entry.key),
-                    stored_value_bytes(entry.value),
-                );
-            }
-            self.stats.storage_calls += 1;
-            Ok(())
-        }
-    }
-
-    fn delete_many(
-        &mut self,
-        space: StorageSpace,
-        keys: &[Key],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            for key in keys {
-                self.kv.remove(physical_key(space.id, key).as_slice());
-            }
-            self.stats.deleted_entries += keys.len() as u64;
-            self.stats.storage_calls += 1;
-            Ok(())
-        }
-    }
-
-    fn delete_range(
-        &mut self,
-        space: StorageSpace,
-        range: KeyRange,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            let range = physical_range(space.id, range);
-            let before = self.kv.len();
-            self.kv
-                .retain(|key, _| !key_matches_range(key, &range, None));
-            self.stats.deleted_entries += (before - self.kv.len()) as u64;
-            self.stats.deleted_ranges += 1;
-            self.stats.storage_calls += 1;
-            Ok(())
-        }
-    }
-
-    fn commit(mut self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
-        async move {
-            write_kv_file(&self.path, &self.kv).map_err(lix_to_storage_error)?;
-            *self
-                .parent
-                .lock()
-                .map_err(|_| storage_lock_error("cli file storage kv"))? = self.kv.clone();
-            self.closed = true;
-            self.clear_write_active();
-            Ok(CommitResult {
-                commit_id: None,
-                stats: self.stats,
-            })
-        }
-    }
-
-    fn rollback(mut self) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            self.closed = true;
-            self.clear_write_active();
-            Ok(())
-        }
-    }
-}
-
-impl FileStorageWrite {
-    fn clear_write_active(&self) {
-        if let Ok(mut active) = self.write_active.lock() {
-            *active = false;
-        }
-    }
-}
-
-impl Drop for FileStorageWrite {
-    fn drop(&mut self) {
-        if !self.closed {
-            self.clear_write_active();
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileSnapshot {
-    entries: Vec<FileEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileEntry {
-    key: String,
-    value: String,
-}
-
-fn read_kv_file(path: &Path) -> Result<KvMap, CliError> {
-    if !path.exists() {
-        return Ok(KvMap::new());
-    }
-    let bytes = fs::read(path).map_err(|source| CliError::io("failed to read lix file", source))?;
-    if bytes.is_empty() {
-        return Ok(KvMap::new());
-    }
-    let snapshot: FileSnapshot = serde_json::from_slice(&bytes)
-        .map_err(|error| CliError::msg(format!("failed to decode lix file: {error}")))?;
-    let mut kv = KvMap::new();
-    for entry in snapshot.entries {
-        kv.insert(decode_bytes(&entry.key)?, decode_bytes(&entry.value)?);
-    }
-    Ok(kv)
-}
-
-fn write_kv_file(path: &Path, kv: &KvMap) -> Result<(), LixError> {
-    let snapshot = FileSnapshot {
-        entries: kv
-            .iter()
-            .map(|(key, value)| FileEntry {
-                key: encode_bytes(key),
-                value: encode_bytes(value),
-            })
-            .collect(),
-    };
-    let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to encode lix file snapshot: {error}"),
-        )
-    })?;
-    fs::write(path, bytes).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to write lix file '{}': {error}", path.display()),
-        )
-    })
-}
-
-fn key_matches_range(key: &[u8], range: &KeyRange, resume_after: Option<&Key>) -> bool {
-    if let Some(resume_after) = resume_after {
-        if key <= resume_after.0.as_ref() {
-            return false;
-        }
-    }
-
-    let lower_matches = match &range.lower {
-        Bound::Included(lower) => key >= lower.0.as_ref(),
-        Bound::Excluded(lower) => key > lower.0.as_ref(),
-        Bound::Unbounded => true,
-    };
-    let upper_matches = match &range.upper {
-        Bound::Included(upper) => key <= upper.0.as_ref(),
-        Bound::Excluded(upper) => key < upper.0.as_ref(),
-        Bound::Unbounded => true,
-    };
-    lower_matches && upper_matches
-}
-
-fn project_value(value: &[u8], projection: CoreProjection) -> ProjectedValue {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
-    }
-}
-
-fn stored_value_bytes(value: StoredValue) -> Vec<u8> {
-    value.bytes.to_vec()
-}
-
-fn encode_bytes(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn decode_bytes(value: &str) -> Result<Vec<u8>, CliError> {
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|error| CliError::msg(format!("failed to decode lix file bytes: {error}")))
-}
-
-fn storage_lock_error(name: &str) -> StorageError {
-    StorageError::Io(format!("{name} mutex was poisoned"))
-}
-
-fn lix_to_storage_error(error: LixError) -> StorageError {
-    StorageError::Io(error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{init_lix_at, prepare_lix_output_path, read_kv_file, resolve_db_path};
+    use super::{block_on, init_lix_at, open_lix_at, prepare_lix_output_path, resolve_db_path};
     use crate::app::AppContext;
+    use lix::Value;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -648,20 +231,119 @@ mod tests {
     }
 
     #[test]
-    fn file_storage_rejects_removed_namespace_field() {
+    fn sqlite_lix_persists_across_fresh_opens() {
+        run_on_large_stack("sqlite-lix-reopen", || {
+            let temp_dir = unique_temp_dir();
+            let path = temp_dir.join("workspace.lix");
+
+            assert!(init_lix_at(&path).expect("SQLite .lix file should initialize"));
+            let header = fs::read(&path).expect("initialized .lix file should be readable");
+            assert!(
+                header.starts_with(b"SQLite format 3\0"),
+                "the .lix file must be owned directly by SQLite"
+            );
+
+            let lix = open_lix_at(&path).expect("initialized SQLite .lix file should open");
+            block_on(lix.execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('persisted', 'yes')",
+                &[],
+            ))
+            .expect("local mutation should commit");
+            block_on(lix.close()).expect("first handle should close");
+            drop(lix);
+
+            let reopened = open_lix_at(&path).expect("SQLite .lix file should reopen");
+            let result = block_on(reopened.execute(
+                "SELECT value FROM lix_key_value WHERE key = 'persisted'",
+                &[],
+            ))
+            .expect("persisted row should read after reopen");
+            assert_eq!(
+                result.rows()[0].get_index(0),
+                Some(&Value::Json(serde_json::Value::String("yes".to_string())))
+            );
+            block_on(reopened.close()).expect("reopened handle should close");
+
+            cleanup_lix_path(&path);
+            fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
+        });
+    }
+
+    #[test]
+    fn legacy_json_snapshot_is_rejected_without_migration_or_fallback() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let path = temp_dir.join("legacy.lix");
-        fs::write(
-            &path,
-            r#"{"entries":[{"namespace":"legacy","key":"a2V5","value":"dmFsdWU="}]}"#,
-        )
-        .expect("legacy snapshot should be written");
+        let legacy = br#"{"entries":[{"key":"a2V5","value":"dmFsdWU="}]}"#;
+        fs::write(&path, legacy).expect("legacy JSON snapshot should be written");
 
-        let error = read_kv_file(&path).expect_err("removed namespace field should be rejected");
-        assert!(error.to_string().contains("unknown field `namespace`"));
+        let error = match open_lix_at(&path) {
+            Ok(_) => panic!("legacy JSON must not be migrated or opened"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not a database"),
+            "unexpected legacy JSON error: {error}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("rejected legacy file should remain readable"),
+            legacy,
+            "a rejected legacy file must remain byte-for-byte unchanged"
+        );
 
+        cleanup_lix_path(&path);
         fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn corrupt_sqlite_lix_is_rejected_without_reinitialization() {
+        run_on_large_stack("sqlite-lix-corruption", || {
+            let temp_dir = unique_temp_dir();
+            let path = temp_dir.join("corrupt.lix");
+            init_lix_at(&path).expect("SQLite .lix file should initialize");
+            remove_sidecars_for_test(&path);
+
+            let corrupt = b"not a sqlite database";
+            fs::write(&path, corrupt).expect("SQLite fixture should be corrupted");
+
+            let error = match open_lix_at(&path) {
+                Ok(_) => panic!("corrupt SQLite .lix file must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("not a database"),
+                "unexpected corruption error: {error}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("corrupt .lix file should remain readable"),
+                corrupt,
+                "opening corruption must not silently reinitialize the file"
+            );
+
+            cleanup_lix_path(&path);
+            fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
+        });
+    }
+
+    fn run_on_large_stack(name: &str, work: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(work)
+            .expect("test thread should spawn")
+            .join()
+            .expect("test thread should complete");
+    }
+
+    fn remove_sidecars_for_test(path: &std::path::Path) {
+        for suffix in ["wal", "shm", "journal"] {
+            let _ = fs::remove_file(format!("{}-{suffix}", path.display()));
+        }
+    }
+
+    fn cleanup_lix_path(path: &std::path::Path) {
+        let _ = fs::remove_file(path);
+        remove_sidecars_for_test(path);
     }
 
     fn unique_temp_dir() -> PathBuf {
