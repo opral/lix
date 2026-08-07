@@ -5,10 +5,11 @@ EVIDENCE=/tmp/forktree-stage2-execution-evidence
 mkdir -p "$EVIDENCE"
 rustc --edition=2024 -D warnings "$ORACLE/main.rs" -o "$EVIDENCE/residue-oracle"
 "$EVIDENCE/residue-oracle" self-test
-bash "$ORACLE/verify_landed_1258_map.sh" "$PWD"
+bash "$ORACLE/verify_landed_1258_map.sh" /absolute/path/to/main-e871 "$ORACLE/main.rs"
+bash "$ORACLE/verify_landed_1244_map.sh" /absolute/path/to/main-e871 "$ORACLE/main.rs"
 
 # Pinned inputs must be red; this records rather than accepts their residue.
-"$EVIDENCE/residue-oracle" baseline /absolute/path/to/main-b5e
+"$EVIDENCE/residue-oracle" baseline /absolute/path/to/main-e871
 "$EVIDENCE/residue-oracle" baseline /absolute/path/to/stage1-138b
 
 # The first runnable candidate must be green.

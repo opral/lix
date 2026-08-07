@@ -125,6 +125,22 @@ const LEGACY_OWNER_TOKENS: &[&str] = &[
     "GcMarkPackV1",
     "GcProgressV1",
     "stage_plugin_checkpoint",
+    // Landed #1244 physical authenticated branch-control/plugin-checkpoint
+    // encodings. Their fail-closed semantics move to ForkTree typed selectors
+    // and objects; none of these old envelopes may survive the hard cut.
+    "BRANCH_HEAD_CONTROL_NAMESPACE",
+    "BRANCH_HEAD_CONTROL_MAGIC",
+    "BRANCH_HEAD_CONTROL_DIGEST_BYTES",
+    "BRANCH_HEAD_CONTROL_DIGEST_CONTEXT",
+    "branch.head_control.v10",
+    "LBC1",
+    "branch_head_control_corruption",
+    "plugin.current_checkpoint.v2",
+    "LPC3",
+    "lix plugin current checkpoint v3",
+    "load_seeded_branch_plugin_checkpoint_for_bench",
+    "seed_branch_plugin_checkpoints_for_bench",
+    "immutable-physical-commit-state.v61",
     // #1258 current-main physical CAS/retention implementation. Its semantics
     // move into typed ForkTree edges and bounded owner progress; these names
     // must not survive as a parallel authority.
@@ -195,14 +211,13 @@ const DELETE_MODULES: &[&str] = &[
     "storage_adapter/scan.rs",
 ];
 
-// The foundational cursor PR owns deletion of this API and its wrappers. The
-// Stage-2 candidate must consume the landed cursor and may not recreate any
-// alias or compatibility plan around page reconstruction.
+// The foundational cursor PR owns deletion of the page-reconstruction API and
+// every ScanPlan wrapper. New ScanChunk is the cursor page value and is not
+// legacy residue.
 const OLD_SCAN_TOKENS: &[&str] = &[
     "StorageScanOptions",
     "ScanPlan",
     "pub struct ScanOptions",
-    "pub struct ScanChunk",
     "scan_resume_after",
 ];
 
@@ -210,6 +225,18 @@ const UNSEALED_TOKENS: &[&str] = &[
     "pub struct SpaceId(pub u32)",
     "pub const fn mutable(id: SpaceId",
     "pub const fn immutable(id: SpaceId",
+];
+
+// Current public semantics bind resume to the live StorageRead/transaction.
+// The previously modeled durable reader lease is research evidence only and
+// must not enter the first runnable Stage-2 authority.
+const FORBIDDEN_READER_LEASE_TOKENS: &[&str] = &[
+    "ReaderLeaseSelector",
+    "ReaderLeaseCursor",
+    "ReaderLeaseV1",
+    "READER_LEASE",
+    "reader_lease",
+    "reader.lease",
 ];
 
 const REQUIRED_OWNER_TOKENS: &[&str] = &[
@@ -268,6 +295,7 @@ fn inspect(source: &str, files: &BTreeSet<String>) -> Vec<Finding> {
         ("legacy-owner-or-codec", LEGACY_OWNER_TOKENS),
         ("old-paginated-scan", OLD_SCAN_TOKENS),
         ("unsealed-owner", UNSEALED_TOKENS),
+        ("forbidden-reader-lease", FORBIDDEN_READER_LEASE_TOKENS),
     ] {
         for token in tokens {
             let occurrences = count(source, token);
@@ -330,8 +358,12 @@ fn self_test() -> Result<(), String> {
         return Err(format!("synthetic clean source rejected: {clean:?}"));
     }
     let dirty_source = format!(
-        "{required}\n{}\n{}\n{}\n{}",
-        LEGACY_SPACES[0], LEGACY_OWNER_TOKENS[0], OLD_SCAN_TOKENS[0], UNSEALED_TOKENS[0]
+        "{required}\n{}\n{}\n{}\n{}\n{}",
+        LEGACY_SPACES[0],
+        LEGACY_OWNER_TOKENS[0],
+        OLD_SCAN_TOKENS[0],
+        UNSEALED_TOKENS[0],
+        FORBIDDEN_READER_LEASE_TOKENS[0]
     );
     let mut dirty_files = BTreeSet::new();
     dirty_files.insert(DELETE_MODULES[0].to_owned());
@@ -341,6 +373,7 @@ fn self_test() -> Result<(), String> {
         "legacy-owner-or-codec",
         "old-paginated-scan",
         "unsealed-owner",
+        "forbidden-reader-lease",
         "superseded-module",
     ] {
         if !dirty.iter().any(|finding| finding.class == class) {

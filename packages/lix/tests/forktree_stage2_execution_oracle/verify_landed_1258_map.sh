@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 REPOSITORY_ROOT" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $0 REPOSITORY_ROOT [ORACLE_SOURCE]" >&2
   exit 2
 fi
 
 repo=$1
 base=4763408467d265b288a124e24b1d47be423f5d17
 head=b5e78190f49cab5de7bb19b6f967706c214363b6
-oracle="$repo/packages/lix/tests/forktree_stage2_execution_oracle/main.rs"
+oracle=${2:-$repo/packages/lix/tests/forktree_stage2_execution_oracle/main.rs}
 
 test "$(git -C "$repo" rev-parse "$head^{tree}")" = c913465505bc773d21a6e2804530287ee937a3f1
 
