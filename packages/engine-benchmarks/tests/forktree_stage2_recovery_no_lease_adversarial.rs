@@ -9,6 +9,7 @@ mod frozen_oracle {
     #[cfg(test)]
     mod adversarial {
         use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::{Arc, Mutex};
         use tokio::sync::Notify;
         use tokio::time::{Duration, timeout};
@@ -28,6 +29,49 @@ mod frozen_oracle {
             inner: W,
             gate: Arc<DeletePageGate>,
             deletes_target: bool,
+        }
+
+        struct ReadBoundary {
+            armed: AtomicBool,
+            reads: AtomicUsize,
+            reached: Notify,
+            release: Notify,
+        }
+
+        struct ReadBoundaryStorage<S> {
+            inner: S,
+            boundary: Arc<ReadBoundary>,
+        }
+
+        impl<S: Storage> Storage for ReadBoundaryStorage<S> {
+            type Read<'a>
+                = S::Read<'a>
+            where
+                Self: 'a;
+            type Write<'a>
+                = S::Write<'a>
+            where
+                Self: 'a;
+
+            async fn begin_read(
+                &self,
+                options: ReadOptions,
+            ) -> Result<Self::Read<'_>, StorageError> {
+                if self.boundary.armed.load(AtomicOrdering::Acquire)
+                    && self.boundary.reads.fetch_add(1, AtomicOrdering::AcqRel) == 1
+                {
+                    self.boundary.reached.notify_one();
+                    self.boundary.release.notified().await;
+                }
+                self.inner.begin_read(options).await
+            }
+
+            async fn begin_write(
+                &self,
+                options: WriteOptions,
+            ) -> Result<Self::Write<'_>, StorageError> {
+                self.inner.begin_write(options).await
+            }
         }
 
         impl<S: Storage> Storage for GatedStorage<S> {
@@ -268,6 +312,91 @@ mod frozen_oracle {
             );
         }
 
+        async fn deletion_between_validation_and_fence_capture_must_fail<S: Storage>(storage: S) {
+            let boundary = Arc::new(ReadBoundary {
+                armed: AtomicBool::new(false),
+                reads: AtomicUsize::new(0),
+                reached: Notify::new(),
+                release: Notify::new(),
+            });
+            let storage = ReadBoundaryStorage {
+                inner: storage,
+                boundary: Arc::clone(&boundary),
+            };
+            let mut metrics = Metrics::default();
+            let initial = seed(&storage, &mut metrics).await.expect("seed");
+            let prepared_gc = prepare_gc(&storage, &mut metrics)
+                .await
+                .expect("prepare GC");
+            start_gc(&storage, &prepared_gc, &mut metrics)
+                .await
+                .expect("start GC");
+            let successor = graph(301);
+            stage(&storage, &successor, &mut metrics)
+                .await
+                .expect("stage successor after mark");
+            let (raw_authority, _) = load_authority(&storage, &mut metrics)
+                .await
+                .expect("load GC authority");
+            let raw_progress = progress_value(&storage, &mut metrics)
+                .await
+                .expect("load GC progress")
+                .expect("active GC progress");
+            let mut progress = Progress::decode(&raw_progress).expect("decode GC progress");
+
+            boundary.reads.store(0, AtomicOrdering::Release);
+            boundary.armed.store(true, AtomicOrdering::Release);
+            let prepare = async {
+                let mut prepare_metrics = Metrics::default();
+                prepare_publish(
+                    &storage,
+                    initial.root.id,
+                    successor.root.id,
+                    &mut prepare_metrics,
+                )
+                .await
+            };
+            let delete = async {
+                timeout(Duration::from_secs(10), boundary.reached.notified())
+                    .await
+                    .expect("publisher did not reach post-validation authority read");
+                let mut delete_metrics = Metrics::default();
+                let result = commit_gc_deletion_page(
+                    &storage,
+                    &raw_authority,
+                    &raw_progress,
+                    &mut progress,
+                    OBJECTS,
+                    vec![successor.objects[0].key.clone()],
+                    &mut delete_metrics,
+                )
+                .await;
+                boundary.release.notify_one();
+                result
+            };
+            let (prepared, deleted) = tokio::join!(prepare, delete);
+            deleted.expect("delete page between validation and fence capture");
+            let prepared = prepared.expect("publisher captures post-delete progress");
+            let result = commit_publish(&storage, &prepared, &mut metrics).await;
+            let (_, authority) = load_authority(&storage, &mut metrics)
+                .await
+                .expect("load authority after publication attempt");
+            let root_validation = validate_root(
+                &storage,
+                Root {
+                    kind: Kind::Catalog,
+                    id: successor.root.id,
+                },
+                &mut metrics,
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(StorageError::PreconditionFailed(_))),
+                "root validation and progress capture must be one coherent fenced observation: publication={result:?}, active_is_deleted_successor={}, successor_validation={root_validation:?}",
+                authority.active == successor.root.id,
+            );
+        }
+
         async fn real_page_error_poisons_held_view<S: Storage>(storage: &S) {
             let mut metrics = Metrics::default();
             let initial = seed(storage, &mut metrics).await.expect("seed");
@@ -378,6 +507,25 @@ mod frozen_oracle {
                 SlateDB::open_with_io_counters(directory.path(), SlateDBIoCounters::default())
                     .expect("open SlateDB");
             same_root_distinct_reads_reject_cursor(&storage).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rocks_deletion_between_validation_and_fence_capture_fails() {
+            let directory = tempfile::tempdir().expect("RocksDB directory");
+            deletion_between_validation_and_fence_capture_must_fail(
+                RocksDB::open(directory.path()).expect("open RocksDB"),
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn slate_deletion_between_validation_and_fence_capture_fails() {
+            let directory = tempfile::tempdir().expect("SlateDB directory");
+            deletion_between_validation_and_fence_capture_must_fail(
+                SlateDB::open_with_io_counters(directory.path(), SlateDBIoCounters::default())
+                    .expect("open SlateDB"),
+            )
+            .await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
