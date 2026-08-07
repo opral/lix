@@ -65,6 +65,7 @@ impl Query {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Cell {
+    Null,
     Integer(i64),
     Text(String),
     Boolean(bool),
@@ -270,6 +271,9 @@ pub fn digest(rows: &[Vec<Cell>]) -> [u8; 32] {
         hasher.update(&(row.len() as u64).to_be_bytes());
         for cell in row {
             match cell {
+                Cell::Null => {
+                    hasher.update(&[0]);
+                }
                 Cell::Integer(value) => {
                     hasher.update(&[1]);
                     hasher.update(&value.to_be_bytes());

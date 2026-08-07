@@ -327,6 +327,10 @@ where
         .await
         .expect("seed dimensions");
     transaction
+        .execute(&nullable_insert_sql(), &[])
+        .await
+        .expect("seed nullable rows");
+    transaction
         .commit()
         .await
         .expect("commit current OLAP seed transaction");
@@ -393,6 +397,12 @@ fn dimension_insert_sql() -> String {
     sql
 }
 
+fn nullable_insert_sql() -> &'static str {
+    "INSERT INTO forktree_olap_nullable (id, note, score) VALUES \
+     ('nullable-00','alpha',10),('nullable-01',NULL,20),\
+     ('nullable-02','gamma',NULL),('nullable-03',NULL,NULL)"
+}
+
 async fn register_schemas<S>(session: &SessionContext<Counted<S>>)
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -415,7 +425,8 @@ where
     required.push("payload".to_string());
     let wide = serde_json::json!({"x-lix-key":"forktree_olap_wide","x-lix-primary-key":["/id"],"type":"object","required":required,"properties":wide_properties,"additionalProperties":false});
     let dimension = serde_json::json!({"x-lix-key":"forktree_olap_dim","x-lix-primary-key":["/lane"],"type":"object","required":["lane","label"],"properties":{"lane":{"type":"integer"},"label":{"type":"string"}},"additionalProperties":false});
-    for schema in [narrow, wide, dimension] {
+    let nullable = serde_json::json!({"x-lix-key":"forktree_olap_nullable","x-lix-primary-key":["/id"],"type":"object","required":["id"],"properties":{"id":{"type":"string"},"note":{"type":["string","null"]},"score":{"type":["integer","null"]}},"additionalProperties":false});
+    for schema in [narrow, wide, dimension, nullable] {
         session.execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)", &[Value::Text(schema.to_string())]).await.expect("register OLAP schema");
     }
 }
@@ -429,6 +440,9 @@ async fn run_queries<S>(
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    if parameters.rows == 1_000 {
+        run_semantic_oracle(session).await;
+    }
     for (query, digest, rows) in expected(parameters.rows) {
         for sample in 0..parameters.warmups + parameters.samples {
             let _ = take_stats(stats);
@@ -474,6 +488,60 @@ async fn run_queries<S>(
     }
 }
 
+async fn run_semantic_oracle<S>(session: &SessionContext<Counted<S>>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let cases = [
+        (
+            "pk_point",
+            "SELECT id, score FROM forktree_olap_narrow WHERE id = '/~forktree-olap/000000123'",
+        ),
+        (
+            "pk_range",
+            "SELECT id, ordinal FROM forktree_olap_narrow WHERE id >= '/~forktree-olap/000000120' AND id < '/~forktree-olap/000000130' ORDER BY id",
+        ),
+        (
+            "pushdown",
+            "SELECT id, score FROM forktree_olap_narrow WHERE active = TRUE AND lane = 7 ORDER BY ordinal LIMIT 17",
+        ),
+        (
+            "null_projection",
+            "SELECT id, note, score, note IS NULL FROM forktree_olap_nullable ORDER BY id",
+        ),
+        (
+            "null_filter",
+            "SELECT id FROM forktree_olap_nullable WHERE note IS NULL ORDER BY id",
+        ),
+        (
+            "null_aggregate",
+            "SELECT COUNT(*) AS rows, COUNT(note) AS notes, SUM(score) AS score_sum FROM forktree_olap_nullable",
+        ),
+        (
+            "ordering",
+            "SELECT id FROM forktree_olap_narrow ORDER BY id LIMIT 32",
+        ),
+        (
+            "limit_pushdown",
+            "SELECT id FROM forktree_olap_narrow LIMIT 7",
+        ),
+    ];
+    for (label, sql) in cases {
+        let rows = execute_sql(session, sql).await;
+        println!(
+            "forktree_current_semantic,label={label},rows={},digest={}",
+            rows.len(),
+            hex_digest(common::digest(&rows))
+        );
+        let explain = session.execute(&format!("EXPLAIN {sql}"), &[]).await;
+        println!(
+            "forktree_current_plan,label={label},supported={},plan={:?}",
+            explain.is_ok(),
+            explain.ok().map(|result| result.rows().to_vec())
+        );
+    }
+}
+
 async fn execute<S>(session: &SessionContext<Counted<S>>, query: Query) -> Vec<Vec<Cell>>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -496,6 +564,41 @@ where
                 .collect()
         })
         .collect()
+}
+
+async fn execute_sql<S>(session: &SessionContext<Counted<S>>, sql: &str) -> Vec<Vec<Cell>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute(sql, &[])
+        .await
+        .expect("execute current semantic SQL")
+        .rows()
+        .iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Cell::Null,
+                    Value::Integer(value) => Cell::Integer(*value),
+                    Value::Text(value) => Cell::Text(value.clone()),
+                    Value::Boolean(value) => Cell::Boolean(*value),
+                    other => panic!("unexpected semantic value {other:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn hex_digest(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn expected(rows: usize) -> Vec<(Query, [u8; 32], usize)> {
