@@ -47,6 +47,7 @@ ahash = "0.8"
 async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
+libc = "0.2"
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -174,6 +175,12 @@ required-features = ["storage-benches", "slatedb"]
 [[bench]]
 name = "large_blob_updates"
 path = "benches/large_blob_updates.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "forktree_multimedia_blocks"
+path = "benches/forktree_multimedia_blocks.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 
