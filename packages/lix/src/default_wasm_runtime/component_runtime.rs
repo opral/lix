@@ -4330,10 +4330,7 @@ fn component_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lix::wasm::{
-        WasmByteSource, WasmEntityPage, WasmEntitySource, WasmFileDescriptor, WasmInputSplice,
-        WasmPluginSelection,
-    };
+    use lix::wasm::{WasmByteSource, WasmFileDescriptor, WasmInputSplice, WasmPluginSelection};
 
     #[derive(Clone, Debug)]
     struct JsonTestSource(Vec<u8>);
@@ -4360,12 +4357,15 @@ mod tests {
         entities: Option<Vec<WasmEntity<WasmHostBytes>>>,
     }
 
-    impl WasmEntitySource for JsonTestEntitySource {
-        fn next_page(&mut self, _max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
+    impl lix::wasm::WasmEntitySource for JsonTestEntitySource {
+        fn next_page(
+            &mut self,
+            _max_bytes: u32,
+        ) -> Result<Option<lix::wasm::WasmEntityPage>, LixError> {
             Ok(self
                 .entities
                 .take()
-                .map(|entities| WasmEntityPage { entities }))
+                .map(|entities| lix::wasm::WasmEntityPage { entities }))
         }
     }
 
