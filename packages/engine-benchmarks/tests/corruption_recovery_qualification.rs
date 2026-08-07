@@ -243,6 +243,17 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     lix.create_checkpoint()
         .await
         .expect("checkpoint tracked-tree fixture");
+    let checkpoint_head = active_head(&lix).await;
+    lix.execute(
+        "UPDATE lix_key_value SET value = 'updated' WHERE key = 'tree-7'",
+        &[],
+    )
+    .await
+    .expect("update tracked-tree fixture row");
+    lix.create_checkpoint()
+        .await
+        .expect("checkpoint updated tracked-tree fixture");
+    let updated_head = active_head(&lix).await;
     lix.close().await.expect("close tracked-tree fixture");
     database.flush_all().await;
     drop(database);
@@ -260,6 +271,22 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .await
         .expect("healthy tracked tree should survive cold reopen");
     assert_eq!(healthy.rows().len(), 8, "healthy tracked tree row count");
+    let healthy_diff = lix
+        .execute(
+            "SELECT schema_key, diff_type FROM lix_diff($1, $2) \
+             WHERE schema_key = 'lix_key_value'",
+            &[
+                Value::Text(checkpoint_head.clone()),
+                Value::Text(updated_head.clone()),
+            ],
+        )
+        .await
+        .expect("healthy tracked-tree diff should survive cold reopen");
+    assert_eq!(
+        healthy_diff.rows().len(),
+        1,
+        "healthy tracked-tree diff row count"
+    );
     lix.close()
         .await
         .expect("close healthy tracked-tree reopen");
@@ -272,12 +299,13 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         Ok(lix) => {
             let result = lix
                 .execute(
-                    "SELECT key, value FROM lix_key_value WHERE key LIKE 'tree-%' ORDER BY key",
-                    &[],
+                    "SELECT schema_key, diff_type FROM lix_diff($1, $2) \
+                     WHERE schema_key = 'lix_key_value'",
+                    &[Value::Text(checkpoint_head), Value::Text(updated_head)],
                 )
                 .await;
             let _ = lix.close().await;
-            result.expect_err("corrupt tracked tree chunk must fail on first read")
+            result.expect_err("corrupt tracked tree chunk must fail on historical diff")
         }
         Err(error) => error,
     };
