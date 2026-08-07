@@ -2386,6 +2386,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::{Column, ScalarValue};
+    use datafusion::datasource::TableProvider;
     use datafusion::execution::context::ExecutionProps;
     use datafusion::logical_expr::expr::BinaryExpr;
     use datafusion::logical_expr::{Expr, Operator};
@@ -2412,7 +2413,7 @@ mod tests {
     use super::super::spec::{SpecTableProvider, TableSpec};
     use super::{
         BranchBinding, DirectoryDescriptorRecord, LixDirectorySpec, UpsertConflictTarget,
-        UpsertSupport, WriteAccess, derive_directory_paths, lix_directory_by_branch_schema,
+        UpsertSupport, derive_directory_paths, lix_directory_by_branch_schema,
         lix_directory_insert_origin, lix_directory_record_batch,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
@@ -3644,7 +3645,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_provider_is_writable_when_given_write_access() {
+    fn directory_provider_keeps_no_write_authority() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
@@ -3654,16 +3655,16 @@ mod tests {
             write_ctx.clone(),
         ));
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = live_state.clone();
-        let provider = SpecTableProvider::new(
-            Arc::new(LixDirectorySpec::active_branch(
-                write_ctx.active_branch_id(),
-                live_state,
-                filesystem_path_index,
-                branch_ref,
-                test_functions(),
-            )),
-            WriteAccess::write(write_ctx),
+        let provider = SpecTableProvider::new(Arc::new(LixDirectorySpec::active_branch(
+            write_ctx.active_branch_id(),
+            live_state,
+            filesystem_path_index,
+            branch_ref,
+            test_functions(),
+        )));
+        assert_eq!(
+            provider.table_type(),
+            datafusion::datasource::TableType::Base
         );
-        assert!(provider.is_write());
     }
 }

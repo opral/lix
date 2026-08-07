@@ -11,9 +11,9 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::encode_diff_id;
 use crate::tracked_state::{
@@ -64,14 +64,11 @@ where
         };
         let from_commit_id = commit_id_argument(from_commit_id, 1)?;
         let to_commit_id = commit_id_argument(to_commit_id, 2)?;
-        Ok(Arc::new(SpecTableProvider::new(
-            Arc::new(DiffSpec {
-                store: self.store.clone(),
-                from_commit_id,
-                to_commit_id,
-            }),
-            WriteAccess::read_only(),
-        )))
+        Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
+            store: self.store.clone(),
+            from_commit_id,
+            to_commit_id,
+        }))))
     }
 }
 

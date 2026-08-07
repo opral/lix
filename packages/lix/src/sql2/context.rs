@@ -315,6 +315,7 @@ pub(crate) struct SqlWriteContext {
     ptr: Arc<SqlWriteContextPtr>,
     gate: Arc<Mutex<()>>,
     explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
+    write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
 }
 
 struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
@@ -338,6 +339,7 @@ impl SqlWriteContext {
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
             explicit_insert_columns: None,
+            write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
         }
     }
 
@@ -351,6 +353,19 @@ impl SqlWriteContext {
 
     pub(crate) fn explicit_insert_columns(&self) -> Option<&BTreeSet<String>> {
         self.explicit_insert_columns.as_deref()
+    }
+
+    pub(crate) fn write_targets(
+        &self,
+    ) -> Result<Arc<super::providers::WriteTargetRegistry>, LixError> {
+        self.write_targets.clone().ok_or_else(|| {
+            LixError::unknown("physical SQL write target cannot own a write-target registry")
+        })
+    }
+
+    pub(crate) fn into_physical_target(mut self) -> Self {
+        self.write_targets = None;
+        self
     }
 
     pub(crate) fn functions(&self) -> FunctionProviderHandle {
@@ -527,20 +542,11 @@ impl WriteAccess {
         Self::Write { ctx }
     }
 
-    pub(crate) fn require_write(
-        &self,
-        action: &str,
-    ) -> Result<SqlWriteContext, datafusion::error::DataFusionError> {
+    pub(crate) fn into_write_context(self) -> Option<SqlWriteContext> {
         match self {
-            Self::Write { ctx } => Ok(ctx.clone()),
-            Self::ReadOnly => Err(datafusion::error::DataFusionError::Execution(format!(
-                "{action} requires a write transaction"
-            ))),
+            Self::ReadOnly => None,
+            Self::Write { ctx } => Some(ctx),
         }
-    }
-
-    pub(crate) fn is_write(&self) -> bool {
-        matches!(self, Self::Write { .. })
     }
 }
 

@@ -27,7 +27,6 @@ use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, DFSchemaRef, JoinType, ParamValues, ScalarValue};
 use datafusion::datasource::{empty::EmptyTable, provider_as_source};
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
@@ -1538,6 +1537,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         .table_provider(&table_name)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    let write_target = session.write_target(&table_name)?;
     let table_schema = table.schema();
     let state = session.state();
     // Diff command sinks own their dedicated RETURNING contract. Every
@@ -1570,8 +1570,10 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                     .iter()
                     .map(|column| column.name.clone())
                     .collect();
-                crate::sql2::providers::validate_spec_upsert(&table, &input, &target_columns)
-                    .await?;
+                write_target
+                    .validate_upsert_target(&input, &target_columns)
+                    .await
+                    .map_err(datafusion_error_to_lix_error)?;
                 let proposed_batches = crate::sql2::runtime::collect_input_plan(
                     std::sync::Arc::clone(&input),
                     session.task_ctx(),
@@ -1594,27 +1596,20 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                     }
                 };
                 let rows_affected = match &returning {
-                    Some(returning) => {
-                        crate::sql2::providers::execute_spec_upsert_with_returning(
-                            &table,
+                    Some(returning) => write_target
+                        .execute_upsert_with_returning(
                             &input,
                             proposed_batches,
                             &target_columns,
                             &action,
                             returning.clone(),
                         )
-                        .await?
-                    }
-                    None => {
-                        crate::sql2::providers::execute_spec_upsert(
-                            &table,
-                            &input,
-                            proposed_batches,
-                            &target_columns,
-                            &action,
-                        )
-                        .await?
-                    }
+                        .await
+                        .map_err(datafusion_error_to_lix_error)?,
+                    None => write_target
+                        .execute_upsert(&input, proposed_batches, &target_columns, &action)
+                        .await
+                        .map_err(datafusion_error_to_lix_error)?,
                 };
                 return match returning.as_ref() {
                     Some(returning) => {
@@ -1624,17 +1619,12 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                 };
             }
             match &returning {
-                Some(returning) => {
-                    crate::sql2::providers::execute_spec_insert_with_returning(
-                        &table,
-                        &state,
-                        input,
-                        returning.clone(),
-                    )
+                Some(returning) => write_target
+                    .insert_with_returning(&state, input, returning.clone())
                     .await
-                }
-                None => table
-                    .insert_into(&state, input, InsertOp::Append)
+                    .map_err(datafusion_error_to_lix_error),
+                None => write_target
+                    .insert(input)
                     .await
                     .map_err(datafusion_error_to_lix_error),
             }
@@ -1647,17 +1637,11 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                 return sql_write_empty_returning_result(returning.as_ref());
             }
             match &returning {
-                Some(returning) => {
-                    crate::sql2::providers::execute_spec_update_with_returning(
-                        &table,
-                        &state,
-                        assignments,
-                        filters,
-                        returning.clone(),
-                    )
+                Some(returning) => write_target
+                    .update_with_returning(&state, assignments, filters, returning.clone())
                     .await
-                }
-                None => table
+                    .map_err(datafusion_error_to_lix_error),
+                None => write_target
                     .update(&state, assignments, filters)
                     .await
                     .map_err(datafusion_error_to_lix_error),
@@ -1669,17 +1653,12 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                 return sql_write_empty_returning_result(returning.as_ref());
             }
             match &returning {
-                Some(returning) => {
-                    crate::sql2::providers::execute_spec_delete_with_returning(
-                        &table,
-                        &state,
-                        filters,
-                        returning.clone(),
-                    )
+                Some(returning) => write_target
+                    .delete_with_returning(&state, filters, returning.clone())
                     .await
-                }
-                None => table
-                    .delete_from(&state, filters)
+                    .map_err(datafusion_error_to_lix_error),
+                None => write_target
+                    .delete(&state, filters)
                     .await
                     .map_err(datafusion_error_to_lix_error),
             }
