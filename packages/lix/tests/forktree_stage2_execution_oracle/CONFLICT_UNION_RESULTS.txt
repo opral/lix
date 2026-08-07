@@ -1,0 +1,48 @@
+ForkTree Stage-2 read-only conflict-union model
+Date: 2026-08-07 UTC
+
+Inputs
+- current main b5e78190f49cab5de7bb19b6f967706c214363b6
+- #1244 head 5d942436358f3ecd4a8df0ace22e9c191f9bcf05
+- #1260 head 7061aad7f4b14e611b32bbe5493f39253b826378
+- approved Stage1 138b55e1de90806c380ad27b2b349f4c66a1387f
+
+Pairwise results (`git merge-tree --write-tree`)
+- b5e + #1244: exit 1, conflicted index/tree
+  174ae2c8df7c01f4bd26388e0b529c14b14c69a5
+  Sole textual conflict: packages/engine-benchmarks/Cargo.toml.
+  Output log SHA-256:
+  ae671df8127a2e8d54050a3652234d4d808269b15173fc7120c9da0d041c0311
+- b5e + #1260: exit 0, clean tree
+  30ab88e5db95460493b7eb83ec72c1a15aa67157
+  Output log SHA-256:
+  92c94ba7837dee8452c3a77d48d6d9522f51631e1ce40c44e677ab56b18b88aa
+- #1244 + #1260: exit 1, conflicted index/tree
+  57cf08889a3d5bd41b1049393f3735ca087a8567
+  Sole textual conflict: packages/engine-benchmarks/Cargo.toml.
+  transaction/context.rs and rs-sdk-tests/tests/e2e.rs merge automatically.
+  Output log SHA-256:
+  ce47a3c2467b7d4c8ee1811fbb39ff66b56a32605a471ce462fd371e84bddff0
+
+Three-lane result
+- A deterministic local evidence-only commit was created from the clean
+  b5e+#1260 tree with parents b5e and #1260. It was not assigned a ref or
+  published.
+- Applying #1244 to that synthetic union: exit 1, conflicted index/tree
+  6b13eec0bb0951ac1be567dc1d4b0604bce9327e
+- Sole textual conflict remains packages/engine-benchmarks/Cargo.toml.
+- branch/control.rs, storage_bench.rs, transaction/context.rs and e2e.rs merge
+  textually, but their semantic ownership remains governed by the execution
+  manifest.
+- Output log SHA-256:
+  1b59311287ddc56ae7a97118b8f4bd2df8926a186f6404d84a414d78bffacdce
+
+Stage1/current-main result
+- b5e + approved Stage1: exit 1, conflicted index/tree
+  7b24abfcd75f4227678fbd7da4590d55639c0b59
+- Real conflicts: packages/lix/src/binary_cas/kv.rs and
+  packages/lix/src/storage_bench.rs.
+- Ten production path intersections are listed in the execution manifest.
+
+No production worktree, PR, remote branch other than the plan artifact, or
+source file outside packages/lix/tests was mutated by this model.

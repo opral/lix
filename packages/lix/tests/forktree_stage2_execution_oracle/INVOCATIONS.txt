@@ -5,6 +5,7 @@ EVIDENCE=/tmp/forktree-stage2-execution-evidence
 mkdir -p "$EVIDENCE"
 rustc --edition=2024 -D warnings "$ORACLE/main.rs" -o "$EVIDENCE/residue-oracle"
 "$EVIDENCE/residue-oracle" self-test
+bash "$ORACLE/verify_landed_1258_map.sh" "$PWD"
 
 # Pinned inputs must be red; this records rather than accepts their residue.
 "$EVIDENCE/residue-oracle" baseline /absolute/path/to/main-b5e
@@ -26,5 +27,10 @@ rg 'E0432|E0599|unresolved import|no method named' "$EVIDENCE/old-scan.stderr"
 # Only after zero residue and both expected compile failures:
 CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo check -p lix --all-features
 CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo clippy -p lix --all-targets --all-features -- -D warnings
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo test -p lix forktree::tests --lib -j2 -- --test-threads=1
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo test -p lix --test integration sealed_owner_violations_are_empty -- --nocapture
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target CARGO_BUILD_JOBS=2 cargo test -p lix_tests --test forktree_stage1_application_oracle --no-run
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target cargo test -p lix_tests --test forktree_stage1_application_oracle forktree_stage1_application_rocksdb -- --exact --nocapture --test-threads=1
+CARGO_TARGET_DIR=/absolute/path/to/exact-candidate-target cargo test -p lix_tests --test forktree_stage1_application_oracle forktree_stage1_application_slatedb -- --exact --nocapture --test-threads=1
 cargo fmt --all -- --check
 git diff --check

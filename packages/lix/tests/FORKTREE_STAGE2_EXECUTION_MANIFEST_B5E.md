@@ -36,9 +36,9 @@ its one authorized merge.
 
 | Lane | Exact reviewed head/tree | Base/merge/path result | Stage-2 disposition |
 |---|---|---|---|
-| #1244 plugin-checkpoint corruption | `5d942436358f3ecd4a8df0ace22e9c191f9bcf05` / `c10d6bddb3657e04c80229e1f939a892c33cdeb5` | merge base `95478b1fa329f7608b2360554ca72fad782dfeb8`; prospective merge has one textual conflict in `packages/engine-benchmarks/Cargo.toml`. Stage-1 path intersections are `branch/control.rs`, `init.rs`, `storage_bench.rs`, `transaction/plugin_checkpoint.rs`, and `rs-sdk-tests/tests/e2e.rs`. | `PLUGIN_CHECKPOINT_SPACE`, `transaction/plugin_checkpoint.rs`, and old branch control are deleted. Preserve #1244's public fail-closed corruption behavior by authenticating plugin-registry/WASM edges in the selected object graph; do not port its physical checkpoint row or resolve its benchmark conflict in this plan branch. |
+| #1244 plugin-checkpoint corruption | `5d942436358f3ecd4a8df0ace22e9c191f9bcf05` / `c10d6bddb3657e04c80229e1f939a892c33cdeb5` | merge base `95478b1fa329f7608b2360554ca72fad782dfeb8`; b5e prospective conflicted index/tree `174ae2c8df7c01f4bd26388e0b529c14b14c69a5`, with the sole textual conflict in `packages/engine-benchmarks/Cargo.toml`. Stage-1 path intersections are `branch/control.rs`, `init.rs`, `storage_bench.rs`, `transaction/plugin_checkpoint.rs`, and `rs-sdk-tests/tests/e2e.rs`. | `PLUGIN_CHECKPOINT_SPACE`, `transaction/plugin_checkpoint.rs`, and old branch control are deleted. Preserve #1244's public fail-closed corruption behavior by authenticating plugin-registry/WASM edges in the selected object graph; do not port its physical checkpoint row or resolve its benchmark conflict in this plan branch. |
 | #1258 binary-CAS GC | merged as current main `b5e78190f49cab5de7bb19b6f967706c214363b6`; second parent `a6cb5d8c316d166b4a4eb5e5c3fc50d04d57774d`, tree `c913465505bc773d21a6e2804530287ee937a3f1` | the b5e+Stage1 prospective merge has real conflicts in `binary_cas/kv.rs` and `storage_bench.rs`; eight other production intersections merge textually but remain semantic hot spots. | Preserve authenticated serving-closure role separation, declared-size/delta/base validation, full-queue roots, retained-history/final-reference semantics, true shared chunks, and both upload/publication race orders in the new object owner. Resolve `binary_cas/kv.rs` by moving callers to typed ForkTree manifests/chunks and deleting the file, not by retaining either physical implementation. Rewrite the bench/oracle to the new owner before deleting old accounting. |
-| #1260 SQL write owner | `7061aad7f4b14e611b32bbe5493f39253b826378` / `d41598c18afae0b6a9c675fb8be3b263000da67a` | based directly on 476; clean prospective tree `d41598c18afae0b6a9c675fb8be3b263000da67a`. Its only Stage-1 intersection is `rs-sdk-tests/tests/e2e.rs`; production changes are confined to `sql2` plus that test. | Do not edit its SQL files. ForkTree exposes only typed transaction/publication/range-projection capabilities. The existing binder remains semantic plan authority; SQL integration is coordinated after its owner freezes. Test overlap is reconciled in qualification, not by changing #1260 here. |
+| #1260 SQL write owner | `7061aad7f4b14e611b32bbe5493f39253b826378` / `d41598c18afae0b6a9c675fb8be3b263000da67a` | based directly on 476; b5e prospective merge is clean at tree `30ab88e5db95460493b7eb83ec72c1a15aa67157`. Its only Stage-1 intersection is `rs-sdk-tests/tests/e2e.rs`; production changes are confined to `sql2` plus that test. | Do not edit its SQL files. ForkTree exposes only typed transaction/publication/range-projection capabilities. The existing binder remains semantic plan authority; SQL integration is coordinated after its owner freezes. Test overlap is reconciled in qualification, not by changing #1260 here. |
 | Storage streaming cursor | provisional branch `codex/storage-streaming-scan-cursor`, not advertised by the remote at freeze time | no immutable head/tree exists yet, so no source merge claim is made. Provisional API and hard deletion contract are recorded below. | Hetzner-IV exclusively owns traits, adapters, scan migration, and deletion of the old scan API. Stage 2 starts only after its immutable head is independently green and merged; the one main merge consumes the final names. This branch never edits those files or restores an old scan wrapper. |
 
 The #1244 benchmark conflict is real but outside this artifact's source scope.
@@ -46,6 +46,15 @@ The #1244 benchmark conflict is real but outside this artifact's source scope.
 predecessor; that is not a promise about the eventual then-current main. Any
 new overlap is resolved once, in the production worktree, by preserving the
 semantic contracts above and never by retaining a legacy authority.
+
+The modeled three-lane union is also bounded. #1244+#1260 produces conflicted
+index/tree `57cf08889a3d5bd41b1049393f3735ca087a8567`; `e2e.rs` and transaction
+context merge automatically and the only textual conflict remains benchmark
+`Cargo.toml`. Applying #1244 after a synthetic read-only b5e+#1260 merge gives
+conflicted index/tree `6b13eec0bb0951ac1be567dc1d4b0604bce9327e`
+with that same sole conflict. The synthetic commit is evidence-only and no ref
+is published. Exact command output hashes are in the conflict-union results
+artifact.
 
 Production release requires both events:
 
@@ -515,8 +524,15 @@ consumers switch only within the coordinated non-runnable wave.
 - **History independence:** noncanonical path-copy roots are accepted. Ordinary
   one-row histories retain 99.6591--99.9528% bytes and sparse diff is 12--14
   gets. Adversarial independently reconstructed equal states may diff O(N+M).
-  Preserve a future deterministic local-resync seam; do not eager-canonicalize
-  (measured 122x--9600x publication cost for 3.2% bulk-byte benefit).
+  Sorted bulk ingest is the reproducible-root boundary. Preserve divergent-
+  frontier/output-proportional diff and do not add online global canonical
+  packing/balancing (measured 122x--9600x publication cost for 3.2% bulk-byte
+  benefit). An optional future offline canonical snapshot requires measured
+  product demand, explicit O(N) cost, and one atomic root move—never a second
+  serving authority. Frozen model head
+  `9ebdadcb38e9b831172fbb4b3033c064d0534e17`, tree
+  `32ffdcfd43e5ccb5007e0f6767ddccc6378472e6`; report SHA-256
+  `0d030076b7501779f665624764f676834a4490942edd87aef2f8c1386c939d68`.
 - **Rocks history disk:** the frozen 1K post-flush +8.954% result is obsolete
   SST/tombstone retention, not live ForkTree geometry. Its perfect source-cut
   ceiling is only 8.218%, so no layout cut is admitted. Equivalent full
@@ -565,6 +581,11 @@ if rustc --edition=2024 -D warnings -L "dependency=$CARGO_TARGET_DIR/debug/deps"
 rg 'E0432|E0599|unresolved import|no method named' "$EVIDENCE/old-scan.stderr"
 CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo check -p lix --all-features
 CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo clippy -p lix --all-targets --all-features -- -D warnings
+CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo test -p lix forktree::tests --lib -j2 -- --test-threads=1
+CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo test -p lix --test integration sealed_owner_violations_are_empty -- --nocapture
+CARGO_TARGET_DIR="$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo test -p lix_tests --test forktree_stage1_application_oracle --no-run
+CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test -p lix_tests --test forktree_stage1_application_oracle forktree_stage1_application_rocksdb -- --exact --nocapture --test-threads=1
+CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test -p lix_tests --test forktree_stage1_application_oracle forktree_stage1_application_slatedb -- --exact --nocapture --test-threads=1
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -573,6 +594,12 @@ The candidate's commit/tree, Cargo.lock, cursor-PR head, built rlib and every
 log are hashed before semantic tests. A compile failure before the residue and
 negative API gates is expected work inside the non-runnable wave; a compile
 success with residue is a failed gate, not progress.
+
+The cursor head is intentionally not named here while Hetzner-IV still owns a
+mutable production branch. At release, append its independently frozen exact
+cursor conformance invocations and head/tree to this sequence before entering
+the non-runnable wave. Do not guess names or preserve the deleted scan API to
+make this list executable early.
 
 ## Exact both-adapter qualification order
 
