@@ -19,8 +19,8 @@ use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    ScanPlan, SharedStorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageReadOptions,
-    StorageScanOptions, StorageWriteOptions,
+    ScanPlan, SharedStorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StoragePrefix, StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
@@ -472,13 +472,13 @@ async fn repository_has_changelog_commit(
             bytes: bytes::Bytes::new(),
         },
     )
-    .collect(
+    .page(
         read,
-        StorageScanOptions {
+        StorageBeginScanOptions {
             projection: StorageCoreProjection::KeyOnly,
-            limit_rows: 1,
-            ..StorageScanOptions::default()
+            ..StorageBeginScanOptions::default()
         },
+        1,
     )
     .await?
     .value
@@ -500,8 +500,8 @@ mod tests {
 
     use super::*;
     use crate::storage_adapter::{
-        Memory, PointReadPlan, ScanPlan, StorageGetOptions, StorageKey, StoragePrefix,
-        StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+        Memory, PointReadPlan, ScanPlan, StorageBeginScanOptions, StorageGetOptions, StorageKey,
+        StoragePrefix, StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue,
     };
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
@@ -1447,7 +1447,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("working-diff inventory should scan");
         let before_packed = ScanPlan::prefix(
@@ -1456,7 +1456,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("packed working-diff inventory should scan");
         assert!(
@@ -1480,7 +1480,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("post-checkpoint working-diff inventory should scan");
         assert!(
@@ -1588,7 +1588,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("scan initialized hot rows")
         .value

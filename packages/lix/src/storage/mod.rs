@@ -26,6 +26,6 @@ pub use types::{
     BeginScanOptions, BufferRange, CommitResult, CoreProjection, EncodedMutationBatch,
     EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency,
-    ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanOrder, SnapshotRef,
-    SpaceId, StorageSpace, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SnapshotRef, SpaceId,
+    StorageSpace, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };

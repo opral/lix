@@ -25,9 +25,9 @@ use lix::storage::immutable::{
 use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOptions, ScanOrder,
-    SpaceId, Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite,
-    StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, SpaceId,
+    Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
+    ValueSemantics, WriteOptions, WriteStats,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -88,7 +88,6 @@ const DEFAULT_METADATA_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 // the L0 and sorted-run fan-out without changing the filter encoding.
 const FILTER_BITS_PER_KEY: u32 = 16;
 const MAX_UNFLUSHED_BYTES: usize = 128 * 1024 * 1024;
-const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
@@ -1666,7 +1665,6 @@ pub struct SlateDBRead {
     publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
-    scan_cursor: Mutex<Option<ScanCursor>>,
 }
 
 #[allow(missing_debug_implementations)]
@@ -2507,7 +2505,6 @@ impl Storage for SlateDB {
                 publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
-                scan_cursor: Mutex::new(None),
             })
         }
     }
@@ -2672,7 +2669,7 @@ async fn check_preconditions(
                 let matches_precondition = match &preconditions[index] {
                     Precondition::RangeEmpty { space, range } => {
                         let range = physical_range(space.id, range.clone())?;
-                        let bounds = EncodedBounds::new(range.clone(), None);
+                        let bounds = EncodedBounds::new(range.clone());
                         let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
                         let visible_writes =
                             read_pipeline.visible_writes(snapshot_sequence, publication_id);
@@ -2932,7 +2929,7 @@ impl StorageRead for SlateDBRead {
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let bounds = EncodedBounds::new(physical_range(space.id, range.clone())?, None);
+            let bounds = EncodedBounds::new(physical_range(space.id, range.clone())?);
             let visible_writes = self
                 .publication_view
                 .as_ref()
@@ -2967,184 +2964,6 @@ impl StorageRead for SlateDBRead {
             )
         }
     }
-
-    fn scan(
-        &self,
-        space: StorageSpace,
-        range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        async move {
-            self.write_pipeline.terminal_error()?;
-            if opts.page_size() == 0 {
-                return Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                });
-            }
-
-            let cursor_range = range.clone();
-            let range = physical_range(space.id, range)?;
-            let resume_after = opts
-                .resume_after
-                .as_ref()
-                .map(|key| physical_key(space.id, key))
-                .transpose()?;
-            let bounds = EncodedBounds::new(range, resume_after.as_ref());
-            if bounds.is_empty() {
-                return Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                });
-            }
-
-            let snapshot = Arc::clone(&self.snapshot);
-            let durability = self.durability;
-            let visible_writes = self
-                .publication_view
-                .as_ref()
-                .map_or_else(Vec::new, |view| {
-                    self.write_pipeline
-                        .visible_writes(view.snapshot_sequence, view.publication_id)
-                });
-            if !visible_writes.is_empty() {
-                let page_size = opts.page_size();
-                let projection = opts.projection;
-                let mut chunk = self
-                    .worker
-                    .call_read(move |_db| {
-                        scan_snapshot_with_writes(
-                            snapshot,
-                            bounds,
-                            durability,
-                            visible_writes,
-                            page_size,
-                            projection,
-                        )
-                    })
-                    .await?;
-                hydrate_immutable_value_scan(
-                    &self.immutable_value_store,
-                    space,
-                    opts.projection,
-                    &mut chunk,
-                )
-                .await?;
-                return Ok(chunk);
-            }
-            let cursor = self
-                .scan_cursor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                .filter(|cursor| {
-                    cursor.space == space
-                        && cursor.range == cursor_range
-                        && cursor.projection == opts.projection
-                        && opts.resume_after.as_ref() == Some(&cursor.expected_resume_after)
-                });
-            let (iter, pending) = if let Some(cursor) = cursor {
-                (cursor.iter, cursor.pending)
-            } else {
-                (
-                    self.worker
-                        .call_read(move |_db| open_snapshot_scan(snapshot, bounds, durability))
-                        .await?,
-                    None,
-                )
-            };
-            let mut iter = Some(iter);
-            let mut pending = pending;
-            let mut all_entries = Vec::with_capacity(opts.page_size());
-
-            loop {
-                let remaining = opts.page_size() - all_entries.len();
-                let batch_limit = remaining.min(SCAN_BATCH_ROWS);
-                let lookahead = batch_limit == remaining;
-                let current_iter = iter
-                    .take()
-                    .expect("slatedb scan iterator is present until scan returns");
-                let current_pending = pending.take();
-                let projection = opts.projection;
-                let batch = self
-                    .worker
-                    .call_read(move |_db| {
-                        scan_snapshot_batch(
-                            current_iter,
-                            current_pending,
-                            batch_limit,
-                            projection,
-                            lookahead,
-                        )
-                    })
-                    .await?;
-                let ScanBatch {
-                    iter: next_iter,
-                    pending: next_pending,
-                    entries,
-                    state,
-                } = batch;
-
-                all_entries.extend(
-                    entries
-                        .into_iter()
-                        .map(|(key, value)| ReadEntry { key, value }),
-                );
-
-                match state {
-                    ScanBatchState::Exhausted => {
-                        let mut chunk = ScanChunk {
-                            entries: all_entries,
-                            has_more: false,
-                        };
-                        hydrate_immutable_value_scan(
-                            &self.immutable_value_store,
-                            space,
-                            opts.projection,
-                            &mut chunk,
-                        )
-                        .await?;
-                        return Ok(chunk);
-                    }
-                    ScanBatchState::HasMore => {
-                        let expected_resume_after = all_entries
-                            .last()
-                            .expect("non-empty SlateDB page has a continuation key")
-                            .key
-                            .clone();
-                        *self
-                            .scan_cursor
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(ScanCursor {
-                                space,
-                                range: cursor_range,
-                                projection: opts.projection,
-                                expected_resume_after,
-                                iter: next_iter,
-                                pending: next_pending,
-                            });
-                        let mut chunk = ScanChunk {
-                            entries: all_entries,
-                            has_more: true,
-                        };
-                        hydrate_immutable_value_scan(
-                            &self.immutable_value_store,
-                            space,
-                            opts.projection,
-                            &mut chunk,
-                        )
-                        .await?;
-                        return Ok(chunk);
-                    }
-                    ScanBatchState::MoreUnknown => {
-                        iter = Some(next_iter);
-                        pending = next_pending;
-                    }
-                }
-            }
-        }
-    }
 }
 
 struct SlateDBScanSource {
@@ -3165,9 +2984,10 @@ impl StorageScanSource for SlateDBScanSource {
             self.write_pipeline.terminal_error()?;
             let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
             let projection = self.projection;
+            let space_id = self.space.id;
             let (state, mut chunk) = self
                 .worker
-                .call_read(move |_db| streaming_scan_page(state, limit_rows, projection))
+                .call_read(move |_db| streaming_scan_page(state, limit_rows, projection, space_id))
                 .await?;
             self.state = Some(state);
             hydrate_immutable_value_scan(
@@ -3285,6 +3105,7 @@ async fn streaming_scan_page(
     mut state: SlateStreamingScanState,
     limit_rows: usize,
     projection: CoreProjection,
+    space_id: SpaceId,
 ) -> Result<(SlateStreamingScanState, ScanChunk), StorageError> {
     let mut rows = Vec::with_capacity(limit_rows);
     if let Some(row) = state.output_pending.take() {
@@ -3301,9 +3122,11 @@ async fn streaming_scan_page(
     let entries = rows
         .into_iter()
         .map(|(key, value)| {
-            if key.0.len() < SPACE_PREFIX_LEN {
+            if key.0.len() < SPACE_PREFIX_LEN
+                || key.0[..SPACE_PREFIX_LEN] != space_id.0.to_be_bytes()
+            {
                 return Err(StorageError::Corruption(format!(
-                    "slatedb key was shorter than space prefix: {:?}",
+                    "slatedb scan key escaped its storage space: {:?}",
                     key.0
                 )));
             }
@@ -3686,7 +3509,7 @@ impl StorageWrite for SlateDBWrite {
         async move {
             self.serialize_publication().await?;
             let range = physical_range(space.id, range)?;
-            let bounds = EncodedBounds::new(range.clone(), None);
+            let bounds = EncodedBounds::new(range.clone());
             if bounds.is_empty() {
                 self.stats.deleted_ranges += 1;
                 self.stats.storage_calls += 1;
@@ -4528,18 +4351,11 @@ struct EncodedBounds {
 }
 
 impl EncodedBounds {
-    fn new(range: KeyRange, resume_after: Option<&Key>) -> Self {
-        let range_lower = match range.lower {
+    fn new(range: KeyRange) -> Self {
+        let lower = match range.lower {
             Bound::Included(key) => Bound::Included(key.0.to_vec()),
             Bound::Excluded(key) => Bound::Included(exclusive_successor(&key)),
             Bound::Unbounded => Bound::Unbounded,
-        };
-        let lower = match resume_after {
-            Some(resume_after) => max_lower_bound(
-                range_lower,
-                Bound::Included(exclusive_successor(resume_after)),
-            ),
-            None => range_lower,
         };
         let upper = match range.upper {
             Bound::Included(key) => Bound::Excluded(exclusive_successor(&key)),
@@ -4617,29 +4433,6 @@ async fn get_snapshot_value(
         .map_err(slatedb_error)
 }
 
-struct ScanBatch {
-    iter: DbIterator,
-    pending: Option<KeyValue>,
-    entries: Vec<(Key, ProjectedValue)>,
-    state: ScanBatchState,
-}
-
-struct ScanCursor {
-    space: StorageSpace,
-    range: KeyRange,
-    projection: CoreProjection,
-    expected_resume_after: Key,
-    iter: DbIterator,
-    pending: Option<KeyValue>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScanBatchState {
-    Exhausted,
-    MoreUnknown,
-    HasMore,
-}
-
 async fn open_snapshot_scan(
     snapshot: Arc<DbSnapshot>,
     bounds: EncodedBounds,
@@ -4650,252 +4443,6 @@ async fn open_snapshot_scan(
         .scan_with_options(bounds.range(), &scan_options)
         .await
         .map_err(slatedb_error)
-}
-
-async fn scan_snapshot_batch(
-    mut iter: DbIterator,
-    mut pending: Option<KeyValue>,
-    limit_rows: usize,
-    projection: CoreProjection,
-    lookahead: bool,
-) -> Result<ScanBatch, StorageError> {
-    let mut entries = Vec::with_capacity(limit_rows);
-    while entries.len() < limit_rows {
-        let row = if pending.is_some() {
-            pending.take()
-        } else {
-            iter.next().await.map_err(slatedb_error)?
-        };
-        let Some(row) = row else {
-            return Ok(ScanBatch {
-                iter,
-                pending: None,
-                entries,
-                state: ScanBatchState::Exhausted,
-            });
-        };
-        if row.key.len() < SPACE_PREFIX_LEN {
-            return Err(StorageError::Corruption(format!(
-                "slatedb key was shorter than space prefix: {:?}",
-                row.key
-            )));
-        }
-        let key = Key(Bytes::copy_from_slice(&row.key[SPACE_PREFIX_LEN..]));
-        let value = match projection {
-            CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-            CoreProjection::FullValue => ProjectedValue::FullValue(row.value),
-        };
-        entries.push((key, value));
-    }
-
-    let state = if lookahead {
-        pending = iter.next().await.map_err(slatedb_error)?;
-        if pending.is_some() {
-            ScanBatchState::HasMore
-        } else {
-            ScanBatchState::Exhausted
-        }
-    } else {
-        ScanBatchState::MoreUnknown
-    };
-    Ok(ScanBatch {
-        iter,
-        pending,
-        entries,
-        state,
-    })
-}
-
-async fn scan_snapshot_with_writes(
-    snapshot: Arc<DbSnapshot>,
-    bounds: EncodedBounds,
-    durability: ReadDurability,
-    visible_writes: Vec<Arc<PublishedWrite>>,
-    page_size: usize,
-    projection: CoreProjection,
-) -> Result<ScanChunk, StorageError> {
-    if let [write] = visible_writes.as_slice() {
-        return scan_snapshot_with_single_write(
-            snapshot,
-            bounds,
-            durability,
-            Arc::clone(write),
-            page_size,
-            projection,
-        )
-        .await;
-    }
-
-    let mut overlay = BTreeMap::new();
-    for write in visible_writes {
-        for (key, value) in &*write.overlay {
-            if bounds.contains(key) {
-                overlay.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    merge_snapshot_with_overlay(
-        snapshot,
-        &bounds,
-        durability,
-        overlay.into_iter(),
-        page_size,
-        projection,
-    )
-    .await
-}
-
-async fn scan_snapshot_with_single_write(
-    snapshot: Arc<DbSnapshot>,
-    bounds: EncodedBounds,
-    durability: ReadDurability,
-    write: Arc<PublishedWrite>,
-    page_size: usize,
-    projection: CoreProjection,
-) -> Result<ScanChunk, StorageError> {
-    let scan_options = slatedb_scan_options(durability);
-    let mut base_iter = snapshot
-        .scan_with_options(bounds.range(), &scan_options)
-        .await
-        .map_err(slatedb_error)?;
-    let mut overlay_iter = write.overlay.iter().peekable();
-    let mut overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
-    let mut base_row = base_iter.next().await.map_err(slatedb_error)?;
-    let mut rows = Vec::with_capacity(page_size.saturating_add(1));
-    while rows.len() <= page_size {
-        let next = match (base_row.as_ref(), overlay_row.as_ref()) {
-            (Some(base_entry), Some((overlay_key, _))) => {
-                match base_entry.key.cmp(&overlay_key.0) {
-                    std::cmp::Ordering::Less => {
-                        let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
-                        base_row = base_iter.next().await.map_err(slatedb_error)?;
-                        Some(row)
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let row = overlay_row.take();
-                        overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
-                        base_row = base_iter.next().await.map_err(slatedb_error)?;
-                        row
-                    }
-                    std::cmp::Ordering::Greater => {
-                        let row = overlay_row.take();
-                        overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
-                        row
-                    }
-                }
-            }
-            (Some(base_entry), None) => {
-                let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
-                base_row = base_iter.next().await.map_err(slatedb_error)?;
-                Some(row)
-            }
-            (None, Some(_)) => {
-                let row = overlay_row.take();
-                overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
-                row
-            }
-            (None, None) => None,
-        };
-        let Some((key, value)) = next else {
-            break;
-        };
-        if let Some(value) = value {
-            rows.push((key, value));
-        }
-    }
-
-    project_scan_rows(rows, page_size, projection)
-}
-
-fn next_bounded_overlay(
-    overlay: &mut std::iter::Peekable<std::collections::btree_map::Iter<'_, Key, Option<Bytes>>>,
-    bounds: &EncodedBounds,
-) -> Option<(Key, Option<Bytes>)> {
-    for (key, value) in overlay.by_ref() {
-        if bounds.contains(key) {
-            return Some((key.clone(), value.clone()));
-        }
-    }
-    None
-}
-
-async fn merge_snapshot_with_overlay(
-    snapshot: Arc<DbSnapshot>,
-    bounds: &EncodedBounds,
-    durability: ReadDurability,
-    overlay: impl Iterator<Item = (Key, Option<Bytes>)>,
-    page_size: usize,
-    projection: CoreProjection,
-) -> Result<ScanChunk, StorageError> {
-    let scan_options = slatedb_scan_options(durability);
-    let mut base_iter = snapshot
-        .scan_with_options(bounds.range(), &scan_options)
-        .await
-        .map_err(slatedb_error)?;
-    let mut overlay = overlay.peekable();
-    let mut base_row = base_iter.next().await.map_err(slatedb_error)?;
-    let mut rows = Vec::with_capacity(page_size.saturating_add(1));
-    while rows.len() <= page_size {
-        let next = match (base_row.as_ref(), overlay.peek()) {
-            (Some(base_entry), Some((overlay_key, _))) => {
-                match base_entry.key.cmp(&overlay_key.0) {
-                    std::cmp::Ordering::Less => {
-                        let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
-                        base_row = base_iter.next().await.map_err(slatedb_error)?;
-                        Some(row)
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let (key, value) = overlay
-                            .next()
-                            .expect("peeked SlateDB publication overlay entry");
-                        base_row = base_iter.next().await.map_err(slatedb_error)?;
-                        Some((key, value))
-                    }
-                    std::cmp::Ordering::Greater => overlay.next(),
-                }
-            }
-            (Some(base_entry), None) => {
-                let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
-                base_row = base_iter.next().await.map_err(slatedb_error)?;
-                Some(row)
-            }
-            (None, Some(_)) => overlay.next(),
-            (None, None) => None,
-        };
-        let Some((key, value)) = next else {
-            break;
-        };
-        if let Some(value) = value {
-            rows.push((key, value));
-        }
-    }
-
-    project_scan_rows(rows, page_size, projection)
-}
-
-fn project_scan_rows(
-    rows: Vec<(Key, Bytes)>,
-    page_size: usize,
-    projection: CoreProjection,
-) -> Result<ScanChunk, StorageError> {
-    let has_more = rows.len() > page_size;
-    let entries = rows
-        .into_iter()
-        .take(page_size)
-        .map(|(key, value)| {
-            if key.0.len() < SPACE_PREFIX_LEN {
-                return Err(StorageError::Corruption(format!(
-                    "slatedb key was shorter than space prefix: {:?}",
-                    key.0
-                )));
-            }
-            Ok(ReadEntry {
-                key: Key(key.0.slice(SPACE_PREFIX_LEN..)),
-                value: project_value(value, projection),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ScanChunk { entries, has_more })
 }
 
 async fn collect_snapshot_keys(
@@ -4932,32 +4479,6 @@ fn slatedb_durability_filter(durability: ReadDurability) -> DurabilityLevel {
     match durability {
         ReadDurability::Visible => DurabilityLevel::Memory,
         ReadDurability::Durable => DurabilityLevel::Remote,
-    }
-}
-
-fn max_lower_bound(left: Bound<Vec<u8>>, right: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
-    match (left, right) {
-        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
-        (Bound::Included(left), Bound::Included(right)) => {
-            Bound::Included(if left >= right { left } else { right })
-        }
-        (Bound::Included(left), Bound::Excluded(right)) => {
-            if left > right {
-                Bound::Included(left)
-            } else {
-                Bound::Excluded(right)
-            }
-        }
-        (Bound::Excluded(left), Bound::Included(right)) => {
-            if left >= right {
-                Bound::Excluded(left)
-            } else {
-                Bound::Included(right)
-            }
-        }
-        (Bound::Excluded(left), Bound::Excluded(right)) => {
-            Bound::Excluded(if left >= right { left } else { right })
-        }
     }
 }
 

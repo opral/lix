@@ -146,8 +146,8 @@ mod tests {
     use crate::CreateBranchOptions;
     use crate::engine::Engine;
     use crate::storage::{
-        GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite, ReadOptions,
-        ScanChunk, ScanOptions, Storage, StorageError, StorageRead, WriteOptions,
+        BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
+        ReadOptions, ScanChunk, Storage, StorageError, StorageRead, WriteOptions,
     };
 
     use super::*;
@@ -255,14 +255,14 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: crate::storage::StorageSpace,
             range: KeyRange,
-            options: ScanOptions,
-        ) -> Result<ScanChunk, StorageError> {
+            options: BeginScanOptions,
+        ) -> Result<ScanCursor, StorageError> {
             self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.scan(space, range, options).await
+            self.inner.begin_scan(space, range, options).await
         }
     }
 

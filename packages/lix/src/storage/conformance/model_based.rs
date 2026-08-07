@@ -10,8 +10,8 @@ use crate::storage::conformance::{
     open_storage,
 };
 use crate::storage::{
-    CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, ReadEntry,
-    ReadOptions, ScanOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
+    ReadEntry, ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite,
     WriteOptions,
 };
 
@@ -189,18 +189,19 @@ where
     R: StorageRead,
 {
     for (space, model) in models {
-        let chunk = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 *space,
                 KeyRange {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
                 },
-                ScanOptions {
-                    limit_rows: usize::MAX,
-                    ..ScanOptions::default()
-                },
+                BeginScanOptions::default(),
             )
+            .await
+            .map_err(|error| format!("{label}: begin full scan in {space:?} failed: {error}"))?;
+        let chunk = cursor
+            .next_page(usize::MAX)
             .await
             .map_err(|error| format!("{label}: full scan in {space:?} failed: {error}"))?;
         let actual = chunk_entries(&chunk.entries);
@@ -254,24 +255,30 @@ where
 
     let scan_space = TEST_SPACES[rng.usize(TEST_SPACES.len())];
     let scan_model = models.get(&scan_space).expect("test space has a model");
-    let range = random_range(rng, keys);
+    let mut range = random_range(rng, keys);
     let resume_after = if rng.usize(3) == 0 {
         None
     } else {
         Some(keys[rng.usize(keys.len())].clone())
     };
+    if let Some(resume_after) = &resume_after {
+        range.lower = max_lower_bound(range.lower, Bound::Excluded(resume_after.clone()));
+    }
     let limit_rows = rng.usize(keys.len() + 2);
     let projection = random_projection(rng);
-    let chunk = read
-        .scan(
+    let mut cursor = read
+        .begin_scan(
             scan_space,
             range.clone(),
-            ScanOptions {
+            BeginScanOptions {
                 projection,
-                limit_rows,
-                resume_after: resume_after.clone(),
+                ..BeginScanOptions::default()
             },
         )
+        .await
+        .map_err(|error| format!("{label}: begin randomized scan failed: {error}"))?;
+    let chunk = cursor
+        .next_page(limit_rows)
         .await
         .map_err(|error| format!("{label}: randomized scan failed: {error}"))?;
     let eligible = scan_model
@@ -314,6 +321,32 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
         Bound::Unbounded => true,
     };
     lower_matches && upper_matches
+}
+
+fn max_lower_bound(left: Bound<Key>, right: Bound<Key>) -> Bound<Key> {
+    match (left, right) {
+        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
+        (Bound::Included(left), Bound::Included(right)) => {
+            Bound::Included(std::cmp::max(left, right))
+        }
+        (Bound::Included(left), Bound::Excluded(right)) => {
+            if left > right {
+                Bound::Included(left)
+            } else {
+                Bound::Excluded(right)
+            }
+        }
+        (Bound::Excluded(left), Bound::Included(right)) => {
+            if left >= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Included(right)
+            }
+        }
+        (Bound::Excluded(left), Bound::Excluded(right)) => {
+            Bound::Excluded(std::cmp::max(left, right))
+        }
+    }
 }
 
 fn chunk_entries(entries: &[ReadEntry]) -> Vec<(Key, Bytes)> {

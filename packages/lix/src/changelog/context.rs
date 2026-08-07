@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Bound;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,8 +34,8 @@ use crate::json_store::JsonSlotRef;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapter,
-    StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions, StorageScanOptions,
+    StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StorageGetManyRequest,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions,
     StorageSpace, StorageWriteSet, exact_get_many,
 };
 use crate::{LixError, storage_codec};
@@ -1037,21 +1038,29 @@ async fn native_scan<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let after_key = after.map(|key| StorageKey(Bytes::from(key)));
-    let opts = StorageScanOptions {
-        projection,
-        limit_rows: limit,
-        resume_after: after_key,
-    };
-    let chunk = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::from(prefix),
-        },
-    )
-    .collect(read, opts)
-    .await?
-    .value;
+    let mut range = StoragePrefix {
+        bytes: Bytes::from(prefix),
+    }
+    .to_range()?;
+    if let Some(after) = after {
+        let after = StorageKey(Bytes::from(after));
+        range.lower = match range.lower {
+            Bound::Included(lower) if lower > after => Bound::Included(lower),
+            Bound::Excluded(lower) if lower >= after => Bound::Excluded(lower),
+            _ => Bound::Excluded(after),
+        };
+    }
+    let chunk = ScanPlan::range(space, range)
+        .page(
+            read,
+            StorageBeginScanOptions {
+                projection,
+                ..StorageBeginScanOptions::default()
+            },
+            limit,
+        )
+        .await?
+        .value;
     let has_more = chunk.has_more;
     let mut keys = Vec::with_capacity(chunk.entries.len());
     let mut values = Vec::with_capacity(chunk.entries.len());

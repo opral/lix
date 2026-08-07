@@ -13,9 +13,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::storage::{
-        CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory, Prefix,
-        ProjectedValue, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
-        StoredValue, WriteOptions,
+        BeginScanOptions, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
+        Memory, Prefix, ProjectedValue, ReadOptions, ScanChunk, ScanCursor, SpaceId, StorageError,
+        StorageRead, StorageScanSource, StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{
         PointReadPlan, ScanPlan, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
@@ -66,20 +66,37 @@ mod tests {
             }
         }
 
-        fn scan(
+        fn begin_scan(
             &self,
             _space: StorageSpace,
             range: KeyRange,
-            _opts: ScanOptions,
-        ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+            opts: BeginScanOptions,
+        ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
             async move {
                 self.scan_calls.fetch_add(1, Ordering::Relaxed);
-                self.scan_ranges.lock().expect("spy lock").push(range);
+                self.scan_ranges
+                    .lock()
+                    .expect("spy lock")
+                    .push(range.clone());
+                ScanCursor::from_source(range, opts.order, EmptyScanSource)
+            }
+        }
+    }
+
+    struct EmptyScanSource;
+
+    impl StorageScanSource for EmptyScanSource {
+        fn next_page(
+            &mut self,
+            _limit_rows: usize,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>>
+        {
+            Box::pin(async {
                 Ok(ScanChunk {
                     entries: Vec::new(),
                     has_more: false,
                 })
-            }
+            })
         }
     }
 
@@ -102,12 +119,12 @@ mod tests {
             Ok(GetManyResult::new(vec![None; self.returned]))
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             _space: StorageSpace,
             _range: KeyRange,
-            _opts: ScanOptions,
-        ) -> Result<ScanChunk, StorageError> {
+            _opts: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
             unreachable!("wrong-cardinality test does not scan")
         }
     }
@@ -126,12 +143,12 @@ mod tests {
             Ok(GetManyResult::new(Vec::new()))
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             _space: StorageSpace,
             _range: KeyRange,
-            _opts: ScanOptions,
-        ) -> Result<ScanChunk, StorageError> {
+            _opts: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
             unreachable!("overlap test does not scan")
         }
     }
@@ -285,7 +302,7 @@ mod tests {
                     bytes: Bytes::copy_from_slice(prefix),
                 },
             )
-            .collect(&read, ScanOptions::default())
+            .first_page(&read, BeginScanOptions::default())
             .await
             .expect("prefix scan");
         }
@@ -310,7 +327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_limit_prefix_scan_skips_storage_and_reports_shape() {
+    async fn zero_limit_prefix_cursor_cancels_without_fetching_a_page() {
         let spy = SpyRead::default();
         let scan_calls = Arc::clone(&spy.scan_calls);
         let read = StorageAdapterReadScope::new(spy);
@@ -320,27 +337,26 @@ mod tests {
                 bytes: Bytes::from_static(b"a"),
             },
         )
-        .collect(
+        .page(
             &read,
-            ScanOptions {
+            BeginScanOptions {
                 projection: CoreProjection::KeyOnly,
-                limit_rows: 0,
-                resume_after: Some(key("resume")),
+                ..BeginScanOptions::default()
             },
+            0,
         )
         .await
         .expect("zero-limit prefix scan");
 
         assert!(result.value.entries.is_empty());
         assert!(!result.value.has_more);
-        assert_eq!(scan_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(scan_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             result.stats,
             StorageReadStats {
                 prefix_lowered: 1,
                 prefix_scan_chunks: 1,
                 scan_key_only_chunks: 1,
-                scan_resume_after: 1,
                 ..StorageReadStats::default()
             }
         );
@@ -369,27 +385,16 @@ mod tests {
             },
         );
 
-        let page = plan
-            .collect(
-                &read,
-                ScanOptions {
-                    limit_rows: 1,
-                    ..ScanOptions::default()
-                },
-            )
+        let mut cursor = plan
+            .begin(&read, BeginScanOptions::default())
             .await
-            .expect("first page");
+            .expect("begin cursor");
+        let page = cursor.next_page(1).await.expect("first page");
         assert_eq!(page.value.entries[0].key, key("a"));
         assert!(page.value.has_more);
 
-        let next = plan
-            .collect(
-                &read,
-                ScanOptions {
-                    resume_after: Some(page.value.entries[0].key.clone()),
-                    ..ScanOptions::default()
-                },
-            )
+        let next = cursor
+            .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
             .await
             .expect("second page");
         assert_eq!(

@@ -19,8 +19,8 @@ use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
 };
 use crate::storage_adapter::{
-    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
-    StorageScanOptions, StorageSpaceId, StorageValue,
+    StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
+    StorageProjectedValue, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -440,18 +440,13 @@ async fn scan_all_values_for_plan(
     plan: &ScanPlan,
 ) -> Result<Vec<Vec<u8>>, LixError> {
     let mut values = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         values.extend(
             page.value
                 .entries
@@ -459,7 +454,7 @@ async fn scan_all_values_for_plan(
                 .filter_map(|entry| full_value(entry.value))
                 .map(|bytes| bytes.to_vec()),
         );
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -2161,7 +2156,7 @@ mod tests {
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
-            opts: StorageScanOptions,
+            opts: StorageBeginScanOptions,
         ) -> Result<StorageScanChunk, StorageError> {
             let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE;
             let manifest_hash = if is_manifest_scan {

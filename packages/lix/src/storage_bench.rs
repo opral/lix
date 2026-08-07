@@ -5,8 +5,8 @@ use bytes::Bytes;
 use crate::storage::{ReadOptions, WriteOptions};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
-    StorageProjectedValue, StorageScanOptions, StorageWriteOptions, StorageWriteSet,
+    ScanPlan, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StoragePrefix, StorageProjectedValue, StorageWriteOptions, StorageWriteSet,
     StorageWriteSetError,
 };
 
@@ -2159,10 +2159,10 @@ where
         let result = plan
             .collect(
                 read,
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     projection: StorageCoreProjection::FullValue,
                     resume_after,
-                    ..StorageScanOptions::default()
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await
@@ -2215,10 +2215,10 @@ where
         let result = plan
             .collect(
                 read,
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     projection: StorageCoreProjection::FullValue,
                     resume_after,
-                    ..StorageScanOptions::default()
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await

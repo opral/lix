@@ -13,8 +13,8 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey,
-    StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageBeginScanOptions, StorageGetOptions,
+    StorageKey, StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
@@ -228,18 +228,13 @@ where
             },
         );
         let mut rows = Vec::new();
-        let mut resume_after = None;
+        let mut cursor = plan
+            .begin(&self.store, StorageBeginScanOptions::default())
+            .await?;
         loop {
-            let page = plan
-                .collect(
-                    &self.store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
                 let key = storage_codec::decode::<BranchHeadControlKey>(
                     "branch-head control key",
@@ -248,7 +243,7 @@ where
                 let control = decode_projected_value(entry.value)?;
                 rows.push((key.branch_id, control));
             }
-            if !page.value.has_more || resume_after.is_none() {
+            if !page.value.has_more {
                 break;
             }
         }

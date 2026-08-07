@@ -2,10 +2,7 @@ use std::future::Future;
 use std::ops::Bound;
 use std::pin::Pin;
 
-use crate::storage::{
-    BeginScanOptions, Key, KeyRange, ScanChunk, ScanOptions, ScanOrder, StorageError, StorageRead,
-    StorageSpace,
-};
+use crate::storage::{Key, KeyRange, ScanChunk, ScanOrder, StorageError};
 
 /// Ephemeral iterator state owned by a coherent storage read view.
 ///
@@ -95,80 +92,6 @@ impl<'a> ScanCursor<'a> {
             previous = Some(&entry.key);
         }
         true
-    }
-}
-
-pub(crate) fn legacy_scan_cursor<'a, R>(
-    read: &'a R,
-    space: StorageSpace,
-    range: KeyRange,
-    opts: BeginScanOptions,
-) -> Result<ScanCursor<'a>, StorageError>
-where
-    R: StorageRead + ?Sized,
-{
-    if opts.order == ScanOrder::Descending {
-        return Err(StorageError::Unsupported(
-            crate::storage::Capability::ReverseScan,
-        ));
-    }
-    ScanCursor::from_source(
-        range.clone(),
-        opts.order,
-        RestartingScanSource {
-            read,
-            space,
-            range,
-            projection: opts.projection,
-            resume_after: None,
-            finished: false,
-        },
-    )
-}
-
-struct RestartingScanSource<'a, R>
-where
-    R: StorageRead + ?Sized,
-{
-    read: &'a R,
-    space: StorageSpace,
-    range: KeyRange,
-    projection: crate::storage::CoreProjection,
-    resume_after: Option<Key>,
-    finished: bool,
-}
-
-impl<R> StorageScanSource for RestartingScanSource<'_, R>
-where
-    R: StorageRead + ?Sized,
-{
-    fn next_page(
-        &mut self,
-        limit_rows: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
-        Box::pin(async move {
-            if self.finished {
-                return Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                });
-            }
-            let chunk = self
-                .read
-                .scan(
-                    self.space,
-                    self.range.clone(),
-                    ScanOptions {
-                        projection: self.projection,
-                        limit_rows,
-                        resume_after: self.resume_after.clone(),
-                    },
-                )
-                .await?;
-            self.resume_after = chunk.entries.last().map(|entry| entry.key.clone());
-            self.finished = !chunk.has_more;
-            Ok(chunk)
-        })
     }
 }
 

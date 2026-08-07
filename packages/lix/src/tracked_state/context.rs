@@ -8399,7 +8399,7 @@ mod tests {
         )
         .collect(
             &read,
-            crate::storage_adapter::StorageScanOptions {
+            crate::storage_adapter::StorageBeginScanOptions {
                 projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
                 limit_rows: usize::MAX,
                 resume_after: None,

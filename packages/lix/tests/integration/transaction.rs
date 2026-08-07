@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use lix::CreateBranchOptions;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
-    PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
-    StorageWrite, WriteOptions,
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
+    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanChunk, SpaceId, Storage, StorageError,
+    StorageRead, StorageWrite, WriteOptions,
 };
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1528,14 +1528,14 @@ impl StorageRead for RecordingRead {
         self.inner.get_many(requests).await
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: lix::storage::StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor, StorageError> {
         self.fail_if_space_matches(space)?;
-        self.inner.scan(space, range, opts).await
+        self.inner.begin_scan(space, range, opts).await
     }
 }
 

@@ -307,13 +307,6 @@ impl Default for BeginScanOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanOptions {
-    pub projection: CoreProjection,
-    pub limit_rows: usize,
-    pub resume_after: Option<Key>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanChunk {
     pub entries: Vec<ReadEntry>,
     pub has_more: bool,
@@ -465,46 +458,5 @@ impl GetManyResult {
             .zip(self.values.iter().cloned())
             .filter_map(|(key, value)| value.map(|value| ReadEntry { key, value }))
             .collect()
-    }
-}
-
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            projection: CoreProjection::FullValue,
-            limit_rows: 1024,
-            resume_after: None,
-        }
-    }
-}
-
-impl ScanOptions {
-    pub fn page_size(&self) -> usize {
-        self.limit_rows.min(MAX_SCAN_PAGE_ROWS)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{MAX_SCAN_PAGE_ROWS, ScanOptions};
-
-    #[test]
-    fn scan_page_size_is_bounded() {
-        assert_eq!(
-            ScanOptions {
-                limit_rows: usize::MAX,
-                ..ScanOptions::default()
-            }
-            .page_size(),
-            MAX_SCAN_PAGE_ROWS
-        );
-        assert_eq!(
-            ScanOptions {
-                limit_rows: 17,
-                ..ScanOptions::default()
-            }
-            .page_size(),
-            17
-        );
     }
 }

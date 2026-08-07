@@ -13,8 +13,8 @@ use super::{
     ConformanceStatus, StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
 use crate::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    BeginScanOptions, CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange,
+    Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk,
     SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
     WriteStats,
 };
@@ -371,11 +371,11 @@ impl StorageRead for BrokenRead {
         &self,
         space: crate::storage::StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
+        opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         async move {
             let range = broken_physical_range(space.id, range);
-            let opts = ScanOptions {
+            let opts = BeginScanOptions {
                 resume_after: opts
                     .resume_after
                     .as_ref()
@@ -555,7 +555,7 @@ fn scan_from_map(
     entries: &BrokenMap,
     mode: BrokenMode,
     range: KeyRange,
-    opts: &ScanOptions,
+    opts: &BeginScanOptions,
 ) -> ScanChunk {
     let mut candidates = entries
         .iter()

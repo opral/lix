@@ -14,10 +14,9 @@ use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapterRead,
-    StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
-    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
-    exact_get_many,
+    StorageBeginScanOptions, StorageCoreProjection, StorageError, StorageGetManyRequest,
+    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
+    StorageScanCursor, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet, exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -9331,18 +9330,19 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
             upper: Bound::Unbounded,
         },
     );
-    let mut resume_after = None;
     let mut emitted = 0usize;
+    let mut cursor = plan
+        .begin(
+            store,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
         for entry_batch in page
             .value
@@ -9438,7 +9438,6 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
         if !page.value.has_more {
             break;
         }
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
     validate_no_orphan_commit_delta_segments(store).await?;
     Ok(emitted)
@@ -9506,17 +9505,18 @@ async fn validate_no_orphan_commit_delta_segments(
             upper: Bound::Unbounded,
         },
     );
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(
+            store,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
         if page.value.entries.is_empty() {
             break;
@@ -9580,7 +9580,6 @@ async fn validate_no_orphan_commit_delta_segments(
         if !page.value.has_more {
             break;
         }
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
     Ok(())
 }
@@ -10039,18 +10038,19 @@ async fn scan_full_space(
             upper: Bound::Unbounded,
         },
     );
-    let mut resume_after = None;
     let mut rows = Vec::new();
+    let mut cursor = plan
+        .begin(
+            store,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
         for entry in &page.value.entries {
             let StorageProjectedValue::FullValue(bytes) = &entry.value else {
@@ -10061,7 +10061,6 @@ async fn scan_full_space(
         if !page.value.has_more {
             break;
         }
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
     Ok(rows)
 }
@@ -11798,19 +11797,19 @@ where
         Ok(result)
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: StorageKeyRange,
-        opts: StorageScanOptions,
-    ) -> Result<StorageScanChunk, StorageError> {
+        opts: StorageBeginScanOptions,
+    ) -> Result<StorageScanCursor<'_>, StorageError> {
         if space == TRACKED_STATE_TREE_CHUNK_SPACE {
             return Err(StorageError::Io(
                 "tracked-state staged audit supports point reads only for overlay spaces"
                     .to_string(),
             ));
         }
-        self.store.scan(space, range, opts).await
+        self.store.begin_scan(space, range, opts).await
     }
 }
 

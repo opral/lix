@@ -56,8 +56,8 @@ use crate::live_state::{
     MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
@@ -807,18 +807,13 @@ where
         },
     );
     let mut active = BTreeMap::new();
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
             let key: BranchRefKey = match storage_codec::decode(
                 "tracked working-diff marker key",
@@ -860,7 +855,7 @@ where
                 },
             );
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -3872,7 +3867,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&projection_read, StorageScanOptions::default())
+        .first_page(&projection_read, StorageBeginScanOptions::default())
         .await
         .expect("file schema markers should scan")
         .value
@@ -4465,7 +4460,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("scan file-schema markers")
         .value
@@ -4530,7 +4525,7 @@ mod tests {
                 bytes: Bytes::new(),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("scan hot rows for fixture")
         .value
@@ -5188,7 +5183,7 @@ mod tests {
                     bytes: Bytes::new(),
                 },
             )
-            .collect(&read, StorageScanOptions::default())
+            .first_page(&read, StorageBeginScanOptions::default())
             .await
             .expect("scan current-state hot storage")
             .value

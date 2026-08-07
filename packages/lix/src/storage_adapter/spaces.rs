@@ -20,8 +20,8 @@ impl StorageSpace {
         encode_physical_key(self.id, key)
     }
 
-    pub fn encode_range(&self, range: KeyRange, resume_after: Option<&Key>) -> KeyRange {
-        encode_physical_range(self.id, range, resume_after)
+    pub fn encode_range(&self, range: KeyRange) -> KeyRange {
+        encode_physical_range(self.id, range)
     }
 }
 
@@ -42,23 +42,11 @@ pub(crate) fn decode_logical_key(key: &Key) -> Result<Key, StorageError> {
     Ok(Key(key.0.slice(4..)))
 }
 
-pub(crate) fn encode_physical_range(
-    space: SpaceId,
-    range: KeyRange,
-    resume_after: Option<&Key>,
-) -> KeyRange {
-    let range_lower = match range.lower {
+pub(crate) fn encode_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+    let lower = match range.lower {
         Bound::Included(key) => Bound::Included(encode_physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(encode_physical_key(space, &key)),
         Bound::Unbounded => Bound::Included(space_lower_bound(space)),
-    };
-
-    let lower = match resume_after {
-        Some(resume_after) => max_lower_bound(
-            range_lower,
-            Bound::Excluded(encode_physical_key(space, resume_after)),
-        ),
-        None => range_lower,
     };
 
     let upper = match range.upper {
@@ -68,40 +56,6 @@ pub(crate) fn encode_physical_range(
     };
 
     KeyRange { lower, upper }
-}
-
-fn max_lower_bound(left: Bound<Key>, right: Bound<Key>) -> Bound<Key> {
-    match (left, right) {
-        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
-        (Bound::Included(left), Bound::Included(right)) => {
-            if left >= right {
-                Bound::Included(left)
-            } else {
-                Bound::Included(right)
-            }
-        }
-        (Bound::Included(left), Bound::Excluded(right)) => {
-            if left > right {
-                Bound::Included(left)
-            } else {
-                Bound::Excluded(right)
-            }
-        }
-        (Bound::Excluded(left), Bound::Included(right)) => {
-            if left >= right {
-                Bound::Excluded(left)
-            } else {
-                Bound::Included(right)
-            }
-        }
-        (Bound::Excluded(left), Bound::Excluded(right)) => {
-            if left >= right {
-                Bound::Excluded(left)
-            } else {
-                Bound::Excluded(right)
-            }
-        }
-    }
 }
 
 fn space_lower_bound(space: SpaceId) -> Key {
@@ -143,18 +97,14 @@ mod tests {
     }
 
     #[test]
-    fn resume_after_before_lower_keeps_lower_bound() {
+    fn included_logical_lower_bound_is_encoded() {
         use std::ops::Bound;
 
         let range = crate::storage::KeyRange {
             lower: Bound::Included(Key(bytes::Bytes::from_static(b"m"))),
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(
-            SpaceId(7),
-            range,
-            Some(&Key(bytes::Bytes::from_static(b"a"))),
-        );
+        let encoded = super::encode_physical_range(SpaceId(7), range);
 
         assert_eq!(
             encoded.lower,
@@ -166,18 +116,14 @@ mod tests {
     }
 
     #[test]
-    fn resume_after_inside_range_becomes_exclusive_lower_bound() {
+    fn exclusive_logical_lower_bound_is_encoded() {
         use std::ops::Bound;
 
         let range = crate::storage::KeyRange {
-            lower: Bound::Included(Key(bytes::Bytes::from_static(b"m"))),
+            lower: Bound::Excluded(Key(bytes::Bytes::from_static(b"r"))),
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(
-            SpaceId(7),
-            range,
-            Some(&Key(bytes::Bytes::from_static(b"r"))),
-        );
+        let encoded = super::encode_physical_range(SpaceId(7), range);
 
         assert_eq!(
             encoded.lower,
@@ -196,7 +142,7 @@ mod tests {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(SpaceId(u32::MAX), range, None);
+        let encoded = super::encode_physical_range(SpaceId(u32::MAX), range);
 
         assert_eq!(encoded.upper, Bound::Unbounded);
     }
@@ -209,7 +155,7 @@ mod tests {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(SpaceId(7), range, None);
+        let encoded = super::encode_physical_range(SpaceId(7), range);
 
         assert_eq!(
             encoded.upper,

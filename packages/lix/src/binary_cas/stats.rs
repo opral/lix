@@ -7,8 +7,8 @@ use crate::binary_cas::kv::{
     BINARY_CAS_MANIFEST_SPACE,
 };
 use crate::storage_adapter::{
-    StorageAdapterRead, StorageCoreProjection, StorageError, StorageKeyRange,
-    StorageProjectedValue, StorageScanOptions, StorageSpace,
+    StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StorageError,
+    StorageKeyRange, StorageProjectedValue, StorageSpace,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -89,30 +89,27 @@ where
         lower: Bound::Unbounded,
         upper: Bound::Unbounded,
     };
-    let mut resume_after = None;
     let mut row_count = 0_u64;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            range,
+            StorageBeginScanOptions {
+                projection,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
 
     loop {
-        let result = read
-            .scan(
-                space,
-                range.clone(),
-                StorageScanOptions {
-                    projection,
-                    limit_rows: 4096,
-                    resume_after,
-                },
-            )
-            .await?;
+        let result = cursor.next_page(4096).await?;
         row_count += result.entries.len() as u64;
-        let last_key = result.entries.last().map(|entry| entry.key.clone());
         for entry in result.entries {
             visit(entry.value)?;
         }
-        if !result.has_more || last_key.is_none() {
+        if !result.has_more {
             break;
         }
-        resume_after = last_key;
     }
 
     Ok(row_count)

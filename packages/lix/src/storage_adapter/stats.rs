@@ -10,7 +10,6 @@ pub struct StorageReadStats {
     pub scan_full_value_chunks: u64,
     pub scan_rows: u64,
     pub scan_has_more: u64,
-    pub scan_resume_after: u64,
     pub scan_limit_rows_total: u64,
     pub scan_limit_rows_max: u64,
 }
@@ -27,7 +26,6 @@ impl StorageReadStats {
         self.scan_full_value_chunks += other.scan_full_value_chunks;
         self.scan_rows += other.scan_rows;
         self.scan_has_more += other.scan_has_more;
-        self.scan_resume_after += other.scan_resume_after;
         self.scan_limit_rows_total += other.scan_limit_rows_total;
         self.scan_limit_rows_max = self.scan_limit_rows_max.max(other.scan_limit_rows_max);
     }

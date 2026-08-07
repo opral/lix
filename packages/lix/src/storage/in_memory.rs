@@ -9,9 +9,9 @@ use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestCon
 use crate::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOptions, ScanOrder, SpaceId, Storage,
-    StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
-    ValueSemantics, WriteOptions, WriteStats,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
+    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
+    WriteOptions, WriteStats,
 };
 
 type InMemoryMap = PersistentMap<Key, Bytes>;
@@ -331,27 +331,6 @@ impl StorageRead for MemoryRead {
             },
         )
     }
-
-    async fn scan(
-        &self,
-        space: StorageSpace,
-        range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
-        let physical = physical_range(space.id, range);
-        let physical_opts = ScanOptions {
-            resume_after: opts
-                .resume_after
-                .as_ref()
-                .map(|key| physical_key(space.id, key)),
-            ..opts
-        };
-        let mut chunk = collect_range_chunk(&self.entries, physical, &physical_opts);
-        for entry in &mut chunk.entries {
-            entry.key = Key(entry.key.0.slice(4..));
-        }
-        Ok(chunk)
-    }
 }
 
 struct MemoryScanSource<'a> {
@@ -456,25 +435,12 @@ impl StorageWrite for MemoryWrite {
         range: KeyRange,
     ) -> Result<(), StorageError> {
         let range = physical_range(space.id, range);
-        let mut base_keys = Vec::new();
-        let mut resume_after = None;
-        loop {
-            let chunk = collect_range_chunk(
-                &self.base,
-                range.clone(),
-                &ScanOptions {
-                    limit_rows: usize::MAX,
-                    projection: CoreProjection::KeyOnly,
-                    resume_after,
-                },
-            );
-            let next_resume = chunk.entries.last().map(|entry| entry.key.clone());
-            base_keys.extend(chunk.entries.into_iter().map(|entry| entry.key));
-            if !chunk.has_more {
-                break;
-            }
-            resume_after = next_resume;
-        }
+        let base_keys = self
+            .base
+            .entries_range(lower_bound(&range), upper_bound(&range), usize::MAX)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
 
         let overlay_puts_before = self.overlay.puts.len();
         self.overlay
@@ -551,17 +517,12 @@ fn check_preconditions(
                 } => entries
                     .get(&physical_key(space.id, key))
                     .is_some_and(|value| value == expected),
-                Precondition::RangeEmpty { space, range } => collect_range_chunk(
-                    entries,
-                    physical_range(space.id, range.clone()),
-                    &ScanOptions {
-                        limit_rows: 1,
-                        projection: CoreProjection::KeyOnly,
-                        resume_after: None,
-                    },
-                )
-                .entries
-                .is_empty(),
+                Precondition::RangeEmpty { space, range } => {
+                    let range = physical_range(space.id, range.clone());
+                    entries
+                        .entries_range(lower_bound(&range), upper_bound(&range), 1)
+                        .is_empty()
+                }
                 Precondition::BranchEquals { .. } => false,
             };
             (!matches).then_some(PreconditionFailure { index })
@@ -574,61 +535,16 @@ fn check_preconditions(
     }
 }
 
-fn collect_range_chunk(entries: &InMemoryMap, range: KeyRange, opts: &ScanOptions) -> ScanChunk {
-    if opts.page_size() == 0 {
-        return ScanChunk {
-            entries: Vec::new(),
-            has_more: false,
-        };
-    }
-
-    let lower = lower_bound(&range, opts.resume_after.as_ref());
-    let upper = upper_bound(&range);
-    if bounds_are_empty(&lower, &upper) {
-        return ScanChunk {
-            entries: Vec::new(),
-            has_more: false,
-        };
-    }
-
-    let page_size = opts.page_size();
-    let mut rows = entries.entries_range(lower, upper, page_size.saturating_add(1));
-    let has_more = rows.len() > page_size;
-    rows.truncate(page_size);
-    let collected = rows
-        .into_iter()
-        .map(|(key, value)| ReadEntry {
-            key,
-            value: project_value(&value, opts.projection),
-        })
-        .collect();
-    ScanChunk {
-        entries: collected,
-        has_more,
-    }
-}
-
-fn lower_bound<'a>(range: &'a KeyRange, resume_after: Option<&'a Key>) -> Bound<&'a Key> {
+fn lower_bound(range: &KeyRange) -> Bound<&Key> {
     let range_lower = match &range.lower {
         Bound::Included(key) => Some((key, true)),
         Bound::Excluded(key) => Some((key, false)),
         Bound::Unbounded => None,
     };
-
-    match (range_lower, resume_after) {
-        (Some((lower, lower_inclusive)), Some(resume_after)) => {
-            if resume_after >= lower {
-                Bound::Excluded(resume_after)
-            } else if lower_inclusive {
-                Bound::Included(lower)
-            } else {
-                Bound::Excluded(lower)
-            }
-        }
-        (Some((lower, true)), None) => Bound::Included(lower),
-        (Some((lower, false)), None) => Bound::Excluded(lower),
-        (None, Some(resume_after)) => Bound::Excluded(resume_after),
-        (None, None) => Bound::Unbounded,
+    match range_lower {
+        Some((lower, true)) => Bound::Included(lower),
+        Some((lower, false)) => Bound::Excluded(lower),
+        None => Bound::Unbounded,
     }
 }
 
@@ -637,15 +553,6 @@ fn upper_bound(range: &KeyRange) -> Bound<&Key> {
         Bound::Included(key) => Bound::Included(key),
         Bound::Excluded(key) => Bound::Excluded(key),
         Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
-fn bounds_are_empty(lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
-    match (lower, upper) {
-        (_, Bound::Unbounded) | (Bound::Unbounded, _) => false,
-        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
-        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
-        | (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
     }
 }
 
@@ -683,9 +590,9 @@ mod tests {
 
     use crate::storage::conformance::{ConformanceStatus, run_storage_conformance};
     use crate::storage::{
-        GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory, ProjectedValue,
-        PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
-        StorageSpace, StorageWrite, StoredValue, WriteOptions,
+        BeginScanOptions, GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory,
+        ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError,
+        StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
 
     #[tokio::test]
@@ -752,15 +659,19 @@ mod tests {
             .begin_read(ReadOptions::default())
             .await
             .expect("begin verification read");
-        let chunk = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 space,
                 KeyRange {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
                 },
-                ScanOptions::default(),
+                BeginScanOptions::default(),
             )
+            .await
+            .expect("begin scan after range delete");
+        let chunk = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan after range delete");
         assert!(chunk.entries.is_empty());

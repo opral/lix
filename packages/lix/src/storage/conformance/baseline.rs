@@ -14,8 +14,8 @@ use crate::storage::conformance::{
     open_storage,
 };
 use crate::storage::{
-    CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition, ProjectedValue,
-    ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
+    BeginScanOptions, CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition,
+    ProjectedValue, ReadEntry, ReadOptions, ScanChunk, SpaceId, Storage, StorageError, StorageRead,
     StorageSpace, StorageWrite, WriteOptions,
 };
 
@@ -527,7 +527,7 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         },
-        ScanOptions::default(),
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("scan_range failed: {error}"))?;
@@ -556,34 +556,23 @@ where
         upper: Bound::Excluded(key("e")),
     };
 
-    let first = scan_range(
-        &read,
-        test_space,
-        range.clone(),
-        ScanOptions {
-            limit_rows: 2,
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(|error| format!("first scan_range failed: {error}"))?;
+    let mut cursor = read
+        .begin_scan(test_space, range, BeginScanOptions::default())
+        .await
+        .map_err(|error| format!("begin scan_range failed: {error}"))?;
+    let first = cursor
+        .next_page(2)
+        .await
+        .map_err(|error| format!("first scan_range failed: {error}"))?;
     assert_read_entries(&first.entries, &[("b", "B"), ("c", "C")])?;
     if !first.has_more {
         return Err("first scan chunk did not report has_more".to_string());
     }
 
-    let second = scan_range(
-        &read,
-        test_space,
-        range,
-        ScanOptions {
-            limit_rows: 2,
-            resume_after: Some(key("c")),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(|error| format!("second scan_range failed: {error}"))?;
+    let second = cursor
+        .next_page(2)
+        .await
+        .map_err(|error| format!("second scan_range failed: {error}"))?;
     assert_read_entries(&second.entries, &[("d", "D")])?;
     if second.has_more {
         return Err("last scan chunk unexpectedly reported has_more".to_string());
@@ -619,16 +608,19 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let first = read
-        .scan(
+    let mut cursor = read
+        .begin_scan(
             TEST_SPACE,
             full_key_range(),
-            ScanOptions {
+            BeginScanOptions {
                 projection: CoreProjection::KeyOnly,
-                limit_rows: usize::MAX,
-                resume_after: None,
+                ..BeginScanOptions::default()
             },
         )
+        .await
+        .map_err(|error| format!("begin capped scan failed: {error}"))?;
+    let first = cursor
+        .next_page(usize::MAX)
         .await
         .map_err(|error| format!("first capped scan failed: {error}"))?;
     if first.entries.len() != MAX_SCAN_PAGE_ROWS || !first.has_more {
@@ -640,21 +632,8 @@ where
         ));
     }
 
-    let resume_after = first
-        .entries
-        .last()
-        .map(|entry| entry.key.clone())
-        .ok_or_else(|| "capped scan unexpectedly returned no resume key".to_string())?;
-    let tail = read
-        .scan(
-            TEST_SPACE,
-            full_key_range(),
-            ScanOptions {
-                projection: CoreProjection::KeyOnly,
-                limit_rows: usize::MAX,
-                resume_after: Some(resume_after),
-            },
-        )
+    let tail = cursor
+        .next_page(usize::MAX)
         .await
         .map_err(|error| format!("tail scan failed: {error}"))?;
     if tail.entries.len() != 1 || tail.has_more {
@@ -700,7 +679,7 @@ where
             lower: Bound::Included(key("b")),
             upper: Bound::Included(key("c")),
         },
-        ScanOptions::default(),
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("included range scan failed: {error}"))?;
@@ -713,7 +692,7 @@ where
             lower: Bound::Excluded(key("b")),
             upper: Bound::Excluded(key("d")),
         },
-        ScanOptions::default(),
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("excluded range scan failed: {error}"))?;
@@ -743,10 +722,7 @@ where
             lower: Bound::Included(key("c")),
             upper: Bound::Excluded(key("e")),
         },
-        ScanOptions {
-            resume_after: Some(key("a")),
-            ..Default::default()
-        },
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("scan_range failed: {error}"))?;
@@ -797,7 +773,7 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         },
-        ScanOptions::default(),
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("scan_range failed: {error}"))?;
@@ -866,23 +842,17 @@ where
     ];
 
     for limit in [1usize, 2, 3] {
-        let mut resume_after = None;
         let mut actual = Vec::new();
-        loop {
-            let chunk = scan_range(
-                &read,
-                test_space,
-                range.clone(),
-                ScanOptions {
-                    limit_rows: limit,
-                    resume_after: resume_after.clone(),
-                    ..Default::default()
-                },
-            )
+        let mut cursor = read
+            .begin_scan(test_space, range.clone(), BeginScanOptions::default())
             .await
-            .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
+            .map_err(|error| format!("begin scan limit {limit} failed: {error}"))?;
+        loop {
+            let chunk = cursor
+                .next_page(limit)
+                .await
+                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
             actual.extend(entries_to_key_values(&chunk.entries));
-            resume_after = chunk.entries.last().map(|entry| entry.key.clone());
             if !chunk.has_more {
                 break;
             }
@@ -939,18 +909,13 @@ where
 
     for limit in [1usize, 2, 3] {
         let mut actual = Vec::new();
+        let mut cursor = read
+            .begin_scan(TEST_SPACE, range.clone(), BeginScanOptions::default())
+            .await
+            .map_err(|error| format!("begin paged scan limit {limit} failed: {error}"))?;
         loop {
-            let resume_after = actual.last().map(|(key, _): &(Key, Bytes)| key.clone());
-            let result = read
-                .scan(
-                    TEST_SPACE,
-                    range.clone(),
-                    ScanOptions {
-                        limit_rows: limit,
-                        resume_after,
-                        ..Default::default()
-                    },
-                )
+            let result = cursor
+                .next_page(limit)
                 .await
                 .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?;
             actual.extend(entries_to_key_values(&result.entries));
@@ -990,7 +955,7 @@ where
             lower: Bound::Included(key("b")),
             upper: Bound::Excluded(key("b")),
         },
-        ScanOptions::default(),
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("scan_range failed: {error}"))?;
@@ -1131,7 +1096,7 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         },
-        ScanOptions::default(),
+        BeginScanOptions::default(),
     )
     .await
     .map_err(|error| format!("old read scan_range failed: {error}"))?;
@@ -1188,7 +1153,7 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         },
-        ScanOptions {
+        BeginScanOptions {
             projection: CoreProjection::KeyOnly,
             ..Default::default()
         },
@@ -1366,10 +1331,15 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
-    let result = read
-        .scan(OTHER_SPACE, full_key_range(), ScanOptions::default())
-        .await
-        .map_err(|error| format!("scan failed: {error}"))?;
+    let result = scan_range_in_space(
+        &read,
+        OTHER_SPACE,
+        full_key_range(),
+        BeginScanOptions::default(),
+        MAX_SCAN_PAGE_ROWS,
+    )
+    .await
+    .map_err(|error| format!("scan failed: {error}"))?;
     let rows = result
         .entries
         .iter()
@@ -1381,17 +1351,18 @@ where
 
     // Resume past the last row: must report exhaustion, never the
     // neighbouring space's rows.
-    let result = read
-        .scan(
-            OTHER_SPACE,
-            full_key_range(),
-            ScanOptions {
-                resume_after: Some(key("c")),
-                ..ScanOptions::default()
-            },
-        )
-        .await
-        .map_err(|error| format!("resume scan failed: {error}"))?;
+    let result = scan_range_in_space(
+        &read,
+        OTHER_SPACE,
+        KeyRange {
+            lower: Bound::Excluded(key("c")),
+            upper: Bound::Unbounded,
+        },
+        BeginScanOptions::default(),
+        MAX_SCAN_PAGE_ROWS,
+    )
+    .await
+    .map_err(|error| format!("resume scan failed: {error}"))?;
     let tail = result
         .entries
         .iter()
@@ -1451,12 +1422,17 @@ where
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
     for (space, expected) in [(TEST_SPACE, 2usize), (OTHER_SPACE, 0), (space(9), 2)] {
-        let rows = read
-            .scan(space, full_key_range(), ScanOptions::default())
-            .await
-            .map_err(|error| format!("scan failed: {error}"))?
-            .entries
-            .len();
+        let rows = scan_range_in_space(
+            &read,
+            space,
+            full_key_range(),
+            BeginScanOptions::default(),
+            MAX_SCAN_PAGE_ROWS,
+        )
+        .await
+        .map_err(|error| format!("scan failed: {error}"))?
+        .entries
+        .len();
         if rows != expected {
             return Err(format!(
                 "truncate must clear only its space: space {space:?} held {rows} rows, expected {expected}"
@@ -1502,10 +1478,15 @@ where
     if result.values[0].as_ref().is_some() {
         return Err("never-written space must miss".to_string());
     }
-    let scan = read
-        .scan(empty, full_key_range(), ScanOptions::default())
-        .await
-        .map_err(|error| format!("scan failed: {error}"))?;
+    let scan = scan_range_in_space(
+        &read,
+        empty,
+        full_key_range(),
+        BeginScanOptions::default(),
+        MAX_SCAN_PAGE_ROWS,
+    )
+    .await
+    .map_err(|error| format!("scan failed: {error}"))?;
     if !scan.entries.is_empty() || scan.has_more {
         return Err("never-written space must scan empty".to_string());
     }
@@ -1594,14 +1575,28 @@ where
 
 async fn scan_range<R>(
     read: &R,
-    _test_space: StorageSpace,
+    test_space: StorageSpace,
     range: KeyRange,
-    opts: ScanOptions,
+    opts: BeginScanOptions,
 ) -> Result<ScanChunk, StorageError>
 where
     R: StorageRead,
 {
-    read.scan(TEST_SPACE, range, opts).await
+    scan_range_in_space(read, test_space, range, opts, MAX_SCAN_PAGE_ROWS).await
+}
+
+async fn scan_range_in_space<R>(
+    read: &R,
+    space: StorageSpace,
+    range: KeyRange,
+    opts: BeginScanOptions,
+    limit_rows: usize,
+) -> Result<ScanChunk, StorageError>
+where
+    R: StorageRead,
+{
+    let mut cursor = read.begin_scan(space, range, opts).await?;
+    cursor.next_page(limit_rows).await
 }
 
 async fn assert_get_entries<StorageImpl>(

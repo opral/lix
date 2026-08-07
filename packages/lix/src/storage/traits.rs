@@ -1,6 +1,6 @@
 use crate::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch,
-    ReadOptions, ScanChunk, ScanCursor, ScanOptions, StorageError, StorageSpace, WriteOptions,
+    ReadOptions, ScanCursor, StorageError, StorageSpace, WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -77,25 +77,7 @@ pub trait StorageRead: Send + Sync {
         space: StorageSpace,
         range: KeyRange,
         opts: BeginScanOptions,
-    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
-        async move { crate::storage::cursor::legacy_scan_cursor(self, space, range, opts) }
-    }
-
-    /// Reads one owned page of a space in ascending logical key order and
-    /// reports whether more rows remain. A page contains at most
-    /// [`crate::storage::MAX_SCAN_PAGE_ROWS`] rows, even when
-    /// `opts.limit_rows` is larger.
-    ///
-    /// `opts.resume_after` is exclusive and must not widen the range: the
-    /// effective lower bound is the maximum of `range.lower` and
-    /// `Excluded(resume_after)`. `limit_rows == 0` emits nothing and
-    /// reports `has_more: false`.
-    fn scan(
-        &self,
-        space: StorageSpace,
-        range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send;
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send;
 }
 
 pub trait StorageWrite: Send {

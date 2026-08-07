@@ -320,13 +320,13 @@ where
         self.read.get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: crate::storage::ScanOptions,
-    ) -> impl Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send {
-        self.read.scan(space, range, opts)
+        opts: crate::storage::BeginScanOptions,
+    ) -> impl Future<Output = Result<crate::storage::ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
     }
 }
 
@@ -377,13 +377,13 @@ where
         self.read.get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: crate::storage::ScanOptions,
-    ) -> impl Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send {
-        self.read.scan(space, range, opts)
+        opts: crate::storage::BeginScanOptions,
+    ) -> impl Future<Output = Result<crate::storage::ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
     }
 }
 

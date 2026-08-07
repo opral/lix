@@ -564,7 +564,7 @@ pub(crate) async fn stage_certified_entity_batches(
                     bytes: Bytes::from(previous_prefix.clone()),
                 },
             )
-            .collect(read, StorageScanOptions::default())
+            .first_page(read, StorageBeginScanOptions::default())
             .await?;
             for entry in manifests.value.entries {
                 let suffix = entry
@@ -628,7 +628,7 @@ pub(crate) async fn stage_certified_entity_batches(
                         bytes: Bytes::from(manifest_prefix),
                     },
                 )
-                .collect(read, StorageScanOptions::default())
+                .first_page(read, StorageBeginScanOptions::default())
                 .await?;
                 for entry in prior_manifests.value.entries {
                     writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
@@ -1003,7 +1003,7 @@ async fn scan_certified_entity_batch_rows(
                     bytes: Bytes::from(prefix),
                 },
             )
-            .collect(store, StorageScanOptions::default())
+            .first_page(store, StorageBeginScanOptions::default())
             .await?;
             manifest_entries.extend(manifests.value.entries);
         }
@@ -1014,7 +1014,7 @@ async fn scan_certified_entity_batch_rows(
                 bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
             },
         )
-        .collect(store, StorageScanOptions::default())
+        .first_page(store, StorageBeginScanOptions::default())
         .await?;
         manifest_entries = manifests.value.entries;
     }
@@ -1138,19 +1138,14 @@ pub(crate) async fn scan_certified_history_rows(
                 bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
             },
         );
-        let mut resume_after = None;
+        let mut cursor = plan
+            .begin(store, StorageBeginScanOptions::default())
+            .await?;
         loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after,
-                        ..StorageScanOptions::default()
-                    },
-                )
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
             let has_more = page.value.has_more;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
                 let value = full_value_bytes(entry.value)?;
                 if certified_batch_commit_id(&value)? != *commit_id {
@@ -1193,11 +1188,6 @@ pub(crate) async fn scan_certified_history_rows(
             }
             if !has_more {
                 break;
-            }
-            if resume_after.is_none() {
-                return Err(head_value_error(
-                    "certified history scan reported more rows without a resume key",
-                ));
             }
         }
     }
@@ -2824,18 +2814,13 @@ async fn packed_exclusive_schema_base_refs(
         },
     );
     let mut refs = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
@@ -2851,7 +2836,7 @@ async fn packed_exclusive_schema_base_refs(
                 index_key: entry.key.0,
             });
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -2902,18 +2887,13 @@ async fn packed_current_base_refs(
         },
     );
     let mut refs = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
@@ -2940,7 +2920,7 @@ async fn packed_current_base_refs(
                 coverage_key: entry.key.0,
             });
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -2976,22 +2956,17 @@ async fn stage_retire_packed_current_bases(
             bytes: Bytes::copy_from_slice(&control_key.0),
         },
     );
-    let mut resume_after = None;
+    let mut cursor = index_plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = index_plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
             writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -3229,7 +3204,7 @@ async fn scan_root_current_base_rows_for_merge(
                     bytes: Bytes::from(hot_scope_prefix(branch_id, generation)),
                 },
             )
-            .collect(store, StorageScanOptions::default())
+            .first_page(store, StorageBeginScanOptions::default())
             .await?
             .value
             .entries;
@@ -3244,7 +3219,7 @@ async fn scan_root_current_base_rows_for_merge(
                             bytes: Bytes::from(prefix),
                         },
                     )
-                    .collect(store, StorageScanOptions::default())
+                    .first_page(store, StorageBeginScanOptions::default())
                     .await?
                     .value
                     .entries,
@@ -4363,18 +4338,13 @@ where
         );
         let mut digest = CompleteHotCollectionDigest::new(branch_id, branch_generation, scope);
         let mut actual = 0_u64;
-        let mut resume_after = None;
+        let mut cursor = plan
+            .begin(&self.store, StorageBeginScanOptions::default())
+            .await?;
         loop {
-            let page = plan
-                .collect(
-                    &self.store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
                 let raw_key = entry.key.0;
                 let raw_value = full_value_bytes(entry.value)?;
@@ -4395,7 +4365,7 @@ where
                         .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
                 }
             }
-            if !page.value.has_more || resume_after.is_none() {
+            if !page.value.has_more {
                 break;
             }
         }
@@ -4520,13 +4490,13 @@ where
                 bytes: Bytes::from(prefix),
             },
         )
-        .collect(
+        .page(
             &self.store,
-            StorageScanOptions {
+            StorageBeginScanOptions {
                 projection: StorageCoreProjection::KeyOnly,
-                limit_rows: 1,
-                ..StorageScanOptions::default()
+                ..StorageBeginScanOptions::default()
             },
+            1,
         )
         .await?;
         if !page.value.entries.is_empty() {
@@ -5590,9 +5560,9 @@ where
                 let page = plan
                     .collect(
                         &self.store,
-                        StorageScanOptions {
+                        StorageBeginScanOptions {
                             resume_after: resume_after.clone(),
-                            ..StorageScanOptions::default()
+                            ..StorageBeginScanOptions::default()
                         },
                     )
                     .await?;
@@ -9524,19 +9494,19 @@ async fn hot_load_file_scope_identities(
         },
     );
     let mut identities = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(
+            store,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
             let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
             if !row
@@ -9554,7 +9524,7 @@ async fn hot_load_file_scope_identities(
                 file_id: row.file_id,
             });
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -9647,18 +9617,13 @@ async fn hot_working_diff_entries(
     );
     let mut actual_coverage = WorkingDiffIndexCoverage::default();
     let mut selected = BTreeMap::<HeadIdentity, Option<WorkingDiffVersion>>::new();
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
             let Ok(bytes) = full_value_bytes(entry.value) else {
                 return Ok(None);
@@ -9713,7 +9678,7 @@ async fn hot_working_diff_entries(
                 return Ok(None);
             }
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -10038,7 +10003,9 @@ async fn hot_scan_entries<'a>(
                 bytes: Bytes::from(prefix),
             },
         );
-        let mut resume_after = None;
+        let mut cursor = plan
+            .begin(store, StorageBeginScanOptions::default())
+            .await?;
         loop {
             let remaining = physical_limit.map(|limit| limit.saturating_sub(rows.len()));
             if matches!(remaining, Some(0)) {
@@ -10049,18 +10016,9 @@ async fn hot_scan_entries<'a>(
                 };
                 return Ok(Some(HotScanEntries::Decoded(rows)));
             }
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        limit_rows: remaining
-                            .unwrap_or_else(|| StorageScanOptions::default().limit_rows),
-                        ..StorageScanOptions::default()
-                    },
-                )
+            let page = cursor
+                .next_page(remaining.unwrap_or(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
                 .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
@@ -10086,7 +10044,7 @@ async fn hot_scan_entries<'a>(
                     }
                 }
             }
-            if !page.value.has_more || resume_after.is_none() {
+            if !page.value.has_more {
                 break;
             }
         }
@@ -10244,24 +10202,18 @@ async fn hot_scan_dense_encoded_key_range<'a>(
     let scan_budget = key_count.saturating_mul(HOT_DENSE_SCAN_MAX_OVERREAD);
     let mut scanned = 0;
     let mut requested_index = 0;
-    let mut resume_after = None;
     let mut values = vec![None; key_count];
+    let mut cursor = plan
+        .begin(store, StorageBeginScanOptions::default())
+        .await?;
     loop {
         let remaining_budget = scan_budget.saturating_sub(scanned);
         if remaining_budget == 0 {
             return Ok(None);
         }
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    limit_rows: remaining_budget.min(StorageScanOptions::default().limit_rows),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(remaining_budget.min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         scanned += page.value.entries.len();
         for entry in page.value.entries {
             while requested_index < key_count && key_at(requested_index) < entry.key.0.as_ref() {
@@ -10272,7 +10224,7 @@ async fn hot_scan_dense_encoded_key_range<'a>(
                 requested_index += 1;
             }
         }
-        if requested_index == key_count || !page.value.has_more || resume_after.is_none() {
+        if requested_index == key_count || !page.value.has_more {
             return Ok(Some(values));
         }
     }
@@ -10342,25 +10294,20 @@ async fn scan_hot_file_entries(
                 bytes: Bytes::from(prefix),
             },
         );
-        let mut resume_after = None;
+        let mut cursor = plan
+            .begin(store, StorageBeginScanOptions::default())
+            .await?;
         loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
                     rows.push((identity, full_value_bytes(entry.value)?));
                 }
             }
-            if !page.value.has_more || resume_after.is_none() {
+            if !page.value.has_more {
                 break;
             }
         }
@@ -11173,9 +11120,9 @@ async fn stage_collect_stale_hot_collection_controls(
         let page = plan
             .collect(
                 store,
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await?;
@@ -11215,9 +11162,9 @@ async fn stage_collect_stale_hot_space(
         let page = plan
             .collect(
                 store,
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await?;
@@ -11263,9 +11210,9 @@ where
         let page = plan
             .collect(
                 store,
-                StorageScanOptions {
+                StorageBeginScanOptions {
                     resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
+                    ..StorageBeginScanOptions::default()
                 },
             )
             .await?;
@@ -11334,24 +11281,24 @@ where
             )),
         },
     );
-    let mut resume_after = None;
+    let mut cursor = plan
+        .begin(
+            store,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         writes.delete_batch(
             HOT_DIFF_SPACE,
             page.value.entries.into_iter().map(|entry| entry.key),
         );
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.value.has_more {
             break;
         }
     }
@@ -11368,8 +11315,9 @@ mod tests {
     use super::*;
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::storage_adapter::{
-        Memory, StorageAdapter, StorageGetManyRequest, StorageGetManyResult, StorageKeyRange,
-        StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageWriteOptions,
+        Memory, StorageAdapter, StorageBeginScanOptions, StorageGetManyRequest,
+        StorageGetManyResult, StorageKeyRange, StorageReadOptions, StorageScanChunk,
+        StorageWriteOptions,
     };
 
     #[test]
@@ -11666,7 +11614,7 @@ mod tests {
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
-            opts: StorageScanOptions,
+            opts: StorageBeginScanOptions,
         ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
             if let Some(scan_calls) = &self.scan_calls {
                 scan_calls.fetch_add(1, Ordering::Relaxed);
@@ -11702,7 +11650,7 @@ mod tests {
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
-            opts: StorageScanOptions,
+            opts: StorageBeginScanOptions,
         ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
             self.inner.scan(space, range, opts).await
         }
@@ -14186,7 +14134,7 @@ mod tests {
                 bytes: Bytes::from(scope.clone()),
             },
         )
-        .collect(&read, StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("scan segmented hot diff");
         assert!(!page.value.has_more);

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite, ReadOptions,
-    ScanChunk, ScanOptions, Storage, StorageError, StorageRead, WriteOptions,
+    BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
+    ReadOptions, ScanChunk, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix::{ExecuteResult, Value};
 use serde::Serialize;
@@ -843,14 +843,14 @@ impl StorageRead for CountingRead {
         self.inner.get_many(requests).await
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: lix::storage::StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor, StorageError> {
         self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan(space, range, opts).await
+        self.inner.begin_scan(space, range, opts).await
     }
 }
 

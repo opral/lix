@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    GetManyRequest, GetManyResult, KeyRange, ScanChunk, ScanOptions, StorageError, StorageRead,
-    StorageSpace,
+    BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, ScanCursor, StorageError,
+    StorageRead, StorageSpace,
 };
 
 /// The async read capability consumed by engine stores.
@@ -19,12 +19,12 @@ pub trait StorageAdapterRead: Send + Sync {
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send;
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send;
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send;
 }
 
 #[derive(Debug)]
@@ -101,13 +101,13 @@ where
         self.read.get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        self.read.scan(space, range, opts)
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
     }
 }
 
@@ -126,13 +126,13 @@ where
         self.read.get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        self.read.scan(space, range, opts)
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
     }
 }
 
@@ -151,13 +151,13 @@ where
         (*self).get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        (*self).scan(space, range, opts)
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        (*self).begin_scan(space, range, opts)
     }
 }
 
@@ -176,12 +176,12 @@ where
         (**self).get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        (**self).scan(space, range, opts)
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        (**self).begin_scan(space, range, opts)
     }
 }

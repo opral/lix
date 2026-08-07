@@ -385,7 +385,7 @@ mod tests {
                 bytes: bytes::Bytes::new(),
             },
         )
-        .collect(&read, crate::storage_adapter::StorageScanOptions::default())
+        .first_page(&read, StorageBeginScanOptions::default())
         .await
         .expect("selected HOT members should scan")
         .value
