@@ -1120,25 +1120,41 @@ async fn prepare_publish<S: Storage>(
     next_root: Id,
     metrics: &mut Metrics,
 ) -> Result<PreparedPublish, StorageError> {
-    validate_root(
-        storage,
-        Root {
-            kind: Kind::Catalog,
-            id: next_root,
-        },
-        metrics,
-    )
-    .await?;
-    let (raw_authority, authority) = load_authority(storage, metrics).await?;
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let wanted = [
+        key(Bytes::from_static(AUTHORITY_KEY)),
+        key(Bytes::from_static(PROGRESS_KEY)),
+    ];
+    let values = get_from(&read, META, &wanted, metrics).await?;
+    let raw_authority = values[0]
+        .clone()
+        .ok_or_else(|| corruption("publication authority is absent"))?;
+    let authority = Authority::decode(&raw_authority)?;
+    let raw_progress = values[1].clone();
+    if let Some(raw_progress) = &raw_progress {
+        let progress = Progress::decode(raw_progress)?;
+        if progress.fenced_authority != raw_authority || progress.cycle != authority.epoch {
+            return Err(corruption("publication observed unbound GC progress"));
+        }
+    }
     if authority.active != expected_root {
         return Err(corruption("publication prepared from stale root"));
     }
+    trace(
+        &read,
+        &[Root {
+            kind: Kind::Catalog,
+            id: next_root,
+        }],
+        metrics,
+    )
+    .await?;
     Ok(PreparedPublish {
         raw_authority,
         authority,
         expected_root,
         next_root,
-        raw_progress: progress_value(storage, metrics).await?,
+        raw_progress,
     })
 }
 

@@ -41,6 +41,29 @@ with its deletes under exact raw authority/progress CAS. Publication CASes the
 same exact bytes and removes progress. Exactly one side can win in either race
 order. There is no fallback or compatibility decoder.
 
+## Explicit invalidation and correction of `97df1eb6`
+
+The first fence correction `97df1eb6feaa23bfba7ba6cc7516e700692dff24`
+is also **REJECTED as a Stage-2 architecture input**. `prepare_publish` validated
+the successor root on one `StorageRead`, then captured authority and progress
+on later independent reads. A deletion page could remove that successor after
+validation, rotate `p0` to `p1`, and let publication capture and successfully
+commit `p1` while selecting the deleted root.
+
+Independent red oracle `41c046e741dc62d167ce7fd76ea77853a21f7e3c`
+(full-index diff SHA-256
+`c05d5db8a740f1eea16c4c8914f40d65ff143ba0577f6cbde92a1fb74a9dfcbd`)
+proved the gap on RocksDB and SlateDB. Its failure log SHA-256 is
+`5e356c6d15c2f9ec7f910a44b27c122b9fe0422712aae820dfdc8efb8a85a651`.
+
+This successor opens exactly one coherent `StorageRead`, reads and decodes the
+raw authority and optional authenticated progress from it, validates the full
+typed successor closure on that same view, and carries those exact raw bytes to
+commit. A delete completed before the snapshot makes validation fail. A delete
+after the snapshot rotates progress and makes the carried CAS fail. Reordering
+independent reads, another selector, another authority, or a retry path is not
+used.
+
 ## Accepted ownership contract
 
 1. A live coherent `StorageRead` is the complete traversal pin. The adapter's
@@ -62,9 +85,10 @@ order. There is no fallback or compatibility decoder.
    publication generation, commit epoch, and GC watermark. Recovery,
    checkpoint, undo, redo, child-branch, and open-upload selectors are semantic
    roots, not reader substitutes or alternate epochs.
-6. Immutable objects/rows are staged before publication. Publication CASes the
-   exact raw authority plus exact present/absent GC progress and records the
-   displaced root as recovery authority.
+6. Immutable objects/rows are staged before publication. One coherent
+   `StorageRead` supplies the exact raw authority/progress bytes and validates
+   the complete typed successor closure. Publication CASes those carried bytes
+   and records the displaced root as recovery authority.
 7. GC persists only a rebuildable exact root-count/digest and deletion revision
    bound to the fenced raw authority. Each deletion page atomically rotates the
    authenticated revision. Deletion-first makes a `p0` publication fail;
@@ -95,6 +119,8 @@ The same sequence passes on RocksDB and SlateDB:
 - publication-first and GC-first races plus competing same-root writers;
 - a real deletion-page-first race, publication-first reverse race,
   restage/retry, and cold reopen on RocksDB and SlateDB;
+- deletion immediately before the coherent publication snapshot and deletion
+  immediately after it, on both adapters;
 - same-root/no-write cursors rejected across distinct `StorageRead` instances;
 - genuine later-page corruption poisoning the live view, followed by a fresh
   `Excluded(last authenticated key)` restart;
@@ -132,11 +158,11 @@ All build and runtime cells completed below 20 minutes.
 
 | Backend | Wall | CPU | Allocated | Peak RSS | Gets / scans / commits | Swept objects / rows | Disk | Physical object I/O |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| RocksDB | 22.439ms | 17.633ms | 1,420,128 B | 22,640 KiB | 896 / 148 / 129 | 46 / 264 | 375,061 B | not exposed |
-| SlateDB | 30.738ms | 18.128ms | 92,945,437 B | 85,720 KiB | 896 / 148 / 129 | 46 / 264 | 108,966 B | 1,067 reads / 468,431 B; 110 writes / 126,380 B; 5 deletes |
+| RocksDB | 20.894ms | 16.081ms | 1,417,628 B | 22,700 KiB | 887 / 148 / 129 | 46 / 264 | 375,062 B | not exposed |
+| SlateDB | 29.924ms | 18.264ms | 91,618,014 B | 77,424 KiB | 887 / 148 / 129 | 46 / 264 | 109,129 B | 1,058 reads / 462,920 B; 111 writes / 126,447 B; 6 deletes |
 
 Every named output field is `pass`. The independent adversarial executable is
-6/6 GREEN in 0.03s. Source gates: `cargo fmt --all -- --check` PASS;
+8/8 GREEN in 0.03s. Source gates: `cargo fmt --all -- --check` PASS;
 `git diff --check` PASS; warnings-denied focused Clippy PASS.
 
 ## Runnable acceptance commands
@@ -164,6 +190,6 @@ CARGO_TARGET_DIR=<isolated-target> CARGO_BUILD_JOBS=2 \
 ```
 
 Corrected full-oracle release binary before commit freeze:
-`77fbe2077887d75f2a67253d9f9229cb1efb4cd720053012b47e7e5165071ed7`.
+`c6840c7e0faf30e3547388046c1e00c07ebce313dba0dd4534b8c10e297fc85f`.
 Corrected adversarial release binary before commit freeze:
-`6067edc5bcab427815d3353423b2e205887b0d2506eddf4f3fc0b3fc3cae6247`.
+`baff0749832c898f4b50f4d805db81f83cd23622dad16819bc0c6c197de1ea46`.

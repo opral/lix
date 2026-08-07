@@ -9,7 +9,6 @@ mod frozen_oracle {
     #[cfg(test)]
     mod adversarial {
         use super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::{Arc, Mutex};
         use tokio::sync::Notify;
         use tokio::time::{Duration, timeout};
@@ -29,49 +28,6 @@ mod frozen_oracle {
             inner: W,
             gate: Arc<DeletePageGate>,
             deletes_target: bool,
-        }
-
-        struct ReadBoundary {
-            armed: AtomicBool,
-            reads: AtomicUsize,
-            reached: Notify,
-            release: Notify,
-        }
-
-        struct ReadBoundaryStorage<S> {
-            inner: S,
-            boundary: Arc<ReadBoundary>,
-        }
-
-        impl<S: Storage> Storage for ReadBoundaryStorage<S> {
-            type Read<'a>
-                = S::Read<'a>
-            where
-                Self: 'a;
-            type Write<'a>
-                = S::Write<'a>
-            where
-                Self: 'a;
-
-            async fn begin_read(
-                &self,
-                options: ReadOptions,
-            ) -> Result<Self::Read<'_>, StorageError> {
-                if self.boundary.armed.load(AtomicOrdering::Acquire)
-                    && self.boundary.reads.fetch_add(1, AtomicOrdering::AcqRel) == 1
-                {
-                    self.boundary.reached.notify_one();
-                    self.boundary.release.notified().await;
-                }
-                self.inner.begin_read(options).await
-            }
-
-            async fn begin_write(
-                &self,
-                options: WriteOptions,
-            ) -> Result<Self::Write<'_>, StorageError> {
-                self.inner.begin_write(options).await
-            }
         }
 
         impl<S: Storage> Storage for GatedStorage<S> {
@@ -313,16 +269,6 @@ mod frozen_oracle {
         }
 
         async fn deletion_between_validation_and_fence_capture_must_fail<S: Storage>(storage: S) {
-            let boundary = Arc::new(ReadBoundary {
-                armed: AtomicBool::new(false),
-                reads: AtomicUsize::new(0),
-                reached: Notify::new(),
-                release: Notify::new(),
-            });
-            let storage = ReadBoundaryStorage {
-                inner: storage,
-                boundary: Arc::clone(&boundary),
-            };
             let mut metrics = Metrics::default();
             let initial = seed(&storage, &mut metrics).await.expect("seed");
             let prepared_gc = prepare_gc(&storage, &mut metrics)
@@ -344,39 +290,25 @@ mod frozen_oracle {
                 .expect("active GC progress");
             let mut progress = Progress::decode(&raw_progress).expect("decode GC progress");
 
-            boundary.reads.store(0, AtomicOrdering::Release);
-            boundary.armed.store(true, AtomicOrdering::Release);
-            let prepare = async {
-                let mut prepare_metrics = Metrics::default();
-                prepare_publish(
-                    &storage,
-                    initial.root.id,
-                    successor.root.id,
-                    &mut prepare_metrics,
-                )
-                .await
-            };
-            let delete = async {
-                timeout(Duration::from_secs(10), boundary.reached.notified())
+            // The publisher first captures authority, progress, and root
+            // validation from one coherent StorageRead at p0.
+            let prepared =
+                prepare_publish(&storage, initial.root.id, successor.root.id, &mut metrics)
                     .await
-                    .expect("publisher did not reach post-validation authority read");
-                let mut delete_metrics = Metrics::default();
-                let result = commit_gc_deletion_page(
-                    &storage,
-                    &raw_authority,
-                    &raw_progress,
-                    &mut progress,
-                    OBJECTS,
-                    vec![successor.objects[0].key.clone()],
-                    &mut delete_metrics,
-                )
-                .await;
-                boundary.release.notify_one();
-                result
-            };
-            let (prepared, deleted) = tokio::join!(prepare, delete);
-            deleted.expect("delete page between validation and fence capture");
-            let prepared = prepared.expect("publisher captures post-delete progress");
+                    .expect("prepare coherent p0 publication");
+            // A delete after that snapshot rotates p0 to p1, so commit must
+            // reject the exact p0 fence carried by the prepared publication.
+            commit_gc_deletion_page(
+                &storage,
+                &raw_authority,
+                &raw_progress,
+                &mut progress,
+                OBJECTS,
+                vec![successor.objects[0].key.clone()],
+                &mut metrics,
+            )
+            .await
+            .expect("delete page after coherent publication snapshot");
             let result = commit_publish(&storage, &prepared, &mut metrics).await;
             let (_, authority) = load_authority(&storage, &mut metrics)
                 .await
@@ -395,6 +327,39 @@ mod frozen_oracle {
                 "root validation and progress capture must be one coherent fenced observation: publication={result:?}, active_is_deleted_successor={}, successor_validation={root_validation:?}",
                 authority.active == successor.root.id,
             );
+
+            // Conversely, a deletion completed before the coherent snapshot
+            // makes root validation fail; no newer p1 fence may bless it.
+            let deleted_before_snapshot = graph(302);
+            stage(&storage, &deleted_before_snapshot, &mut metrics)
+                .await
+                .expect("stage delete-before-snapshot successor");
+            let raw_progress = progress_value(&storage, &mut metrics)
+                .await
+                .expect("load rotated progress")
+                .expect("rotated progress remains active");
+            let mut progress = Progress::decode(&raw_progress).expect("decode rotated progress");
+            commit_gc_deletion_page(
+                &storage,
+                &raw_authority,
+                &raw_progress,
+                &mut progress,
+                OBJECTS,
+                vec![deleted_before_snapshot.objects[0].key.clone()],
+                &mut metrics,
+            )
+            .await
+            .expect("delete page before coherent publication snapshot");
+            assert!(matches!(
+                prepare_publish(
+                    &storage,
+                    initial.root.id,
+                    deleted_before_snapshot.root.id,
+                    &mut metrics,
+                )
+                .await,
+                Err(StorageError::Corruption(_))
+            ));
         }
 
         async fn real_page_error_poisons_held_view<S: Storage>(storage: &S) {
