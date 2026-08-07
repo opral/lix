@@ -34,7 +34,7 @@ const MANIFEST_CHUNK_SPACE: SpaceId = SpaceId(0x0005_0002);
 const PAYLOAD_SPACE: SpaceId = SpaceId(0x0005_0003);
 const PRESENCE_SPACE: SpaceId = SpaceId(0x0005_0004);
 const PATH: &str = "/media/foreground.mov";
-const EDIT_BYTES: usize = 4 * 1024;
+const DEFAULT_EDIT_BYTES: usize = 4 * 1024;
 const RANGE_BYTES: u64 = 4 * 1024;
 const SEED: u64 = 0x89a3_10fd_4242_73c1;
 const SOURCE_BRANCH_ID: &str = "01980000-0000-7000-8000-000000000064";
@@ -319,6 +319,8 @@ struct PreparedPayload {
     parts: Vec<Bytes>,
     size: usize,
     edit_offset: usize,
+    edit_bytes: usize,
+    edit: Bytes,
     base_blake3: String,
     base_sha256: String,
     edited_blake3: String,
@@ -596,7 +598,7 @@ where
     )
     .await;
     assert_eq!(verified_base.sha256(), prepared.base_sha256);
-    let suffix_bytes = prepared.size - prepared.edit_offset - EDIT_BYTES;
+    let suffix_bytes = prepared.size - prepared.edit_offset - prepared.edit_bytes;
     let (verified_result, provenance) = measured(
         backend,
         size_mib,
@@ -610,7 +612,7 @@ where
                 &prepared.edited_sha256,
                 prepared.edit_offset,
                 suffix_bytes,
-                vec![0xa5; EDIT_BYTES].into(),
+                prepared.edit.clone().into(),
             )
         },
     )
@@ -654,12 +656,13 @@ where
         branch_layout,
         edit_layout,
     );
+    let changed_chunk_ceiling = prepared.edit_bytes.div_ceil(1024 * 1024) as u64 + 1;
     assert!(
         edit_layout
             .payload
             .rows
             .saturating_sub(branch_layout.payload.rows)
-            <= 1,
+            <= changed_chunk_ceiling,
         "localized edit rewrote unchanged payload chunks"
     );
 
@@ -891,8 +894,14 @@ where
 
 fn prepare_payload(size: usize) -> PreparedPayload {
     assert_eq!(size % FILE_UPLOAD_PART_BYTES, 0);
+    let edit_bytes = qualification_edit_bytes(size);
     let edit_offset = size / 2 + 12_345;
-    let edit_end = edit_offset + EDIT_BYTES;
+    let edit_end = edit_offset + edit_bytes;
+    assert!(edit_end <= size, "qualification edit must fit the payload");
+    let edit = Bytes::from(deterministic_bytes(
+        edit_bytes,
+        SEED ^ 0xa5a5_5a5a_0f0f_f0f0,
+    ));
     let mut parts = Vec::with_capacity(size / FILE_UPLOAD_PART_BYTES);
     let mut base_blake3 = blake3::Hasher::new();
     let mut edited_blake3 = blake3::Hasher::new();
@@ -906,7 +915,9 @@ fn prepare_payload(size: usize) -> PreparedPayload {
             let local_start = edit_offset.saturating_sub(offset);
             let local_end = (edit_end - offset).min(bytes.len());
             let mut edited = bytes.clone();
-            edited[local_start..local_end].fill(0xa5);
+            let edit_start = offset + local_start - edit_offset;
+            let edit_end = edit_start + local_end - local_start;
+            edited[local_start..local_end].copy_from_slice(&edit[edit_start..edit_end]);
             edited_blake3.update(&edited);
             edited_sha256.update(&edited);
         } else {
@@ -919,11 +930,30 @@ fn prepare_payload(size: usize) -> PreparedPayload {
         parts,
         size,
         edit_offset,
+        edit_bytes,
+        edit,
         base_blake3: base_blake3.finalize().to_hex().to_string(),
         base_sha256: format!("{:x}", base_sha256.finalize()),
         edited_blake3: edited_blake3.finalize().to_hex().to_string(),
         edited_sha256: format!("{:x}", edited_sha256.finalize()),
     }
+}
+
+fn qualification_edit_bytes(size: usize) -> usize {
+    let Some(percent) = std::env::var("LIX_MEDIA_QUAL_EDIT_PERCENT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("invalid LIX_MEDIA_QUAL_EDIT_PERCENT '{value}'"))
+        })
+    else {
+        return DEFAULT_EDIT_BYTES;
+    };
+    assert!(matches!(percent, 1 | 10), "edit percent must be 1 or 10");
+    size.checked_mul(percent)
+        .expect("qualification edit size overflow")
+        .div_ceil(100)
 }
 
 fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -990,8 +1020,12 @@ where
     let disk_after = directory_bytes(database);
     let cas = binary_cas_write_accounting();
     let structural = take_media_structural_accounting();
+    let edit_percent = std::env::var("LIX_MEDIA_QUAL_EDIT_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     println!(
-        "large_payload_read,backend={backend},size_mib={size_mib},operation={operation},\
+        "large_payload_read,backend={backend},size_mib={size_mib},edit_percent={edit_percent},operation={operation},\
          wall_ms={:.3},cpu_ticks={cpu_ticks},allocated_bytes={allocated_bytes},allocation_calls={allocation_calls},\
          rss_before_kib={rss_before},rss_after_kib={rss_after},peak_rss_kib={},hwm_kib={},\
          begin_reads={},begin_writes={},get_many_calls={},get_many_keys={},get_many_found={},get_many_value_bytes={},\

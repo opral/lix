@@ -2,7 +2,39 @@ use crate::LixError;
 use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
+#[cfg(not(target_family = "wasm"))]
+use rayon::prelude::*;
 use std::ops::Range;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::OnceLock;
+
+#[cfg(not(target_family = "wasm"))]
+// Below this point, bounded scheduling costs more than the independent chunk work.
+const PARALLEL_BLOB_ID_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(not(target_family = "wasm"))]
+// Keep aggregate CPU and resident thread stacks bounded under concurrent writers.
+const MAX_BLOB_ID_HASH_THREADS: usize = 4;
+
+#[cfg(not(target_family = "wasm"))]
+fn blob_id_hash_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_BLOB_ID_HASH_THREADS);
+        (threads > 1)
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|index| format!("lix-blob-id-{index}"))
+                    .build()
+                    .ok()
+            })
+            .flatten()
+    })
+    .as_ref()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobId([u8; 32]);
@@ -15,6 +47,22 @@ impl BlobId {
     pub(crate) fn from_content(content: &[u8]) -> Self {
         if content.len() <= MEDIA_CHUNK_BYTES {
             return Self::from_single_chunk(ChunkHash::from_content(content));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // Fixed-manifest chunk hashes are independent, while `from_chunks`
+            // below remains the sole ordered canonical identity derivation.
+            if content.len() >= PARALLEL_BLOB_ID_BYTES
+                && let Some(pool) = blob_id_hash_pool()
+            {
+                let chunks = pool.install(|| {
+                    content
+                        .par_chunks(MEDIA_CHUNK_BYTES)
+                        .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64))
+                        .collect::<Vec<_>>()
+                });
+                return Self::from_chunks(content.len() as u64, chunks);
+            }
         }
         let chunks = content
             .chunks(MEDIA_CHUNK_BYTES)
@@ -268,4 +316,37 @@ pub(crate) struct BinaryCasChunkView<'a> {
     pub(crate) uncompressed_len: u64,
     #[musli(bytes)]
     pub(crate) payload: &'a [u8],
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+
+    fn sequential_blob_id(content: &[u8]) -> BlobId {
+        if content.len() <= MEDIA_CHUNK_BYTES {
+            return BlobId::from_single_chunk(ChunkHash::from_content(content));
+        }
+        BlobId::from_chunks(
+            content.len() as u64,
+            content
+                .chunks(MEDIA_CHUNK_BYTES)
+                .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64)),
+        )
+    }
+
+    #[test]
+    fn parallel_blob_identity_is_byte_stable_at_routing_boundaries() {
+        for len in [
+            MEDIA_CHUNK_BYTES,
+            MEDIA_CHUNK_BYTES + 1,
+            PARALLEL_BLOB_ID_BYTES - 1,
+            PARALLEL_BLOB_ID_BYTES,
+            PARALLEL_BLOB_ID_BYTES + 1,
+        ] {
+            let content = (0..len)
+                .map(|index| (index as u8).wrapping_mul(31).wrapping_add(17))
+                .collect::<Vec<_>>();
+            assert_eq!(BlobId::from_content(&content), sequential_blob_id(&content));
+        }
+    }
 }

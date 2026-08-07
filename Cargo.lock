@@ -3357,6 +3357,7 @@ dependencies = [
  "paste",
  "plugin_csv",
  "plugin_json",
+ "rayon",
  "ruzstd",
  "serde",
  "serde_json",
