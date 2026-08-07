@@ -3963,8 +3963,9 @@ mod tests {
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix::storage::{
-        CommitResult, Key, KeyRange, MemoryRead, MemoryWrite, PutBatch, ReadOptions, Storage,
-        StorageError, StorageSpace, StorageWrite, WriteOptions,
+        CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, MemoryRead, MemoryWrite,
+        PutBatch, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead,
+        StorageSpace, StorageWrite, WriteOptions,
     };
     use lix::telemetry::TracingTelemetrySink;
     use lix::{Blob, Memory, RequestBlobSpliceProvenance, open_lix};
@@ -4318,6 +4319,126 @@ mod tests {
                 return Err(StorageError::Fenced);
             }
             self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingFencedBranchControlReadStorage {
+        inner: Memory,
+        gate: Arc<BlockingFencedBranchControlReadGate>,
+    }
+
+    struct BlockingFencedBranchControlRead {
+        inner: MemoryRead,
+        gate: Arc<BlockingFencedBranchControlReadGate>,
+    }
+
+    struct BlockingFencedBranchControlReadGate {
+        remaining: AtomicUsize,
+        entered: AtomicBool,
+        entered_notify: Notify,
+        release: Notify,
+    }
+
+    impl BlockingFencedBranchControlReadStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                gate: Arc::new(BlockingFencedBranchControlReadGate {
+                    remaining: AtomicUsize::new(0),
+                    entered: AtomicBool::new(false),
+                    entered_notify: Notify::new(),
+                    release: Notify::new(),
+                }),
+            }
+        }
+
+        fn block_next_branch_control_read(&self) {
+            assert_eq!(
+                self.gate.remaining.swap(1, Ordering::AcqRel),
+                0,
+                "test branch-control read gate must be idle before arming"
+            );
+            self.gate.entered.store(false, Ordering::Release);
+        }
+
+        async fn wait_for_blocked_branch_control_read(&self) {
+            loop {
+                let notified = self.gate.entered_notify.notified();
+                if self.gate.entered.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_blocked_branch_control_read(&self) {
+            self.gate.release.notify_waiters();
+        }
+    }
+
+    impl Storage for BlockingFencedBranchControlReadStorage {
+        type Read<'a>
+            = BlockingFencedBranchControlRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            Ok(BlockingFencedBranchControlRead {
+                inner: self.inner.begin_read(options).await?,
+                gate: Arc::clone(&self.gate),
+            })
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    impl StorageRead for BlockingFencedBranchControlRead {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        async fn get_many(
+            &self,
+            requests: &[GetManyRequest<'_>],
+        ) -> Result<GetManyResult, StorageError> {
+            let reads_branch_control = requests
+                .iter()
+                .any(|request| request.space.name == "branch.head_control.v9");
+            if reads_branch_control
+                && self
+                    .gate
+                    .remaining
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                let release = self.gate.release.notified();
+                self.gate.entered.store(true, Ordering::Release);
+                self.gate.entered_notify.notify_waiters();
+                release.await;
+                return Err(StorageError::Fenced);
+            }
+            self.inner.get_many(requests).await
+        }
+
+        async fn scan(
+            &self,
+            space: StorageSpace,
+            range: KeyRange,
+            options: ScanOptions,
+        ) -> Result<ScanChunk, StorageError> {
+            self.inner.scan(space, range, options).await
         }
     }
 
@@ -10097,7 +10218,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_branch_switch_reports_terminal_storage_after_caller_cancellation() {
-        let storage = BlockingFencedWriteStorage::new();
+        let storage = BlockingFencedBranchControlReadStorage::new();
         let root = Arc::new(
             open_lix()
                 .with_storage(storage.clone())
@@ -10126,14 +10247,17 @@ mod tests {
             .lease(&session_id, Some(notifier))
             .await
             .expect("session lease");
-        storage.block_next_write();
+        storage.block_next_branch_control_read();
         let operation =
             tokio::spawn(
                 async move { lease.switch_branch(SwitchBranchOptions { branch_id }).await },
             );
-        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_write())
-            .await
-            .expect("branch switch should begin its write");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            storage.wait_for_blocked_branch_control_read(),
+        )
+        .await
+        .expect("branch switch should begin its authoritative branch-control read");
 
         operation.abort();
         assert!(
@@ -10143,7 +10267,7 @@ mod tests {
                 .is_cancelled()
         );
 
-        storage.release_blocked_write();
+        storage.release_blocked_branch_control_read();
         assert!(
             tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
                 .await
