@@ -3,6 +3,11 @@
     reason = "test fixtures mirror explicit Send future signatures from StorageFixture"
 )]
 
+#[path = "../../lix/tests/adapter_deterministic_sequence_corruption.rs"]
+mod deterministic_sequence_corruption;
+#[path = "../../lix/tests/adapter_undo_redo_checkpoint.rs"]
+mod undo_redo_checkpoint;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
@@ -150,6 +155,74 @@ async fn slatedb_exposes_database_path_and_flushes() {
     storage.flush().await.expect("flush slatedb storage");
 
     assert_eq!(storage.path(), path.as_path());
+}
+
+#[tokio::test]
+async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_slatedb() {
+    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
+    let path = temp_dir.path().join("undo-redo.slatedb");
+    let storage = SlateDB::open(&path).expect("open SlateDB storage");
+    Engine::initialize(storage.clone())
+        .await
+        .expect("initialize SlateDB storage");
+    let engine = Engine::new(storage.clone()).await.expect("open engine");
+    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&engine).await;
+    drop(engine);
+    storage.flush().await.expect("flush undo state");
+    drop(storage);
+
+    let storage = SlateDB::open(&path).expect("reopen SlateDB after undo");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("reopen engine after undo");
+    undo_redo_checkpoint::assert_cold_undo_then_redo(&engine, branch_id.clone()).await;
+    drop(engine);
+    storage.flush().await.expect("flush redo state");
+    drop(storage);
+
+    let storage = SlateDB::open(&path).expect("reopen SlateDB after redo");
+    let engine = Engine::new(storage)
+        .await
+        .expect("reopen engine after redo");
+    undo_redo_checkpoint::assert_cold_redo(&engine, branch_id).await;
+}
+
+#[tokio::test]
+async fn deterministic_sequence_member_corruption_fails_closed_on_slatedb() {
+    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
+
+    let initial_path = temp_dir.path().join("sequence-initial.slatedb");
+    let storage = SlateDB::open(&initial_path).expect("open initial SlateDB storage");
+    deterministic_sequence_corruption::initialize_with_deterministic_mode(storage.clone()).await;
+    storage
+        .flush()
+        .await
+        .expect("flush initial deterministic mode");
+    drop(storage);
+    let storage = SlateDB::open(&initial_path).expect("reopen initial SlateDB storage");
+    deterministic_sequence_corruption::assert_next_uuid(storage, "000000000000").await;
+
+    let corrupt_path = temp_dir.path().join("sequence-corrupt.slatedb");
+    let storage = SlateDB::open(&corrupt_path).expect("open corruption SlateDB storage");
+    deterministic_sequence_corruption::initialize_with_deterministic_mode(storage.clone()).await;
+    deterministic_sequence_corruption::assert_next_uuid(storage.clone(), "000000000000").await;
+    storage
+        .flush()
+        .await
+        .expect("flush published sequence member");
+    drop(storage);
+
+    let storage = SlateDB::open(&corrupt_path).expect("reopen published sequence storage");
+    deterministic_sequence_corruption::replace_selected_sequence_member_with_unrelated(&storage)
+        .await;
+    storage
+        .flush()
+        .await
+        .expect("flush same-count sequence member substitution");
+    drop(storage);
+
+    let storage = SlateDB::open(&corrupt_path).expect("reopen corrupt sequence storage");
+    deterministic_sequence_corruption::assert_missing_sequence_member_fails_closed(storage).await;
 }
 
 #[tokio::test]

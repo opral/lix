@@ -1053,7 +1053,6 @@ struct StagedChangelogCommit {
     replay_debt: CommitStateReplayDebt,
     change_count: usize,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
-    current_state_base_commit_id: Option<CommitId>,
 }
 
 struct StagedCommitDeltaIndex {
@@ -1471,7 +1470,6 @@ async fn stage_changelog_commits(
                 },
                 change_count,
                 selected_change_batches: commit_row.selected_change_batches.clone(),
-                current_state_base_commit_id: commit_row.current_state_base_commit_id,
             },
         );
     }
@@ -3412,6 +3410,7 @@ async fn stage_tracked_head(
         .collect::<BTreeSet<_>>();
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
+    let mut key_value_control_mutations = BTreeSet::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
 
@@ -3483,6 +3482,15 @@ async fn stage_tracked_head(
         } else {
             None
         };
+        if state_row_indices.iter().any(|&row_index| {
+            let row = state_rows.row(row_index);
+            !row.untracked && row.schema_key == "lix_key_value"
+        }) || selected_materialization
+            .as_ref()
+            .is_some_and(|(rows, _, _)| rows.iter().any(|row| row.schema_key == "lix_key_value"))
+        {
+            key_value_control_mutations.insert(root.branch_id.as_str());
+        }
         let mut untracked_deltas = if certified_columnar_parts.is_some() {
             Vec::new()
         } else {
@@ -3638,95 +3646,6 @@ async fn stage_tracked_head(
                 engine_rows,
             )
             .await?;
-        }
-
-        if let Some(base_commit_id) = staged.current_state_base_commit_id {
-            if is_checkpoint_publication
-                || selected_materialization.is_some()
-                || !staged.selected_change_batches.is_empty()
-                || !untracked_deltas.is_empty()
-                || !engine_rows.is_empty()
-                || !explicit_branch_targets.is_empty()
-                || certified_fresh_plugin_file_id.is_some()
-                || host_certified_live_increments.contains_key(&root.branch_id)
-                || state_row_indices.is_empty()
-                || state_row_indices.iter().any(|&row_index| {
-                    let row = state_rows.row(row_index);
-                    row.global
-                        || row.untracked
-                        || row.branch_id.as_str() != root.branch_id
-                        || row.commit_id != Some(root.commit_id)
-                })
-                || !state_row_indices.iter().any(|&row_index| {
-                    state_rows.row(row_index).schema_key
-                        != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-                })
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "certified current-state base overlaps an unsupported publication shape",
-                ));
-            }
-            let generation =
-                lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
-            let mut coverage = WorkingDiffIndexCoverage::default();
-            let mut writer = tracked_head.writer(read, writes);
-            writer.stage_root_current_base(&root.branch_id, generation, base_commit_id);
-            let overlay_deltas = state_row_indices
-                .iter()
-                .filter_map(|&row_index| {
-                    let row = state_rows.row(row_index);
-                    (row.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY)
-                        .then(|| current_state_delta_from_state_row(row))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if !overlay_deltas.is_empty() {
-                writer
-                    .stage_current_state_with_certified_predecessors(
-                        &root.branch_id,
-                        Some(generation),
-                        root.commit_id,
-                        &overlay_deltas,
-                        &[],
-                        &BTreeSet::new(),
-                        None,
-                        None,
-                        None,
-                        &mut coverage,
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.materialization.tracked_head.stage_transition_base_overlay"
-                    ))
-                    .await?;
-            }
-            let mut control = normal_branch_head_control(root, parent_control, generation, None)?;
-            if let Some(parent) = parent_control
-                .filter(|parent| parent.tracked_generation == parent.untracked_generation)
-            {
-                let next_untracked_generation = untracked_lifecycle_generation(
-                    &root.branch_id,
-                    parent.untracked_generation,
-                    control.current_state_revision,
-                );
-                writer
-                    .stage_untracked_generation(
-                        &root.branch_id,
-                        parent.untracked_generation,
-                        next_untracked_generation,
-                        &[],
-                        &BTreeSet::new(),
-                    )
-                    .await?;
-                control.untracked_generation = next_untracked_generation;
-            }
-            control.note_schemas(
-                state_row_indices
-                    .iter()
-                    .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
-            );
-            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
-            continue;
         }
 
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
@@ -4438,6 +4357,44 @@ async fn stage_tracked_head(
                 .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
         );
         insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+    }
+
+    // Bootstrap may initially use one physical generation for both selector
+    // domains. A tracked-only publication mutates that generation in place,
+    // so preserve the complete untracked authority under its own selector
+    // before publishing the updated branch control. Subsequent publications
+    // already have disjoint selectors and pay no copy cost.
+    for (branch_id, control) in &mut controls {
+        if !key_value_control_mutations.contains(branch_id.as_str()) {
+            continue;
+        }
+        let Some(previous) = observations
+            .get(branch_id)
+            .and_then(|observation| observation.control)
+        else {
+            continue;
+        };
+        if control.tracked_generation != control.untracked_generation
+            || control.untracked_generation != previous.untracked_generation
+        {
+            continue;
+        }
+        let next_generation = untracked_lifecycle_generation(
+            branch_id,
+            previous.untracked_generation,
+            control.current_state_revision,
+        );
+        tracked_head
+            .writer(read, writes)
+            .stage_untracked_generation(
+                branch_id,
+                previous.untracked_generation,
+                next_generation,
+                &[],
+                &BTreeSet::new(),
+            )
+            .await?;
+        control.untracked_generation = next_generation;
     }
 
     // An untracked-only transaction touches the same hot rows without
@@ -6195,7 +6152,6 @@ struct FinalizedCommitRow {
     created_at: LixTimestamp,
     change_id: ChangeId,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
-    current_state_base_commit_id: Option<CommitId>,
 }
 
 struct PendingTrackedRoot {
@@ -6224,7 +6180,6 @@ async fn finalize_commit_rows(
         let created_at = change_refs.created_at;
         let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
-        let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
         commit_rows.push(FinalizedCommitRow {
             commit_id,
@@ -6232,7 +6187,6 @@ async fn finalize_commit_rows(
             created_at,
             change_id: commit_change_id,
             selected_change_batches,
-            current_state_base_commit_id,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id: intermediate.branch_id,
@@ -6253,7 +6207,6 @@ async fn finalize_commit_rows(
         let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
-        let current_state_base_commit_id = change_refs.current_state_base_commit_id();
         let selected_change_batches = change_refs.into_selected_change_batches();
         let parent_commit_ids =
             if let Some(parent) = first_commit_parent_override_by_branch.get(&branch_id) {
@@ -6286,7 +6239,6 @@ async fn finalize_commit_rows(
             created_at: timestamp,
             change_id: commit_change_id,
             selected_change_batches,
-            current_state_base_commit_id,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id,
@@ -6586,7 +6538,9 @@ mod tests {
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
         StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
-    use crate::transaction::types::{PreparedRowFacts, TestPreparedStateRow};
+    use crate::transaction::types::{
+        PreparedRowFacts, TestPreparedStateRow, TransactionFileContent,
+    };
     use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
     macro_rules! prepared_rows {
@@ -7174,7 +7128,6 @@ mod tests {
             created_at: timestamp,
             change_id: change_id("mixed-certified-commit"),
             selected_change_batches: Vec::new(),
-            current_state_base_commit_id: None,
         }];
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -8137,6 +8090,164 @@ mod tests {
             change_id("winner-normal-branch-ref-change"),
             "the stale commit must not replace the winner's public branch-ref metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_deduplicated_publication_first_rejects_stale_cas_gc() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let payload = b"ordinary-deduplicated-publication-race";
+        seed_orphan_cas_payload(&storage, payload).await;
+        let sweep_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary stale sweep read should open");
+        let mut publication_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary publication read should open");
+        let (sweep, sweep_preconditions) = stage_low_level_cas_sweep(&storage, &sweep_read).await;
+        let (publication, publication_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut publication_read,
+            prepared_normal_file_commit(
+                payload,
+                "ordinary-publish-row",
+                "ordinary-publish-commit",
+                "ordinary-publish-commit-change",
+                "ordinary-publish-branch-change",
+            ),
+        )
+        .await
+        .expect("fully deduplicated ordinary file publication should stage");
+        drop(sweep_read);
+        drop(publication_read);
+
+        storage
+            .commit_write_set(
+                publication,
+                StorageWriteOptions {
+                    preconditions: publication_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("ordinary publication should win the CAS epoch");
+        let error = storage
+            .commit_write_set(
+                sweep,
+                StorageWriteOptions {
+                    preconditions: sweep_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale GC must lose after ordinary CAS publication");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+        assert_cas_payload(&storage, payload, true).await;
+    }
+
+    #[tokio::test]
+    async fn cas_gc_first_rejects_stale_ordinary_publication_and_retry_restages() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let payload = b"ordinary-deduplicated-publication-race";
+        seed_orphan_cas_payload(&storage, payload).await;
+        let sweep_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary winning sweep read should open");
+        let mut stale_publication_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary stale publication read should open");
+        let (sweep, sweep_preconditions) = stage_low_level_cas_sweep(&storage, &sweep_read).await;
+        let (stale_publication, stale_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut stale_publication_read,
+            prepared_normal_file_commit(
+                payload,
+                "ordinary-stale-row",
+                "ordinary-stale-commit",
+                "ordinary-stale-commit-change",
+                "ordinary-stale-branch-change",
+            ),
+        )
+        .await
+        .expect("stale fully deduplicated ordinary publication should stage");
+        drop(sweep_read);
+        drop(stale_publication_read);
+
+        storage
+            .commit_write_set(
+                sweep,
+                StorageWriteOptions {
+                    preconditions: sweep_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("GC should win the CAS epoch");
+        assert_cas_payload(&storage, payload, false).await;
+        let error = storage
+            .commit_write_set(
+                stale_publication,
+                StorageWriteOptions {
+                    preconditions: stale_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale ordinary publication must lose after GC");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+
+        let mut retry_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ordinary publication retry read should open");
+        let (retry, retry_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut retry_read,
+            prepared_normal_file_commit(
+                payload,
+                "ordinary-retry-row",
+                "ordinary-retry-commit",
+                "ordinary-retry-commit-change",
+                "ordinary-retry-branch-change",
+            ),
+        )
+        .await
+        .expect("fresh ordinary publication retry should restage CAS payload");
+        drop(retry_read);
+        storage
+            .commit_write_set(
+                retry,
+                StorageWriteOptions {
+                    preconditions: retry_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("fresh ordinary publication retry should commit");
+        assert_cas_payload(&storage, payload, true).await;
     }
 
     #[tokio::test]
@@ -9248,7 +9359,6 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:01Z"),
                 change_id: ChangeId::for_test_label("child-commit-change"),
                 selected_change_batches: Vec::new(),
-                current_state_base_commit_id: None,
             },
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
@@ -9256,7 +9366,6 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: ChangeId::for_test_label("parent-commit-change"),
                 selected_change_batches: Vec::new(),
-                current_state_base_commit_id: None,
             },
         ];
         let mut rootless_commit_ids = BTreeSet::from([CommitId::for_test_label("parent-commit")]);
@@ -9394,7 +9503,6 @@ mod tests {
                 created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
                 selected_change_batches: Vec::new(),
-                current_state_base_commit_id: None,
             })
             .collect::<Vec<_>>();
         let row_indices = commit_ids
@@ -10138,6 +10246,114 @@ mod tests {
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
         }
+    }
+
+    fn prepared_normal_file_commit(
+        payload: &[u8],
+        row_change_label: &str,
+        commit_label: &str,
+        commit_change_label: &str,
+        branch_ref_change_label: &str,
+    ) -> PreparedWriteSet {
+        let file_id = "01960000-0000-7000-8000-00000000ca55";
+        let blob_id = crate::binary_cas::BlobId::from_content(payload);
+        let mut row = tracked_global_row(row_change_label);
+        row.entity_pk = EntityPk::single(file_id);
+        row.schema_key = "lix_binary_blob_ref".into();
+        row.file_id = Some(file_id.into());
+        row.snapshot = Some(
+            crate::transaction::types::stage_json_from_value(
+                crate::transaction::types::TransactionJson::from_value_for_test(
+                    serde_json::json!({
+                        "id": file_id,
+                        "blob_hash": blob_id.to_hex(),
+                        "size_bytes": payload.len(),
+                    }),
+                ),
+                "ordinary CAS epoch test blob reference",
+            )
+            .expect("ordinary file blob reference should stage"),
+        );
+        PreparedWriteSet {
+            insert_selection: PreparedInsertSelection::new(),
+            state_rows: prepared_rows![row],
+            commit_change_refs_by_branch: BTreeMap::from([(
+                GLOBAL_BRANCH_ID.to_string(),
+                change_refs_with(
+                    [row_change_label],
+                    commit_label,
+                    commit_change_label,
+                    branch_ref_change_label,
+                ),
+            )]),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: vec![TransactionFileContent::new(
+                file_id.into(),
+                Some("/ordinary-epoch.bin".into()),
+                Some("ordinary-epoch.bin".into()),
+                GLOBAL_BRANCH_ID.into(),
+                true,
+                false,
+                payload.to_vec(),
+            )],
+        }
+    }
+
+    async fn seed_orphan_cas_payload(storage: &StorageAdapter, payload: &[u8]) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan CAS seed read should open");
+        let mut writes = storage.new_write_set();
+        BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&read, &mut writes)
+            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
+                payload.to_vec(),
+            ))
+            .await
+            .expect("orphan CAS payload should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("orphan CAS payload should commit");
+    }
+
+    async fn stage_low_level_cas_sweep(
+        storage: &StorageAdapter,
+        read: &impl StorageAdapterRead,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let swept = crate::binary_cas::stage_gc_reclamation(
+            read,
+            &mut writes,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("ordinary race CAS sweep should stage");
+        assert_eq!(swept.reclaimed_chunk_rows, 1);
+        crate::binary_cas::stage_mutation_epoch(read, &mut writes, &mut preconditions)
+            .await
+            .expect("ordinary race sweep epoch should stage");
+        (writes, preconditions)
+    }
+
+    async fn assert_cas_payload(storage: &StorageAdapter, payload: &[u8], expected: bool) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("cold CAS verification read should open");
+        let mut reader = BinaryCasContext::new().reader(read);
+        let loaded = reader
+            .load_bytes_many(&[crate::binary_cas::BlobId::from_content(payload)])
+            .await
+            .expect("cold CAS verification should authenticate");
+        assert_eq!(loaded.into_vec()[0].as_deref(), expected.then_some(payload));
     }
 
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {

@@ -2889,8 +2889,7 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options_inner(sql, params, ExecuteOptions::default())
-            .await
+        Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
     /// Executes one public prepared-DML parameter page inside this explicit

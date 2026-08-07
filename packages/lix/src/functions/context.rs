@@ -16,6 +16,7 @@ use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWri
 pub(crate) struct FunctionContext {
     functions: FunctionProviderHandle,
     bookkeeping_timestamp: LixTimestamp,
+    deterministic_mode_enabled: bool,
 }
 
 impl FunctionContext {
@@ -27,6 +28,7 @@ impl FunctionContext {
         Self {
             functions: FunctionProviderHandle::system(),
             bookkeeping_timestamp: bookkeeping_functions.timestamp(),
+            deterministic_mode_enabled: false,
         }
     }
 
@@ -59,7 +61,12 @@ impl FunctionContext {
             ))
                 as Box<dyn FunctionProvider + Send>),
             bookkeeping_timestamp,
+            deterministic_mode_enabled: true,
         })
+    }
+
+    pub(crate) fn deterministic_mode_enabled(&self) -> bool {
+        self.deterministic_mode_enabled
     }
 
     /// Returns the engine-owned provider used by SQL and transaction staging.
@@ -118,12 +125,14 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 #[cfg(test)]
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
-    use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
+    use crate::branch::{
+        BranchHeadControlContext, stage_branch_head_control, untracked_lifecycle_generation,
+    };
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -354,13 +363,20 @@ mod tests {
             .expect("global branch control should load")
             .expect("global branch control should exist");
         let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
-        let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+        let mut next_control = control
+            .next_current_state_revision()
+            .expect("global control revision should advance");
+        let next_generation = untracked_lifecycle_generation(
+            GLOBAL_BRANCH_ID,
+            control.untracked_generation,
+            next_control.current_state_revision,
+        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
+            .stage_untracked_generation(
                 GLOBAL_BRANCH_ID,
-                Some(control.tracked_generation),
-                control.head_commit_id,
+                control.untracked_generation,
+                next_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
@@ -376,21 +392,13 @@ mod tests {
                     columnar_base_coordinate: None,
                 }],
                 &std::collections::BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut working_diff_coverage,
             )
             .await
             .expect("test key-value current row should stage");
-        stage_branch_head_control(
-            &mut writes,
-            GLOBAL_BRANCH_ID,
-            control
-                .next_current_state_revision()
-                .expect("global control revision should advance"),
-        )
-        .expect("global control should publish current state");
+        next_control.untracked_generation = next_generation;
+        next_control.note_schema("lix_key_value");
+        stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
+            .expect("global control should publish current state");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

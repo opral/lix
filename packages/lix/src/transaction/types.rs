@@ -2381,6 +2381,27 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     slots: impl IntoIterator<Item = &'a mut Option<TransactionJson>>,
     context: &str,
 ) -> Result<(), LixError> {
+    enum DecodedCanonicalValue {
+        Owned(JsonValue),
+        Shared(Arc<JsonValue>),
+    }
+
+    impl DecodedCanonicalValue {
+        fn as_value(&self) -> &JsonValue {
+            match self {
+                Self::Owned(value) => value,
+                Self::Shared(value) => value.as_ref(),
+            }
+        }
+
+        fn into_shared(self) -> Arc<JsonValue> {
+            match self {
+                Self::Owned(value) => Arc::new(value),
+                Self::Shared(value) => value,
+            }
+        }
+    }
+
     let mut slots = slots.into_iter().collect::<Vec<_>>();
     let decoded_count = slots
         .iter()
@@ -2391,6 +2412,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         })
         .count();
     let mut values = Vec::with_capacity(decoded_count);
+    let mut all_values_uniquely_owned = true;
     let mut cached_normalized = Vec::with_capacity(decoded_count);
     let mut positions = Vec::with_capacity(decoded_count);
     for (position, slot) in slots.iter_mut().enumerate() {
@@ -2399,7 +2421,13 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         };
         match json.storage {
             TransactionJsonStorage::Decoded { value, normalized } => {
-                let value = Arc::try_unwrap(value).unwrap_or_else(|value| value.as_ref().clone());
+                let value = match Arc::try_unwrap(value) {
+                    Ok(value) => DecodedCanonicalValue::Owned(value),
+                    Err(value) => {
+                        all_values_uniquely_owned = false;
+                        DecodedCanonicalValue::Shared(value)
+                    }
+                };
                 positions.push(position);
                 values.push(value);
                 cached_normalized.push(normalized.into_inner());
@@ -2476,7 +2504,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                 .append(cached.as_bytes())
                 .map_err(|failure| canonical_json_arena_error(context, failure))?;
         } else {
-            serde_json::to_writer(&mut normalized, value).map_err(|error| {
+            serde_json::to_writer(&mut normalized, value.as_value()).map_err(|error| {
                 normalized.failure().map_or_else(
                     || {
                         LixError::new(
@@ -2497,16 +2525,51 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         })?;
         offsets.push((start, end));
     }
-    let rows = WasmCanonicalJson::from_batch_parts(
-        values,
-        normalized.into_bytes(),
-        offsets,
-        positions.len(),
-        serialize_count,
-    )?;
-    for ((position, row), expected_row) in positions.into_iter().zip(rows).zip(0..) {
-        debug_assert_eq!(row.row_index(), expected_row);
-        *slots[position] = Some(TransactionJson::from_canonical_batch(row));
+    if all_values_uniquely_owned {
+        let values = values
+            .into_iter()
+            .map(|value| {
+                let DecodedCanonicalValue::Owned(value) = value else {
+                    unreachable!("unique canonicalization retained a shared decoded JSON owner")
+                };
+                value
+            })
+            .collect();
+        let rows = WasmCanonicalJson::from_batch_parts(
+            values,
+            normalized.into_bytes(),
+            offsets,
+            positions.len(),
+            serialize_count,
+        )?;
+        for ((position, row), expected_row) in positions.into_iter().zip(rows).zip(0..) {
+            debug_assert_eq!(row.row_index(), expected_row);
+            *slots[position] = Some(TransactionJson::from_canonical_batch(row));
+        }
+    } else {
+        let normalized =
+            SharedStr::from_utf8(Bytes::from(normalized.into_bytes())).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("{context} canonical JSON batch is not UTF-8"),
+                )
+            })?;
+        for ((position, value), (start, end)) in positions.into_iter().zip(values).zip(offsets) {
+            let normalized = normalized
+                .slice(start as usize..end as usize)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_UNKNOWN,
+                        format!("{context} canonical JSON batch offsets are invalid"),
+                    )
+                })?;
+            *slots[position] = Some(TransactionJson {
+                storage: TransactionJsonStorage::CanonicalShared {
+                    value: OnceLock::from(value.into_shared()),
+                    normalized,
+                },
+            });
+        }
     }
     Ok(())
 }
@@ -3987,9 +4050,6 @@ pub(crate) struct StagedCommitChangeRefs {
     /// separate so staging/finalization clones only `Arc` owners rather than
     /// copying schema/file/entity or metadata columns.
     selected_change_batches: Vec<StagedCommitChangeBatch>,
-    /// Immutable commit whose complete logical state is certified as the
-    /// current-state base of this new semantic commit.
-    current_state_base_commit_id: Option<CommitId>,
     /// Certified immutable mutation columns for this commit. This owner is
     /// attached only at drain, after complete-replacement certification, and
     /// is cloned through commit finalization in O(1).
@@ -4006,7 +4066,6 @@ impl Default for StagedCommitChangeRefs {
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
             tracked_change_count: 0,
             selected_change_batches: Vec::new(),
-            current_state_base_commit_id: None,
             ordered_mutation_journal: None,
             allow_empty: false,
         }
@@ -4016,11 +4075,8 @@ impl Default for StagedCommitChangeRefs {
 impl StagedCommitChangeRefs {
     pub(crate) fn absorb_cohort_membership(&mut self, mut other: Self) {
         debug_assert!(
-            self.ordered_mutation_journal.is_none()
-                && other.ordered_mutation_journal.is_none()
-                && self.current_state_base_commit_id.is_none()
-                && other.current_state_base_commit_id.is_none(),
-            "certified publication routes cannot join commit cohorts"
+            self.ordered_mutation_journal.is_none() && other.ordered_mutation_journal.is_none(),
+            "immutable replacement journals cannot join commit cohorts"
         );
         self.tracked_change_count = self
             .tracked_change_count
@@ -4250,27 +4306,6 @@ impl StagedCommitChangeRefs {
         self.ordered_mutation_journal.take()
     }
 
-    pub(crate) fn certify_current_state_base(
-        &mut self,
-        commit_id: CommitId,
-    ) -> Result<(), LixError> {
-        if self
-            .current_state_base_commit_id
-            .replace(commit_id)
-            .is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "commit received more than one certified current-state base",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn current_state_base_commit_id(&self) -> Option<CommitId> {
-        self.current_state_base_commit_id
-    }
-
     pub(crate) fn new(
         commit_id: CommitId,
         commit_change_id: ChangeId,
@@ -4284,7 +4319,6 @@ impl StagedCommitChangeRefs {
             created_at,
             tracked_change_count: 0,
             selected_change_batches: Vec::new(),
-            current_state_base_commit_id: None,
             ordered_mutation_journal: None,
             allow_empty: false,
         }
@@ -5706,6 +5740,51 @@ mod tests {
             first.normalized().len() + second.normalized().len()
         );
         assert_eq!(first.validation_counts(), (2, 2));
+    }
+
+    #[test]
+    fn shared_decoded_rows_retain_source_values_in_one_canonical_arena() {
+        let first_source = Arc::new(serde_json::json!({"id": "a", "value": "first"}));
+        let second_source = Arc::new(serde_json::json!({"id": "b", "value": "second"}));
+        let mut rows = vec![
+            Some(
+                TransactionJson::from_shared_value(Arc::clone(&first_source), "shared SQL fixture")
+                    .expect("shared first row"),
+            ),
+            Some(
+                TransactionJson::from_shared_value(
+                    Arc::clone(&second_source),
+                    "shared SQL fixture",
+                )
+                .expect("shared second row"),
+            ),
+        ];
+
+        canonicalize_transaction_json_batch(rows.iter_mut(), "shared SQL fixture")
+            .expect("canonicalize shared SQL batch");
+        let (first_value, first_normalized) = match &rows[0].as_ref().expect("first row").storage {
+            TransactionJsonStorage::CanonicalShared { value, normalized } => (
+                value.get().expect("first decoded owner"),
+                normalized.clone(),
+            ),
+            _ => panic!("shared decoded row must retain its source owner"),
+        };
+        let (second_value, second_normalized) = match &rows[1].as_ref().expect("second row").storage
+        {
+            TransactionJsonStorage::CanonicalShared { value, normalized } => (
+                value.get().expect("second decoded owner"),
+                normalized.clone(),
+            ),
+            _ => panic!("shared decoded row must retain its source owner"),
+        };
+
+        assert!(Arc::ptr_eq(first_value, &first_source));
+        assert!(Arc::ptr_eq(second_value, &second_source));
+        assert!(first_normalized.shares_buffer_with(&second_normalized));
+        assert_eq!(
+            first_normalized.retained_buffer_len(),
+            first_normalized.len() + second_normalized.len()
+        );
     }
 
     #[test]

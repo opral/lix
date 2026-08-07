@@ -821,7 +821,62 @@ pub struct SlateDB {
     write_gate: WriteGate,
     write_pipeline: WritePipeline,
     point_cache: SnapshotPointCache,
-    startup_gc: Arc<tokio::sync::OnceCell<Result<(), String>>>,
+    startup_immutable_gc: StartupImmutableGc,
+}
+
+#[derive(Clone, Default)]
+struct StartupImmutableGc {
+    state: Arc<StartupImmutableGcState>,
+}
+
+#[derive(Default)]
+struct StartupImmutableGcState {
+    scheduled: AtomicBool,
+    result: Mutex<Option<Result<(), StorageError>>>,
+}
+
+impl StartupImmutableGc {
+    fn schedule(&self, worker: &SlateDBWorker, store: &ImmutableValueStore) {
+        let cutoff = SystemTime::now()
+            .checked_sub(IMMUTABLE_GC_GRACE)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        self.schedule_with_cutoff(worker, store, cutoff);
+    }
+
+    fn schedule_with_cutoff(
+        &self,
+        worker: &SlateDBWorker,
+        store: &ImmutableValueStore,
+        cutoff: SystemTime,
+    ) {
+        if self
+            .state
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let store = store.clone();
+        worker.spawn_reclamation(move |database| async move {
+            let result =
+                collect_startup_immutable_garbage_from_database(database, &store, cutoff).await;
+            *state
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        });
+    }
+
+    fn completed_result(&self) -> Result<(), StorageError> {
+        self.state
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or(Ok(()))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2349,28 +2404,8 @@ impl SlateDB {
             write_gate: WriteGate::new(),
             write_pipeline: WritePipeline::new(),
             point_cache: SnapshotPointCache::new(),
-            startup_gc: Arc::new(tokio::sync::OnceCell::new()),
+            startup_immutable_gc: StartupImmutableGc::default(),
         })
-    }
-
-    async fn ensure_startup_immutable_gc(&self) -> Result<(), StorageError> {
-        // Qualification targets one active SlateDB adapter per namespace;
-        // distributed multi-writer sidecar GC is intentionally out of scope.
-        let worker = self.worker.clone();
-        let store = self.immutable_value_store.clone();
-        let cutoff = SystemTime::now()
-            .checked_sub(IMMUTABLE_GC_GRACE)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        self.startup_gc
-            .get_or_init(|| async move {
-                collect_startup_immutable_garbage(&worker, &store, cutoff)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-            .await
-            .as_ref()
-            .map_err(|error| StorageError::Io(error.clone()))
-            .copied()
     }
 
     pub fn path(&self) -> &Path {
@@ -2380,6 +2415,7 @@ impl SlateDB {
     pub async fn flush(&self) -> Result<(), StorageError> {
         self.write_pipeline.wait_for_visible().await?;
         self.worker.wait_for_reclamation().await?;
+        self.startup_immutable_gc.completed_result()?;
         let snapshot_sequence = self
             .worker
             .call(|db| async move {
@@ -2394,7 +2430,8 @@ impl SlateDB {
             self.write_pipeline
                 .capture_with_worker(self.worker.clone(), snapshot_sequence),
         );
-        self.worker.wait_for_reclamation().await
+        self.worker.wait_for_reclamation().await?;
+        self.startup_immutable_gc.completed_result()
     }
 
     /// Forces the active and immutable memtables into SSTs for storage-layout
@@ -2408,6 +2445,7 @@ impl SlateDB {
     pub async fn flush_memtable_for_diagnostics(&self) -> Result<(), StorageError> {
         self.write_pipeline.wait_for_visible().await?;
         self.worker.wait_for_reclamation().await?;
+        self.startup_immutable_gc.completed_result()?;
         let snapshot_sequence = self
             .worker
             .call(|db| async move {
@@ -2426,7 +2464,8 @@ impl SlateDB {
             self.write_pipeline
                 .capture_with_worker(self.worker.clone(), snapshot_sequence),
         );
-        self.worker.wait_for_reclamation().await
+        self.worker.wait_for_reclamation().await?;
+        self.startup_immutable_gc.completed_result()
     }
 }
 
@@ -2477,7 +2516,9 @@ impl Storage for SlateDB {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
-            self.ensure_startup_immutable_gc().await?;
+            self.startup_immutable_gc.completed_result()?;
+            self.startup_immutable_gc
+                .schedule(&self.worker, &self.immutable_value_store);
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 immutable_value_store: self.immutable_value_store.clone(),
@@ -2499,30 +2540,37 @@ impl Storage for SlateDB {
     }
 }
 
+#[cfg(test)]
 async fn collect_startup_immutable_garbage(
     worker: &SlateDBWorker,
     store: &ImmutableValueStore,
     cutoff: SystemTime,
 ) -> Result<(), StorageError> {
-    let snapshot = worker
-        .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
-        .await?;
-    let reachable = worker
-        .call_read(move |_db| async move {
-            let scan_options = slatedb_scan_options(ReadDurability::Visible);
-            let mut rows = snapshot
-                .scan_with_options(.., &scan_options)
-                .await
-                .map_err(slatedb_error)?;
-            let mut reachable = HashSet::new();
-            while let Some(row) = rows.next().await.map_err(slatedb_error)? {
-                if let Ok(locator) = decode_immutable_locator(&row.value) {
-                    reachable.insert(locator.segment_id);
-                }
-            }
-            Ok(reachable)
+    let store = store.clone();
+    worker
+        .call_read(move |database| async move {
+            collect_startup_immutable_garbage_from_database(database, &store, cutoff).await
         })
-        .await?;
+        .await
+}
+
+async fn collect_startup_immutable_garbage_from_database(
+    database: Arc<Db>,
+    store: &ImmutableValueStore,
+    cutoff: SystemTime,
+) -> Result<(), StorageError> {
+    let snapshot = database.snapshot().await.map_err(slatedb_error)?;
+    let scan_options = slatedb_scan_options(ReadDurability::Visible);
+    let mut rows = snapshot
+        .scan_with_options(.., &scan_options)
+        .await
+        .map_err(slatedb_error)?;
+    let mut reachable = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(slatedb_error)? {
+        if let Ok(locator) = decode_immutable_locator(&row.value) {
+            reachable.insert(locator.segment_id);
+        }
+    }
     store.collect_unreachable(reachable, cutoff).await
 }
 
@@ -3797,6 +3845,21 @@ impl SlateDBWorker {
         });
     }
 
+    fn spawn_reclamation<F, Fut>(&self, operation: F)
+    where
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let in_flight = self.inner.in_flight.enter();
+        let reclamation = self.inner.reclamation.enter();
+        let db = Arc::clone(&self.inner.db);
+        self.inner.runtime.spawn(async move {
+            let _in_flight = in_flight;
+            let _reclamation = reclamation;
+            operation(db).await;
+        });
+    }
+
     fn defer_publication_drop(&self, retired: Vec<Arc<PublishedWrite>>) {
         self.publication_reclaimer().defer(retired);
     }
@@ -3813,9 +3876,7 @@ impl SlateDBWorker {
         let reclamation = self.inner.reclamation.clone();
         tokio::task::spawn_blocking(move || reclamation.wait_until_idle())
             .await
-            .map_err(|error| {
-                StorageError::Io(format!("join SlateDB publication reclaimer: {error}"))
-            })
+            .map_err(|error| StorageError::Io(format!("join SlateDB reclamation task: {error}")))
     }
 
     fn check_open(&self) -> Result<(), StorageError> {
@@ -5126,6 +5187,227 @@ mod tests {
                 .len(),
             1,
             "GC must remove unreferenced segments not used by this process"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn first_commit_does_not_wait_for_startup_immutable_gc() {
+        let object_store = Arc::new(InMemory::new());
+        let store = BlockingStore::new(Arc::clone(&object_store));
+        let storage = SlateDB::open_object_store_with_options(
+            "background-startup-immutable-gc",
+            Arc::new(store.clone()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open background startup-GC storage");
+        object_store
+            .put(
+                &storage.immutable_value_store.prefix.clone().join("orphan"),
+                PutPayload::from_static(b"orphan"),
+            )
+            .await
+            .expect("seed immutable object for blocked listing");
+        let blocked = store.block_immutable_lists();
+
+        let mutable_space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let mut write = tokio::time::timeout(
+            Duration::from_secs(1),
+            storage.begin_write(WriteOptions::default()),
+        )
+        .await
+        .expect("begin_write must not wait for immutable listing")
+        .expect("begin first foreground write");
+        blocked.wait_for_entries(1, "background immutable listing");
+        write
+            .put_many(
+                mutable_space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"key")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"value"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage first foreground write");
+        tokio::time::timeout(Duration::from_secs(1), write.commit())
+            .await
+            .expect("first commit must not wait for immutable listing")
+            .expect("commit first foreground write");
+
+        drop(blocked);
+        storage
+            .flush()
+            .await
+            .expect("flush waits for background immutable GC");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn background_startup_gc_reclaims_stale_orphan_and_retains_reachable_value() {
+        let directory = tempfile::tempdir().expect("create startup-GC lifecycle directory");
+        let immutable_key = Key(Bytes::from(vec![3; 32]));
+        let immutable_value = Bytes::from_static(b"reachable immutable value");
+        let orphan_location = {
+            let storage = SlateDB::open(directory.path()).expect("open seed storage");
+            let mut write = storage
+                .begin_write(WriteOptions::default())
+                .await
+                .expect("begin reachable immutable write");
+            write
+                .put_many(
+                    TEST_IMMUTABLE_SPACE,
+                    PutBatch {
+                        entries: vec![PutEntry {
+                            key: immutable_key.clone(),
+                            value: StoredValue {
+                                bytes: immutable_value.clone(),
+                            },
+                        }],
+                    },
+                )
+                .await
+                .expect("stage reachable immutable value");
+            write
+                .commit()
+                .await
+                .expect("publish reachable immutable value");
+            storage.flush().await.expect("flush seed storage");
+
+            let mut orphan_writer = ImmutableSegmentWriter::default();
+            orphan_writer
+                .insert(Key(Bytes::from(vec![4; 32])), Bytes::from_static(b"orphan"))
+                .expect("stage stale orphan");
+            let orphan = orphan_writer
+                .finish(|_| true)
+                .expect("finish stale orphan")
+                .remove(0);
+            let orphan_location = storage
+                .immutable_value_store
+                .location(&orphan.id)
+                .expect("locate stale orphan");
+            storage
+                .immutable_value_store
+                .object_store
+                .put(
+                    &orphan_location,
+                    orphan.frames.into_iter().collect::<PutPayload>(),
+                )
+                .await
+                .expect("upload stale orphan");
+            orphan_location
+        };
+        let orphan_path = directory.path().join(orphan_location.as_ref());
+        let orphan = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan_path)
+            .expect("open stale orphan file");
+        orphan
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH)
+                    .set_accessed(SystemTime::UNIX_EPOCH),
+            )
+            .expect("age stale orphan file");
+
+        let storage = SlateDB::open(directory.path()).expect("reopen lifecycle storage");
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin first write after reopen");
+        write
+            .put_many(
+                StorageSpace::mutable(SpaceId(8), "test.mutable"),
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"trigger")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"gc"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage first write after reopen");
+        write
+            .commit()
+            .await
+            .expect("commit first write after reopen");
+        storage
+            .flush()
+            .await
+            .expect("wait for reopened background GC");
+        assert!(!orphan_path.exists(), "stale orphan must be reclaimed");
+
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("read retained immutable value");
+        assert_eq!(
+            read.get_many(&[GetManyRequest {
+                space: TEST_IMMUTABLE_SPACE,
+                keys: std::slice::from_ref(&immutable_key),
+                opts: GetOptions::default(),
+            }])
+            .await
+            .expect("load retained immutable value")
+            .values,
+            vec![Some(ProjectedValue::FullValue(immutable_value))]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn background_startup_gc_failure_surfaces_on_flush_and_later_writes() {
+        let store = BlockingStore::new(Arc::new(InMemory::new()));
+        let storage = SlateDB::open_object_store_with_options(
+            "failed-background-startup-immutable-gc",
+            Arc::new(store.clone()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open failed startup-GC storage");
+        store.fail_immutable_lists();
+
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("first write starts before background failure");
+        write
+            .put_many(
+                StorageSpace::mutable(SpaceId(9), "test.mutable"),
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"key")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"value"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage write before background failure");
+        write
+            .commit()
+            .await
+            .expect("foreground commit precedes background failure");
+
+        let flush_error = storage
+            .flush()
+            .await
+            .expect_err("flush must surface background GC failure");
+        assert!(
+            flush_error
+                .to_string()
+                .contains("injected immutable list failure")
+        );
+        let write_error = match storage.begin_write(WriteOptions::default()).await {
+            Ok(_) => panic!("later write must surface background GC failure"),
+            Err(error) => error,
+        };
+        assert!(
+            write_error
+                .to_string()
+                .contains("injected immutable list failure")
         );
     }
 
@@ -7440,6 +7722,9 @@ mod tests {
         block_reads: Arc<AtomicBool>,
         block_compacted_reads: Arc<AtomicBool>,
         reads: Arc<OperationBlock>,
+        block_immutable_lists: Arc<AtomicBool>,
+        fail_immutable_lists: Arc<AtomicBool>,
+        lists: Arc<OperationBlock>,
     }
 
     impl BlockingStore {
@@ -7453,6 +7738,9 @@ mod tests {
                 block_reads: Arc::new(AtomicBool::new(false)),
                 block_compacted_reads: Arc::new(AtomicBool::new(false)),
                 reads: Arc::new(OperationBlock::default()),
+                block_immutable_lists: Arc::new(AtomicBool::new(false)),
+                fail_immutable_lists: Arc::new(AtomicBool::new(false)),
+                lists: Arc::new(OperationBlock::default()),
             }
         }
 
@@ -7477,6 +7765,17 @@ mod tests {
                 Arc::clone(&self.block_compacted_reads),
                 Arc::clone(&self.reads),
             )
+        }
+
+        fn block_immutable_lists(&self) -> OperationBlockGuard {
+            OperationBlockGuard::arm(
+                Arc::clone(&self.block_immutable_lists),
+                Arc::clone(&self.lists),
+            )
+        }
+
+        fn fail_immutable_lists(&self) {
+            self.fail_immutable_lists.store(true, Ordering::Release);
         }
 
         async fn maybe_block_write(&self, location: &ObjectPath) {
@@ -7656,7 +7955,30 @@ mod tests {
             &self,
             prefix: Option<&ObjectPath>,
         ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list(prefix)
+            let immutable =
+                prefix.is_some_and(|prefix| prefix.as_ref().contains(IMMUTABLE_VALUE_PATH));
+            if immutable && self.fail_immutable_lists.load(Ordering::Acquire) {
+                return stream::once(async {
+                    Err(ObjectStoreError::NotSupported {
+                        source: Box::new(std::io::Error::other("injected immutable list failure")),
+                    })
+                })
+                .boxed();
+            }
+            let inner = self.inner.list(prefix);
+            if !immutable || !self.block_immutable_lists.load(Ordering::Acquire) {
+                return inner;
+            }
+            let lists = Arc::clone(&self.lists);
+            inner
+                .then(move |result| {
+                    let lists = Arc::clone(&lists);
+                    async move {
+                        lists.enter().await;
+                        result
+                    }
+                })
+                .boxed()
         }
 
         fn list_with_offset(

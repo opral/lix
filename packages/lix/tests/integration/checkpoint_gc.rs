@@ -4,6 +4,7 @@ use serde_json::json;
 use tokio::time::{Duration, Instant};
 
 const CHECKPOINT_GC_INTERVAL: u64 = 64;
+const REPLAY_GC_SCHEMA_KEY: &str = "checkpoint_replay_gc_row";
 
 simulation_test!(
     checkpoint_gc_keeps_one_recovery_interval_then_sweeps_it,
@@ -213,24 +214,238 @@ simulation_test!(
             .await
             .expect("other interval write should succeed");
         let other_auto_commit = branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
-        other
+        let other_recovery_alias = other
             .create_checkpoint()
             .await
-            .expect("other checkpoint should retain its interval");
-        other
+            .expect("other checkpoint should retain its interval")
+            .commit_id;
+        let other_serving_checkpoint = other
             .create_checkpoint()
             .await
-            .expect("other recovery root should rotate");
+            .expect("other recovery root should rotate")
+            .commit_id;
+        other
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('gc-other-active', 'active')",
+                &[],
+            )
+            .await
+            .expect("other active undo interval write should succeed");
+        let other_active_history =
+            branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
 
-        assert_commits(&main, &[&main_auto_commit, &other_auto_commit], true).await;
+        assert_commits(
+            &main,
+            &[
+                &main_auto_commit,
+                &other_auto_commit,
+                &other_recovery_alias,
+                &other_serving_checkpoint,
+                &other_active_history,
+            ],
+            true,
+        )
+        .await;
         for _ in 4..CHECKPOINT_GC_INTERVAL {
             main.create_checkpoint()
                 .await
                 .expect("global GC padding checkpoint should succeed");
         }
         wait_for_commits(&main, &[&main_auto_commit, &other_auto_commit], false).await;
+        // The other branch's current recovery alias, serving checkpoint
+        // floor, and active undo/history interval remain distinct logical
+        // roots even though both branches' expired auto-commit intervals are
+        // now reclaimable.
+        assert_commits(
+            &main,
+            &[
+                &other_recovery_alias,
+                &other_serving_checkpoint,
+                &other_active_history,
+            ],
+            true,
+        )
+        .await;
     }
 );
+
+simulation_test!(
+    checkpoint_gc_retains_full_active_replay_interval,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        register_replay_gc_schema(&session).await;
+        let mut seed = session
+            .begin_transaction()
+            .await
+            .expect("replay fixture seed transaction should begin");
+        for index in 0..100 {
+            seed.execute(
+                &format!(
+                    "INSERT INTO {REPLAY_GC_SCHEMA_KEY} (id, indexed_value, note, generation) VALUES ($1, $2, $3, 0)"
+                ),
+                &[
+                    Value::Text(format!("row-{index}")),
+                    Value::Text(format!("indexed-{index}-0")),
+                    Value::Text(format!("seed-{index}")),
+                ],
+            )
+            .await
+            .expect("replay fixture seed should succeed");
+        }
+        seed.commit()
+            .await
+            .expect("replay fixture seed should commit");
+        let mut first = session
+            .begin_transaction()
+            .await
+            .expect("first churn transaction should begin");
+        first
+            .execute(
+                &format!(
+                    "UPDATE {REPLAY_GC_SCHEMA_KEY} SET indexed_value = 'indexed-0-1', generation = 1 WHERE id = 'row-0'"
+                ),
+                &[],
+            )
+            .await
+            .expect("first indexed churn should succeed");
+        first
+            .execute(
+                &format!(
+                    "UPDATE {REPLAY_GC_SCHEMA_KEY} SET note = 'one', generation = 1 WHERE id = 'row-1'"
+                ),
+                &[],
+            )
+            .await
+            .expect("first nonindexed churn should succeed");
+        first
+            .execute(
+                &format!("DELETE FROM {REPLAY_GC_SCHEMA_KEY} WHERE id = 'row-99'"),
+                &[],
+            )
+            .await
+            .expect("replacement delete should succeed");
+        first.commit().await.expect("first churn should commit");
+
+        let mut second = session
+            .begin_transaction()
+            .await
+            .expect("second churn transaction should begin");
+        second
+            .execute(
+                &format!(
+                    "UPDATE {REPLAY_GC_SCHEMA_KEY} SET indexed_value = 'indexed-0-2', generation = 2 WHERE id = 'row-0'"
+                ),
+                &[],
+            )
+            .await
+            .expect("second indexed churn should succeed");
+        second
+            .execute(
+                &format!(
+                    "UPDATE {REPLAY_GC_SCHEMA_KEY} SET note = 'two', generation = 2 WHERE id = 'row-1'"
+                ),
+                &[],
+            )
+            .await
+            .expect("second nonindexed churn should succeed");
+        second
+            .execute(
+                &format!(
+                    "INSERT INTO {REPLAY_GC_SCHEMA_KEY} (id, indexed_value, note, generation) VALUES ('row-99', 'indexed-99-2', 'replacement', 2)"
+                ),
+                &[],
+            )
+            .await
+            .expect("replacement insert should succeed");
+        second.commit().await.expect("second churn should commit");
+        let retired_head = branch_head(&engine, sim.main_branch_id()).await;
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("compacting checkpoint should succeed");
+        for _ in 1..CHECKPOINT_GC_INTERVAL {
+            session
+                .create_checkpoint()
+                .await
+                .expect("padding checkpoint should succeed");
+        }
+        wait_for_commits(&session, &[&retired_head], false).await;
+
+        assert_replay_gc_state(&session).await;
+        let history = session
+            .execute(
+                &format!("SELECT note FROM {REPLAY_GC_SCHEMA_KEY}_history() WHERE id = 'row-1'"),
+                &[],
+            )
+            .await
+            .expect("compacted history should remain readable after GC");
+        assert!(!history.is_empty());
+
+        let reopened_engine = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("engine should reopen after replay GC");
+        let reopened = sim.wrap_session(
+            reopened_engine
+                .open_workspace_session()
+                .await
+                .expect("reopened workspace session should open"),
+            &reopened_engine,
+        );
+        assert_replay_gc_state(&reopened).await;
+        reopened
+            .execute(
+                &format!("SELECT note FROM {REPLAY_GC_SCHEMA_KEY}_history() WHERE id = 'row-1'"),
+                &[],
+            )
+            .await
+            .expect("compacted history should remain readable after cold reopen");
+    }
+);
+
+async fn register_replay_gc_schema(session: &support::simulation_test::engine::SimSession) {
+    let schema = json!({
+        "x-lix-key": REPLAY_GC_SCHEMA_KEY,
+        "x-lix-primary-key": ["/id"],
+        "x-lix-unique": [["/indexed_value"]],
+        "type": "object",
+        "required": ["id", "indexed_value", "note", "generation"],
+        "properties": {
+            "id": { "type": "string" },
+            "indexed_value": { "type": "string" },
+            "note": { "type": "string" },
+            "generation": { "type": "integer" }
+        },
+        "additionalProperties": false
+    });
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("replay GC schema should register");
+}
+
+async fn assert_replay_gc_state(session: &support::simulation_test::engine::SimSession) {
+    let state = session
+        .execute(
+            &format!("SELECT note FROM {REPLAY_GC_SCHEMA_KEY} WHERE id = 'row-1'"),
+            &[],
+        )
+        .await
+        .expect("current state should remain readable after replay GC");
+    assert_eq!(state.rows()[0].values(), &[Value::Text("two".to_string())]);
+}
 
 async fn advance_to_next_gc(session: &support::simulation_test::engine::SimSession, sequence: u64) {
     for _ in (sequence + 1)..CHECKPOINT_GC_INTERVAL {

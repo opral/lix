@@ -1134,6 +1134,86 @@ where
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryGcCommitBenchResult {
+    pub staged_deletes: u64,
+    pub swept_commits: usize,
+    pub reclaimed_manifest_rows: usize,
+    pub reclaimed_manifest_chunk_rows: usize,
+    pub reclaimed_chunk_rows: usize,
+    pub reclaimed_chunk_bytes: u64,
+    pub plan_us: u64,
+    pub commit_us: u64,
+}
+
+/// Commits one production GC pass for the dual-adapter qualification lane.
+/// The helper exposes only maintenance accounting; it does not add a second
+/// reclamation implementation. Because benchmark callers operate below the
+/// session write gate, a concurrently spawned checkpoint sweep can win the
+/// authenticated publication fences. Retry that ordinary conflict from a new
+/// snapshot; all failed planning and commit work remains visible in whole-cell
+/// resource measurements.
+pub async fn collect_repository_gc_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<RepositoryGcCommitBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    const MAX_CONFLICT_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_CONFLICT_ATTEMPTS {
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage.begin_read(ReadOptions::default()).await?,
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let started = std::time::Instant::now();
+        let plan = crate::gc::stage_repository_gc_with_preconditions(
+            read,
+            &mut writes,
+            &mut preconditions,
+        )
+        .await?;
+        let plan_us = started.elapsed().as_micros() as u64;
+        let stats = writes.stats();
+        let binary_cas = plan.sweep.binary_cas.clone();
+        let commit_started = std::time::Instant::now();
+        match storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                return Ok(RepositoryGcCommitBenchResult {
+                    staged_deletes: stats.staged_deletes,
+                    swept_commits: plan
+                        .changelog
+                        .sweep
+                        .commits
+                        .len()
+                        .saturating_add(plan.sweep.tracked_commit_roots.len()),
+                    reclaimed_manifest_rows: binary_cas.reclaimed_manifest_rows,
+                    reclaimed_manifest_chunk_rows: binary_cas.reclaimed_manifest_chunk_rows,
+                    reclaimed_chunk_rows: binary_cas.reclaimed_chunk_rows,
+                    reclaimed_chunk_bytes: binary_cas.reclaimed_chunk_bytes,
+                    plan_us,
+                    commit_us: commit_started.elapsed().as_micros() as u64,
+                });
+            }
+            Err(StorageWriteSetError::Storage(
+                crate::storage_adapter::StorageError::WriteConflict
+                | crate::storage_adapter::StorageError::PreconditionFailed(_),
+            )) if attempt + 1 < MAX_CONFLICT_ATTEMPTS => tokio::task::yield_now().await,
+            Err(error) => return Err(crate::LixError::from(error)),
+        }
+    }
+    unreachable!("bounded repository GC conflict loop must return")
+}
+
 /// Audits standalone semantic facts for the GC benchmark without adding the
 /// scan to the measured planner phase. The exact IDs and their authenticated
 /// control reason make the old-vs-frontier sweep discrepancy explicit.
@@ -1583,7 +1663,7 @@ pub async fn binary_manifest_layout_accounting<R>(
 where
     R: StorageAdapterRead,
 {
-    let entries = scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let entries = scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_SPACE).await;
     let mut accounting = BinaryManifestLayoutAccounting::default();
     for entry in entries {
         let StorageProjectedValue::FullValue(value) = entry.value else {
@@ -1620,8 +1700,7 @@ where
 {
     const BATCH_SIZE: usize = 256;
 
-    let manifests =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let manifests = scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_SPACE).await;
     let mut entries = Vec::with_capacity(manifests.len());
     for batch in manifests.chunks(BATCH_SIZE) {
         let hashes = batch
@@ -1721,13 +1800,12 @@ where
     }
 
     let manifest_entries =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+        scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_SPACE).await;
     let manifest_chunk_entries =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
-    let chunk_entries =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE).await;
+        scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
+    let chunk_entries = scan_layout_entries(read, crate::binary_cas::BINARY_CAS_CHUNK_SPACE).await;
     let presence_entries =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE).await;
+        scan_layout_entries(read, crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE).await;
 
     let mut manifest_chunks = std::collections::BTreeMap::<
         crate::binary_cas::BlobId,
@@ -1917,7 +1995,7 @@ where
     }
 
     let manifest_chunk_entries =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
+        scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
     let mut manifest_chunks = std::collections::BTreeMap::<
         crate::binary_cas::BlobId,
         Vec<crate::binary_cas::BlobId>,
@@ -1945,7 +2023,7 @@ where
             .push(crate::binary_cas::BlobId::from_bytes(chunk_hash));
     }
 
-    let entries = scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let entries = scan_layout_entries(read, crate::binary_cas::BINARY_CAS_MANIFEST_SPACE).await;
     let mut accounting =
         std::collections::BTreeMap::<String, BinaryCasOwnerLayoutAccounting>::new();
     let mut chunk_owners = std::collections::BTreeMap::<
@@ -2023,8 +2101,7 @@ where
             }
         }
     }
-    let chunk_entries =
-        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE).await;
+    let chunk_entries = scan_layout_entries(read, crate::binary_cas::BINARY_CAS_CHUNK_SPACE).await;
     for entry in chunk_entries {
         let chunk_hash: [u8; 32] = entry.key.0.as_ref().try_into().map_err(|_| {
             crate::LixError::new(
@@ -2158,10 +2235,10 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
+        crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+        crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+        crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
+        crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,
         crate::changelog::COMMIT_CHANGE_ID_SPACE,
@@ -2366,7 +2443,7 @@ mod tests {
             ),
         ] {
             writes.put(
-                crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
+                crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
                 StorageKey(bytes::Bytes::from(vec![key_byte; 32])),
                 StorageValue {
                     bytes: bytes::Bytes::from(crate::binary_cas::encode_binary_cas_manifest(
@@ -2500,9 +2577,14 @@ mod tests {
         assert_eq!(first.swept_standalone_changes, 10);
         assert_eq!(first.deleted_commit_state_manifests, 10);
         assert_eq!(first.deleted_mutation_inventories, 10);
-        assert_eq!(first.deleted_semantic_commit_projections, 11);
-        assert_eq!(first.deleted_semantic_change_rows, 21);
-        assert_eq!(first.deleted_semantic_reverse_index_rows, 11);
+        // The ten branch-only commits are reclaimable, while the branch base
+        // remains the active main head and therefore keeps its semantic
+        // projection in the authenticated serving-dependency closure.
+        assert_eq!(first.deleted_semantic_commit_projections, 10);
+        // Each reclaimed projection owns one change fact and reverse-index
+        // row; the other ten change deletes are retired branch-ref facts.
+        assert_eq!(first.deleted_semantic_change_rows, 20);
+        assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
@@ -2518,9 +2600,9 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 11), // semantic commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 21), // semantic change facts
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 11), // commit -> change reverse index
+                (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 20), // projection and branch-ref changes
+                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
         assert_eq!(
@@ -2532,8 +2614,13 @@ mod tests {
             first.staged_deletes
         );
         assert_eq!(first.delete_descriptors, first.staged_deletes as usize);
-        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize);
-        assert_eq!(first.key_shared_bytes, first.staged_deletes as usize * 16);
+        // GC also stages the mandatory five-byte binary-CAS epoch key. Its
+        // put shares the key arena with the UUID-keyed delete descriptors.
+        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
+        assert_eq!(
+            first.key_shared_bytes,
+            first.staged_deletes as usize * 16 + 5
+        );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
         assert_eq!(second.staged_deletes, first.staged_deletes);

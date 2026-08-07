@@ -229,6 +229,65 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
     transaction.rollback().await.unwrap();
 }
 
+simulation_test!(
+    explicit_transaction_collection_delete_is_visible_and_terminates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+                   VALUES (lix_json('{"x-lix-key":"transaction_collection_delete","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
+                &[],
+            )
+            .await
+            .expect("collection schema should register");
+        session
+            .execute(
+                "INSERT INTO transaction_collection_delete (id) VALUES ('a'), ('b')",
+                &[],
+            )
+            .await
+            .expect("collection members should seed");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("explicit transaction should begin");
+        let deleted = transaction
+            .execute("DELETE FROM transaction_collection_delete", &[])
+            .await
+            .expect("whole collection delete should terminate");
+        assert_eq!(deleted.rows_affected(), 2);
+        let visible = transaction
+            .execute("SELECT id FROM transaction_collection_delete", &[])
+            .await
+            .expect("transaction should read its staged collection delete");
+        assert!(visible.rows().is_empty());
+        let deleted_again = transaction
+            .execute("DELETE FROM transaction_collection_delete", &[])
+            .await
+            .expect("repeated whole collection delete should terminate");
+        assert_eq!(deleted_again.rows_affected(), 0);
+        transaction
+            .commit()
+            .await
+            .expect("whole collection delete should commit");
+
+        let committed = session
+            .execute("SELECT id FROM transaction_collection_delete", &[])
+            .await
+            .expect("committed collection delete should remain visible");
+        assert!(committed.rows().is_empty());
+    }
+);
+
 #[tokio::test]
 async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
     let storage = Memory::new();
@@ -441,6 +500,51 @@ async fn existing_workspace_session_ignores_later_selector_corruption() {
         .await
         .err()
         .expect("a new workspace session should reject the corrupt selector");
+}
+
+#[tokio::test]
+async fn explicit_transaction_open_uses_one_authoritative_snapshot_in_every_session_mode() {
+    let storage = RecordingStorage::new();
+    let receipt = Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("initialized storage should create an engine");
+    let workspace = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let before = storage.stats();
+    let workspace_transaction = workspace
+        .begin_transaction()
+        .await
+        .expect("workspace transaction should open");
+    let delta = storage.stats().delta_since(&before);
+    assert_eq!(delta.read_opened, 1, "workspace open must own one snapshot");
+    assert_eq!(delta.write_opened, 0, "transaction open must not write");
+    workspace_transaction
+        .rollback()
+        .await
+        .expect("workspace transaction should roll back");
+
+    let pinned = engine
+        .open_session(receipt.main_branch_id)
+        .await
+        .expect("pinned session should open");
+    let before = storage.stats();
+    let pinned_transaction = pinned
+        .begin_transaction()
+        .await
+        .expect("pinned transaction should open");
+    let delta = storage.stats().delta_since(&before);
+    assert_eq!(delta.read_opened, 1, "pinned open must own one snapshot");
+    assert_eq!(delta.write_opened, 0, "transaction open must not write");
+    pinned_transaction
+        .rollback()
+        .await
+        .expect("pinned transaction should roll back");
 }
 
 #[tokio::test]
