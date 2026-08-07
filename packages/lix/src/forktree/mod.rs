@@ -9,6 +9,8 @@ mod codec;
 mod gc_index;
 mod model;
 mod object;
+#[cfg(feature = "storage-benches")]
+mod oracle;
 mod publication;
 mod reachability;
 mod serving;
@@ -25,6 +27,10 @@ pub(crate) use model::{
     UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 pub(crate) use object::ObjectId;
+#[cfg(feature = "storage-benches")]
+pub(crate) use oracle::{
+    run as run_application_oracle, verify_reopen as verify_application_oracle_reopen,
+};
 pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{

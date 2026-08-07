@@ -54,6 +54,27 @@ pub const fn synthetic_space_for_bench(
     )
 }
 
+/// Runs one typed ForkTree Stage-1 application-oracle cell. The bridge exposes
+/// no descriptor, object mutation, or sweep-plan construction capability.
+pub async fn run_forktree_application_oracle<S>(storage: &S, case: &str) -> Result<String, String>
+where
+    S: Storage,
+{
+    crate::forktree::run_application_oracle(storage, case).await
+}
+
+/// Revalidates one completed oracle cell after the adapter has been dropped
+/// and reopened by the external harness.
+pub async fn verify_forktree_application_oracle_reopen<S>(
+    storage: &S,
+    case: &str,
+) -> Result<String, String>
+where
+    S: Storage,
+{
+    crate::forktree::verify_application_oracle_reopen(storage, case).await
+}
+
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],

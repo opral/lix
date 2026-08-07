@@ -61,6 +61,157 @@ pub(crate) struct PreparedPublication {
     untracked_deletes: BTreeSet<Bytes>,
 }
 
+/// Test-only typed bootstrap input for the unwired Stage-1 application oracle.
+///
+/// The external harness cannot construct or name an object-space descriptor.
+/// This value stays inside the ForkTree owner and is accepted only after every
+/// canonical envelope, selected root, catalog back-edge, and selector binding
+/// has been authenticated. Production bootstrap remains part of the Stage-2
+/// compiler wave; this bridge does not make an alternate serving path.
+#[cfg(feature = "storage-benches")]
+pub(super) struct OracleBootstrap {
+    pub(super) objects: ImmutableObjectSet,
+    pub(super) global_selector: GlobalSelectorV1,
+    pub(super) branch_selector: BranchSelectorV1,
+}
+
+#[cfg(feature = "storage-benches")]
+pub(super) async fn commit_oracle_bootstrap<S>(
+    storage: &S,
+    bootstrap: OracleBootstrap,
+) -> Result<(), StorageError>
+where
+    S: Storage,
+{
+    let OracleBootstrap {
+        objects,
+        global_selector,
+        branch_selector,
+    } = bootstrap;
+    if global_selector.epoch == 0
+        || global_selector.selector_generation == 0
+        || branch_selector.selector_generation == 0
+    {
+        return Err(corruption("oracle bootstrap selector generation is zero"));
+    }
+    let load = |id: ObjectId| {
+        objects
+            .get(id)
+            .cloned()
+            .ok_or_else(|| corruption(format!("oracle bootstrap object {id} is absent")))
+    };
+    for (id, bytes) in objects.iter() {
+        super::object::authenticate_object_domain(id, bytes)?;
+    }
+    let repository = super::model::RepositoryRootV1::decode(
+        global_selector.repository_root,
+        &load(global_selector.repository_root)?,
+    )?;
+    let snapshot = BranchSnapshotV1::decode(
+        branch_selector.branch_snapshot_object_id,
+        &load(branch_selector.branch_snapshot_object_id)?,
+    )?;
+    if snapshot.branch_id != branch_selector.branch_id {
+        return Err(corruption(
+            "oracle bootstrap branch selector names another branch snapshot",
+        ));
+    }
+    for (root, kind) in [
+        (repository.global_state_root, "state"),
+        (repository.commit_catalog_root, "commit"),
+        (repository.change_catalog_root, "change"),
+        (repository.retention_policy_root, "retention"),
+        (snapshot.local_state_root, "state"),
+        (snapshot.historical_global_state_root, "state"),
+    ] {
+        super::tree::validate_root_bytes(root, kind, &load(root)?)?;
+    }
+    let head = CommitObjectV1::decode(
+        snapshot.semantic_head_commit_object_id,
+        &load(snapshot.semantic_head_commit_object_id)?,
+    )?;
+    if head.global_state_root != snapshot.historical_global_state_root
+        || head.local_state_root != snapshot.local_state_root
+    {
+        return Err(corruption(
+            "oracle bootstrap semantic head does not own the selected state roots",
+        ));
+    }
+    super::tree::validate_branch_snapshot_ref_edge(&snapshot, &load)?;
+    for (key, value) in super::tree::scan_all(repository.commit_catalog_root, "commit", &load)? {
+        let id = super::model::CommitId::from_bytes(
+            key.as_slice()
+                .try_into()
+                .map_err(|_| corruption("oracle CommitCatalog key is not a raw UUID"))?,
+        );
+        let entry = super::model::CommitCatalogEntry::decode(&value)?;
+        super::tree::validate_commit_catalog_back_edge(id, entry, &load)?;
+    }
+    for (key, value) in super::tree::scan_all(repository.change_catalog_root, "change", &load)? {
+        let id = super::model::ChangeId::from_bytes(
+            key.as_slice()
+                .try_into()
+                .map_err(|_| corruption("oracle ChangeCatalog key is not a raw UUID"))?,
+        );
+        let entry = super::model::ChangeCatalogEntry::decode(&value)?;
+        super::tree::validate_change_catalog_back_edge(id, entry, &load)?;
+    }
+
+    let raw_global = global_selector.encode()?;
+    let raw_branch = branch_selector.encode()?;
+    let global_key = global_selector_key();
+    let branch_key = branch_selector_key(branch_selector.branch_id);
+    let mut write = storage
+        .begin_write(WriteOptions {
+            preconditions: vec![
+                Precondition::KeyAbsent {
+                    space: SELECTOR_SPACE,
+                    key: Key(global_key.clone()),
+                },
+                Precondition::KeyAbsent {
+                    space: SELECTOR_SPACE,
+                    key: Key(branch_key.clone()),
+                },
+            ],
+            ..WriteOptions::default()
+        })
+        .await?;
+    write
+        .put_many(
+            OBJECT_SPACE,
+            PutBatch {
+                entries: objects
+                    .iter()
+                    .map(|(id, bytes)| PutEntry {
+                        key: Key(Bytes::copy_from_slice(id.as_bytes())),
+                        value: StoredValue {
+                            bytes: bytes.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+        )
+        .await?;
+    write
+        .put_many(
+            SELECTOR_SPACE,
+            PutBatch {
+                entries: vec![
+                    PutEntry {
+                        key: Key(global_key),
+                        value: StoredValue { bytes: raw_global },
+                    },
+                    PutEntry {
+                        key: Key(branch_key),
+                        value: StoredValue { bytes: raw_branch },
+                    },
+                ],
+            },
+        )
+        .await?;
+    write.commit().await.map(|_| ())
+}
+
 impl PreparedPublication {
     /// Starts a branch/state publication and fences both raw selectors from
     /// the one coherent view used to derive it.
