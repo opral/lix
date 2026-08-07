@@ -1032,7 +1032,6 @@ async fn scan_certified_entity_batch_rows(
         .await?
         .value;
     let content_count = contents.iter().flatten().count();
-    let decode_limit = (content_count <= 1).then_some(limit).flatten();
     let needs_snapshot = request.read_columns.columns.is_empty()
         || request
             .read_columns
@@ -1082,16 +1081,13 @@ async fn scan_certified_entity_batch_rows(
             request,
             &filter_index,
             needs_snapshot,
-            decode_limit,
+            None,
             &mut builder,
         )?;
-        if decode_limit.is_some_and(|limit| builder.len() >= limit) {
-            break;
-        }
     }
     let batch = builder.finish();
     if content_count <= 1 {
-        return Ok(batch);
+        return canonicalize_single_certified_batch(batch, limit);
     }
     let mut winners = BTreeMap::new();
     for row in batch.into_rows() {
@@ -3826,7 +3822,6 @@ async fn load_packed_current_base_exact_entries(
     Ok(winners)
 }
 
-#[cfg(test)]
 fn compare_materialized_live_identities(
     left: &MaterializedLiveStateRow,
     right: &MaterializedLiveStateRow,
@@ -3835,6 +3830,54 @@ fn compare_materialized_live_identities(
         .cmp(&right.schema_key)
         .then_with(|| left.entity_pk.cmp(&right.entity_pk))
         .then_with(|| left.file_id.cmp(&right.file_id))
+}
+
+/// Restores the identity-order contract at the producer boundary for one
+/// certified content object.
+///
+/// Certified packet order is plugin-defined and therefore cannot be used for
+/// SQL order or LIMIT. The common already-ordered batch remains borrowed and
+/// allocation-free. Only a noncanonical batch expands into owned rows for one
+/// sort. Repeated identities are valid only when every materialized payload
+/// byte and authority field is identical.
+fn canonicalize_single_certified_batch(
+    batch: MaterializedLiveStateBatch,
+    limit: Option<usize>,
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    let already_strictly_ordered = (1..batch.len()).all(|index| {
+        compare_materialized_live_identity_refs(batch.row(index - 1), batch.row(index)).is_lt()
+    });
+    if already_strictly_ordered {
+        return Ok(if limit.is_some_and(|limit| batch.len() > limit) {
+            batch.filter(|_| true, limit)
+        } else {
+            batch
+        });
+    }
+
+    let mut rows = batch.into_rows();
+    rows.sort_unstable_by(compare_materialized_live_identities);
+    let mut canonical = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(previous) = canonical.last() else {
+            canonical.push(row);
+            continue;
+        };
+        if compare_materialized_live_identities(previous, &row).is_ne() {
+            canonical.push(row);
+            continue;
+        }
+        if previous != &row {
+            return Err(head_value_error(format!(
+                "duplicate certified authority for schema '{}' entity_pk {:?} file_id {:?} has conflicting row bytes or authority evidence",
+                row.schema_key, row.entity_pk, row.file_id,
+            )));
+        }
+    }
+    if let Some(limit) = limit {
+        canonical.truncate(limit);
+    }
+    Ok(MaterializedLiveStateBatch::from_rows(canonical))
 }
 
 #[cfg(test)]
@@ -3927,6 +3970,39 @@ fn merge_ordered_live_batches(
         right_index += 1;
     }
     merged.finish()
+}
+
+/// Removes rows whose identity is already owned by another identity-ordered
+/// authority batch. Both inputs are scan results in canonical identity order,
+/// so one forward cursor replaces a per-row tree lookup and owned identity.
+fn exclude_ordered_live_batch_identities(
+    rows: MaterializedLiveStateBatch,
+    authority: &MaterializedLiveStateBatch,
+) -> MaterializedLiveStateBatch {
+    if rows.is_empty() || authority.is_empty() {
+        return rows;
+    }
+    debug_assert!((1..rows.len()).all(|index| {
+        compare_materialized_live_identity_refs(rows.row(index - 1), rows.row(index)).is_lt()
+    }));
+    debug_assert!((1..authority.len()).all(|index| {
+        compare_materialized_live_identity_refs(authority.row(index - 1), authority.row(index))
+            .is_lt()
+    }));
+    let mut authority_index = 0usize;
+    rows.filter(
+        |row| loop {
+            let Some(authority_row) = authority.get(authority_index) else {
+                return true;
+            };
+            match compare_materialized_live_identity_refs(authority_row, row) {
+                Ordering::Less => authority_index += 1,
+                Ordering::Equal => return false,
+                Ordering::Greater => return true,
+            }
+        },
+        None,
+    )
 }
 
 /// Direct reader for one published hot generation.
@@ -4735,20 +4811,8 @@ where
             },
             None,
         );
-        let overlay_commits = rows
-            .iter()
-            .map(|row| {
-                (
-                    (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    ),
-                    row.commit_id(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let packed_limit = if overlay_commits.is_empty() && replaced_generation.is_none() {
+        let has_overlay_rows = !rows.is_empty();
+        let packed_limit = if !has_overlay_rows && replaced_generation.is_none() {
             request.limit.map(|limit| limit.saturating_sub(rows.len()))
         } else {
             None
@@ -4777,60 +4841,7 @@ where
         } else {
             scan_packed_current_base_rows(&self.store, branch_id, generation, request, packed_limit)
                 .await?
-        }
-        .filter(
-            |row| {
-                overlay_commits.is_empty() || {
-                    let identity = (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    );
-                    overlay_commits.get(&identity).is_none_or(|overlay_commit| {
-                        overlay_commit.is_some_and(|overlay_commit| {
-                            row.commit_id()
-                                .is_some_and(|packed_commit| packed_commit > overlay_commit)
-                        })
-                    })
-                }
-            },
-            None,
-        );
-        let packed_commits = if rows.is_empty() {
-            BTreeMap::new()
-        } else {
-            packed_rows
-                .iter()
-                .map(|row| {
-                    (
-                        (
-                            row.schema_key().to_owned(),
-                            row.entity_pk().clone(),
-                            row.file_id().map(str::to_owned),
-                        ),
-                        row.commit_id(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
         };
-        let rows = rows.filter(
-            |row| {
-                packed_commits.is_empty() || {
-                    let identity = (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    );
-                    packed_commits.get(&identity).is_none_or(|packed_commit| {
-                        !packed_commit.is_some_and(|packed_commit| {
-                            row.commit_id()
-                                .is_some_and(|overlay_commit| packed_commit > overlay_commit)
-                        })
-                    })
-                }
-            },
-            None,
-        );
         // Format plugins cannot publish engine-owned schemas. Do not even
         // inspect certified semantic manifests for a scan that can only match
         // engine rows such as file descriptors or blob materializations.
@@ -4848,7 +4859,7 @@ where
                 branch_id,
                 generation,
                 request,
-                if overlay_commits.is_empty() {
+                if !has_overlay_rows {
                     request.limit.map(|limit| limit.saturating_sub(rows.len()))
                 } else {
                     None
@@ -4856,43 +4867,6 @@ where
                 self.transaction_cache.as_deref(),
             )
             .await?
-            .filter(
-                |row| {
-                    overlay_commits.is_empty() || {
-                        let identity = (
-                            row.schema_key().to_owned(),
-                            row.entity_pk().clone(),
-                            row.file_id().map(str::to_owned),
-                        );
-                        !overlay_commits.contains_key(&identity)
-                    }
-                },
-                None,
-            )
-        };
-        let certified_rows = if certified_rows.is_empty() || packed_rows.is_empty() {
-            certified_rows
-        } else {
-            let packed_identities = packed_rows
-                .iter()
-                .map(|row| {
-                    (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    )
-                })
-                .collect::<BTreeSet<_>>();
-            certified_rows.filter(
-                |row| {
-                    !packed_identities.contains(&(
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    ))
-                },
-                None,
-            )
         };
         // A pristine root-backed generation has no possible shadowing winner,
         // so preserve bounded-read behavior by pushing LIMIT into the tracked
@@ -4909,7 +4883,12 @@ where
                 .saturating_add(certified_rows.len()),
         ))
         .await?;
+        // HOT and packed rows carry comparable commit ownership; their
+        // existing ordered merge selects the newest authority directly.
+        // Certified rows remain subordinate to either authority regardless of
+        // commit ID, so exclude their collisions with one linear cursor.
         let combined = merge_ordered_live_batches(rows, packed_rows);
+        let certified_rows = exclude_ordered_live_batch_identities(certified_rows, &combined);
         let combined = merge_ordered_live_batches(combined, root_rows);
         let rows = merge_ordered_live_batches(combined, certified_rows);
         if request.filter.include_tombstones
@@ -9762,7 +9741,12 @@ async fn hot_scan_entries<'a>(
     prefixes.sort();
     prefixes.dedup();
     let mut rows = Vec::new();
+    let mut saw_file_backed_row = false;
     let mut retained_bytes = 0_usize;
+    // A fixed file bucket has the same physical and logical order. Every
+    // broader file domain must defer LIMIT until file-first storage order has
+    // been restored to canonical `(schema, entity_pk, file_id)` order.
+    let physical_limit = limit.filter(|_| hot_filter_has_one_fixed_file_bucket(filter));
     for prefix in prefixes {
         let plan = ScanPlan::prefix(
             HOT_ROW_SPACE,
@@ -9772,8 +9756,13 @@ async fn hot_scan_entries<'a>(
         );
         let mut resume_after = None;
         loop {
-            let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
+            let remaining = physical_limit.map(|limit| limit.saturating_sub(rows.len()));
             if matches!(remaining, Some(0)) {
+                let rows = if saw_file_backed_row {
+                    canonicalize_hot_scan_rows(rows, limit)?
+                } else {
+                    rows
+                };
                 return Ok(Some(HotScanEntries::Decoded(rows)));
             }
             let page = plan
@@ -9792,6 +9781,7 @@ async fn hot_scan_entries<'a>(
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
+                    saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
                     retained_bytes = retained_bytes
                         .checked_add(encoded_key_bytes)
@@ -9802,7 +9792,12 @@ async fn hot_scan_entries<'a>(
                         return Ok(None);
                     }
                     rows.push((identity, value));
-                    if limit.is_some_and(|limit| rows.len() >= limit) {
+                    if physical_limit.is_some_and(|limit| rows.len() >= limit) {
+                        let rows = if saw_file_backed_row {
+                            canonicalize_hot_scan_rows(rows, limit)?
+                        } else {
+                            rows
+                        };
                         return Ok(Some(HotScanEntries::Decoded(rows)));
                     }
                 }
@@ -9812,7 +9807,58 @@ async fn hot_scan_entries<'a>(
             }
         }
     }
+    if saw_file_backed_row {
+        rows = canonicalize_hot_scan_rows(rows, limit)?;
+    } else if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
     Ok(Some(HotScanEntries::Decoded(rows)))
+}
+
+fn hot_filter_has_one_fixed_file_bucket(filter: &TrackedStateFilter) -> bool {
+    let Some(first) = filter.file_ids.first() else {
+        return false;
+    };
+    !matches!(first, NullableKeyFilter::Any)
+        && filter.file_ids.iter().all(|file_id| file_id == first)
+}
+
+/// Restores the logical live-state identity order before any caller observes
+/// rows or applies LIMIT.
+///
+/// One physical HOT primary key is the sole authority for its logical
+/// identity. Repeated scans may therefore collapse only byte-identical copies
+/// of that same key. Distinct keys or values for one logical identity are an
+/// invalid authority state and fail closed instead of selecting a second
+/// winner.
+fn canonicalize_hot_scan_rows(
+    mut rows: Vec<(HotScanIdentity, Bytes)>,
+    limit: Option<usize>,
+) -> Result<Vec<(HotScanIdentity, Bytes)>, LixError> {
+    let already_strictly_ordered = rows
+        .windows(2)
+        .all(|pair| pair[0].0.cmp(&pair[1].0).is_lt());
+    if !already_strictly_ordered {
+        rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for pair in rows.windows(2) {
+            if pair[0].0 != pair[1].0 {
+                continue;
+            }
+            if pair[0].0.key != pair[1].0.key || pair[0].1 != pair[1].1 {
+                return Err(head_value_error(format!(
+                    "duplicate HOT authority for schema '{}' entity_pk {:?} file_id {:?} has different physical bytes",
+                    pair[0].0.schema_key(),
+                    pair[0].0.entity_pk,
+                    pair[0].0.file_id(),
+                )));
+            }
+        }
+        rows.dedup_by(|left, right| left.0 == right.0);
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
 }
 
 fn hot_scan_entries_fit_budget<'a>(
@@ -10036,14 +10082,8 @@ async fn scan_hot_file_entries(
         }
     }
     // Physical rows are ordered `(schema, file_id, entity_pk)`, while SQL rows
-    // are ordered `(schema, entity_pk, file_id)`. Restore the public order
-    // after multi-file scans and defend against repeated predicates.
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    rows.dedup_by(|left, right| left.0 == right.0);
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    Ok(rows)
+    // are ordered `(schema, entity_pk, file_id)`.
+    canonicalize_hot_scan_rows(rows, limit)
 }
 
 async fn hot_schema_has_file_members(
@@ -11355,6 +11395,77 @@ mod tests {
                 .map(|row| row.entity_pk.as_single_string_owned().expect("single key"))
                 .collect::<Vec<_>>(),
             ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn ordered_authority_exclusion_removes_only_identity_collisions() {
+        let rows = MaterializedLiveStateBatch::from_rows(vec![
+            live_row("a", "candidate-a"),
+            live_row("b", "candidate-b"),
+            live_row("c", "candidate-c"),
+            live_row("d", "candidate-d"),
+        ]);
+        let authority = MaterializedLiveStateBatch::from_rows(vec![
+            live_row("a", "authority-a"),
+            live_row("c", "authority-c"),
+        ]);
+
+        let filtered = exclude_ordered_live_batch_identities(rows, &authority);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| {
+                    row.entity_pk()
+                        .as_single_string_owned()
+                        .expect("single key")
+                })
+                .collect::<Vec<_>>(),
+            ["b", "d"]
+        );
+    }
+
+    #[test]
+    fn single_certified_batch_canonicalizes_before_limit_and_validates_duplicates() {
+        let mut root = live_row("root", "certified-order");
+        root.schema_key = "json_root".to_owned();
+        let mut member = live_row("member", "certified-order");
+        member.schema_key = "json_object_member".to_owned();
+
+        let canonical = canonicalize_single_certified_batch(
+            MaterializedLiveStateBatch::from_rows(vec![
+                root.clone(),
+                member.clone(),
+                member.clone(),
+            ]),
+            None,
+        )
+        .expect("identical duplicate certified rows should collapse");
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(canonical.row(0).schema_key(), "json_object_member");
+        assert_eq!(canonical.row(1).schema_key(), "json_root");
+
+        let limited = canonicalize_single_certified_batch(
+            MaterializedLiveStateBatch::from_rows(vec![root.clone(), member.clone()]),
+            Some(1),
+        )
+        .expect("LIMIT should follow certified identity canonicalization");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited.row(0).schema_key(), "json_object_member");
+
+        let mut conflicting = member.clone();
+        conflicting.metadata = Some(SharedStr::from("{\"conflict\":true}"));
+        let error = canonicalize_single_certified_batch(
+            MaterializedLiveStateBatch::from_rows(vec![member, conflicting]),
+            None,
+        )
+        .expect_err("conflicting duplicate certified authority must fail closed");
+        assert!(
+            error
+                .message
+                .contains("duplicate certified authority for schema 'json_object_member'"),
+            "unexpected duplicate-authority error: {error:?}"
         );
     }
 
@@ -12954,6 +13065,77 @@ mod tests {
         assert_eq!(
             rows.row(0).file_id().expect("file").as_ptr(),
             rows.row(ROW_COUNT - 1).file_id().expect("file").as_ptr()
+        );
+    }
+
+    fn adversarial_hot_scan_entry(
+        generation: CommitId,
+        entity_pk: &str,
+        file_id: &str,
+        value: &'static [u8],
+    ) -> (HotScanIdentity, Bytes) {
+        let scope = hot_scope_prefix("branch", generation);
+        let key = Bytes::from(encode_hot_row_key_parts(
+            "branch",
+            generation,
+            "schema",
+            &EntityPk::single(entity_pk),
+            Some(file_id),
+        ));
+        let identity = decode_hot_scan_row_key_in_scope(key, &scope)
+            .expect("decode adversarial HOT scan identity");
+        (identity, Bytes::from_static(value))
+    }
+
+    #[test]
+    fn hot_scan_canonicalizes_before_limit_and_collapses_only_identical_duplicates() {
+        let generation = CommitId::for_test_label("adversarial-hot-canonical-order");
+        let physical_rows = || {
+            vec![
+                adversarial_hot_scan_entry(generation, "entity-z", "file-a", b"z"),
+                adversarial_hot_scan_entry(generation, "entity-z", "file-a", b"z"),
+                adversarial_hot_scan_entry(generation, "entity-a", "file-b", b"a"),
+            ]
+        };
+
+        let canonical = canonicalize_hot_scan_rows(physical_rows(), None)
+            .expect("identical repeated HOT observations should canonicalize");
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(
+            canonical
+                .iter()
+                .map(|(identity, _)| (identity.entity_pk.clone(), identity.file_id()))
+                .collect::<Vec<_>>(),
+            [
+                (EntityPk::single("entity-a"), Some("file-b")),
+                (EntityPk::single("entity-z"), Some("file-a")),
+            ]
+        );
+
+        let limited = canonicalize_hot_scan_rows(physical_rows(), Some(1))
+            .expect("LIMIT should apply after HOT canonicalization");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0.entity_pk, EntityPk::single("entity-a"));
+        assert_eq!(limited[0].0.file_id(), Some("file-b"));
+    }
+
+    #[test]
+    fn hot_scan_rejects_conflicting_duplicate_authority() {
+        let generation = CommitId::for_test_label("conflicting-hot-authority");
+        let error = canonicalize_hot_scan_rows(
+            vec![
+                adversarial_hot_scan_entry(generation, "entity", "file", b"older"),
+                adversarial_hot_scan_entry(generation, "entity", "file", b"newer"),
+            ],
+            None,
+        )
+        .expect_err("one HOT identity cannot have two authoritative byte values");
+
+        assert!(
+            error
+                .message
+                .contains("duplicate HOT authority for schema 'schema'"),
+            "unexpected duplicate-authority error: {error:?}"
         );
     }
 
