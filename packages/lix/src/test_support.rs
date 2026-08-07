@@ -699,21 +699,62 @@ async fn stage_test_changelog_commit(
                 .checked_add(1)
                 .ok_or_else(|| crate::LixError::unknown("test commit generation exceeds u64"))
         })?;
-    let parent_segment = match typed_parent_ids.as_slice() {
+    let parent_depth = match typed_parent_ids.as_slice() {
         [_] => parent_records
             .iter()
             .next()
             .and_then(|(_, record)| record)
-            .map(|record| {
-                (
-                    record.linear_segment_base_commit_id,
-                    record.linear_segment_depth,
-                )
-            }),
+            .map(|record| record.linear_segment_depth),
         _ => None,
     };
-    let (linear_segment_base_commit_id, linear_segment_depth) =
-        crate::changelog::next_linear_segment(typed_commit_id, &typed_parent_ids, parent_segment)?;
+    let linear_segment_depth = crate::changelog::next_linear_segment_depth(
+        typed_commit_id,
+        &typed_parent_ids,
+        parent_depth,
+    )?;
+    let mut linear_segment_ancestor_commit_ids = Vec::new();
+    if linear_segment_depth == crate::changelog::LINEAR_SEGMENT_MAX_DEPTH {
+        let mut child_commit_id = typed_commit_id;
+        let mut child_generation = generation;
+        let mut next_ancestor = parent_records
+            .iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .cloned()
+            .ok_or_else(|| crate::LixError::unknown("test changelog parent commit is missing"))?;
+        for expected_depth in (0..crate::changelog::LINEAR_SEGMENT_MAX_DEPTH).rev() {
+            if next_ancestor.linear_segment_depth != expected_depth
+                || child_generation != next_ancestor.generation.saturating_add(1)
+            {
+                return Err(crate::LixError::unknown(format!(
+                    "test commit '{child_commit_id}' has malformed linear ancestry"
+                )));
+            }
+            linear_segment_ancestor_commit_ids.push(next_ancestor.commit_id);
+            child_commit_id = next_ancestor.commit_id;
+            child_generation = next_ancestor.generation;
+            if expected_depth > 0 {
+                let [parent_commit_id] = next_ancestor.parent_commit_ids.as_slice() else {
+                    return Err(crate::LixError::unknown(format!(
+                        "test commit '{child_commit_id}' has nonlinear segment ancestry"
+                    )));
+                };
+                let requested = [*parent_commit_id];
+                next_ancestor = ChangelogContext::new()
+                    .reader(&mut *read)
+                    .load_commits(CommitLoadRequest {
+                        commit_ids: &requested,
+                    })
+                    .await?
+                    .into_iter()
+                    .next()
+                    .and_then(|(_, record)| record)
+                    .ok_or_else(|| {
+                        crate::LixError::unknown("test linear ancestor commit is missing")
+                    })?;
+            }
+        }
+    }
     let winner_indices = final_state_row_winner_indices(rows)?;
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
@@ -738,8 +779,8 @@ async fn stage_test_changelog_commit(
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,
-        linear_segment_base_commit_id,
         linear_segment_depth,
+        linear_segment_ancestor_commit_ids,
         change_id: typed_commit_change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,

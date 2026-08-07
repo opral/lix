@@ -529,7 +529,10 @@ where
     }
     let mut records = Vec::new();
     let mut generations = std::collections::HashMap::new();
-    let mut linear_segments = std::collections::HashMap::new();
+    let mut linear_segments = std::collections::HashMap::<
+        crate::changelog::CommitId,
+        (u8, Vec<crate::changelog::CommitId>),
+    >::new();
     let scenario_name = match scenario {
         MergeBaseBenchScenario::EqualHeads => "equal",
         MergeBaseBenchScenario::AncestorDescendant => "ancestor",
@@ -555,21 +558,25 @@ where
         let commit_id = crate::changelog::CommitId::for_test_label(&label);
         let parent_segment = match parents.as_slice() {
             [parent_commit_id] => {
-                Some(*linear_segments.get(parent_commit_id).ok_or_else(|| {
+                let (depth, path) = linear_segments.get(parent_commit_id).ok_or_else(|| {
                     crate::LixError::unknown("merge-base benchmark parent segment is not seeded")
-                })?)
+                })?;
+                Some((*depth, path.as_slice()))
             }
             _ => None,
         };
-        let (linear_segment_base_commit_id, linear_segment_depth) =
-            crate::changelog::next_linear_segment(commit_id, &parents, parent_segment)?;
+        let (linear_segment_depth, linear_segment_path) =
+            crate::changelog::next_linear_segment_path(commit_id, &parents, parent_segment)?;
         records.push(crate::changelog::CommitRecord {
             format_version: 3,
             commit_id,
             generation,
             parent_commit_ids: parents,
-            linear_segment_base_commit_id,
             linear_segment_depth,
+            linear_segment_ancestor_commit_ids: crate::changelog::persisted_linear_segment_path(
+                linear_segment_depth,
+                &linear_segment_path,
+            ),
             change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
@@ -578,10 +585,7 @@ where
             ),
         });
         generations.insert(commit_id, generation);
-        linear_segments.insert(
-            commit_id,
-            (linear_segment_base_commit_id, linear_segment_depth),
-        );
+        linear_segments.insert(commit_id, (linear_segment_depth, linear_segment_path));
         Ok(commit_id)
     };
 

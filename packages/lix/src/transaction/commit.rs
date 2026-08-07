@@ -1189,7 +1189,9 @@ async fn stage_changelog_commits(
         })
         .await?;
     let mut generations = BTreeMap::new();
-    let mut linear_segments = BTreeMap::new();
+    let mut linear_segment_depths = BTreeMap::new();
+    let mut linear_segment_ancestor_commit_ids = BTreeMap::new();
+    let mut known_commit_records = BTreeMap::new();
     let mut rootless_depths = BTreeMap::new();
     let mut rootless_rows = BTreeMap::new();
     let mut rootless_bytes = BTreeMap::new();
@@ -1220,19 +1222,24 @@ async fn stage_changelog_commits(
                 ),
             ));
         }
+        crate::changelog::validate_linear_segment_hint_shape(
+            record.commit_id,
+            &record.parent_commit_ids,
+            record.linear_segment_depth,
+            &record.linear_segment_ancestor_commit_ids,
+        )?;
         generations.insert(*commit_id, record.generation);
-        linear_segments.insert(
+        linear_segment_depths.insert(*commit_id, record.linear_segment_depth);
+        linear_segment_ancestor_commit_ids.insert(
             *commit_id,
-            (
-                record.linear_segment_base_commit_id,
-                record.linear_segment_depth,
-            ),
+            record.linear_segment_ancestor_commit_ids.clone(),
         );
         let replay_debt = published.replay_debt();
         rootless_depths.insert(*commit_id, replay_debt.depth);
         rootless_rows.insert(*commit_id, replay_debt.rows);
         rootless_bytes.insert(*commit_id, replay_debt.bytes);
         external_parent_manifests.insert(*commit_id, published);
+        known_commit_records.insert(*commit_id, record);
     }
     let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
     let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
@@ -1266,22 +1273,38 @@ async fn stage_changelog_commits(
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
             })?;
-        let parent_segment = match commit.parent_commit_ids.as_slice() {
+        let parent_depth = match commit.parent_commit_ids.as_slice() {
             [parent_commit_id] => {
-                Some(*linear_segments.get(parent_commit_id).ok_or_else(|| {
+                Some(*linear_segment_depths.get(parent_commit_id).ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        format!("commit '{commit_id}' has missing parent segment metadata"),
+                        format!("commit '{commit_id}' has missing parent segment depth"),
                     )
                 })?)
             }
             _ => None,
         };
-        let linear_segment = crate::changelog::next_linear_segment(
+        let linear_segment_depth = crate::changelog::next_linear_segment_depth(
             commit_id,
             &commit.parent_commit_ids,
-            parent_segment,
+            parent_depth,
         )?;
+        let ancestor_commit_ids =
+            if linear_segment_depth == crate::changelog::LINEAR_SEGMENT_MAX_DEPTH {
+                collect_authenticated_linear_segment_hint(
+                    read,
+                    commit_id,
+                    generation,
+                    &commit.parent_commit_ids,
+                    &commit_rows_by_id,
+                    &generations,
+                    &linear_segment_depths,
+                    &mut known_commit_records,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
         let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
         let commit_delta_rows = tracked_row_indices_by_commit
             .get(&commit_id)
@@ -1409,7 +1432,8 @@ async fn stage_changelog_commits(
         rootless_rows.insert(commit_id, cumulative_rootless_rows);
         rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
-        linear_segments.insert(commit_id, linear_segment);
+        linear_segment_depths.insert(commit_id, linear_segment_depth);
+        linear_segment_ancestor_commit_ids.insert(commit_id, ancestor_commit_ids);
         for child in children.get(&commit_id).into_iter().flatten() {
             let remaining = staged_parent_count
                 .get_mut(child)
@@ -1472,8 +1496,10 @@ async fn stage_changelog_commits(
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            linear_segment_base_commit_id: linear_segments[&commit_row.commit_id].0,
-            linear_segment_depth: linear_segments[&commit_row.commit_id].1,
+            linear_segment_depth: linear_segment_depths[&commit_row.commit_id],
+            linear_segment_ancestor_commit_ids: linear_segment_ancestor_commit_ids
+                .remove(&commit_row.commit_id)
+                .expect("every staged commit has linear segment routing metadata"),
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
@@ -1511,6 +1537,119 @@ async fn stage_changelog_commits(
         .await?;
     writer.stage_transaction_append(append)?;
     Ok(staged)
+}
+
+async fn collect_authenticated_linear_segment_hint(
+    read: &mut impl StorageAdapterRead,
+    endpoint_commit_id: CommitId,
+    endpoint_generation: u64,
+    endpoint_parent_commit_ids: &[CommitId],
+    staged_commit_rows: &BTreeMap<CommitId, &FinalizedCommitRow>,
+    generations: &BTreeMap<CommitId, u64>,
+    linear_segment_depths: &BTreeMap<CommitId, u8>,
+    known_commit_records: &mut BTreeMap<CommitId, CommitRecord>,
+) -> Result<Vec<CommitId>, LixError> {
+    let mut child_commit_id = endpoint_commit_id;
+    let mut child_generation = endpoint_generation;
+    let mut child_parent_commit_ids = endpoint_parent_commit_ids.to_vec();
+    let mut ancestor_commit_ids =
+        Vec::with_capacity(usize::from(crate::changelog::LINEAR_SEGMENT_MAX_DEPTH));
+    let mut unique_commit_ids = BTreeSet::from([endpoint_commit_id]);
+
+    for expected_depth in (0..crate::changelog::LINEAR_SEGMENT_MAX_DEPTH).rev() {
+        let [ancestor_commit_id] = child_parent_commit_ids.as_slice() else {
+            return Err(LixError::unknown(format!(
+                "commit '{child_commit_id}' has a nonlinear parent set inside a linear segment"
+            )));
+        };
+        if !unique_commit_ids.insert(*ancestor_commit_id) {
+            return Err(LixError::unknown(format!(
+                "commit '{endpoint_commit_id}' linear segment routing contains a cycle"
+            )));
+        }
+
+        let (ancestor_generation, ancestor_parent_commit_ids, ancestor_depth) =
+            if let Some(staged) = staged_commit_rows.get(ancestor_commit_id) {
+                let ancestor_generation = *generations.get(ancestor_commit_id).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "commit '{endpoint_commit_id}' has missing staged ancestor generation"
+                        ),
+                    )
+                })?;
+                let ancestor_depth = *linear_segment_depths.get(ancestor_commit_id).ok_or_else(
+                    || {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "commit '{endpoint_commit_id}' has missing staged ancestor depth"
+                            ),
+                        )
+                    },
+                )?;
+                (
+                    ancestor_generation,
+                    staged.parent_commit_ids.clone(),
+                    ancestor_depth,
+                )
+            } else {
+                if !known_commit_records.contains_key(ancestor_commit_id) {
+                    let requested = [*ancestor_commit_id];
+                    let loaded = ChangelogContext::new()
+                        .reader(&mut *read)
+                        .load_commits(ChangelogCommitLoadRequest {
+                            commit_ids: &requested,
+                        })
+                        .await?;
+                    let record = loaded
+                        .into_iter()
+                        .next()
+                        .and_then(|(_, record)| record)
+                        .ok_or_else(|| {
+                            LixError::unknown(format!(
+                                "changelog parent commit '{ancestor_commit_id}' does not exist"
+                            ))
+                        })?;
+                    known_commit_records.insert(*ancestor_commit_id, record);
+                }
+                let record = &known_commit_records[ancestor_commit_id];
+                crate::changelog::validate_linear_segment_hint_shape(
+                    record.commit_id,
+                    &record.parent_commit_ids,
+                    record.linear_segment_depth,
+                    &record.linear_segment_ancestor_commit_ids,
+                )?;
+                (
+                    record.generation,
+                    record.parent_commit_ids.clone(),
+                    record.linear_segment_depth,
+                )
+            };
+
+        if ancestor_depth != expected_depth {
+            return Err(LixError::unknown(format!(
+                "commit '{endpoint_commit_id}' linear segment routing has out-of-order member '{ancestor_commit_id}'"
+            )));
+        }
+        if child_generation
+            != ancestor_generation.checked_add(1).ok_or_else(|| {
+                LixError::unknown(format!(
+                    "commit '{ancestor_commit_id}' linear segment generation exceeds u64"
+                ))
+            })?
+        {
+            return Err(LixError::unknown(format!(
+                "commit '{child_commit_id}' parent '{ancestor_commit_id}' does not have a lower generation"
+            )));
+        }
+
+        ancestor_commit_ids.push(*ancestor_commit_id);
+        child_commit_id = *ancestor_commit_id;
+        child_generation = ancestor_generation;
+        child_parent_commit_ids = ancestor_parent_commit_ids;
+    }
+    Ok(ancestor_commit_ids)
 }
 
 /// The terminal transaction append deliberately skips the changelog writer's

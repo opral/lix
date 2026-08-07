@@ -7028,8 +7028,8 @@ mod tests {
                     commit_id: commit_a,
                     generation: 2,
                     parent_commit_ids: vec![commit_b],
-                    linear_segment_base_commit_id: commit_a,
                     linear_segment_depth: 0,
+                    linear_segment_ancestor_commit_ids: Vec::new(),
                     change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(

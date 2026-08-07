@@ -320,19 +320,25 @@ pub(crate) struct CommitRecord {
     /// smaller generation, enabling bounded priority graph walks.
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
-    /// Lowest commit reachable from this commit without crossing a merge or
-    /// more than one bounded linear segment. This is authoritative topology
-    /// metadata written with the parent list, not a separately published
-    /// index. Readers refine within a shared segment before choosing a base.
-    pub(crate) linear_segment_base_commit_id: CommitId,
-    /// Number of single-parent edges from this commit to the segment base.
+    /// Number of single-parent edges from this commit to the current bounded
+    /// routing segment's base. Parent ids and generations remain the sole
+    /// chronology authority; this field only decides when a reader may attempt
+    /// a fully authenticated batched walk.
     pub(crate) linear_segment_depth: u8,
+    /// Immediate-parent-to-base commit ids for a full-width segment endpoint.
+    /// Non-endpoints store an empty list. A reader must load and validate every
+    /// listed commit before it can skip the corresponding adapter round trips.
+    pub(crate) linear_segment_ancestor_commit_ids: Vec<CommitId>,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
 }
 
-pub(crate) const LINEAR_SEGMENT_MAX_DEPTH: u8 = 63;
+// Three edges per authenticated batch keeps the persisted route below the
+// five-percent write/disk ceiling while still eliminating half of adapter
+// calls on a deep linear walk. Wider routes approach the same sixteen bytes
+// of duplicated ids per commit and exceeded the SlateDB physical-disk gate.
+pub(crate) const LINEAR_SEGMENT_MAX_DEPTH: u8 = 3;
 
 /// Derives the bounded linear segment owned by a new commit record.
 ///
@@ -340,59 +346,145 @@ pub(crate) const LINEAR_SEGMENT_MAX_DEPTH: u8 = 63;
 /// parent's segment until the fixed width is full, then starts the next one.
 /// Branches may share a base; merge-base readers detect that case and refine
 /// within the segment instead of skipping over the fork.
-pub(crate) fn next_linear_segment(
+pub(crate) fn next_linear_segment_depth(
     commit_id: CommitId,
     parent_commit_ids: &[CommitId],
-    parent_segment: Option<(CommitId, u8)>,
-) -> Result<(CommitId, u8), LixError> {
+    parent_depth: Option<u8>,
+) -> Result<u8, LixError> {
     match parent_commit_ids {
         [_] => {
-            let (base_commit_id, depth) = parent_segment.ok_or_else(|| {
+            let depth = parent_depth.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("commit '{commit_id}' has no parent segment metadata"),
                 )
             })?;
             if depth < LINEAR_SEGMENT_MAX_DEPTH {
-                Ok((base_commit_id, depth + 1))
+                Ok(depth + 1)
             } else {
-                Ok((commit_id, 0))
+                Ok(0)
             }
         }
-        _ => Ok((commit_id, 0)),
+        _ => Ok(0),
     }
+}
+
+/// Derives an in-memory parent route while constructing a linear fixture or
+/// publication batch. Callers persist the returned route only at full-width
+/// endpoints; shorter routes are construction state, not storage authority.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn next_linear_segment_path(
+    commit_id: CommitId,
+    parent_commit_ids: &[CommitId],
+    parent_segment: Option<(u8, &[CommitId])>,
+) -> Result<(u8, Vec<CommitId>), LixError> {
+    let parent_depth = parent_segment.map(|(depth, _)| depth);
+    let depth = next_linear_segment_depth(commit_id, parent_commit_ids, parent_depth)?;
+    if depth == 0 {
+        return Ok((0, Vec::new()));
+    }
+    let [parent_commit_id] = parent_commit_ids else {
+        unreachable!("positive linear segment depth requires one parent");
+    };
+    let (_, parent_path) = parent_segment.expect("positive depth has parent segment metadata");
+    if parent_path.len() != usize::from(depth - 1) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("commit '{commit_id}' has incomplete parent routing metadata"),
+        ));
+    }
+    let mut path = Vec::with_capacity(usize::from(depth));
+    path.push(*parent_commit_id);
+    path.extend_from_slice(parent_path);
+    Ok((depth, path))
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn persisted_linear_segment_path(depth: u8, path: &[CommitId]) -> Vec<CommitId> {
+    if depth == LINEAR_SEGMENT_MAX_DEPTH {
+        path.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn validate_linear_segment_hint_shape(
+    commit_id: CommitId,
+    parent_commit_ids: &[CommitId],
+    depth: u8,
+    ancestor_commit_ids: &[CommitId],
+) -> Result<(), LixError> {
+    if depth > LINEAR_SEGMENT_MAX_DEPTH {
+        return Err(LixError::unknown(format!(
+            "commit '{commit_id}' linear segment depth exceeds the bounded width"
+        )));
+    }
+    if depth > 0 && parent_commit_ids.len() != 1 {
+        return Err(LixError::unknown(format!(
+            "commit '{commit_id}' has a nonlinear parent set inside a linear segment"
+        )));
+    }
+    if depth == LINEAR_SEGMENT_MAX_DEPTH {
+        if ancestor_commit_ids.len() != usize::from(LINEAR_SEGMENT_MAX_DEPTH) {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' full linear segment has an invalid routing width"
+            )));
+        }
+        if ancestor_commit_ids.first() != parent_commit_ids.first() {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' linear segment routing does not start at its parent"
+            )));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        unique.insert(commit_id);
+        if ancestor_commit_ids
+            .iter()
+            .any(|ancestor_commit_id| !unique.insert(*ancestor_commit_id))
+        {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' linear segment routing contains a cycle"
+            )));
+        }
+    } else if !ancestor_commit_ids.is_empty() {
+        return Err(LixError::unknown(format!(
+            "commit '{commit_id}' non-endpoint linear segment has routing entries"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{CommitId, LINEAR_SEGMENT_MAX_DEPTH, next_linear_segment};
+    use super::{CommitId, LINEAR_SEGMENT_MAX_DEPTH, next_linear_segment_depth};
 
     #[test]
     fn linear_segments_are_bounded_and_merges_reset_them() {
         let root = CommitId::for_test_label("segment-root");
         let mut parent = root;
-        let mut segment = next_linear_segment(root, &[], None).expect("root should start segment");
-        assert_eq!(segment, (root, 0));
+        let mut depth =
+            next_linear_segment_depth(root, &[], None).expect("root should start segment");
+        assert_eq!(depth, 0);
 
-        for depth in 1..=LINEAR_SEGMENT_MAX_DEPTH {
-            let commit = CommitId::for_test_label(&format!("segment-{depth}"));
-            segment = next_linear_segment(commit, &[parent], Some(segment))
+        for expected_depth in 1..=LINEAR_SEGMENT_MAX_DEPTH {
+            let commit = CommitId::for_test_label(&format!("segment-{expected_depth}"));
+            depth = next_linear_segment_depth(commit, &[parent], Some(depth))
                 .expect("linear child should extend segment");
-            assert_eq!(segment, (root, depth));
+            assert_eq!(depth, expected_depth);
             parent = commit;
         }
 
         let next = CommitId::for_test_label("next-segment");
         assert_eq!(
-            next_linear_segment(next, &[parent], Some(segment))
+            next_linear_segment_depth(next, &[parent], Some(depth))
                 .expect("full segment should roll over"),
-            (next, 0)
+            0
         );
 
         let merge = CommitId::for_test_label("segment-merge");
         assert_eq!(
-            next_linear_segment(merge, &[root, next], None).expect("merge should reset segment"),
-            (merge, 0)
+            next_linear_segment_depth(merge, &[root, next], None)
+                .expect("merge should reset segment"),
+            0
         );
     }
 }

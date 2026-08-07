@@ -332,34 +332,37 @@ where
                 return Ok(LinearMergeBase::Resolved(left.commit_id));
             }
             if left.generation == right.generation
-                && left.linear_segment_depth > 0
-                && right.linear_segment_depth > 0
+                && left.linear_segment_depth == LINEAR_SEGMENT_MAX_DEPTH
+                && right.linear_segment_depth == LINEAR_SEGMENT_MAX_DEPTH
             {
-                let left_base_generation = linear_segment_base_generation(&left)?;
-                let right_base_generation = linear_segment_base_generation(&right)?;
-                if left_base_generation == right_base_generation
-                    && left.linear_segment_base_commit_id != right.linear_segment_base_commit_id
-                {
-                    let base_ids = [
-                        left.linear_segment_base_commit_id,
-                        right.linear_segment_base_commit_id,
-                    ];
-                    let bases = self.load_nodes(&base_ids).await?;
-                    let mut bases = bases.into_iter().map(|(_, base)| base);
-                    let left_base = bases
-                        .next()
-                        .flatten()
-                        .ok_or_else(|| missing_commit_graph_error(&base_ids[0]))?;
-                    let right_base = bases
-                        .next()
-                        .flatten()
-                        .ok_or_else(|| missing_commit_graph_error(&base_ids[1]))?;
-                    validate_linear_segment_base(&left, &left_base)?;
-                    validate_linear_segment_base(&right, &right_base)?;
-                    left = left_base;
-                    right = right_base;
-                    continue;
+                let mut route_ids =
+                    Vec::with_capacity(usize::from(LINEAR_SEGMENT_MAX_DEPTH).saturating_mul(2));
+                route_ids.extend_from_slice(&left.linear_segment_ancestor_commit_ids);
+                route_ids.extend_from_slice(&right.linear_segment_ancestor_commit_ids);
+                let mut routes = self.load_nodes(&route_ids).await?;
+                let split = usize::from(LINEAR_SEGMENT_MAX_DEPTH);
+                authenticate_linear_segment(&left, &routes, 0)?;
+                authenticate_linear_segment(&right, &routes, split)?;
+                if let Some(common) = (0..split).find_map(|index| {
+                    let (_, left) = routes
+                        .slot(index)
+                        .expect("authenticated left route slot is present");
+                    let (_, right) = routes
+                        .slot(split + index)
+                        .expect("authenticated right route slot is present");
+                    let left = left.expect("authenticated left route entry is present");
+                    let right = right.expect("authenticated right route entry is present");
+                    (left.commit_id == right.commit_id).then_some(left.commit_id)
+                }) {
+                    return Ok(LinearMergeBase::Resolved(common));
                 }
+                left = routes
+                    .take_value(split - 1)
+                    .expect("authenticated segment contains its base");
+                right = routes
+                    .take_value(route_ids.len() - 1)
+                    .expect("authenticated segment contains its base");
+                continue;
             }
             match left.generation.cmp(&right.generation) {
                 Ordering::Greater => {
@@ -570,15 +573,21 @@ fn commit_graph_node_from_authority(
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
-        linear_segment_base_commit_id: record.linear_segment_base_commit_id,
         linear_segment_depth: record.linear_segment_depth,
+        linear_segment_ancestor_commit_ids: record.linear_segment_ancestor_commit_ids,
         created_at: record.created_at,
     };
     validate_linear_segment_summary(&node)?;
     Ok(Some(node))
 }
 
-fn linear_segment_base_generation(node: &CommitGraphNode) -> Result<u64, LixError> {
+fn validate_linear_segment_summary(node: &CommitGraphNode) -> Result<(), LixError> {
+    crate::changelog::validate_linear_segment_hint_shape(
+        node.commit_id,
+        &node.parent_commit_ids,
+        node.linear_segment_depth,
+        &node.linear_segment_ancestor_commit_ids,
+    )?;
     node.generation
         .checked_sub(u64::from(node.linear_segment_depth))
         .ok_or_else(|| {
@@ -586,39 +595,58 @@ fn linear_segment_base_generation(node: &CommitGraphNode) -> Result<u64, LixErro
                 "commit '{}' linear segment depth exceeds its generation",
                 node.commit_id
             ))
-        })
-}
-
-fn validate_linear_segment_summary(node: &CommitGraphNode) -> Result<(), LixError> {
-    if node.linear_segment_depth > LINEAR_SEGMENT_MAX_DEPTH {
-        return Err(LixError::unknown(format!(
-            "commit '{}' linear segment depth exceeds the bounded width",
-            node.commit_id
-        )));
-    }
-    linear_segment_base_generation(node)?;
-    if node.linear_segment_depth == 0 && node.linear_segment_base_commit_id != node.commit_id {
-        return Err(LixError::unknown(format!(
-            "commit '{}' starts a linear segment with a different base",
-            node.commit_id
-        )));
-    }
+        })?;
     Ok(())
 }
 
-fn validate_linear_segment_base(
-    node: &CommitGraphNode,
-    base: &CommitGraphNode,
+fn authenticate_linear_segment(
+    endpoint: &CommitGraphNode,
+    route: &ExactBatch<'_, CommitId, CommitGraphNode>,
+    start: usize,
 ) -> Result<(), LixError> {
-    if base.commit_id != node.linear_segment_base_commit_id
-        || base.generation != linear_segment_base_generation(node)?
-        || base.linear_segment_depth != 0
-        || base.linear_segment_base_commit_id != base.commit_id
-    {
-        return Err(LixError::unknown(format!(
-            "commit '{}' has an invalid linear segment base '{}'",
-            node.commit_id, node.linear_segment_base_commit_id
-        )));
+    let mut child = endpoint;
+    for index in 0..usize::from(LINEAR_SEGMENT_MAX_DEPTH) {
+        let (requested_id, ancestor) = route
+            .slot(start + index)
+            .expect("route width was validated on endpoint load");
+        let ancestor = ancestor.ok_or_else(|| missing_commit_graph_error(requested_id))?;
+        let expected_id = endpoint
+            .linear_segment_ancestor_commit_ids
+            .get(index)
+            .expect("route width was validated on endpoint load");
+        if requested_id != expected_id || ancestor.commit_id != *expected_id {
+            return Err(LixError::unknown(format!(
+                "commit '{}' linear segment routing identity mismatch",
+                endpoint.commit_id
+            )));
+        }
+        if child.parent_commit_ids.as_slice() != [ancestor.commit_id] {
+            return Err(LixError::unknown(format!(
+                "commit '{}' linear segment routing is not parent-adjacent at '{}'",
+                endpoint.commit_id, ancestor.commit_id
+            )));
+        }
+        let expected_generation = ancestor.generation.checked_add(1).ok_or_else(|| {
+            LixError::unknown(format!(
+                "commit '{}' linear segment generation exceeds u64",
+                ancestor.commit_id
+            ))
+        })?;
+        if child.generation != expected_generation {
+            return Err(LixError::unknown(format!(
+                "commit '{}' parent '{}' does not have a lower generation",
+                child.commit_id, ancestor.commit_id
+            )));
+        }
+        let consumed = u8::try_from(index + 1).expect("bounded route index fits u8");
+        let expected_depth = LINEAR_SEGMENT_MAX_DEPTH - consumed;
+        if ancestor.linear_segment_depth != expected_depth {
+            return Err(LixError::unknown(format!(
+                "commit '{}' linear segment routing has out-of-order member '{}'",
+                endpoint.commit_id, ancestor.commit_id
+            )));
+        }
+        child = ancestor;
     }
     Ok(())
 }
@@ -1171,8 +1199,8 @@ mod tests {
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
-                    linear_segment_base_commit_id: commit_id,
                     linear_segment_depth: 0,
+                    linear_segment_ancestor_commit_ids: Vec::new(),
                     change_id: change_id("selected-tombstone-commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
@@ -1638,7 +1666,7 @@ mod tests {
         let mut append = ChangelogAppend::default();
         let mut commit_members = Vec::<(CommitId, Vec<ChangeRecord>)>::new();
         let mut generations = BTreeMap::<CommitId, u64>::new();
-        let mut linear_segments = BTreeMap::<CommitId, (CommitId, u8)>::new();
+        let mut linear_segments = BTreeMap::<CommitId, (u8, Vec<CommitId>)>::new();
         for change in changes.iter().filter(|change| change.is_commit()) {
             let commit_label = change
                 .change
@@ -1653,7 +1681,7 @@ mod tests {
                 {
                     append_empty_commit(&mut append, *parent_commit_id);
                     generations.insert(*parent_commit_id, 0);
-                    linear_segments.insert(*parent_commit_id, (*parent_commit_id, 0));
+                    linear_segments.insert(*parent_commit_id, (0, Vec::new()));
                 }
             }
             let generation = change
@@ -1663,11 +1691,14 @@ mod tests {
                 .max()
                 .map_or(0, |parent_generation| parent_generation + 1);
             let parent_segment = match change.parent_commit_ids.as_slice() {
-                [parent_commit_id] => Some(linear_segments[parent_commit_id]),
+                [parent_commit_id] => {
+                    let (depth, path) = &linear_segments[parent_commit_id];
+                    Some((*depth, path.as_slice()))
+                }
                 _ => None,
             };
-            let (linear_segment_base_commit_id, linear_segment_depth) =
-                crate::changelog::next_linear_segment(
+            let (linear_segment_depth, linear_segment_path) =
+                crate::changelog::next_linear_segment_path(
                     commit_id,
                     &change.parent_commit_ids,
                     parent_segment,
@@ -1685,8 +1716,11 @@ mod tests {
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
-                linear_segment_base_commit_id,
                 linear_segment_depth,
+                linear_segment_ancestor_commit_ids: crate::changelog::persisted_linear_segment_path(
+                    linear_segment_depth,
+                    &linear_segment_path,
+                ),
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
@@ -1694,10 +1728,7 @@ mod tests {
             commit_members.push((commit_id, members));
             staged_commit_ids.insert(commit_id);
             generations.insert(commit_id, generation);
-            linear_segments.insert(
-                commit_id,
-                (linear_segment_base_commit_id, linear_segment_depth),
-            );
+            linear_segments.insert(commit_id, (linear_segment_depth, linear_segment_path));
         }
         let commit_records = append.commits.clone();
         writer
@@ -1776,8 +1807,8 @@ mod tests {
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            linear_segment_base_commit_id: commit_id,
             linear_segment_depth: 0,
+            linear_segment_ancestor_commit_ids: Vec::new(),
             change_id: ChangeId::for_test_label(&change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -1823,8 +1854,8 @@ mod tests {
                 .iter()
                 .map(|parent_id| CommitId::for_test_label(parent_id))
                 .collect(),
-            linear_segment_base_commit_id: commit_id,
             linear_segment_depth: 0,
+            linear_segment_ancestor_commit_ids: Vec::new(),
             created_at: ts("2026-01-01T00:00:00Z"),
         }
     }

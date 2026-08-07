@@ -359,8 +359,8 @@ mod tests {
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                linear_segment_base_commit_id: embedded,
                 linear_segment_depth: 0,
+                linear_segment_ancestor_commit_ids: Vec::new(),
                 change_id: ChangeId::for_test_label("mismatched-key-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -400,8 +400,8 @@ mod tests {
                 commit_id,
                 generation: 1,
                 parent_commit_ids: commit_ids([parent]),
-                linear_segment_base_commit_id: commit_id,
                 linear_segment_depth: 0,
+                linear_segment_ancestor_commit_ids: Vec::new(),
                 change_id: ChangeId::for_test_label(&format!("{label}-change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -704,8 +704,8 @@ mod tests {
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
-            linear_segment_base_commit_id: child,
             linear_segment_depth: 0,
+            linear_segment_ancestor_commit_ids: Vec::new(),
             change_id: ChangeId::for_test_label("commit-child-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -770,6 +770,79 @@ mod tests {
             .merge_base(&commit_id("commit-root"), &commit_id("commit-grandchild"))
             .await
             .expect_err("linear prefix and DAG fallback must preserve generation validation");
+        assert!(error.message.contains("does not have a lower generation"));
+    }
+
+    #[tokio::test]
+    async fn merge_base_segment_batch_rejects_non_decreasing_interior_generation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut changes = vec![commit_change(
+            "segment-corrupt-root-change",
+            "segment-corrupt-root",
+            &[],
+            &[],
+        )];
+        let mut left_parent = "segment-corrupt-root".to_string();
+        let mut right_parent = "segment-corrupt-root".to_string();
+        for index in 0..3 {
+            let left = format!("segment-corrupt-left-{index}");
+            let right = format!("segment-corrupt-right-{index}");
+            changes.push(commit_change(
+                &format!("{left}-change"),
+                &left,
+                &[],
+                &[&left_parent],
+            ));
+            changes.push(commit_change(
+                &format!("{right}-change"),
+                &right,
+                &[],
+                &[&right_parent],
+            ));
+            left_parent = left;
+            right_parent = right;
+        }
+        append_changes(&storage, &changes).await;
+
+        let corrupt_id = commit_id("segment-corrupt-left-1");
+        let record = CommitRecord {
+            format_version: 3,
+            commit_id: corrupt_id,
+            generation: 3,
+            parent_commit_ids: commit_ids(["segment-corrupt-left-0"]),
+            linear_segment_depth: 2,
+            linear_segment_ancestor_commit_ids: Vec::new(),
+            change_id: ChangeId::for_test_label("segment-corrupt-left-61-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+        };
+        let mut writes = storage.new_write_set();
+        writes.put(
+            crate::changelog::COMMIT_SPACE,
+            StorageKey(Bytes::copy_from_slice(corrupt_id.as_uuid().as_bytes())),
+            crate::changelog::encode_commit_record(&record)
+                .expect("corrupt interior commit should encode"),
+        );
+        stage_test_commit_manifest(&mut writes, &record)
+            .expect("matching corrupt authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corrupt interior commit should persist");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .merge_base(
+                &commit_id("segment-corrupt-left-2"),
+                &commit_id("segment-corrupt-right-2"),
+            )
+            .await
+            .expect_err("authenticated segment batch must reject interior corruption");
+
         assert!(error.message.contains("does not have a lower generation"));
     }
 
@@ -1186,7 +1259,8 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut append = ChangelogAppend::default();
         let mut generations = std::collections::BTreeMap::<CommitId, u64>::new();
-        let mut linear_segments = std::collections::BTreeMap::<CommitId, (CommitId, u8)>::new();
+        let mut linear_segments =
+            std::collections::BTreeMap::<CommitId, (u8, Vec<CommitId>)>::new();
         for change in changes {
             let commit_id = change
                 .change
@@ -1201,37 +1275,36 @@ mod tests {
                 .max()
                 .map_or(0, |parent_generation| parent_generation + 1);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
-            let (linear_segment_base_commit_id, linear_segment_depth) =
-                match parent_commit_ids.as_slice() {
-                    [parent_commit_id] => linear_segments.get(parent_commit_id).map_or(
-                        (typed_commit_id, 0),
-                        |parent_segment| {
-                            crate::changelog::next_linear_segment(
-                                typed_commit_id,
-                                &parent_commit_ids,
-                                Some(*parent_segment),
-                            )
-                            .expect("known test parent segment should derive")
-                        },
-                    ),
-                    _ => (typed_commit_id, 0),
-                };
+            let (linear_segment_depth, linear_segment_path) = match parent_commit_ids.as_slice() {
+                [parent_commit_id] => linear_segments.get(parent_commit_id).map_or(
+                    (0, Vec::new()),
+                    |(parent_depth, parent_path)| {
+                        crate::changelog::next_linear_segment_path(
+                            typed_commit_id,
+                            &parent_commit_ids,
+                            Some((*parent_depth, parent_path)),
+                        )
+                        .expect("known test parent segment should derive")
+                    },
+                ),
+                _ => (0, Vec::new()),
+            };
             append.commits.push(CommitRecord {
                 format_version: 3,
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
-                linear_segment_base_commit_id,
                 linear_segment_depth,
+                linear_segment_ancestor_commit_ids: crate::changelog::persisted_linear_segment_path(
+                    linear_segment_depth,
+                    &linear_segment_path,
+                ),
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             });
             generations.insert(typed_commit_id, generation);
-            linear_segments.insert(
-                typed_commit_id,
-                (linear_segment_base_commit_id, linear_segment_depth),
-            );
+            linear_segments.insert(typed_commit_id, (linear_segment_depth, linear_segment_path));
         }
         let commit_records = append.commits.clone();
         ChangelogContext::new()

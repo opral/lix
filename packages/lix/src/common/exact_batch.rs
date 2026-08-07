@@ -62,6 +62,17 @@ where
             .zip(&self.values)
             .map(|(key, value)| (key, value.as_ref()))
     }
+
+    pub(crate) fn slot(&self, index: usize) -> Option<(&K, Option<&V>)> {
+        self.requested
+            .get(index)
+            .zip(self.values.get(index))
+            .map(|(key, value)| (key, value.as_ref()))
+    }
+
+    pub(crate) fn take_value(&mut self, index: usize) -> Option<V> {
+        self.values.get_mut(index).and_then(Option::take)
+    }
 }
 
 impl<'keys, K, V> IntoIterator for ExactBatch<'keys, K, V> {

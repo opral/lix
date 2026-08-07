@@ -31,6 +31,9 @@ pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,
     CommitScanRequest, LINEAR_SEGMENT_MAX_DEPTH, TransactionChangeRecordRef,
-    TransactionChangelogAppend, commit_row_snapshot_json, next_linear_segment,
+    TransactionChangelogAppend, commit_row_snapshot_json, next_linear_segment_depth,
+    validate_linear_segment_hint_shape,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use types::{next_linear_segment_path, persisted_linear_segment_path};

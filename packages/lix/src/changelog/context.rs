@@ -167,7 +167,33 @@ fn json_slot_ref_value_capacity(slot: JsonSlotRef<'_>) -> usize {
 }
 
 fn commit_value_capacity(commit: &CommitRecord) -> usize {
-    113usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
+    98usize
+        .saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
+        .saturating_add(
+            commit
+                .linear_segment_ancestor_commit_ids
+                .len()
+                .saturating_mul(16),
+        )
+}
+
+fn validate_linear_segment_record_hint(commit: &CommitRecord) -> Result<(), LixError> {
+    crate::changelog::validate_linear_segment_hint_shape(
+        commit.commit_id,
+        &commit.parent_commit_ids,
+        commit.linear_segment_depth,
+        &commit.linear_segment_ancestor_commit_ids,
+    )?;
+    commit
+        .generation
+        .checked_sub(u64::from(commit.linear_segment_depth))
+        .ok_or_else(|| {
+            LixError::unknown(format!(
+                "commit '{}' linear segment depth exceeds its generation",
+                commit.commit_id
+            ))
+        })?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -443,6 +469,9 @@ where
     ) -> Result<(), LixError> {
         self.ensure_changelog_mutation_is_allowed()?;
         let TransactionChangelogAppend { commits, changes } = append;
+        for commit in &commits {
+            validate_linear_segment_record_hint(commit)?;
+        }
         let mut change_batch = EncodedChangelogBatch::with_capacity(
             changes.len(),
             changes.len() * 16,
@@ -546,6 +575,9 @@ where
     }
 
     async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<bool, LixError> {
+        for commit in &append.commits {
+            validate_linear_segment_record_hint(commit)?;
+        }
         validate_unique(
             append.commits.iter().map(|commit| commit.commit_id),
             "commit_id",
