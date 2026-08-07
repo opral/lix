@@ -30,6 +30,9 @@ mod udfs;
 mod value_contract;
 mod write_normalization;
 
+#[cfg(feature = "storage-benches")]
+pub(crate) use error::datafusion_error_to_lix_error;
+
 #[cfg(test)]
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
@@ -57,6 +60,11 @@ pub(crate) use entity_columnar_layout::{
 };
 pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
+#[cfg(feature = "storage-benches")]
+pub(crate) use exec::{
+    BatchRowCursor, execute_read_statement_in_session_with_batch_stream,
+    execute_read_statement_in_session_with_collected_batches,
+};
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{

@@ -8,30 +8,6 @@
     clippy::unnecessary_wraps
 )]
 
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, DFSchemaRef, JoinType, ParamValues, ScalarValue};
-use datafusion::datasource::{empty::EmptyTable, provider_as_source};
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
-use datafusion::logical_expr::registry::FunctionRegistry;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
-use datafusion::prelude::SessionContext;
-use datafusion::sql::parser::Statement as DataFusionStatement;
-use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, TableFactor, Value as SqlValue, Visit, VisitMut,
-    Visitor, VisitorMut,
-};
-use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::marker::PhantomData;
-use std::ops::ControlFlow;
-#[cfg(feature = "storage-benches")]
-use std::time::Instant;
-
 use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
 use crate::sql2::bind::expr::{BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral};
@@ -44,6 +20,33 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
+use datafusion::arrow::array::Array;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, JoinType, ParamValues, ScalarValue};
+use datafusion::datasource::{empty::EmptyTable, provider_as_source};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
+use datafusion::logical_expr::registry::FunctionRegistry;
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
+#[cfg(any(feature = "storage-benches", test))]
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::sqlparser::ast::{
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, TableFactor, Value as SqlValue, Visit, VisitMut,
+    Visitor, VisitorMut,
+};
+#[cfg(any(feature = "storage-benches", test))]
+use futures_util::TryStreamExt;
+use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::marker::PhantomData;
+use std::ops::ControlFlow;
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 
 use crate::catalog::CatalogFingerprint;
 use crate::sql2::predicate_typecheck::{
@@ -82,6 +85,125 @@ pub(crate) struct DataFusionLogicalPlan {
 pub(crate) struct SessionReadSqlResult {
     pub(crate) runtime_functions: Option<FunctionContext>,
     pub(crate) query: SessionReadResult,
+}
+
+/// A live DataFusion result returned before any RecordBatch is collected or
+/// converted to public scalar rows.
+#[cfg(any(feature = "storage-benches", test))]
+pub(crate) struct SessionReadBatchStreamResult<'session> {
+    pub(crate) fields: Vec<Field>,
+    pub(crate) stream: SendableRecordBatchStream,
+    pub(crate) notices: Vec<LixNotice>,
+    _session: PhantomData<&'session ()>,
+}
+
+/// Benchmark control that always stops at collected Arrow batches and never
+/// applies the public result path's row-retention heuristic.
+#[cfg(feature = "storage-benches")]
+pub(crate) struct SessionReadCollectedBatchResult {
+    pub(crate) fields: Vec<Field>,
+    pub(crate) batches: std::sync::Arc<[RecordBatch]>,
+    pub(crate) notices: Vec<LixNotice>,
+}
+
+#[cfg(any(feature = "storage-benches", test))]
+enum BatchRowSource<'a> {
+    Collected {
+        batches: &'a [RecordBatch],
+        next_batch: usize,
+    },
+    Live(&'a mut SendableRecordBatchStream),
+}
+
+/// Internal row cursor over Arrow batches. It borrows its batch source, so a
+/// live cursor cannot escape the read session and storage snapshot that own
+/// the DataFusion stream.
+#[cfg(any(feature = "storage-benches", test))]
+pub(crate) struct BatchRowCursor<'a> {
+    fields: &'a [Field],
+    source: BatchRowSource<'a>,
+    current_batch: Option<RecordBatch>,
+    next_row: usize,
+}
+
+#[cfg(any(feature = "storage-benches", test))]
+impl<'a> BatchRowCursor<'a> {
+    pub(crate) fn collected(fields: &'a [Field], batches: &'a [RecordBatch]) -> Self {
+        Self {
+            fields,
+            source: BatchRowSource::Collected {
+                batches,
+                next_batch: 0,
+            },
+            current_batch: None,
+            next_row: 0,
+        }
+    }
+
+    pub(crate) fn live(result: &'a mut SessionReadBatchStreamResult<'_>) -> Self {
+        Self {
+            fields: &result.fields,
+            source: BatchRowSource::Live(&mut result.stream),
+            current_batch: None,
+            next_row: 0,
+        }
+    }
+
+    pub(crate) async fn next_values(&mut self) -> Result<Option<Vec<Value>>, LixError> {
+        loop {
+            if let Some(batch) = &self.current_batch
+                && self.next_row < batch.num_rows()
+            {
+                #[cfg(feature = "storage-benches")]
+                let started = crate::sql_profile::is_active().then(Instant::now);
+                let values = row_values_from_batch(self.fields, batch, self.next_row)?;
+                #[cfg(feature = "storage-benches")]
+                if let Some(started) = started {
+                    crate::sql_profile::record_phase(
+                        crate::sql_profile::Phase::PublicResultMaterialization,
+                        started.elapsed(),
+                    );
+                }
+                self.next_row += 1;
+                return Ok(Some(values));
+            }
+
+            self.current_batch = self.next_batch().await?;
+            self.next_row = 0;
+            if self.current_batch.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, LixError> {
+        match &mut self.source {
+            BatchRowSource::Collected {
+                batches,
+                next_batch,
+            } => {
+                let batch = batches.get(*next_batch).cloned();
+                *next_batch += usize::from(batch.is_some());
+                Ok(batch)
+            }
+            BatchRowSource::Live(stream) => {
+                #[cfg(feature = "storage-benches")]
+                let started = crate::sql_profile::is_active().then(Instant::now);
+                let batch = stream
+                    .try_next()
+                    .await
+                    .map_err(datafusion_error_to_lix_error);
+                #[cfg(feature = "storage-benches")]
+                if let Some(started) = started {
+                    crate::sql_profile::record_phase(
+                        crate::sql_profile::Phase::ArrowExecution,
+                        started.elapsed(),
+                    );
+                }
+                batch
+            }
+        }
+    }
 }
 
 /// One read-result authority. DataFusion results remain owned by their
@@ -226,6 +348,44 @@ pub(crate) async fn execute_read_statement_in_session_with_result(
         runtime_functions: None,
         query: execute_logical_plan(plan, params).await?,
     })
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn execute_read_statement_in_session_with_batch_stream<'session>(
+    session: &'session ReadSqlSession<'_>,
+    sql: &str,
+    statement: DataFusionStatement,
+    params: &[Value],
+) -> Result<SessionReadBatchStreamResult<'session>, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
+    let plan = create_logical_plan_in_session_from_parsed(session, sql, statement, params).await?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::LogicalPlanning,
+            started.elapsed(),
+        );
+    }
+    execute_logical_plan_stream(plan, params, session).await
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn execute_read_statement_in_session_with_collected_batches(
+    session: &ReadSqlSession<'_>,
+    sql: &str,
+    statement: DataFusionStatement,
+    params: &[Value],
+) -> Result<SessionReadCollectedBatchResult, LixError> {
+    let started = crate::sql_profile::is_active().then(Instant::now);
+    let plan = create_logical_plan_in_session_from_parsed(session, sql, statement, params).await?;
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::LogicalPlanning,
+            started.elapsed(),
+        );
+    }
+    execute_logical_plan_collected_batches(plan, params).await
 }
 
 async fn create_logical_plan_in_session_from_parsed(
@@ -1197,6 +1357,106 @@ async fn execute_logical_plan(
     }
     result.notices = notices;
     Ok(SessionReadResult::Rows(result))
+}
+
+#[cfg(feature = "storage-benches")]
+async fn execute_logical_plan_stream<'session>(
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    _read_session: &'session ReadSqlSession<'_>,
+) -> Result<SessionReadBatchStreamResult<'session>, LixError> {
+    let SqlLogicalPlan::DataFusion(plan) = plan else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 bound write execution is not wired yet",
+        ));
+    };
+    let SqlDataFusionLogicalPlan {
+        session,
+        plan,
+        notices,
+        json_predicate_params,
+        expected_parameter_count,
+        physical_planning_cache,
+    } = plan;
+    debug_assert_eq!(expected_parameter_count, params.len());
+    validate_json_predicate_params(&json_predicate_params, params)?;
+
+    let mut dataframe = session
+        .execute_logical_plan(plan)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    if !params.is_empty() {
+        dataframe = dataframe
+            .with_param_values(ParamValues::List(
+                params.iter().map(scalar_value_from_lix_value).collect(),
+            ))
+            .map_err(datafusion_error_to_lix_error)?;
+    }
+    let fields = dataframe
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let stream = crate::sql2::runtime::stream_dataframe(dataframe, physical_planning_cache)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(SessionReadBatchStreamResult {
+        fields,
+        stream,
+        notices,
+        _session: PhantomData,
+    })
+}
+
+#[cfg(feature = "storage-benches")]
+async fn execute_logical_plan_collected_batches(
+    plan: SqlLogicalPlan,
+    params: &[Value],
+) -> Result<SessionReadCollectedBatchResult, LixError> {
+    let SqlLogicalPlan::DataFusion(plan) = plan else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 bound write execution is not wired yet",
+        ));
+    };
+    let SqlDataFusionLogicalPlan {
+        session,
+        plan,
+        notices,
+        json_predicate_params,
+        expected_parameter_count,
+        physical_planning_cache,
+    } = plan;
+    debug_assert_eq!(expected_parameter_count, params.len());
+    validate_json_predicate_params(&json_predicate_params, params)?;
+
+    let mut dataframe = session
+        .execute_logical_plan(plan)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    if !params.is_empty() {
+        dataframe = dataframe
+            .with_param_values(ParamValues::List(
+                params.iter().map(scalar_value_from_lix_value).collect(),
+            ))
+            .map_err(datafusion_error_to_lix_error)?;
+    }
+    let fields = dataframe
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let batches = crate::sql2::runtime::collect_dataframe(dataframe, physical_planning_cache)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(SessionReadCollectedBatchResult {
+        fields,
+        batches: std::sync::Arc::from(batches),
+        notices,
+    })
 }
 
 /// Keep large, ordinary Arrow result sets columnar until a caller requests a
@@ -2711,14 +2971,7 @@ pub(crate) fn query_result_from_batches(
     let mut rows = Vec::<Vec<Value>>::new();
     for batch in batches {
         for row_index in 0..batch.num_rows() {
-            let mut row = Vec::<Value>::with_capacity(batch.num_columns());
-            for (column_index, array) in batch.columns().iter().enumerate() {
-                let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
-                    .map_err(datafusion_error_to_lix_error)?;
-                let field = result_fields.get(column_index);
-                row.push(scalar_value_to_lix_value(scalar, field)?);
-            }
-            rows.push(row);
+            rows.push(row_values_from_batch(result_fields, batch, row_index)?);
         }
     }
 
@@ -2727,6 +2980,21 @@ pub(crate) fn query_result_from_batches(
         columns: result_columns.clone(),
         notices: Vec::new(),
     })
+}
+
+pub(crate) fn row_values_from_batch(
+    result_fields: &[Field],
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<Vec<Value>, LixError> {
+    let mut row = Vec::<Value>::with_capacity(batch.num_columns());
+    for (column_index, array) in batch.columns().iter().enumerate() {
+        let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
+            .map_err(datafusion_error_to_lix_error)?;
+        let field = result_fields.get(column_index);
+        row.push(scalar_value_to_lix_value(scalar, field)?);
+    }
+    Ok(row)
 }
 
 fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Result<Value, LixError> {
@@ -2803,13 +3071,16 @@ fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Va
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    use std::task::{Context, Poll};
 
     use async_trait::async_trait;
-    use futures_util::FutureExt;
+    use futures_util::{FutureExt, Stream};
     use serde_json::Value as JsonValue;
     use serde_json::json;
 
@@ -2850,7 +3121,12 @@ mod tests {
     };
     use crate::{LixError, NullableKeyFilter, Value};
     use bytes::Bytes;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
+    use datafusion::error::DataFusionError;
+    use datafusion::physical_plan::RecordBatchStream;
 
     struct DummyBlobReader;
     struct StaticBlobReader {
@@ -2867,6 +3143,101 @@ mod tests {
     struct CountingRowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
         scans: Arc<AtomicUsize>,
+    }
+    struct CountingBatchStream {
+        schema: SchemaRef,
+        batches: VecDeque<RecordBatch>,
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for CountingBatchStream {
+        type Item = Result<RecordBatch, DataFusionError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(self.batches.pop_front().map(Ok))
+        }
+    }
+
+    impl RecordBatchStream for CountingBatchStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    impl Drop for CountingBatchStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_live_batch_cursor_stops_before_polling_later_batches() {
+        let field = Field::new("ordinal", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let batches = [1i64, 2i64]
+            .into_iter()
+            .map(|value| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![value]))],
+                )
+                .expect("test batch should match schema")
+            })
+            .collect::<VecDeque<_>>();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = CountingBatchStream {
+            schema,
+            batches,
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+        };
+        let mut result = super::SessionReadBatchStreamResult {
+            fields: vec![field],
+            stream: Box::pin(stream),
+            notices: Vec::new(),
+            _session: std::marker::PhantomData,
+        };
+        assert!(result.notices.is_empty());
+
+        let mut cursor = super::BatchRowCursor::live(&mut result);
+        assert_eq!(
+            cursor.next_values().await.unwrap(),
+            Some(vec![Value::Integer(1)])
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+
+        drop(cursor);
+        drop(result);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn collected_batch_cursor_converts_rows_without_retaining_public_rows() {
+        let field = Field::new("ordinal", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let batches = vec![
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1i64, 2i64]))],
+            )
+            .expect("test batch should match schema"),
+        ];
+        let fields = vec![field];
+        let mut cursor = super::BatchRowCursor::collected(&fields, &batches);
+
+        assert_eq!(
+            cursor.next_values().await.unwrap(),
+            Some(vec![Value::Integer(1)])
+        );
+        assert_eq!(
+            cursor.next_values().await.unwrap(),
+            Some(vec![Value::Integer(2)])
+        );
+        assert_eq!(cursor.next_values().await.unwrap(), None);
     }
     struct RecordingEntitySnapshotReader {
         snapshots: Vec<Option<Bytes>>,

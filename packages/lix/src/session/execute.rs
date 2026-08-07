@@ -28,6 +28,8 @@ use datafusion::sql::sqlparser::ast::{
     SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableAlias, TableFactor,
     Value as SqlValue, Visit, Visitor,
 };
+#[cfg(feature = "storage-benches")]
+use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
@@ -763,6 +765,152 @@ where
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
         let (result, profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
         result.map(|result| (result, profile))
+    }
+
+    /// Benchmark-only comparison of the eager result path with internal
+    /// collected-batch and live-batch consumers. No stream escapes the scoped
+    /// storage read, and this does not change the public execution contract.
+    #[cfg(feature = "storage-benches")]
+    #[doc(hidden)]
+    pub async fn execute_result_streaming_profiled(
+        &self,
+        sql: &str,
+        params: &[Value],
+        mode: &str,
+        row_limit: Option<usize>,
+    ) -> Result<crate::SqlReadProfile, LixError> {
+        let (result, profile) = crate::sql_profile::scope(async {
+            if mode == "full" {
+                let result = self.execute(sql, params).await?;
+                let rows = result.rows();
+                let consumed = row_limit.map_or(rows.len(), |limit| limit.min(rows.len()));
+                let checksum = rows.iter().take(consumed).try_fold(0u64, |checksum, row| {
+                    profile_result_checksum(checksum, row.values())
+                })?;
+                crate::sql_profile::record_result_rows(consumed, rows.len(), rows.len());
+                crate::sql_profile::record_result_checksum(checksum);
+                return Ok(());
+            }
+
+            if !matches!(mode, "stream" | "live" | "count_only") {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("unknown result streaming profile mode '{mode}'"),
+                ));
+            }
+
+            self.ensure_open()?;
+            let statement = self.sql_planning_cache.parse_statement(sql)?;
+            if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Read
+                || sql2::statement_has_durable_runtime_function(&statement)
+                || exact_filesystem_read_route(&statement, params).is_some()
+                || late_materialized_lix_file_content_read(&statement).is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "result streaming profiler accepts only ordinary cancellable reads",
+                ));
+            }
+
+            let _operation_guard = self.begin_waitable_session_operation().await?;
+            let read_scope = self
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await?;
+            with_static_session_sql_read::<StorageImpl, _, _>(
+                read_scope,
+                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
+                    let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                    let ctx = SessionSqlExecutionContext {
+                        active_branch_id: &active_branch_id,
+                        active_account_id: self.active_account_id(),
+                        read_store,
+                        live_state: Arc::clone(&self.live_state),
+                        binary_cas: Arc::clone(&self.binary_cas),
+                        branch_ctx: Arc::clone(&self.branch_ctx),
+                        catalog_context: Arc::clone(&self.catalog_context),
+                        sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                        functions: FunctionProviderHandle::system(),
+                        plugin_host: self.plugin_host.clone(),
+                        file_views: None,
+                    };
+                    let read_session =
+                        sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
+
+                    match mode {
+                        "stream" => {
+                            let result =
+                                sql2::execute_read_statement_in_session_with_collected_batches(
+                                    &read_session,
+                                    sql,
+                                    statement,
+                                    params,
+                                )
+                                .await?;
+                            let _notice_count = result.notices.len();
+                            let mut cursor =
+                                sql2::BatchRowCursor::collected(&result.fields, &result.batches);
+                            consume_profile_cursor(&mut cursor, row_limit).await?;
+                        }
+                        "live" => {
+                            let mut result =
+                                sql2::execute_read_statement_in_session_with_batch_stream(
+                                    &read_session,
+                                    sql,
+                                    statement,
+                                    params,
+                                )
+                                .await?;
+                            let _notice_count = result.notices.len();
+                            let mut cursor = sql2::BatchRowCursor::live(&mut result);
+                            consume_profile_cursor(&mut cursor, row_limit).await?;
+                            drop(cursor);
+                            drop(result);
+                        }
+                        "count_only" => {
+                            let mut result =
+                                sql2::execute_read_statement_in_session_with_batch_stream(
+                                    &read_session,
+                                    sql,
+                                    statement,
+                                    params,
+                                )
+                                .await?;
+                            let _notice_count = result.notices.len();
+                            let mut rows = 0usize;
+                            let mut batches = 0usize;
+                            while let Some(batch) = {
+                                let started = std::time::Instant::now();
+                                let batch = result
+                                    .stream
+                                    .try_next()
+                                    .await
+                                    .map_err(sql2::datafusion_error_to_lix_error);
+                                crate::sql_profile::record_phase(
+                                    crate::sql_profile::Phase::ArrowExecution,
+                                    started.elapsed(),
+                                );
+                                batch?
+                            } {
+                                rows = rows.saturating_add(batch.num_rows());
+                                batches = batches.saturating_add(1);
+                            }
+                            crate::sql_profile::record_result_count_only(rows, batches);
+                            crate::sql_profile::record_result_rows(rows, 0, 0);
+                            drop(result);
+                        }
+                        _ => unreachable!("profile mode validated before opening read"),
+                    }
+                    drop(read_session);
+                    drop(ctx);
+                    Ok(())
+                },
+            )
+            .await
+        })
+        .await;
+        result?;
+        Ok(profile)
     }
 
     pub async fn execute_with_options(
@@ -2548,6 +2696,80 @@ async fn hydrate_lix_file_content_result(
         })?;
     }
     Ok(())
+}
+
+#[cfg(feature = "storage-benches")]
+async fn consume_profile_cursor(
+    cursor: &mut sql2::BatchRowCursor<'_>,
+    row_limit: Option<usize>,
+) -> Result<(), LixError> {
+    let limit = row_limit.unwrap_or(usize::MAX);
+    let mut consumed = 0usize;
+    let mut checksum = 0u64;
+    while consumed < limit {
+        let Some(values) = cursor.next_values().await? else {
+            break;
+        };
+        checksum = profile_result_checksum(checksum, &values)?;
+        consumed += 1;
+    }
+    crate::sql_profile::record_result_rows(consumed, consumed, 0);
+    crate::sql_profile::record_result_checksum(checksum);
+    Ok(())
+}
+
+#[cfg(feature = "storage-benches")]
+fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixError> {
+    if values.len() != 3 {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "streaming profile expected exactly three projected values",
+        ));
+    }
+    let mut checksum = if checksum == 0 {
+        0xcbf2_9ce4_8422_2325
+    } else {
+        checksum
+    };
+    checksum = profile_checksum_bytes(checksum, &[0xff]);
+    for value in values {
+        checksum = match value {
+            Value::Null => profile_checksum_bytes(checksum, &[0]),
+            Value::Boolean(value) => profile_checksum_bytes(checksum, &[1, u8::from(*value)]),
+            Value::Integer(value) => {
+                let checksum = profile_checksum_bytes(checksum, &[2]);
+                profile_checksum_bytes(checksum, &value.to_le_bytes())
+            }
+            Value::Real(value) => {
+                let checksum = profile_checksum_bytes(checksum, &[3]);
+                profile_checksum_bytes(checksum, &value.to_bits().to_le_bytes())
+            }
+            Value::Text(value) => profile_checksum_sized_bytes(checksum, 4, value.as_bytes()),
+            Value::Json(value) => {
+                profile_checksum_sized_bytes(checksum, 5, value.to_string().as_bytes())
+            }
+            Value::Blob(value) => {
+                profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
+            }
+        };
+    }
+    Ok(checksum)
+}
+
+#[cfg(feature = "storage-benches")]
+fn profile_checksum_sized_bytes(checksum: u64, tag: u8, bytes: &[u8]) -> u64 {
+    let checksum = profile_checksum_bytes(checksum, &[tag]);
+    let checksum = profile_checksum_bytes(checksum, &(bytes.len() as u64).to_le_bytes());
+    profile_checksum_bytes(checksum, bytes)
+}
+
+#[cfg(feature = "storage-benches")]
+fn profile_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum ^= u64::from(*byte);
+        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    checksum
 }
 
 /// Runs one session SQL read using a widened storage-read lifetime.
