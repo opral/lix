@@ -121,6 +121,10 @@ The same sequence passes on RocksDB and SlateDB:
   restage/retry, and cold reopen on RocksDB and SlateDB;
 - deletion immediately before the coherent publication snapshot and deletion
   immediately after it, on both adapters;
+- an adapter read-return boundary that pins the publisher's inner
+  `StorageRead`, commits an ordinary GC deletion/progress rotation before that
+  read is returned, and proves publication carries the pinned p0 bytes through
+  exactly one `begin_read`;
 - same-root/no-write cursors rejected across distinct `StorageRead` instances;
 - genuine later-page corruption poisoning the live view, followed by a fresh
   `Excluded(last authenticated key)` restart;
@@ -162,7 +166,13 @@ All build and runtime cells completed below 20 minutes.
 | SlateDB | 29.924ms | 18.264ms | 91,618,014 B | 77,424 KiB | 887 / 148 / 129 | 46 / 264 | 109,129 B | 1,058 reads / 462,920 B; 111 writes / 126,447 B; 6 deletes |
 
 Every named output field is `pass`. The independent adversarial executable is
-8/8 GREEN in 0.03s. Source gates: `cargo fmt --all -- --check` PASS;
+10/10 GREEN in 0.05s. The added read-return discriminator is 2/2 GREEN on the
+coherent-publication model and 0/2 on unmodified `97df1eb6`, where both RocksDB
+and SlateDB observe three publisher `begin_read` calls instead of exactly one.
+The wrapper obtains the adapter's inner read before pausing; the concurrent
+mutation is the ordinary `commit_gc_deletion_page` path and rotates the existing
+authenticated progress record. No model or production algorithm is changed by
+this test/report-only successor. Source gates: `cargo fmt --all -- --check` PASS;
 `git diff --check` PASS; warnings-denied focused Clippy PASS.
 
 ## Runnable acceptance commands

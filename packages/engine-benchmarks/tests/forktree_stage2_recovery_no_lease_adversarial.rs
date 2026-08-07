@@ -9,6 +9,7 @@ mod frozen_oracle {
     #[cfg(test)]
     mod adversarial {
         use super::*;
+        use std::sync::atomic::AtomicUsize;
         use std::sync::{Arc, Mutex};
         use tokio::sync::Notify;
         use tokio::time::{Duration, timeout};
@@ -28,6 +29,51 @@ mod frozen_oracle {
             inner: W,
             gate: Arc<DeletePageGate>,
             deletes_target: bool,
+        }
+
+        struct ReadReturnGate {
+            armed: AtomicBool,
+            publisher_reads: AtomicUsize,
+            inner_read_ready: Notify,
+            release: Notify,
+        }
+
+        struct ReadReturnStorage<S> {
+            inner: S,
+            gate: Arc<ReadReturnGate>,
+        }
+
+        impl<S: Storage> Storage for ReadReturnStorage<S> {
+            type Read<'a>
+                = S::Read<'a>
+            where
+                Self: 'a;
+            type Write<'a>
+                = S::Write<'a>
+            where
+                Self: 'a;
+
+            async fn begin_read(
+                &self,
+                options: ReadOptions,
+            ) -> Result<Self::Read<'_>, StorageError> {
+                let read = self.inner.begin_read(options).await?;
+                if self.gate.armed.load(Ordering::Acquire) {
+                    let ordinal = self.gate.publisher_reads.fetch_add(1, Ordering::AcqRel);
+                    if ordinal == 0 {
+                        self.gate.inner_read_ready.notify_one();
+                        self.gate.release.notified().await;
+                    }
+                }
+                Ok(read)
+            }
+
+            async fn begin_write(
+                &self,
+                options: WriteOptions,
+            ) -> Result<Self::Write<'_>, StorageError> {
+                self.inner.begin_write(options).await
+            }
         }
 
         impl<S: Storage> Storage for GatedStorage<S> {
@@ -362,6 +408,108 @@ mod frozen_oracle {
             ));
         }
 
+        async fn pinned_read_return_boundary_carries_exact_fence<S: Storage>(storage: S) {
+            let gate = Arc::new(ReadReturnGate {
+                armed: AtomicBool::new(false),
+                publisher_reads: AtomicUsize::new(0),
+                inner_read_ready: Notify::new(),
+                release: Notify::new(),
+            });
+            let storage = ReadReturnStorage {
+                inner: storage,
+                gate: Arc::clone(&gate),
+            };
+            let mut metrics = Metrics::default();
+            let initial = seed(&storage, &mut metrics).await.expect("seed");
+            let prepared_gc = prepare_gc(&storage, &mut metrics)
+                .await
+                .expect("prepare GC");
+            start_gc(&storage, &prepared_gc, &mut metrics)
+                .await
+                .expect("start GC");
+            let successor = graph(401);
+            stage(&storage, &successor, &mut metrics)
+                .await
+                .expect("stage successor after mark");
+            let (raw_authority, _) = load_authority(&storage, &mut metrics)
+                .await
+                .expect("load GC authority");
+            let raw_progress = progress_value(&storage, &mut metrics)
+                .await
+                .expect("load GC progress")
+                .expect("active GC progress");
+            let mut progress = Progress::decode(&raw_progress).expect("decode GC progress");
+
+            gate.publisher_reads.store(0, Ordering::Release);
+            gate.armed.store(true, Ordering::Release);
+            let prepare = async {
+                let mut prepare_metrics = Metrics::default();
+                let result = prepare_publish(
+                    &storage,
+                    initial.root.id,
+                    successor.root.id,
+                    &mut prepare_metrics,
+                )
+                .await;
+                (result, prepare_metrics)
+            };
+            let delete = async {
+                timeout(Duration::from_secs(10), gate.inner_read_ready.notified())
+                    .await
+                    .expect("publisher did not pin its StorageRead");
+                let mut delete_metrics = Metrics::default();
+                let result = commit_gc_deletion_page(
+                    &storage,
+                    &raw_authority,
+                    &raw_progress,
+                    &mut progress,
+                    OBJECTS,
+                    vec![successor.objects[0].key.clone()],
+                    &mut delete_metrics,
+                )
+                .await;
+                gate.release.notify_one();
+                (result, delete_metrics)
+            };
+            let ((prepared, prepare_metrics), (deleted, delete_metrics)) =
+                tokio::join!(prepare, delete);
+            gate.armed.store(false, Ordering::Release);
+            metrics += prepare_metrics;
+            metrics += delete_metrics;
+            deleted.expect("ordinary deletion page rotates progress while read is pinned");
+            assert_eq!(
+                gate.publisher_reads.load(Ordering::Acquire),
+                1,
+                "publication preparation must use exactly one coherent StorageRead"
+            );
+            let prepared = prepared.expect("pinned p0 view validates the staged successor");
+            assert_eq!(prepared.raw_authority, raw_authority);
+            assert_eq!(prepared.raw_progress.as_ref(), Some(&raw_progress));
+            assert!(matches!(
+                commit_publish(&storage, &prepared, &mut metrics).await,
+                Err(StorageError::PreconditionFailed(_))
+            ));
+            verify_active(&storage, initial.root.id, &mut metrics)
+                .await
+                .expect("failed stale publication leaves initial authority active");
+            assert!(
+                get(
+                    &storage,
+                    OBJECTS,
+                    &[successor.objects[0].key.clone()],
+                    &mut metrics,
+                )
+                .await
+                .expect("read deleted successor object")[0]
+                    .is_none(),
+                "the committed deletion page must remove its target"
+            );
+            assert!(matches!(
+                validate_root(&storage, successor.root, &mut metrics).await,
+                Err(StorageError::Corruption(_))
+            ));
+        }
+
         async fn real_page_error_poisons_held_view<S: Storage>(storage: &S) {
             let mut metrics = Metrics::default();
             let initial = seed(storage, &mut metrics).await.expect("seed");
@@ -487,6 +635,25 @@ mod frozen_oracle {
         async fn slate_deletion_between_validation_and_fence_capture_fails() {
             let directory = tempfile::tempdir().expect("SlateDB directory");
             deletion_between_validation_and_fence_capture_must_fail(
+                SlateDB::open_with_io_counters(directory.path(), SlateDBIoCounters::default())
+                    .expect("open SlateDB"),
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rocks_pinned_read_return_boundary_carries_exact_fence() {
+            let directory = tempfile::tempdir().expect("RocksDB directory");
+            pinned_read_return_boundary_carries_exact_fence(
+                RocksDB::open(directory.path()).expect("open RocksDB"),
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn slate_pinned_read_return_boundary_carries_exact_fence() {
+            let directory = tempfile::tempdir().expect("SlateDB directory");
+            pinned_read_return_boundary_carries_exact_fence(
                 SlateDB::open_with_io_counters(directory.path(), SlateDBIoCounters::default())
                     .expect("open SlateDB"),
             )
