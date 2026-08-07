@@ -1833,6 +1833,89 @@ struct HotCollectionControl {
     ordered_identity_digest: Option<[u8; 32]>,
 }
 
+const COMPLETE_HOT_COLLECTION_DIGEST_DOMAIN: &[u8] = b"lix.complete-hot-collection-identities.v1";
+
+/// Streaming certificate for one complete selected HOT collection.
+///
+/// Untouched unfiled single-string collections retain the historical compact
+/// digest used by packed replacement proofs. Every other collection hashes
+/// the complete canonical HOT key, including the file discriminator and the
+/// typed/composite entity-primary-key encoding. Callers feed keys in physical
+/// storage order; strict ordering makes duplicate identities fail closed.
+struct CompleteHotCollectionDigest {
+    canonical: blake3::Hasher,
+    single_string: blake3::Hasher,
+    single_string_compatible: bool,
+    previous_key: Vec<u8>,
+}
+
+impl CompleteHotCollectionDigest {
+    fn new(
+        branch_id: &str,
+        branch_generation: CommitId,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Self {
+        let mut canonical = blake3::Hasher::new();
+        canonical.update(COMPLETE_HOT_COLLECTION_DIGEST_DOMAIN);
+        let scope_key = hot_collection_control_key(branch_id, branch_generation, scope);
+        canonical.update(&(scope_key.len() as u64).to_le_bytes());
+        canonical.update(&scope_key);
+        Self {
+            canonical,
+            single_string: blake3::Hasher::new(),
+            single_string_compatible: scope.file_id.is_none(),
+            previous_key: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, identity: &HeadRowIdentity, canonical_key: &[u8]) -> Result<(), LixError> {
+        if !self.previous_key.is_empty() {
+            match self.previous_key.as_slice().cmp(canonical_key) {
+                Ordering::Less => {}
+                Ordering::Equal => {
+                    return Err(head_value_error(
+                        "complete collection contains a duplicate canonical identity",
+                    ));
+                }
+                Ordering::Greater => {
+                    return Err(head_value_error(
+                        "complete collection identities are not in canonical order",
+                    ));
+                }
+            }
+        }
+        self.previous_key.clear();
+        self.previous_key.extend_from_slice(canonical_key);
+
+        self.canonical
+            .update(&(canonical_key.len() as u64).to_le_bytes());
+        self.canonical.update(canonical_key);
+
+        if self.single_string_compatible {
+            match (
+                identity.file_id.as_deref(),
+                identity.entity_pk.as_single_string(),
+            ) {
+                (None, Ok(value)) => {
+                    self.single_string
+                        .update(&(value.len() as u64).to_le_bytes());
+                    self.single_string.update(value.as_bytes());
+                }
+                _ => self.single_string_compatible = false,
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> [u8; 32] {
+        if self.single_string_compatible {
+            *self.single_string.finalize().as_bytes()
+        } else {
+            *self.canonical.finalize().as_bytes()
+        }
+    }
+}
+
 // Root-backed branches defer collection cardinality until an operation
 // actually asks for it. Ordinary sparse edits must not scan the immutable
 // root merely to maintain an eager count.
@@ -2517,6 +2600,7 @@ fn stage_complete_collection_controls(
     };
 
     let mut controls = BTreeMap::<(String, Option<String>), HotCollectionControl>::new();
+    let mut physical_buckets = BTreeMap::<(String, Option<String>), Vec<&HeadRowIdentity>>::new();
     for (identity, bytes) in rows {
         if identity.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
             let target = collection_scope_from_entity_pk(&identity.entity_pk)?;
@@ -2584,6 +2668,10 @@ fn stage_complete_collection_controls(
         if !visible_after_schema_generation || !visible_after_file_generation {
             continue;
         }
+        physical_buckets
+            .entry((identity.schema_key.clone(), identity.file_id.clone()))
+            .or_default()
+            .push(identity);
         for scope in [Some(schema_scope), file_scope].into_iter().flatten() {
             let control = controls
                 .get_mut(&scope)
@@ -2595,7 +2683,51 @@ fn stage_complete_collection_controls(
         }
     }
 
-    for ((schema_key, file_id), control) in controls {
+    let mut digests = controls
+        .keys()
+        .map(|(schema_key, file_id)| {
+            (
+                (schema_key.clone(), file_id.clone()),
+                CompleteHotCollectionDigest::new(
+                    branch_id,
+                    branch_generation,
+                    CollectionScopeRef {
+                        schema_key,
+                        file_id: file_id.as_deref(),
+                    },
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for ((schema_key, file_id), identities) in physical_buckets {
+        for identity in identities {
+            let canonical_key = encode_hot_row_key_parts(
+                branch_id,
+                branch_generation,
+                &identity.schema_key,
+                &identity.entity_pk,
+                identity.file_id.as_deref(),
+            );
+            digests
+                .get_mut(&(schema_key.clone(), None))
+                .expect("complete row schema digest was initialized above")
+                .push(identity, &canonical_key)?;
+            if file_id.is_some() {
+                digests
+                    .get_mut(&(schema_key.clone(), file_id.clone()))
+                    .expect("complete row file digest was initialized above")
+                    .push(identity, &canonical_key)?;
+            }
+        }
+    }
+
+    for ((schema_key, file_id), mut control) in controls {
+        control.ordered_identity_digest = Some(
+            digests
+                .remove(&(schema_key.clone(), file_id.clone()))
+                .expect("complete collection digest was initialized above")
+                .finish(),
+        );
         stage_hot_collection_control(
             writes,
             branch_id,
@@ -4103,23 +4235,114 @@ where
         branch_id: &str,
         branch_generation: CommitId,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
+        required_identity: TrackedStateKeyRef<'_>,
+        expected_domain: LiveStateReadDomain,
+        allow_bootstrap_absence: bool,
     ) -> Result<(), LixError> {
-        let control = self
-            .collection_control(branch_id, branch_generation, scope)
-            .await?;
-        if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
+        let expected_untracked = match expected_domain {
+            LiveStateReadDomain::Tracked => false,
+            LiveStateReadDomain::Untracked => true,
+            LiveStateReadDomain::Combined => {
+                return Err(head_value_error(
+                    "exact collection closure requires one explicit state domain",
+                ));
+            }
+        };
+        let control =
+            load_stored_hot_collection_control(&self.store, branch_id, branch_generation, scope)
+                .await?;
+        if let Some(control) = control {
+            if control.active_generation != branch_generation {
+                return Err(head_value_error(format!(
+                    "selected collection '{}' control names stale generation {} instead of {branch_generation}",
+                    scope.schema_key, control.active_generation
+                )));
+            }
+            if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
+                return Err(head_value_error(format!(
+                    "selected collection '{}' has no exact member count",
+                    scope.schema_key
+                )));
+            }
+            if control.ordered_identity_digest.is_none() {
+                return Err(head_value_error(format!(
+                    "selected collection '{}' has no exact identity digest",
+                    scope.schema_key
+                )));
+            }
+        }
+
+        let scope_prefix = hot_scope_prefix(branch_id, branch_generation);
+        let mut selected_prefix = scope_prefix.clone();
+        write_key_string(&mut selected_prefix, scope.schema_key, KEY_PART_FINAL);
+        if let Some(file_id) = scope.file_id {
+            write_file_id(&mut selected_prefix, Some(file_id));
+        }
+        let plan = ScanPlan::prefix(
+            HOT_ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(selected_prefix),
+            },
+        );
+        let mut digest = CompleteHotCollectionDigest::new(branch_id, branch_generation, scope);
+        let mut actual = 0_u64;
+        let mut resume_after = None;
+        loop {
+            let page = plan
+                .collect(
+                    &self.store,
+                    StorageScanOptions {
+                        resume_after: resume_after.clone(),
+                        ..StorageScanOptions::default()
+                    },
+                )
+                .await?;
+            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+            for entry in page.value.entries {
+                let raw_key = entry.key.0;
+                let raw_value = full_value_bytes(entry.value)?;
+                let identity = validate_exact_collection_member(
+                    branch_id,
+                    branch_generation,
+                    &scope_prefix,
+                    scope,
+                    required_identity,
+                    expected_untracked,
+                    raw_key.as_ref(),
+                    raw_value.as_ref(),
+                )?;
+                if let Some(identity) = identity {
+                    digest.push(&identity, raw_key.as_ref())?;
+                    actual = actual
+                        .checked_add(1)
+                        .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+                }
+            }
+            if !page.value.has_more || resume_after.is_none() {
+                break;
+            }
+        }
+        let actual_digest = digest.finish();
+
+        let Some(control) = control else {
+            if allow_bootstrap_absence && actual == 0 {
+                return Ok(());
+            }
             return Err(head_value_error(format!(
-                "selected collection '{}' has no exact member count",
+                "selected collection '{}' is missing its exact control",
                 scope.schema_key
             )));
-        }
-        let actual = self
-            .exact_collection_live_count(branch_id, branch_generation, scope)
-            .await?;
+        };
         if actual != control.live_count {
             return Err(head_value_error(format!(
                 "selected collection '{}' declares {} live members but materializes {actual}",
                 scope.schema_key, control.live_count
+            )));
+        }
+        if control.ordered_identity_digest != Some(actual_digest) {
+            return Err(head_value_error(format!(
+                "selected collection '{}' identity digest does not match its canonical members",
+                scope.schema_key
             )));
         }
         Ok(())
@@ -10133,7 +10356,6 @@ pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
     )
 }
 
-#[cfg(test)]
 fn encode_hot_row_key_parts(
     branch_id: &str,
     generation: CommitId,
@@ -10146,6 +10368,71 @@ fn encode_hot_row_key_parts(
     write_file_id(&mut key, file_id);
     write_entity_pk(&mut key, entity_pk);
     key
+}
+
+fn validate_exact_collection_member(
+    branch_id: &str,
+    branch_generation: CommitId,
+    scope_prefix: &[u8],
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+    required_identity: TrackedStateKeyRef<'_>,
+    expected_untracked: bool,
+    raw_key: &[u8],
+    raw_value: &[u8],
+) -> Result<Option<HeadRowIdentity>, LixError> {
+    let identity = decode_hot_row_key_in_scope(raw_key, scope_prefix)?;
+    if identity.schema_key != scope.schema_key
+        || scope
+            .file_id
+            .is_some_and(|file_id| identity.file_id.as_deref() != Some(file_id))
+    {
+        return Err(head_value_error(
+            "selected collection scan escaped its exact scope",
+        ));
+    }
+    let canonical = encode_hot_row_key_parts(
+        branch_id,
+        branch_generation,
+        &identity.schema_key,
+        &identity.entity_pk,
+        identity.file_id.as_deref(),
+    );
+    validate_canonical_exact_collection_key(raw_key, &canonical)?;
+    let value = decode_head_value(raw_value)?;
+    let is_required_identity = identity.schema_key == required_identity.schema_key
+        && identity.entity_pk == *required_identity.entity_pk
+        && identity.file_id.as_deref() == required_identity.file_id;
+    if value.deleted {
+        if !is_required_identity {
+            return Ok(None);
+        }
+        return Err(head_value_error(
+            "required collection identity is a tombstone instead of a live member",
+        ));
+    }
+    if is_required_identity && value.untracked != expected_untracked {
+        return Err(head_value_error(
+            "required collection identity belongs to the wrong state domain",
+        ));
+    }
+    if is_required_identity {
+        return Err(head_value_error(
+            "required point miss omitted a live collection authority member",
+        ));
+    }
+    Ok(Some(identity))
+}
+
+fn validate_canonical_exact_collection_key(
+    raw_key: &[u8],
+    canonical_key: &[u8],
+) -> Result<(), LixError> {
+    if canonical_key != raw_key {
+        return Err(head_value_error(
+            "selected collection contains a non-canonical identity key",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -11356,6 +11643,400 @@ mod tests {
 
     fn timestamp() -> LixTimestamp {
         LixTimestamp::expect_parse("hot working-diff test timestamp", "2026-01-01T00:00:00Z")
+    }
+
+    fn encoded_test_hot_value(generation: CommitId, untracked: bool, deleted: bool) -> Bytes {
+        Bytes::from(
+            encode_head_value(&HeadValueRef {
+                change_id: (!untracked).then(|| ChangeId::for_test_label("closure-change")),
+                commit_id: (!untracked).then_some(generation),
+                untracked,
+                deleted,
+                created_at: timestamp(),
+                updated_at: timestamp(),
+                snapshot: JsonSlotRef::None,
+                metadata: JsonSlotRef::None,
+                columnar_base_coordinate: None,
+                working_diff_baseline: WorkingDiffBaseline::Disabled,
+            })
+            .expect("closure fixture HOT value should encode"),
+        )
+    }
+
+    #[test]
+    fn exact_collection_member_rejects_noncanonical_domain_tombstone_and_order() {
+        const BRANCH_ID: &str = "closure-member-branch";
+        const SCHEMA_KEY: &str = "closure_member_schema";
+        let generation = CommitId::for_test_label("closure-member-generation");
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: SCHEMA_KEY,
+            file_id: None,
+        };
+        let scope_prefix = hot_scope_prefix(BRANCH_ID, generation);
+        let identity = HeadRowIdentity {
+            schema_key: SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single("member-a"),
+            file_id: None,
+        };
+        let missing_entity_pk = EntityPk::single("missing-member");
+        let missing_identity = TrackedStateKeyRef {
+            schema_key: SCHEMA_KEY,
+            entity_pk: &missing_entity_pk,
+            file_id: None,
+        };
+        let required_identity = TrackedStateKeyRef {
+            schema_key: SCHEMA_KEY,
+            entity_pk: &identity.entity_pk,
+            file_id: None,
+        };
+        let key =
+            encode_hot_row_key_parts(BRANCH_ID, generation, SCHEMA_KEY, &identity.entity_pk, None);
+        let untracked = encoded_test_hot_value(generation, true, false);
+        validate_exact_collection_member(
+            BRANCH_ID,
+            generation,
+            &scope_prefix,
+            scope,
+            missing_identity,
+            true,
+            &key,
+            &untracked,
+        )
+        .expect("live untracked member should validate");
+
+        let tracked = encoded_test_hot_value(generation, false, false);
+        let wrong_domain = validate_exact_collection_member(
+            BRANCH_ID,
+            generation,
+            &scope_prefix,
+            scope,
+            required_identity,
+            true,
+            &key,
+            &tracked,
+        )
+        .expect_err("tracked member must not satisfy an untracked closure");
+        assert!(wrong_domain.message.contains("wrong state domain"));
+
+        let tombstone = encoded_test_hot_value(generation, false, true);
+        let tombstone_error = validate_exact_collection_member(
+            BRANCH_ID,
+            generation,
+            &scope_prefix,
+            scope,
+            required_identity,
+            false,
+            &key,
+            &tombstone,
+        )
+        .expect_err("tombstone must not satisfy a live closure");
+        assert!(tombstone_error.message.contains("tombstone"));
+
+        let mut malformed = key.clone();
+        malformed.pop();
+        assert!(
+            validate_exact_collection_member(
+                BRANCH_ID,
+                generation,
+                &scope_prefix,
+                scope,
+                missing_identity,
+                true,
+                &malformed,
+                &untracked,
+            )
+            .is_err()
+        );
+        let mut noncanonical = key.clone();
+        noncanonical.push(0);
+        let noncanonical_error = validate_canonical_exact_collection_key(&noncanonical, &key)
+            .expect_err("raw and canonical encodings must match byte-for-byte");
+        assert!(noncanonical_error.message.contains("non-canonical"));
+
+        let mut digest = CompleteHotCollectionDigest::new(BRANCH_ID, generation, scope);
+        digest
+            .push(&identity, &key)
+            .expect("first canonical identity should hash");
+        let duplicate = digest
+            .push(&identity, &key)
+            .expect_err("duplicate canonical identity must fail");
+        assert!(duplicate.message.contains("duplicate canonical identity"));
+
+        let high_identity = HeadRowIdentity {
+            schema_key: SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single("member-z"),
+            file_id: None,
+        };
+        let high_key = encode_hot_row_key_parts(
+            BRANCH_ID,
+            generation,
+            SCHEMA_KEY,
+            &high_identity.entity_pk,
+            None,
+        );
+        let mut out_of_order = CompleteHotCollectionDigest::new(BRANCH_ID, generation, scope);
+        out_of_order
+            .push(&high_identity, &high_key)
+            .expect("first high identity should hash");
+        let ordering = out_of_order
+            .push(&identity, &key)
+            .expect_err("descending identity must fail");
+        assert!(ordering.message.contains("not in canonical order"));
+    }
+
+    #[tokio::test]
+    async fn complete_collection_digest_closes_typed_file_members_and_authenticated_empty() {
+        const BRANCH_ID: &str = "closure-file-branch";
+        const SCHEMA_KEY: &str = "closure_file_schema";
+        let generation = CommitId::for_test_label("closure-file-generation");
+        let mut rows = HotRowMap::new();
+        let typed_pk = EntityPk::from_components(smallvec::smallvec![
+            crate::entity_pk::EntityPkComponent::Integer(-7),
+            crate::entity_pk::EntityPkComponent::Bytes(Bytes::from_static(b"typed")),
+        ])
+        .expect("typed composite primary key");
+        for (entity_pk, file_id) in [
+            (EntityPk::single("unfiled"), None),
+            (typed_pk, Some("a.lix".to_owned())),
+            (EntityPk::single("file-string"), Some("b.lix".to_owned())),
+        ] {
+            rows.insert(
+                HeadRowIdentity {
+                    schema_key: SCHEMA_KEY.to_owned(),
+                    entity_pk,
+                    file_id,
+                },
+                encoded_test_hot_value(generation, false, false),
+            );
+        }
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &rows)
+            .expect("complete controls should stage");
+        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("typed file fixture should publish");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("typed file fixture should read");
+        let reader = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+        };
+        let missing_entity_pk = EntityPk::single("missing-member");
+        let missing_identity = TrackedStateKeyRef {
+            schema_key: SCHEMA_KEY,
+            entity_pk: &missing_entity_pk,
+            file_id: None,
+        };
+        reader
+            .validate_exact_collection_closure(
+                BRANCH_ID,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: SCHEMA_KEY,
+                    file_id: None,
+                },
+                missing_identity,
+                LiveStateReadDomain::Tracked,
+                false,
+            )
+            .await
+            .expect("schema scope should close in canonical file/member order");
+        reader
+            .validate_exact_collection_closure(
+                BRANCH_ID,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: SCHEMA_KEY,
+                    file_id: Some("a.lix"),
+                },
+                TrackedStateKeyRef {
+                    schema_key: SCHEMA_KEY,
+                    entity_pk: &missing_entity_pk,
+                    file_id: Some("a.lix"),
+                },
+                LiveStateReadDomain::Tracked,
+                false,
+            )
+            .await
+            .expect("typed file scope should close with complete PK encoding");
+
+        const EMPTY_SCHEMA_KEY: &str = "authenticated_empty_schema";
+        let empty_scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: EMPTY_SCHEMA_KEY,
+            file_id: None,
+        };
+        let marker_identity = HeadRowIdentity {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single(crate::collection_generation::collection_scope_key(
+                empty_scope,
+            )),
+            file_id: None,
+        };
+        let marker_rows = HotRowMap::from([(
+            marker_identity,
+            encoded_test_hot_value(generation, false, false),
+        )]);
+        let mut writes = StorageWriteSet::new();
+        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &marker_rows)
+            .expect("authenticated empty control should stage");
+        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, marker_rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authenticated empty fixture should publish");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authenticated empty fixture should read");
+        HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+        }
+        .validate_exact_collection_closure(
+            BRANCH_ID,
+            generation,
+            empty_scope,
+            TrackedStateKeyRef {
+                schema_key: EMPTY_SCHEMA_KEY,
+                entity_pk: &missing_entity_pk,
+                file_id: None,
+            },
+            LiveStateReadDomain::Tracked,
+            false,
+        )
+        .await
+        .expect("explicit empty control should authenticate an empty scope");
+    }
+
+    #[tokio::test]
+    async fn exact_collection_closure_rejects_missing_malformed_stale_and_forged_controls() {
+        const BRANCH_ID: &str = "closure-control-branch";
+        const SCHEMA_KEY: &str = "closure_control_schema";
+        let generation = CommitId::for_test_label("closure-control-generation");
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: SCHEMA_KEY,
+            file_id: None,
+        };
+        let rows = HotRowMap::from([(
+            HeadRowIdentity {
+                schema_key: SCHEMA_KEY.to_owned(),
+                entity_pk: EntityPk::single("member"),
+                file_id: None,
+            },
+            encoded_test_hot_value(generation, false, false),
+        )]);
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        let mut writes = StorageWriteSet::new();
+        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &rows)
+            .expect("base control should stage");
+        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("base closure fixture should publish");
+        let snapshot = memory.export_snapshot().expect("base fixture snapshot");
+        drop(storage);
+        drop(memory);
+        let missing_entity_pk = EntityPk::single("missing-member");
+
+        for (label, expected) in [
+            ("missing", "missing its exact control"),
+            ("malformed", "hot collection control"),
+            ("stale", "stale generation"),
+            ("no-digest", "no exact identity digest"),
+            ("forged", "identity digest"),
+        ] {
+            let storage = StorageAdapter::new(
+                Memory::from_snapshot(&snapshot).expect("reopen base closure fixture"),
+            );
+            let control_key = StorageKey(Bytes::from(hot_collection_control_key(
+                BRANCH_ID, generation, scope,
+            )));
+            let mut writes = StorageWriteSet::new();
+            match label {
+                "missing" => writes.delete(HOT_COLLECTION_CONTROL_SPACE, control_key),
+                "malformed" => writes.put(
+                    HOT_COLLECTION_CONTROL_SPACE,
+                    control_key,
+                    StorageValue {
+                        bytes: Bytes::from_static(b"malformed-control"),
+                    },
+                ),
+                "stale" => stage_hot_collection_control(
+                    &mut writes,
+                    BRANCH_ID,
+                    generation,
+                    scope,
+                    HotCollectionControl {
+                        active_generation: CommitId::for_test_label("stale-generation"),
+                        live_count: 1,
+                        ordered_identity_digest: Some([0; 32]),
+                    },
+                )
+                .expect("stale control should encode"),
+                "no-digest" => stage_hot_collection_control(
+                    &mut writes,
+                    BRANCH_ID,
+                    generation,
+                    scope,
+                    HotCollectionControl {
+                        active_generation: generation,
+                        live_count: 1,
+                        ordered_identity_digest: None,
+                    },
+                )
+                .expect("digest-free control should encode"),
+                "forged" => stage_hot_collection_control(
+                    &mut writes,
+                    BRANCH_ID,
+                    generation,
+                    scope,
+                    HotCollectionControl {
+                        active_generation: generation,
+                        live_count: 1,
+                        ordered_identity_digest: Some([0; 32]),
+                    },
+                )
+                .expect("forged control should encode"),
+                _ => unreachable!("closed corruption fixture set"),
+            }
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("control corruption should publish below the reader");
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("corrupt control fixture should read");
+            let error = HotStateStoreReader {
+                store: &read,
+                transaction_cache: None,
+            }
+            .validate_exact_collection_closure(
+                BRANCH_ID,
+                generation,
+                scope,
+                TrackedStateKeyRef {
+                    schema_key: SCHEMA_KEY,
+                    entity_pk: &missing_entity_pk,
+                    file_id: None,
+                },
+                LiveStateReadDomain::Tracked,
+                false,
+            )
+            .await
+            .expect_err("corrupt exact control must fail closed");
+            assert!(
+                error.message.contains(expected),
+                "unexpected {label} control error: {error:?}"
+            );
+        }
     }
 
     fn live_row(entity_pk: &str, commit_label: &str) -> MaterializedLiveStateRow {

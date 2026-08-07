@@ -79,10 +79,11 @@ async fn deterministic_sequence_member_corruption_fails_closed_on_rocksdb() {
     drop(storage);
 
     let storage = RocksDB::open(&corrupt_path).expect("reopen published sequence storage");
-    deterministic_sequence_corruption::delete_selected_sequence_member(&storage).await;
+    deterministic_sequence_corruption::replace_selected_sequence_member_with_unrelated(&storage)
+        .await;
     storage
         .flush()
-        .expect("flush physical sequence member deletion");
+        .expect("flush same-count sequence member substitution");
     drop(storage);
 
     let storage = RocksDB::open(&corrupt_path).expect("reopen corrupt sequence storage");

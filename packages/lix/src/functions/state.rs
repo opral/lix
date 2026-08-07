@@ -184,6 +184,9 @@ async fn load_key_value_row(
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
                 },
+                key_refs[0],
+                LiveStateReadDomain::Untracked,
+                control.current_state_revision == 0,
             )
             .await?;
         return Ok(None);
@@ -265,7 +268,10 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage_adapter::StorageAdapter;
-    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{
+        Memory, StorageKey, StorageProjectedValue, StorageReadOptions, StorageValue,
+        StorageWriteOptions,
+    };
 
     use super::*;
 
@@ -335,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_selected_sequence_member_fails_collection_closure() {
+    async fn same_count_sequence_substitution_fails_identity_closure() {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
         crate::test_support::seed_global_branch_head(storage.clone()).await;
@@ -373,7 +379,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("reopened sequence storage should read");
-        let rows = crate::storage_adapter::ScanPlan::prefix(
+        let mut rows = crate::storage_adapter::ScanPlan::prefix(
             crate::live_state::HOT_ROW_SPACE,
             crate::storage_adapter::StoragePrefix {
                 bytes: bytes::Bytes::new(),
@@ -389,15 +395,37 @@ mod tests {
             1,
             "fixture should publish only the sequence member"
         );
-        let sequence_member_key = rows[0].key.clone();
+        let sequence_member = rows.pop().expect("one sequence member");
+        let StorageProjectedValue::FullValue(sequence_value) = sequence_member.value else {
+            panic!("sequence fixture should scan the full HOT row value");
+        };
+        let sequence_identity = DETERMINISTIC_SEQUENCE_KEY.as_bytes();
+        let unrelated_identity = b"lix_unrelated_sequence_substitute";
+        assert_eq!(sequence_identity.len(), unrelated_identity.len());
+        let identity_offset = sequence_member
+            .key
+            .0
+            .windows(sequence_identity.len())
+            .position(|candidate| candidate == sequence_identity)
+            .expect("sequence identity should be encoded in its HOT key");
+        let mut unrelated_key = sequence_member.key.0.to_vec();
+        unrelated_key[identity_offset..identity_offset + sequence_identity.len()]
+            .copy_from_slice(unrelated_identity);
         drop(read);
 
         let mut corrupt = storage.new_write_set();
-        corrupt.delete(crate::live_state::HOT_ROW_SPACE, sequence_member_key);
+        corrupt.delete(crate::live_state::HOT_ROW_SPACE, sequence_member.key);
+        corrupt.put(
+            crate::live_state::HOT_ROW_SPACE,
+            StorageKey(bytes::Bytes::from(unrelated_key)),
+            StorageValue {
+                bytes: sequence_value,
+            },
+        );
         storage
             .commit_write_set(corrupt, StorageWriteOptions::default())
             .await
-            .expect("physical sequence member deletion should commit");
+            .expect("same-count sequence member substitution should commit");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -409,7 +437,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("declares 1 live members but materializes 0"),
+                .contains("identity digest does not match its canonical members"),
             "unexpected closure error: {error:?}"
         );
     }
