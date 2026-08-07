@@ -140,7 +140,13 @@ async fn pure_read_skips_durable_function_state_storage_work() {
         "only the durable-function statement should load durable mode state: \
          pure={pure_reads:?}, durable={durable_reads:?}"
     );
-    assert_eq!(durable_reads.scan_calls, pure_reads.scan_calls);
+    assert_eq!(
+        durable_reads.scan_calls,
+        pure_reads.scan_calls + 1,
+        "a missing engine-owned durable key must validate its exact collection closure once, \
+         while a pure read must not scan durable state: \
+         pure={pure_reads:?}, durable={durable_reads:?}"
+    );
 }
 
 #[tokio::test]
