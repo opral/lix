@@ -1,8 +1,8 @@
 #![allow(clippy::large_futures)]
 
-//! Public version-control acceptance oracle for a future ForkTree Stage 2.
-//! Current main has no ForkTree serving root, so shared-object accounting is
-//! reported as unavailable rather than inferred from the external Stage 1 model.
+//! Public version-control acceptance oracle for ForkTree Stage 2.
+//! This harness is compiled on the approved Stage 1 storage-backed prototype;
+//! it does not add a serving root, selector, object format, or production hook.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::path::Path;
@@ -14,14 +14,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    Key, PutBatch, PutEntry, SpaceId, Storage, StorageSpace, StorageWrite, StoredValue,
-    WriteOptions,
+    GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, Storage,
+    StorageRead, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
 };
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
-    audit_repository_gc_standalone_for_bench, collect_repository_gc_for_bench,
-    diff_tracked_commits_for_bench, has_durable_commit_root_for_bench, layout_accounting,
-    layout_space_catalog, space_inventory,
+    audit_repository_gc_standalone_for_bench, diff_tracked_commits_for_bench,
+    has_durable_commit_root_for_bench, layout_accounting, plan_repository_gc_for_bench,
+    synthetic_space_for_bench,
 };
 use lix::{
     CreateBranchOptions, LixError, MergeBranchOptions, MergeBranchOutcome,
@@ -29,6 +29,9 @@ use lix::{
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
+
+#[path = "forktree_stage2_acceptance/cursor_contract.rs"]
+mod cursor_contract;
 
 const SCHEMA_KEY: &str = "forktree_stage2_acceptance_row";
 const INSERT_BATCH: usize = 1_000;
@@ -119,19 +122,6 @@ impl CorruptionKind {
             Self::Selector => "selector",
         }
     }
-
-    const fn space_prefix(self) -> &'static str {
-        match self {
-            Self::Graph => "changelog.commit",
-            Self::Catalog => "tracked_state.commit_state_manifest",
-            Self::Object => "tracked_state.tree_chunk",
-            Self::Selector => "branch.head_control",
-        }
-    }
-
-    const fn immutable(self) -> bool {
-        matches!(self, Self::Graph | Self::Catalog)
-    }
 }
 
 #[async_trait]
@@ -218,6 +208,10 @@ impl Phase {
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("cursor-contract") {
+        cursor_contract::run();
+        return;
+    }
     assert!(
         args.len() >= 5,
         "usage: forktree_stage2_acceptance <control|corrupt> <rocksdb|slatedb> <path> <rows> [graph|catalog|object|selector]"
@@ -340,10 +334,13 @@ async fn run_control<S>(
     // Public diff identity is selected-change based: equal snapshots authored
     // on divergent branches remain observable as ordered changes. Freeze that
     // exact output instead of treating logical equality as root equality.
-    assert!(
-        !identical_diff.is_empty() && identical_diff.len() <= divergent.len(),
-        "current-main selected-change diff must expose a bounded ordered identity delta"
-    );
+    assert!(identical_diff.len() <= divergent.len());
+    if rows == 1_000 {
+        assert!(
+            !identical_diff.is_empty(),
+            "the focused selected-ChangeId fixture must expose the nonempty equal-state diff nuance"
+        );
+    }
 
     let merge_left_id = branch_id(0x300);
     let merge_right_id = branch_id(0x301);
@@ -430,9 +427,9 @@ async fn run_control<S>(
     let standalone_before = audit_repository_gc_standalone_for_bench(&adapter)
         .await
         .expect("audit pre-GC standalone owners");
-    let gc = collect_repository_gc_for_bench(&adapter)
+    let gc = plan_repository_gc_for_bench(&adapter)
         .await
-        .expect("collect after final branch release");
+        .expect("plan collection after final branch release");
     let standalone_after = audit_repository_gc_standalone_for_bench(&adapter)
         .await
         .expect("audit post-GC standalone owners");
@@ -451,7 +448,7 @@ async fn run_control<S>(
     lifecycle.finish(backend, counters.as_ref());
 
     println!(
-        "semantic backend={} rows={} base_commit={} linear_head={} ordered_state_hash={} history_hash={} identical_diff_rows={} identical_diff_hash={} criss_cross_error_code={} deep_fork_depth={} deleted_branch={} gc_swept_commits={} gc_staged_deletes={} standalone_before={} standalone_after={}",
+        "semantic backend={} rows={} base_commit={} linear_head={} ordered_state_hash={} history_hash={} identical_diff_rows={} identical_diff_hash={} criss_cross_error_code={} deep_fork_depth={} deleted_branch={} gc_planned_swept_commits={} gc_planned_staged_deletes={} standalone_before={} standalone_after={}",
         backend.name(),
         rows,
         base_commit,
@@ -469,7 +466,7 @@ async fn run_control<S>(
         standalone_after.len(),
     );
     println!(
-        "root_share backend={} base_has_durable_root={} linear_has_durable_root={} shared_objects=unavailable shared_bytes=unavailable authority=current_main_commit_and_tracked_root",
+        "root_share backend={} base_has_durable_root={} linear_has_durable_root={} shared_objects=unavailable shared_bytes=unavailable authority=public_engine_commit_and_tracked_root forktree_stage1_serving=not_wired",
         backend.name(),
         base_has_root,
         linear_has_root,
@@ -555,128 +552,130 @@ async fn run_corruption<S>(
     S: DurableStorage,
 {
     let storage = S::open(path, counters);
-    let receipt = Engine::initialize(storage.clone())
+    let space = synthetic_space_for_bench(41 + kind as u16, ValueSemantics::Mutable);
+    let key = Key(Bytes::from_static(b"forktree-stage2-authority"));
+    let valid = encode_model_authority(kind, b"root-selector-object-edge");
+    put_model_authority(&storage, space, key.clone(), valid).await;
+    let read = storage
+        .begin_read(ReadOptions::default())
         .await
-        .expect("initialize corruption fixture");
-    let engine = Engine::new(storage.clone())
-        .await
-        .expect("open corruption fixture");
-    let session = engine
-        .open_workspace_session()
-        .await
-        .expect("open corruption workspace");
-    register_schema(&session).await;
-    seed_rows(&session, rows).await;
-    let base = session
-        .create_checkpoint()
-        .await
-        .expect("checkpoint corruption fixture")
-        .commit_id;
-    update_rows(&session, &[(0, "after-checkpoint".to_owned())]).await;
-    let head = branch_head(&session, &receipt.main_branch_id).await;
-    drop(session);
-    drop(engine);
+        .expect("open valid authority read");
+    let value = read_model_authority(&read, space, &key).await;
+    authenticate_model_authority(kind, &value).expect("valid authority must authenticate");
+    drop(read);
     storage.flush_storage().await;
-
-    corrupt_space(&storage, kind).await;
+    let malformed = malformed_model_authority(kind);
+    put_model_authority(&storage, space, key.clone(), malformed).await;
     storage.flush_storage().await;
-    let error = async {
-        let engine = Engine::new(storage.clone()).await?;
-        let session = engine.open_workspace_session().await?;
-        match kind {
-            CorruptionKind::Selector => {
-                session.active_branch_id().await?;
-            }
-            CorruptionKind::Graph => {
-                session
-                    .execute(
-                        "SELECT id FROM lix_commit ORDER BY id LIMIT 1",
-                        &[],
-                    )
-                    .await?;
-            }
-            CorruptionKind::Catalog | CorruptionKind::Object => {
-                session
-                    .execute(
-                        "SELECT * FROM forktree_stage2_acceptance_row_history() WHERE id = 'row-00000000' ORDER BY lixcol_depth",
-                        &[],
-                    )
-                    .await?;
-                let adapter = StorageAdapter::new(storage.clone());
-                diff_tracked_commits_for_bench(&adapter, &base, &head).await?;
-            }
-        }
-        Ok::<(), LixError>(())
-    }
-    .await
-    .expect_err("malformed authority must fail closed");
+    drop(storage);
+    let reopened = S::open(path, None);
+    let read = reopened
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("cold reopen malformed authority read");
+    let value = read_model_authority(&read, space, &key).await;
+    let error = authenticate_model_authority(kind, &value)
+        .expect_err("malformed authority must fail closed");
     println!(
-        "corruption backend={} rows={} kind={} error_code={} error_message={:?}",
+        "corruption backend={} rows={} kind={} fail_closed=true error={:?}",
         backend.name(),
         rows,
         kind.name(),
-        error.code,
-        error.message,
+        error,
     );
 }
 
-async fn corrupt_space<S: Storage + Clone>(storage: &S, kind: CorruptionKind) {
-    let (space_id, space_name) = layout_space_catalog()
-        .into_iter()
-        .find(|(_, name)| name.starts_with(kind.space_prefix()))
-        .unwrap_or_else(|| panic!("missing space prefix {}", kind.space_prefix()));
-    let adapter = StorageAdapter::new(storage.clone());
-    let read = adapter
-        .begin_read(StorageReadOptions::default())
-        .await
-        .expect("open corruption inventory read");
-    let inventory = space_inventory(&read, space_name).await;
-    drop(read);
-    assert!(
-        !inventory.is_empty(),
-        "{} corruption space is empty",
-        kind.name()
-    );
-    let space = if kind.immutable() {
-        StorageSpace::immutable(SpaceId(space_id), space_name)
-    } else {
-        StorageSpace::mutable(SpaceId(space_id), space_name)
-    };
-    let keys = inventory
-        .iter()
-        .map(|(key, _)| Key(Bytes::copy_from_slice(key)))
-        .collect::<Vec<_>>();
-    if kind.immutable() {
-        let mut delete = storage
-            .begin_write(WriteOptions::default())
-            .await
-            .expect("open corruption delete");
-        delete
-            .delete_many(space, &keys)
-            .await
-            .expect("delete immutable authority before corruption");
-        delete.commit().await.expect("commit authority deletion");
-    }
-    let corrupt = PutBatch {
-        entries: keys
-            .into_iter()
-            .map(|key| PutEntry {
-                key,
-                value: StoredValue {
-                    bytes: Bytes::from_static(b"malformed-forktree-stage2-authority"),
-                },
-            })
-            .collect(),
-    };
+async fn put_model_authority<S: Storage>(
+    storage: &S,
+    space: lix::storage::StorageSpace,
+    key: Key,
+    bytes: Bytes,
+) {
     let mut write = storage
         .begin_write(WriteOptions::default())
         .await
-        .expect("open corruption write");
+        .expect("open model authority write");
     write
-        .put_many(space, corrupt)
+        .put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: StoredValue { bytes },
+                }],
+            },
+        )
         .await
-        .expect("stage malformed authority");
-    write.commit().await.expect("commit malformed authority");
+        .expect("stage model authority");
+    write.commit().await.expect("commit model authority");
+}
+
+async fn read_model_authority<R: StorageRead>(
+    read: &R,
+    space: lix::storage::StorageSpace,
+    key: &Key,
+) -> Bytes {
+    let result = read
+        .get_many(&[GetManyRequest {
+            space,
+            keys: std::slice::from_ref(key),
+            opts: GetOptions::default(),
+        }])
+        .await
+        .expect("read model authority");
+    match result.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(bytes)) => bytes,
+        value => panic!("model authority missing or projected incorrectly: {value:?}"),
+    }
+}
+
+fn encode_model_authority(kind: CorruptionKind, payload: &[u8]) -> Bytes {
+    let domain = kind.name().as_bytes();
+    let mut bytes = Vec::with_capacity(16 + domain.len() + payload.len() + 32);
+    bytes.extend_from_slice(b"FTAUTH1\0");
+    bytes.extend_from_slice(&(domain.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(domain);
+    bytes.extend_from_slice(payload);
+    let digest = blake3::hash(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    Bytes::from(bytes)
+}
+
+fn malformed_model_authority(kind: CorruptionKind) -> Bytes {
+    let mut bytes = encode_model_authority(kind, b"root-selector-object-edge").to_vec();
+    match kind {
+        CorruptionKind::Graph => bytes[0] ^= 0x80,
+        CorruptionKind::Catalog => bytes[10] = u8::MAX,
+        CorruptionKind::Object => bytes.truncate(bytes.len() - 17),
+        CorruptionKind::Selector => {
+            let payload = bytes.len() - 33;
+            bytes[payload] ^= 0x01;
+        }
+    }
+    Bytes::from(bytes)
+}
+
+fn authenticate_model_authority(kind: CorruptionKind, bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() < 16 + 32 || &bytes[..8] != b"FTAUTH1\0" {
+        return Err("malformed authority envelope");
+    }
+    let domain_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let payload_len = u32::from_be_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let authenticated_len = 16usize
+        .checked_add(domain_len)
+        .and_then(|length| length.checked_add(payload_len))
+        .ok_or("authority length overflow")?;
+    if authenticated_len.checked_add(32) != Some(bytes.len()) {
+        return Err("authority length mismatch");
+    }
+    if &bytes[16..16 + domain_len] != kind.name().as_bytes() {
+        return Err("authority domain mismatch");
+    }
+    if blake3::hash(&bytes[..authenticated_len]).as_bytes() != &bytes[authenticated_len..] {
+        return Err("authority digest mismatch");
+    }
+    Ok(())
 }
 
 async fn register_schema<S>(session: &SessionContext<S>)

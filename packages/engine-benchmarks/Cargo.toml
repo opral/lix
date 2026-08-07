@@ -50,6 +50,7 @@ bytes = "1"
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libc = "0.2"
 sha2 = "0.10"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
