@@ -1670,13 +1670,15 @@ pub(crate) struct RepositoryGcProfile {
 }
 
 /// Extends the existing retirement proof with every commit the point reader
-/// can still visit from an active rootless authority.
+/// can still visit from an active logical root.
 ///
 /// Semantic first-parent edges come only from the commit graph. A replacement
 /// generation may substitute its authenticated physical fallback, exactly as
-/// `TrackedStateStoreReader::point_replay_interval` does. Both authorities are
-/// required before collection can proceed; malformed debt, missing state, or a
-/// cycle aborts the complete GC transaction before any sweep is staged.
+/// `TrackedStateStoreReader::point_replay_interval` does. Physical serving
+/// owners are retained directly by their authenticated inventory and do not
+/// acquire point-replay chronology merely because their original manifest had
+/// replay debt. Malformed debt, missing state, or a cycle aborts the complete
+/// GC transaction before any sweep is staged.
 async fn collect_active_point_replay_dependencies<S>(
     store: &S,
     active_manifests: &BTreeMap<CommitId, crate::tracked_state::CommitStateManifest>,
@@ -1689,35 +1691,23 @@ where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
     let mut graph = CommitGraphContext::new().reader(store.clone());
-    let mut completed_physical = BTreeSet::new();
-    let mut completed_logical = BTreeSet::new();
+    let mut completed = BTreeSet::new();
     let mut loaded_manifests = active_manifests.clone();
     let mut discovered_physical = BTreeSet::new();
     let mut discovered_semantic = BTreeSet::new();
     let mut discovered_cas_logical = BTreeSet::new();
 
     for (start_commit_id, start_manifest) in active_manifests {
-        if start_manifest.replay_debt.depth == 0 {
+        if start_manifest.replay_debt.depth == 0 || !logical_start_ids.contains(start_commit_id) {
             continue;
         }
         let start_commit_id = *start_commit_id;
-        let logical_path = logical_start_ids.contains(&start_commit_id);
-        // Every retained replay authority needs its authenticated graph and
-        // physical manifests, but only a logical history/undo/root role owns
-        // the public semantic projection. A checkpoint-selected source may
-        // remain physical serving authority after its recovery interval has
-        // expired; promoting that role to semantic liveness would retain the
-        // expired auto-commit indefinitely.
-        if logical_path {
-            discovered_semantic.insert(start_commit_id);
-        }
+        discovered_semantic.insert(start_commit_id);
         let mut current_commit_id = start_commit_id;
         let mut path = Vec::new();
         let mut seen = BTreeSet::new();
         loop {
-            if (logical_path && completed_logical.contains(&current_commit_id))
-                || (!logical_path && completed_physical.contains(&current_commit_id))
-            {
+            if completed.contains(&current_commit_id) {
                 break;
             }
             if !seen.insert(current_commit_id) {
@@ -1830,16 +1820,11 @@ where
             }
 
             discovered_physical.insert(next_commit_id);
-            if logical_path {
-                discovered_semantic.insert(next_commit_id);
-                discovered_cas_logical.insert(next_commit_id);
-            }
+            discovered_semantic.insert(next_commit_id);
+            discovered_cas_logical.insert(next_commit_id);
             current_commit_id = next_commit_id;
         }
-        completed_physical.extend(path.iter().copied());
-        if logical_path {
-            completed_logical.extend(path);
-        }
+        completed.extend(path);
     }
     physical_dependencies.extend(discovered_physical);
     semantic_dependencies.extend(discovered_semantic);
@@ -3766,10 +3751,10 @@ mod tests {
         );
         assert_eq!(cas, BTreeSet::from([fallback.commit_id]));
 
-        // The same bytes reached only through a checkpoint-selected physical
-        // source still require graph/manifests for serving validation, but do
-        // not own semantic history or binary-CAS chronology after recovery
-        // and undo roots release the interval.
+        // The same bytes reached only through a selected physical owner are
+        // retained directly by that manifest and its mutation inventory. They
+        // do not enter point replay or acquire semantic/CAS chronology after
+        // recovery and undo roots release the interval.
         let mut physical_only = BTreeSet::new();
         let mut semantic_only = BTreeSet::new();
         let mut cas_only = BTreeSet::new();
@@ -3783,13 +3768,14 @@ mod tests {
         )
         .await
         .expect("authenticated physical-only fallback should close");
-        assert_eq!(physical_only, BTreeSet::from([fallback.commit_id]));
+        assert!(physical_only.is_empty());
         assert!(semantic_only.is_empty());
         assert!(cas_only.is_empty());
 
-        // A physical root without its semantic graph node cannot silently
-        // become a root commit; the external retained-history oracle depends
-        // on this exact fail-closed boundary.
+        // A rootless physical owner without a public graph projection remains
+        // valid serving authority. Its authenticated manifest and mutation
+        // inventory are consumed directly; replay debt from its former
+        // logical role must not promote it back into chronology.
         let storage = StorageAdapter::new(Memory::new());
         let missing_graph = replay_commit_record("replay-missing-graph", 1, None, timestamp);
         let missing_graph_manifest =
@@ -3810,6 +3796,25 @@ mod tests {
                 .await
                 .expect("missing-graph replay read should open"),
         );
+        let mut physical_only = BTreeSet::new();
+        let mut semantic_only = BTreeSet::new();
+        let mut cas_only = BTreeSet::new();
+        super::collect_active_point_replay_dependencies(
+            &read,
+            &BTreeMap::from([(missing_graph.commit_id, missing_graph_manifest.clone())]),
+            &BTreeSet::new(),
+            &mut physical_only,
+            &mut semantic_only,
+            &mut cas_only,
+        )
+        .await
+        .expect("physical-only owner must not require semantic graph chronology");
+        assert!(physical_only.is_empty());
+        assert!(semantic_only.is_empty());
+        assert!(cas_only.is_empty());
+
+        // The identical bytes named by a logical history/undo/root role do
+        // require public chronology and must still fail closed.
         let error = super::collect_active_point_replay_dependencies(
             &read,
             &BTreeMap::from([(missing_graph.commit_id, missing_graph_manifest)]),
@@ -4012,6 +4017,70 @@ mod tests {
         .await
         .expect_err("replacement fallback cycle must fail closed");
         assert!(error.message.contains("dependency cycle"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_closure_accepts_rootless_selected_owner_without_semantic_projection() {
+        let timestamp =
+            LixTimestamp::expect_parse("rootless selected owner timestamp", "2026-01-01T00:00:00Z");
+        let owner = replay_commit_record("rootless-selected-owner", 1, None, timestamp);
+        let active = replay_commit_record("rootless-selected-alias", 0, None, timestamp);
+
+        let selected_change = packed_change(
+            "rootless-selected-owner-change",
+            "rootless-selected-owner-row",
+            JsonSlot::Inline(r#"{"selected":true}"#.into()),
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        let owner_deltas =
+            commit_delta_refs(owner.commit_id, std::slice::from_ref(&selected_change));
+        let owner_stage = stage_commit_deltas_for_commit_state(&mut writes, &owner_deltas)
+            .expect("rootless selected-owner payload should stage");
+        let mut alias_deltas =
+            commit_delta_refs(active.commit_id, std::slice::from_ref(&selected_change));
+        alias_deltas[0].authored = false;
+        let alias_stage = stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &alias_deltas,
+            &[false],
+            owner.commit_id,
+        )
+        .expect("rootless selected alias should stage");
+        let owner_manifest =
+            test_commit_state_manifest(&owner, owner_stage.mutation_inventory().clone());
+        let mut active_manifest =
+            test_commit_state_manifest(&active, alias_stage.mutation_inventory().clone());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
+
+        // The owner's semantic projection has already retired. The active
+        // alias still authenticates the owner's immutable mutation inventory,
+        // exactly like a selected current-state generation in production.
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            std::slice::from_ref(&active),
+            &[owner_manifest, active_manifest],
+        )
+        .await;
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rootless selected-owner read should open"),
+        );
+        let closure = super::load_authenticated_serving_dependency_closure(
+            &read,
+            BTreeSet::from([active.commit_id]),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        )
+        .await
+        .expect("rootless selected owner must remain valid physical authority");
+        assert!(closure.physical_authorities.contains(&owner.commit_id));
+        assert!(!closure.semantic_dependencies.contains(&owner.commit_id));
+        assert!(!closure.cas_logical_dependencies.contains(&owner.commit_id));
     }
 
     #[tokio::test]
