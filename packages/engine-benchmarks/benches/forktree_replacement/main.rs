@@ -83,6 +83,13 @@ fn end_allocation_profile() -> (u64, u64) {
     )
 }
 
+fn allocation_profile_snapshot() -> (u64, u64) {
+    (
+        PROFILE_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        PROFILE_ALLOCATION_CALLS.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Clone, Debug, Default)]
 struct IoStats {
     begin_reads: u64,

@@ -15,9 +15,9 @@ use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
 use super::model::{ForkTree, ForkTreeReadView, Mutation, RelationalValue};
 use super::{
-    Backend, CountingStorage, IoStats, Layout, Parameters, begin_allocation_profile,
-    directory_bytes, end_allocation_profile, physical_delta, process_cpu_nanos,
-    process_resident_bytes, take_stats,
+    Backend, CountingStorage, IoStats, Layout, Parameters, allocation_profile_snapshot,
+    begin_allocation_profile, directory_bytes, end_allocation_profile, physical_delta,
+    process_cpu_nanos, process_resident_bytes, take_stats,
 };
 
 const ACTIVE_BRANCH: &str = "019f0000-0000-7000-8000-000000000001";
@@ -379,17 +379,43 @@ async fn measure_model<S>(
     let mut digest = String::new();
     let mut object_writes = 0_u64;
     let mut object_bytes = 0_u64;
+    let mut node_writes = 0_u64;
+    let mut node_bytes = 0_u64;
+    let mut leaf_writes = 0_u64;
+    let mut leaf_bytes = 0_u64;
+    let mut internal_writes = 0_u64;
+    let mut internal_bytes = 0_u64;
+    let mut reused_objects = 0_u64;
+    let mut logical_bytes = 0_u64;
     let mut binder_scans = 0_u64;
     let mut binder_exact = 0_u64;
     let mut target_point_reads = 0_u64;
     let mut target_broad_scans = 0_u64;
     let mut binder_us = 0_u128;
     let mut publication_us = 0_u128;
+    let mut view_alloc_bytes = 0_u64;
+    let mut view_alloc_calls = 0_u64;
+    let mut binder_alloc_bytes = 0_u64;
+    let mut binder_alloc_calls = 0_u64;
+    let mut target_alloc_bytes = 0_u64;
+    let mut target_alloc_calls = 0_u64;
+    let mut mutation_alloc_bytes = 0_u64;
+    let mut mutation_alloc_calls = 0_u64;
+    let mut publication_alloc_bytes = 0_u64;
+    let mut publication_alloc_calls = 0_u64;
     for generation in 0..parameters.iterations {
         let phase = Instant::now();
+        let allocation_before = allocation_profile_snapshot();
         let mut target = ForkTreeDmlReadTarget::new(&tree)
             .await
             .expect("open coherent ForkTree DML read view");
+        accumulate_allocation_delta(
+            allocation_before,
+            allocation_profile_snapshot(),
+            &mut view_alloc_bytes,
+            &mut view_alloc_calls,
+        );
+        let allocation_before = allocation_profile_snapshot();
         let result = execute_sql_dml_batch_with_read_target_for_bench(
             ACTIVE_BRANCH,
             &[SCHEMA.to_string()],
@@ -398,22 +424,52 @@ async fn measure_model<S>(
         )
         .await
         .expect("execute ForkTree-bound DML batch");
+        accumulate_allocation_delta(
+            allocation_before,
+            allocation_profile_snapshot(),
+            &mut binder_alloc_bytes,
+            &mut binder_alloc_calls,
+        );
         binder_us = binder_us.saturating_add(phase.elapsed().as_micros());
         target_point_reads = target_point_reads.saturating_add(target.point_reads);
         target_broad_scans = target_broad_scans.saturating_add(target.broad_scans);
+        target_alloc_bytes = target_alloc_bytes.saturating_add(target.alloc_bytes);
+        target_alloc_calls = target_alloc_calls.saturating_add(target.alloc_calls);
         drop(target);
         digest = digest_model(&result.results);
         binder_scans = binder_scans.saturating_add(result.live_scans);
         binder_exact = binder_exact.saturating_add(result.exact_reads);
+        let allocation_before = allocation_profile_snapshot();
         let mutations = mutations_from_postimages(&tree, result.final_rows).await;
+        accumulate_allocation_delta(
+            allocation_before,
+            allocation_profile_snapshot(),
+            &mut mutation_alloc_bytes,
+            &mut mutation_alloc_calls,
+        );
         let phase = Instant::now();
+        let allocation_before = allocation_profile_snapshot();
         let (_, accounting) = tree
             .apply_sorted_mutations(&mutations)
             .await
             .expect("publish ForkTree DML batch");
+        accumulate_allocation_delta(
+            allocation_before,
+            allocation_profile_snapshot(),
+            &mut publication_alloc_bytes,
+            &mut publication_alloc_calls,
+        );
         publication_us = publication_us.saturating_add(phase.elapsed().as_micros());
         object_writes = object_writes.saturating_add(accounting.object_writes);
         object_bytes = object_bytes.saturating_add(accounting.object_bytes);
+        node_writes = node_writes.saturating_add(accounting.node_writes);
+        node_bytes = node_bytes.saturating_add(accounting.node_bytes);
+        leaf_writes = leaf_writes.saturating_add(accounting.leaf_writes);
+        leaf_bytes = leaf_bytes.saturating_add(accounting.leaf_bytes);
+        internal_writes = internal_writes.saturating_add(accounting.internal_writes);
+        internal_bytes = internal_bytes.saturating_add(accounting.internal_bytes);
+        reused_objects = reused_objects.saturating_add(accounting.reused_objects);
+        logical_bytes = logical_bytes.saturating_add(accounting.logical_bytes);
     }
     let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
     let (allocated_bytes, allocation_calls) = end_allocation_profile();
@@ -426,7 +482,7 @@ async fn measure_model<S>(
     let reopened = tree.clone();
     let live_rows = load_model_rows(&reopened).await.len();
     println!(
-        "forktree_dml_gate,backend={},layout=forktree_direct,rows={},iterations={},wall_us_per_tx={:.3},cpu_us_per_tx={:.3},alloc_bytes_per_tx={:.1},alloc_calls_per_tx={:.1},rss_delta_bytes={},begin_reads={},get_calls={},get_keys={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},begin_writes={},write_batches={},write_puts={},write_deletes={},write_bytes={},commits={},physical_read_objects={},physical_read_bytes={},physical_write_objects={},physical_write_bytes={},disk_before={},disk_after={},result_digest={},live_rows={},binder_scans={},binder_exact_reads={},target_point_reads={},target_broad_scans={},object_writes={},object_bytes={},binder_us={},publication_us={}",
+        "forktree_dml_gate,backend={},layout=forktree_direct,rows={},iterations={},wall_us_per_tx={:.3},cpu_us_per_tx={:.3},alloc_bytes_per_tx={:.1},alloc_calls_per_tx={:.1},rss_delta_bytes={},begin_reads={},get_calls={},get_keys={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},begin_writes={},write_batches={},write_puts={},write_deletes={},write_bytes={},commits={},physical_read_objects={},physical_read_bytes={},physical_write_objects={},physical_write_bytes={},disk_before={},disk_after={},result_digest={},live_rows={},binder_scans={},binder_exact_reads={},target_point_reads={},target_broad_scans={},object_writes={},object_bytes={},node_writes={},node_bytes={},leaf_writes={},leaf_bytes={},internal_writes={},internal_bytes={},reused_objects={},logical_bytes={},view_alloc_bytes={},view_alloc_calls={},binder_alloc_bytes={},binder_alloc_calls={},target_alloc_bytes={},target_alloc_calls={},mutation_alloc_bytes={},mutation_alloc_calls={},publication_alloc_bytes={},publication_alloc_calls={},binder_us={},publication_us={}",
         parameters.backend.label(),
         parameters.rows,
         parameters.iterations,
@@ -462,9 +518,37 @@ async fn measure_model<S>(
         target_broad_scans,
         object_writes,
         object_bytes,
+        node_writes,
+        node_bytes,
+        leaf_writes,
+        leaf_bytes,
+        internal_writes,
+        internal_bytes,
+        reused_objects,
+        logical_bytes,
+        view_alloc_bytes,
+        view_alloc_calls,
+        binder_alloc_bytes,
+        binder_alloc_calls,
+        target_alloc_bytes,
+        target_alloc_calls,
+        mutation_alloc_bytes,
+        mutation_alloc_calls,
+        publication_alloc_bytes,
+        publication_alloc_calls,
         binder_us,
         publication_us,
     );
+}
+
+fn accumulate_allocation_delta(
+    before: (u64, u64),
+    after: (u64, u64),
+    bytes: &mut u64,
+    calls: &mut u64,
+) {
+    *bytes = bytes.saturating_add(after.0.saturating_sub(before.0));
+    *calls = calls.saturating_add(after.1.saturating_sub(before.1));
 }
 
 fn statements(generation: usize) -> Vec<SqlDmlBenchStatement> {
@@ -606,6 +690,8 @@ struct ForkTreeDmlReadTarget<'a, S: Storage> {
     untracked: bool,
     point_reads: u64,
     broad_scans: u64,
+    alloc_bytes: u64,
+    alloc_calls: u64,
 }
 
 impl<'a, S: Storage> ForkTreeDmlReadTarget<'a, S> {
@@ -619,6 +705,8 @@ impl<'a, S: Storage> ForkTreeDmlReadTarget<'a, S> {
             untracked: false,
             point_reads: 0,
             broad_scans: 0,
+            alloc_bytes: 0,
+            alloc_calls: 0,
         })
     }
 }
@@ -629,6 +717,52 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     async fn scan_rows(
+        &mut self,
+        request: &SqlDmlBenchScanRequest,
+    ) -> Result<Vec<SqlDmlBenchRow>, LixError> {
+        let before = allocation_profile_snapshot();
+        let result = self.scan_rows_inner(request).await;
+        let after = allocation_profile_snapshot();
+        self.alloc_bytes = self
+            .alloc_bytes
+            .saturating_add(after.0.saturating_sub(before.0));
+        self.alloc_calls = self
+            .alloc_calls
+            .saturating_add(after.1.saturating_sub(before.1));
+        result
+    }
+
+    async fn load_exact_rows(
+        &mut self,
+        rows: &[SqlDmlBenchExactRowRequest],
+        untracked: Option<bool>,
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<SqlDmlBenchRow>>, LixError> {
+        let before = allocation_profile_snapshot();
+        let result = self
+            .load_identity_rows(rows, untracked.unwrap_or(self.untracked))
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| row.filter(|row| include_tombstones || !row.deleted))
+                    .collect()
+            });
+        let after = allocation_profile_snapshot();
+        self.alloc_bytes = self
+            .alloc_bytes
+            .saturating_add(after.0.saturating_sub(before.0));
+        self.alloc_calls = self
+            .alloc_calls
+            .saturating_add(after.1.saturating_sub(before.1));
+        result
+    }
+}
+
+impl<S> ForkTreeDmlReadTarget<'_, S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    async fn scan_rows_inner(
         &mut self,
         request: &SqlDmlBenchScanRequest,
     ) -> Result<Vec<SqlDmlBenchRow>, LixError> {
@@ -685,26 +819,6 @@ where
         }
         Ok(rows)
     }
-
-    async fn load_exact_rows(
-        &mut self,
-        rows: &[SqlDmlBenchExactRowRequest],
-        untracked: Option<bool>,
-        include_tombstones: bool,
-    ) -> Result<Vec<Option<SqlDmlBenchRow>>, LixError> {
-        Ok(self
-            .load_identity_rows(rows, untracked.unwrap_or(self.untracked))
-            .await?
-            .into_iter()
-            .map(|row| row.filter(|row| include_tombstones || !row.deleted))
-            .collect())
-    }
-}
-
-impl<S> ForkTreeDmlReadTarget<'_, S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
     async fn load_identity_rows(
         &mut self,
         identities: &[SqlDmlBenchExactRowRequest],
