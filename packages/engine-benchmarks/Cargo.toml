@@ -91,6 +91,11 @@ path = "tests/large_payload_read_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
+name = "forktree_stage2_recovery_no_lease_adversarial"
+path = "tests/forktree_stage2_recovery_no_lease_adversarial.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
 name = "certified_replacement_delete_reopen"
 path = "tests/certified_replacement_delete_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
