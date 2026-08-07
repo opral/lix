@@ -257,6 +257,17 @@ pub struct ObjectLayoutStats {
     pub selector_value_bytes: u64,
 }
 
+/// Read-only authenticated state-shape evidence for the history-independence
+/// benchmark. It exposes canonical object identities and tree boundaries but
+/// cannot publish, route, or authorize an object.
+#[derive(Clone, Debug)]
+pub struct StateInspection {
+    pub root: ObjectId,
+    pub object_bytes: BTreeMap<ObjectId, u64>,
+    pub leaf_ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    pub internal_boundaries: Vec<Vec<Vec<u8>>>,
+}
+
 impl std::ops::AddAssign for ApplyAccounting {
     fn add_assign(&mut self, other: Self) {
         self.object_writes += other.object_writes;
@@ -2140,6 +2151,64 @@ where
             resume_after = page.entries.last().map(|entry| entry.key.clone());
         }
         Ok((rows, bytes))
+    }
+
+    /// Authenticates one commit and its complete state-tree/value-pack closure.
+    /// Commit and semantic-delta objects are intentionally excluded so this
+    /// compares physical state packing rather than expected history identity.
+    pub async fn inspect_state(&self, commit_id: ObjectId) -> Result<StateInspection, String> {
+        let commit = self.load_commit(commit_id).await?;
+        let mut object_bytes = BTreeMap::new();
+        let mut leaf_ranges = Vec::new();
+        let mut internal_boundaries = Vec::new();
+        let mut frontier = vec![commit.root];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(id) = frontier.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let bytes = self.load_object(id).await?;
+            object_bytes.insert(id, bytes.len() as u64);
+            match decode_node(&bytes)? {
+                Node::Leaf(rows) => {
+                    let first = rows
+                        .first()
+                        .ok_or_else(|| "ForkTree inspection found an empty leaf".to_string())?
+                        .key
+                        .clone();
+                    let last = rows
+                        .last()
+                        .ok_or_else(|| "ForkTree inspection found an empty leaf".to_string())?
+                        .key
+                        .clone();
+                    leaf_ranges.push((first, last));
+                    for pack in rows
+                        .iter()
+                        .map(|row| row.value.pack)
+                        .collect::<std::collections::BTreeSet<_>>()
+                    {
+                        if visited.insert(pack) {
+                            let pack_bytes = self.load_object(pack).await?;
+                            decode_value_pack(&pack_bytes)?;
+                            object_bytes.insert(pack, pack_bytes.len() as u64);
+                        }
+                    }
+                }
+                Node::Internal(children) => {
+                    internal_boundaries
+                        .push(children.iter().map(|child| child.max_key.clone()).collect());
+                    frontier.extend(children.into_iter().rev().map(|child| child.id));
+                }
+            }
+        }
+        leaf_ranges.sort();
+        internal_boundaries.sort();
+        Ok(StateInspection {
+            root: commit.root,
+            object_bytes,
+            leaf_ranges,
+            internal_boundaries,
+        })
     }
 
     /// Derives physical-layout accounting from the authenticated object and

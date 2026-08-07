@@ -244,6 +244,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "forktree_history_independence"
+path = "benches/forktree_history_independence.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "repository_gc_scale"
 path = "benches/repository_gc_scale.rs"
 harness = false
