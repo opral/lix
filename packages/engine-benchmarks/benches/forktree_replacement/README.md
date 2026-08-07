@@ -6,9 +6,12 @@ production index and is deliberately not registered with Lix serving paths.
 ## Authority and invariants
 
 - One immutable `forktree_objects` key space stores every authenticated object.
-  The key is BLAKE3 of the complete tagged encoding. Tree nodes, semantic
-  deltas, commits, blob manifests, and blob chunks therefore share one object
-  identity and one prospective reachability universe.
+  Metadata keys are BLAKE3 of the complete tagged encoding. Blob chunks keep
+  the same domain-separated content ID but store the raw payload as the value,
+  avoiding a second whole-chunk encoding; manifest-declared length plus the
+  authenticated key validate reads. Tree nodes, semantic deltas, commits, blob
+  manifests, and blob chunks therefore share one object identity and one
+  prospective reachability universe.
 - One tiny mutable `forktree_refs` key space stores branch/checkpoint pins and
   one publication/GC epoch. A root move and epoch rotation are one adapter
   commit guarded by exact preconditions.
@@ -26,9 +29,14 @@ production index and is deliberately not registered with Lix serving paths.
   graph; they are not a side index or second format. Initial trees are
   deterministically bulk packed; value-only updates rewrite only touched leaves
   and ancestor paths.
-- Blob manifests and FastCDC chunks use the same object keys, commit edge, and
-  reachability walk as row objects. An unchanged branch copies only a selector;
-  a localized edit writes only newly identified chunks and metadata.
+- Blob manifests and canonical FastCDC chunks use the same object keys, commit
+  edge, and reachability walk as row objects. Ingest recycles one 8 MiB window,
+  performs one bounded KeyOnly presence read per window, and commits immutable
+  chunks before the small root publication. Exact matches to the current
+  authenticated manifest bypass CDC and redundant presence reads; a mismatch
+  uses the one canonical chunker and resynchronizes by content ID. An unchanged
+  branch copies only a selector; a localized edit writes only newly identified
+  chunks and metadata.
 - Reclamation snapshots the epoch before discovering all selectors, authenticates
   every traversed object, scans the object space in bounded pages, and rotates
   the same epoch on each deleting page. A publication after root discovery
@@ -51,10 +59,13 @@ mutations, and `Z` newly materialized objects.
   when key-set edits change packing boundaries.
 - Branch/checkpoint/undo/redo movement: `O(1)` mutable ref writes plus one epoch
   rotation; no tree objects are copied.
-- Blob ingest and whole-payload rechunking: `O(L)` CPU. A localized edit writes
-  `O(Z + metadata)` immutable bytes, while unchanged chunks remain hash
-  references. Range read is `O(requested bytes + touched chunk bytes)` and
-  bounded by the maximum chunk size.
+- Fresh blob ingest: `O(L)` CPU and physical bytes, `O(W + C)` payload memory
+  for fixed source window `W` and maximum chunk `C`, and `O(L/W)` bounded
+  emission commits. Exact-repeat/localized-edit ingest still reads and
+  authenticates `O(L)` bytes, but locality skipping makes CDC work proportional
+  to mismatch regions and writes only `O(Z + metadata)` immutable bytes.
+  Range read is `O(requested bytes + touched chunk bytes)` and bounded by the
+  maximum chunk size.
 - Global reclamation: `O(P + R + O)` for selectors `P`, reachable objects `R`,
   and scanned orphan candidates `O`. Scan memory is one page, but the prototype
   retains `O(R)` unique object IDs; a production implementation still needs a
@@ -83,6 +94,15 @@ Properties taken from prior work are kept separate from this synthesis:
   it does not prove GC behavior for this immutable object synthesis.
 - Sapling's segmented commit graph motivates keeping high-level graph traversal
   separate from lazily loaded commit detail; it does not determine row layout.
+- [FastCDC](https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia)
+  establishes Gear-based rolling hashes, minimum-size skipping, and normalized
+  cut masks. ForkTree uses those mechanisms with one measured canonical
+  512 KiB/512 KiB/2 MiB profile; the selected constants are our result.
+- [RapidCDC](https://ranger.uta.edu/~sjiang/pubs/papers/ni19-rapidcdc.pdf)
+  establishes duplicate-locality acceleration. ForkTree synthesizes the
+  narrower owner-safe form: authenticate expected chunks directly from the
+  live manifest and invoke canonical FastCDC only on a mismatch. It does not
+  implement RapidCDC's full algorithm or claim its published speedups.
 
 ForkTree's single object space, fixed canonical bulk packing, semantic delta
 objects, and tiny ref/epoch plane are our synthesis and must be judged by the

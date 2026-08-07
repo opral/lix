@@ -47,6 +47,9 @@ async fn run_rocksdb(parameters: Parameters) {
             Scenario::Blob => {
                 run_blob_setup(storage, parameters, &stats, directory.path(), None).await
             }
+            Scenario::BlobProfile => {
+                run_blob_profile_setup(storage, parameters, &stats, directory.path(), None).await
+            }
             Scenario::Apply => unreachable!(),
         };
         database
@@ -70,6 +73,7 @@ async fn run_rocksdb(parameters: Parameters) {
         VerticalOracle::Blob(oracle) => {
             run_blob_reopen(storage, parameters, &stats, directory.path(), None, oracle).await;
         }
+        VerticalOracle::Profile => {}
     }
     database
         .flush()
@@ -102,6 +106,16 @@ async fn run_slatedb(parameters: Parameters) {
             }
             Scenario::Blob => {
                 run_blob_setup(
+                    storage,
+                    parameters,
+                    &stats,
+                    directory.path(),
+                    Some(&counters),
+                )
+                .await
+            }
+            Scenario::BlobProfile => {
+                run_blob_profile_setup(
                     storage,
                     parameters,
                     &stats,
@@ -152,6 +166,7 @@ async fn run_slatedb(parameters: Parameters) {
             )
             .await;
         }
+        VerticalOracle::Profile => {}
     }
     database
         .flush_memtable_for_diagnostics()
@@ -168,6 +183,7 @@ async fn run_slatedb(parameters: Parameters) {
 enum VerticalOracle {
     History(HistoryOracle),
     Blob(BlobOracle),
+    Profile,
 }
 
 async fn run_history_setup<S>(
@@ -943,8 +959,151 @@ struct BlobOracle {
     range: Vec<u8>,
 }
 
-const BLOB_PATH: &str = "/forktree/semantic-64m.bin";
-const BLOB_BYTES: usize = 64 * 1024 * 1024;
+struct DeterministicBlobReader {
+    output: blake3::OutputReader,
+    remaining: usize,
+    position: usize,
+    edit_start: Option<usize>,
+}
+
+impl DeterministicBlobReader {
+    fn new(bytes: usize, edit_start: Option<usize>) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ForkTree deterministic semantic blob fixture v2");
+        Self {
+            output: hasher.finalize_xof(),
+            remaining: bytes,
+            position: 0,
+            edit_start,
+        }
+    }
+}
+
+impl std::io::Read for DeterministicBlobReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let length = buffer.len().min(self.remaining);
+        if length == 0 {
+            return Ok(0);
+        }
+        self.output.fill(&mut buffer[..length]);
+        if let Some(edit_start) = self.edit_start {
+            let read_start = self.position;
+            let read_end = read_start + length;
+            let edit_end = edit_start + 4096;
+            let overlap_start = read_start.max(edit_start);
+            let overlap_end = read_end.min(edit_end);
+            for absolute in overlap_start..overlap_end {
+                let edit_index = absolute - edit_start;
+                buffer[absolute - read_start] ^=
+                    (edit_index as u8).wrapping_mul(31).wrapping_add(1);
+            }
+        }
+        self.position += length;
+        self.remaining -= length;
+        Ok(length)
+    }
+}
+
+const BLOB_PREFETCH_BYTES: usize = 8 * 1024 * 1024;
+
+struct PrefetchedBlobReader {
+    current: Vec<u8>,
+    current_bytes: usize,
+    current_offset: usize,
+    current_is_last: bool,
+    ready: std::sync::mpsc::Receiver<(Vec<u8>, usize, bool)>,
+    recycle: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+impl PrefetchedBlobReader {
+    fn new(bytes: usize, edit_start: Option<usize>) -> Self {
+        let mut source = DeterministicBlobReader::new(bytes, edit_start);
+        let mut first = vec![0_u8; BLOB_PREFETCH_BYTES];
+        let (first_bytes, first_is_last) = fill_prefetch_window(&mut source, &mut first);
+        let (ready_sender, ready) = std::sync::mpsc::sync_channel(1);
+        let (recycle, recycled) = std::sync::mpsc::sync_channel(2);
+        if !first_is_last {
+            let second = vec![0_u8; BLOB_PREFETCH_BYTES];
+            std::thread::spawn(move || {
+                let mut buffer = second;
+                loop {
+                    let (buffered, is_last) = fill_prefetch_window(&mut source, &mut buffer);
+                    if ready_sender.send((buffer, buffered, is_last)).is_err() || is_last {
+                        break;
+                    }
+                    let Ok(next) = recycled.recv() else {
+                        break;
+                    };
+                    buffer = next;
+                }
+            });
+        }
+        Self {
+            current: first,
+            current_bytes: first_bytes,
+            current_offset: 0,
+            current_is_last: first_is_last,
+            ready,
+            recycle,
+        }
+    }
+}
+
+impl std::io::Read for PrefetchedBlobReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.current_offset == self.current_bytes {
+            if self.current_is_last {
+                return Ok(0);
+            }
+            let (next, next_bytes, next_is_last) = self.ready.recv().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ForkTree blob prefetch producer stopped",
+                )
+            })?;
+            let previous = std::mem::replace(&mut self.current, next);
+            let _ = self.recycle.send(previous);
+            self.current_bytes = next_bytes;
+            self.current_offset = 0;
+            self.current_is_last = next_is_last;
+            if next_bytes == 0 {
+                return Ok(0);
+            }
+        }
+        let bytes = output
+            .len()
+            .min(self.current_bytes.saturating_sub(self.current_offset));
+        output[..bytes]
+            .copy_from_slice(&self.current[self.current_offset..self.current_offset + bytes]);
+        self.current_offset += bytes;
+        Ok(bytes)
+    }
+}
+
+fn fill_prefetch_window(source: &mut impl std::io::Read, buffer: &mut [u8]) -> (usize, bool) {
+    let mut buffered = 0;
+    while buffered < buffer.len() {
+        let read = source
+            .read(&mut buffer[buffered..])
+            .expect("fill deterministic ForkTree prefetch window");
+        if read == 0 {
+            return (buffered, true);
+        }
+        buffered += read;
+    }
+    (buffered, false)
+}
+
+const BLOB_PATH: &str = "/forktree/semantic-blob.bin";
+
+fn blob_bytes() -> usize {
+    std::env::var("FORKTREE_BLOB_MIB")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("FORKTREE_BLOB_MIB is usize"))
+        .unwrap_or(64)
+        .checked_mul(1024 * 1024)
+        .expect("ForkTree blob fixture size fits usize")
+}
 
 async fn run_blob_setup<S>(
     storage: CountingStorage<S>,
@@ -957,23 +1116,15 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     assert_eq!(parameters.rows, 1_000, "blob gate uses the 1K tree fixture");
-    let base = blob_payload();
-    let mut edited = base.clone();
-    let edit_start = BLOB_BYTES / 2 + 123;
-    for (index, byte) in edited[edit_start..edit_start + 4096].iter_mut().enumerate() {
-        *byte ^= (index as u8).wrapping_mul(31).wrapping_add(1);
-    }
+    let blob_bytes = blob_bytes();
+    let edit_start = blob_bytes / 2 + 123;
     let range_start = (edit_start - 32 * 1024) as u64;
     let range_end = range_start + 64 * 1024;
-    let oracle = BlobOracle {
-        hash: *blake3::hash(&edited).as_bytes(),
-        range_start,
-        range_end,
-        range: edited[range_start as usize..range_end as usize].to_vec(),
-    };
+    let oracle = blob_oracle(blob_bytes, edit_start, range_start, range_end);
     match parameters.layout {
         Layout::Current => {
             let fixture = prepare_current(storage, parameters).await;
+            let base = blob_payload(blob_bytes, None);
             let base_blob: lix::Blob = base.into();
             let affected = measure_phase(
                 "blob_ingest_64m",
@@ -988,6 +1139,21 @@ where
             )
             .await
             .expect("ingest current-Lix 64 MiB blob");
+            assert_eq!(affected, 1);
+            let repeated_blob: lix::Blob = blob_payload(blob_bytes, None).into();
+            let affected = measure_phase(
+                "blob_repeated_ingest",
+                parameters,
+                1,
+                stats,
+                path,
+                counters,
+                fixture
+                    .session
+                    .upsert_file_content(BLOB_PATH.to_owned(), repeated_blob),
+            )
+            .await
+            .expect("repeat current-Lix blob ingest");
             assert_eq!(affected, 1);
             let base_head = current_head(&fixture.session).await;
             measure_phase(
@@ -1013,7 +1179,7 @@ where
                 })
                 .await
                 .expect("switch to current-Lix blob source");
-            let edited_blob: lix::Blob = edited.into();
+            let edited_blob: lix::Blob = blob_payload(blob_bytes, Some(edit_start)).into();
             measure_phase(
                 "blob_localized_edit",
                 parameters,
@@ -1100,26 +1266,36 @@ where
         }
         Layout::ForkTree => {
             let fixture = prepare_replacement(storage, parameters).await;
-            let (base_head, ingest) = measure_phase(
+            let (_initial_head, ingest) = measure_phase(
                 "blob_ingest_64m",
                 parameters,
                 1,
                 stats,
                 path,
                 counters,
-                fixture.tree.ingest_blob("main", &base),
+                fixture
+                    .tree
+                    .ingest_blob("main", PrefetchedBlobReader::new(blob_bytes, None)),
             )
             .await
             .expect("ingest ForkTree 64 MiB blob");
-            println!(
-                "forktree_blob_accounting,phase=ingest,chunks={},reused_chunks={},object_writes={},object_bytes={},logical_bytes={},chunking_us={}",
-                ingest.chunks,
-                ingest.reused_chunks,
-                ingest.object_writes,
-                ingest.object_bytes,
-                ingest.logical_bytes,
-                ingest.chunking_us
-            );
+            print_blob_accounting("ingest", ingest);
+            let (base_head, repeated) = measure_phase(
+                "blob_repeated_ingest",
+                parameters,
+                1,
+                stats,
+                path,
+                counters,
+                fixture
+                    .tree
+                    .ingest_blob("main", PrefetchedBlobReader::new(blob_bytes, None)),
+            )
+            .await
+            .expect("repeat ForkTree blob ingest");
+            assert_eq!(repeated.reused_chunks, repeated.chunks);
+            assert_eq!(repeated.emission_batches, 0);
+            print_blob_accounting("repeated_ingest", repeated);
             measure_phase(
                 "blob_unchanged_branch",
                 parameters,
@@ -1138,20 +1314,15 @@ where
                 stats,
                 path,
                 counters,
-                fixture.tree.ingest_blob("source", &edited),
+                fixture.tree.ingest_blob(
+                    "source",
+                    PrefetchedBlobReader::new(blob_bytes, Some(edit_start)),
+                ),
             )
             .await
             .expect("edit ForkTree blob");
             assert!(changed.reused_chunks > 0);
-            println!(
-                "forktree_blob_accounting,phase=localized_edit,chunks={},reused_chunks={},object_writes={},object_bytes={},logical_bytes={},chunking_us={}",
-                changed.chunks,
-                changed.reused_chunks,
-                changed.object_writes,
-                changed.object_bytes,
-                changed.logical_bytes,
-                changed.chunking_us
-            );
+            print_blob_accounting("localized_edit", changed);
             let diff = measure_phase(
                 "blob_diff",
                 parameters,
@@ -1249,6 +1420,105 @@ where
         }
     }
     VerticalOracle::Blob(oracle)
+}
+
+fn print_blob_accounting(phase: &str, accounting: super::model::BlobAccounting) {
+    println!(
+        "forktree_blob_accounting,phase={phase},chunks={},reused_chunks={},locality_hits={},locality_misses={},object_writes={},object_bytes={},logical_bytes={},chunking_us={},source_read_us={},object_hash_us={},object_encode_us={},dedup_read_us={},emission_us={},publication_us={},emission_batches={},peak_buffer_bytes={}",
+        accounting.chunks,
+        accounting.reused_chunks,
+        accounting.locality_hits,
+        accounting.locality_misses,
+        accounting.object_writes,
+        accounting.object_bytes,
+        accounting.logical_bytes,
+        accounting.chunking_us,
+        accounting.source_read_us,
+        accounting.object_hash_us,
+        accounting.object_encode_us,
+        accounting.dedup_read_us,
+        accounting.emission_us,
+        accounting.publication_us,
+        accounting.emission_batches,
+        accounting.peak_buffer_bytes
+    );
+}
+
+async fn run_blob_profile_setup<S>(
+    storage: CountingStorage<S>,
+    parameters: Parameters,
+    stats: &Arc<Mutex<IoStats>>,
+    path: &std::path::Path,
+    counters: Option<&SlateDBIoCounters>,
+) -> VerticalOracle
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    assert_eq!(
+        parameters.rows, 1_000,
+        "blob profile uses the 1K tree fixture"
+    );
+    let bytes = blob_bytes();
+    match parameters.layout {
+        Layout::Current => {
+            let fixture = prepare_current(storage, parameters).await;
+            let payload = blob_payload(bytes, None);
+            let affected = measure_phase(
+                "profile_ingest",
+                parameters,
+                1,
+                stats,
+                path,
+                counters,
+                fixture
+                    .session
+                    .upsert_file_content(BLOB_PATH.to_owned(), lix::Blob::from(payload)),
+            )
+            .await
+            .expect("profile current-Lix blob ingest");
+            assert_eq!(affected, 1);
+            fixture
+                .session
+                .close()
+                .await
+                .expect("close profile session");
+        }
+        Layout::ForkTree => {
+            let fixture = prepare_replacement(storage, parameters).await;
+            let (_, accounting) = measure_phase(
+                "profile_ingest",
+                parameters,
+                1,
+                stats,
+                path,
+                counters,
+                fixture
+                    .tree
+                    .ingest_blob("main", PrefetchedBlobReader::new(bytes, None)),
+            )
+            .await
+            .expect("profile ForkTree blob ingest");
+            println!(
+                "forktree_blob_profile_ingest,bytes={},chunks={},locality_hits={},locality_misses={},chunking_us={},source_read_us={},object_hash_us={},object_encode_us={},dedup_read_us={},emission_us={},publication_us={},emission_batches={},peak_buffer_bytes={},object_writes={},object_bytes={}",
+                bytes,
+                accounting.chunks,
+                accounting.locality_hits,
+                accounting.locality_misses,
+                accounting.chunking_us,
+                accounting.source_read_us,
+                accounting.object_hash_us,
+                accounting.object_encode_us,
+                accounting.dedup_read_us,
+                accounting.emission_us,
+                accounting.publication_us,
+                accounting.emission_batches,
+                accounting.peak_buffer_bytes,
+                accounting.object_writes,
+                accounting.object_bytes
+            );
+        }
+    }
+    VerticalOracle::Profile
 }
 
 async fn run_blob_reopen<S>(
@@ -1398,12 +1668,47 @@ async fn run_blob_reopen<S>(
     }
 }
 
-fn blob_payload() -> Vec<u8> {
-    let mut payload = vec![0_u8; BLOB_BYTES];
-    let mut output = blake3::Hasher::new();
-    output.update(b"ForkTree deterministic 64 MiB semantic blob fixture");
-    output.finalize_xof().fill(&mut payload);
+fn blob_payload(bytes: usize, edit_start: Option<usize>) -> Vec<u8> {
+    let mut payload = vec![0_u8; bytes];
+    std::io::Read::read_exact(
+        &mut DeterministicBlobReader::new(bytes, edit_start),
+        &mut payload,
+    )
+    .expect("fill deterministic ForkTree blob fixture");
     payload
+}
+
+fn blob_oracle(bytes: usize, edit_start: usize, range_start: u64, range_end: u64) -> BlobOracle {
+    let mut source = DeterministicBlobReader::new(bytes, Some(edit_start));
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    let mut range = Vec::with_capacity((range_end - range_start) as usize);
+    let mut position = 0_u64;
+    loop {
+        let read = std::io::Read::read(&mut source, &mut buffer)
+            .expect("read deterministic ForkTree blob oracle");
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        let read_end = position + read as u64;
+        let overlap_start = position.max(range_start);
+        let overlap_end = read_end.min(range_end);
+        if overlap_start < overlap_end {
+            range.extend_from_slice(
+                &buffer[(overlap_start - position) as usize..(overlap_end - position) as usize],
+            );
+        }
+        position = read_end;
+    }
+    assert_eq!(position, bytes as u64);
+    assert_eq!(range.len(), (range_end - range_start) as usize);
+    BlobOracle {
+        hash: *hasher.finalize().as_bytes(),
+        range_start,
+        range_end,
+        range,
+    }
 }
 
 async fn current_blob_read<S>(

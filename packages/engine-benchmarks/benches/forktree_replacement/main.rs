@@ -299,6 +299,7 @@ enum Scenario {
     Apply,
     History,
     Blob,
+    BlobProfile,
 }
 
 impl Scenario {
@@ -306,6 +307,7 @@ impl Scenario {
         match value {
             Some("history") => (Self::History, 1),
             Some("blob") => (Self::Blob, 1),
+            Some("blob-profile") => (Self::BlobProfile, 1),
             _ => (Self::Apply, 0),
         }
     }

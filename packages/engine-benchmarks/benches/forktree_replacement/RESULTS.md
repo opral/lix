@@ -2,17 +2,22 @@
 
 Date: 2026-08-07. Baseline: exact current main
 `deea8a4ae9c7a948827dfe9f9a44879910247211`, tree
-`615f9978286a9f6545251ea42d658550bf772b74`.
+`615f9978286a9f6545251ea42d658550bf772b74`. This streaming phase starts from
+frozen prototype head `143210be4a51f9af302fbf7febd11265701558d0`.
 
 ## Decision
 
-**GO to a bounded production hard-cut design; do not wire or open a production
-PR yet.** The ordered-history architecture clears both adapters by large
-margins and the packed layout has removed the original leaf-body disk
-amplification. The blob read/share/ref-movement path also clears. Production
-work remains conditional on eliminating the measured whole-payload chunking
-and adapter-staging costs, implementing key-set edits/general merge, and
-passing deterministic crash/corruption/publication-race gates.
+**GO for manager review of a production hard-cut plan; do not wire or open a
+production PR yet.** The ordered-history architecture still clears both
+adapters. The multimedia phase now also eliminates whole-payload construction,
+O(L) adapter staging, global edit rechunking, and per-chunk publication fences.
+Fresh ingest has no critical latency regression and localized edit is about
+51% faster on both adapters while preserving 74/75 chunks. Exact-repeat raw
+wall remains +5.8% Rocks/+10.6% Slate because the streaming side must receive
+and authenticate all bytes while the current comparator starts with a complete
+`Blob`; source-copy-excluded work is faster. Skipping authentication or adding
+a full-payload arena was rejected. A zero-copy segmented source interface is a
+production-design question, not a second chunker or compatibility path.
 
 This is one replacement layout, not an adjacent index: all commit, tree,
 delta, value-pack, blob-manifest, and blob-chunk objects live in
@@ -29,10 +34,12 @@ dual-write path exists.
   hash-pruned diff, disjoint branch updates/merge, undo/redo-equivalent root
   movement, checkpoint, retention cut, flush/drop/reopen/recovery, checkpoint
   release, and reclamation.
-- Blob gate: deterministic incompressible 64 MiB payload, FastCDC 256 KiB/1
-  MiB/4 MiB min/average/max, a 4 KiB middle edit, branch/diff/merge/checkpoint,
-  64 KiB and full reads, flush/drop/reopen, retained-root sweep, final release,
-  and sweep.
+- Original blob gate: deterministic incompressible 64 MiB payload, FastCDC 256
+  KiB/1 MiB/4 MiB min/average/max. Corrected streaming gate: the same payload
+  semantics with one canonical 512 KiB/512 KiB/2 MiB profile, an 8 MiB recycled
+  engine window, a bounded two-window source prefetcher, and a 4 KiB middle
+  edit. Both run branch/diff/merge/checkpoint, 64 KiB and full reads,
+  flush/drop/reopen, retained-root sweep, final release, and sweep.
 - Every read result, diff cardinality, merge result, range, and BLAKE3 full-blob
   hash is asserted. Objects are authenticated against their BLAKE3 key on
   load. Both adapters perform a real close/drop/reopen.
@@ -43,6 +50,8 @@ All cells completed in well under 20 minutes. Commands:
 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- <backend> <layout> 50000 32 7 2 15
 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- history <backend> <layout> 1000 1 1 0 1000
 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- blob <backend> <layout> 1000 1 1 0 1
+FORKTREE_BLOB_MIB=64 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- blob-profile <backend> <layout> 1000 1 1 0 1
+FORKTREE_BLOB_MIB=512 cargo bench -q -p lix_benchmarks --bench forktree_replacement --features storage-benches,slatedb -- blob-profile <backend> <layout> 1000 1 1 0 1
 ```
 
 ## Focused ordered gate
@@ -94,7 +103,7 @@ cost. Final disk is 3.088 MB versus current 2.960 MB on Rocks (+4.34%, within
 5%) and 3.871 MB versus 7.327 MB on Slate (-47.2%). Rocks tombstones do not
 produce immediate physical reclamation without later LSM compaction.
 
-## 64 MiB blob lifecycle
+## Frozen-predecessor 64 MiB blob lifecycle
 
 | Phase | Rocks current | Rocks ForkTree | Change | Slate current | Slate ForkTree | Change |
 |---|---:|---:|---:|---:|---:|---:|
@@ -142,6 +151,104 @@ authenticated immutable objects in bounded batches and atomically publish only
 the small commit/ref/epoch, accepting reclaimable unpublished objects after a
 crash.
 
+## Streaming multimedia phase
+
+The hard cut is one format and one authority:
+
+- a recycled 8 MiB `BytesMut` window is split into zero-copy raw chunk values;
+- chunk IDs retain the exact domain-separated BLAKE3 identity of the former
+  tagged encoding, so authentication and public bytes are unchanged;
+- each completed window performs one bounded KeyOnly dedup read and one
+  immutable commit, then releases every payload slice;
+- the final transaction writes only manifest/delta/commit plus selector/epoch;
+  exact selector and epoch equality reject root or GC races. GC is the only
+  chunk deleter and rotates this epoch on every deleting page, so the former
+  `KeyPresent` precondition for every chunk was duplicate `O(chunks)` work;
+- matching IDs from the current authenticated manifest prove canonical
+  boundaries and skip CDC/presence reads. A mismatch invokes the same canonical
+  FastCDC profile and resynchronizes by ID. There is no fallback chunker,
+  compatibility codec, side presence index, or second durable byte authority.
+
+### Fresh ingest medians
+
+Three one-operation samples; setup and bounded source prefetch initialization
+are excluded consistently with current Lix's already-materialized input.
+
+| Size/adapter | Current | ForkTree | Raw change | Alloc current / FT | Phase RSS growth current / FT |
+|---|---:|---:|---:|---:|---:|
+| 64 MiB Rocks | 85.345 ms | 77.450 ms | -9.25% | 68.96 / 8.46 MB | 133.8 / 84.6 MB |
+| 64 MiB Slate | 29.138 ms | 28.877 ms | -0.90% | 70.97 / 8.98 MB | 68.3 / 10.9 MB |
+| 512 MiB Rocks | 671.075 ms | 663.151 ms | -1.18% | 539.47 / 8.96 MB | 1,144.6 / 173.2 MB |
+| 512 MiB Slate | 196.042 ms | 190.608 ms | -2.77% | 545.75 / 14.18 MB | 614.0 / 12.9 MB |
+
+At 64 MiB the engine-owned payload peak is exactly 8 MiB and the bounded
+source has two fixed 8 MiB buffers. At 512 MiB those bounds do not grow.
+RocksDB's process RSS still grows by 173 MB because of adapter write buffers and
+cache state, but the 8x payload increase grows ForkTree allocation only 0.5 MB
+and phase RSS about 2x, not 8x; current retains roughly one additional GiB.
+Slate's RSS is effectively flat. Logical bytes are 67,114,612/536,919,860 for
+ForkTree versus 67,122,608/536,950,516 current. Post-flush disk is within 0.1%
+at 512 MiB and 0.5% at 64 MiB.
+
+Rocks pays 11/81 commits at 64/512 MiB instead of current's one commit. Its
+512 MiB timed ingest reports about 101 foreground CPU ticks versus 67 because
+bounded commits expose work current defers. A warm whole-process measurement
+including flush/close reverses that attribution: current is 1.36 CPU seconds
+and 1.68 s elapsed versus ForkTree 1.25 CPU seconds and 0.96 s elapsed. Slate
+timed CPU falls from a 45-tick median to 24 ticks at 512 MiB. The rejected
+16/32 MiB windows worsened 64 MiB Rocks latency to 88.50/101.97 ms and raised
+allocations to 16.85/33.63 MB; 8 MiB is the measured common optimum.
+
+### Repeat and 4 KiB edit
+
+Three-sample candidate medians use the same 64 MiB lifecycle. Current values
+are the exact current-main lifecycle comparator.
+
+| Phase | Rocks current | Rocks FT | Change | Slate current | Slate FT | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Fully deduplicated publication | 7.945 ms | 8.409 ms | +5.85% | 7.935 ms | 8.774 ms | +10.57% |
+| 4 KiB localized edit | 18.467 ms | 9.141 ms | -50.50% | 18.107 ms | 8.828 ms | -51.24% |
+
+The repeated path has 75 locality hits, zero CDC, zero chunk emission, four
+backend reads, one tiny commit, and 8.42/8.45 MB allocated on Rocks/Slate. Its
+raw regression is source delivery plus mandatory authentication of every byte;
+subtracting measured source-copy time leaves it faster than current. A
+segmented zero-copy source could remove that copy in a production API. Skipping
+authentication, trusting an unauthenticated whole-file signature, or retaining
+the payload was rejected.
+
+The edit has 74 locality hits and one mismatch: CDC falls from 14.4 ms in the
+frozen predecessor to about 53 us, reuse improves from 58/59 to 74/75, and only
+one new 725.4 KiB raw chunk plus three metadata objects are written. Presence
+work is one bounded probe; logical write bytes are 725,798 versus current's
+1,055,920. Allocation is 8.42/8.48 MB versus current's 13.08/17.36 MB.
+
+The exact lifecycle also verifies authenticated 64 KiB/full reads, hash-pruned
+diff, merge, O(1) branch/checkpoint publication, retained-root preservation,
+flush/drop/cold reopen, and final-reference reclamation on both adapters. The
+edit reports 74 shared chunks; retained sweep reclaims zero, final release
+reclaims 11 objects / 726,272 bytes, and the merged bytes remain BLAKE3-verified
+after reopen. Final disk is 68.20 MB versus current 68.79 MB on Rocks and 68.08
+MB versus 69.29 MB on Slate. Authentication and manifest-declared sizes fail
+closed on reads; deterministic crash-point/corruption injection remains a
+production-cut gate rather than a property claimed by this benchmark.
+
+### Rejected focused variants
+
+- The frozen 256 KiB/1 MiB/4 MiB profile costs about 14.4 ms per edit.
+  FastCDC v2020 at 512 KiB min/average and 2 MiB max lowers focused chunking to
+  5.6--7.6 ms and gives 74/75 edit reuse. A 1 MiB average profile retained only
+  53 chunks and was rejected; the Ronomon implementation retained 62 but cut
+  CPU only about 13% and was rejected.
+- One in-flight asynchronous emission batch did not overlap adapter commits:
+  Rocks stayed near 80 ms, Slate worsened to 35.59 ms, and peak buffering grew
+  to 18.9 MB. It was deleted.
+- Parallel per-chunk BLAKE3/Rayon doubled hash wall time and raised Rocks edit
+  CPU to 27 ticks. It was deleted; authentication remains single-threaded.
+- The redundant final per-chunk presence fence made 512 MiB Rocks publication
+  alone cost 239.8 ms. The single publication/GC epoch proves the same race
+  invariant and restores publication to about 50 us.
+
 ## Complexity and authority result
 
 - Current common tracked-state materialization is `O(N + D log_F N)` at a
@@ -150,8 +257,12 @@ crash.
 - Point/range are `O(log_F N + returned blocks)`. Aligned hash-pruned diff is
   `O(D log_F N + Z_d)`. Branch/checkpoint/undo/redo are `O(1)` selector plus
   epoch writes. Disjoint merge is diff plus changed-path apply.
-- Blob ingest/rechunk is currently `O(L)` CPU; physical writes are `O(Z +
-  metadata)`. A range read is `O(requested bytes + touched chunk bytes)`.
+- Blob ingest is `O(L)` CPU and fresh physical bytes with `O(W + C)` payload
+  memory. Repeat/edit still read and authenticate `O(L)`, locality makes CDC
+  proportional to mismatch regions, and physical writes are `O(Z + metadata)`.
+  Final publication is `O(chunks)` manifest metadata but no longer performs
+  `O(chunks)` adapter preconditions. A range read is `O(requested bytes +
+  touched chunk bytes)`.
 - GC is `O(pins + reachable objects + scanned orphan candidates)`, scans in
   512-object pages, and keeps `O(reachable IDs + page)` memory. Production must
   replace the in-memory mark set for truly bounded large-repository GC.
@@ -176,9 +287,10 @@ the commit in the same object space.
 
 1. Add canonical local split/merge/repacking for inserts and deletes; prove
    shape-changing diff and bulk apply on both adapters.
-2. Replace full-payload CDC rescans for edit-aware callers and pack/stream
-   immutable object publication until ingest is non-regressed and RSS is
-   `O(chunk_size)`.
+2. Design a segmented zero-copy source API so fully deduplicated publication
+   does not pay the prototype `Read` copy while preserving mandatory
+   authentication and bounded backpressure. Streaming immutable publication
+   and bounded ingest-owned memory are now demonstrated.
 3. Implement general three-way conflicts and preserve semantic/rootless deltas
    required by plugins, audit, and metadata-only commits.
 4. Move the reachable mark set to bounded/external storage and qualify GC on a

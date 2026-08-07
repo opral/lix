@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::ops::Bound;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
 use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, Precondition, ProjectedValue,
@@ -20,6 +21,10 @@ const BLOB_CHUNK_TAG: u8 = 6;
 const BLOB_MANIFEST_TAG: u8 = 7;
 const LEAF_ROWS: usize = 8;
 const INTERNAL_CHILDREN: usize = 8;
+const BLOB_MIN_BYTES: usize = 512 * 1024;
+const BLOB_AVG_BYTES: usize = 512 * 1024;
+const BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
+const BLOB_STREAM_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 
 pub const OBJECT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00f0_0001), "forktree_objects");
@@ -44,10 +49,20 @@ pub struct Update {
 pub struct BlobAccounting {
     pub chunks: u64,
     pub reused_chunks: u64,
+    pub locality_hits: u64,
+    pub locality_misses: u64,
     pub object_writes: u64,
     pub object_bytes: u64,
     pub logical_bytes: u64,
     pub chunking_us: u64,
+    pub source_read_us: u64,
+    pub object_hash_us: u64,
+    pub object_encode_us: u64,
+    pub dedup_read_us: u64,
+    pub emission_us: u64,
+    pub publication_us: u64,
+    pub emission_batches: u64,
+    pub peak_buffer_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -141,16 +156,31 @@ struct Commit {
     blob: Option<ObjectId>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BlobChunkRef {
     id: ObjectId,
     bytes: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BlobManifest {
     logical_bytes: u64,
     chunks: Vec<BlobChunkRef>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChunkEmissionAccounting {
+    object_writes: u64,
+    object_bytes: u64,
+    emission_us: u64,
+    emission_batches: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WindowChunk {
+    id: ObjectId,
+    start: usize,
+    bytes: usize,
 }
 
 struct Head {
@@ -619,36 +649,203 @@ where
             .await
     }
 
-    /// Chunks and authenticates one blob into the same immutable object space,
-    /// then atomically publishes a commit/root selector and epoch. Existing
-    /// chunk IDs are referenced and never rewritten.
-    pub async fn ingest_blob(
+    /// Streams one blob through the single canonical CDC profile, emits
+    /// authenticated chunks in bounded immutable batches, then atomically
+    /// publishes only metadata, the branch selector, and the epoch. A crash
+    /// before publication can leave unreachable immutable objects, but cannot
+    /// expose a partial blob; reclamation owns those objects later.
+    pub async fn ingest_blob<R>(
         &self,
         branch: &str,
-        payload: &[u8],
-    ) -> Result<(ObjectId, BlobAccounting), String> {
+        mut source: R,
+    ) -> Result<(ObjectId, BlobAccounting), String>
+    where
+        R: Read,
+    {
         let branch_key = selector_key(BRANCH_PREFIX, branch);
         let head = self.load_head_at_key(&branch_key).await?;
         let current = self.load_commit(head.commit).await?;
-        let chunking_started = std::time::Instant::now();
-        let ranges =
-            fastcdc::v2020::FastCDC::new(payload, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024)
-                .map(|chunk| (chunk.offset, chunk.offset + chunk.length))
-                .collect::<Vec<_>>();
-        let chunking_us = chunking_started.elapsed().as_micros() as u64;
-        let chunks = ranges
+        let previous_manifest = self.load_blob_manifest(current.blob).await?;
+        let previous_chunk_positions = previous_manifest
+            .chunks
             .iter()
-            .map(|&(start, end)| BlobChunkRef {
-                id: blob_chunk_id(&payload[start..end]),
-                bytes: (end - start) as u64,
-            })
-            .collect::<Vec<_>>();
+            .enumerate()
+            .map(|(index, chunk)| (chunk.id, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut previous_chunk_cursor = 0_usize;
+        let mut accounting = BlobAccounting::default();
+        let mut chunks = Vec::new();
+        let mut unique_chunks = std::collections::BTreeSet::new();
+        let mut buffer = BytesMut::zeroed(BLOB_STREAM_WINDOW_BYTES);
+        accounting.peak_buffer_bytes = buffer.len() as u64;
+        let mut buffered = 0_usize;
+        let mut eof = false;
+
+        while buffered != 0 || !eof {
+            let source_started = std::time::Instant::now();
+            while buffered < buffer.len() && !eof {
+                let read = source
+                    .read(&mut buffer[buffered..])
+                    .map_err(|error| format!("read ForkTree blob stream: {error}"))?;
+                if read == 0 {
+                    eof = true;
+                } else {
+                    buffered += read;
+                }
+            }
+            accounting.source_read_us += source_started.elapsed().as_micros() as u64;
+            if buffered == 0 {
+                break;
+            }
+
+            let mut consumed = 0_usize;
+            let mut window_chunks = Vec::new();
+            while consumed < buffered {
+                let remaining = buffered - consumed;
+                if !eof && remaining < BLOB_MAX_BYTES {
+                    break;
+                }
+
+                // A matching authenticated prior chunk is already a proven
+                // canonical boundary: FastCDC is deterministic from the last
+                // boundary and the bytes are identical. On a mismatch, run
+                // the one canonical chunker and resynchronize by object ID.
+                let previous = previous_manifest.chunks.get(previous_chunk_cursor);
+                let mut predicted = None;
+                if let Some(previous) = previous {
+                    let previous_bytes = usize::try_from(previous.bytes)
+                        .map_err(|_| "ForkTree prior blob chunk length exceeds usize")?;
+                    if previous_bytes <= remaining {
+                        let hash_started = std::time::Instant::now();
+                        let id = blob_chunk_id(&buffer[consumed..consumed + previous_bytes]);
+                        accounting.object_hash_us += hash_started.elapsed().as_micros() as u64;
+                        predicted = Some((previous_bytes, id));
+                        if id == previous.id {
+                            accounting.locality_hits += 1;
+                        } else {
+                            accounting.locality_misses += 1;
+                        }
+                    }
+                }
+
+                let (chunk_bytes, id, known_existing) = match (previous, predicted) {
+                    (Some(previous), Some((bytes, id))) if id == previous.id => {
+                        previous_chunk_cursor += 1;
+                        (bytes, id, true)
+                    }
+                    _ => {
+                        let chunking_started = std::time::Instant::now();
+                        let (_, chunk_bytes) = fastcdc::v2020::cut(
+                            &buffer[consumed..buffered],
+                            BLOB_MIN_BYTES,
+                            BLOB_AVG_BYTES,
+                            BLOB_MAX_BYTES,
+                            fastcdc::v2020::MASKS[20],
+                            fastcdc::v2020::MASKS[18],
+                            fastcdc::v2020::MASKS[20] << 1,
+                            fastcdc::v2020::MASKS[18] << 1,
+                        );
+                        accounting.chunking_us += chunking_started.elapsed().as_micros() as u64;
+                        if chunk_bytes == 0 || chunk_bytes > remaining {
+                            return Err("ForkTree CDC produced an invalid chunk size".to_string());
+                        }
+                        let id = if let Some((predicted_bytes, id)) = predicted {
+                            if predicted_bytes == chunk_bytes {
+                                id
+                            } else {
+                                let hash_started = std::time::Instant::now();
+                                let id = blob_chunk_id(&buffer[consumed..consumed + chunk_bytes]);
+                                accounting.object_hash_us +=
+                                    hash_started.elapsed().as_micros() as u64;
+                                id
+                            }
+                        } else {
+                            let hash_started = std::time::Instant::now();
+                            let id = blob_chunk_id(&buffer[consumed..consumed + chunk_bytes]);
+                            accounting.object_hash_us += hash_started.elapsed().as_micros() as u64;
+                            id
+                        };
+                        let known_existing = if let Some(index) = previous_chunk_positions.get(&id)
+                        {
+                            previous_chunk_cursor = index.saturating_add(1);
+                            true
+                        } else if previous.is_some_and(|chunk| chunk.bytes == chunk_bytes as u64) {
+                            previous_chunk_cursor = previous_chunk_cursor.saturating_add(1);
+                            false
+                        } else {
+                            false
+                        };
+                        (chunk_bytes, id, known_existing)
+                    }
+                };
+                if chunk_bytes == 0 || chunk_bytes > remaining {
+                    return Err("ForkTree CDC produced an invalid chunk size".to_string());
+                }
+                chunks.push(BlobChunkRef {
+                    id,
+                    bytes: chunk_bytes as u64,
+                });
+                accounting.logical_bytes += chunk_bytes as u64;
+                if !unique_chunks.insert(id) || known_existing {
+                    accounting.reused_chunks += 1;
+                } else {
+                    window_chunks.push(WindowChunk {
+                        id,
+                        start: consumed,
+                        bytes: chunk_bytes,
+                    });
+                }
+                consumed += chunk_bytes;
+            }
+            if consumed == 0 {
+                return Err("ForkTree CDC streaming window made no progress".to_string());
+            }
+
+            let ids = window_chunks
+                .iter()
+                .map(|chunk| chunk.id)
+                .collect::<Vec<_>>();
+            let dedup_started = std::time::Instant::now();
+            let existing = self.existing_object_ids(&ids).await?;
+            accounting.dedup_read_us += dedup_started.elapsed().as_micros() as u64;
+            let window = buffer.freeze();
+            let mut pending_chunks = BTreeMap::new();
+            for chunk in window_chunks {
+                if existing.contains(&chunk.id) {
+                    accounting.reused_chunks += 1;
+                    continue;
+                }
+                pending_chunks.insert(
+                    chunk.id,
+                    window.slice(chunk.start..chunk.start + chunk.bytes),
+                );
+            }
+            accounting.peak_buffer_bytes = accounting.peak_buffer_bytes.max(window.len() as u64);
+            let emitted = self.emit_chunk_batch(&mut pending_chunks).await?;
+            accounting.object_writes += emitted.object_writes;
+            accounting.object_bytes += emitted.object_bytes;
+            accounting.emission_us += emitted.emission_us;
+            accounting.emission_batches += emitted.emission_batches;
+
+            buffer = window.try_into_mut().map_err(|_| {
+                "ForkTree chunk emission retained the completed streaming window".to_string()
+            })?;
+            buffer.copy_within(consumed..buffered, 0);
+            buffered -= consumed;
+        }
+
         let manifest = BlobManifest {
-            logical_bytes: payload.len() as u64,
+            logical_bytes: accounting.logical_bytes,
             chunks,
         };
         let mut pending = BTreeMap::new();
-        let manifest_id = stage_object(encode_blob_manifest(&manifest), &mut pending);
+        let manifest_id = if manifest == previous_manifest {
+            current
+                .blob
+                .ok_or_else(|| "ForkTree identical blob has no prior manifest".to_string())?
+        } else {
+            stage_object(encode_blob_manifest(&manifest), &mut pending)
+        };
         let delta = stage_object(encode_blob_delta(current.blob, manifest_id), &mut pending);
         let next_commit = stage_object(
             encode_commit(Commit {
@@ -660,80 +857,39 @@ where
             &mut pending,
         );
         self.remove_existing_objects(&mut pending).await?;
-
-        let chunk_ids = manifest
-            .chunks
-            .iter()
-            .map(|chunk| chunk.id)
-            .collect::<Vec<_>>();
-        let existing = self.existing_object_ids(&chunk_ids).await?;
-        let mut unique = std::collections::BTreeSet::new();
-        let mut accounting = BlobAccounting {
-            chunks: manifest.chunks.len() as u64,
-            logical_bytes: payload.len() as u64,
-            chunking_us,
-            ..BlobAccounting::default()
-        };
-        let missing_bytes = manifest
-            .chunks
-            .iter()
-            .filter(|chunk| !existing.contains(&chunk.id) && unique.insert(chunk.id))
-            .map(|chunk| chunk.bytes + 13)
+        accounting.chunks = manifest.chunks.len() as u64;
+        accounting.object_writes += pending.len() as u64;
+        accounting.object_bytes += pending
+            .values()
+            .map(|bytes| bytes.len() as u64)
             .sum::<u64>();
-        accounting.reused_chunks = manifest.chunks.len() as u64 - unique.len() as u64
-            + unique.iter().filter(|id| existing.contains(id)).count() as u64;
-        accounting.object_writes =
-            unique.iter().filter(|id| !existing.contains(id)).count() as u64 + pending.len() as u64;
-        accounting.object_bytes = missing_bytes
-            + pending
-                .values()
-                .map(|bytes| bytes.len() as u64)
-                .sum::<u64>();
 
         let next_ref = encode_ref(next_commit);
         let next_epoch = encode_epoch(head.epoch.saturating_add(1));
+        let preconditions = vec![
+            Precondition::KeyValueEquals {
+                space: REF_SPACE,
+                key: key(&branch_key),
+                expected: head.raw_ref,
+            },
+            Precondition::KeyValueEquals {
+                space: REF_SPACE,
+                key: key(EPOCH_KEY),
+                expected: head.raw_epoch,
+            },
+        ];
+        let publication_started = std::time::Instant::now();
         let mut write = self
             .storage
             .begin_write(WriteOptions {
-                preconditions: vec![
-                    Precondition::KeyValueEquals {
-                        space: REF_SPACE,
-                        key: key(&branch_key),
-                        expected: head.raw_ref,
-                    },
-                    Precondition::KeyValueEquals {
-                        space: REF_SPACE,
-                        key: key(EPOCH_KEY),
-                        expected: head.raw_epoch,
-                    },
-                ],
-                batch_capacity_hint_bytes: usize::try_from(accounting.object_bytes)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(next_ref.len() + next_epoch.len()),
+                preconditions,
+                batch_capacity_hint_bytes: pending.values().map(Bytes::len).sum::<usize>()
+                    + next_ref.len()
+                    + next_epoch.len(),
                 ..WriteOptions::default()
             })
             .await
             .map_err(storage_error)?;
-        let mut staged = std::collections::BTreeSet::new();
-        for ((start, end), chunk) in ranges.iter().copied().zip(&manifest.chunks) {
-            if existing.contains(&chunk.id) || !staged.insert(chunk.id) {
-                continue;
-            }
-            let bytes = encode_blob_chunk(&payload[start..end]);
-            authenticate(chunk.id, &bytes)?;
-            write
-                .put_many(
-                    OBJECT_SPACE,
-                    PutBatch {
-                        entries: vec![PutEntry {
-                            key: key(&chunk.id.0),
-                            value: StoredValue { bytes },
-                        }],
-                    },
-                )
-                .await
-                .map_err(storage_error)?;
-        }
         if !pending.is_empty() {
             write
                 .put_many(OBJECT_SPACE, object_batch(&pending))
@@ -759,7 +915,42 @@ where
             .await
             .map_err(storage_error)?;
         write.commit().await.map_err(storage_error)?;
+        accounting.publication_us = publication_started.elapsed().as_micros() as u64;
         Ok((next_commit, accounting))
+    }
+
+    async fn emit_chunk_batch(
+        &self,
+        pending: &mut BTreeMap<ObjectId, Bytes>,
+    ) -> Result<ChunkEmissionAccounting, String> {
+        if pending.is_empty() {
+            return Ok(ChunkEmissionAccounting::default());
+        }
+        let object_writes = pending.len() as u64;
+        let object_bytes = pending.values().map(|bytes| bytes.len() as u64).sum();
+        let mut accounting = ChunkEmissionAccounting {
+            object_writes,
+            object_bytes,
+            ..ChunkEmissionAccounting::default()
+        };
+        let emission_started = std::time::Instant::now();
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                batch_capacity_hint_bytes: usize::try_from(object_bytes).unwrap_or(usize::MAX),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(OBJECT_SPACE, object_batch(pending))
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        accounting.emission_us = emission_started.elapsed().as_micros() as u64;
+        accounting.emission_batches = 1;
+        pending.clear();
+        Ok(accounting)
     }
 
     pub async fn read_blob(&self, branch: &str) -> Result<Vec<u8>, String> {
@@ -1906,13 +2097,6 @@ fn encode_retention_delta(root: ObjectId, blob: Option<ObjectId>) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn encode_blob_chunk(payload: &[u8]) -> Bytes {
-    let mut bytes = object_prefix(BLOB_CHUNK_TAG);
-    put_u64(&mut bytes, payload.len() as u64);
-    bytes.extend_from_slice(payload);
-    Bytes::from(bytes)
-}
-
 fn blob_chunk_id(payload: &[u8]) -> ObjectId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(OBJECT_MAGIC);
@@ -2026,20 +2210,10 @@ fn decode_value_pack(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 }
 
 fn decode_blob_chunk(bytes: &[u8], expected_bytes: u64) -> Result<Vec<u8>, String> {
-    let mut decoder = Decoder::new(bytes);
-    if decoder.object_tag()? != BLOB_CHUNK_TAG {
-        return Err("ForkTree blob manifest does not reference a chunk".to_string());
-    }
-    let declared = decoder.u64()?;
-    if declared != expected_bytes {
+    if bytes.len() as u64 != expected_bytes {
         return Err("ForkTree blob chunk declared size mismatch".to_string());
     }
-    let payload = decoder.remaining().to_vec();
-    decoder.finish()?;
-    if payload.len() as u64 != declared {
-        return Err("ForkTree blob chunk payload size mismatch".to_string());
-    }
-    Ok(payload)
+    Ok(bytes.to_vec())
 }
 
 fn decode_blob_manifest(bytes: &[u8]) -> Result<BlobManifest, String> {
@@ -2182,17 +2356,6 @@ fn object_edges(bytes: &[u8]) -> Result<ObjectEdges, String> {
                 .into_iter()
                 .map(|chunk| chunk.id),
         )),
-        BLOB_CHUNK_TAG => {
-            let mut decoder = Decoder::new(bytes);
-            let _ = decoder.object_tag()?;
-            let declared = decoder.u64()?;
-            let payload = decoder.remaining();
-            decoder.finish()?;
-            if payload.len() as u64 != declared {
-                return Err("ForkTree blob chunk payload size mismatch".to_string());
-            }
-            Ok(ObjectEdges::empty())
-        }
         tag => Err(format!("unknown ForkTree object tag {tag}")),
     }
 }
@@ -2283,13 +2446,13 @@ fn selector_key(prefix: &[u8], name: &str) -> Vec<u8> {
 }
 
 fn authenticate(id: ObjectId, bytes: &[u8]) -> Result<(), String> {
-    if blake3::hash(bytes).as_bytes() != &id.0 {
-        return Err(format!(
-            "ForkTree object {} failed authentication",
-            hex_id(id)
-        ));
+    if blake3::hash(bytes).as_bytes() == &id.0 || blob_chunk_id(bytes) == id {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "ForkTree object {} failed authentication",
+        hex_id(id)
+    ))
 }
 
 fn projected_bytes(value: &ProjectedValue) -> Result<&Bytes, String> {
