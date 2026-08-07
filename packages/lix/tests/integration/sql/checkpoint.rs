@@ -321,7 +321,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file (id, path, content) \
-                     VALUES ('{file_id}', '/a.md', X'6F6C64')"
+                     VALUES ('{file_id}', '/a.md', CAST('old' AS BYTEA))"
                 ),
                 &[],
             )
@@ -348,7 +348,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file (id, path, content) \
-                     VALUES ('{nested_file_id}', '/existing/b.md', X'6F6C64')"
+                     VALUES ('{nested_file_id}', '/existing/b.md', CAST('old' AS BYTEA))"
                 ),
                 &[],
             )
@@ -362,7 +362,7 @@ simulation_test!(
             session
                 .execute(
                     &format!(
-                        "UPDATE lix_file SET content = X'6E6577' WHERE id = '{changed_file_id}'"
+                        "UPDATE lix_file SET content = CAST('new' AS BYTEA) WHERE id = '{changed_file_id}'"
                     ),
                     &[],
                 )
@@ -453,7 +453,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01950000-0000-7000-8000-000000000001', '/docs/readme.md', X'68656C6C6F')",
+                 VALUES ('01950000-0000-7000-8000-000000000001', '/docs/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await

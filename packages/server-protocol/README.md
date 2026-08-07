@@ -137,6 +137,30 @@ For a localized edit in a 10 MiB blob, 16-subscriber p50 conversion fell from
 6,979 microseconds to 428 microseconds (16.28x). Four-subscriber p50 fell from
 1,658 microseconds to 402 microseconds (4.12x). One subscriber remains neutral.
 
+## SQL file writes
+
+The SQL `lix_file.content` column stores `BYTEA`. For text files, bind the
+content as a text value and cast the parameter in the `INSERT` or `UPDATE`:
+
+```http
+POST /lix/v1/execute
+Lix-Session-Id: <session-id>
+Content-Type: application/json
+
+{
+  "sql": "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+  "params": [
+    { "kind": "text", "value": "/a.md" },
+    { "kind": "text", "value": "# Hello\n" }
+  ]
+}
+```
+
+Read text content with `CAST(content AS TEXT)`. Use a blob parameter only for
+raw bytes that are not UTF-8 text. `length(content)` counts characters even
+though `content` is `BYTEA`; use the standard `OCTET_LENGTH(content)` function
+when verifying the stored byte count.
+
 ## Binary file upsert
 
 Clients that explicitly want file **upsert** semantics can check for

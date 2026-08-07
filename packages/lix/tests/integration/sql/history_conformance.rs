@@ -420,14 +420,14 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/docs/conformance.txt', X'6F6E65')",
+                 VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/docs/conformance.txt', CAST('one' AS BYTEA))",
                 &[],
             )
             .await
             .expect("file insert should succeed");
         session
             .execute(
-                "UPDATE lix_file SET content = X'74776F' WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
+                "UPDATE lix_file SET content = CAST('two' AS BYTEA) WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
                 &[],
             )
             .await

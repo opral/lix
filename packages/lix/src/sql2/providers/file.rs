@@ -63,9 +63,10 @@ use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
 use crate::sql2::write_normalization::{
-    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
-    defaultable_bool_insert_value, defaultable_text_insert_value, insert_column_is_omitted,
-    lix_file_content_type_error, lix_file_content_type_error_with_value, scalar_is_binary_or_null,
+    InsertCell, InsertColumnIntents, LIX_FILE_CONTENT_CAST_HINT, SqlCell, UpdateAssignmentValues,
+    UpdateCell, defaultable_bool_insert_value, defaultable_text_insert_value,
+    insert_column_is_omitted, lix_file_content_type_error, lix_file_content_type_error_with_value,
+    scalar_is_binary_or_null,
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 #[cfg(test)]
@@ -6576,11 +6577,7 @@ fn reject_non_binary_lix_file_content_assignment(expr: &Expr) -> Result<()> {
 }
 
 fn non_binary_lix_file_content_assignment_error() -> DataFusionError {
-    lix_file_content_type_error(
-        "UPDATE lix_file",
-        "content",
-        "use X'...' or a binary parameter for file contents",
-    )
+    lix_file_content_type_error("UPDATE lix_file", "content", LIX_FILE_CONTENT_CAST_HINT)
 }
 
 fn record_batch_has_non_null_column(batch: &RecordBatch, column_name: &str) -> Result<bool> {
@@ -6681,7 +6678,7 @@ fn update_required_binary_value(
             Err(lix_file_content_type_error(
                 "UPDATE lix_file",
                 column_name,
-                "use X'' for an empty file or omit content to leave contents unchanged",
+                "Use CAST('' AS BYTEA) for an empty file or omit content to leave contents unchanged.",
             ))
         }
         UpdateCell::Assigned(SqlCell::Value(
@@ -6694,7 +6691,7 @@ fn update_required_binary_value(
             "UPDATE lix_file",
             column_name,
             &other,
-            "use X'...' or a binary parameter for file contents",
+            LIX_FILE_CONTENT_CAST_HINT,
         )),
     }
 }
@@ -6788,7 +6785,7 @@ fn insert_optional_binary_value(
         ) => Err(lix_file_content_type_error(
             "INSERT into lix_file",
             column_name,
-            "use X'' for an empty file or omit content to create an empty file",
+            "Use CAST('' AS BYTEA) for an empty file or omit content to create an empty file.",
         )),
         Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => {
             Ok(Some(value))
@@ -6798,7 +6795,7 @@ fn insert_optional_binary_value(
             "INSERT into lix_file",
             column_name,
             &other,
-            "use X'...' or a binary parameter for file contents",
+            LIX_FILE_CONTENT_CAST_HINT,
         )),
     }
 }
