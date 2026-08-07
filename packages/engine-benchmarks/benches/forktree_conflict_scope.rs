@@ -69,6 +69,7 @@ const PREP_BYTES: usize = 256 * 1024;
 enum Mode {
     Current,
     Scoped,
+    Handoff,
 }
 
 impl Mode {
@@ -76,6 +77,7 @@ impl Mode {
         match value {
             "current" => Self::Current,
             "scoped" => Self::Scoped,
+            "handoff" => Self::Handoff,
             other => panic!("unknown mode '{other}'"),
         }
     }
@@ -84,6 +86,7 @@ impl Mode {
         match self {
             Self::Current => "current",
             Self::Scoped => "scoped",
+            Self::Handoff => "handoff",
         }
     }
 }
@@ -446,6 +449,9 @@ async fn run_cohort<S: Storage + Clone>(
     owners: usize,
     same_owner: bool,
 ) -> CohortResult {
+    if mode == Mode::Handoff {
+        return run_handoff_cohort(storage, kind, cohort, owners, same_owner).await;
+    }
     let mut initial = Vec::with_capacity(owners);
     for writer in 0..owners {
         let owner = if same_owner { 0 } else { writer };
@@ -464,6 +470,97 @@ async fn run_cohort<S: Storage + Clone>(
         cohort_result.global_retries += result.global_retries;
         cohort_result.prepare_calls += result.prepare_calls;
         cohort_result.io += result.io;
+    }
+    cohort_result
+}
+
+/// Models one process-local reservation queue over the sole durable global
+/// selector. A successful atomic global+owner publication hands its exact
+/// resulting global bytes to the next waiter, avoiding a doomed CAS and
+/// reread. The handoff is disposable scheduling state: an external writer or
+/// crash merely forces the normal global CAS/reread path.
+async fn run_handoff_cohort<S: Storage + Clone>(
+    storage: &S,
+    kind: OwnerKind,
+    cohort: u64,
+    owners: usize,
+    same_owner: bool,
+) -> CohortResult {
+    let mut initial = Vec::with_capacity(owners);
+    for writer in 0..owners {
+        let owner = if same_owner { 0 } else { writer };
+        let (snapshot, _) = read_snapshot(storage, &owner_key(kind, cohort, owner)).await;
+        initial.push((owner, snapshot));
+    }
+    let mut handoff_global = initial
+        .first()
+        .expect("handoff cohort must not be empty")
+        .1
+        .global
+        .clone();
+    assert!(
+        initial
+            .iter()
+            .all(|(_, snapshot)| snapshot.global == handoff_global),
+        "same-instant cohort must reserve from one global version"
+    );
+
+    let mut cohort_result = CohortResult::default();
+    for (owner, initial_snapshot) in initial {
+        let prepared = prepare(kind, cohort, owner, initial_snapshot.owner.clone());
+        cohort_result.prepare_calls += 1;
+        let mut snapshot = Snapshot {
+            global: handoff_global.clone(),
+            owner: initial_snapshot.owner.clone(),
+        };
+        loop {
+            cohort_result.io.commit_attempts += 1;
+            cohort_result.io.put_entries += 3;
+            cohort_result.io.put_bytes +=
+                (prepared.payload.len() + prepared.object_key.0.len() + 128) as u64;
+            match publish_once(storage, &snapshot, &prepared).await {
+                Ok(_) => {
+                    cohort_result.successes += 1;
+                    let (epoch, watermark) = decode_global(&snapshot.global);
+                    handoff_global = global_value(
+                        epoch.checked_add(1).expect("global epoch overflow"),
+                        watermark,
+                    );
+                    break;
+                }
+                Err(StorageError::PreconditionFailed(failures)) => {
+                    if failures.iter().any(|failure| failure.index == 1) {
+                        cohort_result.stale += 1;
+                        break;
+                    }
+                    assert!(
+                        failures.iter().any(|failure| failure.index == 0),
+                        "only global or owner preconditions exist"
+                    );
+                    cohort_result.global_retries += 1;
+                    let (latest, io) = read_snapshot(storage, &prepared.owner_key).await;
+                    cohort_result.io += io;
+                    if latest.owner != initial_snapshot.owner {
+                        cohort_result.stale += 1;
+                        break;
+                    }
+                    handoff_global = latest.global.clone();
+                    snapshot = latest;
+                }
+                Err(StorageError::WriteConflict) => {
+                    cohort_result.global_retries += 1;
+                    let (latest, io) = read_snapshot(storage, &prepared.owner_key).await;
+                    cohort_result.io += io;
+                    if latest.owner != initial_snapshot.owner {
+                        cohort_result.stale += 1;
+                        break;
+                    }
+                    handoff_global = latest.global.clone();
+                    snapshot = latest;
+                }
+                Err(error) => panic!("handoff publication failed unexpectedly: {error}"),
+            }
+        }
     }
     cohort_result
 }
@@ -496,18 +593,19 @@ async fn advance_gc<S: Storage>(storage: &S, expected_global: Bytes) -> Result<(
     Ok(())
 }
 
-async fn run_oracle<S: Storage + Clone>(storage: &S) {
+async fn run_oracle<S: Storage + Clone>(backend: &str, storage: &S) {
     seed_global(storage).await;
 
     for (offset, kind) in [OwnerKind::Branch, OwnerKind::Catalog, OwnerKind::Upload]
         .into_iter()
         .enumerate()
     {
-        let distinct = run_cohort(storage, Mode::Scoped, kind, 10 + offset as u64, 10, false).await;
+        let distinct =
+            run_cohort(storage, Mode::Handoff, kind, 10 + offset as u64, 10, false).await;
         assert_eq!(distinct.successes, 10, "unrelated owners must all publish");
         assert_eq!(distinct.stale, 0, "unrelated owners are not stale");
 
-        let same = run_cohort(storage, Mode::Scoped, kind, 20 + offset as u64, 10, true).await;
+        let same = run_cohort(storage, Mode::Handoff, kind, 20 + offset as u64, 10, true).await;
         assert_eq!(same.successes, 1, "one same-owner writer wins");
         assert_eq!(same.stale, 9, "same-owner stale writers reject");
     }
@@ -521,7 +619,7 @@ async fn run_oracle<S: Storage + Clone>(storage: &S) {
         .expect("GC-first global fence");
     let gc_first = run_writer(
         storage.clone(),
-        Mode::Scoped,
+        Mode::Handoff,
         OwnerKind::Branch,
         30,
         0,
@@ -535,7 +633,7 @@ async fn run_oracle<S: Storage + Clone>(storage: &S) {
     let (gc_snapshot, _) = read_snapshot(storage, &gc_key).await;
     let publication = run_writer(
         storage.clone(),
-        Mode::Scoped,
+        Mode::Handoff,
         OwnerKind::Catalog,
         31,
         0,
@@ -550,8 +648,8 @@ async fn run_oracle<S: Storage + Clone>(storage: &S) {
 
     // A reader pin and an open upload are independent owner selectors and
     // remain present across unrelated publication and GC fencing.
-    let pins = run_cohort(storage, Mode::Scoped, OwnerKind::Branch, 40, 1, false).await;
-    let uploads = run_cohort(storage, Mode::Scoped, OwnerKind::Upload, 41, 1, false).await;
+    let pins = run_cohort(storage, Mode::Handoff, OwnerKind::Branch, 40, 1, false).await;
+    let uploads = run_cohort(storage, Mode::Handoff, OwnerKind::Upload, 41, 1, false).await;
     assert_eq!((pins.successes, uploads.successes), (1, 1));
     let pin_key = owner_key(OwnerKind::Branch, 40, 0);
     let upload_key = owner_key(OwnerKind::Upload, 41, 0);
@@ -565,6 +663,21 @@ async fn run_oracle<S: Storage + Clone>(storage: &S) {
     let (upload_after, _) = read_snapshot(storage, &upload_key).await;
     assert_eq!(pin.owner, pin_after.owner);
     assert_eq!(upload.owner, upload_after.owner);
+
+    // A local reservation has no durable row. Losing it before publication
+    // changes neither global nor owner authority; a committed successor does.
+    let crash_key = owner_key(OwnerKind::Branch, 42, 0);
+    let (before_crash, _) = read_snapshot(storage, &crash_key).await;
+    let _lost_preparation = prepare(OwnerKind::Branch, 42, 0, before_crash.owner.clone());
+    let (after_crash, _) = read_snapshot(storage, &crash_key).await;
+    assert_eq!(before_crash.global, after_crash.global);
+    assert_eq!(before_crash.owner, after_crash.owner);
+    let committed_after_crash =
+        run_cohort(storage, Mode::Handoff, OwnerKind::Branch, 43, 1, false).await;
+    assert_eq!(committed_after_crash.successes, 1);
+    println!(
+        "forktree_global_handoff_oracle,backend={backend},unrelated_branch_catalog_upload=pass,same_owner_successes=1,same_owner_stale=9,gc_first_publication_retry=pass,publication_first_stale_gc_reject=pass,reader_pin_preserved=pass,open_upload_preserved=pass,crash_before_commit_no_authority=pass,crash_after_commit_durable=pass,global_authorities=1"
+    );
 }
 
 async fn assert_reopen<S: Storage>(storage: &S) {
@@ -572,10 +685,16 @@ async fn assert_reopen<S: Storage>(storage: &S) {
         (OwnerKind::Branch, 40),
         (OwnerKind::Upload, 41),
         (OwnerKind::Catalog, 31),
+        (OwnerKind::Branch, 43),
     ] {
         let (snapshot, _) = read_snapshot(storage, &owner_key(kind, cohort, 0)).await;
         assert!(snapshot.owner.is_some(), "owner selector survives reopen");
     }
+    let (lost_reservation, _) = read_snapshot(storage, &owner_key(OwnerKind::Branch, 42, 0)).await;
+    assert!(
+        lost_reservation.owner.is_none(),
+        "crash-before-commit reservation must not become authority"
+    );
     let (global, _) = read_snapshot(storage, &owner_key(OwnerKind::Catalog, 999, 0)).await;
     let (epoch, watermark) = decode_global(&global.global);
     assert!(epoch > 1 && watermark > 0 && watermark < epoch);
@@ -748,7 +867,7 @@ async fn run_rocks(mode: Mode, kind: OwnerKind, owners: usize, rounds: usize) {
     let directory = tempfile::tempdir().expect("create RocksDB model directory");
     let path = directory.path().join("rocksdb");
     let storage = RocksDB::open(&path).expect("open RocksDB model");
-    run_oracle(&storage).await;
+    run_oracle("rocksdb", &storage).await;
     storage.flush().expect("flush RocksDB oracle");
     measure("rocksdb", &storage, &path, None, mode, kind, owners, rounds).await;
     storage.flush().expect("flush RocksDB measurement");
@@ -769,7 +888,7 @@ async fn run_slate(mode: Mode, kind: OwnerKind, owners: usize, rounds: usize) {
     let counters = SlateDBIoCounters::default();
     let storage =
         SlateDB::open_with_io_counters(&path, counters.clone()).expect("open SlateDB model");
-    run_oracle(&storage).await;
+    run_oracle("slatedb", &storage).await;
     storage.flush().await.expect("flush SlateDB oracle");
     measure(
         "slatedb",
