@@ -33,7 +33,7 @@ use crate::changelog::{
 use crate::json_store::JsonSlotRef;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapter,
+    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapter,
     StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StorageGetManyRequest,
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions,
     StorageSpace, StorageWriteSet, exact_get_many,
@@ -1050,17 +1050,17 @@ where
             _ => Bound::Excluded(after),
         };
     }
-    let chunk = ScanPlan::range(space, range)
-        .page(
-            read,
+    let mut cursor = read
+        .begin_scan(
+            space,
+            range,
             StorageBeginScanOptions {
                 projection,
                 ..StorageBeginScanOptions::default()
             },
-            limit,
         )
-        .await?
-        .value;
+        .await?;
+    let chunk = cursor.next_page(limit).await?;
     let has_more = chunk.has_more;
     let mut keys = Vec::with_capacity(chunk.entries.len());
     let mut values = Vec::with_capacity(chunk.entries.len());

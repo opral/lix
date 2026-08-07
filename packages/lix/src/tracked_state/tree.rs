@@ -2732,7 +2732,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::storage::{
-        BeginScanOptions, GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanCursor, Storage,
+        BeginScanOptions, GetManyResult, KeyRange, ProjectedValue, ScanCursor, Storage,
         StorageError, StorageRead,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
@@ -2773,7 +2773,7 @@ mod tests {
             space: crate::storage::StorageSpace,
             range: KeyRange,
             opts: BeginScanOptions,
-        ) -> impl Future<Output = Result<ScanCursor, StorageError>> + Send {
+        ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
             self.read.begin_scan(space, range, opts)
         }
     }
@@ -2813,7 +2813,7 @@ mod tests {
             _space: crate::storage::StorageSpace,
             _range: KeyRange,
             _opts: BeginScanOptions,
-        ) -> impl Future<Output = Result<ScanCursor, StorageError>> + Send {
+        ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
             async { unreachable!("tracked-state node cache test only performs point reads") }
         }
     }

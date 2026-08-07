@@ -1,28 +1,22 @@
 use std::sync::Arc;
 
 use lix::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
-    PutBatch, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead,
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
+    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError, StorageRead,
     StorageSpace, StorageWrite, WriteOptions,
 };
 use lix_storage_rocksdb::{RocksDB, RocksDBRead, RocksDBWrite};
-use lix_storage_sqlite::{SQLite, SQLiteRead, SQLiteWrite};
 use tempfile::TempDir;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChangelogBenchStorage {
     Unit,
-    SQLiteTempfile,
     RocksDBTempdir,
 }
 
 #[derive(Clone)]
 pub(crate) enum ChangelogScoreStorage {
     Unit(Memory),
-    SQLite {
-        storage: SQLite,
-        _temp_dir: Arc<TempDir>,
-    },
     RocksDB {
         storage: RocksDB,
         _temp_dir: Arc<TempDir>,
@@ -31,13 +25,11 @@ pub(crate) enum ChangelogScoreStorage {
 
 pub(crate) enum ChangelogScoreRead<'a> {
     Unit(MemoryRead),
-    SQLite(SQLiteRead),
     RocksDB(RocksDBRead<'a>),
 }
 
 pub(crate) enum ChangelogScoreWrite {
     Unit(MemoryWrite),
-    SQLite(SQLiteWrite),
     RocksDB(RocksDBWrite),
 }
 
@@ -45,14 +37,6 @@ impl ChangelogBenchStorage {
     pub(crate) fn create(self) -> ChangelogScoreStorage {
         match self {
             Self::Unit => ChangelogScoreStorage::Unit(Memory::new()),
-            Self::SQLiteTempfile => {
-                let temp_dir = Arc::new(tempfile::tempdir().expect("create sqlite temp dir"));
-                let path = temp_dir.path().join("changelog-scorecard.sqlite");
-                ChangelogScoreStorage::SQLite {
-                    storage: SQLite::open(path).expect("open sqlite scorecard storage"),
-                    _temp_dir: temp_dir,
-                }
-            }
             Self::RocksDBTempdir => {
                 let temp_dir = Arc::new(tempfile::tempdir().expect("create rocksdb temp dir"));
                 let path = temp_dir.path().join("changelog-scorecard.rocksdb");
@@ -78,10 +62,6 @@ impl Storage for ChangelogScoreStorage {
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         match self {
             Self::Unit(storage) => storage.begin_read(opts).await.map(ChangelogScoreRead::Unit),
-            Self::SQLite { storage, .. } => storage
-                .begin_read(opts)
-                .await
-                .map(ChangelogScoreRead::SQLite),
             Self::RocksDB { storage, .. } => storage
                 .begin_read(opts)
                 .await
@@ -95,10 +75,6 @@ impl Storage for ChangelogScoreStorage {
                 .begin_write(opts)
                 .await
                 .map(ChangelogScoreWrite::Unit),
-            Self::SQLite { storage, .. } => storage
-                .begin_write(opts)
-                .await
-                .map(ChangelogScoreWrite::SQLite),
             Self::RocksDB { storage, .. } => storage
                 .begin_write(opts)
                 .await
@@ -114,21 +90,19 @@ impl StorageRead for ChangelogScoreRead<'_> {
     ) -> Result<GetManyResult, StorageError> {
         match self {
             Self::Unit(read) => read.get_many(requests).await,
-            Self::SQLite(read) => read.get_many(requests).await,
             Self::RocksDB(read) => read.get_many(requests).await,
         }
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
         match self {
-            Self::Unit(read) => read.scan(space, range, opts).await,
-            Self::SQLite(read) => read.scan(space, range, opts).await,
-            Self::RocksDB(read) => read.scan(space, range, opts).await,
+            Self::Unit(read) => read.begin_scan(space, range, opts).await,
+            Self::RocksDB(read) => read.begin_scan(space, range, opts).await,
         }
     }
 }
@@ -141,7 +115,6 @@ impl StorageWrite for ChangelogScoreWrite {
     ) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.put_many(space, entries).await,
-            Self::SQLite(write) => write.put_many(space, entries).await,
             Self::RocksDB(write) => write.put_many(space, entries).await,
         }
     }
@@ -149,7 +122,6 @@ impl StorageWrite for ChangelogScoreWrite {
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.delete_many(space, keys).await,
-            Self::SQLite(write) => write.delete_many(space, keys).await,
             Self::RocksDB(write) => write.delete_many(space, keys).await,
         }
     }
@@ -161,7 +133,6 @@ impl StorageWrite for ChangelogScoreWrite {
     ) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.delete_range(space, range).await,
-            Self::SQLite(write) => write.delete_range(space, range).await,
             Self::RocksDB(write) => write.delete_range(space, range).await,
         }
     }
@@ -169,7 +140,6 @@ impl StorageWrite for ChangelogScoreWrite {
     async fn commit(self) -> Result<CommitResult, StorageError> {
         match self {
             Self::Unit(write) => write.commit().await,
-            Self::SQLite(write) => write.commit().await,
             Self::RocksDB(write) => write.commit().await,
         }
     }
@@ -177,7 +147,6 @@ impl StorageWrite for ChangelogScoreWrite {
     async fn rollback(self) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.rollback().await,
-            Self::SQLite(write) => write.rollback().await,
             Self::RocksDB(write) => write.rollback().await,
         }
     }

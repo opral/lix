@@ -147,7 +147,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::storage::{
         BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
-        ReadOptions, ScanChunk, Storage, StorageError, StorageRead, WriteOptions,
+        ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
     };
 
     use super::*;
@@ -260,7 +260,7 @@ mod tests {
             space: crate::storage::StorageSpace,
             range: KeyRange,
             options: BeginScanOptions,
-        ) -> Result<ScanCursor, StorageError> {
+        ) -> Result<ScanCursor<'_>, StorageError> {
             self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
             self.inner.begin_scan(space, range, options).await
         }

@@ -558,15 +558,21 @@ pub(crate) async fn stage_certified_entity_batches(
             *generation != control.tracked_generation && *generation != control.untracked_generation
         }) {
             let previous_prefix = source_generation.as_uuid().as_bytes().to_vec();
-            let manifests = ScanPlan::prefix(
-                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(previous_prefix.clone()),
-                },
-            )
-            .first_page(read, StorageBeginScanOptions::default())
-            .await?;
-            for entry in manifests.value.entries {
+            let range = StoragePrefix {
+                bytes: Bytes::from(previous_prefix.clone()),
+            }
+            .to_range()?;
+            let mut cursor = read
+                .begin_scan(
+                    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                    range,
+                    StorageBeginScanOptions::default(),
+                )
+                .await?;
+            let manifests = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?;
+            for entry in manifests.entries {
                 let suffix = entry
                     .key
                     .0
@@ -622,15 +628,21 @@ pub(crate) async fn stage_certified_entity_batches(
                 let mut manifest_prefix = control.tracked_generation.as_uuid().as_bytes().to_vec();
                 append_batch_text(&mut manifest_prefix, file.file_id)?;
                 manifest_prefix.extend_from_slice(&batch.format.to_le_bytes());
-                let prior_manifests = ScanPlan::prefix(
-                    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                    StoragePrefix {
-                        bytes: Bytes::from(manifest_prefix),
-                    },
-                )
-                .first_page(read, StorageBeginScanOptions::default())
-                .await?;
-                for entry in prior_manifests.value.entries {
+                let range = StoragePrefix {
+                    bytes: Bytes::from(manifest_prefix),
+                }
+                .to_range()?;
+                let mut cursor = read
+                    .begin_scan(
+                        CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                        range,
+                        StorageBeginScanOptions::default(),
+                    )
+                    .await?;
+                let prior_manifests = cursor
+                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                    .await?;
+                for entry in prior_manifests.entries {
                     writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
                 }
             }
@@ -997,26 +1009,40 @@ async fn scan_certified_entity_batch_rows(
         for file_id in file_ids {
             let mut prefix = generation.as_uuid().as_bytes().to_vec();
             append_batch_text(&mut prefix, file_id)?;
-            let manifests = ScanPlan::prefix(
-                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(prefix),
-                },
-            )
-            .first_page(store, StorageBeginScanOptions::default())
-            .await?;
-            manifest_entries.extend(manifests.value.entries);
+            let range = StoragePrefix {
+                bytes: Bytes::from(prefix),
+            }
+            .to_range()?;
+            let mut cursor = store
+                .begin_scan(
+                    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                    range,
+                    StorageBeginScanOptions::default(),
+                )
+                .await?;
+            manifest_entries.extend(
+                cursor
+                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                    .await?
+                    .entries,
+            );
         }
     } else {
-        let manifests = ScanPlan::prefix(
-            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-            StoragePrefix {
-                bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
-            },
-        )
-        .first_page(store, StorageBeginScanOptions::default())
-        .await?;
-        manifest_entries = manifests.value.entries;
+        let range = StoragePrefix {
+            bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+        }
+        .to_range()?;
+        let mut cursor = store
+            .begin_scan(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await?;
+        manifest_entries = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?
+            .entries;
     }
     if exact_file_ids.is_none() && manifest_entries.is_empty() {
         if let Some(cache) = transaction_cache {
@@ -1132,21 +1158,23 @@ pub(crate) async fn scan_certified_history_rows(
     let filter_index = CertifiedScanFilterIndex::new(request);
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
     for commit_id in commit_ids {
-        let plan = ScanPlan::prefix(
-            CERTIFIED_ENTITY_BATCH_SPACE,
-            StoragePrefix {
-                bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
-            },
-        );
-        let mut cursor = plan
-            .begin(store, StorageBeginScanOptions::default())
+        let range = StoragePrefix {
+            bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
+        }
+        .to_range()?;
+        let mut cursor = store
+            .begin_scan(
+                CERTIFIED_ENTITY_BATCH_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
             .await?;
         loop {
             let page = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            let has_more = page.value.has_more;
-            for entry in page.value.entries {
+            let has_more = page.has_more;
+            for entry in page.entries {
                 let value = full_value_bytes(entry.value)?;
                 if certified_batch_commit_id(&value)? != *commit_id {
                     continue;
@@ -2807,21 +2835,23 @@ async fn packed_exclusive_schema_base_refs(
     schema_key: &str,
 ) -> Result<Vec<PackedExclusiveSchemaBaseRef>, LixError> {
     let prefix = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
-    let plan = ScanPlan::prefix(
-        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(&prefix),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::copy_from_slice(&prefix),
+    }
+    .to_range()?;
     let mut refs = Vec::new();
-    let mut cursor = plan
-        .begin(store, StorageBeginScanOptions::default())
+    let mut cursor = store
+        .begin_scan(
+            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
         .await?;
     loop {
         let page = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry in page.value.entries {
+        for entry in page.entries {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
                 return Err(head_value_error(
@@ -2836,7 +2866,7 @@ async fn packed_exclusive_schema_base_refs(
                 index_key: entry.key.0,
             });
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -2880,21 +2910,23 @@ async fn packed_current_base_refs(
     if marker.is_none() {
         return Ok(Vec::new());
     }
-    let plan = ScanPlan::prefix(
-        PACKED_CURRENT_BASE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(&prefix),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::copy_from_slice(&prefix),
+    }
+    .to_range()?;
     let mut refs = Vec::new();
-    let mut cursor = plan
-        .begin(store, StorageBeginScanOptions::default())
+    let mut cursor = store
+        .begin_scan(
+            PACKED_CURRENT_BASE_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
         .await?;
     loop {
         let page = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry in page.value.entries {
+        for entry in page.entries {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
                 return Err(head_value_error(
@@ -2920,7 +2952,7 @@ async fn packed_current_base_refs(
                 coverage_key: entry.key.0,
             });
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -2950,23 +2982,25 @@ async fn stage_retire_packed_current_bases(
     for base_ref in packed_current_base_refs(store, branch_id, generation).await? {
         writes.delete(PACKED_CURRENT_BASE_SPACE, StorageKey(base_ref.coverage_key));
     }
-    let index_plan = ScanPlan::prefix(
-        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(&control_key.0),
-        },
-    );
-    let mut cursor = index_plan
-        .begin(store, StorageBeginScanOptions::default())
+    let range = StoragePrefix {
+        bytes: Bytes::copy_from_slice(&control_key.0),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
         .await?;
     loop {
         let page = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry in page.value.entries {
+        for entry in page.entries {
             writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -3198,31 +3232,41 @@ async fn scan_root_current_base_rows_for_merge(
     } else {
         let mut control_entries = Vec::new();
         if request.filter.schema_keys.is_empty() {
-            control_entries = ScanPlan::prefix(
-                HOT_COLLECTION_CONTROL_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(hot_scope_prefix(branch_id, generation)),
-                },
-            )
-            .first_page(store, StorageBeginScanOptions::default())
-            .await?
-            .value
-            .entries;
+            let range = StoragePrefix {
+                bytes: Bytes::from(hot_scope_prefix(branch_id, generation)),
+            }
+            .to_range()?;
+            let mut cursor = store
+                .begin_scan(
+                    HOT_COLLECTION_CONTROL_SPACE,
+                    range,
+                    StorageBeginScanOptions::default(),
+                )
+                .await?;
+            control_entries = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await?
+                .entries;
         } else {
             for schema_key in &request.filter.schema_keys {
                 let mut prefix = hot_scope_prefix(branch_id, generation);
                 write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-                control_entries.extend(
-                    ScanPlan::prefix(
+                let range = StoragePrefix {
+                    bytes: Bytes::from(prefix),
+                }
+                .to_range()?;
+                let mut cursor = store
+                    .begin_scan(
                         HOT_COLLECTION_CONTROL_SPACE,
-                        StoragePrefix {
-                            bytes: Bytes::from(prefix),
-                        },
+                        range,
+                        StorageBeginScanOptions::default(),
                     )
-                    .first_page(store, StorageBeginScanOptions::default())
-                    .await?
-                    .value
-                    .entries,
+                    .await?;
+                control_entries.extend(
+                    cursor
+                        .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                        .await?
+                        .entries,
                 );
             }
         }
@@ -4330,22 +4374,21 @@ where
         if let Some(file_id) = scope.file_id {
             write_file_id(&mut selected_prefix, Some(file_id));
         }
-        let plan = ScanPlan::prefix(
-            HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(selected_prefix),
-            },
-        );
+        let range = StoragePrefix {
+            bytes: Bytes::from(selected_prefix),
+        }
+        .to_range()?;
         let mut digest = CompleteHotCollectionDigest::new(branch_id, branch_generation, scope);
         let mut actual = 0_u64;
-        let mut cursor = plan
-            .begin(&self.store, StorageBeginScanOptions::default())
+        let mut cursor = self
+            .store
+            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
             let page = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            for entry in page.value.entries {
+            for entry in page.entries {
                 let raw_key = entry.key.0;
                 let raw_value = full_value_bytes(entry.value)?;
                 let identity = validate_exact_collection_member(
@@ -4365,7 +4408,7 @@ where
                         .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
                 }
             }
-            if !page.value.has_more {
+            if !page.has_more {
                 break;
             }
         }
@@ -4484,22 +4527,23 @@ where
     ) -> Result<bool, LixError> {
         let mut prefix = hot_scope_prefix(branch_id, control.tracked_generation);
         write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-        let page = ScanPlan::prefix(
-            HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(prefix),
-            },
-        )
-        .page(
-            &self.store,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-            1,
-        )
-        .await?;
-        if !page.value.entries.is_empty() {
+        let range = StoragePrefix {
+            bytes: Bytes::from(prefix),
+        }
+        .to_range()?;
+        let mut cursor = self
+            .store
+            .begin_scan(
+                HOT_ROW_SPACE,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
+        let page = cursor.next_page(1).await?;
+        if !page.entries.is_empty() {
             return Ok(true);
         }
         if packed_current_base_has_schema(
@@ -5549,30 +5593,24 @@ where
         let mut refs = BTreeSet::new();
         for (branch_id, control) in controls {
             let scope = hot_scope_prefix(branch_id, control.untracked_generation);
-            let plan = ScanPlan::prefix(
-                HOT_ROW_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(scope),
-                },
-            );
-            let mut resume_after = None;
+            let range = StoragePrefix {
+                bytes: Bytes::from(scope),
+            }
+            .to_range()?;
+            let mut cursor = self
+                .store
+                .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
+                .await?;
             loop {
-                let page = plan
-                    .collect(
-                        &self.store,
-                        StorageBeginScanOptions {
-                            resume_after: resume_after.clone(),
-                            ..StorageBeginScanOptions::default()
-                        },
-                    )
+                let page = cursor
+                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                     .await?;
-                resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-                for entry in page.value.entries {
+                for entry in page.entries {
                     let bytes = full_value_bytes(entry.value)?;
                     let value = decode_head_value(&bytes)?;
                     collect_hot_untracked_refs(value, &mut refs);
                 }
-                if !page.value.has_more || resume_after.is_none() {
+                if !page.has_more {
                     break;
                 }
             }
@@ -9487,16 +9525,15 @@ async fn hot_load_file_scope_identities(
     cascades: &BTreeMap<String, &CurrentStateDeltaRef<'_>>,
 ) -> Result<Vec<HeadIdentity>, LixError> {
     let scope = hot_scope_prefix(branch_id, generation);
-    let plan = ScanPlan::prefix(
-        HOT_ROW_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(scope.clone()),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::from(scope.clone()),
+    }
+    .to_range()?;
     let mut identities = Vec::new();
-    let mut cursor = plan
-        .begin(
-            store,
+    let mut cursor = store
+        .begin_scan(
+            HOT_ROW_SPACE,
+            range,
             StorageBeginScanOptions {
                 projection: StorageCoreProjection::KeyOnly,
                 ..StorageBeginScanOptions::default()
@@ -9507,7 +9544,7 @@ async fn hot_load_file_scope_identities(
         let page = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry in page.value.entries {
+        for entry in page.entries {
             let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
             if !row
                 .file_id
@@ -9524,7 +9561,7 @@ async fn hot_load_file_scope_identities(
                 file_id: row.file_id,
             });
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -9609,22 +9646,20 @@ async fn hot_working_diff_entries(
     }
 
     let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
-    let plan = ScanPlan::prefix(
-        HOT_DIFF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(scope.clone()),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::from(scope.clone()),
+    }
+    .to_range()?;
     let mut actual_coverage = WorkingDiffIndexCoverage::default();
     let mut selected = BTreeMap::<HeadIdentity, Option<WorkingDiffVersion>>::new();
-    let mut cursor = plan
-        .begin(store, StorageBeginScanOptions::default())
+    let mut cursor = store
+        .begin_scan(HOT_DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
         let page = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        for entry in page.value.entries {
+        for entry in page.entries {
             let Ok(bytes) = full_value_bytes(entry.value) else {
                 return Ok(None);
             };
@@ -9678,7 +9713,7 @@ async fn hot_working_diff_entries(
                 return Ok(None);
             }
         }
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -9997,14 +10032,12 @@ async fn hot_scan_entries<'a>(
     // been restored to canonical `(schema, entity_pk, file_id)` order.
     let physical_limit = limit.filter(|_| hot_filter_has_one_fixed_file_bucket(filter));
     for prefix in prefixes {
-        let plan = ScanPlan::prefix(
-            HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(prefix),
-            },
-        );
-        let mut cursor = plan
-            .begin(store, StorageBeginScanOptions::default())
+        let range = StoragePrefix {
+            bytes: Bytes::from(prefix),
+        }
+        .to_range()?;
+        let mut cursor = store
+            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
             let remaining = physical_limit.map(|limit| limit.saturating_sub(rows.len()));
@@ -10019,7 +10052,7 @@ async fn hot_scan_entries<'a>(
             let page = cursor
                 .next_page(remaining.unwrap_or(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
                 .await?;
-            for entry in page.value.entries {
+            for entry in page.entries {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
@@ -10044,7 +10077,7 @@ async fn hot_scan_entries<'a>(
                     }
                 }
             }
-            if !page.value.has_more {
+            if !page.has_more {
                 break;
             }
         }
@@ -10192,19 +10225,16 @@ async fn hot_scan_dense_encoded_key_range<'a>(
     }
     let first_key = StorageKey(Bytes::copy_from_slice(key_at(0)));
     let last_key = StorageKey(Bytes::copy_from_slice(key_at(key_count - 1)));
-    let plan = ScanPlan::range(
-        HOT_ROW_SPACE,
-        crate::storage_adapter::StorageKeyRange {
-            lower: std::ops::Bound::Included(first_key),
-            upper: std::ops::Bound::Included(last_key),
-        },
-    );
+    let range = crate::storage_adapter::StorageKeyRange {
+        lower: std::ops::Bound::Included(first_key),
+        upper: std::ops::Bound::Included(last_key),
+    };
     let scan_budget = key_count.saturating_mul(HOT_DENSE_SCAN_MAX_OVERREAD);
     let mut scanned = 0;
     let mut requested_index = 0;
     let mut values = vec![None; key_count];
-    let mut cursor = plan
-        .begin(store, StorageBeginScanOptions::default())
+    let mut cursor = store
+        .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
         let remaining_budget = scan_budget.saturating_sub(scanned);
@@ -10214,8 +10244,8 @@ async fn hot_scan_dense_encoded_key_range<'a>(
         let page = cursor
             .next_page(remaining_budget.min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
             .await?;
-        scanned += page.value.entries.len();
-        for entry in page.value.entries {
+        scanned += page.entries.len();
+        for entry in page.entries {
             while requested_index < key_count && key_at(requested_index) < entry.key.0.as_ref() {
                 requested_index += 1;
             }
@@ -10224,7 +10254,7 @@ async fn hot_scan_dense_encoded_key_range<'a>(
                 requested_index += 1;
             }
         }
-        if requested_index == key_count || !page.value.has_more {
+        if requested_index == key_count || !page.has_more {
             return Ok(Some(values));
         }
     }
@@ -10288,26 +10318,24 @@ async fn scan_hot_file_entries(
     let scope = hot_scope_prefix(branch_id, generation);
     let mut rows = Vec::new();
     for prefix in prefixes {
-        let plan = ScanPlan::prefix(
-            HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(prefix),
-            },
-        );
-        let mut cursor = plan
-            .begin(store, StorageBeginScanOptions::default())
+        let range = StoragePrefix {
+            bytes: Bytes::from(prefix),
+        }
+        .to_range()?;
+        let mut cursor = store
+            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
             let page = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?;
-            for entry in page.value.entries {
+            for entry in page.entries {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
                     rows.push((identity, full_value_bytes(entry.value)?));
                 }
             }
-            if !page.value.has_more {
+            if !page.has_more {
                 break;
             }
         }
@@ -11109,32 +11137,29 @@ async fn stage_collect_stale_hot_collection_controls(
     writes: &mut StorageWriteSet,
     active: &BTreeSet<(String, CommitId)>,
 ) -> Result<(), LixError> {
-    let plan = ScanPlan::prefix(
-        HOT_COLLECTION_CONTROL_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            HOT_COLLECTION_CONTROL_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageBeginScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageBeginScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
+        for entry in page.entries {
             let keep = decode_hot_collection_control_scope(entry.key.0.as_ref())
                 .is_ok_and(|scope| active.contains(&scope));
             if !keep {
                 writes.delete(HOT_COLLECTION_CONTROL_SPACE, entry.key);
             }
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
@@ -11150,26 +11175,19 @@ async fn stage_collect_stale_hot_space(
     active: &BTreeSet<(String, CommitId)>,
     stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<bool, LixError> {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
     let mut deleted_any = false;
-    let mut resume_after = None;
+    let mut cursor = store
+        .begin_scan(space, range, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageBeginScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageBeginScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
+        for entry in page.entries {
             let active_generation =
                 decode_key(entry.key.0.as_ref()).is_ok_and(|identity| active.contains(&identity));
             if active_generation {
@@ -11183,7 +11201,7 @@ async fn stage_collect_stale_hot_space(
             }
             writes.delete(space, entry.key);
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
@@ -11199,25 +11217,18 @@ pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plan = ScanPlan::prefix(
-        HOT_DIFF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(HOT_DIFF_SPACE, range, StorageBeginScanOptions::default())
+        .await?;
     loop {
-        let page = plan
-            .collect(
-                store,
-                StorageBeginScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageBeginScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
+        for entry in page.entries {
             let keep = match full_value_bytes(entry.value) {
                 Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
                     .is_ok_and(|(checkpoint_commit_id, identity)| {
@@ -11250,7 +11261,7 @@ where
                 writes.delete(HOT_DIFF_SPACE, entry.key);
             }
         }
-        if !page.value.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
@@ -11271,19 +11282,18 @@ pub(super) async fn stage_delete_hot_diff_scope<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plan = ScanPlan::prefix(
-        HOT_DIFF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(encode_working_diff_scope_prefix(
-                branch_id,
-                checkpoint_commit_id,
-                generation,
-            )),
-        },
-    );
-    let mut cursor = plan
-        .begin(
-            store,
+    let range = StoragePrefix {
+        bytes: Bytes::from(encode_working_diff_scope_prefix(
+            branch_id,
+            checkpoint_commit_id,
+            generation,
+        )),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            HOT_DIFF_SPACE,
+            range,
             StorageBeginScanOptions {
                 projection: StorageCoreProjection::KeyOnly,
                 ..StorageBeginScanOptions::default()
@@ -11296,9 +11306,9 @@ where
             .await?;
         writes.delete_batch(
             HOT_DIFF_SPACE,
-            page.value.entries.into_iter().map(|entry| entry.key),
+            page.entries.into_iter().map(|entry| entry.key),
         );
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -11316,7 +11326,7 @@ mod tests {
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageBeginScanOptions, StorageGetManyRequest,
-        StorageGetManyResult, StorageKeyRange, StorageReadOptions, StorageScanChunk,
+        StorageGetManyResult, StorageKeyRange, StorageReadOptions, StorageScanCursor,
         StorageWriteOptions,
     };
 
@@ -11610,16 +11620,16 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageBeginScanOptions,
-        ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
+        ) -> Result<StorageScanCursor<'_>, crate::storage_adapter::StorageError> {
             if let Some(scan_calls) = &self.scan_calls {
                 scan_calls.fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.scan(space, range, opts).await
+            self.inner.begin_scan(space, range, opts).await
         }
     }
 
@@ -11646,13 +11656,13 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageBeginScanOptions,
-        ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
-            self.inner.scan(space, range, opts).await
+        ) -> Result<StorageScanCursor<'_>, crate::storage_adapter::StorageError> {
+            self.inner.begin_scan(space, range, opts).await
         }
     }
 
@@ -14128,20 +14138,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open segmented hot diff read");
-        let page = ScanPlan::prefix(
-            HOT_DIFF_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(scope.clone()),
-            },
-        )
-        .first_page(&read, StorageBeginScanOptions::default())
-        .await
-        .expect("scan segmented hot diff");
-        assert!(!page.value.has_more);
+        let range = StoragePrefix {
+            bytes: Bytes::from(scope.clone()),
+        }
+        .to_range()
+        .expect("valid prefix range");
+        let mut cursor = read
+            .begin_scan(HOT_DIFF_SPACE, range, StorageBeginScanOptions::default())
+            .await
+            .expect("begin segmented hot diff scan");
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await
+            .expect("scan segmented hot diff");
+        assert!(!page.has_more);
 
         let mut actual_coverage = WorkingDiffIndexCoverage::default();
         let mut decoded = 0_usize;
-        for entry in page.value.entries {
+        for entry in page.entries {
             let bytes = full_value_bytes(entry.value).expect("full segment value");
             let segment_scope =
                 decode_hot_diff_segment_key(entry.key.0.as_ref()).expect("segment key");

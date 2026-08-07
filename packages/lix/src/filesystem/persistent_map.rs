@@ -511,5 +511,11 @@ mod tests {
                 .entries_range(Bound::Unbounded, Bound::Unbounded, 0)
                 .is_empty()
         );
+        assert_eq!(
+            changed
+                .range_cursor(Bound::Included(48), Bound::Excluded(53))
+                .collect::<Vec<_>>(),
+            vec![(48, 480), (49, 490), (50, 999), (51, 510), (52, 520)]
+        );
     }
 }

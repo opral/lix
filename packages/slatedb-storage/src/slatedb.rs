@@ -3,7 +3,7 @@
     reason = "explicit future signatures mirror Storage traits and keep Send guarantees visible"
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::ops::{Bound, Range};
@@ -1665,6 +1665,34 @@ pub struct SlateDBRead {
     publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
+    #[cfg(test)]
+    scan_worker_gate: Option<Arc<ScanTestGate>>,
+    #[cfg(test)]
+    scan_hydration_gate: Option<Arc<ScanTestGate>>,
+}
+
+#[cfg(test)]
+struct ScanTestGate {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl ScanTestGate {
+    fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        while !self.entered.load(Ordering::Acquire) {
+            self.entered_notify.notified().await;
+        }
+    }
 }
 
 #[allow(missing_debug_implementations)]
@@ -2505,6 +2533,10 @@ impl Storage for SlateDB {
                 publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
+                #[cfg(test)]
+                scan_worker_gate: None,
+                #[cfg(test)]
+                scan_hydration_gate: None,
             })
         }
     }
@@ -2926,6 +2958,7 @@ impl StorageRead for SlateDBRead {
     ) -> impl Future<Output = Result<StorageScanCursor<'_>, StorageError>> + Send {
         async move {
             self.write_pipeline.terminal_error()?;
+            StorageScanCursor::validate_range(&range)?;
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
@@ -2960,6 +2993,10 @@ impl StorageRead for SlateDBRead {
                     space,
                     projection: opts.projection,
                     state: Some(state),
+                    #[cfg(test)]
+                    worker_gate: self.scan_worker_gate.clone(),
+                    #[cfg(test)]
+                    hydration_gate: self.scan_hydration_gate.clone(),
                 },
             )
         }
@@ -2973,6 +3010,10 @@ struct SlateDBScanSource {
     space: StorageSpace,
     projection: CoreProjection,
     state: Option<SlateStreamingScanState>,
+    #[cfg(test)]
+    worker_gate: Option<Arc<ScanTestGate>>,
+    #[cfg(test)]
+    hydration_gate: Option<Arc<ScanTestGate>>,
 }
 
 impl StorageScanSource for SlateDBScanSource {
@@ -2985,11 +3026,27 @@ impl StorageScanSource for SlateDBScanSource {
             let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
             let projection = self.projection;
             let space_id = self.space.id;
+            #[cfg(test)]
+            let worker_gate = self.worker_gate.clone();
             let (state, mut chunk) = self
                 .worker
-                .call_read(move |_db| streaming_scan_page(state, limit_rows, projection, space_id))
+                .call_read(move |_db| async move {
+                    #[cfg(test)]
+                    if let Some(gate) = worker_gate {
+                        gate.entered.store(true, Ordering::Release);
+                        gate.entered_notify.notify_waiters();
+                        gate.release.notified().await;
+                    }
+                    streaming_scan_page(state, limit_rows, projection, space_id).await
+                })
                 .await?;
             self.state = Some(state);
+            #[cfg(test)]
+            if let Some(gate) = &self.hydration_gate {
+                gate.entered.store(true, Ordering::Release);
+                gate.entered_notify.notify_waiters();
+                gate.release.notified().await;
+            }
             hydrate_immutable_value_scan(
                 &self.immutable_value_store,
                 self.space,
@@ -3034,62 +3091,111 @@ impl SlateStreamingScanState {
 }
 
 struct StreamingOverlayCursor {
-    bounds: EncodedBounds,
     writes: Vec<Arc<PublishedWrite>>,
-    last_key: Option<Key>,
+    upper: Bound<Key>,
+    heads: BinaryHeap<OverlayHeapEntry>,
     pending: Option<(Key, Option<Bytes>)>,
+}
+
+#[derive(Eq, PartialEq)]
+struct OverlayHeapEntry {
+    key: Key,
+    publication_id: u64,
+    write_index: usize,
+}
+
+impl Ord for OverlayHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| self.publication_id.cmp(&other.publication_id))
+            .then_with(|| self.write_index.cmp(&other.write_index))
+    }
+}
+
+impl PartialOrd for OverlayHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl StreamingOverlayCursor {
     fn new(bounds: EncodedBounds, writes: Vec<Arc<PublishedWrite>>) -> Self {
-        Self {
-            bounds,
+        let lower = bound_vec_to_key(&bounds.lower);
+        let mut cursor = Self {
             writes,
-            last_key: None,
+            upper: bound_vec_to_key(&bounds.upper),
+            heads: BinaryHeap::new(),
             pending: None,
+        };
+        for write_index in 0..cursor.writes.len() {
+            cursor.push_next(write_index, lower.clone());
         }
+        cursor
     }
 
     fn peek(&mut self) -> Option<&(Key, Option<Bytes>)> {
         if self.pending.is_none() {
-            self.pending = self.find_next();
+            let next = self.find_next();
+            self.pending = next;
         }
         self.pending.as_ref()
     }
 
     fn take(&mut self) -> Option<(Key, Option<Bytes>)> {
         let _ = self.peek();
-        let next = self.pending.take();
-        if let Some((key, _)) = &next {
-            self.last_key = Some(key.clone());
-        }
-        next
+        self.pending.take()
     }
 
-    fn find_next(&self) -> Option<(Key, Option<Bytes>)> {
-        let lower = self.last_key.as_ref().map_or_else(
-            || bound_vec_to_key(&self.bounds.lower),
-            |key| Bound::Excluded(key.clone()),
-        );
-        let upper = bound_vec_to_key(&self.bounds.upper);
-        let next_key = self
-            .writes
+    fn find_next(&mut self) -> Option<(Key, Option<Bytes>)> {
+        let first = self.heads.pop()?;
+        let key = first.key.clone();
+        let mut equal_heads = vec![first];
+        while self.heads.peek().is_some_and(|head| head.key == key) {
+            equal_heads.push(self.heads.pop().expect("peeked overlay head exists"));
+        }
+        let winner = equal_heads
             .iter()
-            .filter_map(|write| {
-                write
-                    .overlay
-                    .range((lower.clone(), upper.clone()))
-                    .next()
-                    .map(|(key, _)| key)
-            })
-            .min()
-            .cloned()?;
-        let value = self
-            .writes
-            .iter()
-            .rev()
-            .find_map(|write| write.overlay.get(&next_key).cloned())?;
-        Some((next_key, value))
+            .max_by_key(|head| head.publication_id)
+            .expect("at least one overlay head exists")
+            .write_index;
+        let value = self.writes[winner]
+            .overlay
+            .get(&key)
+            .cloned()
+            .expect("overlay head remains bound to its immutable publication");
+        for head in equal_heads {
+            self.push_next(head.write_index, Bound::Excluded(key.clone()));
+        }
+        Some((key, value))
+    }
+
+    fn push_next(&mut self, write_index: usize, lower: Bound<Key>) {
+        if key_bounds_are_empty(&lower, &self.upper) {
+            return;
+        }
+        let Some((key, _)) = self.writes[write_index]
+            .overlay
+            .range((lower, self.upper.clone()))
+            .next()
+        else {
+            return;
+        };
+        self.heads.push(OverlayHeapEntry {
+            key: key.clone(),
+            publication_id: self.writes[write_index].publication_id,
+            write_index,
+        });
+    }
+}
+
+fn key_bounds_are_empty(lower: &Bound<Key>, upper: &Bound<Key>) -> bool {
+    match (lower, upper) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
     }
 }
 
@@ -4372,21 +4478,6 @@ impl EncodedBounds {
     fn range(&self) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
         (self.lower.clone(), self.upper.clone())
     }
-
-    fn contains(&self, key: &Key) -> bool {
-        let key = key.0.as_ref();
-        let above_lower = match &self.lower {
-            Bound::Included(lower) => key >= lower.as_slice(),
-            Bound::Excluded(lower) => key > lower.as_slice(),
-            Bound::Unbounded => true,
-        };
-        let below_upper = match &self.upper {
-            Bound::Included(upper) => key <= upper.as_slice(),
-            Bound::Excluded(upper) => key < upper.as_slice(),
-            Bound::Unbounded => true,
-        };
-        above_lower && below_upper
-    }
 }
 
 fn exclusive_successor(key: &Key) -> Vec<u8> {
@@ -5402,26 +5493,70 @@ mod tests {
     #[test]
     fn encoded_bounds_normalize_to_half_open_ranges() {
         let key = Key(Bytes::from_static(b"key"));
-        let bounds = EncodedBounds::new(
-            KeyRange {
-                lower: Bound::Excluded(key.clone()),
-                upper: Bound::Included(key.clone()),
-            },
-            None,
-        );
+        let bounds = EncodedBounds::new(KeyRange {
+            lower: Bound::Excluded(key.clone()),
+            upper: Bound::Included(key.clone()),
+        });
         let successor = b"key\0".to_vec();
         assert_eq!(bounds.lower, Bound::Included(successor.clone()));
         assert_eq!(bounds.upper, Bound::Excluded(successor));
 
-        let bounds = EncodedBounds::new(
-            KeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            Some(&key),
-        );
+        let bounds = EncodedBounds::new(KeyRange {
+            lower: Bound::Excluded(key),
+            upper: Bound::Unbounded,
+        });
         assert_eq!(bounds.lower, Bound::Included(b"key\0".to_vec()));
         assert_eq!(bounds.upper, Bound::Unbounded);
+    }
+
+    #[test]
+    fn streaming_overlay_cursor_advances_heads_and_newest_duplicate_wins() {
+        let published = |publication_id, rows: &[(&'static [u8], Option<&'static [u8]>)]| {
+            Arc::new(PublishedWrite {
+                publication_id,
+                overlay: Arc::new(
+                    rows.iter()
+                        .map(|(key, value)| {
+                            (
+                                Key(Bytes::copy_from_slice(key)),
+                                value.map(Bytes::copy_from_slice),
+                            )
+                        })
+                        .collect(),
+                ),
+                persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
+            })
+        };
+        let older = published(
+            7,
+            &[(b"a", Some(b"old-a")), (b"b", None), (b"d", Some(b"old-d"))],
+        );
+        let newer = published(9, &[(b"a", Some(b"new-a")), (b"c", Some(b"new-c"))]);
+        let mut cursor = StreamingOverlayCursor::new(
+            EncodedBounds::new(KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            }),
+            vec![newer, older],
+        );
+        assert_eq!(
+            std::iter::from_fn(|| cursor.take()).collect::<Vec<_>>(),
+            vec![
+                (
+                    Key(Bytes::from_static(b"a")),
+                    Some(Bytes::from_static(b"new-a")),
+                ),
+                (Key(Bytes::from_static(b"b")), None),
+                (
+                    Key(Bytes::from_static(b"c")),
+                    Some(Bytes::from_static(b"new-c")),
+                ),
+                (
+                    Key(Bytes::from_static(b"d")),
+                    Some(Bytes::from_static(b"old-d")),
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -5553,19 +5688,19 @@ mod tests {
         }]))
         .expect("load immutable chunk key only");
         assert_eq!(key_only.values, vec![Some(ProjectedValue::KeyOnly)]);
-        let scan = block_on(read.scan(
+        let mut cursor = block_on(read.begin_scan(
             TEST_IMMUTABLE_SPACE,
             KeyRange {
                 lower: Bound::Unbounded,
                 upper: Bound::Unbounded,
             },
-            ScanOptions {
+            BeginScanOptions {
                 projection: CoreProjection::FullValue,
-                limit_rows: 16,
-                resume_after: None,
+                ..BeginScanOptions::default()
             },
         ))
-        .expect("scan immutable chunk");
+        .expect("begin immutable chunk scan");
+        let scan = block_on(cursor.next_page(16)).expect("scan immutable chunk");
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].key, key);
         assert_eq!(scan.entries[0].value, ProjectedValue::FullValue(value));
@@ -5604,6 +5739,197 @@ mod tests {
         }]))
         .expect_err("a published marker must not hide a missing immutable object");
         assert!(matches!(error, StorageError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_worker_poisons_streaming_cursor_fail_closed() {
+        let storage = SlateDB::open_object_store_with_options(
+            "cancel-during-worker",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open worker-cancellation storage");
+        let space = StorageSpace::mutable(SpaceId(0x77), "test.worker-cancellation");
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin worker-cancellation seed");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: Key(Bytes::from_static(b"a")),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"A"),
+                            },
+                        },
+                        PutEntry {
+                            key: Key(Bytes::from_static(b"b")),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"B"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("stage worker-cancellation seed");
+        write
+            .commit()
+            .await
+            .expect("commit worker-cancellation seed");
+
+        let mut read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin worker-cancellation read");
+        let gate = Arc::new(ScanTestGate::new());
+        read.scan_worker_gate = Some(Arc::clone(&gate));
+        let mut cursor = read
+            .begin_scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .expect("begin worker-cancellation cursor");
+        let mut page = Box::pin(cursor.next_page(1));
+        tokio::select! {
+            () = gate.wait_until_entered() => {}
+            result = &mut page => panic!("scan page completed before worker suspension: {result:?}"),
+        }
+        drop(page);
+        gate.release.notify_waiters();
+        assert!(matches!(
+            cursor.next_page(1).await,
+            Err(StorageError::InvalidCursor)
+        ));
+        drop(cursor);
+        drop(read);
+
+        let restart_read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin fresh worker-cancellation read");
+        let mut restart = restart_read
+            .begin_scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .expect("begin fresh worker-cancellation cursor");
+        let restarted = restart
+            .next_page(2)
+            .await
+            .expect("drain fresh worker-cancellation cursor");
+        assert_eq!(
+            restarted
+                .entries
+                .iter()
+                .map(|entry| entry.key.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"a".as_slice(), b"b".as_slice()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_immutable_hydration_poisons_streaming_cursor_without_skipping() {
+        let directory = tempfile::tempdir().expect("create cancelled-scan storage directory");
+        let storage = SlateDB::open(directory.path()).expect("open cancelled-scan storage");
+        let first_key = Key(Bytes::from(vec![0x31; 32]));
+        let second_key = Key(Bytes::from(vec![0x32; 32]));
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin cancelled-scan seed");
+        write
+            .put_many(
+                TEST_IMMUTABLE_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: first_key.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"first-value"),
+                            },
+                        },
+                        PutEntry {
+                            key: second_key.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"second-value"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("stage cancelled-scan seed");
+        write.commit().await.expect("commit cancelled-scan seed");
+
+        let mut read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin cancelled-scan read");
+        let gate = Arc::new(ScanTestGate::new());
+        read.scan_hydration_gate = Some(Arc::clone(&gate));
+        let mut cursor = read
+            .begin_scan(
+                TEST_IMMUTABLE_SPACE,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .expect("begin cancelled immutable scan");
+        let mut page = Box::pin(cursor.next_page(1));
+        tokio::select! {
+            () = gate.wait_until_entered() => {}
+            result = &mut page => panic!("scan page completed before hydration suspension: {result:?}"),
+        }
+        drop(page);
+        assert!(matches!(
+            cursor.next_page(1).await,
+            Err(StorageError::InvalidCursor)
+        ));
+        drop(cursor);
+        drop(read);
+
+        let restart_read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin explicit restart read");
+        let mut restart = restart_read
+            .begin_scan(
+                TEST_IMMUTABLE_SPACE,
+                KeyRange {
+                    lower: Bound::Excluded(first_key),
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .expect("begin explicit exclusive restart");
+        let restarted = restart
+            .next_page(1)
+            .await
+            .expect("read explicit exclusive restart page");
+        assert_eq!(restarted.entries.len(), 1);
+        assert_eq!(restarted.entries[0].key, second_key);
+        assert_eq!(
+            restarted.entries[0].value,
+            ProjectedValue::FullValue(Bytes::from_static(b"second-value"))
+        );
     }
 
     #[test]
@@ -6129,38 +6455,54 @@ mod tests {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         };
-        let scan = |resume_after, projection| {
-            block_on(read.scan(
-                space,
-                range.clone(),
-                ScanOptions {
-                    projection,
-                    limit_rows: 1,
-                    resume_after,
-                },
-            ))
-            .expect("scan cursor-test page")
-        };
-
-        let first = scan(None, CoreProjection::FullValue);
+        let mut cursor = block_on(read.begin_scan(
+            space,
+            range.clone(),
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        ))
+        .expect("begin cursor-test scan");
+        let first = block_on(cursor.next_page(1)).expect("scan first cursor-test page");
         assert_eq!(first.entries[0].key, keys[0]);
         assert!(first.has_more);
-        let second = scan(Some(keys[0].clone()), CoreProjection::FullValue);
+        let second = block_on(cursor.next_page(1)).expect("scan second cursor-test page");
         assert_eq!(second.entries[0].key, keys[1]);
         assert!(second.has_more);
 
-        // A changed projection cannot reuse the cursor, but stateless fallback
-        // must preserve the same continuation semantics.
-        let third = scan(Some(keys[1].clone()), CoreProjection::KeyOnly);
+        // A changed projection requires a new cursor with an explicit exclusive
+        // authenticated restart boundary.
+        let mut key_cursor = block_on(read.begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Excluded(keys[1].clone()),
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
+                projection: CoreProjection::KeyOnly,
+                ..BeginScanOptions::default()
+            },
+        ))
+        .expect("begin projected restart scan");
+        let third = block_on(key_cursor.next_page(1)).expect("scan projected restart page");
         assert_eq!(third.entries[0].key, keys[2]);
         assert_eq!(third.entries[0].value, ProjectedValue::KeyOnly);
         assert!(!third.has_more);
 
-        // Starting over abandons any cached continuation without affecting
-        // correctness, and the new scan can itself resume through the cursor.
-        let restarted = scan(None, CoreProjection::FullValue);
+        let mut restarted_cursor = block_on(read.begin_scan(
+            space,
+            range,
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        ))
+        .expect("begin restarted cursor-test scan");
+        let restarted = block_on(restarted_cursor.next_page(1)).expect("scan restarted first page");
         assert_eq!(restarted.entries[0].key, keys[0]);
-        let restarted_second = scan(Some(keys[0].clone()), CoreProjection::FullValue);
+        let restarted_second =
+            block_on(restarted_cursor.next_page(1)).expect("scan restarted second page");
         assert_eq!(restarted_second.entries[0].key, keys[1]);
     }
 
@@ -6317,17 +6659,19 @@ mod tests {
             .values,
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
+        let mut cursor = block_on(read.begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions::default(),
+        ))
+        .expect("begin pending point scan");
         assert_eq!(
-            block_on(read.scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                ScanOptions::default(),
-            ))
-            .expect("scan pending point")
-            .entries,
+            block_on(cursor.next_page(usize::MAX))
+                .expect("scan pending point")
+                .entries,
             vec![ReadEntry {
                 key: key.clone(),
                 value: ProjectedValue::FullValue(value.clone()),
@@ -6750,23 +7094,26 @@ mod tests {
             .values,
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
+        let mut cursor = block_on(older.begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions::default(),
+        ))
+        .expect("begin publication scan through older view");
         assert_eq!(
-            block_on(older.scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                ScanOptions::default(),
-            ))
-            .expect("read publication through older scan view")
-            .entries,
+            block_on(cursor.next_page(usize::MAX))
+                .expect("read publication through older scan view")
+                .entries,
             vec![ReadEntry {
                 key,
                 value: ProjectedValue::FullValue(value),
             }]
         );
 
+        drop(cursor);
         drop(older);
         assert!(
             storage

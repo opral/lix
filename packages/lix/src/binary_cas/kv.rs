@@ -15,9 +15,7 @@ use crate::binary_cas::{
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
-use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
-};
+use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, StorageWriteSet};
 use crate::storage_adapter::{
     StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
     StorageProjectedValue, StorageSpaceId, StorageValue,
@@ -151,8 +149,7 @@ async fn load_declared_manifest_chunks(
             u64::from(chunk_count),
         )))),
     };
-    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
-    scan_all_values_for_plan(store, &plan)
+    scan_all_values_for_range(store, BINARY_CAS_MANIFEST_CHUNK_SPACE, range)
         .await?
         .into_iter()
         .map(|value| {
@@ -184,8 +181,7 @@ async fn load_declared_manifest_chunk_range(
             blob_hash, end_index,
         )))),
     };
-    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
-    scan_all_values_for_plan(store, &plan)
+    scan_all_values_for_range(store, BINARY_CAS_MANIFEST_CHUNK_SPACE, range)
         .await?
         .into_iter()
         .map(|value| {
@@ -426,35 +422,33 @@ async fn scan_all_values(
     space: StorageSpace,
     prefix: Vec<u8>,
 ) -> Result<Vec<Vec<u8>>, LixError> {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::from(prefix),
-        },
-    );
-    scan_all_values_for_plan(store, &plan).await
+    let range = StoragePrefix {
+        bytes: Bytes::from(prefix),
+    }
+    .to_range()?;
+    scan_all_values_for_range(store, space, range).await
 }
 
-async fn scan_all_values_for_plan(
+async fn scan_all_values_for_range(
     store: &(impl StorageAdapterRead + ?Sized),
-    plan: &ScanPlan,
+    space: StorageSpace,
+    range: StorageKeyRange,
 ) -> Result<Vec<Vec<u8>>, LixError> {
     let mut values = Vec::new();
-    let mut cursor = plan
-        .begin(store, StorageBeginScanOptions::default())
+    let mut cursor = store
+        .begin_scan(space, range, StorageBeginScanOptions::default())
         .await?;
     loop {
         let page = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
         values.extend(
-            page.value
-                .entries
+            page.entries
                 .into_iter()
                 .filter_map(|entry| full_value(entry.value))
                 .map(|bytes| bytes.to_vec()),
         );
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
     }
@@ -2082,7 +2076,7 @@ mod tests {
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
         Memory, StorageError, StorageGetManyResult, StorageKeyRange, StorageReadOptions,
-        StorageScanChunk, StorageWriteOptions, StorageWriteSet,
+        StorageScanCursor, StorageWriteOptions, StorageWriteSet,
     };
 
     struct DelayedManifestScanRead<R> {
@@ -2152,12 +2146,12 @@ mod tests {
             self.inner.get_many(requests).await
         }
 
-        async fn scan(
+        async fn begin_scan(
             &self,
             space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageBeginScanOptions,
-        ) -> Result<StorageScanChunk, StorageError> {
+        ) -> Result<StorageScanCursor<'_>, StorageError> {
             let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE;
             let manifest_hash = if is_manifest_scan {
                 manifest_hash_from_range(&range)
@@ -2179,7 +2173,7 @@ mod tests {
                     tokio::time::sleep(self.default_manifest_delay).await;
                 }
             }
-            let result = self.inner.scan(space, range, opts).await;
+            let result = self.inner.begin_scan(space, range, opts).await;
             if is_manifest_scan {
                 self.active_manifest_scans.fetch_sub(1, Ordering::Relaxed);
                 if let Some(manifest_hash) = manifest_hash {

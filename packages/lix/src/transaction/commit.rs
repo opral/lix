@@ -6531,7 +6531,7 @@ mod tests {
         LiveStateProjection, LiveStateRowRequest, PACKED_CURRENT_BASE_SPACE,
     };
     use crate::storage::{
-        BeginScanOptions, CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, SpaceId,
+        BeginScanOptions, CommitResult, GetManyResult, KeyRange, PutBatch, ScanCursor, SpaceId,
         Storage, StorageError, StorageRead, StorageWrite,
     };
     use crate::storage_adapter::{
@@ -7006,7 +7006,7 @@ mod tests {
             space: StorageSpace,
             range: KeyRange,
             opts: BeginScanOptions,
-        ) -> Result<ScanCursor, StorageError> {
+        ) -> Result<ScanCursor<'_>, StorageError> {
             if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }

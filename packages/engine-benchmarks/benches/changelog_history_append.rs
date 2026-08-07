@@ -1,13 +1,14 @@
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lix::changelog::bench as changelog_bench;
 use lix::storage::{
-    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, WriteOptions,
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
+    PutBatch, ReadOptions, ScanChunk, ScanCursor, Storage, StorageError, StorageRead,
+    StorageScanSource, StorageSpace, StorageWrite, WriteOptions,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
@@ -352,18 +353,41 @@ where
         self.inner.get_many(requests).await
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let order = opts.order;
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_calls += 1;
         }
-        let chunk = self.inner.scan(space, range, opts).await?;
-        {
+        let inner = self.inner.begin_scan(space, range.clone(), opts).await?;
+        ScanCursor::from_source(
+            range,
+            order,
+            CountingScanSource {
+                inner,
+                stats: Arc::clone(&self.stats),
+            },
+        )
+    }
+}
+
+struct CountingScanSource<'a> {
+    inner: ScanCursor<'a>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl StorageScanSource for CountingScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let chunk = self.inner.next_page(limit_rows).await?;
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_rows += chunk.entries.len() as u64;
             stats.scan_value_bytes += chunk
@@ -371,8 +395,9 @@ where
                 .iter()
                 .map(|entry| projected_value_bytes(&entry.value) as u64)
                 .sum::<u64>();
-        }
-        Ok(chunk)
+            drop(stats);
+            Ok(chunk)
+        })
     }
 }
 

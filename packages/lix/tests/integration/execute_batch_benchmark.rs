@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
-    ReadOptions, ScanChunk, Storage, StorageError, StorageRead, WriteOptions,
+    ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix::{ExecuteBatchStatement, Value};
 
@@ -104,7 +104,7 @@ impl StorageRead for CountingRead {
         space: lix::storage::StorageSpace,
         range: KeyRange,
         options: BeginScanOptions,
-    ) -> Result<ScanCursor, StorageError> {
+    ) -> Result<ScanCursor<'_>, StorageError> {
         self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.begin_scan(space, range, options).await
     }

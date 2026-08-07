@@ -1,12 +1,12 @@
 use bytes::Bytes;
 use lix::storage::{Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, Storage};
 use lix::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
-    StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
-    StorageWriteOptions, StorageWriteSetStats,
+    PointReadPlan, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions,
+    StorageCoreProjection, StorageGetOptions, StoragePrefix, StorageReadOptions, StorageSpace,
+    StorageValue, StorageWriteOptions, StorageWriteSetStats,
 };
 
-use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, SQLite, StorageProfile};
+use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};
 
 const ROW_SPACE: StorageSpace =
@@ -20,10 +20,6 @@ struct BenchRow {
 }
 
 enum ProfileStorage {
-    SQLite {
-        storage: StorageAdapter<SQLite>,
-        _dir: tempfile::TempDir,
-    },
     RocksDB {
         storage: StorageAdapter<RocksDB>,
         _dir: tempfile::TempDir,
@@ -166,37 +162,30 @@ impl KvFixture {
 impl ProfileStorage {
     async fn insert_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::SQLite { storage, .. } => insert_all_storage(storage, rows).await,
             Self::RocksDB { storage, .. } => insert_all_storage(storage, rows).await,
         }
     }
 
     async fn update_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::SQLite { storage, .. } => update_all_storage(storage, rows).await,
             Self::RocksDB { storage, .. } => update_all_storage(storage, rows).await,
         }
     }
 
     async fn delete_all(&self, row_count: usize) -> KvWriteOutcome {
         match self {
-            Self::SQLite { storage, .. } => delete_all_storage(storage, row_count).await,
             Self::RocksDB { storage, .. } => delete_all_storage(storage, row_count).await,
         }
     }
 
     async fn delete_one(&self, row: &BenchRow) -> KvWriteOutcome {
         match self {
-            Self::SQLite { storage, .. } => delete_one_storage(storage, row).await,
             Self::RocksDB { storage, .. } => delete_one_storage(storage, row).await,
         }
     }
 
     async fn read_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
         match self {
-            Self::SQLite { storage, .. } => {
-                read_all_storage(storage, expected_rows, projection).await
-            }
             Self::RocksDB { storage, .. } => {
                 read_all_storage(storage, expected_rows, projection).await
             }
@@ -205,14 +194,12 @@ impl ProfileStorage {
 
     async fn read_points(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::SQLite { storage, .. } => read_points_storage(storage, rows).await,
             Self::RocksDB { storage, .. } => read_points_storage(storage, rows).await,
         }
     }
 
     async fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
         match self {
-            Self::SQLite { storage, .. } => layout_accounting_storage(storage).await,
             Self::RocksDB { storage, .. } => layout_accounting_storage(storage).await,
         }
     }
@@ -220,10 +207,6 @@ impl ProfileStorage {
 
 fn profile_storage(profile: StorageProfile) -> ProfileStorage {
     match profile.storage() {
-        RawProfileStorage::SQLite { storage, _dir: dir } => ProfileStorage::SQLite {
-            storage: StorageAdapter::new(storage),
-            _dir: dir,
-        },
         RawProfileStorage::RocksDB { storage, _dir: dir } => ProfileStorage::RocksDB {
             storage: StorageAdapter::new(storage),
             _dir: dir,
@@ -370,38 +353,31 @@ where
         .begin_read(StorageReadOptions::default())
         .await
         .expect("begin read");
-    let plan = ScanPlan::prefix(
-        ROW_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()
+            .expect("empty prefix range"),
+            StorageBeginScanOptions {
+                projection,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin row scan");
     let mut rows = 0usize;
     loop {
-        let page = plan
-            .collect(
-                &read,
-                StorageScanOptions {
-                    projection,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan rows");
-        rows += page.value.entries.len();
-        if !page.value.has_more {
+        rows += page.entries.len();
+        if !page.has_more {
             break;
         }
-        resume_after = Some(
-            page.value
-                .entries
-                .last()
-                .expect("non-terminal scan page must not be empty")
-                .key
-                .clone(),
-        );
     }
     assert_eq!(rows, expected_rows);
     rows
@@ -438,38 +414,37 @@ where
         .begin_read(StorageReadOptions::default())
         .await
         .expect("begin kv layout accounting read");
-    let plan = ScanPlan::prefix(
-        ROW_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()
+            .expect("empty prefix range"),
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin kv layout accounting scan");
     let mut rows = 0u64;
     let mut key_bytes = 0u64;
     let mut value_bytes = 0u64;
     loop {
-        let page = plan
-            .collect(
-                &read,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan kv layout accounting");
 
-        rows += page.value.entries.len() as u64;
+        rows += page.entries.len() as u64;
         key_bytes += page
-            .value
             .entries
             .iter()
             .map(|entry| entry.key.0.len() as u64 + 4)
             .sum::<u64>();
         value_bytes += page
-            .value
             .entries
             .iter()
             .map(|entry| match &entry.value {
@@ -478,17 +453,9 @@ where
             })
             .sum::<u64>();
 
-        if !page.value.has_more {
+        if !page.has_more {
             break;
         }
-        resume_after = Some(
-            page.value
-                .entries
-                .last()
-                .expect("non-terminal accounting page must not be empty")
-                .key
-                .clone(),
-        );
     }
 
     if rows == 0 {

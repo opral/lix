@@ -460,3 +460,42 @@ impl GetManyResult {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_ranges_cover_exact_lexicographic_edges() {
+        let cases = [
+            (
+                &[][..],
+                Bound::Included(Key(Bytes::new())),
+                Bound::Unbounded,
+            ),
+            (
+                &[0x61][..],
+                Bound::Included(Key(Bytes::from_static(&[0x61]))),
+                Bound::Excluded(Key(Bytes::from_static(&[0x62]))),
+            ),
+            (
+                &[0x61, 0xff][..],
+                Bound::Included(Key(Bytes::from_static(&[0x61, 0xff]))),
+                Bound::Excluded(Key(Bytes::from_static(&[0x62]))),
+            ),
+            (
+                &[0xff, 0xff][..],
+                Bound::Included(Key(Bytes::from_static(&[0xff, 0xff]))),
+                Bound::Unbounded,
+            ),
+        ];
+        for (bytes, lower, upper) in cases {
+            let actual = Prefix {
+                bytes: Bytes::copy_from_slice(bytes),
+            }
+            .to_range()
+            .expect("prefix range should be valid");
+            assert_eq!(actual, KeyRange { lower, upper });
+        }
+    }
+}

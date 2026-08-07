@@ -809,22 +809,26 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open upload cleanup read");
-        let temporary_receipts = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 UPLOAD_MANIFEST_LEAF_SPACE,
                 upload_manifest_leaf_range("movie-proxy-1").expect("upload leaf range"),
                 StorageBeginScanOptions {
                     projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
+            .await
+            .expect("begin temporary upload receipt scan");
+        let temporary_receipts = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan temporary upload receipts");
         assert!(
             temporary_receipts.entries.is_empty(),
             "publication must atomically remove temporary chunk receipts",
         );
+        drop(cursor);
         drop(read);
         let published_commit_id = resumed_session
             .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
@@ -895,8 +899,8 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open CAS accounting read");
-        let chunks = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 BINARY_CAS_CHUNK_SPACE,
                 StorageKeyRange {
                     lower: Bound::Unbounded,
@@ -904,10 +908,13 @@ mod tests {
                 },
                 StorageBeginScanOptions {
                     projection: StorageCoreProjection::KeyOnly,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
+            .await
+            .expect("begin CAS chunk scan");
+        let chunks = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan CAS chunks");
         assert!(!chunks.has_more);
@@ -961,16 +968,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read upload leaves");
-        let leaves = read
-            .scan(
+        let mut cursor = read
+            .begin_scan(
                 UPLOAD_MANIFEST_LEAF_SPACE,
                 upload_manifest_leaf_range("windowed-proxy").expect("leaf range"),
                 StorageBeginScanOptions {
                     projection: StorageCoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after: None,
+                    ..StorageBeginScanOptions::default()
                 },
             )
+            .await
+            .expect("begin upload leaf scan");
+        let leaves = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan upload leaves");
         assert_eq!(leaves.entries.len(), 3);
@@ -981,6 +991,7 @@ mod tests {
             let leaf = decode_upload_manifest_leaf(&value).expect("decode manifest leaf");
             assert_eq!(leaf.chunks.len(), FILE_UPLOAD_PART_BYTES / (1024 * 1024));
         }
+        drop(cursor);
         drop(read);
 
         let outside_window = session

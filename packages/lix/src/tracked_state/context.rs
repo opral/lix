@@ -8390,24 +8390,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("chunk inventory read should open");
-        let chunk = crate::storage_adapter::ScanPlan::range(
-            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
-            crate::storage_adapter::StorageKeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-        )
-        .collect(
-            &read,
-            crate::storage_adapter::StorageBeginScanOptions {
-                projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
-                limit_rows: usize::MAX,
-                resume_after: None,
-            },
-        )
-        .await
-        .expect("chunk inventory should scan")
-        .value;
+        let mut cursor = read
+            .begin_scan(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                crate::storage_adapter::StorageBeginScanOptions {
+                    projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
+                    ..crate::storage_adapter::StorageBeginScanOptions::default()
+                },
+            )
+            .await
+            .expect("chunk inventory scan should begin");
+        let chunk = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await
+            .expect("chunk inventory should scan");
         assert!(!chunk.has_more, "test chunk inventory must fit one page");
         chunk
             .entries

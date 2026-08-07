@@ -669,7 +669,7 @@ mod tests {
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
     use crate::storage::{
-        BeginScanOptions, GetManyResult, KeyRange, ScanChunk, StorageError, StorageRead,
+        BeginScanOptions, GetManyResult, KeyRange, ScanCursor, StorageError, StorageRead,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageKey,
@@ -713,7 +713,7 @@ mod tests {
             space: crate::storage::StorageSpace,
             range: KeyRange,
             opts: BeginScanOptions,
-        ) -> Result<ScanCursor, StorageError> {
+        ) -> Result<ScanCursor<'_>, StorageError> {
             self.inner.begin_scan(space, range, opts).await
         }
     }

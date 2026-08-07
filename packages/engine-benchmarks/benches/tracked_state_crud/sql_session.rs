@@ -7,7 +7,7 @@ use lix::{ExecuteBatchStatement, ExecuteResult, PreparedDmlParameterBatch, Value
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
-use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
+use crate::storage::{ProfileStorage, RocksDB, StorageProfile};
 use crate::workload::{UpdateWorkloadRow, WorkloadRow, sql_string};
 
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
@@ -187,7 +187,6 @@ impl UntrackedFixture {
 }
 
 pub(crate) enum SqlFixture {
-    SQLite(GenericSqlFixture<SQLite>),
     RocksDB(GenericSqlFixture<RocksDB>),
     #[cfg(feature = "slatedb")]
     SlateDB(GenericSqlFixture<SlateDB>),
@@ -244,14 +243,6 @@ async fn empty_fixture_with_shape(
     );
     let untracked_fixture = profile_untracked_fixture();
     match profile.storage() {
-        ProfileStorage::SQLite { storage, _dir: dir } => SqlFixture::SQLite(fixture_for_session(
-            prepare_session(storage).await,
-            rows,
-            read_many_by_pk_count,
-            untracked_fixture,
-            shape,
-            dir,
-        )),
         ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
             prepare_session(storage).await,
             rows,
@@ -355,7 +346,6 @@ pub(crate) async fn seeded_bound_update_fixture_with_read_many_pk_count(
 impl SqlFixture {
     fn install_olap_mutation_profile(&mut self, mutation_profile: OlapMutationProfile) {
         match self {
-            Self::SQLite(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
             Self::RocksDB(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
@@ -364,7 +354,6 @@ impl SqlFixture {
 
     fn release_bound_update_setup(&mut self) {
         match self {
-            Self::SQLite(fixture) => fixture.release_bound_update_setup(),
             Self::RocksDB(fixture) => fixture.release_bound_update_setup(),
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.release_bound_update_setup(),
@@ -373,7 +362,6 @@ impl SqlFixture {
 
     fn install_bound_seed_batch(&mut self, rows: Vec<WorkloadRow>) {
         match self {
-            Self::SQLite(fixture) => fixture.install_bound_seed_batch(rows),
             Self::RocksDB(fixture) => fixture.install_bound_seed_batch(rows),
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.install_bound_seed_batch(rows),
@@ -382,7 +370,6 @@ impl SqlFixture {
 
     fn install_bound_update_batch(&mut self, rows: Vec<UpdateWorkloadRow>) {
         match self {
-            Self::SQLite(fixture) => fixture.install_bound_update_batch(rows),
             Self::RocksDB(fixture) => fixture.install_bound_update_batch(rows),
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.install_bound_update_batch(rows),
@@ -391,7 +378,6 @@ impl SqlFixture {
 
     pub(crate) async fn insert_all(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.insert_all().await,
             Self::RocksDB(fixture) => fixture.insert_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.insert_all().await,
@@ -400,7 +386,6 @@ impl SqlFixture {
 
     pub(crate) async fn active_commit_id(&self) -> String {
         match self {
-            Self::SQLite(fixture) => fixture.active_commit_id().await,
             Self::RocksDB(fixture) => fixture.active_commit_id().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.active_commit_id().await,
@@ -409,7 +394,6 @@ impl SqlFixture {
 
     pub(crate) async fn columnar_history_count(&self, commit_id: &str) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.columnar_history_count(commit_id).await,
             Self::RocksDB(fixture) => fixture.columnar_history_count(commit_id).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.columnar_history_count(commit_id).await,
@@ -418,7 +402,6 @@ impl SqlFixture {
 
     pub(crate) async fn columnar_diff_count(&self, before: &str, after: &str) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.columnar_diff_count(before, after).await,
             Self::RocksDB(fixture) => fixture.columnar_diff_count(before, after).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.columnar_diff_count(before, after).await,
@@ -427,7 +410,6 @@ impl SqlFixture {
 
     async fn seed_rows(&self) {
         match self {
-            Self::SQLite(fixture) => fixture.seed_rows().await,
             Self::RocksDB(fixture) => fixture.seed_rows().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.seed_rows().await,
@@ -443,7 +425,6 @@ impl SqlFixture {
 
     async fn apply_olap_mutations(&self, mutation_profile: OlapMutationProfile) {
         match self {
-            Self::SQLite(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
             Self::RocksDB(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
@@ -452,7 +433,6 @@ impl SqlFixture {
 
     async fn insert_untracked_probe(&self) {
         match self {
-            Self::SQLite(fixture) => fixture.insert_untracked_probe().await,
             Self::RocksDB(fixture) => fixture.insert_untracked_probe().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.insert_untracked_probe().await,
@@ -476,7 +456,6 @@ impl SqlFixture {
             ),
         }
         match self {
-            Self::SQLite(fixture) => fixture.read_all().await,
             Self::RocksDB(fixture) => fixture.read_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_all().await,
@@ -488,7 +467,6 @@ impl SqlFixture {
     /// making the exact scan-vs-aggregate boundary reproducible at 1M rows.
     async fn count_all(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.count_all().await,
             Self::RocksDB(fixture) => fixture.count_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.count_all().await,
@@ -497,7 +475,6 @@ impl SqlFixture {
 
     async fn general_filter_sort_all(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.general_filter_sort_all().await,
             Self::RocksDB(fixture) => fixture.general_filter_sort_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.general_filter_sort_all().await,
@@ -506,7 +483,6 @@ impl SqlFixture {
 
     async fn general_aggregate(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.general_aggregate().await,
             Self::RocksDB(fixture) => fixture.general_aggregate().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.general_aggregate().await,
@@ -515,7 +491,6 @@ impl SqlFixture {
 
     pub(crate) async fn read_olap(&self, shape: OlapReadShape) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_olap(shape).await,
             Self::RocksDB(fixture) => fixture.read_olap(shape).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_olap(shape).await,
@@ -530,7 +505,6 @@ impl SqlFixture {
         shape: OlapReadShape,
     ) -> (usize, lix::SqlReadProfile) {
         match self {
-            Self::SQLite(fixture) => fixture.read_olap_profiled(shape).await,
             Self::RocksDB(fixture) => fixture.read_olap_profiled(shape).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_olap_profiled(shape).await,
@@ -539,7 +513,6 @@ impl SqlFixture {
 
     async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_olap_timed(shape).await,
             Self::RocksDB(fixture) => fixture.read_olap_timed(shape).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_olap_timed(shape).await,
@@ -556,7 +529,6 @@ impl SqlFixture {
     #[allow(dead_code)]
     pub(crate) async fn read_all_result(&self) -> ExecuteResult {
         match self {
-            Self::SQLite(fixture) => fixture.read_all_result().await,
             Self::RocksDB(fixture) => fixture.read_all_result().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_all_result().await,
@@ -565,7 +537,6 @@ impl SqlFixture {
 
     pub(crate) async fn read_many_by_pk(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_many_by_pk().await,
             Self::RocksDB(fixture) => fixture.read_many_by_pk().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_many_by_pk().await,
@@ -576,7 +547,6 @@ impl SqlFixture {
     #[allow(dead_code)]
     pub(crate) async fn read_many_by_pk_result(&self) -> ExecuteResult {
         match self {
-            Self::SQLite(fixture) => fixture.read_many_by_pk_result().await,
             Self::RocksDB(fixture) => fixture.read_many_by_pk_result().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_many_by_pk_result().await,
@@ -585,7 +555,6 @@ impl SqlFixture {
 
     pub(crate) async fn read_one_by_pk(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.read_one_by_pk().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_one_by_pk().await,
@@ -596,7 +565,6 @@ impl SqlFixture {
     #[allow(dead_code)]
     pub(crate) async fn read_one_by_pk_result(&self) -> ExecuteResult {
         match self {
-            Self::SQLite(fixture) => fixture.read_one_by_pk_result().await,
             Self::RocksDB(fixture) => fixture.read_one_by_pk_result().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_one_by_pk_result().await,
@@ -605,7 +573,6 @@ impl SqlFixture {
 
     pub(crate) async fn update_all(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_all().await,
             Self::RocksDB(fixture) => fixture.update_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.update_all().await,
@@ -617,7 +584,6 @@ impl SqlFixture {
     /// literal SQL planning from the versioned write path.
     pub(crate) async fn update_all_bound(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_all_bound().await,
             Self::RocksDB(fixture) => fixture.update_all_bound().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.update_all_bound().await,
@@ -626,7 +592,6 @@ impl SqlFixture {
 
     pub(crate) async fn update_bound_rows(&self, row_count: usize) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_bound_rows(row_count).await,
             Self::RocksDB(fixture) => fixture.update_bound_rows(row_count).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.update_bound_rows(row_count).await,
@@ -635,7 +600,6 @@ impl SqlFixture {
 
     pub(crate) async fn update_spread_bound_rows(&self, row_count: usize) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_spread_bound_rows(row_count).await,
             Self::RocksDB(fixture) => fixture.update_spread_bound_rows(row_count).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.update_spread_bound_rows(row_count).await,
@@ -644,7 +608,6 @@ impl SqlFixture {
 
     pub(crate) async fn update_one_by_pk(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.update_one_by_pk().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.update_one_by_pk().await,
@@ -653,7 +616,6 @@ impl SqlFixture {
 
     pub(crate) async fn delete_all(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.delete_all().await,
             Self::RocksDB(fixture) => fixture.delete_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.delete_all().await,
@@ -662,7 +624,6 @@ impl SqlFixture {
 
     pub(crate) async fn delete_one_by_pk(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.delete_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.delete_one_by_pk().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.delete_one_by_pk().await,

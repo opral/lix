@@ -58,7 +58,7 @@ RTT. Production SLOs must add measured network latency; this result must not be
 presented as a public-internet end-to-end number.
 
 Both capacity rows use Lix's canonical in-memory storage so they isolate the
-engine and transport paths. A deployment using SQLite, RocksDB, SlateDB, or a
+engine and transport paths. A deployment using RocksDB, SlateDB, or a
 remote object store must run the same gate on that storage before claiming its
 own production capacity.
 

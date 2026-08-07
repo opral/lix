@@ -18,8 +18,8 @@ mod tests {
         StorageRead, StorageScanSource, StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{
-        PointReadPlan, ScanPlan, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
-        StorageAdapterReadScope, StorageReadStats, StorageSpace, exact_get_many,
+        PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
+        StorageAdapterReadScope, StorageSpace, exact_get_many,
     };
 
     fn key(bytes: &'static str) -> Key {
@@ -296,15 +296,16 @@ mod tests {
         let read = StorageAdapterReadScope::new(spy);
 
         for prefix in [b"".as_slice(), b"\xff".as_slice(), b"\x00\xff".as_slice()] {
-            ScanPlan::prefix(
-                space(),
-                Prefix {
-                    bytes: Bytes::copy_from_slice(prefix),
-                },
-            )
-            .first_page(&read, BeginScanOptions::default())
-            .await
-            .expect("prefix scan");
+            let range = Prefix {
+                bytes: Bytes::copy_from_slice(prefix),
+            }
+            .to_range()
+            .expect("valid prefix range");
+            let mut cursor = read
+                .begin_scan(space(), range, BeginScanOptions::default())
+                .await
+                .expect("begin prefix scan");
+            cursor.next_page(1).await.expect("prefix scan");
         }
 
         assert_eq!(
@@ -331,35 +332,27 @@ mod tests {
         let spy = SpyRead::default();
         let scan_calls = Arc::clone(&spy.scan_calls);
         let read = StorageAdapterReadScope::new(spy);
-        let result = ScanPlan::prefix(
-            space(),
-            Prefix {
-                bytes: Bytes::from_static(b"a"),
-            },
-        )
-        .page(
-            &read,
-            BeginScanOptions {
-                projection: CoreProjection::KeyOnly,
-                ..BeginScanOptions::default()
-            },
-            0,
-        )
-        .await
-        .expect("zero-limit prefix scan");
+        let range = Prefix {
+            bytes: Bytes::from_static(b"a"),
+        }
+        .to_range()
+        .expect("valid prefix range");
+        let mut cursor = read
+            .begin_scan(
+                space(),
+                range,
+                BeginScanOptions {
+                    projection: CoreProjection::KeyOnly,
+                    ..BeginScanOptions::default()
+                },
+            )
+            .await
+            .expect("begin zero-limit prefix scan");
+        let result = cursor.next_page(0).await.expect("zero-limit prefix scan");
 
-        assert!(result.value.entries.is_empty());
-        assert!(!result.value.has_more);
+        assert!(result.entries.is_empty());
+        assert!(!result.has_more);
         assert_eq!(scan_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            result.stats,
-            StorageReadStats {
-                prefix_lowered: 1,
-                prefix_scan_chunks: 1,
-                scan_key_only_chunks: 1,
-                ..StorageReadStats::default()
-            }
-        );
     }
 
     #[tokio::test]
@@ -377,29 +370,27 @@ mod tests {
             .begin_read(ReadOptions::default())
             .await
             .expect("begin read");
-        let plan = ScanPlan::range(
-            space(),
-            KeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-        );
-
-        let mut cursor = plan
-            .begin(&read, BeginScanOptions::default())
+        let mut cursor = read
+            .begin_scan(
+                space(),
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
             .await
             .expect("begin cursor");
         let page = cursor.next_page(1).await.expect("first page");
-        assert_eq!(page.value.entries[0].key, key("a"));
-        assert!(page.value.has_more);
+        assert_eq!(page.entries[0].key, key("a"));
+        assert!(page.has_more);
 
         let next = cursor
             .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
             .await
             .expect("second page");
         assert_eq!(
-            next.value
-                .entries
+            next.entries
                 .into_iter()
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>(),

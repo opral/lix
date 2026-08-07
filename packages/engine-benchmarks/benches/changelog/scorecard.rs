@@ -12,9 +12,8 @@ use storage::ChangelogBenchStorage;
 
 type TimedFuture = Pin<Box<dyn Future<Output = Result<Duration, LixError>>>>;
 
-const STORAGE_IMPLEMENTATIONS: [ChangelogBenchStorage; 3] = [
+const STORAGE_IMPLEMENTATIONS: [ChangelogBenchStorage; 2] = [
     ChangelogBenchStorage::Unit,
-    ChangelogBenchStorage::SQLiteTempfile,
     ChangelogBenchStorage::RocksDBTempdir,
 ];
 
@@ -327,7 +326,6 @@ async fn storage_row(
     let mut row = StorageScoreRow {
         label,
         mem_unit: Duration::ZERO,
-        sqlite_tempfile: Duration::ZERO,
         rocksdb_tempdir: Duration::ZERO,
     };
 
@@ -336,7 +334,6 @@ async fn storage_row(
         let duration = measure_async(samples, || op(storage)).await?;
         match storage {
             ChangelogBenchStorage::Unit => row.mem_unit = duration,
-            ChangelogBenchStorage::SQLiteTempfile => row.sqlite_tempfile = duration,
             ChangelogBenchStorage::RocksDBTempdir => row.rocksdb_tempdir = duration,
         }
     }
@@ -377,7 +374,6 @@ fn median(mut durations: Vec<Duration>) -> Duration {
 struct StorageScoreRow {
     label: &'static str,
     mem_unit: Duration,
-    sqlite_tempfile: Duration,
     rocksdb_tempdir: Duration,
 }
 
@@ -392,14 +388,13 @@ fn print_scorecard(cpu: &[(&'static str, Duration)], storage: &[StorageScoreRow]
     println!();
     println!("## Storage Smoke Scoreboard");
     println!();
-    println!("| row | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |");
-    println!("| --- | ---: | ---: | ---: |");
+    println!("| row | mem_unit_ms | rocksdb_tempdir_ms |");
+    println!("| --- | ---: | ---: |");
     for row in storage {
         println!(
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} |",
             row.label,
             ms(row.mem_unit),
-            ms(row.sqlite_tempfile),
             ms(row.rocksdb_tempdir)
         );
     }

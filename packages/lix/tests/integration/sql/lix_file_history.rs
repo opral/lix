@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6,7 +7,8 @@ use lix::Value;
 use lix::integration::Engine;
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
-    ReadOptions, ScanChunk, Storage, StorageError, StorageRead, WriteOptions,
+    ReadOptions, ScanChunk, ScanCursor, Storage, StorageError, StorageRead, StorageScanSource,
+    WriteOptions,
 };
 use lix::{CreateBranchOptions, LixError, MergeBranchOptions};
 use serde_json::json;
@@ -88,12 +90,37 @@ impl StorageRead for CountingRead {
         space: lix::storage::StorageSpace,
         range: KeyRange,
         options: BeginScanOptions,
-    ) -> Result<ScanCursor, StorageError> {
-        let chunk = self.inner.begin_scan(space, range, options).await?;
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let order = options.order;
+        let inner = self.inner.begin_scan(space, range.clone(), options).await?;
         self.scan_calls.fetch_add(1, Ordering::Relaxed);
-        self.scanned_rows
-            .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
-        Ok(chunk)
+        ScanCursor::from_source(
+            range,
+            order,
+            CountingScanSource {
+                inner,
+                scanned_rows: Arc::clone(&self.scanned_rows),
+            },
+        )
+    }
+}
+
+struct CountingScanSource<'a> {
+    inner: ScanCursor<'a>,
+    scanned_rows: Arc<AtomicU64>,
+}
+
+impl StorageScanSource for CountingScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let chunk = self.inner.next_page(limit_rows).await?;
+            self.scanned_rows
+                .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
+            Ok(chunk)
+        })
     }
 }
 

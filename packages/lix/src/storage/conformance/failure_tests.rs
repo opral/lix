@@ -3,7 +3,7 @@
     reason = "failure storage implementations mirror explicit Send future signatures from storage traits"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
@@ -15,8 +15,8 @@ use super::{
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange,
     Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk,
-    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
-    WriteStats,
+    ScanCursor, SpaceId, Storage, StorageError, StorageRead, StorageScanSource, StorageWrite,
+    StoredValue, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -367,21 +367,14 @@ impl StorageRead for BrokenRead {
         }
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: crate::storage::StorageSpace,
         range: KeyRange,
         opts: BeginScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         async move {
-            let range = broken_physical_range(space.id, range);
-            let opts = BeginScanOptions {
-                resume_after: opts
-                    .resume_after
-                    .as_ref()
-                    .map(|key| broken_physical_key(space.id, key)),
-                ..opts
-            };
+            let physical_range = broken_physical_range(space.id, range.clone());
             let live_entries;
             let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
                 live_entries = self
@@ -393,12 +386,54 @@ impl StorageRead for BrokenRead {
             } else {
                 &self.snapshot
             };
-            let mut chunk = scan_from_map(entries, self.mode, range, &opts);
-            for entry in &mut chunk.entries {
+            let mut rows = scan_entries_from_map(entries, self.mode, physical_range, &opts);
+            for entry in &mut rows {
                 entry.key = Key(entry.key.0.slice(4..));
             }
-            Ok(chunk)
+            ScanCursor::from_source(
+                range,
+                opts.order,
+                BrokenScanSource {
+                    rows: rows.into(),
+                    mode: self.mode,
+                    last: None,
+                },
+            )
         }
+    }
+}
+
+struct BrokenScanSource {
+    rows: VecDeque<ReadEntry>,
+    mode: BrokenMode,
+    last: Option<ReadEntry>,
+}
+
+impl StorageScanSource for BrokenScanSource {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut entries = Vec::with_capacity(limit_rows);
+            if matches!(self.mode, BrokenMode::KeyResumeRepeatsLastKey)
+                && let Some(last) = self.last.clone()
+                && limit_rows != 0
+            {
+                entries.push(last);
+            }
+            while entries.len() < limit_rows {
+                let Some(entry) = self.rows.pop_front() else {
+                    break;
+                };
+                self.last = Some(entry.clone());
+                entries.push(entry);
+            }
+            Ok(ScanChunk {
+                entries,
+                has_more: !self.rows.is_empty(),
+            })
+        })
     }
 }
 
@@ -551,12 +586,12 @@ fn get_many_from_map(
     )
 }
 
-fn scan_from_map(
+fn scan_entries_from_map(
     entries: &BrokenMap,
     mode: BrokenMode,
     range: KeyRange,
     opts: &BeginScanOptions,
-) -> ScanChunk {
+) -> Vec<ReadEntry> {
     let mut candidates = entries
         .iter()
         .filter(|(key, _)| range_contains(&range, key))
@@ -571,27 +606,13 @@ fn scan_from_map(
         });
     }
 
-    let mut candidates = candidates.into_iter().filter(|(key, _)| {
-        !opts.resume_after.as_ref().is_some_and(|resume_after| {
-            if matches!(mode, BrokenMode::KeyResumeRepeatsLastKey) {
-                *key < resume_after
-            } else {
-                *key <= resume_after
-            }
-        })
-    });
-    let rows = candidates
-        .by_ref()
-        .take(opts.page_size())
+    candidates
+        .into_iter()
         .map(|(key, value)| ReadEntry {
             key: key.clone(),
             value: project_value(value, mode, opts.projection, true),
         })
-        .collect();
-    ScanChunk {
-        entries: rows,
-        has_more: candidates.next().is_some(),
-    }
+        .collect()
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {

@@ -16,8 +16,8 @@ use lix::storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
 use lix::storage::{
-    CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
+    PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, StoredValue, WriteOptions,
 };
 use lix::{LixError, Value};
@@ -286,19 +286,22 @@ async fn slatedb_streams_unbounded_scan_limits() {
         .begin_read(ReadOptions::default())
         .await
         .expect("begin slatedb read");
-    let result = read
-        .scan(
+    let mut cursor = read
+        .begin_scan(
             StorageSpace::mutable(SpaceId(1), "test.mutable"),
             KeyRange {
                 lower: Bound::Unbounded,
                 upper: Bound::Unbounded,
             },
-            ScanOptions {
+            BeginScanOptions {
                 projection: CoreProjection::KeyOnly,
-                limit_rows: usize::MAX,
-                resume_after: None,
+                ..BeginScanOptions::default()
             },
         )
+        .await
+        .expect("begin scan slatedb rows");
+    let result = cursor
+        .next_page(usize::MAX)
         .await
         .expect("scan slatedb rows");
 
@@ -507,19 +510,22 @@ async fn assert_cached_rows(
         .begin_read(ReadOptions::default())
         .await
         .expect("begin cached read");
-    let result = read
-        .scan(
+    let mut cursor = read
+        .begin_scan(
             space,
             KeyRange {
                 lower: Bound::Unbounded,
                 upper: Bound::Unbounded,
             },
-            ScanOptions {
+            BeginScanOptions {
                 projection: CoreProjection::FullValue,
-                limit_rows: usize::MAX,
-                resume_after: None,
+                ..BeginScanOptions::default()
             },
         )
+        .await
+        .expect("begin cached scan");
+    let result = cursor
+        .next_page(usize::MAX)
         .await
         .expect("scan cached rows");
 

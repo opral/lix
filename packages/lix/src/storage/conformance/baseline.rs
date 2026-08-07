@@ -15,8 +15,8 @@ use crate::storage::conformance::{
 };
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition,
-    ProjectedValue, ReadEntry, ReadOptions, ScanChunk, SpaceId, Storage, StorageError, StorageRead,
-    StorageSpace, StorageWrite, WriteOptions,
+    ProjectedValue, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SpaceId, Storage, StorageError,
+    StorageRead, StorageSpace, StorageWrite, WriteOptions,
 };
 
 pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -116,6 +116,22 @@ where
     run!(
         "baseline::begin_read_pins_coherent_view",
         begin_read_pins_coherent_view
+    );
+    run!(
+        "baseline::scan_cursor_survives_concurrent_commit_and_restarts_exclusively",
+        scan_cursor_survives_concurrent_commit_and_restarts_exclusively
+    );
+    run!(
+        "baseline::unpolled_scan_page_cancellation_keeps_cursor_usable",
+        unpolled_scan_page_cancellation_keeps_cursor_usable
+    );
+    run!(
+        "baseline::descending_scan_is_explicitly_unsupported",
+        descending_scan_is_explicitly_unsupported
+    );
+    run!(
+        "baseline::invalid_scan_range_fails_closed",
+        invalid_scan_range_fails_closed
     );
     run!(
         "baseline::full_value_and_key_only_are_core",
@@ -557,7 +573,7 @@ where
     };
 
     let mut cursor = read
-        .begin_scan(test_space, range, BeginScanOptions::default())
+        .begin_scan(TEST_SPACE, range, BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin scan_range failed: {error}"))?;
     let first = cursor
@@ -844,7 +860,7 @@ where
     for limit in [1usize, 2, 3] {
         let mut actual = Vec::new();
         let mut cursor = read
-            .begin_scan(test_space, range.clone(), BeginScanOptions::default())
+            .begin_scan(TEST_SPACE, range.clone(), BeginScanOptions::default())
             .await
             .map_err(|error| format!("begin scan limit {limit} failed: {error}"))?;
         loop {
@@ -1103,6 +1119,182 @@ where
     assert_read_entries(&old_scan.entries, &[("a", "A")])?;
 
     assert_get_entries(&storage, test_space, &[("a", Some("C"))]).await
+}
+
+async fn scan_cursor_survives_concurrent_commit_and_restarts_exclusively<F>(
+    factory: &F,
+) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    seed_full_values(
+        &storage,
+        TEST_SPACE,
+        [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")],
+    )
+    .await?;
+
+    let old_read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin old read failed: {error}"))?;
+    let full_range = KeyRange {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    };
+    let mut old_cursor = old_read
+        .begin_scan(TEST_SPACE, full_range.clone(), BeginScanOptions::default())
+        .await
+        .map_err(|error| format!("begin old cursor failed: {error}"))?;
+    let first = old_cursor
+        .next_page(2)
+        .await
+        .map_err(|error| format!("old cursor first page failed: {error}"))?;
+    assert_read_entries(&first.entries, &[("a", "A"), ("b", "B")])?;
+    if !first.has_more {
+        return Err("old cursor ended before its second page".to_string());
+    }
+
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .map_err(|error| format!("begin concurrent write failed: {error}"))?;
+    write
+        .delete_many(TEST_SPACE, &[key("d")])
+        .await
+        .map_err(|error| format!("stage concurrent delete failed: {error}"))?;
+    write
+        .put_many(
+            TEST_SPACE,
+            put_batch([
+                full_put(key("c"), Bytes::from_static(b"C2")),
+                full_put(key("e"), Bytes::from_static(b"E")),
+            ]),
+        )
+        .await
+        .map_err(|error| format!("stage concurrent puts failed: {error}"))?;
+    write
+        .commit()
+        .await
+        .map_err(|error| format!("commit concurrent mutation failed: {error}"))?;
+
+    let second = old_cursor
+        .next_page(2)
+        .await
+        .map_err(|error| format!("old cursor second page failed: {error}"))?;
+    assert_read_entries(&second.entries, &[("c", "C"), ("d", "D")])?;
+    if second.has_more {
+        return Err("old cursor exposed unexpected rows after its snapshot tail".to_string());
+    }
+    drop(old_cursor);
+    drop(old_read);
+
+    let current_read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin current read failed: {error}"))?;
+    let mut restarted = current_read
+        .begin_scan(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Excluded(key("b")),
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions::default(),
+        )
+        .await
+        .map_err(|error| format!("begin exclusive restart failed: {error}"))?;
+    let restarted_page = restarted
+        .next_page(usize::MAX)
+        .await
+        .map_err(|error| format!("exclusive restart failed: {error}"))?;
+    assert_read_entries(&restarted_page.entries, &[("c", "C2"), ("e", "E")])
+}
+
+async fn descending_scan_is_explicitly_unsupported<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    let result = read
+        .begin_scan(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
+                order: ScanOrder::Descending,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await;
+    match result {
+        Err(StorageError::Unsupported(crate::storage::Capability::ReverseScan)) => Ok(()),
+        Err(error) => Err(format!("descending scan returned wrong error: {error}")),
+        Ok(_) => Err("descending scan unexpectedly succeeded".to_string()),
+    }
+}
+
+async fn unpolled_scan_page_cancellation_keeps_cursor_usable<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    seed_full_values(&storage, TEST_SPACE, [("a", "A"), ("b", "B")]).await?;
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    let mut cursor = read
+        .begin_scan(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions::default(),
+        )
+        .await
+        .map_err(|error| format!("begin cursor failed: {error}"))?;
+    let unpolled = cursor.next_page(1);
+    drop(unpolled);
+    let page = cursor
+        .next_page(1)
+        .await
+        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?;
+    assert_read_entries(&page.entries, &[("a", "A")])
+}
+
+async fn invalid_scan_range_fails_closed<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    match read
+        .begin_scan(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Included(key("z")),
+                upper: Bound::Excluded(key("a")),
+            },
+            BeginScanOptions::default(),
+        )
+        .await
+    {
+        Err(StorageError::InvalidCursor) => Ok(()),
+        Err(error) => Err(format!("invalid range returned wrong error: {error}")),
+        Ok(_) => Err("invalid range unexpectedly opened a cursor".to_string()),
+    }
 }
 
 async fn full_value_and_key_only_are_core<F>(factory: &F) -> ConformanceResult
@@ -1575,14 +1767,14 @@ where
 
 async fn scan_range<R>(
     read: &R,
-    test_space: StorageSpace,
+    _test_space: StorageSpace,
     range: KeyRange,
     opts: BeginScanOptions,
 ) -> Result<ScanChunk, StorageError>
 where
     R: StorageRead,
 {
-    scan_range_in_space(read, test_space, range, opts, MAX_SCAN_PAGE_ROWS).await
+    scan_range_in_space(read, TEST_SPACE, range, opts, MAX_SCAN_PAGE_ROWS).await
 }
 
 async fn scan_range_in_space<R>(

@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use bytes::{Buf, Bytes};
+#[cfg(test)]
+use bytes::Buf as _;
+use bytes::Bytes;
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::validate_immutable_batch;
 use lix::storage::{
@@ -372,6 +374,7 @@ impl StorageRead for RocksDBRead<'_> {
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         async move {
+            ScanCursor::validate_range(&range)?;
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
@@ -766,12 +769,14 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
 
 /// Reclaims the iterator-owned physical key and removes its four-byte space
 /// prefix without copying its logical-key bytes.
+#[cfg(test)]
 fn logical_key_from_physical(encoded_key: Box<[u8]>) -> Key {
     let mut key = Bytes::from(encoded_key);
     key.advance(4);
     Key(key)
 }
 
+#[cfg(test)]
 fn project_owned_value<T>(value: T, projection: CoreProjection) -> ProjectedValue
 where
     Bytes: From<T>,

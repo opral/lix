@@ -9,8 +9,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use lix::Value;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    CoreProjection, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions, ScanOptions,
-    SpaceId, Storage, StorageRead, StoredValue, WriteOptions,
+    BeginScanOptions, CoreProjection, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue,
+    ReadOptions, SpaceId, Storage, StorageRead, StoredValue, WriteOptions,
 };
 use lix::storage_adapter::{StorageAdapter, StorageSpace};
 use lix::storage_bench::{binary_cas_write_accounting, reset_binary_cas_write_accounting};
@@ -529,21 +529,23 @@ where
         .await
         .expect("open accounting read");
     let mut accounting = SpaceAccounting::default();
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin accounting scan");
     loop {
-        let page = read
-            .scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                ScanOptions {
-                    projection: CoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan accounting space");
         accounting.rows += page.entries.len() as u64;
@@ -558,13 +560,6 @@ where
         if !page.has_more {
             break;
         }
-        resume_after = Some(
-            page.entries
-                .last()
-                .expect("non-final accounting page has a row")
-                .key
-                .clone(),
-        );
     }
     accounting
 }

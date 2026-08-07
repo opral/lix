@@ -18,7 +18,6 @@ mod point;
 mod read_scope;
 #[cfg(test)]
 mod reader;
-mod scan;
 mod spaces;
 mod stats;
 mod write_set;
@@ -46,7 +45,6 @@ pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
-pub use scan::{ScanPlan, ScanPlanCursor};
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };

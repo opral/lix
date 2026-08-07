@@ -7,7 +7,7 @@ use lix::CreateBranchOptions;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
-    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanChunk, SpaceId, Storage, StorageError,
+    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
     StorageRead, StorageWrite, WriteOptions,
 };
 
@@ -1533,7 +1533,7 @@ impl StorageRead for RecordingRead {
         space: lix::storage::StorageSpace,
         range: KeyRange,
         opts: BeginScanOptions,
-    ) -> Result<ScanCursor, StorageError> {
+    ) -> Result<ScanCursor<'_>, StorageError> {
         self.fail_if_space_matches(space)?;
         self.inner.begin_scan(space, range, opts).await
     }

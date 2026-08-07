@@ -269,8 +269,8 @@ mod tests {
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
-        Memory, StorageKey, StorageProjectedValue, StorageReadOptions, StorageValue,
-        StorageWriteOptions,
+        Memory, StorageBeginScanOptions, StorageKey, StorageProjectedValue, StorageReadOptions,
+        StorageValue, StorageWriteOptions,
     };
 
     use super::*;
@@ -379,17 +379,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("reopened sequence storage should read");
-        let mut rows = crate::storage_adapter::ScanPlan::prefix(
-            crate::live_state::HOT_ROW_SPACE,
-            crate::storage_adapter::StoragePrefix {
-                bytes: bytes::Bytes::new(),
-            },
-        )
-        .first_page(&read, StorageBeginScanOptions::default())
-        .await
-        .expect("selected HOT members should scan")
-        .value
-        .entries;
+        let range = crate::storage_adapter::StoragePrefix {
+            bytes: bytes::Bytes::new(),
+        }
+        .to_range()
+        .expect("valid empty prefix");
+        let mut cursor = read
+            .begin_scan(
+                crate::live_state::HOT_ROW_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .expect("selected HOT member scan should begin");
+        let mut rows = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await
+            .expect("selected HOT members should scan")
+            .entries;
         assert_eq!(
             rows.len(),
             1,
@@ -411,6 +418,7 @@ mod tests {
         let mut unrelated_key = sequence_member.key.0.to_vec();
         unrelated_key[identity_offset..identity_offset + sequence_identity.len()]
             .copy_from_slice(unrelated_identity);
+        drop(cursor);
         drop(read);
 
         let mut corrupt = storage.new_write_set();

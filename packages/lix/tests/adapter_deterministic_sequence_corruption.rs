@@ -3,8 +3,9 @@ use std::ops::Bound;
 use bytes::Bytes;
 use lix::integration::Engine;
 use lix::storage::{
-    CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions,
-    SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+    BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
+    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    WriteOptions,
 };
 
 const HOT_ROW_SPACE: StorageSpace =
@@ -65,31 +66,33 @@ where
         lower: Bound::Unbounded,
         upper: Bound::Unbounded,
     };
-    let mut resume_after = None;
     let mut sequence_entries = Vec::new();
+    let mut cursor = read
+        .begin_scan(
+            HOT_ROW_SPACE,
+            range,
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("HOT member scan should begin");
     loop {
-        let page = read
-            .scan(
-                HOT_ROW_SPACE,
-                range.clone(),
-                ScanOptions {
-                    projection: CoreProjection::FullValue,
-                    resume_after: resume_after.clone(),
-                    ..ScanOptions::default()
-                },
-            )
+        let page = cursor
+            .next_page(lix::storage::MAX_SCAN_PAGE_ROWS)
             .await
             .expect("HOT members should scan");
-        resume_after = page.entries.last().map(|entry| entry.key.clone());
         sequence_entries.extend(
             page.entries
                 .into_iter()
                 .filter(|entry| contains_subslice(entry.key.0.as_ref(), SEQUENCE_IDENTITY)),
         );
-        if !page.has_more || resume_after.is_none() {
+        if !page.has_more {
             break;
         }
     }
+    drop(cursor);
     drop(read);
     assert_eq!(
         sequence_entries.len(),

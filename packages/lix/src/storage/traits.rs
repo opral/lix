@@ -71,7 +71,8 @@ pub trait StorageRead: Send + Sync {
     /// Opens one storage-owned iterator on this coherent read view.
     ///
     /// The returned cursor is ephemeral and cannot outlive this read handle.
-    /// Implementations must keep one native iterator alive as pages advance.
+    /// It advances source state bound to this view and must never acquire a
+    /// replacement read view as pages advance.
     fn begin_scan(
         &self,
         space: StorageSpace,

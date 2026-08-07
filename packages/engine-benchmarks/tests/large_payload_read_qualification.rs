@@ -12,9 +12,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-    ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageSpace, StorageWrite, WriteOptions,
+    BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange,
+    MAX_SCAN_PAGE_ROWS, ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanCursor, SpaceId,
+    Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite,
+    WriteOptions,
 };
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
@@ -188,25 +189,51 @@ impl<R: StorageRead> StorageRead for CountingRead<R> {
         Ok(result)
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         space: StorageSpace,
         range: KeyRange,
-        options: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        options: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let order = options.order;
         self.stats.lock().expect("I/O stats mutex").scan_calls += 1;
-        let chunk = self.inner.scan(space, range, options).await?;
-        let mut stats = self.stats.lock().expect("I/O stats mutex");
-        stats.scan_rows += chunk.entries.len() as u64;
-        stats.scan_value_bytes += chunk
-            .entries
-            .iter()
-            .map(|entry| match &entry.value {
-                ProjectedValue::KeyOnly => 0,
-                ProjectedValue::FullValue(value) => value.len() as u64,
-            })
-            .sum::<u64>();
-        Ok(chunk)
+        let inner = self.inner.begin_scan(space, range.clone(), options).await?;
+        ScanCursor::from_source(
+            range,
+            order,
+            CountingScanSource {
+                inner,
+                stats: Arc::clone(&self.stats),
+            },
+        )
+    }
+}
+
+struct CountingScanSource<'a> {
+    inner: ScanCursor<'a>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl StorageScanSource for CountingScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let chunk = self.inner.next_page(limit_rows).await?;
+            let mut stats = self.stats.lock().expect("I/O stats mutex");
+            stats.scan_rows += chunk.entries.len() as u64;
+            stats.scan_value_bytes += chunk
+                .entries
+                .iter()
+                .map(|entry| match &entry.value {
+                    ProjectedValue::KeyOnly => 0,
+                    ProjectedValue::FullValue(value) => value.len() as u64,
+                })
+                .sum::<u64>();
+            drop(stats);
+            Ok(chunk)
+        })
     }
 }
 
@@ -1072,21 +1099,23 @@ where
         .await
         .expect("open CAS accounting read");
     let mut accounting = SpaceAccounting::default();
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await
+        .expect("begin CAS accounting scan");
     loop {
-        let page = read
-            .scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                ScanOptions {
-                    projection: CoreProjection::FullValue,
-                    limit_rows: MAX_SCAN_PAGE_ROWS,
-                    resume_after,
-                },
-            )
+        let page = cursor
+            .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan CAS accounting space");
         accounting.rows += page.entries.len() as u64;
@@ -1106,7 +1135,6 @@ where
         if !page.has_more {
             break;
         }
-        resume_after = page.entries.last().map(|entry| entry.key.clone());
     }
     accounting
 }

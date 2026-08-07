@@ -2933,14 +2933,15 @@ mod tests {
             self.inner.get_many(requests)
         }
 
-        fn scan(
+        fn begin_scan(
             &self,
             space: StorageSpace,
             range: crate::storage::KeyRange,
-            opts: crate::storage::ScanOptions,
-        ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
-        {
-            self.inner.scan(space, range, opts)
+            opts: crate::storage::BeginScanOptions,
+        ) -> impl Future<
+            Output = Result<crate::storage::ScanCursor<'_>, crate::storage::StorageError>,
+        > + Send {
+            self.inner.begin_scan(space, range, opts)
         }
     }
 

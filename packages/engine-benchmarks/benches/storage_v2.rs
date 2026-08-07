@@ -15,16 +15,16 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
-    Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
+    KeyRange, Memory, Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk,
+    ScanCursor, SpaceId, Storage, StorageError, StorageRead, StorageScanSource, StorageWrite,
+    StoredValue, WriteOptions, WriteStats,
 };
 use lix::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterReadScope, StorageReadStats,
+    PointReadPlan, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope, StorageReadStats,
     StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
 use lix_storage_rocksdb::RocksDB;
-use lix_storage_sqlite::SQLite;
 use rustc_hash::FxBuildHasher;
 use tempfile::TempDir;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
@@ -177,57 +177,6 @@ impl StorageBenchStorage for InMemoryBenchStorage {
         storage
             .fork_snapshot()
             .expect("fork in-memory bench storage")
-    }
-}
-
-struct SQLiteTempBenchStorage {
-    temp_dir: TempDir,
-    next_database_id: AtomicU64,
-}
-
-impl SQLiteTempBenchStorage {
-    fn new() -> Self {
-        Self {
-            temp_dir: tempfile::tempdir().expect("create sqlite bench matrix temp dir"),
-            next_database_id: AtomicU64::new(0),
-        }
-    }
-
-    fn next_path(&self) -> PathBuf {
-        let database_id = self.next_database_id.fetch_add(1, Ordering::Relaxed);
-        self.temp_dir
-            .path()
-            .join(format!("storage-v2-matrix-{database_id}.sqlite"))
-    }
-}
-
-impl StorageBenchStorage for SQLiteTempBenchStorage {
-    type Storage = SQLite;
-
-    fn name(&self) -> &'static str {
-        "sqlite_temp"
-    }
-
-    fn open_empty(&self) -> Self::Storage {
-        SQLite::open(self.next_path()).expect("open empty sqlite bench storage")
-    }
-
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
-        let storage = self.open_empty();
-        seed_storage_points(&storage, space, rows, value_size, "sqlite bench storage");
-        storage
-            .checkpoint()
-            .expect("checkpoint seeded sqlite bench storage");
-        storage
-    }
-
-    fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
-        storage
-            .checkpoint()
-            .expect("checkpoint sqlite bench seed before fork");
-        let fork_path = self.next_path();
-        fs::copy(storage.path(), &fork_path).expect("copy sqlite bench seed database");
-        SQLite::open(fork_path).expect("open sqlite bench fork")
     }
 }
 
@@ -442,12 +391,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     if std::env::var_os("STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY").is_some() {
         match std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_STORAGE").as_deref() {
             Ok("in_memory") => bench_storage_direct_profile(c, InMemoryBenchStorage),
-            Ok("sqlite_temp") => bench_storage_direct_profile(c, SQLiteTempBenchStorage::new()),
             Ok("rocksdb_temp") => bench_storage_direct_profile(c, RocksDBTempBenchStorage::new()),
             Ok(other) => panic!("unknown direct profile storage: {other}"),
             Err(_) => {
                 bench_storage_direct_profile(c, InMemoryBenchStorage);
-                bench_storage_direct_profile(c, SQLiteTempBenchStorage::new());
                 bench_storage_direct_profile(c, RocksDBTempBenchStorage::new());
             }
         }
@@ -457,30 +404,22 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_write_set_lowering(c);
     bench_write_set_construction(c);
     bench_write_set_build_and_commit(c, InMemoryBenchStorage);
-    bench_write_set_build_and_commit(c, SQLiteTempBenchStorage::new());
     bench_write_set_build_and_commit(c, RocksDBTempBenchStorage::new());
     bench_direct_write_order(c, InMemoryBenchStorage);
-    bench_direct_write_order(c, SQLiteTempBenchStorage::new());
     bench_direct_write_order(c, RocksDBTempBenchStorage::new());
     bench_write_batch_seal_sort(c);
     bench_delete_range_fallback(c, InMemoryBenchStorage);
-    bench_delete_range_fallback(c, SQLiteTempBenchStorage::new());
     bench_delete_range_fallback(c, RocksDBTempBenchStorage::new());
     bench_delete_range_native(c, InMemoryBenchStorage);
-    bench_delete_range_native(c, SQLiteTempBenchStorage::new());
     bench_delete_range_native(c, RocksDBTempBenchStorage::new());
     bench_delete_range_storage_helpers(c, InMemoryBenchStorage);
-    bench_delete_range_storage_helpers(c, SQLiteTempBenchStorage::new());
     bench_delete_range_storage_helpers(c, RocksDBTempBenchStorage::new());
     bench_scan_chunking_matrix(c, InMemoryBenchStorage);
-    bench_scan_chunking_matrix(c, SQLiteTempBenchStorage::new());
     bench_scan_chunking_matrix(c, RocksDBTempBenchStorage::new());
     bench_durable_commit(c, InMemoryBenchStorage);
-    bench_durable_commit(c, SQLiteTempBenchStorage::new());
     bench_durable_commit(c, RocksDBTempBenchStorage::new());
     bench_point_request_plan(c);
     bench_storage_direct_profile(c, InMemoryBenchStorage);
-    bench_storage_direct_profile(c, SQLiteTempBenchStorage::new());
     bench_storage_direct_profile(c, RocksDBTempBenchStorage::new());
     bench_hash_algorithms(c);
 }
@@ -1529,11 +1468,11 @@ where
                     let chunk = block_on(materialize_storage_scan(
                         &read,
                         scan_range.clone(),
-                        ScanOptions {
-                            limit_rows: 1_001,
+                        BeginScanOptions {
                             projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
+                            ..BeginScanOptions::default()
                         },
+                        1_001,
                     ))
                     .expect("direct materialized scan");
                     assert_eq!(chunk.entries.len(), 1_000);
@@ -1560,11 +1499,11 @@ where
                     let chunk = block_on(materialize_storage_scan(
                         &read,
                         scan_range.clone(),
-                        ScanOptions {
-                            limit_rows: rows as usize + 1,
+                        BeginScanOptions {
                             projection: CoreProjection::FullValue,
-                            ..ScanOptions::default()
+                            ..BeginScanOptions::default()
                         },
+                        rows as usize + 1,
                     ))
                     .expect("direct full-value scan");
                     assert_eq!(chunk.entries.len(), rows as usize);
@@ -1691,12 +1630,23 @@ impl StorageRead for EmptyRead {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    async fn scan(
+    async fn begin_scan(
         &self,
         _space: StorageSpace,
-        _range: KeyRange,
-        _opts: ScanOptions,
-    ) -> Result<ScanChunk, StorageError> {
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        ScanCursor::from_source(range, opts.order, EmptyScanSource)
+    }
+}
+
+struct EmptyScanSource;
+
+impl StorageScanSource for EmptyScanSource {
+    fn next_page(
+        &mut self,
+        _limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         unreachable!("write-set benchmark does not scan")
     }
 }
@@ -1821,29 +1771,31 @@ where
         .await
         .map_err(|error| error.to_string())?;
     let mut keys = Vec::new();
-    let mut resume_after = None::<Key>;
     let mut scanned = 0usize;
     let mut chunks = 0usize;
+    let mut cursor = read
+        .begin_scan(
+            storage_space,
+            range,
+            BeginScanOptions {
+                projection: CoreProjection::KeyOnly,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
 
     loop {
-        let result = ScanPlan::range(storage_space, range.clone())
-            .collect(
-                &read,
-                ScanOptions {
-                    limit_rows: chunk_size,
-                    projection: CoreProjection::KeyOnly,
-                    resume_after,
-                },
-            )
+        let result = cursor
+            .next_page(chunk_size)
             .await
             .map_err(|error| error.to_string())?;
 
-        scanned += result.value.entries.len();
-        chunks += usize::from(!result.value.entries.is_empty() || result.value.has_more);
-        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
-        keys.extend(result.value.entries.into_iter().map(|entry| entry.key));
+        scanned += result.entries.len();
+        chunks += usize::from(!result.entries.is_empty() || result.has_more);
+        keys.extend(result.entries.into_iter().map(|entry| entry.key));
 
-        if !result.value.has_more {
+        if !result.has_more {
             break;
         }
     }
@@ -1876,34 +1828,52 @@ async fn drain_scan_materialized<R>(
 where
     R: StorageRead,
 {
-    let mut resume_after = None::<Key>;
     let mut stats = ScanDrainStats::default();
+    let (range, prefix) = match scan {
+        ScanChunkingMode::Range => (point_scan_range(), false),
+        ScanChunkingMode::Prefix => (
+            Prefix {
+                bytes: Bytes::from_static(b"point-"),
+            }
+            .to_range()?,
+            true,
+        ),
+    };
+    let mut cursor = read
+        .begin_scan(
+            storage_space,
+            range,
+            BeginScanOptions {
+                projection: CoreProjection::KeyOnly,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await?;
+    if prefix {
+        stats.read_stats.prefix_lowered = 1;
+    }
 
     loop {
-        let opts = ScanOptions {
-            limit_rows: chunk_size,
-            projection: CoreProjection::KeyOnly,
-            resume_after,
-        };
-        let plan = match scan {
-            ScanChunkingMode::Range => ScanPlan::range(storage_space, point_scan_range()),
-            ScanChunkingMode::Prefix => ScanPlan::prefix(
-                storage_space,
-                Prefix {
-                    bytes: Bytes::from_static(b"point-"),
-                },
-            ),
-        };
-        let chunk = plan.collect(read, opts).await?;
+        let chunk = cursor.next_page(chunk_size).await?;
 
-        let entries = &chunk.value.entries;
+        let entries = &chunk.entries;
         stats.scanned += entries.len();
-        stats.storage_calls += chunk.stats.storage_calls;
-        stats.chunks += usize::from(!entries.is_empty() || chunk.value.has_more);
-        stats.read_stats.add(chunk.stats);
-        resume_after = entries.last().map(|entry| entry.key.clone());
+        stats.storage_calls += 1;
+        stats.chunks += usize::from(!entries.is_empty() || chunk.has_more);
+        stats.read_stats.storage_calls += 1;
+        stats.read_stats.scan_rows += entries.len() as u64;
+        stats.read_stats.scan_has_more += u64::from(chunk.has_more);
+        stats.read_stats.scan_limit_rows_total += chunk_size as u64;
+        stats.read_stats.scan_limit_rows_max =
+            stats.read_stats.scan_limit_rows_max.max(chunk_size as u64);
+        stats.read_stats.scan_key_only_chunks += 1;
+        if prefix {
+            stats.read_stats.prefix_scan_chunks += 1;
+        } else {
+            stats.read_stats.range_scan_chunks += 1;
+        }
 
-        if !chunk.value.has_more {
+        if !chunk.has_more {
             break;
         }
     }
@@ -1917,12 +1887,10 @@ where
 
 fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
     let expected_chunks = case.rows.div_ceil(case.chunk_size);
-    let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
     let expected_has_more = expected_chunks.saturating_sub(1) as u64;
 
     assert_eq!(stats.read_stats.storage_calls, expected_chunks as u64);
     assert_eq!(stats.read_stats.scan_rows, case.rows as u64);
-    assert_eq!(stats.read_stats.scan_resume_after, expected_resume_after);
     assert_eq!(stats.read_stats.scan_has_more, expected_has_more);
     assert_eq!(
         stats.read_stats.scan_limit_rows_total,
@@ -1939,12 +1907,12 @@ fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
         ScanChunkingMode::Range => {
             assert_eq!(stats.read_stats.range_scan_chunks, expected_chunks as u64);
             assert_eq!(stats.read_stats.prefix_scan_chunks, 0);
-            assert_eq!(stats.read_stats.prefix_lowered, 0);
+            assert_eq!(stats.read_stats.prefix_lowered, 1);
         }
         ScanChunkingMode::Prefix => {
             assert_eq!(stats.read_stats.range_scan_chunks, 0);
             assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
-            assert_eq!(stats.read_stats.prefix_lowered, expected_chunks as u64);
+            assert_eq!(stats.read_stats.prefix_lowered, 0);
         }
     }
 }
@@ -1975,12 +1943,14 @@ fn point_scan_range() -> KeyRange {
 async fn materialize_storage_scan<R>(
     read: &R,
     range: KeyRange,
-    opts: ScanOptions,
+    opts: BeginScanOptions,
+    limit_rows: usize,
 ) -> Result<ScanChunk, StorageError>
 where
     R: StorageRead,
 {
-    read.scan(space(1), range, opts).await
+    let mut cursor = read.begin_scan(space(1), range, opts).await?;
+    cursor.next_page(limit_rows).await
 }
 
 async fn materialize_complete_storage_scan<R>(
@@ -1991,22 +1961,20 @@ where
     R: StorageRead,
 {
     let mut entries = Vec::new();
-    let mut resume_after = None;
+    let mut cursor = read
+        .begin_scan(
+            space(1),
+            range,
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..BeginScanOptions::default()
+            },
+        )
+        .await?;
 
     loop {
-        let chunk = read
-            .scan(
-                space(1),
-                range.clone(),
-                ScanOptions {
-                    projection: CoreProjection::FullValue,
-                    resume_after,
-                    ..ScanOptions::default()
-                },
-            )
-            .await?;
+        let chunk = cursor.next_page(lix::storage::MAX_SCAN_PAGE_ROWS).await?;
         let has_more = chunk.has_more;
-        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
         entries.extend(chunk.entries);
 
         if !has_more {
@@ -2015,10 +1983,6 @@ where
                 has_more: false,
             });
         }
-        assert!(
-            resume_after.is_some(),
-            "scan reported more rows without a resume key"
-        );
     }
 }
 

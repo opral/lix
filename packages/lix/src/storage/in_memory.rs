@@ -316,6 +316,7 @@ impl StorageRead for MemoryRead {
         range: KeyRange,
         opts: BeginScanOptions,
     ) -> Result<ScanCursor<'_>, StorageError> {
+        ScanCursor::validate_range(&range)?;
         if opts.order == ScanOrder::Descending {
             return Err(StorageError::Unsupported(Capability::ReverseScan));
         }

@@ -264,6 +264,9 @@ where
     if let Some(resume_after) = &resume_after {
         range.lower = max_lower_bound(range.lower, Bound::Excluded(resume_after.clone()));
     }
+    if !range_is_valid(&range) {
+        range.upper = Bound::Unbounded;
+    }
     let limit_rows = rng.usize(keys.len() + 2);
     let projection = random_projection(rng);
     let mut cursor = read
@@ -321,6 +324,15 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
         Bound::Unbounded => true,
     };
     lower_matches && upper_matches
+}
+
+fn range_is_valid(range: &KeyRange) -> bool {
+    match (&range.lower, &range.upper) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => true,
+        (Bound::Included(lower), Bound::Included(upper)) => lower <= upper,
+        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper)) => lower <= upper,
+    }
 }
 
 fn max_lower_bound(left: Bound<Key>, right: Bound<Key>) -> Bound<Key> {
