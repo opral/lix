@@ -22,7 +22,9 @@ use lix::storage::{
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
-const CHUNK_BYTES: usize = 1 << 20;
+const CURRENT_CHUNK_BYTES: usize = 1 << 20;
+const BLOCKED_LEAF_BYTES: usize = 1 << 20;
+const DATA_GENERATION_BLOCK_BYTES: usize = 1 << 20;
 const FANOUT: usize = 64;
 const AUTH_LEAF_BATCH: usize = 8;
 const OBJECT_MAGIC: &[u8; 8] = b"LIXMMO\0\x01";
@@ -275,6 +277,20 @@ struct HashWork {
     object_bytes: u64,
     leaf_objects: u64,
     internal_objects: u64,
+    root_read_alloc_bytes: u64,
+    root_read_cpu_ns: u64,
+    leaf_read_alloc_bytes: u64,
+    leaf_read_cpu_ns: u64,
+    path_copy_alloc_bytes: u64,
+    path_copy_cpu_ns: u64,
+    publication_alloc_bytes: u64,
+    publication_cpu_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ProfileSnapshot {
+    allocated_bytes: u64,
+    cpu_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -576,7 +592,7 @@ async fn seed_fixture<S: Storage>(storage: &S, parameters: Parameters) -> Fixtur
 }
 
 async fn seed_current<S: Storage>(storage: &S, bytes: &[u8]) -> ObjectId {
-    let refs = chunk_refs(bytes, None, &mut HashWork::default());
+    let refs = chunk_refs(bytes, None, CURRENT_CHUNK_BYTES, &mut HashWork::default());
     for batch in refs.chunks(32) {
         let entries = batch
             .iter()
@@ -585,7 +601,7 @@ async fn seed_current<S: Storage>(storage: &S, bytes: &[u8]) -> ObjectId {
                     .iter()
                     .position(|candidate| candidate.id == child.id)
                     .expect("chunk ref exists");
-                let start = index * CHUNK_BYTES;
+                let start = index * CURRENT_CHUNK_BYTES;
                 let end = (start + child.logical_bytes as usize).min(bytes.len());
                 PutEntry {
                     key: child.id.key(),
@@ -624,7 +640,7 @@ async fn seed_current<S: Storage>(storage: &S, bytes: &[u8]) -> ObjectId {
 async fn seed_flat<S: Storage>(storage: &S, bytes: &[u8]) -> ObjectId {
     let mut refs = Vec::new();
     let mut pending = Vec::new();
-    for chunk in bytes.chunks(CHUNK_BYTES) {
+    for chunk in bytes.chunks(CURRENT_CHUNK_BYTES) {
         let (id, encoded) = encode_object(&Object::Leaf(Bytes::copy_from_slice(chunk)));
         refs.push(ChildRef {
             id,
@@ -662,7 +678,7 @@ async fn seed_flat<S: Storage>(storage: &S, bytes: &[u8]) -> ObjectId {
 async fn seed_blocked<S: Storage>(storage: &S, bytes: &[u8]) -> ObjectId {
     let mut level = Vec::new();
     let mut pending = Vec::new();
-    for chunk in bytes.chunks(CHUNK_BYTES) {
+    for chunk in bytes.chunks(BLOCKED_LEAF_BYTES) {
         let (id, encoded) = encode_object(&Object::Leaf(Bytes::copy_from_slice(chunk)));
         level.push(ChildRef {
             id,
@@ -746,18 +762,23 @@ async fn publish_current<S: Storage>(
     let refs = chunk_refs(
         &fixture.base,
         Some((fixture.edit_offset, &fixture.edit)),
+        CURRENT_CHUNK_BYTES,
         &mut work,
     );
     let manifest = encode_manifest(fixture.base.len() as u64, &refs);
     work.object_bytes += manifest.len() as u64;
     work.internal_objects += 1;
     let root = object_id(&manifest);
-    let changed =
-        changed_chunk_indices(fixture.base.len(), fixture.edit_offset, fixture.edit.len());
+    let changed = changed_chunk_indices(
+        fixture.base.len(),
+        fixture.edit_offset,
+        fixture.edit.len(),
+        CURRENT_CHUNK_BYTES,
+    );
     let mut payloads = Vec::new();
     let mut markers = Vec::new();
     for index in changed {
-        let chunk = edited_chunk(fixture, index);
+        let chunk = edited_chunk_with_size(fixture, index, CURRENT_CHUNK_BYTES);
         let child = refs[index];
         payloads.push(PutEntry {
             key: child.id.key(),
@@ -830,18 +851,19 @@ async fn publish_flat<S: Storage>(
     let refs = chunk_refs(
         &fixture.base,
         Some((fixture.edit_offset, &fixture.edit)),
+        CURRENT_CHUNK_BYTES,
         &mut work,
     );
     assert_eq!(children.len(), refs.len());
     let mut digest = blake3::Hasher::new();
-    for (index, original) in fixture.base.chunks(CHUNK_BYTES).enumerate() {
+    for (index, original) in fixture.base.chunks(CURRENT_CHUNK_BYTES).enumerate() {
         if ranges_overlap(
-            index * CHUNK_BYTES,
-            index * CHUNK_BYTES + original.len(),
+            index * CURRENT_CHUNK_BYTES,
+            index * CURRENT_CHUNK_BYTES + original.len(),
             fixture.edit_offset,
             fixture.edit_offset + fixture.edit.len(),
         ) {
-            let chunk = edited_chunk(fixture, index);
+            let chunk = edited_chunk_with_size(fixture, index, CURRENT_CHUNK_BYTES);
             digest.update(&chunk);
             work.payload_bytes += chunk.len() as u64;
         } else {
@@ -859,9 +881,17 @@ async fn publish_flat<S: Storage>(
         key: root.key(),
         value: StoredValue { bytes: encoded },
     }];
-    for index in changed_chunk_indices(fixture.base.len(), fixture.edit_offset, fixture.edit.len())
-    {
-        let leaf = Object::Leaf(Bytes::from(edited_chunk(fixture, index)));
+    for index in changed_chunk_indices(
+        fixture.base.len(),
+        fixture.edit_offset,
+        fixture.edit.len(),
+        CURRENT_CHUNK_BYTES,
+    ) {
+        let leaf = Object::Leaf(Bytes::from(edited_chunk_with_size(
+            fixture,
+            index,
+            CURRENT_CHUNK_BYTES,
+        )));
         let (id, encoded) = encode_object_counted(&leaf, &mut work);
         assert_eq!(id, flat_child(&flat, index));
         entries.push(PutEntry {
@@ -878,8 +908,13 @@ async fn publish_blocked<S: Storage>(
     selector_key: &Key,
     fixture: &Fixture,
 ) -> (ObjectId, HashWork) {
-    let changed =
-        changed_chunk_indices(fixture.base.len(), fixture.edit_offset, fixture.edit.len());
+    let changed = changed_chunk_indices(
+        fixture.base.len(),
+        fixture.edit_offset,
+        fixture.edit.len(),
+        BLOCKED_LEAF_BYTES,
+    );
+    let root_read_started = profile_snapshot();
     let root_raw = get_one(storage, OBJECT_SPACE, fixture.base_root.key())
         .await
         .expect("blocked root exists");
@@ -894,6 +929,12 @@ async fn publish_blocked<S: Storage>(
     };
     assert_eq!(logical_bytes, fixture.base.len() as u64);
     let mut work = HashWork::default();
+    add_profile_delta(
+        root_read_started,
+        profile_snapshot(),
+        &mut work.root_read_alloc_bytes,
+        &mut work.root_read_cpu_ns,
+    );
     work.object_bytes += root_raw.len() as u64;
     let mut entries = Vec::new();
     if root_level == 1 {
@@ -902,9 +943,23 @@ async fn publish_blocked<S: Storage>(
                 .iter()
                 .map(|index| children[*index].id.key())
                 .collect::<Vec<_>>();
+            let leaf_read_started = profile_snapshot();
             let leaf_values = get_many_values(storage, OBJECT_SPACE, &leaf_keys).await;
+            add_profile_delta(
+                leaf_read_started,
+                profile_snapshot(),
+                &mut work.leaf_read_alloc_bytes,
+                &mut work.leaf_read_cpu_ns,
+            );
             for (index, raw) in indices.iter().copied().zip(leaf_values) {
+                let path_copy_started = profile_snapshot();
                 let (id, encoded) = path_copy_leaf(children[index], raw, fixture, index, &mut work);
+                add_profile_delta(
+                    path_copy_started,
+                    profile_snapshot(),
+                    &mut work.path_copy_alloc_bytes,
+                    &mut work.path_copy_cpu_ns,
+                );
                 children[index].id = id;
                 entries.push(PutEntry {
                     key: id.key(),
@@ -923,6 +978,7 @@ async fn publish_blocked<S: Storage>(
             .iter()
             .map(|(group, _)| children[*group].id.key())
             .collect::<Vec<_>>();
+        let group_read_started = profile_snapshot();
         let group_values = get_many_values(storage, OBJECT_SPACE, &group_keys).await;
         let mut states = Vec::new();
         for ((group, indices), child_raw) in groups.into_iter().zip(group_values) {
@@ -939,6 +995,12 @@ async fn publish_blocked<S: Storage>(
             };
             states.push((group, indices, child_bytes, leaves));
         }
+        add_profile_delta(
+            group_read_started,
+            profile_snapshot(),
+            &mut work.root_read_alloc_bytes,
+            &mut work.root_read_cpu_ns,
+        );
         let leaf_requests = states
             .iter()
             .enumerate()
@@ -954,11 +1016,25 @@ async fn publish_blocked<S: Storage>(
                 .iter()
                 .map(|(_, _, _, child)| child.id.key())
                 .collect::<Vec<_>>();
+            let leaf_read_started = profile_snapshot();
             let leaf_values = get_many_values(storage, OBJECT_SPACE, &leaf_keys).await;
+            add_profile_delta(
+                leaf_read_started,
+                profile_snapshot(),
+                &mut work.leaf_read_alloc_bytes,
+                &mut work.leaf_read_cpu_ns,
+            );
             for ((state_index, index, local, child), raw) in
                 requests.iter().copied().zip(leaf_values)
             {
+                let path_copy_started = profile_snapshot();
                 let (id, encoded) = path_copy_leaf(child, raw, fixture, index, &mut work);
+                add_profile_delta(
+                    path_copy_started,
+                    profile_snapshot(),
+                    &mut work.path_copy_alloc_bytes,
+                    &mut work.path_copy_cpu_ns,
+                );
                 states[state_index].3[local].id = id;
                 entries.push(PutEntry {
                     key: id.key(),
@@ -969,7 +1045,7 @@ async fn publish_blocked<S: Storage>(
         for (group, _, child_bytes, leaves) in states {
             for (local, leaf) in leaves.iter().enumerate() {
                 let index = group * FANOUT + local;
-                if index * CHUNK_BYTES < fixture.base.len() {
+                if index * BLOCKED_LEAF_BYTES < fixture.base.len() {
                     assert_eq!(leaf.logical_bytes, base_chunk(fixture, index).len() as u64);
                 }
             }
@@ -996,7 +1072,14 @@ async fn publish_blocked<S: Storage>(
         key: new_root.key(),
         value: StoredValue { bytes: encoded },
     });
+    let publication_started = profile_snapshot();
     publish_objects_and_selector(storage, selector_key, fixture.base_root, new_root, entries).await;
+    add_profile_delta(
+        publication_started,
+        profile_snapshot(),
+        &mut work.publication_alloc_bytes,
+        &mut work.publication_cpu_ns,
+    );
     (new_root, work)
 }
 
@@ -1022,7 +1105,7 @@ fn path_copy_leaf(
     assert_eq!(&raw[LEAF_HEADER_BYTES..], base_chunk(fixture, index));
 
     let mut successor = raw.to_vec();
-    let chunk_start = index * CHUNK_BYTES;
+    let chunk_start = index * BLOCKED_LEAF_BYTES;
     let chunk_end = chunk_start + declared_len as usize;
     let edit_end = fixture.edit_offset + fixture.edit.len();
     let overlap_start = chunk_start.max(fixture.edit_offset);
@@ -1090,23 +1173,40 @@ fn compute_expected_root(
     edit: &[u8],
 ) -> (ObjectId, HashWork) {
     let mut work = HashWork::default();
-    let refs = chunk_refs(base, Some((edit_offset, edit)), &mut work);
     match layout {
         Layout::Current => {
+            let refs = chunk_refs(
+                base,
+                Some((edit_offset, edit)),
+                CURRENT_CHUNK_BYTES,
+                &mut work,
+            );
             let manifest = encode_manifest(base.len() as u64, &refs);
             (object_id(&manifest), work)
         }
         Layout::Flat => {
+            let refs = chunk_refs(
+                base,
+                Some((edit_offset, edit)),
+                CURRENT_CHUNK_BYTES,
+                &mut work,
+            );
             let mut digest = blake3::Hasher::new();
-            for (index, original) in base.chunks(CHUNK_BYTES).enumerate() {
-                let chunk_start = index * CHUNK_BYTES;
+            for (index, original) in base.chunks(CURRENT_CHUNK_BYTES).enumerate() {
+                let chunk_start = index * CURRENT_CHUNK_BYTES;
                 if ranges_overlap(
                     chunk_start,
                     chunk_start + original.len(),
                     edit_offset,
                     edit_offset + edit.len(),
                 ) {
-                    digest.update(&apply_edit_to_chunk(original, index, edit_offset, edit));
+                    digest.update(&apply_edit_to_chunk(
+                        original,
+                        index,
+                        edit_offset,
+                        edit,
+                        CURRENT_CHUNK_BYTES,
+                    ));
                 } else {
                     digest.update(original);
                 }
@@ -1119,7 +1219,12 @@ fn compute_expected_root(
             (encode_object(&object).0, work)
         }
         Layout::Blocked => {
-            let mut level = refs;
+            let mut level = chunk_refs(
+                base,
+                Some((edit_offset, edit)),
+                BLOCKED_LEAF_BYTES,
+                &mut work,
+            );
             let mut tree_level = 1;
             while level.len() > 1 {
                 level = level
@@ -1144,21 +1249,26 @@ fn compute_expected_root(
     }
 }
 
-fn chunk_refs(base: &[u8], edit: Option<(usize, &[u8])>, work: &mut HashWork) -> Vec<ChildRef> {
-    base.chunks(CHUNK_BYTES)
+fn chunk_refs(
+    base: &[u8],
+    edit: Option<(usize, &[u8])>,
+    chunk_bytes: usize,
+    work: &mut HashWork,
+) -> Vec<ChildRef> {
+    base.chunks(chunk_bytes)
         .enumerate()
         .map(|(index, original)| {
             let owned;
             let chunk = if edit.is_some_and(|(offset, bytes)| {
                 ranges_overlap(
-                    index * CHUNK_BYTES,
-                    index * CHUNK_BYTES + original.len(),
+                    index * chunk_bytes,
+                    index * chunk_bytes + original.len(),
                     offset,
                     offset + bytes.len(),
                 )
             }) {
                 let (offset, bytes) = edit.expect("overlapping edit exists");
-                owned = apply_edit_to_chunk(original, index, offset, bytes);
+                owned = apply_edit_to_chunk(original, index, offset, bytes, chunk_bytes);
                 owned.as_slice()
             } else {
                 original
@@ -1173,43 +1283,43 @@ fn chunk_refs(base: &[u8], edit: Option<(usize, &[u8])>, work: &mut HashWork) ->
         .collect()
 }
 
-fn changed_chunk_indices(size: usize, edit_offset: usize, edit_len: usize) -> Vec<usize> {
-    let first = edit_offset / CHUNK_BYTES;
-    let last = (edit_offset + edit_len - 1) / CHUNK_BYTES;
-    (first..=last.min((size - 1) / CHUNK_BYTES)).collect()
+fn changed_chunk_indices(
+    size: usize,
+    edit_offset: usize,
+    edit_len: usize,
+    chunk_bytes: usize,
+) -> Vec<usize> {
+    let first = edit_offset / chunk_bytes;
+    let last = (edit_offset + edit_len - 1) / chunk_bytes;
+    (first..=last.min((size - 1) / chunk_bytes)).collect()
 }
 
 fn base_chunk(fixture: &Fixture, index: usize) -> &[u8] {
-    let start = index * CHUNK_BYTES;
-    let end = (start + CHUNK_BYTES).min(fixture.base.len());
+    let start = index * BLOCKED_LEAF_BYTES;
+    let end = (start + BLOCKED_LEAF_BYTES).min(fixture.base.len());
     &fixture.base[start..end]
 }
 
-fn edited_chunk(fixture: &Fixture, index: usize) -> Vec<u8> {
+fn edited_chunk_with_size(fixture: &Fixture, index: usize, chunk_bytes: usize) -> Vec<u8> {
+    let start = index * chunk_bytes;
+    let end = (start + chunk_bytes).min(fixture.base.len());
     apply_edit_to_chunk(
-        base_chunk(fixture, index),
+        &fixture.base[start..end],
         index,
         fixture.edit_offset,
         &fixture.edit,
+        chunk_bytes,
     )
 }
 
-fn expected_chunk(fixture: &Fixture, index: usize) -> Vec<u8> {
-    let original = base_chunk(fixture, index);
-    if ranges_overlap(
-        index * CHUNK_BYTES,
-        index * CHUNK_BYTES + original.len(),
-        fixture.edit_offset,
-        fixture.edit_offset + fixture.edit.len(),
-    ) {
-        edited_chunk(fixture, index)
-    } else {
-        original.to_vec()
-    }
-}
-
-fn apply_edit_to_chunk(original: &[u8], index: usize, edit_offset: usize, edit: &[u8]) -> Vec<u8> {
-    let chunk_start = index * CHUNK_BYTES;
+fn apply_edit_to_chunk(
+    original: &[u8],
+    index: usize,
+    edit_offset: usize,
+    edit: &[u8],
+    chunk_bytes: usize,
+) -> Vec<u8> {
+    let chunk_start = index * chunk_bytes;
     let chunk_end = chunk_start + original.len();
     let edit_end = edit_offset + edit.len();
     let overlap_start = chunk_start.max(edit_offset);
@@ -1529,9 +1639,10 @@ async fn assert_cold_reopen<S: Storage>(storage: &S, layout: Layout, fixture: &F
         assert_eq!(root, fixture.expected_root);
         let reconstructed = reconstruct(storage, layout, root).await;
         assert_eq!(reconstructed.len(), fixture.base.len());
-        for (index, chunk) in reconstructed.chunks(CHUNK_BYTES).enumerate() {
-            assert_eq!(chunk, expected_chunk(fixture, index));
-        }
+        let mut expected = fixture.base.as_ref().clone();
+        expected[fixture.edit_offset..fixture.edit_offset + fixture.edit.len()]
+            .copy_from_slice(&fixture.edit);
+        assert_eq!(reconstructed, expected);
     }
 }
 
@@ -1705,7 +1816,7 @@ async fn run_correctness<S: Storage>(storage: &S, backend: &str) {
     }
 
     let reopen_key = Key(Bytes::from_static(b"correctness-reopen"));
-    let root = seed_blocked(storage, &fixture.base[..4 * CHUNK_BYTES]).await;
+    let root = seed_blocked(storage, &fixture.base[..4 * BLOCKED_LEAF_BYTES]).await;
     seed_selectors(storage, std::slice::from_ref(&reopen_key), root).await;
     println!(
         "forktree_media_correctness,backend={backend},authenticated_decode=true,corruption_fail_closed=true,selector_cas=true,shared_survives=true,final_reference_reclaims=true"
@@ -1719,7 +1830,7 @@ async fn assert_correctness_reopen<S: Storage>(storage: &S) {
         .expect("correctness selector survives reopen");
     let root = ObjectId(raw.as_ref().try_into().expect("root width"));
     let bytes = reconstruct_blocked(storage, root).await;
-    assert_eq!(bytes.len(), 4 * CHUNK_BYTES);
+    assert_eq!(bytes.len(), 4 * BLOCKED_LEAF_BYTES);
     println!("forktree_media_correctness_reopen,cold_reopen=true,exact_bytes=true");
 }
 
@@ -1808,7 +1919,7 @@ async fn sweep_objects<S: Storage>(storage: &S, roots: &[ObjectId]) -> usize {
 
 fn deterministic_bytes(size: usize, seed: u64) -> Vec<u8> {
     let mut bytes = vec![0; size];
-    for (index, chunk) in bytes.chunks_mut(CHUNK_BYTES).enumerate() {
+    for (index, chunk) in bytes.chunks_mut(DATA_GENERATION_BLOCK_BYTES).enumerate() {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"lix multimedia blocked tree benchmark bytes v1");
         hasher.update(&seed.to_be_bytes());
@@ -1858,7 +1969,7 @@ fn print_sample(
     hash_work: HashWork,
 ) {
     println!(
-        "forktree_media,sample={sample},backend={backend},layout={},size_mib={},edit_percent={},wall_us={wall_us:.3},cpu_us={cpu_us:.3},alloc_bytes={allocated_bytes},alloc_calls={allocation_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},rss_hwm_before_bytes={high_water_before},rss_hwm_after_bytes={high_water_after},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},write_batches={},write_puts={},write_deletes={},write_bytes={},disk_before_bytes={disk_before},disk_after_bytes={disk_after},slate_read_objects={},slate_read_bytes={},slate_write_objects={},slate_write_bytes={},hash_payload_bytes={},hash_object_bytes={},new_leaf_objects={},new_internal_objects={} ",
+        "forktree_media,sample={sample},backend={backend},layout={},size_mib={},edit_percent={},wall_us={wall_us:.3},cpu_us={cpu_us:.3},alloc_bytes={allocated_bytes},alloc_calls={allocation_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},rss_hwm_before_bytes={high_water_before},rss_hwm_after_bytes={high_water_after},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},write_batches={},write_puts={},write_deletes={},write_bytes={},disk_before_bytes={disk_before},disk_after_bytes={disk_after},slate_read_objects={},slate_read_bytes={},slate_write_objects={},slate_write_bytes={},hash_payload_bytes={},hash_object_bytes={},new_leaf_objects={},new_internal_objects={},root_read_alloc_bytes={},root_read_cpu_us={:.3},leaf_read_alloc_bytes={},leaf_read_cpu_us={:.3},path_copy_alloc_bytes={},path_copy_cpu_us={:.3},publication_alloc_bytes={},publication_cpu_us={:.3} ",
         parameters.layout.name(),
         parameters.size_mib,
         parameters.edit_percent,
@@ -1881,6 +1992,14 @@ fn print_sample(
         hash_work.object_bytes,
         hash_work.leaf_objects,
         hash_work.internal_objects,
+        hash_work.root_read_alloc_bytes,
+        hash_work.root_read_cpu_ns as f64 / 1_000.0,
+        hash_work.leaf_read_alloc_bytes,
+        hash_work.leaf_read_cpu_ns as f64 / 1_000.0,
+        hash_work.path_copy_alloc_bytes,
+        hash_work.path_copy_cpu_ns as f64 / 1_000.0,
+        hash_work.publication_alloc_bytes,
+        hash_work.publication_cpu_ns as f64 / 1_000.0,
     );
 }
 
@@ -1907,6 +2026,24 @@ fn end_allocation_profile() -> (u64, u64) {
         PROFILE_ALLOCATED_BYTES.load(Ordering::Relaxed),
         PROFILE_ALLOCATION_CALLS.load(Ordering::Relaxed),
     )
+}
+
+fn profile_snapshot() -> ProfileSnapshot {
+    ProfileSnapshot {
+        allocated_bytes: PROFILE_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        cpu_ns: process_cpu_nanos(),
+    }
+}
+
+fn add_profile_delta(
+    before: ProfileSnapshot,
+    after: ProfileSnapshot,
+    allocated_bytes: &mut u64,
+    cpu_ns: &mut u64,
+) {
+    *allocated_bytes = allocated_bytes
+        .saturating_add(after.allocated_bytes.saturating_sub(before.allocated_bytes));
+    *cpu_ns = cpu_ns.saturating_add(after.cpu_ns.saturating_sub(before.cpu_ns));
 }
 
 fn process_resident_bytes() -> u64 {

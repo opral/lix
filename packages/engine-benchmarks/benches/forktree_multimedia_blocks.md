@@ -75,6 +75,99 @@ but the production implementation must preserve zero-copy/sliced read buffers
 and re-qualify this adapter cost. RocksDB allocations are neutral after the
 one-copy path-copy primitive.
 
+## SlateDB resource-amplification follow-up
+
+Status: **retain the accepted 1 MiB/F64/Q8 tree; reject smaller leaves and new
+packing; implement exact-extent ownership transfer in the storage read path.**
+This follow-up starts at model head
+`4c7b1a5ccc97fc1a0466355ca84ad0717862c226` and remains benchmark-only.
+
+Phase counters on the exact 64 MiB/1% Slate cell attribute the steady
+7,398,239 allocated bytes as follows:
+
+| Phase | Allocated bytes | CPU (typical) | Meaning |
+|---|---:|---:|---|
+| Root fetch/decode | 15,072 | 11–27 us | Small authenticated path metadata |
+| One old-leaf fetch | 2,104,458 | 85–122 us | Object-store range plus a second 1 MiB reconstruction buffer |
+| Authenticate/copy/hash successor leaf | 1,048,593 | 249–254 us | Required single mutable successor buffer |
+| Atomic object/selector publication | 4,225,604 | 326–342 us | Existing Slate write ownership |
+
+`ImmutableValueStore::get_many` already obtains each remote extent as `Bytes`,
+but then reconstructs every requested value into a new
+`BytesMut::with_capacity(requested.len())`. For this cell the requested value
+is one complete 1,048,593-byte encoded leaf in one extent. Transferring or
+slicing that exact owned span removes precisely 1,048,593 bytes. Projected
+blocked allocation becomes 6,349,646 bytes, only 31,890 bytes (+0.50%) above
+current's 6,317,756. Across the accepted four cells, subtracting exactly one
+encoded old-leaf buffer per touched leaf leaves approximately +0.50%, +0.08%,
++0.03%, and +0.03% versus current. This is the allocation perfect-elimination
+ceiling; successor bytes and write ownership remain required.
+
+Physical reads have a different bound. A trusted root names immutable object
+bytes, not a presence bit or cache entry, so every touched old leaf must be read
+and hashed before its child ID can be reused. The lower bound is
+`sum(encoded touched leaves) + touched path nodes`; for 64/1 it is 1,051,175
+logical bytes. Slate's steady 3,155,111 physical bytes are its approximately
+2.10 MiB current publication/settle work plus that mandatory old-leaf/path
+read. Eliminating the latter would require another attestation or cache
+authority and is rejected.
+
+### Parameter and packing experiments
+
+A fixed 64 KiB/F128 tree with a constant 8 MiB leaf batch improved the focused
+Slate 64/1 cell versus the accepted 1 MiB tree: paired median wall/CPU -12%
+(-20% in the initial focused profile), allocated bytes -30.2%, physical reads
+-30.8%, and logical writes -30.8%. Against current, its
+5,163,243 allocated bytes were -18.3%, and 2,181,855 physical read bytes were
+only +3.9%. Rocks showed the same direction and exact cold reopen passed.
+
+The cut fails at scale. At Slate 512/10, 820 small leaves produce 298,648
+allocation calls; median wall rises from the accepted 49.7 ms to 69.7 ms
+(+40%), CPU from 49.8 ms to 78.7 ms (+58%), and allocation from 364.3 MiB to
+413.5 MiB (+13.5%). Reducing the key batch from 128 to 32 leaves changes neither
+bytes nor allocation and changes wall by only about 1%, proving request count
+is not the causal term. The fixed small-leaf layout is therefore rejected; no
+adaptive second format is allowed.
+
+Content-independent extent packing was also modeled. Authenticated objects and
+their IDs remained the sole authority; the 60-byte
+`ObjectId -> (extent, offset, length)` locator was treated as rebuildable
+routing data. Packing base objects into approximately 63 MiB extents reduced
+512/10 steady physical read objects from 37 to 13 and seed disk by 186,125
+bytes (0.035%), but physical read bytes stayed 161,417,382 and allocation stayed
+about 413.4 MiB. Median wall rose from 69.7 to 73.2 ms (+5.0%) and CPU from
+78.7 to 84.7 ms (+7.6%). Existing range coalescing had already removed the byte
+cost, so a new pack/locator layer is rejected. A 60-byte locator per 64 KiB
+object is 61,440 bytes per 64 MiB before LSM key overhead; rebuilding it must
+scan/frame/hash every packed object, `O(N)`, and GC must still trace object IDs.
+
+The final complexity remains `O(KL + P*F*D)` CPU/hash work and
+`O(KL + P*F)` authenticated read bytes with `L=1 MiB`, `F=64`, and `Q=8`.
+Exact-extent ownership transfer changes the allocation coefficient, not Big-O.
+The physical-read amplification is accepted as the authentication cost for the
+single-authority layout.
+
+### Additional implementer requirements for Ryzen-V
+
+1. Keep the accepted fixed 1 MiB leaf, fanout 64, and eight-leaf/8 MiB bounded
+   authentication batch. Do not add adaptive leaves or a second format.
+2. Add a read-only storage primitive that can transfer or slice an already
+   owned exact immutable extent into the returned `Bytes`. Use reconstruction
+   allocation only when a value is genuinely fragmented. This is buffer
+   ownership, never cache or content authority.
+3. Authenticate the complete returned object bytes against the parent
+   `ObjectId` before decoding or path copying. Zero-copy must not skip hashing,
+   length checks, or fail-closed behavior.
+4. Submit one coherent `get_many` per path level and retain the Q=8 memory
+   bound. More or smaller calls did not reduce allocation.
+5. Reuse the adapter's existing physical immutable segments only. If a routing
+   locator can be rebuilt by framing and hashing segment bytes, it may remain a
+   disposable index; it must not publish independently, name content, or gate
+   GC. Do not add a new extent layout for this optimization.
+6. Qualify exact-span and fragmented-span reads, malformed frame/range/locator,
+   cold reopen, shared/final-reference GC, and the four 64/512 MiB 1%/10%
+   adapter cells. Track allocation bytes and calls separately.
+
 Logical writes and first-settled disk are within 1% of current because edited
 payload dominates. Metadata improves slightly at 512 MiB: blocked writes
 54,534,143 bytes at 10% versus current 54,549,897. Process peak RSS includes
