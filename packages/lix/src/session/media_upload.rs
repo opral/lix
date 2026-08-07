@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::ops::Bound;
 
-use crate::binary_cas::{BlobChunkReceipt, ChunkHash};
+use crate::binary_cas::{BlobChunkReceipt, BlobId, ChunkHash};
 use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, Storage, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StorageKeyRange, StoragePrecondition, StorageProjectedValue, StorageReadOptions,
@@ -20,10 +21,153 @@ const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0007_0007),
     "session.file_upload_manifest_leaf.v2",
 );
+const UPLOAD_RECLAIM_FENCE_SPACE: StorageSpace = StorageSpace::mutable(
+    StorageSpaceId(0x0007_0008),
+    "session.file_upload_reclaim_fence.v1",
+);
+const UPLOAD_RECLAIM_FENCE_KEY: &[u8] = b"fence";
 pub const FILE_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const UPLOAD_PART_WINDOW: u32 = 4;
 const UPLOAD_MANIFEST_LEAF_MAGIC: &[u8; 8] = b"LIXUML2\0";
+
+/// Collects active resumable-upload receipt chunks and stages receipt cleanup.
+/// Upload leaves contain hashes and sizes only; they are never a second payload
+/// authority. Open uploads retain their receipt chunks. A completed state is
+/// only an idempotency receipt: the published file reference is the sole blob
+/// root, so a completed state with no live file root can be retired.
+pub(crate) async fn stage_reclaimable_upload_receipts(
+    store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    writes: &mut crate::storage_adapter::StorageWriteSet,
+    live_blob_roots: &BTreeSet<BlobId>,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<BTreeSet<ChunkHash>, LixError> {
+    let (_, fence_token) = load_upload_reclaim_fence(store).await?;
+    preconditions.push(upload_reclaim_fence_precondition(fence_token));
+    let mut states = Vec::<(String, UploadState)>::new();
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                UPLOAD_STATE_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: MAX_SCAN_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let upload_id = std::str::from_utf8(&entry.key.0)
+                .map_err(|_| invalid_upload_storage("upload state key is not UTF-8"))?
+                .to_owned();
+            validate_upload_id_for_storage(&upload_id)?;
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(invalid_upload_storage(
+                    "upload state scan omitted its value",
+                ));
+            };
+            let state = serde_json::from_slice(&value)
+                .map_err(|_| invalid_upload_storage("upload state value is invalid JSON"))?;
+            states.push((upload_id, state));
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    let mut open_ids = BTreeSet::new();
+    for (upload_id, state) in states {
+        match state {
+            UploadState::Open(_) => {
+                open_ids.insert(upload_id);
+            }
+            UploadState::Complete(complete) => {
+                if !live_blob_roots.contains(&BlobId::from_bytes(complete.blob_id)) {
+                    writes.delete(UPLOAD_STATE_SPACE, upload_state_key(&upload_id)?);
+                }
+            }
+        }
+    }
+
+    let mut upload_chunks = BTreeSet::new();
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                UPLOAD_MANIFEST_LEAF_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: MAX_SCAN_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let upload_id = decode_upload_manifest_leaf_upload_id(&entry.key)?;
+            if !open_ids.contains(&upload_id) {
+                // Finalized or state-less receipts are not active roots; the
+                // published file snapshot, if any, owns the blob instead.
+                writes.delete(UPLOAD_MANIFEST_LEAF_SPACE, entry.key);
+                continue;
+            }
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(invalid_upload_storage(
+                    "active upload manifest leaf scan omitted its value",
+                ));
+            };
+            let leaf = decode_upload_manifest_leaf(&value)?;
+            upload_chunks.extend(leaf.chunks.into_iter().map(|chunk| chunk.hash));
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    Ok(upload_chunks)
+}
+
+fn decode_upload_manifest_leaf_upload_id(key: &StorageKey) -> Result<String, LixError> {
+    if key.0.len() < 2 + 4 {
+        return Err(invalid_upload_storage(
+            "upload manifest leaf key is too short",
+        ));
+    }
+    let id_len = usize::from(u16::from_be_bytes([key.0[0], key.0[1]]));
+    if key.0.len() != 2 + id_len + 4 {
+        return Err(invalid_upload_storage(
+            "upload manifest leaf key has an invalid upload id length",
+        ));
+    }
+    let upload_id = std::str::from_utf8(&key.0[2..2 + id_len])
+        .map_err(|_| invalid_upload_storage("upload manifest leaf id is not UTF-8"))?
+        .to_owned();
+    validate_upload_id_for_storage(&upload_id)?;
+    Ok(upload_id)
+}
+
+fn validate_upload_id_for_storage(upload_id: &str) -> Result<(), LixError> {
+    if upload_id.is_empty() || upload_id.len() > 200 || !upload_id.is_ascii() {
+        return Err(invalid_upload_storage("upload id is not a valid ASCII key"));
+    }
+    Ok(())
+}
+
+fn invalid_upload_storage(message: &'static str) -> LixError {
+    LixError::new(LixError::CODE_STORAGE_ERROR, message)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileUploadProgress {
@@ -95,6 +239,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?;
             let loaded_state = load_upload_state(&read, &state_key).await?;
+            let (_, fence_token) = load_upload_reclaim_fence(&read).await?;
             match &loaded_state {
                 Some(UploadState::Complete(complete)) => {
                     validate_upload_binding(&complete.path, complete.total_size, &path, total_size)?
@@ -166,6 +311,9 @@ where
                 space: UPLOAD_MANIFEST_LEAF_SPACE,
                 key: leaf_key.clone(),
             }];
+            let next_fence = next_upload_reclaim_fence(fence_token.as_deref())?;
+            stage_upload_reclaim_fence(&mut writes, next_fence);
+            preconditions.push(upload_reclaim_fence_precondition(fence_token));
             match loaded_state {
                 Some(UploadState::Open(existing)) => {
                     preconditions.push(StoragePrecondition::KeyValueEquals {
@@ -249,6 +397,13 @@ where
         let (receipts, part_identities) =
             load_upload_manifest_leaves(&read, &upload_id, state.total_size).await?;
         let mut finalization_writes = self.storage.new_write_set();
+        let (fence, fence_token) = load_upload_reclaim_fence(&read).await?;
+        stage_upload_reclaim_fence(
+            &mut finalization_writes,
+            fence
+                .checked_add(1)
+                .ok_or_else(|| invalid_upload("upload reclaim fence exhausted"))?,
+        );
         finalization_writes
             .delete_range_exclusive(
                 UPLOAD_MANIFEST_LEAF_SPACE,
@@ -269,11 +424,14 @@ where
         let expected_blob_id = receipt.hash.into_bytes();
         stage_upload_state(&mut finalization_writes, state_key.clone(), &complete)?;
         let expected_open = encode_upload_state(&UploadState::Open(state.clone()))?;
-        let finalization_preconditions = vec![StoragePrecondition::KeyValueEquals {
-            space: UPLOAD_STATE_SPACE,
-            key: state_key,
-            expected: Bytes::from(expected_open),
-        }];
+        let finalization_preconditions = vec![
+            StoragePrecondition::KeyValueEquals {
+                space: UPLOAD_STATE_SPACE,
+                key: state_key,
+                expected: Bytes::from(expected_open),
+            },
+            upload_reclaim_fence_precondition(fence_token),
+        ];
         drop(read);
         let path = state.path.clone();
         let write_access = self.begin_session_write_access().await?;
@@ -366,6 +524,87 @@ fn upload_state_key(upload_id: &str) -> Result<StorageKey, LixError> {
         return Err(invalid_upload("upload id must be 1-200 ASCII bytes"));
     }
     Ok(StorageKey(Bytes::copy_from_slice(upload_id.as_bytes())))
+}
+
+fn upload_reclaim_fence_key() -> StorageKey {
+    StorageKey(Bytes::from_static(UPLOAD_RECLAIM_FENCE_KEY))
+}
+
+async fn load_upload_reclaim_fence(
+    store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+) -> Result<(u64, Option<Bytes>), LixError> {
+    let key = upload_reclaim_fence_key();
+    let values = exact_get_many(
+        store,
+        &[StorageGetManyRequest {
+            space: UPLOAD_RECLAIM_FENCE_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: StorageGetOptions {
+                projection: StorageCoreProjection::FullValue,
+            },
+        }],
+    )
+    .await?;
+    let Some(value) = values.values.into_iter().next().flatten() else {
+        return Ok((0, None));
+    };
+    let StorageProjectedValue::FullValue(value) = value else {
+        return Err(invalid_upload_storage(
+            "upload reclaim fence omitted its value",
+        ));
+    };
+    if value.len() != 8 {
+        return Err(invalid_upload_storage(
+            "upload reclaim fence has an invalid width",
+        ));
+    }
+    Ok((
+        u64::from_be_bytes(value.as_ref().try_into().expect("checked fence width")),
+        Some(value),
+    ))
+}
+
+fn next_upload_reclaim_fence(token: Option<&[u8]>) -> Result<u64, LixError> {
+    let current = token
+        .map(|value| {
+            if value.len() != 8 {
+                return Err(invalid_upload_storage(
+                    "upload reclaim fence has an invalid width",
+                ));
+            }
+            Ok(u64::from_be_bytes(
+                value.try_into().expect("checked fence width"),
+            ))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    current
+        .checked_add(1)
+        .ok_or_else(|| invalid_upload("upload reclaim fence exhausted"))
+}
+
+fn stage_upload_reclaim_fence(writes: &mut crate::storage_adapter::StorageWriteSet, value: u64) {
+    writes.put(
+        UPLOAD_RECLAIM_FENCE_SPACE,
+        upload_reclaim_fence_key(),
+        StorageValue {
+            bytes: Bytes::copy_from_slice(&value.to_be_bytes()),
+        },
+    );
+}
+
+fn upload_reclaim_fence_precondition(expected: Option<Bytes>) -> StoragePrecondition {
+    match expected {
+        Some(expected) => StoragePrecondition::KeyValueEquals {
+            space: UPLOAD_RECLAIM_FENCE_SPACE,
+            key: upload_reclaim_fence_key(),
+            expected,
+        },
+        None => StoragePrecondition::KeyAbsent {
+            space: UPLOAD_RECLAIM_FENCE_SPACE,
+            key: upload_reclaim_fence_key(),
+        },
+    }
 }
 
 async fn load_upload_state(
@@ -757,10 +996,70 @@ mod tests {
     use crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE;
     use crate::storage_adapter::{
         StorageAdapter, StorageAdapterRead, StorageCoreProjection, StorageKeyRange,
-        StorageScanOptions,
+        StorageScanOptions, StorageWriteOptions,
     };
     use crate::{Memory, engine::Engine};
     use std::ops::Bound;
+
+    #[tokio::test]
+    async fn completed_receipt_without_a_live_file_root_is_reclaimed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let upload_id = "completed-receipt";
+        let mut initial = storage.new_write_set();
+        stage_upload_state(
+            &mut initial,
+            upload_state_key(upload_id).expect("upload state key should encode"),
+            &UploadState::Complete(UploadComplete {
+                path: "/orphaned.bin".to_owned(),
+                total_size: 7,
+                blob_id: BlobId::from_content(b"orphaned").into_bytes(),
+                part_identities: Vec::new(),
+            }),
+        )
+        .expect("completed state should encode");
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("completed receipt should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("receipt read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let chunks = stage_reclaimable_upload_receipts(
+            &read,
+            &mut writes,
+            &BTreeSet::new(),
+            &mut preconditions,
+        )
+        .await
+        .expect("receipt sweep should succeed");
+        assert!(chunks.is_empty());
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("completed receipt cleanup should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reopened receipt read should open");
+        assert!(
+            load_upload_state(&read, &upload_state_key(upload_id).unwrap())
+                .await
+                .expect("completed receipt lookup should succeed")
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn sequential_parts_survive_a_new_session_and_publish_one_file() {

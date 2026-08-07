@@ -10,8 +10,9 @@ use std::ops::Bound;
 use std::time::Instant;
 
 use bytes::Bytes;
+use serde::Deserialize;
 
-use crate::branch::BranchHeadControlContext;
+use crate::branch::{BranchHeadControlContext, branch_head_control_precondition};
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::ChangeScanRequest;
 use crate::changelog::{
@@ -1627,6 +1628,7 @@ fn validate_stored_recovery_ref(
 pub(crate) struct RepositoryGcSweep {
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
+    pub(crate) binary_cas: crate::binary_cas::kv::BinaryCasReclamation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1681,6 +1683,26 @@ where
         .reader(store.clone())
         .scan()
         .await?;
+    let branch_ids = controls
+        .iter()
+        .map(|(branch_id, _)| branch_id.clone())
+        .collect::<Vec<_>>();
+    let observed_controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .load_observed(&branch_ids)
+        .await?;
+    for ((branch_id, control), observed) in controls.iter().zip(observed_controls) {
+        if observed.control != Some(*control) {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("branch '{branch_id}' changed while GC roots were being observed"),
+            ));
+        }
+        preconditions.push(branch_head_control_precondition(
+            branch_id,
+            observed.raw_token,
+        )?);
+    }
     let recovery_refs = load_recovery_refs(&store).await?;
     let mut active_roots = controls
         .iter()
@@ -1713,6 +1735,22 @@ where
             .iter()
             .flat_map(|(_, batch)| batch.checkpoint_roots.iter().copied()),
     );
+
+    let blob_roots = collect_active_binary_blob_roots(&store, &active_roots).await?;
+    let upload_chunks = crate::session::stage_reclaimable_upload_receipts(
+        &store,
+        writes,
+        &blob_roots,
+        preconditions,
+    )
+    .await?;
+    let binary_cas = crate::binary_cas::kv::stage_reclaim_unreachable_binary_cas(
+        &store,
+        writes,
+        &blob_roots,
+        &upload_chunks,
+    )
+    .await?;
     if batches.is_empty() {
         return Ok(RepositoryGcPlan {
             changelog: GcPlan {
@@ -1737,6 +1775,7 @@ where
             sweep: RepositoryGcSweep {
                 tracked_commit_roots: Vec::new(),
                 standalone_changes: Vec::new(),
+                binary_cas,
             },
             profile: RepositoryGcProfile {
                 root_discovery_us: elapsed_micros(started),
@@ -2065,6 +2104,7 @@ where
         sweep: RepositoryGcSweep {
             tracked_commit_roots: reclaimed_commits,
             standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
+            binary_cas,
         },
         profile: RepositoryGcProfile {
             root_discovery_us: elapsed_micros(started),
@@ -2237,6 +2277,7 @@ where
         sweep: RepositoryGcSweep {
             tracked_commit_roots: swept_snapshot_authorities,
             standalone_changes: Vec::new(),
+            binary_cas: Default::default(),
         },
         profile: RepositoryGcProfile {
             root_discovery_us,
@@ -2245,6 +2286,63 @@ where
             total_us: elapsed_micros(total_started),
         },
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct BinaryBlobRefSnapshot {
+    blob_hash: String,
+}
+
+/// Re-derives file blob roots from authenticated serving roots. Materialized
+/// snapshots contain only the small filesystem reference JSON; payload bytes
+/// are never loaded by this maintenance path.
+async fn collect_active_binary_blob_roots<S>(
+    store: &S,
+    roots: &BTreeSet<CommitId>,
+) -> Result<BTreeSet<crate::binary_cas::BlobId>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    if roots.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let request = crate::tracked_state::TrackedStateScanRequest {
+        filter: crate::tracked_state::TrackedStateFilter {
+            schema_keys: vec!["lix_binary_blob_ref".to_owned()],
+            ..crate::tracked_state::TrackedStateFilter::default()
+        },
+        read_columns: crate::tracked_state::TrackedStateReadColumns {
+            columns: vec!["snapshot_content".to_owned()],
+        },
+        limit: None,
+    };
+    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+    let mut blob_roots = BTreeSet::new();
+    for commit_id in roots {
+        let rows = reader
+            .scan_batch_at_commit(&commit_id.to_string(), &request)
+            .await?;
+        for row in rows.iter() {
+            if row.deleted() {
+                continue;
+            }
+            let snapshot = row.snapshot_content().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("live binary blob reference in commit '{commit_id}' has no snapshot"),
+                )
+            })?;
+            let snapshot: BinaryBlobRefSnapshot =
+                serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("invalid live binary blob reference snapshot: {error}"),
+                    )
+                })?;
+            blob_roots.insert(crate::binary_cas::BlobId::from_hex(&snapshot.blob_hash)?);
+        }
+    }
+    Ok(blob_roots)
 }
 
 #[cfg(test)]
@@ -3035,7 +3133,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use crate::branch::{BranchHeadControl, BranchHeadControlContext, stage_branch_head_control};
+    use crate::branch::{
+        BranchHeadControl, BranchHeadControlContext, branch_head_control_precondition,
+        stage_branch_head_control,
+    };
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
@@ -3068,13 +3169,13 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, GC_TREE_SWEEP_FORMAT_VERSION,
-        GC_TREE_SWEEP_MARK_SPACE, RootReachabilityDelta, StoredTreeSweepMark,
-        begin_tree_sweep_epoch, load_checkpoint_gc_state, load_reachability_batches,
-        load_reachability_queue, load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch,
-        retirement_is_proven, root_control_digest_for_control, stage_checkpoint_gc_state,
-        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
-        stage_tree_sweep_epoch_page,
+        CheckpointGcState, CheckpointRecoveryRef, GC_REACHABILITY_QUEUE_SPACE,
+        GC_TREE_SWEEP_FORMAT_VERSION, GC_TREE_SWEEP_MARK_SPACE, RootReachabilityDelta,
+        StoredTreeSweepMark, begin_tree_sweep_epoch, load_checkpoint_gc_state,
+        load_reachability_batches, load_reachability_queue, load_recovery_ref, load_recovery_refs,
+        open_tree_sweep_epoch, retirement_is_proven, root_control_digest_for_control,
+        stage_checkpoint_gc_state, stage_reachability_delta_batch, stage_reachability_queue_seed,
+        stage_recovery_ref_rotation, stage_tree_sweep_epoch_page,
     };
 
     async fn tree_sweep_fixture() -> (
@@ -3143,6 +3244,60 @@ mod tests {
             .await
             .expect("tree sweep fixture should commit");
         (storage, commit_id, root_hash, dead_hash, dead_hash_two)
+    }
+
+    #[tokio::test]
+    async fn gc_sweep_branch_guard_rejects_concurrent_publication() {
+        let (storage, commit_id, _root_hash, _dead_hash, _dead_hash_two) =
+            tree_sweep_fixture().await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fixture read should open");
+        let observed = BranchHeadControlContext::new()
+            .reader(&read)
+            .load_observed(&["main".to_owned()])
+            .await
+            .expect("branch control should load")
+            .pop()
+            .expect("branch control observation should exist");
+        let guard = branch_head_control_precondition("main", observed.raw_token)
+            .expect("branch control guard should encode");
+        drop(read);
+
+        let mut concurrent = storage.new_write_set();
+        let mut advanced = observed.control.expect("fixture control should exist");
+        advanced.head_commit_id = CommitId::for_test_label("concurrent-head");
+        advanced.tracked_generation = advanced.head_commit_id;
+        advanced.untracked_generation = advanced.head_commit_id;
+        advanced.current_state_revision = advanced.current_state_revision.saturating_add(1);
+        stage_branch_head_control(&mut concurrent, "main", advanced)
+            .expect("concurrent control should stage");
+        storage
+            .commit_write_set(concurrent, StorageWriteOptions::default())
+            .await
+            .expect("concurrent publication should commit");
+
+        let mut stale_sweep = storage.new_write_set();
+        stale_sweep.put(
+            GC_REACHABILITY_QUEUE_SPACE,
+            StorageKey(Bytes::from_static(b"stale-sweep-marker")),
+            StorageValue {
+                bytes: Bytes::from_static(b"stale-sweep-marker"),
+            },
+        );
+        let error = storage
+            .commit_write_set(
+                stale_sweep,
+                StorageWriteOptions {
+                    preconditions: vec![guard],
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale GC publication must be rejected");
+        assert!(error.to_string().contains("precondition"));
+        assert_ne!(advanced.head_commit_id, commit_id);
     }
 
     #[tokio::test]

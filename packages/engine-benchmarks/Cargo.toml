@@ -69,6 +69,11 @@ name = "revision_pack_oracle"
 path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
 
+[[example]]
+name = "cas_gc_qualification"
+path = "examples/cas_gc_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
