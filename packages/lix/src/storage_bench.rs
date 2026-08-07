@@ -10,6 +10,28 @@ use crate::storage_adapter::{
     StorageWriteSetError,
 };
 
+/// Runs one feature-gated ForkTree adversarial oracle cell against a real adapter.
+pub async fn run_forktree_adversarial_oracle<StorageImpl>(
+    storage: &StorageImpl,
+    case: &str,
+) -> Result<String, String>
+where
+    StorageImpl: Storage,
+{
+    crate::forktree::oracle::run(storage, case).await
+}
+
+/// Revalidates a completed ForkTree oracle cell after dropping and reopening its adapter.
+pub async fn verify_forktree_adversarial_oracle_reopen<StorageImpl>(
+    storage: &StorageImpl,
+    case: &str,
+) -> Result<String, String>
+where
+    StorageImpl: Storage,
+{
+    crate::forktree::oracle::verify_reopen(storage, case).await
+}
+
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],

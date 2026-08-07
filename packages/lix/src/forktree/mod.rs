@@ -220,3 +220,6 @@ const _: () = {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "storage-benches")]
+pub(crate) mod oracle;
