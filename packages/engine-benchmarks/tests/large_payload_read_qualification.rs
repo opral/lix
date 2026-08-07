@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 use std::alloc::{GlobalAlloc, Layout};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -12,9 +13,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-    ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageSpace, StorageWrite, WriteOptions,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
+    MAX_SCAN_PAGE_ROWS, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, Storage, StorageError, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    WriteOptions,
 };
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
@@ -320,11 +322,13 @@ impl CasLayout {
 
 struct PreparedPayload {
     family: WorkloadFamily,
+    shape: WorkloadShape,
     parts: Vec<Bytes>,
     size: usize,
+    edited: Bytes,
+    edited_size: usize,
     edit_offset: usize,
     edit_bytes: usize,
-    edit: Bytes,
     base_blake3: String,
     base_sha256: String,
     edited_blake3: String,
@@ -337,6 +341,55 @@ enum WorkloadFamily {
     Audio,
     Archive,
     Video,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadShape {
+    AudioMiddle,
+    AudioPrefix,
+    ArchiveAppend,
+    ArchiveTruncate,
+    ArchiveMiddle,
+    VideoSparse,
+    VideoPrefixInsert,
+}
+
+impl WorkloadShape {
+    fn from_env() -> Self {
+        match std::env::var("LIX_MEDIA_QUAL_SHAPE").as_deref() {
+            Ok("audio-middle") => Self::AudioMiddle,
+            Ok("audio-prefix") => Self::AudioPrefix,
+            Ok("archive-append") => Self::ArchiveAppend,
+            Ok("archive-truncate") => Self::ArchiveTruncate,
+            Ok("archive-middle") => Self::ArchiveMiddle,
+            Ok("video-sparse") => Self::VideoSparse,
+            Ok("video-prefix-insert") => Self::VideoPrefixInsert,
+            Ok(value) => panic!("unknown workload shape '{value}'"),
+            Err(_) => panic!("LIX_MEDIA_QUAL_SHAPE is required"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AudioMiddle => "middle_overwrite",
+            Self::AudioPrefix => "metadata_prefix_overwrite",
+            Self::ArchiveAppend => "append_1pct",
+            Self::ArchiveTruncate => "truncate_1pct",
+            Self::ArchiveMiddle => "middle_replacement",
+            Self::VideoSparse => "sparse_four_region_overwrite",
+            Self::VideoPrefixInsert => "prefix_insert_256k",
+        }
+    }
+
+    const fn expected_family(self) -> WorkloadFamily {
+        match self {
+            Self::AudioMiddle | Self::AudioPrefix => WorkloadFamily::Audio,
+            Self::ArchiveAppend | Self::ArchiveTruncate | Self::ArchiveMiddle => {
+                WorkloadFamily::Archive
+            }
+            Self::VideoSparse | Self::VideoPrefixInsert => WorkloadFamily::Video,
+        }
+    }
 }
 
 impl WorkloadFamily {
@@ -389,6 +442,7 @@ struct ReopenExpectation {
     base_blake3: String,
     content_blake3: String,
     content_identity: String,
+    first_chunk_key: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,8 +471,8 @@ async fn large_media_foreground_lifecycle() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(64);
     assert!(
-        matches!(size_mib, 8 | 64 | 512),
-        "qualification size must be 8, 64, or 512 MiB"
+        matches!(size_mib, 8 | 16 | 32 | 64 | 512),
+        "qualification size must be 8, 16, 32, 64, or 512 MiB"
     );
     let mode = QualificationMode::from_env();
     let persistent_root = std::env::var_os("LIX_MEDIA_QUAL_FIXTURE_PATH").map(PathBuf::from);
@@ -570,9 +624,10 @@ async fn seed_visible_fixture<S>(
     );
     assert_eq!(layout.presence.rows, layout.payload.rows);
     println!(
-        "media_seed,backend={backend},family={},size_mib={size_mib},edit_bytes={},edit_offset={},\
+        "media_seed,backend={backend},family={},shape={},size_mib={size_mib},edit_bytes={},edit_offset={},\
          main_branch_id={},database_bytes={},base_blake3={},base_sha256={}",
         prepared.family.label(),
+        prepared.shape.label(),
         prepared.edit_bytes,
         prepared.edit_offset,
         receipt.main_branch_id,
@@ -639,11 +694,12 @@ where
         .await;
     }
     println!(
-        "media_edit_shape,backend={backend},family={},size_mib={size_mib},edit_bytes={},edit_offset={},edit_end={}",
+        "media_edit_shape,backend={backend},family={},shape={},size_mib={size_mib},edit_bytes={},edit_offset={},edited_size={}",
         prepared.family.label(),
+        prepared.shape.label(),
         prepared.edit_bytes,
         prepared.edit_offset,
-        prepared.edit_offset + prepared.edit_bytes,
+        prepared.edited_size,
     );
     let ingest_layout = cas_layout(&storage).await;
     print_layout(backend, size_mib, "after_ingest", ingest_layout);
@@ -813,67 +869,30 @@ where
     assert_eq!(branch_read.content(), base_read.content());
     drop(branch_read);
 
-    let verified_base = measured(
-        backend,
-        size_mib,
-        "localized_edit_verify_base",
-        database,
-        &storage,
-        slate_counters.as_ref(),
-        async { VerifiedRequestBlob::verify(base_read.into_content()) },
-    )
-    .await;
-    assert_eq!(verified_base.sha256(), prepared.base_sha256);
-    let suffix_bytes = prepared.size - prepared.edit_offset - prepared.edit_bytes;
-    let (verified_result, provenance) = measured(
-        backend,
-        size_mib,
-        "localized_edit_reconstruct",
-        database,
-        &storage,
-        slate_counters.as_ref(),
-        async {
-            verified_base.reconstruct_splice(
-                &prepared.base_sha256,
-                &prepared.edited_sha256,
-                prepared.edit_offset,
-                suffix_bytes,
-                prepared.edit.clone().into(),
-            )
-        },
-    )
-    .await
-    .expect("reconstruct authenticated localized edit");
-    drop(verified_base);
+    drop(base_read);
 
     let edit_result = measured(
         backend,
         size_mib,
-        "localized_edit_publish",
+        prepared.shape.label(),
         database,
         &storage,
         slate_counters.as_ref(),
-        source.execute_with_options_and_metadata(
+        source.execute(
             UPSERT_SQL,
             &[
                 Value::Text(PATH.to_owned()),
-                Value::Blob(verified_result.blob().clone()),
+                Value::Blob(prepared.edited.clone().into()),
             ],
-            ExecuteOptions::default(),
-            ExecuteStatementMetadata {
-                parameter_blob_splices: vec![None, Some(provenance)],
-                mutation_identity: None,
-            },
         ),
     )
     .await
-    .expect("publish authenticated localized edit");
+    .expect("publish multimedia mutation");
     assert_eq!(edit_result.rows_affected(), 1);
     assert_eq!(
-        blake3::hash(verified_result.blob()).to_hex().to_string(),
+        blake3::hash(&prepared.edited).to_hex().to_string(),
         prepared.edited_blake3
     );
-    drop(verified_result);
     let edit_layout = cas_layout(&storage).await;
     print_amplification(
         backend,
@@ -882,27 +901,31 @@ where
         branch_layout,
         edit_layout,
     );
-    let first_edited_chunk = prepared.edit_offset / CAS_CHUNK_BYTES;
-    let last_edited_chunk = (prepared.edit_offset + prepared.edit_bytes - 1) / CAS_CHUNK_BYTES;
-    let edited_chunk_count = last_edited_chunk - first_edited_chunk + 1;
+    let sharing = fixed_chunk_sharing(&prepared);
     assert!(
         edit_layout
             .payload
             .rows
             .saturating_sub(branch_layout.payload.rows)
-            <= edited_chunk_count as u64,
-        "localized edit rewrote unchanged payload chunks"
+            <= sharing.new_unique_chunks as u64,
+        "fixed-chunk publication wrote more unique payloads than the content model"
     );
-    let total_chunks = prepared.size / CAS_CHUNK_BYTES;
-    let unchanged_chunks = total_chunks - edited_chunk_count;
     println!(
-        "media_unchanged_sharing,backend={backend},family={},size_mib={size_mib},\
-         total_chunks={total_chunks},edited_chunks={edited_chunk_count},minimum_reused_manifest_refs={unchanged_chunks},\
-         minimum_reused_chunk_bytes={},unchanged_content_bytes={},new_payload_rows={},\
+        "media_unchanged_sharing,backend={backend},family={},shape={},size_mib={size_mib},\
+         base_bytes={},edited_bytes={},mutation_bytes={},edit_offset={},base_chunks={},edited_chunks={},\
+         shared_manifest_refs={},shared_chunk_bytes={},new_unique_chunks={},new_payload_rows={},\
          base_blake3={},edited_blake3={},base_sha256={},edited_sha256={}",
         prepared.family.label(),
-        unchanged_chunks * CAS_CHUNK_BYTES,
-        prepared.size - prepared.edit_bytes,
+        prepared.shape.label(),
+        prepared.size,
+        prepared.edited_size,
+        prepared.edit_bytes,
+        prepared.edit_offset,
+        sharing.base_chunks,
+        sharing.edited_chunks,
+        sharing.shared_refs,
+        sharing.shared_bytes,
+        sharing.new_unique_chunks,
         edit_layout
             .payload
             .rows
@@ -1024,10 +1047,14 @@ where
 
     ReopenExpectation {
         main_branch_id,
-        size: prepared.size,
+        size: prepared.edited_size,
         base_blake3: prepared.base_blake3,
         content_blake3: prepared.edited_blake3,
         content_identity: edited_identity,
+        first_chunk_key: *blake3::hash(
+            &prepared.edited[..prepared.edited.len().min(CAS_CHUNK_BYTES)],
+        )
+        .as_bytes(),
     }
 }
 
@@ -1151,6 +1178,104 @@ async fn qualify_reopen<S>(
     print_layout(backend, size_mib, "after_reopen", layout);
     print_owner_inventory(backend, size_mib, &storage).await;
     main.close().await.expect("close reopened main session");
+    drop(main);
+    drop(engine);
+    qualify_corruption_fail_closed(
+        backend,
+        database,
+        &storage,
+        slate_counters.as_ref(),
+        &expected.main_branch_id,
+        expected.first_chunk_key,
+        expected.size,
+    )
+    .await;
+}
+
+async fn qualify_corruption_fail_closed<S>(
+    backend: &str,
+    database: &Path,
+    storage: &CountingStorage<S>,
+    slate_counters: Option<&SlateDBIoCounters>,
+    branch_id: &str,
+    chunk_key: [u8; 32],
+    size: usize,
+) where
+    S: QualificationStorage,
+{
+    let key = Key(Bytes::copy_from_slice(&chunk_key));
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("open corruption source read");
+    let result = read
+        .get_many(&[GetManyRequest {
+            space: StorageSpace::immutable(PAYLOAD_SPACE, "qualification.binary_cas_payload"),
+            keys: std::slice::from_ref(&key),
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("load live payload for corruption oracle");
+    let mut encoded = match result.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(value)) => value.to_vec(),
+        _ => panic!("live payload chunk is absent from corruption oracle"),
+    };
+    let final_byte = encoded.len() - 1;
+    encoded[final_byte] ^= 0x80;
+    let overwrite = measured(
+        backend,
+        size / (1024 * 1024),
+        "corruption_injection",
+        database,
+        storage,
+        slate_counters,
+        async {
+            let mut write = storage.begin_write(WriteOptions::default()).await?;
+            write
+                .put_many(
+                    StorageSpace::immutable(PAYLOAD_SPACE, "qualification.binary_cas_payload"),
+                    PutBatch {
+                        entries: vec![PutEntry {
+                            key,
+                            value: StoredValue {
+                                bytes: Bytes::from(encoded),
+                            },
+                        }],
+                    },
+                )
+                .await?;
+            write.commit().await
+        },
+    )
+    .await;
+    if overwrite.is_err() {
+        println!("media_corruption,backend={backend},result=immutable_overwrite_rejected");
+        return;
+    }
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("cold-open corruption oracle engine");
+    let session = engine
+        .open_session(branch_id)
+        .await
+        .expect("cold-open corruption oracle branch");
+    let result = measured(
+        backend,
+        size / (1024 * 1024),
+        "corruption_fail_closed_read",
+        database,
+        storage,
+        slate_counters,
+        session.read_file_content(PATH.to_owned(), None),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "corrupted live payload returned ordinary bytes"
+    );
+    println!("media_corruption,backend={backend},result=authenticated_read_rejected");
 }
 
 async fn qualify_final_reclamation<S>(
@@ -1325,8 +1450,8 @@ where
 
 fn prepare_payload(size: usize) -> PreparedPayload {
     assert!(
-        matches!(size / (1024 * 1024), 8 | 64 | 512),
-        "family oracle size must be 8, 64, or 512 MiB"
+        matches!(size / (1024 * 1024), 8 | 16 | 32 | 64 | 512),
+        "family oracle size must be 8, 16, 32, 64, or 512 MiB"
     );
     let edit_percent = std::env::var("LIX_MEDIA_QUAL_EDIT_PERCENT").map_or(1, |value| {
         value
@@ -1335,58 +1460,122 @@ fn prepare_payload(size: usize) -> PreparedPayload {
     });
     assert_eq!(edit_percent, 1, "family oracle edit must be exactly 1%");
     let family = WorkloadFamily::from_env();
-    let edit_bytes = size / 100;
-    let edit_offset = family.edit_offset(size);
-    let edit_end = edit_offset
-        .checked_add(edit_bytes)
-        .expect("qualification edit end must fit usize");
-    assert!(
-        edit_end <= size,
-        "qualification edit must fit inside the payload"
+    let shape = WorkloadShape::from_env();
+    assert_eq!(shape.expected_family(), family, "shape/family mismatch");
+    let expected_size_mib = match shape {
+        WorkloadShape::AudioMiddle | WorkloadShape::AudioPrefix => 16,
+        WorkloadShape::ArchiveAppend
+        | WorkloadShape::ArchiveTruncate
+        | WorkloadShape::ArchiveMiddle => 32,
+        WorkloadShape::VideoSparse | WorkloadShape::VideoPrefixInsert => 64,
+    };
+    assert_eq!(
+        size / (1024 * 1024),
+        expected_size_mib,
+        "shape/size mismatch"
     );
-    let edit = family_bytes(
-        family,
-        edit_offset,
-        edit_bytes,
-        SEED ^ 0x6a09_e667_f3bc_c909,
-    );
-    let mut parts = Vec::with_capacity(size.div_ceil(FILE_UPLOAD_PART_BYTES));
-    let mut base_blake3 = blake3::Hasher::new();
-    let mut edited_blake3 = blake3::Hasher::new();
-    let mut base_sha256 = Sha256::new();
-    let mut edited_sha256 = Sha256::new();
-    for offset in (0..size).step_by(FILE_UPLOAD_PART_BYTES) {
-        let part_len = (size - offset).min(FILE_UPLOAD_PART_BYTES);
-        let bytes = family_bytes(family, offset, part_len, SEED);
-        base_blake3.update(&bytes);
-        base_sha256.update(&bytes);
-        if offset < edit_end && offset + bytes.len() > edit_offset {
-            let local_start = edit_offset.saturating_sub(offset);
-            let local_end = (edit_end - offset).min(bytes.len());
-            let mut edited = bytes.clone();
-            let edit_start = offset.saturating_sub(edit_offset);
-            let edit_end = edit_start + local_end - local_start;
-            edited[local_start..local_end].copy_from_slice(&edit[edit_start..edit_end]);
-            edited_blake3.update(&edited);
-            edited_sha256.update(&edited);
-        } else {
-            edited_blake3.update(&bytes);
-            edited_sha256.update(&bytes);
-        }
-        parts.push(Bytes::from(bytes));
-    }
+    let base = family_payload(family, size, SEED);
+    let (edited, edit_offset, edit_bytes) = apply_shape(&base, shape);
+    let parts = base
+        .chunks(FILE_UPLOAD_PART_BYTES)
+        .map(Bytes::copy_from_slice)
+        .collect();
+    let base_blake3 = blake3::hash(&base).to_hex().to_string();
+    let edited_blake3 = blake3::hash(&edited).to_hex().to_string();
+    let base_sha256 = format!("{:x}", Sha256::digest(&base));
+    let edited_sha256 = format!("{:x}", Sha256::digest(&edited));
     PreparedPayload {
         family,
+        shape,
         parts,
         size,
+        edited_size: edited.len(),
+        edited: Bytes::from(edited),
         edit_offset,
         edit_bytes,
-        edit: Bytes::from(edit),
-        base_blake3: base_blake3.finalize().to_hex().to_string(),
-        base_sha256: format!("{:x}", base_sha256.finalize()),
-        edited_blake3: edited_blake3.finalize().to_hex().to_string(),
-        edited_sha256: format!("{:x}", edited_sha256.finalize()),
+        base_blake3,
+        base_sha256,
+        edited_blake3,
+        edited_sha256,
     }
+}
+
+fn family_payload(family: WorkloadFamily, len: usize, seed: u64) -> Vec<u8> {
+    match family {
+        WorkloadFamily::Audio => audio_like_bytes(len, seed),
+        WorkloadFamily::Archive => deterministic_bytes(len, seed ^ 0x510e_527f_ade6_82d1),
+        WorkloadFamily::Video => video_like_bytes(0, len, seed),
+        WorkloadFamily::Image => image_like_bytes(0, len, seed),
+    }
+}
+
+fn apply_shape(base: &[u8], shape: WorkloadShape) -> (Vec<u8>, usize, usize) {
+    let seed = SEED ^ 0x6a09_e667_f3bc_c909;
+    match shape {
+        WorkloadShape::AudioMiddle | WorkloadShape::ArchiveMiddle => {
+            let offset = base.len() / 2;
+            let bytes = base.len() / 100;
+            let mut edited = base.to_vec();
+            edited[offset..offset + bytes].copy_from_slice(&deterministic_bytes(bytes, seed));
+            (edited, offset, bytes)
+        }
+        WorkloadShape::AudioPrefix => {
+            let bytes = 64 * 1024;
+            let mut edited = base.to_vec();
+            edited[..bytes].copy_from_slice(&deterministic_bytes(bytes, seed));
+            (edited, 0, bytes)
+        }
+        WorkloadShape::ArchiveAppend => {
+            let bytes = base.len() / 100;
+            let mut edited = base.to_vec();
+            edited.extend_from_slice(&deterministic_bytes(bytes, seed));
+            (edited, base.len(), bytes)
+        }
+        WorkloadShape::ArchiveTruncate => {
+            let bytes = base.len() / 100;
+            (
+                base[..base.len() - bytes].to_vec(),
+                base.len() - bytes,
+                bytes,
+            )
+        }
+        WorkloadShape::VideoSparse => {
+            let bytes = 4 * 64 * 1024;
+            let region_bytes = bytes / 4;
+            let mut edited = base.to_vec();
+            for (index, numerator) in [1_usize, 3, 5, 7].into_iter().enumerate() {
+                let offset = base.len() * numerator / 8;
+                let replacement = deterministic_bytes(
+                    region_bytes,
+                    seed ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                );
+                edited[offset..offset + region_bytes].copy_from_slice(&replacement);
+            }
+            (edited, base.len() / 8, bytes)
+        }
+        WorkloadShape::VideoPrefixInsert => {
+            let bytes = 256 * 1024;
+            let mut edited = Vec::with_capacity(base.len() + bytes);
+            edited.extend_from_slice(&deterministic_bytes(bytes, seed));
+            edited.extend_from_slice(base);
+            (edited, 0, bytes)
+        }
+    }
+}
+
+fn audio_like_bytes(len: usize, seed: u64) -> Vec<u8> {
+    const FRAME_BYTES: usize = 16 * 1024;
+    let mut bytes = deterministic_bytes(len, seed ^ 0xa54f_f53a_5f1d_36f1);
+    for (frame, chunk) in bytes.chunks_mut(FRAME_BYTES).enumerate() {
+        let header = [
+            0xff,
+            0xfb,
+            (frame & 0xff) as u8,
+            ((frame >> 8) & 0xff) as u8,
+        ];
+        chunk[..header.len()].copy_from_slice(&header);
+    }
+    bytes
 }
 
 fn family_bytes(family: WorkloadFamily, global_offset: usize, len: usize, seed: u64) -> Vec<u8> {
@@ -1450,6 +1639,46 @@ fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
     bytes
 }
 
+#[derive(Clone, Copy)]
+struct FixedChunkSharing {
+    base_chunks: usize,
+    edited_chunks: usize,
+    shared_refs: usize,
+    shared_bytes: u64,
+    new_unique_chunks: usize,
+}
+
+fn fixed_chunk_sharing(payload: &PreparedPayload) -> FixedChunkSharing {
+    let base_chunks = payload
+        .parts
+        .iter()
+        .flat_map(|part| part.chunks(CAS_CHUNK_BYTES))
+        .map(|chunk| (*blake3::hash(chunk).as_bytes(), chunk.len()))
+        .collect::<Vec<_>>();
+    let edited_chunks = payload
+        .edited
+        .chunks(CAS_CHUNK_BYTES)
+        .map(|chunk| (*blake3::hash(chunk).as_bytes(), chunk.len()))
+        .collect::<Vec<_>>();
+    let base_by_id = base_chunks.iter().copied().collect::<BTreeMap<_, _>>();
+    let base_ids = base_by_id.keys().copied().collect::<BTreeSet<_>>();
+    let edited_ids = edited_chunks
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let shared = edited_chunks
+        .iter()
+        .filter(|(id, bytes)| base_by_id.get(id) == Some(bytes))
+        .collect::<Vec<_>>();
+    FixedChunkSharing {
+        base_chunks: base_chunks.len(),
+        edited_chunks: edited_chunks.len(),
+        shared_refs: shared.len(),
+        shared_bytes: shared.iter().map(|(_, bytes)| *bytes as u64).sum(),
+        new_unique_chunks: edited_ids.difference(&base_ids).count(),
+    }
+}
+
 async fn active_commit_id<S>(session: &SessionContext<S>) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1502,8 +1731,9 @@ where
     let cas = binary_cas_write_accounting();
     let structural = take_media_structural_accounting();
     let family = WorkloadFamily::from_env().label();
+    let shape = WorkloadShape::from_env().label();
     println!(
-        "large_payload_read,backend={backend},family={family},size_mib={size_mib},operation={operation},\
+        "large_payload_read,backend={backend},family={family},shape={shape},size_mib={size_mib},operation={operation},\
          wall_ms={:.3},cpu_ticks={cpu_ticks},allocated_bytes={allocated_bytes},allocation_calls={allocation_calls},\
          rss_before_kib={rss_before},rss_after_kib={rss_after},peak_rss_kib={},hwm_kib={},\
          begin_reads={},begin_writes={},get_many_calls={},get_many_keys={},get_many_found={},get_many_value_bytes={},\
@@ -1625,8 +1855,9 @@ where
 
 fn print_layout(backend: &str, size_mib: usize, label: &str, layout: CasLayout) {
     let family = WorkloadFamily::from_env().label();
+    let shape = WorkloadShape::from_env().label();
     println!(
-        "media_cas_layout,backend={backend},family={family},size_mib={size_mib},label={label},\
+        "media_cas_layout,backend={backend},family={family},shape={shape},size_mib={size_mib},label={label},\
          manifests={},manifest_bytes={},manifest_chunks={},manifest_chunk_bytes={},\
          payload_chunks={},payload_bytes={},presence_rows={},presence_bytes={},total_rows={},total_bytes={}",
         layout.manifest.rows,
@@ -1650,8 +1881,9 @@ fn print_amplification(
     after: CasLayout,
 ) {
     let family = WorkloadFamily::from_env().label();
+    let shape = WorkloadShape::from_env().label();
     println!(
-        "media_cas_amplification,backend={backend},family={family},size_mib={size_mib},operation={operation},\
+        "media_cas_amplification,backend={backend},family={family},shape={shape},size_mib={size_mib},operation={operation},\
          manifest_rows_delta={},manifest_chunk_rows_delta={},payload_chunk_rows_delta={},presence_rows_delta={},\
          cas_rows_delta={},cas_bytes_delta={}",
         after.manifest.rows.saturating_sub(before.manifest.rows),
@@ -1671,6 +1903,7 @@ where
     S: Storage + Clone,
 {
     let family = WorkloadFamily::from_env().label();
+    let shape = WorkloadShape::from_env().label();
     let adapter = StorageAdapter::new(storage.clone());
     let read = adapter
         .begin_read(ReadOptions::default())
@@ -1680,7 +1913,7 @@ where
         .await
         .expect("inventory binary CAS owners");
     println!(
-        "media_owner_inventory,backend={backend},family={family},size_mib={size_mib},owners={},references={},manifests={},logical_bytes={},encoded_manifest_bytes={},chunk_values={},encoded_chunk_bytes={}",
+        "media_owner_inventory,backend={backend},family={family},shape={shape},size_mib={size_mib},owners={},references={},manifests={},logical_bytes={},encoded_manifest_bytes={},chunk_values={},encoded_chunk_bytes={}",
         owners.len(),
         owners.iter().map(|owner| owner.references).sum::<u64>(),
         owners.iter().map(|owner| owner.manifests).sum::<u64>(),
