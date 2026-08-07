@@ -12653,8 +12653,8 @@ mod tests {
         HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
     use crate::storage_adapter::{
-        Memory, StorageAdapter, StorageReadOptions, StorageSpace, StorageWriteOptions,
-        StorageWriteSet,
+        Memory, StorageAdapter, StorageProjectedValue, StorageReadOptions, StorageSpace,
+        StorageWriteOptions, StorageWriteSet,
     };
     use crate::storage_codec;
     use crate::tracked_state::codec::{
@@ -12675,16 +12675,16 @@ mod tests {
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, columnar_identity_row_map,
-        decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
-        decode_stored_commit_state_authority, encode_commit_delta_segment,
-        encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
-        encode_commit_state_manifest, key, load_change_record_by_id, load_commit_delta_change_ids,
-        load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-        load_commit_delta_values_encoded, load_commit_state_manifest,
-        load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
-        scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
-        stage_change_locators, stage_commit_state_manifest,
-        stage_delete_commit_delta_inventory_entry,
+        decode_commit_delta_with_payloads, decode_commit_state_authority_id,
+        decode_encoded_commit_state_manifest, decode_stored_commit_state_authority,
+        encode_commit_delta_segment, encode_commit_delta_segment_with_payloads,
+        encode_commit_delta_segment_with_raw_sidecar, encode_commit_state_manifest, key,
+        load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
+        load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
+        load_commit_state_manifest, load_owned_commit_delta_entries,
+        scan_change_records_from_commit_deltas, scan_commit_delta_inventory,
+        scan_commit_delta_members, scan_commit_delta_values, stage_change_locators,
+        stage_commit_state_manifest, stage_delete_commit_delta_inventory_entry,
         stage_fragmented_scoped_current_state_descriptor, value,
     };
 
@@ -16829,6 +16829,31 @@ mod tests {
         let decoded =
             decode_encoded_commit_state_manifest(&encoded).expect("manifest should round trip");
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn commit_state_authority_id_rejects_malformed_and_mismatched_headers() {
+        let manifest = commit_state_manifest_fixture();
+        let malformed = decode_commit_state_authority_id(
+            manifest.commit_id,
+            Some(StorageProjectedValue::FullValue(Bytes::from_static(
+                b"malformed-present-authority",
+            ))),
+        )
+        .expect_err("a present malformed authority must fail closed");
+        assert!(malformed.message.contains("unsupported format"));
+
+        let encoded = encode_commit_state_manifest(&manifest).expect("manifest should encode");
+        let requested_id = CommitId::for_test_label("mismatched-authority-request");
+        let mismatched = decode_commit_state_authority_id(
+            requested_id,
+            Some(StorageProjectedValue::FullValue(Bytes::from(
+                encoded.header,
+            ))),
+        )
+        .expect_err("a present authority for another commit must fail closed");
+        assert!(mismatched.message.contains(&requested_id.to_string()));
+        assert!(mismatched.message.contains(&manifest.commit_id.to_string()));
     }
 
     #[test]

@@ -80,6 +80,7 @@ where
                 record.commit_id,
                 CommitGraphNode {
                     commit_id: record.commit_id,
+                    has_authenticated_commit_state_authority: false,
                     change_id: record.change_id,
                     account_id: record.account_id,
                     generation: record.generation,

@@ -26,6 +26,11 @@ pub(crate) struct CommitGraphChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphNode {
     pub(crate) commit_id: CommitId,
+    /// Exact commit-state authority authenticated in the same immutable read.
+    ///
+    /// General graph membership remains owned by the changelog projection.
+    /// Bounded routes require this proof before eliding the node.
+    pub(crate) has_authenticated_commit_state_authority: bool,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) generation: u64,

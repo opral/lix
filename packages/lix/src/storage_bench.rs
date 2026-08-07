@@ -499,6 +499,8 @@ pub struct MergeBaseBenchFixture {
     pub left_head: String,
     pub right_head: String,
     pub expected_base: Option<String>,
+    /// One durable interior member that a depth-bounded route will elide.
+    pub segment_interior_commit_id: Option<String>,
     pub commits: usize,
 }
 
@@ -640,6 +642,12 @@ where
         }
     };
 
+    let segment_interior_commit_id = records
+        .iter()
+        .rev()
+        .find(|record| record.linear_segment_depth == crate::changelog::LINEAR_SEGMENT_MAX_DEPTH)
+        .and_then(|record| record.linear_segment_ancestor_commit_ids.first())
+        .map(ToString::to_string);
     let mut read = storage.begin_read(ReadOptions::default()).await?;
     let mut writes = storage.new_write_set();
     crate::changelog::ChangelogWriter::stage_append(
@@ -675,8 +683,34 @@ where
         left_head: left_head.to_string(),
         right_head: right_head.to_string(),
         expected_base: expected_base.map(|commit_id| commit_id.to_string()),
+        segment_interior_commit_id,
         commits: records.len(),
     })
+}
+
+/// Deletes one exact commit-state authority for corruption qualification.
+///
+/// The benchmark fixture keeps the changelog projection intact so callers can
+/// prove that bounded routing rejects authority absence instead of treating the
+/// commit itself as missing.
+pub async fn delete_commit_state_authority_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    commit_id: &str,
+) -> Result<(), crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let commit_id =
+        crate::changelog::CommitId::parse_lix(commit_id, "authority corruption commit")?;
+    let mut writes = storage.new_write_set();
+    writes.delete(
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        crate::tracked_state::commit_state_authority_key(commit_id),
+    );
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await?;
+    Ok(())
 }
 
 #[inline(never)]

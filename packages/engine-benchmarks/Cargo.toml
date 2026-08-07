@@ -80,6 +80,11 @@ path = "tests/tracked_state_crud_public_result.rs"
 required-features = ["storage-benches"]
 
 [[test]]
+name = "merge_base_segment_authority"
+path = "tests/merge_base_segment_authority.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
 name = "movie_workspace_qualification"
 path = "tests/movie_workspace_qualification.rs"
 required-features = ["storage-benches", "slatedb"]

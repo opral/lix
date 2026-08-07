@@ -1060,6 +1060,7 @@ mod tests {
             Ok(Arc::from([ReachableCommitGraphNode {
                 commit: CommitGraphNode {
                     commit_id: self.start_commit_id,
+                    has_authenticated_commit_state_authority: false,
                     change_id: ChangeId::for_test_label("commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     generation: 0,
@@ -1082,6 +1083,7 @@ mod tests {
                 .then(|| ReachableCommitGraphNode {
                     commit: CommitGraphNode {
                         commit_id: self.start_commit_id,
+                        has_authenticated_commit_state_authority: false,
                         change_id: ChangeId::for_test_label("commit-change"),
                         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                         generation: 0,

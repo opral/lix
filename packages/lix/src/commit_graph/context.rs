@@ -569,6 +569,7 @@ fn commit_graph_node_from_authority(
     }
     let node = CommitGraphNode {
         commit_id: record.commit_id,
+        has_authenticated_commit_state_authority: authority_id.is_some(),
         change_id: record.change_id,
         account_id: record.account_id,
         generation: record.generation,
@@ -610,6 +611,12 @@ fn authenticate_linear_segment(
             .slot(start + index)
             .expect("route width was validated on endpoint load");
         let ancestor = ancestor.ok_or_else(|| missing_commit_graph_error(requested_id))?;
+        if !ancestor.has_authenticated_commit_state_authority {
+            return Err(LixError::unknown(format!(
+                "commit '{}' linear segment routing member '{}' is missing its commit-state authority",
+                endpoint.commit_id, ancestor.commit_id
+            )));
+        }
         let expected_id = endpoint
             .linear_segment_ancestor_commit_ids
             .get(index)
@@ -1847,6 +1854,7 @@ mod tests {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
             commit_id,
+            has_authenticated_commit_state_authority: false,
             change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             generation: 0,

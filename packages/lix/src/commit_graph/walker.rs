@@ -774,6 +774,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_base_segment_batch_rejects_missing_interior_authority() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut changes = vec![commit_change(
+            "segment-missing-authority-root-change",
+            "segment-missing-authority-root",
+            &[],
+            &[],
+        )];
+        let mut left_parent = "segment-missing-authority-root".to_string();
+        let mut right_parent = "segment-missing-authority-root".to_string();
+        for index in 0..3 {
+            let left = format!("segment-missing-authority-left-{index}");
+            let right = format!("segment-missing-authority-right-{index}");
+            changes.push(commit_change(
+                &format!("{left}-change"),
+                &left,
+                &[],
+                &[&left_parent],
+            ));
+            changes.push(commit_change(
+                &format!("{right}-change"),
+                &right,
+                &[],
+                &[&right_parent],
+            ));
+            left_parent = left;
+            right_parent = right;
+        }
+        append_changes(&storage, &changes).await;
+
+        let missing_authority_id = commit_id("segment-missing-authority-left-1");
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            crate::tracked_state::commit_state_authority_key(missing_authority_id),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("interior authority should delete while its commit remains");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .merge_base(
+                &commit_id("segment-missing-authority-left-2"),
+                &commit_id("segment-missing-authority-right-2"),
+            )
+            .await
+            .expect_err("bounded segment must reject a missing interior authority");
+
+        assert!(error.message.contains("missing its commit-state authority"));
+        assert!(error.message.contains(&missing_authority_id.to_string()));
+    }
+
+    #[tokio::test]
     async fn merge_base_segment_batch_rejects_non_decreasing_interior_generation() {
         let storage = StorageAdapter::new(Memory::new());
         let mut changes = vec![commit_change(
