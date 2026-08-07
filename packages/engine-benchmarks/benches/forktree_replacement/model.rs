@@ -195,6 +195,19 @@ pub struct BlobDiff {
     pub changed_chunks: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlobObjectRef {
+    pub object_id: [u8; 32],
+    pub declared_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobIdentityInventory {
+    pub manifest_object_id: [u8; 32],
+    pub logical_bytes: u64,
+    pub chunks: Vec<BlobObjectRef>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReclaimAccounting {
     pub roots: u64,
@@ -1515,6 +1528,102 @@ where
             shared_chunks: shared,
             changed_chunks: before_ids.symmetric_difference(&after_ids).count() as u64,
         })
+    }
+
+    /// Exposes authenticated blob identities to the external acceptance
+    /// harness without making the benchmark model's codecs a second reader.
+    pub async fn blob_identity_at_commit(
+        &self,
+        commit_id: ObjectId,
+    ) -> Result<BlobIdentityInventory, String> {
+        let commit = self.load_commit(commit_id).await?;
+        let manifest_id = commit
+            .blob
+            .ok_or_else(|| "ForkTree commit has no blob identity".to_string())?;
+        let manifest = self.load_blob_manifest(Some(manifest_id)).await?;
+        Ok(BlobIdentityInventory {
+            manifest_object_id: manifest_id.0,
+            logical_bytes: manifest.logical_bytes,
+            chunks: manifest
+                .chunks
+                .into_iter()
+                .map(|chunk| BlobObjectRef {
+                    object_id: chunk.id.0,
+                    declared_bytes: chunk.bytes,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn blob_identity(&self, branch: &str) -> Result<BlobIdentityInventory, String> {
+        self.blob_identity_at_commit(self.branch_head(branch).await?)
+            .await
+    }
+
+    pub async fn present_object_ids(
+        &self,
+        ids: &[[u8; 32]],
+    ) -> Result<std::collections::BTreeSet<[u8; 32]>, String> {
+        let typed = ids.iter().copied().map(ObjectId).collect::<Vec<_>>();
+        Ok(self
+            .existing_object_ids(&typed)
+            .await?
+            .into_iter()
+            .map(|id| id.0)
+            .collect())
+    }
+
+    /// Hashes the complete authenticated object/ref authority in canonical
+    /// scan order. This is an acceptance assertion, not a serving cache.
+    pub async fn authority_fingerprint(&self) -> Result<[u8; 32], String> {
+        const PAGE: usize = 1_024;
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut hasher =
+            blake3::Hasher::new_derive_key("lix benchmark ForkTree authority fingerprint v1");
+        for (space, marker) in [(OBJECT_SPACE, 1_u8), (REF_SPACE, 2_u8)] {
+            let mut resume_after = None;
+            loop {
+                let page = read
+                    .scan(
+                        space,
+                        KeyRange {
+                            lower: Bound::Unbounded,
+                            upper: Bound::Unbounded,
+                        },
+                        ScanOptions {
+                            projection: CoreProjection::FullValue,
+                            limit_rows: PAGE,
+                            resume_after: resume_after.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(storage_error)?;
+                for entry in &page.entries {
+                    let value = projected_bytes(&entry.value)?;
+                    if marker == 1 {
+                        authenticate(object_id_from_key(&entry.key)?, value)?;
+                    } else if entry.key.0.as_ref() == EPOCH_KEY {
+                        let _ = decode_epoch(value)?;
+                    } else {
+                        let _ = decode_ref(value)?;
+                    }
+                    hasher.update(&[marker]);
+                    hasher.update(&(entry.key.0.len() as u64).to_be_bytes());
+                    hasher.update(&entry.key.0);
+                    hasher.update(&(value.len() as u64).to_be_bytes());
+                    hasher.update(value);
+                }
+                if !page.has_more {
+                    break;
+                }
+                resume_after = page.entries.last().map(|entry| entry.key.clone());
+            }
+        }
+        Ok(*hasher.finalize().as_bytes())
     }
 
     pub async fn merge_blob_branches(
