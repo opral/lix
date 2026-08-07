@@ -657,6 +657,17 @@ impl PersistedQueue {
                 self.pop_sequence += 1;
             }
         }
+        let retired: Vec<_> = self
+            .packs
+            .keys()
+            .copied()
+            .take_while(|pack_number| {
+                (pack_number + 1) * QUEUE_PACK_MAX as u64 <= self.pop_sequence
+            })
+            .collect();
+        for pack_number in retired {
+            self.packs.remove(&pack_number);
+        }
         Ok(output)
     }
 
@@ -668,7 +679,12 @@ impl PersistedQueue {
         if self.pop_sequence > self.push_sequence {
             return Err("queue pop cursor exceeds push cursor".into());
         }
-        let mut expected = 0_u64;
+        let mut expected = self
+            .packs
+            .values()
+            .next()
+            .and_then(Option::as_ref)
+            .map_or(self.push_sequence, |pack| pack.first_sequence);
         let mut metrics = QueueMetrics::default();
         for (pack_number, slot) in &self.packs {
             let pack = slot.as_ref().ok_or("queue pack object is missing")?;
@@ -690,6 +706,20 @@ impl PersistedQueue {
         }
         if expected != self.push_sequence {
             return Err("queue packs do not cover the push cursor".into());
+        }
+        if self.pop_sequence < self.push_sequence {
+            let first = self
+                .packs
+                .values()
+                .next()
+                .and_then(Option::as_ref)
+                .ok_or("nonempty queue has no retained pack")?;
+            let end = first.first_sequence + first.entries.len() as u64;
+            if self.pop_sequence < first.first_sequence || self.pop_sequence >= end {
+                return Err("queue pop cursor is outside its first retained pack".into());
+            }
+        } else if self.packs.len() > 1 {
+            return Err("empty queue retains more than one partial pack".into());
         }
         Ok(metrics)
     }
