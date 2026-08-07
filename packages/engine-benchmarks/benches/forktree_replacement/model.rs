@@ -2039,7 +2039,7 @@ where
                         stage_object(encode_value_pack(std::iter::once(&value)), &mut pending);
                     let leaf = stage_object(
                         encode_leaf(&[LeafEntry {
-                            key: b"z/substituted".to_vec(),
+                            key: b"n/substituted".to_vec(),
                             value: ValueRef { pack, index: 0 },
                         }]),
                         &mut pending,
@@ -2047,7 +2047,7 @@ where
                     stage_object(
                         encode_internal(&[NodeRef {
                             id: leaf,
-                            max_key: b"a/false-bound".to_vec(),
+                            max_key: b"n/false-bound".to_vec(),
                         }]),
                         &mut pending,
                     )

@@ -12,10 +12,7 @@ use super::{
     process_resident_bytes, take_stats,
 };
 
-#[path = "olap_common.rs"]
-#[allow(dead_code)]
-mod common;
-
+use super::olap_common as common;
 use common::{Cell, NarrowRow, Query, WideRow};
 
 struct Expected {

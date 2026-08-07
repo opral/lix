@@ -2,6 +2,9 @@
 
 mod model;
 mod olap;
+#[allow(dead_code)]
+mod olap_common;
+mod olap_datafusion;
 mod relational;
 mod vertical;
 mod workload;
@@ -305,6 +308,7 @@ enum Scenario {
     Relational,
     Olap,
     OlapMemory,
+    OlapDatafusion,
 }
 
 impl Scenario {
@@ -316,6 +320,7 @@ impl Scenario {
             Some("relational") => (Self::Relational, 1),
             Some("olap") => (Self::Olap, 1),
             Some("olap-memory") => (Self::OlapMemory, 1),
+            Some("olap-datafusion") => (Self::OlapDatafusion, 1),
             _ => (Self::Apply, 0),
         }
     }
@@ -421,6 +426,10 @@ async fn main() {
     }
     if parameters.scenario == Scenario::OlapMemory {
         olap::run_memory_gate(parameters.rows).await;
+        return;
+    }
+    if parameters.scenario == Scenario::OlapDatafusion {
+        olap_datafusion::run(parameters).await;
         return;
     }
     if parameters.scenario != Scenario::Apply {

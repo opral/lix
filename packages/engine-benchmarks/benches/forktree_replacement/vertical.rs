@@ -51,9 +51,11 @@ async fn run_rocksdb(parameters: Parameters) {
             Scenario::BlobProfile => {
                 run_blob_profile_setup(storage, parameters, &stats, directory.path(), None).await
             }
-            Scenario::Apply | Scenario::Relational | Scenario::Olap | Scenario::OlapMemory => {
-                unreachable!()
-            }
+            Scenario::Apply
+            | Scenario::Relational
+            | Scenario::Olap
+            | Scenario::OlapMemory
+            | Scenario::OlapDatafusion => unreachable!(),
         };
         database
             .flush()
@@ -137,9 +139,11 @@ async fn run_slatedb(parameters: Parameters) {
                 )
                 .await
             }
-            Scenario::Apply | Scenario::Relational | Scenario::Olap | Scenario::OlapMemory => {
-                unreachable!()
-            }
+            Scenario::Apply
+            | Scenario::Relational
+            | Scenario::Olap
+            | Scenario::OlapMemory
+            | Scenario::OlapDatafusion => unreachable!(),
         };
         database
             .flush_memtable_for_diagnostics()
