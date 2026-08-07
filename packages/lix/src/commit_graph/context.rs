@@ -266,9 +266,11 @@ where
             return Ok(*left_commit_id);
         }
         if left.parent_commit_ids.as_slice() == [*right_commit_id] {
+            validate_parent_generation(&left, &right)?;
             return Ok(*right_commit_id);
         }
         if right.parent_commit_ids.as_slice() == [*left_commit_id] {
+            validate_parent_generation(&right, &left)?;
             return Ok(*left_commit_id);
         }
         if let ([left_parent], [right_parent]) = (
@@ -277,16 +279,15 @@ where
         ) && left_parent == right_parent
         {
             let parent_ids = [*left_parent];
-            if self
+            let parent = self
                 .load_nodes(&parent_ids)
                 .await?
                 .into_iter()
                 .next()
                 .and_then(|(_, value)| value)
-                .is_none()
-            {
-                return Err(missing_commit_graph_error(left_parent));
-            }
+                .ok_or_else(|| missing_commit_graph_error(left_parent))?;
+            validate_parent_generation(&left, &parent)?;
+            validate_parent_generation(&right, &parent)?;
             return Ok(*left_parent);
         }
 

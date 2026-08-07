@@ -671,13 +671,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_common_ancestors_rejects_non_decreasing_parent_generation() {
+    async fn merge_base_and_general_walk_reject_non_decreasing_parent_generation() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-child-change", "commit-child", &[], &["commit-root"]),
+                commit_change(
+                    "commit-sibling-change",
+                    "commit-sibling",
+                    &[],
+                    &["commit-root"],
+                ),
                 commit_change(
                     "commit-grandchild-change",
                     "commit-grandchild",
@@ -722,6 +728,33 @@ mod tests {
 
         assert!(error.message.contains("does not have a lower generation"));
 
+        for (left, right) in [
+            ("commit-root", "commit-child"),
+            ("commit-child", "commit-root"),
+        ] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open");
+            let mut reader = CommitGraphContext::new().reader(read);
+            let error = reader
+                .merge_base(&commit_id(left), &commit_id(right))
+                .await
+                .expect_err("direct-parent shortcut must reject invalid generations");
+            assert!(error.message.contains("does not have a lower generation"));
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .merge_base(&commit_id("commit-child"), &commit_id("commit-sibling"))
+            .await
+            .expect_err("shared-parent shortcut must reject invalid generations");
+        assert!(error.message.contains("does not have a lower generation"));
+
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -730,7 +763,7 @@ mod tests {
         let error = reader
             .merge_base(&commit_id("commit-root"), &commit_id("commit-grandchild"))
             .await
-            .expect_err("linear merge-base fast path should preserve generation validation");
+            .expect_err("linear prefix and DAG fallback must preserve generation validation");
         assert!(error.message.contains("does not have a lower generation"));
     }
 
