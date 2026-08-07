@@ -15,7 +15,8 @@ use crate::LixError;
 #[cfg(test)]
 use crate::transaction::CommitBoundaryGuard;
 use crate::transaction::{
-    CommitBoundaryState, Transaction, TransactionCommitBoundary, open_transaction,
+    CommitBoundaryState, Transaction, TransactionCommitBoundary,
+    open_transaction_with_runtime_boundary,
 };
 
 use super::SessionContext;
@@ -47,39 +48,45 @@ where
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<StorageImpl>, LixError> {
         self.ensure_open()?;
         let mut write_access = self.begin_explicit_session_write_access().await?;
-        let deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
-            // Bounded durable-runtime writes take the collaboration gate before
-            // the deterministic-runtime gate. Keep that order for explicit
-            // transactions as well, then retain both guards for their lifetime
-            // so commit cannot deadlock with a bounded writer holding one gate
-            // while waiting for the other.
-            write_access
-                .serialize_collaboration_writes(&self.collaboration_write_gate)
-                .await;
-            Some(self.lock_deterministic_runtime().await)
-        } else {
-            None
-        };
-        let mut opened = match open_transaction(
-            &self.mode,
-            self.active_account_id.to_string(),
-            self.storage.clone(),
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
-            self.plugin_host.clone(),
-            Arc::clone(&self.branch_ctx),
-            Arc::clone(&self.catalog_context),
-            Arc::clone(&self.sql_planning_cache),
-            self.file_views.clone(),
-        )
-        .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                return Err(error);
-            }
-        };
+        // Mode and sequence are global write authority. Serialize through the
+        // same collaboration gate as every writer while the transaction's one
+        // retained opening snapshot loads them. The runtime boundary below is
+        // invoked immediately after that load: deterministic transactions keep
+        // collaboration serialization and then take the runtime gate in the
+        // global order, while ordinary transactions release serialization
+        // before catalog and branch-head setup continues on the same snapshot.
+        write_access
+            .serialize_collaboration_writes(&self.collaboration_write_gate)
+            .await;
+        let (mut opened, deterministic_runtime_guard) =
+            match open_transaction_with_runtime_boundary(
+                &self.mode,
+                self.active_account_id.to_string(),
+                self.storage.clone(),
+                Arc::clone(&self.live_state),
+                Arc::clone(&self.tracked_state),
+                Arc::clone(&self.binary_cas),
+                self.plugin_host.clone(),
+                Arc::clone(&self.branch_ctx),
+                Arc::clone(&self.catalog_context),
+                Arc::clone(&self.sql_planning_cache),
+                self.file_views.clone(),
+                async |runtime_functions| {
+                    if runtime_functions.deterministic_mode_enabled() {
+                        Ok(Some(self.lock_deterministic_runtime().await))
+                    } else {
+                        write_access.release_collaboration_write_serialization();
+                        Ok(None)
+                    }
+                },
+            )
+            .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
         self.ensure_open()?;
         opened
             .transaction

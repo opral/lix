@@ -3,6 +3,9 @@
     reason = "test fixtures mirror explicit Send future signatures from StorageFixture"
 )]
 
+#[path = "../../lix/tests/adapter_undo_redo_checkpoint.rs"]
+mod undo_redo_checkpoint;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
@@ -150,6 +153,36 @@ async fn slatedb_exposes_database_path_and_flushes() {
     storage.flush().await.expect("flush slatedb storage");
 
     assert_eq!(storage.path(), path.as_path());
+}
+
+#[tokio::test]
+async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_slatedb() {
+    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
+    let path = temp_dir.path().join("undo-redo.slatedb");
+    let storage = SlateDB::open(&path).expect("open SlateDB storage");
+    Engine::initialize(storage.clone())
+        .await
+        .expect("initialize SlateDB storage");
+    let engine = Engine::new(storage.clone()).await.expect("open engine");
+    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&engine).await;
+    drop(engine);
+    storage.flush().await.expect("flush undo state");
+    drop(storage);
+
+    let storage = SlateDB::open(&path).expect("reopen SlateDB after undo");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("reopen engine after undo");
+    undo_redo_checkpoint::assert_cold_undo_then_redo(&engine, branch_id.clone()).await;
+    drop(engine);
+    storage.flush().await.expect("flush redo state");
+    drop(storage);
+
+    let storage = SlateDB::open(&path).expect("reopen SlateDB after redo");
+    let engine = Engine::new(storage)
+        .await
+        .expect("reopen engine after redo");
+    undo_redo_checkpoint::assert_cold_redo(&engine, branch_id).await;
 }
 
 #[tokio::test]

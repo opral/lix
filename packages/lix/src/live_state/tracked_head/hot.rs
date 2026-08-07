@@ -5815,6 +5815,21 @@ where
         }) {
             return Ok(None);
         }
+        let control = load_hot_collection_control(
+            self.store,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if control.active_generation != generation
+            || control.live_count != u64::try_from(deltas.len()).unwrap_or(u64::MAX)
+        {
+            return Ok(None);
+        }
         let mut entity_pks = deltas
             .iter()
             .map(|delta| delta.entity_pk)
@@ -5832,6 +5847,9 @@ where
         else {
             return Ok(None);
         };
+        if control.ordered_identity_digest != Some(identity_digest) {
+            return Ok(None);
+        }
         if !self
             .authoritative_collection_matches(
                 parent_commit_id,
@@ -5840,22 +5858,6 @@ where
                 identity_digest,
             )
             .await?
-        {
-            return Ok(None);
-        }
-        let control = load_hot_collection_control(
-            self.store,
-            branch_id,
-            generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            },
-        )
-        .await?;
-        if control.active_generation != generation
-            || control.live_count != u64::try_from(entity_pks.len()).unwrap_or(u64::MAX)
-            || control.ordered_identity_digest != Some(identity_digest)
         {
             return Ok(None);
         }
@@ -5905,6 +5907,21 @@ where
         }) {
             return Ok(None);
         }
+        let control = load_hot_collection_control(
+            self.store,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if control.active_generation != generation
+            || control.live_count != u64::try_from(deltas.len()).unwrap_or(u64::MAX)
+        {
+            return Ok(None);
+        }
         let mut entity_pks = deltas
             .iter()
             .map(|delta| delta.entity_pk)
@@ -5922,6 +5939,9 @@ where
         else {
             return Ok(None);
         };
+        if control.ordered_identity_digest != Some(identity_digest) {
+            return Ok(None);
+        }
         if !self
             .authoritative_collection_matches(
                 parent_commit_id,
@@ -5933,23 +5953,6 @@ where
         {
             return Ok(None);
         }
-        let control = load_hot_collection_control(
-            self.store,
-            branch_id,
-            generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            },
-        )
-        .await?;
-        if control.active_generation != generation
-            || control.live_count != u64::try_from(entity_pks.len()).unwrap_or(u64::MAX)
-            || control.ordered_identity_digest != Some(identity_digest)
-        {
-            return Ok(None);
-        }
-
         let replaced =
             packed_exclusive_schema_base_refs(self.store, branch_id, generation, schema_key)
                 .await?;
@@ -6004,7 +6007,9 @@ where
     }
 
     /// Recomputes a full-collection certificate from immutable tracked-state
-    /// authority before a derived HOT control is allowed to retire a base.
+    /// authority before a derived HOT control may retire a base. The scan
+    /// projects identity columns only: payloads remain in their canonical
+    /// owner and are neither fetched nor decoded for this set-equality proof.
     /// A corrupt or stale control can therefore disable the compact route,
     /// but it can never make omitted identities disappear from current state.
     async fn authoritative_collection_matches(
@@ -6024,7 +6029,10 @@ where
                         file_ids: vec![NullableKeyFilter::Null],
                         ..TrackedStateFilter::default()
                     },
-                    ..TrackedStateScanRequest::default()
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["schema_key".to_owned()],
+                    },
+                    limit: None,
                 },
             )
             .await?;
