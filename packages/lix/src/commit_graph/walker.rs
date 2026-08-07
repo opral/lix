@@ -671,13 +671,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_common_ancestors_rejects_non_decreasing_parent_generation() {
+    async fn merge_base_and_general_walk_reject_non_decreasing_parent_generation() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-child-change", "commit-child", &[], &["commit-root"]),
+                commit_change(
+                    "commit-sibling-change",
+                    "commit-sibling",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change(
+                    "commit-grandchild-change",
+                    "commit-grandchild",
+                    &[],
+                    &["commit-child"],
+                ),
             ],
         )
         .await;
@@ -714,6 +726,44 @@ mod tests {
             .await
             .expect_err("invalid generations should fail the graph walk");
 
+        assert!(error.message.contains("does not have a lower generation"));
+
+        for (left, right) in [
+            ("commit-root", "commit-child"),
+            ("commit-child", "commit-root"),
+        ] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open");
+            let mut reader = CommitGraphContext::new().reader(read);
+            let error = reader
+                .merge_base(&commit_id(left), &commit_id(right))
+                .await
+                .expect_err("direct-parent shortcut must reject invalid generations");
+            assert!(error.message.contains("does not have a lower generation"));
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .merge_base(&commit_id("commit-child"), &commit_id("commit-sibling"))
+            .await
+            .expect_err("shared-parent shortcut must reject invalid generations");
+        assert!(error.message.contains("does not have a lower generation"));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .merge_base(&commit_id("commit-root"), &commit_id("commit-grandchild"))
+            .await
+            .expect_err("linear prefix and DAG fallback must preserve generation validation");
         assert!(error.message.contains("does not have a lower generation"));
     }
 
@@ -877,6 +927,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_base_resolves_deep_linear_ancestor_and_fork() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-a-change", "commit-a", &[], &[]),
+                commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
+                commit_change("commit-c-change", "commit-c", &[], &["commit-b"]),
+                commit_change("commit-d-change", "commit-d", &[], &["commit-c"]),
+                commit_change("commit-e-change", "commit-e", &[], &["commit-d"]),
+                commit_change("commit-x-change", "commit-x", &[], &["commit-b"]),
+                commit_change("commit-y-change", "commit-y", &[], &["commit-x"]),
+                commit_change("commit-z-change", "commit-z", &[], &["commit-y"]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = graph.reader(read);
+
+        assert_eq!(
+            reader
+                .merge_base(&commit_id("commit-b"), &commit_id("commit-e"))
+                .await
+                .expect("deep ancestor should resolve"),
+            commit_id("commit-b")
+        );
+        assert_eq!(
+            reader
+                .merge_base(&commit_id("commit-e"), &commit_id("commit-z"))
+                .await
+                .expect("deep linear fork should resolve"),
+            commit_id("commit-b")
+        );
+    }
+
+    #[tokio::test]
     async fn merge_base_errors_when_histories_have_no_common_commit() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
@@ -925,6 +1016,30 @@ mod tests {
                     &[],
                     &["commit-right", "commit-left"],
                 ),
+                commit_change(
+                    "commit-left-tail-1-change",
+                    "commit-left-tail-1",
+                    &[],
+                    &["commit-head-left"],
+                ),
+                commit_change(
+                    "commit-left-tail-2-change",
+                    "commit-left-tail-2",
+                    &[],
+                    &["commit-left-tail-1"],
+                ),
+                commit_change(
+                    "commit-right-tail-1-change",
+                    "commit-right-tail-1",
+                    &[],
+                    &["commit-head-right"],
+                ),
+                commit_change(
+                    "commit-right-tail-2-change",
+                    "commit-right-tail-2",
+                    &[],
+                    &["commit-right-tail-1"],
+                ),
             ],
         )
         .await;
@@ -935,8 +1050,8 @@ mod tests {
             .await
             .expect("read should open");
         let mut reader = graph.reader(read);
-        let commit_head_left = commit_id("commit-head-left");
-        let commit_head_right = commit_id("commit-head-right");
+        let commit_head_left = commit_id("commit-left-tail-2");
+        let commit_head_right = commit_id("commit-right-tail-2");
         let error = reader
             .merge_base(&commit_head_left, &commit_head_right)
             .await
@@ -948,14 +1063,14 @@ mod tests {
                 .details
                 .as_ref()
                 .and_then(|details| details.get("left_commit_id")),
-            Some(&json!(commit_id("commit-head-left").to_string()))
+            Some(&json!(commit_id("commit-left-tail-2").to_string()))
         );
         assert_eq!(
             error
                 .details
                 .as_ref()
                 .and_then(|details| details.get("right_commit_id")),
-            Some(&json!(commit_id("commit-head-right").to_string()))
+            Some(&json!(commit_id("commit-right-tail-2").to_string()))
         );
         assert_eq!(
             error

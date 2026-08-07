@@ -61,6 +61,8 @@ pub(crate) use row_materialization::{
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
+#[cfg(not(any(test, feature = "storage-benches")))]
+pub(crate) use storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE;
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
@@ -68,16 +70,16 @@ pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
     CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology,
-    StagedCommitStateManifest, commit_delta_contains_schema, direct_change_locator,
-    load_change_record_by_id, load_commit_delta_change_records,
-    load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
-    load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
-    load_commit_mutation_directory_roots, load_commit_state_authority_ids,
-    load_commit_state_manifest, load_commit_state_manifests, load_owned_commit_delta_entries,
-    load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
-    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
-    selected_change_selection_fingerprint, stage_addressable_commit_deltas,
-    stage_addressable_commit_deltas_with_selected_source,
+    StagedCommitStateManifest, commit_delta_contains_schema, commit_state_authority_key,
+    decode_commit_state_authority_id, direct_change_locator, load_change_record_by_id,
+    load_commit_delta_change_records, load_commit_delta_members_with_payloads,
+    load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
+    load_commit_delta_selection_certificate, load_commit_mutation_directory_roots,
+    load_commit_state_authority_ids, load_commit_state_manifest, load_commit_state_manifests,
+    load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
+    load_published_commit_state_topology, scan_change_records_from_commit_deltas,
+    scan_commit_delta_inventory, scan_commit_delta_values, selected_change_selection_fingerprint,
+    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_published_parent,
