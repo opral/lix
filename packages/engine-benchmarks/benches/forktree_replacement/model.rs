@@ -227,6 +227,21 @@ pub struct SelectorConflictAccounting {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct DiffAccounting {
+    pub changes: u64,
+    pub hash_pruned_nodes: u64,
+    pub decoded_nodes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SharedObjectAccounting {
+    pub shared_objects: u64,
+    pub shared_bytes: u64,
+    pub left_objects: u64,
+    pub right_objects: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ApplyAccounting {
     pub object_writes: u64,
     pub object_bytes: u64,
@@ -1089,6 +1104,40 @@ where
             .into_iter()
             .map(|change| change.key)
             .collect())
+    }
+
+    pub async fn diff_commits_profiled(
+        &self,
+        before: ObjectId,
+        after: ObjectId,
+    ) -> Result<(Vec<Vec<u8>>, DiffAccounting), String> {
+        let (changes, accounting) = self.diff_rows_profiled(before, after).await?;
+        Ok((
+            changes.into_iter().map(|change| change.key).collect(),
+            accounting,
+        ))
+    }
+
+    pub async fn shared_object_inventory(
+        &self,
+        left: ObjectId,
+        right: ObjectId,
+    ) -> Result<SharedObjectAccounting, String> {
+        let left = self.object_closure(left).await?;
+        let right = self.object_closure(right).await?;
+        let shared = left.intersection(&right).copied().collect::<Vec<_>>();
+        let shared_bytes = self
+            .load_objects(&shared)
+            .await?
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .sum();
+        Ok(SharedObjectAccounting {
+            shared_objects: shared.len() as u64,
+            shared_bytes,
+            left_objects: left.len() as u64,
+            right_objects: right.len() as u64,
+        })
     }
 
     pub async fn merge_branches(
@@ -2924,8 +2973,20 @@ where
     }
 
     async fn diff_rows(&self, before: ObjectId, after: ObjectId) -> Result<Vec<RowChange>, String> {
+        self.diff_rows_profiled(before, after)
+            .await
+            .map(|(changes, _)| changes)
+    }
+
+    async fn diff_rows_profiled(
+        &self,
+        before: ObjectId,
+        after: ObjectId,
+    ) -> Result<(Vec<RowChange>, DiffAccounting), String> {
+        let mut accounting = DiffAccounting::default();
         if before == after {
-            return Ok(Vec::new());
+            accounting.hash_pruned_nodes = 1;
+            return Ok((Vec::new(), accounting));
         }
         let before = self.load_commit(before).await?;
         let after = self.load_commit(after).await?;
@@ -2940,13 +3001,15 @@ where
                 max_key: self.node_max_key(after.root).await?,
             }],
             &mut output,
+            &mut accounting,
         )
         .await?;
         output.sort_by(|left, right| left.key.cmp(&right.key));
         if output.windows(2).any(|pair| pair[0].key >= pair[1].key) {
             return Err("ForkTree diff emitted duplicate identities".to_string());
         }
-        Ok(output)
+        accounting.changes = output.len() as u64;
+        Ok((output, accounting))
     }
 
     fn diff_forests<'a>(
@@ -2954,6 +3017,7 @@ where
         before: Vec<NodeRef>,
         after: Vec<NodeRef>,
         output: &'a mut Vec<RowChange>,
+        accounting: &'a mut DiffAccounting,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             if before.is_empty() && after.is_empty() {
@@ -2975,10 +3039,12 @@ where
                     continue;
                 }
                 found_common = true;
+                accounting.hash_pruned_nodes += 1;
                 self.diff_forests(
                     before[before_start..before_index].to_vec(),
                     after[after_start..after_index].to_vec(),
                     output,
+                    accounting,
                 )
                 .await?;
                 before_start = before_index + 1;
@@ -2990,6 +3056,7 @@ where
                         before[before_start..].to_vec(),
                         after[after_start..].to_vec(),
                         output,
+                        accounting,
                     )
                     .await;
             }
@@ -3002,6 +3069,7 @@ where
             for node in &after {
                 after_nodes.push(decode_node(&self.load_object(node.id).await?)?);
             }
+            accounting.decoded_nodes += (before_nodes.len() + after_nodes.len()) as u64;
             let before_leaves = before_nodes
                 .iter()
                 .all(|node| matches!(node, Node::Leaf(_)));
@@ -3080,8 +3148,39 @@ where
 
             let before = expand_forest(before, before_nodes);
             let after = expand_forest(after, after_nodes);
-            self.diff_forests(before, after, output).await
+            self.diff_forests(before, after, output, accounting).await
         })
+    }
+
+    async fn object_closure(
+        &self,
+        root: ObjectId,
+    ) -> Result<std::collections::BTreeSet<ObjectId>, String> {
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut frontier = vec![root];
+        while !frontier.is_empty() {
+            let mut ids = Vec::new();
+            while ids.len() < 512 {
+                let Some(id) = frontier.pop() else {
+                    break;
+                };
+                if reachable.insert(id) {
+                    ids.push(id);
+                }
+            }
+            if ids.is_empty() {
+                continue;
+            }
+            for bytes in self.load_objects(&ids).await? {
+                let edges = object_edges(&bytes)?;
+                for edge in edges.terminal.into_iter().chain(edges.traverse) {
+                    if !reachable.contains(&edge) {
+                        frontier.push(edge);
+                    }
+                }
+            }
+        }
+        Ok(reachable)
     }
 
     async fn load_value(&self, value: ValueRef) -> Result<Vec<u8>, String> {

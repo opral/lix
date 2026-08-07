@@ -1,5 +1,6 @@
 #![allow(clippy::large_futures)]
 
+mod branch_diff_scaling;
 mod model;
 mod multimedia_acceptance;
 mod multimedia_fanout;
@@ -407,6 +408,10 @@ struct Sample {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("branch-diff-scaling") {
+        branch_diff_scaling::run().await;
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("multimedia-fanout") {
         multimedia_fanout::run().await;
         return;
