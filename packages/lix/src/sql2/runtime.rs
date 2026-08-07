@@ -2,6 +2,8 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
@@ -25,8 +27,6 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
-#[cfg(feature = "storage-benches")]
-use std::time::Instant;
 use tokio::sync::OnceCell;
 
 use crate::catalog::CatalogFingerprint;
@@ -66,6 +66,30 @@ pub(crate) async fn collect_dataframe(
         );
     }
     result
+}
+
+/// Create a pull-based stream from a DataFusion physical plan without
+/// collecting its output batches first. The caller owns the stream and may
+/// stop polling it early; dropping the stream then drops the underlying scan
+/// futures as well.
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn stream_dataframe(
+    dataframe: DataFrame,
+    physical_planning_cache: Option<PhysicalPlanningCache>,
+) -> Result<SendableRecordBatchStream> {
+    let task_ctx = Arc::new(dataframe.task_ctx());
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
+    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
+    let plan = adapt_runtime_plan(plan)?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::PhysicalPlanning,
+            started.elapsed(),
+        );
+    }
+    stream_adapted_input_plan(plan, task_ctx)
 }
 
 async fn create_or_rebind_physical_plan(
@@ -310,6 +334,35 @@ async fn collect_adapted_input_plan(
         batches.extend(partition_batches);
     }
     Ok(batches)
+}
+
+#[cfg(feature = "storage-benches")]
+fn stream_adapted_input_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream> {
+    let partition_count = plan.output_partitioning().partition_count();
+    if partition_count == 0 {
+        return internal_err!("execution plan exposes no output partitions");
+    }
+    if partition_count == 1 {
+        return plan.execute(0, task_ctx);
+    }
+
+    // Preserve Lix's serial partition semantics and defer even construction of
+    // each child stream until the flattened stream needs that partition.
+    // Dropping early therefore leaves later partitions unexecuted, not merely
+    // unpolled.
+    let schema = plan.schema();
+    let streams = stream::iter(0..partition_count).then(move |partition| {
+        let plan = Arc::clone(&plan);
+        let task_ctx = Arc::clone(&task_ctx);
+        async move { plan.execute(partition, task_ctx) }
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        streams.try_flatten(),
+    )))
 }
 
 pub(crate) fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {

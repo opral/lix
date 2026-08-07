@@ -136,6 +136,8 @@ class RemoteLixBinding implements LixBinding {
 		this.#observationHub = new RemoteObservationHub({
 			openStream: (subscriptions, signal) =>
 				this.#requestObserveStream(subscriptions, signal),
+			refreshObservation: (subscription) =>
+				this.#refreshObservation(subscription),
 		});
 	}
 
@@ -632,6 +634,21 @@ class RemoteLixBinding implements LixBinding {
 		}
 	}
 
+	async #refreshObservation(
+		subscription: RemoteObserveSubscription,
+	): Promise<BindingExecuteResult> {
+		return this.#enqueue(async () => {
+			const value = await this.#requestJson("execute", {
+				method: "POST",
+				body: JSON.stringify({
+					sql: subscription.sql,
+					params: subscription.params,
+				}),
+			});
+			return decodeExecuteResult(value);
+		});
+	}
+
 	async #prepareParams(
 		params: NativeLixValue[],
 		slot: (index: number) => string,
@@ -980,10 +997,14 @@ type RemoteObservationHubOptions = {
 		subscriptions: RemoteObserveSubscription[],
 		signal: AbortSignal,
 	): Promise<Response>;
+	refreshObservation(
+		subscription: RemoteObserveSubscription,
+	): Promise<BindingExecuteResult>;
 };
 
 class RemoteObservationHub {
 	readonly #openStream: RemoteObservationHubOptions["openStream"];
+	readonly #refreshObservation: RemoteObservationHubOptions["refreshObservation"];
 	readonly #observations = new Map<string, RemoteObservation>();
 	#nextObservationId = 0;
 	#controller: AbortController | undefined;
@@ -996,6 +1017,7 @@ class RemoteObservationHub {
 
 	constructor(options: RemoteObservationHubOptions) {
 		this.#openStream = options.openStream;
+		this.#refreshObservation = options.refreshObservation;
 	}
 
 	observe(
@@ -1083,6 +1105,7 @@ class RemoteObservationHub {
 			);
 			if (!this.#isCurrent(generation, controller)) return;
 			streamOpened = true;
+			const initialSubscriptions = new Set(this.#observations.keys());
 			if (!response.ok) {
 				if (isRetryableObserveStatus(response.status)) {
 					void response.body?.cancel();
@@ -1135,7 +1158,25 @@ class RemoteObservationHub {
 							transportBases.get(subscriptionId),
 						);
 						transportBases.set(subscriptionId, event);
-						observation.accept(event, transportDelta);
+						if (initialSubscriptions.delete(subscriptionId)) {
+							// The first frame after opening (including a reconnect) is a
+							// synchronization point, not an authoritative snapshot. The
+							// remote runtime may have observed the stream before its
+							// external-storage watcher caught up. Reconcile through the
+							// normal execute endpoint before publishing it to consumers.
+							const rows = await this.#refreshObservation(
+								observation.request(),
+							);
+							observation.accept(
+								{
+									...event,
+									rows,
+								},
+								false,
+							);
+						} else {
+							observation.accept(event, transportDelta);
+						}
 						this.#retryAttempt = 0;
 					} catch (error) {
 						this.#failStream(asObserveProtocolError(error, "next"), controller);

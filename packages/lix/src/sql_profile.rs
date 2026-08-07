@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::time::Duration;
 
-use crate::{ExecuteResult, LixError};
+use crate::LixError;
 
 tokio::task_local! {
     static ACTIVE_PROFILE: RefCell<SqlReadProfile>;
@@ -33,6 +33,17 @@ pub struct SqlReadProfile {
     /// it is never set by the production result path.
     pub result_count_only_rows: u64,
     pub result_count_only_batches: u64,
+    /// Number of public rows consumed while the profile scope was active.
+    pub result_rows_consumed: u64,
+    /// Number of rows materialized into the public `Vec<Row>` representation
+    /// or an owned benchmark scalar row while the profile scope was active.
+    pub result_rows_materialized: u64,
+    /// Number of owned rows retained through the end of result consumption.
+    /// Cursor modes materialize one scalar row at a time but retain none.
+    pub result_rows_retained: u64,
+    /// Checksum of consumed scalar values. This is a benchmark-only
+    /// correctness witness, not a public result API.
+    pub result_checksum: u64,
 }
 
 impl SqlReadProfile {
@@ -94,9 +105,29 @@ pub(crate) fn record_result_count_only(rows: usize, batches: usize) {
     });
 }
 
-pub(crate) async fn scope<F>(future: F) -> (Result<ExecuteResult, LixError>, SqlReadProfile)
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_result_rows(consumed: usize, materialized: usize, retained: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.result_rows_consumed = profile.result_rows_consumed.saturating_add(consumed as u64);
+        profile.result_rows_materialized = profile
+            .result_rows_materialized
+            .saturating_add(materialized as u64);
+        profile.result_rows_retained = profile.result_rows_retained.saturating_add(retained as u64);
+    });
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_result_checksum(checksum: u64) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.result_checksum = profile.result_checksum.wrapping_add(checksum);
+    });
+}
+
+pub(crate) async fn scope<T, F>(future: F) -> (Result<T, LixError>, SqlReadProfile)
 where
-    F: Future<Output = Result<ExecuteResult, LixError>>,
+    F: Future<Output = Result<T, LixError>>,
 {
     let started = std::time::Instant::now();
     let (result, mut profile) = ACTIVE_PROFILE
@@ -113,6 +144,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteResult;
     use crate::{Memory, Value, engine::Engine};
 
     #[tokio::test]
@@ -242,5 +274,81 @@ mod tests {
             + profile.arrow_execution
             + profile.public_result_materialization;
         assert!(disjoint_phase_sum <= profile.total);
+    }
+
+    #[tokio::test]
+    async fn live_profile_early_drop_stops_before_later_datafusion_partition() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("profile cancellation storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("profile cancellation engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("profile cancellation session should open");
+
+        for table in ["sql_profile_cancel_a", "sql_profile_cancel_b"] {
+            let schema = serde_json::json!({
+                "x-lix-key": table,
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "ordinal": { "type": "integer" },
+                    "payload": { "type": "string" }
+                },
+                "required": ["id", "ordinal", "payload"],
+                "additionalProperties": false
+            });
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("profile cancellation schema should register");
+        }
+        session
+            .execute(
+                "INSERT INTO sql_profile_cancel_a (id, ordinal, payload) VALUES \
+                 ('row-00000000', 0, 'payload-00000000'), \
+                 ('row-00000001', 1, 'payload-00000001'), \
+                 ('row-00000002', 2, 'payload-00000002'), \
+                 ('row-00000003', 3, 'payload-00000003')",
+                &[],
+            )
+            .await
+            .expect("first cancellation partition should seed");
+        session
+            .execute(
+                "INSERT INTO sql_profile_cancel_b (id, ordinal, payload) VALUES \
+                 ('row-00000004', 4, 'payload-00000004'), \
+                 ('row-00000005', 5, 'payload-00000005'), \
+                 ('row-00000006', 6, 'payload-00000006'), \
+                 ('row-00000007', 7, 'payload-00000007')",
+                &[],
+            )
+            .await
+            .expect("second cancellation partition should seed");
+
+        let profile = session
+            .execute_result_streaming_profiled(
+                "SELECT id, ordinal, payload FROM sql_profile_cancel_a \
+                 UNION ALL SELECT id, ordinal, payload FROM sql_profile_cancel_b",
+                &[],
+                "live",
+                Some(1),
+            )
+            .await
+            .expect("live cancellation profile should execute");
+
+        assert_eq!(profile.result_rows_consumed, 1);
+        assert_eq!(profile.result_rows_materialized, 1);
+        assert_eq!(profile.result_rows_retained, 0);
+        assert_eq!(profile.scan_rows, 4);
+        assert!(profile.scan_batches > 0);
     }
 }

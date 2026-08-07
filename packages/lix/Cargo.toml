@@ -52,6 +52,12 @@ path = "tests/semantic_merge.rs"
 name = "send_futures"
 path = "tests/send_futures.rs"
 
+[[bench]]
+name = "profile_sql_result_streaming"
+path = "benches/profile_sql_result_streaming.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [[test]]
 name = "plugin_arena_scorecard"
 path = "tests/plugin_arena_scorecard.rs"
