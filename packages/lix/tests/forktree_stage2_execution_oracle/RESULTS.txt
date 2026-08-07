@@ -1,72 +1,37 @@
-ForkTree Stage-2 execution-oracle qualification
+ForkTree Stage-2 corrected deletion-oracle qualification
 Date: 2026-08-07 UTC
 
-Pinned sources
-- current main: b5e78190f49cab5de7bb19b6f967706c214363b6
-- current tree: c913465505bc773d21a6e2804530287ee937a3f1
-- inventory predecessor: 4763408467d265b288a124e24b1d47be423f5d17
-- approved Stage 1: 138b55e1de90806c380ad27b2b349f4c66a1387f
-- Stage-1 tree: 26a3e6ead4d690bf1fe2ebca1e2da7d597256b84
+Test/static only; no production source changed.
 
-Standalone source gate
-- warnings-denied scanner compile: PASS
+Standalone gates
+- rustc --edition=2024 -D warnings main.rs: PASS
 - scanner self-test: PASS
-- scanner binary SHA-256:
-  4d9f4f797ec2544491f4dddf41aa7204dee58cd7a219c4d20a63034a821056d9
-- main b5e baseline: 192 findings
-  - 41 legacy-space items / 693 source occurrences
-  - 103 legacy owner/codec tokens, including the complete merged #1258 physical
-    CAS/retention implementation / 2,016 source occurrences
-  - 23 superseded modules / 23 path occurrences
-  - 5 old paginated-scan tokens / 202 source occurrences
-  - 3 unsealed raw-space tokens / 3 source occurrences
-  - 17 missing required owner tokens
-- main baseline log SHA-256:
-  0b477b19b64d34d4c006ced9c9e2afd08ccae5d7a18f6fce39362087c42c4819
-- Stage1 138b baseline: 133 findings
-  - 41 legacy-space items / 657 source occurrences
-  - 64 legacy owner/codec tokens / 1,694 source occurrences
-  - 23 superseded modules / 23 path occurrences
-  - 5 old paginated-scan tokens / 190 source occurrences
-  - no unsealed or missing-owner finding
-- Stage1 baseline log SHA-256:
-  11286ebd28bb7d962c6a7ca997f9075f2035696291efba015b8c14013a8a5182
-- self-test log SHA-256:
-  5aa097ea408a9bbce25c119b546cc2e887e50066ee85d4b825dbc7274333bb33
+- compiler dependency oracle: PASS, 21 nodes / 35 edges
+- landed #1258 21-path / 39-symbol verifier: PASS
+- item-scoped production extraction: PASS, including declarations after
+  #[cfg(test)], inside impls, #[cfg(not(test))], and potentially production
+  #[cfg(any(test, ...))]
+- executable 19-row public semantic contract: calibrated red on all pre-cut
+  trees (1/19 passes), as required
 
-External safe-Rust probe calibration
-- Exact-main b5e lix build: PASS (58.38s incremental after the predecessor
-  calibration build).
-- Exact-main rlib SHA-256:
-  0d4b3ee07fa2b68648ba1c44e2f365658f011ba94da643debed6aaa6b19a5d47
-- On b5e, equivalent object-space construction/put/delete: COMPILES, as expected
-  for the legacy baseline.
-- On b5e, StorageRead::scan + ScanOptions resume page: COMPILES, as expected
-  for the legacy baseline.
-- Approved-Stage1 138b lix build: PASS in 2m44s.
-- Exact-Stage1 rlib SHA-256:
-  c388bca15c65b92316b37473cf210f4c79306ec4a8f93d1f4dc18a2b3be1feea
-- On 138b, equivalent object-space construction/put/delete: REJECTED as
-  required with E0599 (no StorageSpace::immutable) and E0423 (private SpaceId
-  tuple field).
-- Stage1 rejection stderr SHA-256:
-  583b8d926242dae57ff8776a3b953cbbe33ef2aee01994c7b13e550893423006
-- On 138b, StorageRead::scan + ScanOptions resume page: COMPILES, as expected;
-  cursor ownership is a separately held prerequisite.
+Exact red calibration totals
+- b5e78190: 295 findings; 42 spaces / 699 occurrences
+- Stage1 138b55e1: 233 findings; 42 spaces / 657 occurrences
+- e8713ed1: 295 findings; 42 spaces / 702 occurrences
+- e871 + #1260 tree 2ae6ffd8: 295 findings; 42 spaces / 702 occurrences
 
-Landed #1258 completeness gate
-- Exact changed production path set: 21/21 matched.
-- Every one of the 39 physical CAS/retention symbols listed by the landed-source
-  map exists in b5e and is named by the residue oracle: PASS.
-- Semantic facade exceptions are explicit and present:
-  stage_repository_gc, stage_repository_gc_with_preconditions, and
-  load_plugin_registry_at_commit.
-- Verification source SHA-256:
-  371f0dbe0e8423c5264f88bf33614ae2a559585643d340cd013f06e8e40db368
+Boundary
+- packages/sqlite-storage and all runtime/dependency selectors: delete
+- CLI FileStorage/FileLix/read/write owners: delete
+- normal CLI local open/init: RocksDB
+- explicit SlateDB: retained
+- SQLite: not a conformance adapter and not a required consumer
+- all retained workspace Rust callers are cursor/residue scan roots
 
-Acceptance meaning
-- Baselines are deliberately red and are not Stage-2 acceptance.
-- The first runnable Stage-2 candidate must report zero scanner findings.
-- The equivalent-space and old-scan probes must both fail against an rlib
-  built from that exact candidate. A stale rlib is invalid evidence.
-- No production file was modified or compiled with Stage-2 wiring here.
+Compile calibration
+- exact b5 raw-space and old-scan probes compile
+- exact approved Stage1 raw-space probe rejects E0599/E0423; old scan compiles
+- full matrix: COMPILE_PROBE_RESULTS.tsv
+
+Canonical detailed report:
+packages/lix/tests/FORKTREE_STAGE2_AUTHORITY_DELETION_BUDGET.md

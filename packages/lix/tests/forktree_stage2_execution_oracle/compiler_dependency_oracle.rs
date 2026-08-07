@@ -25,11 +25,18 @@ const EDGES: &[(&str, &str)] = &[
     ("R5", "W0"),
     ("R6", "W0"),
     ("R7", "W0"),
-    ("W0", "W1"),
-    ("W0", "W2"),
-    ("W0", "W3"),
+    // Install the owner-local conflict keys and read-only GC-generation fence
+    // before any logical publication/root writer or sweep can run.
     ("W0", "W4"),
-    ("W0", "W5"),
+    ("W4", "W1"),
+    ("W4", "W2"),
+    ("W4", "W3"),
+    // Sweep starts only after state/catalog, selector/root, and
+    // blob/upload/plugin publication can all add every authoritative root
+    // under that fence.
+    ("W1", "W5"),
+    ("W2", "W5"),
+    ("W3", "W5"),
     // Working-diff writers disappear only after root-diff readers and
     // state/selector publication are authoritative.
     ("R4", "D0"),
@@ -98,6 +105,16 @@ fn main() {
         assert!(
             position[delete] < position["C1"],
             "compile precedes {delete}"
+        );
+    }
+    for publication in ["W1", "W2", "W3"] {
+        assert!(
+            position["W4"] < position[publication],
+            "{publication} precedes the owner-local fence"
+        );
+        assert!(
+            position[publication] < position["W5"],
+            "sweep precedes publication/root prerequisite {publication}"
         );
     }
     assert!(position["D2"] < position["C0"]);

@@ -1,4 +1,5 @@
 disposition	class	item	occurrences
+zero	legacy-space	BINARY_CAS_MUTATION_EPOCH_SPACE	6
 zero	legacy-space	BINARY_CAS_MANIFEST_SPACE	21
 zero	legacy-space	BINARY_CAS_MANIFEST_CHUNK_SPACE	17
 zero	legacy-space	BINARY_CAS_CHUNK_SPACE	19
@@ -214,21 +215,39 @@ absent	superseded-module	binary_cas/chunking.rs	1
 absent	superseded-module	binary_cas/stats.rs	1
 absent	superseded-module	transaction/plugin_checkpoint.rs	1
 absent	superseded-module	storage_adapter/scan.rs	1
-zero	old-scan-identifier	ScanOptions	83
-zero	old-scan-identifier	StorageScanOptions	1
-zero	old-scan-identifier	ScanPlan	11
+zero	sqlite-adapter-residue	lix_storage_sqlite	7
+zero	sqlite-adapter-residue	StorageProfile::SQLite	12
+zero	sqlite-adapter-residue	LixStorageProfile::SQLite	5
+zero	sqlite-adapter-residue	SQLiteTempBenchStorage	13
+zero	sqlite-adapter-residue	ChangelogScoreStorage::SQLite	1
+absent	sqlite-adapter-package	packages/sqlite-storage	1
+zero	removed-storage-owner	FileLix	8
+zero	removed-storage-owner	FileStorage	6
+zero	removed-storage-owner	FileStorageRead	4
+zero	removed-storage-owner	FileStorageWrite	6
+present	cli-rocksdb-default	lix_storage_rocksdb	1
+present	cli-rocksdb-default	RocksDB::open	0
+present	cli-rocksdb-default	Lix<RocksDB>	0
+zero	old-scan-identifier	ScanOptions	148
+zero	old-scan-identifier	StorageScanOptions	118
+zero	old-scan-identifier	ScanPlan	83
 zero	old-scan-identifier	ScanPlanCursor	0
-zero	old-scan-identifier	resume_after	76
-zero	old-scan-identifier	scan_resume_after	6
+zero	old-scan-identifier	resume_after	293
+zero	old-scan-identifier	scan_resume_after	7
+zero	old-scan-identifier	expected_resume_after	6
 zero	old-scan-pattern	.first_page(	0
-zero	old-scan-pattern	.page(	0
+zero	old-scan-pattern	.page(	1
 zero	old-scan-pattern	fn first_page(	0
 zero	old-scan-pattern	async fn first_page(	0
 zero	old-scan-pattern	StorageRead::scan	0
-zero	old-scan-pattern	read.scan(	9
+zero	old-scan-pattern	read.scan(	14
 zero	old-scan-pattern	older.scan(	1
 zero	old-scan-pattern	snapshot_scan_cursor	1
 zero	old-scan-pattern	stateless fallback	1
+zero	old-scan-pattern	slate_scan_resume	0
+zero	old-scan-pattern	scan_resume_cache	0
+zero	old-scan-pattern	resume_cache	0
+zero	old-scan-pattern	scan_cursor: Mutex<Option<ScanCursor>>	1
 zero	unsealed-owner	pub struct SpaceId(pub u32)	1
 zero	unsealed-owner	pub const fn mutable(id: SpaceId	1
 zero	unsealed-owner	pub const fn immutable(id: SpaceId	1
@@ -264,15 +283,34 @@ allow	public-semantic	BranchOperation	32
 allow	public-semantic	ChangeId	628
 allow	public-semantic	ChangelogContext	73
 allow	public-semantic	CommitId	1587
-allow	public-semantic	Engine	215
+allow	public-semantic	Engine	222
 allow	public-semantic	LiveStateContext	55
 allow	public-semantic	LiveStateReader	158
-allow	public-semantic	SessionContext	144
+allow	public-semantic	SessionContext	148
 allow	public-semantic	load_plugin_registry_at_commit	6
 allow	public-semantic	stage_repository_gc	3
 allow	public-semantic	stage_repository_gc_with_preconditions	13
-allow	public-semantic	upsert_file_content_part	18
-allow	public-semantic	lix_branch	75
+allow	public-semantic	upsert_file_content_part	19
+allow	public-semantic	lix_branch	83
 allow	public-semantic	lix_branch_ref	21
 allow	public-semantic	lix_change	41
-allow	public-semantic	lix_commit	24
+allow	public-semantic	lix_commit	30
+pass	semantic-facade-contract	BlobDataReader	0
+pass	semantic-facade-contract	BranchContext	0
+pass	semantic-facade-contract	BranchLifecycle	0
+pass	semantic-facade-contract	BranchOperation	1
+pass	semantic-facade-contract	ChangeId	0
+pass	semantic-facade-contract	ChangelogContext	0
+pass	semantic-facade-contract	CommitId	0
+pass	semantic-facade-contract	Engine	0
+pass	semantic-facade-contract	LiveStateContext	0
+pass	semantic-facade-contract	LiveStateReader	0
+pass	semantic-facade-contract	SessionContext	0
+pass	semantic-facade-contract	load_plugin_registry_at_commit	0
+pass	semantic-facade-contract	stage_repository_gc	0
+pass	semantic-facade-contract	stage_repository_gc_with_preconditions	0
+pass	semantic-facade-contract	upsert_file_content_part	0
+pass	semantic-facade-contract	lix_branch	0
+pass	semantic-facade-contract	lix_branch_ref	0
+pass	semantic-facade-contract	lix_change	0
+pass	semantic-facade-contract	lix_commit	0

@@ -1,25 +1,25 @@
-symbol	retained_owner_boundary	reason_allowed
-BlobDataReader	ForkTree authenticated blob manifest/chunk facade	Public file/blob read semantics remain; old binary-CAS KV and codec bodies do not.
-BranchContext	ForkTree branch selector facade	Branch API remains while BRANCH_HEAD_CONTROL_SPACE and control codec disappear.
-BranchLifecycle	ForkTree selector and RefChange publication facade	Create/delete/rename/switch semantics remain without branch-control persistence.
-BranchOperation	Immutable RefChange semantic value	Public operation identity is semantic data, not physical branch control.
-ChangeId	Unified raw-UUID ChangeCatalog	Stable public identity remains; CHANGE_SPACE and COMMIT_CHANGE_ID_SPACE do not.
-ChangelogContext	CommitCatalog and unified ChangeCatalog facade	Public history API remains; changelog store/codec authority does not.
-CommitId	Raw-UUID CommitCatalog	Stable public identity remains; COMMIT_SPACE does not.
-Engine	ForkTree-backed public engine facade	Session/bootstrap behavior remains; no physical legacy owner is implied.
-LiveStateContext	Coherent global+branch+untracked view facade	Current-state semantics remain; tracked HOT/base authorities do not.
-LiveStateReader	Coherent selected-view reader facade	Point/range materialization remains without a legacy tracked serving path.
-SessionContext	ForkTree-backed public session facade	Public transactions/files/history remain unchanged.
-load_plugin_registry_at_commit	Authenticated selected plugin-registry object reader	Semantic facade explicitly retained from #1258; old plugin checkpoint rows are deleted.
-stage_repository_gc	Bounded ForkTree owner GC facade	Public maintenance entry remains; old queue/mark/CAS sweep internals do not.
-stage_repository_gc_with_preconditions	Bounded ForkTree owner GC facade	Preconditioned maintenance entry remains; it cannot decode old owner bytes.
-upsert_file_content_part	UploadSelector/ReceiptTree publication facade	Multipart API remains; UPLOAD_STATE_SPACE and cumulative leaf format do not.
-lix_branch	Derived branch selector materialization	Public SQL relation remains and is not durable authority.
-lix_branch_ref	Derived RefChange materialization	Public SQL relation remains; selector does not duplicate ref_change_id.
-lix_change	Unified ChangeCatalog materialization	Public SQL relation remains; no semantic/ref split directory.
-lix_commit	CommitCatalog materialization	Public SQL relation remains; no COMMIT_SPACE compatibility reader.
-BeginScanOptions	Ephemeral storage cursor options	Projection/order only; no resume or durable continuation state.
-ScanOrder	Ephemeral storage cursor ordering request	Descending may report Unsupported(ReverseScan); it owns no persisted state.
-ScanCursor	Read-handle-bound ephemeral cursor	Only next_page survives; errors/cancellation poison terminally.
-ScanChunk	Owned result page	Rows and stats only; never a durable continuation or authority.
-StorageScanSource	Doc-hidden adapter implementation trait	Backend iterator implementation only; no public compatibility wrapper.
+class	symbol	retained_owner_boundary	executable_contract	reason_allowed
+semantic	BlobDataReader	ForkTree authenticated blob manifest/chunk facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Public file/blob read semantics remain; old binary-CAS KV and codec bodies do not.
+semantic	BranchContext	ForkTree branch selector facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Branch API remains while BRANCH_HEAD_CONTROL_SPACE and control codec disappear.
+semantic	BranchLifecycle	ForkTree selector and RefChange publication facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Create/delete/rename/switch semantics remain without branch-control persistence.
+semantic	BranchOperation	Immutable RefChange semantic value	declaration exists; no raw StorageSpace/write/delete	Public operation identity is semantic data, not physical branch control.
+semantic	ChangeId	Unified raw-UUID ChangeCatalog	declaration exists; no raw StorageSpace/write/delete	Stable public identity remains; CHANGE_SPACE and COMMIT_CHANGE_ID_SPACE do not.
+semantic	ChangelogContext	CommitCatalog and unified ChangeCatalog facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Public history API remains; changelog store/codec authority does not.
+semantic	CommitId	Raw-UUID CommitCatalog	declaration exists; no raw StorageSpace/write/delete	Stable public identity remains; COMMIT_SPACE does not.
+semantic	Engine	ForkTree-backed public engine facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Session/bootstrap behavior remains; no physical legacy owner is implied.
+semantic	LiveStateContext	Coherent global+branch+untracked view facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Current-state semantics remain; tracked HOT/base authorities do not.
+semantic	LiveStateReader	Coherent selected-view reader facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Point/range materialization remains without a legacy tracked serving path.
+semantic	SessionContext	ForkTree-backed public session facade	declaration/impl exists; ForkTree delegation present; no raw StorageSpace/write/delete	Public transactions/files/history remain unchanged.
+semantic	load_plugin_registry_at_commit	Authenticated selected plugin-registry object reader	function exists; ForkTree delegation present; no raw StorageSpace/write/delete	Semantic facade explicitly retained from #1258; old plugin checkpoint rows are deleted.
+semantic	stage_repository_gc	Bounded ForkTree owner GC facade	function exists; ForkTree delegation present; no raw StorageSpace/write/delete	Public maintenance entry remains; old queue/mark/CAS sweep internals do not.
+semantic	stage_repository_gc_with_preconditions	Bounded ForkTree owner GC facade	function exists; ForkTree delegation present; no raw StorageSpace/write/delete	Preconditioned maintenance entry remains; it cannot decode old owner bytes.
+semantic	upsert_file_content_part	UploadSelector/ReceiptTree publication facade	function exists; ForkTree delegation present; no raw StorageSpace/write/delete	Multipart API remains; UPLOAD_STATE_SPACE and cumulative leaf format do not.
+semantic	lix_branch	Derived branch selector materialization	relation literal exists in a ForkTree-delegating item; no raw StorageSpace/write/delete	Public SQL relation remains and is not durable authority.
+semantic	lix_branch_ref	Derived RefChange materialization	relation literal exists in a ForkTree-delegating item; no raw StorageSpace/write/delete	Public SQL relation remains; selector does not duplicate ref_change_id.
+semantic	lix_change	Unified ChangeCatalog materialization	relation literal exists in a ForkTree-delegating item; no raw StorageSpace/write/delete	Public SQL relation remains; no semantic/ref split directory.
+semantic	lix_commit	CommitCatalog materialization	relation literal exists in a ForkTree-delegating item; no raw StorageSpace/write/delete	Public SQL relation remains; no COMMIT_SPACE compatibility reader.
+cursor	BeginScanOptions	Ephemeral storage cursor options	must exist; scanner forbids resume fields	Projection/order only; no resume or durable continuation state.
+cursor	ScanOrder	Ephemeral storage cursor ordering request	must exist	Descending may report Unsupported(ReverseScan); it owns no persisted state.
+cursor	ScanCursor	Read-handle-bound ephemeral cursor	must exist; only next_page survives	Errors/cancellation poison terminally.
+cursor	ScanChunk	Owned result page	must exist	Rows and stats only; never a durable continuation or authority.
+cursor	StorageScanSource	Doc-hidden adapter implementation trait	must exist; adapter reconstruction loop forbidden	Backend iterator implementation only; no public compatibility wrapper.
