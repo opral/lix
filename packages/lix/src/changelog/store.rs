@@ -82,26 +82,6 @@ pub(crate) fn commit_change_id_index_format_value() -> Vec<u8> {
     COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.to_vec()
 }
 
-#[cfg(test)]
-pub(crate) fn commit_id_from_key(key: &[u8]) -> Result<CommitId, LixError> {
-    uuid_from_key(key, "commit").map(CommitId::new)
-}
-
-#[cfg(test)]
-pub(crate) fn change_id_from_key(key: &[u8]) -> Result<ChangeId, LixError> {
-    uuid_from_key(key, "change").map(ChangeId::new)
-}
-
-#[cfg(test)]
-fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
-    uuid::Uuid::from_slice(key).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog {kind} key is not a 16-byte uuid: {error}"),
-        )
-    })
-}
-
 #[async_trait]
 pub(crate) trait ChangelogReader {
     async fn load_commits<'a>(
