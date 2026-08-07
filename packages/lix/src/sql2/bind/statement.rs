@@ -29,6 +29,7 @@ use super::write::{
     BoundReturning, BoundReturningItem, BoundWrite, BoundWriteInput, BoundWriteOp,
     BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
 };
+use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 
 #[cfg(test)]
 pub(crate) fn bind_statement(
@@ -623,7 +624,7 @@ fn bind_insert_input(
                 LixError::CODE_TYPE_MISMATCH,
                 "lix_file.content expects binary content",
             )
-            .with_hint("Use X'...' or a binary parameter for file contents."));
+            .with_hint(LIX_FILE_CONTENT_CAST_HINT));
         }
         let statement =
             DataFusionStatement::Statement(Box::new(SqlStatement::Query(Box::new(source.clone()))));
@@ -1031,7 +1032,6 @@ fn bind_value(value: &Value, params: &mut ParamBinder) -> Result<BoundExpr, LixE
         Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => {
             Ok(BoundExpr::Literal(BoundLiteral::Text(value.clone())))
         }
-        Value::HexStringLiteral(value) => decode_hex_literal(value),
         Value::Number(value, _) => bind_number_literal(value),
         Value::Placeholder(name) => Ok(BoundExpr::Param(params.bind(name)?)),
         _ => Err(super::error::unsupported(format!(
@@ -1073,24 +1073,6 @@ fn bind_negative_number_expr(expr: &Expr) -> Result<BoundExpr, LixError> {
         )));
     };
     bind_number_literal(&format!("-{value}"))
-}
-
-fn decode_hex_literal(value: &str) -> Result<BoundExpr, LixError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(super::error::unsupported(format!(
-            "hex literal has odd length '{value}'"
-        )));
-    }
-    let bytes = value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|chunk| {
-            let high = hex_digit(chunk[0])?;
-            let low = hex_digit(chunk[1])?;
-            Ok((high << 4) | low)
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    Ok(BoundExpr::Literal(BoundLiteral::Blob(bytes)))
 }
 
 fn bind_insert_value_function(
@@ -1253,18 +1235,6 @@ fn function_args(args: &FunctionArguments) -> Result<Vec<&Expr>, LixError> {
             )),
         })
         .collect()
-}
-
-fn hex_digit(byte: u8) -> Result<u8, LixError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(super::error::unsupported(format!(
-            "invalid hex literal digit '{}'",
-            byte as char
-        ))),
-    }
 }
 
 fn bind_exact_column_name(name: &ObjectName) -> Result<String, LixError> {
@@ -1992,18 +1962,14 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_binds_hex_literals_as_blobs() {
+    fn bind_statement_rejects_hex_literals() {
         let statement =
             parse_statement("INSERT INTO lix_file (id, content) VALUES ('file1', X'4142')");
-        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("hex literals should be removed from the SQL surface");
 
-        let write = bound;
-        let BoundWriteInput::Values(values) = write.input else {
-            panic!("expected values input");
-        };
-        assert!(values.rows[0]
-            .iter()
-            .any(|value| matches!(value, BoundExpr::Literal(BoundLiteral::Blob(bytes)) if bytes == &vec![0x41, 0x42])));
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.message.contains("unsupported SQL literal"));
     }
 
     #[test]

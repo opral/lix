@@ -18,7 +18,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('72657475-726e-896e-872d-66696c650000', '/returning-file.txt', X'6265666F7265')",
+                 VALUES ('72657475-726e-896e-872d-66696c650000', '/returning-file.txt', CAST('before' AS BYTEA))",
                 &[],
             )
             .await

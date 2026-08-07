@@ -178,7 +178,7 @@ simulation_test!(
         let inserted_file = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/returning-file.txt', X'6265666F7265') \
+                 VALUES ('/returning-file.txt', CAST('before' AS BYTEA)) \
                  RETURNING id, path, content",
                 &[],
             )
@@ -197,7 +197,7 @@ simulation_test!(
 
         let updated_file = session
             .execute(
-                "UPDATE lix_file SET content = X'6166746572' WHERE id = $1 \
+                "UPDATE lix_file SET content = CAST('after' AS BYTEA) WHERE id = $1 \
                  RETURNING id, path, content",
                 &[Value::Text(file_id.clone())],
             )
@@ -215,7 +215,7 @@ simulation_test!(
         let upserted_file = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/returning-file.txt', X'66696E616C') \
+                 VALUES ('/returning-file.txt', CAST('final' AS BYTEA)) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content \
                  RETURNING id, content",
                 &[],
@@ -339,7 +339,7 @@ simulation_test!(
         let inserted_file_by_branch = session
             .execute(
                 "INSERT INTO lix_file_by_branch (path, content, lixcol_branch_id) \
-                 VALUES ('/returning-by-branch-file.txt', X'01', $1) \
+                 VALUES ('/returning-by-branch-file.txt', CAST('byte-01' AS BYTEA), $1) \
                  RETURNING id, path, lixcol_branch_id",
                 &[Value::Text(explicit_branch_id.clone())],
             )
@@ -360,10 +360,13 @@ simulation_test!(
         let upserted_file_by_branch = session
             .execute(
                 "INSERT INTO lix_file_by_branch (path, content, lixcol_branch_id) \
-                 VALUES ('/returning-by-branch-file.txt', X'02', $1) \
+                 VALUES ('/returning-by-branch-file.txt', $2, $1) \
                  ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET content = excluded.content \
                  RETURNING id, content, lixcol_branch_id",
-                &[Value::Text(explicit_branch_id.clone())],
+                &[
+                    Value::Text(explicit_branch_id.clone()),
+                    Value::Blob(vec![2].into()),
+                ],
             )
             .await
             .expect("by-branch file UPSERT RETURNING should expose its postimage");
@@ -381,7 +384,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file_by_branch \
                  (id, path, content, lixcol_global, lixcol_branch_id) \
-                 VALUES ($1, '/returning-global-file.txt', X'01', true, \
+                 VALUES ($1, '/returning-global-file.txt', CAST('byte-01' AS BYTEA), true, \
                          'ffffffff-ffff-7fff-bfff-ffffffffffff')",
                 &[Value::Text(global_file_id.to_string())],
             )
@@ -393,7 +396,7 @@ simulation_test!(
         // than re-validate the rendered row as a new global write.
         let updated_global_projection = session
             .execute(
-                "UPDATE lix_file_by_branch SET content = X'03' \
+                "UPDATE lix_file_by_branch SET content = CAST('byte-03' AS BYTEA) \
                  WHERE id = $1 AND lixcol_branch_id = $2 \
                  RETURNING id, path, lixcol_branch_id, lixcol_global",
                 &[
@@ -487,7 +490,7 @@ simulation_test!(
             .expect("atomic-returning entity seed should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/42', X'01')",
+                "INSERT INTO lix_file (path, content) VALUES ('/42', CAST('byte-01' AS BYTEA))",
                 &[],
             )
             .await
@@ -500,7 +503,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/successful-before-returning-error.txt', X'02')",
+                 VALUES ('/successful-before-returning-error.txt', CAST('byte-02' AS BYTEA))",
                 &[],
             )
             .await

@@ -33,6 +33,7 @@ use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
+use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
     CertifiedRawWriteBatchPreparation, CompleteCollectionReplacementProof, PreparedRowFacts,
@@ -2219,8 +2220,7 @@ fn fast_file_content_update_shape(
         metadata,
         data_parameter_index: match &assignment.value {
             BoundExpr::Param(param) => Some(param.index),
-            BoundExpr::Literal(_) => None,
-            _ => unreachable!("fast file data update accepts only params and blob literals"),
+            _ => None,
         },
     })
 }
@@ -2254,10 +2254,14 @@ fn fast_file_text_expr_supported(expr: &BoundExpr) -> bool {
 }
 
 fn fast_file_blob_expr_supported(expr: &BoundExpr) -> bool {
-    matches!(
-        expr,
-        BoundExpr::Param(_) | BoundExpr::Literal(BoundLiteral::Blob(_))
-    )
+    match expr {
+        BoundExpr::Param(_) => true,
+        BoundExpr::Cast {
+            expr,
+            data_type: BoundCastType::Binary,
+        } => fast_file_text_expr_supported(expr),
+        _ => false,
+    }
 }
 
 async fn execute_entity_write(
@@ -2800,21 +2804,27 @@ fn eval_fast_file_blob(
     column: &str,
 ) -> Result<crate::Blob, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Blob(value)) => Ok(value.clone().into()),
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
             Some(Value::Blob(value)) => Ok(value.clone()),
             Some(_) => Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 format!("lix_file fast write column '{column}' expects blob content"),
-            )),
+            )
+            .with_hint(LIX_FILE_CONTENT_CAST_HINT)),
             None => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 format!("missing SQL parameter ${}", param.index),
             )),
         },
+        BoundExpr::Cast {
+            expr,
+            data_type: BoundCastType::Binary,
+        } => Ok(eval_fast_file_text(expr, params, column)?
+            .into_bytes()
+            .into()),
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            format!("lix_file fast write column '{column}' supports params and blob literals only"),
+            format!("lix_file fast write column '{column}' supports blob parameters only"),
         )),
     }
 }
@@ -3757,9 +3767,6 @@ fn entity_returning_value(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Value, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Blob(value)) => {
-            return Ok(Value::Blob(value.clone().into()));
-        }
         BoundExpr::Param(param)
             if params
                 .get(param.index.saturating_sub(1))
@@ -6959,7 +6966,6 @@ fn reject_direct_blob_json_value(
         return Ok(());
     }
     let is_blob = match expr {
-        BoundExpr::Literal(BoundLiteral::Blob(_)) => true,
         BoundExpr::Param(param) => params
             .get(param.index.saturating_sub(1))
             .is_some_and(|value| matches!(value, Value::Blob(_))),
@@ -6982,9 +6988,6 @@ fn literal_json(literal: &BoundLiteral) -> JsonValue {
         BoundLiteral::Number { value, .. } => JsonValue::Number(value.clone()),
         BoundLiteral::Text(value) => JsonValue::String(value.clone()),
         BoundLiteral::Json(value) => value.clone(),
-        BoundLiteral::Blob(value) => {
-            JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
-        }
     }
 }
 
@@ -7841,7 +7844,9 @@ mod splice_provenance_tests {
 
         let literal_shape = FastFileContentUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 1 }),
-            data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
+            data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Text(
+                "literal".to_string(),
+            )),
             metadata: None,
             data_parameter_index: None,
         };
@@ -7884,7 +7889,9 @@ mod splice_provenance_tests {
         );
         assert_eq!(
             fast_file_blob_expr_splice_provenance(
-                &BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
+                &BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Text(
+                    "literal".to_string(),
+                )),
                 &metadata,
             ),
             None

@@ -82,8 +82,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content, lixcol_global) VALUES \
-                 ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', X'61', false), \
-                 ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', X'62', true)",
+                 ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', CAST('a' AS BYTEA), false), \
+                 ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', CAST('b' AS BYTEA), true)",
                 &[],
             )
             .await

@@ -343,7 +343,7 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
             .iter()
             .map(|id| {
                 let suffix = id_index(id);
-                format!("('{id}', '/bench-{suffix:08}.bin', X'00')")
+                format!("('{id}', '/bench-{suffix:08}.bin', CAST('byte-00' AS BYTEA))")
             })
             .collect::<Vec<_>>()
             .join(",");

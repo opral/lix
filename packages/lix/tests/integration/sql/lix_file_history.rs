@@ -124,7 +124,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
             format!(
-                "('01940000-0000-7000-8000-{index:012x}', '/unrelated-history-{index:03}.txt', X'78')"
+                "('01940000-0000-7000-8000-{index:012x}', '/unrelated-history-{index:03}.txt', CAST('x' AS BYTEA))"
             )
         })
         .collect::<Vec<_>>()
@@ -152,7 +152,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     let unrelated_additional_files = (0..UNRELATED_ADDITIONAL_FILE_COUNT)
         .map(|index| {
             format!(
-                "('01940002-0000-7000-8000-{index:012x}', '/unrelated-additional-{index:03}.bin', X'78')"
+                "('01940002-0000-7000-8000-{index:012x}', '/unrelated-additional-{index:03}.bin', CAST('x' AS BYTEA))"
             )
         })
         .collect::<Vec<_>>()
@@ -169,7 +169,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     session
         .execute(
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('3faa577b-02e3-7c30-8b7d-30a9698cba93', '/3faa577b-02e3-7c30-8b7d-30a9698cba93.txt', X'746172676574')",
+             VALUES ('3faa577b-02e3-7c30-8b7d-30a9698cba93', '/3faa577b-02e3-7c30-8b7d-30a9698cba93.txt', CAST('target' AS BYTEA))",
             &[],
         )
         .await
@@ -266,7 +266,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     session
         .execute(
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('626f756e-6465-842d-8669-6c6500000000', '/bounded/child/target.txt', X'78')",
+             VALUES ('626f756e-6465-842d-8669-6c6500000000', '/bounded/child/target.txt', CAST('x' AS BYTEA))",
             &[],
         )
         .await
@@ -357,7 +357,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('70726f6a-6563-8469-8f6e-2d66696c6500', '/workspace/docs/guides/readme.md', X'78')",
+                 VALUES ('70726f6a-6563-8469-8f6e-2d66696c6500', '/workspace/docs/guides/readme.md', CAST('x' AS BYTEA))",
                 &[],
             )
             .await
@@ -482,7 +482,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('67726f75-7065-842d-8669-6c6500000000', '/grouped/child/file.txt', X'78')",
+                 VALUES ('67726f75-7065-842d-8669-6c6500000000', '/grouped/child/file.txt', CAST('x' AS BYTEA))",
                 &[],
             )
             .await
@@ -605,7 +605,7 @@ simulation_test!(
         .expect("sibling directories should insert");
         main.execute(
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('616e6365-7374-8f72-8d73-69626c696e00', '/before/child/file.txt', X'78')",
+             VALUES ('616e6365-7374-8f72-8d73-69626c696e00', '/before/child/file.txt', CAST('x' AS BYTEA))",
             &[],
         )
         .await
@@ -717,7 +717,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restore/child/file.txt', X'78')",
+                 VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restore/child/file.txt', CAST('x' AS BYTEA))",
                 &[],
             )
             .await
@@ -786,7 +786,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restored/child/file.txt', X'79')",
+                 VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restored/child/file.txt', CAST('y' AS BYTEA))",
                 &[],
             )
             .await
@@ -859,7 +859,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('68697374-6f72-892d-8669-6c6500000000', '/docs/guides/readme.md', X'68656C6C6F')",
+                 VALUES ('68697374-6f72-892d-8669-6c6500000000', '/docs/guides/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -1050,7 +1050,7 @@ simulation_test!(
         );
         main.execute(
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('6469616d-6f6e-842d-8669-6c6500000000', '/before.md', X'62617365')",
+             VALUES ('6469616d-6f6e-842d-8669-6c6500000000', '/before.md', CAST('base' AS BYTEA))",
             &[],
         )
         .await
@@ -1182,7 +1182,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('68697374-6f72-892d-8a6f-696e2d666900', '/joined/old.txt', X'6F6E65')",
+                 VALUES ('68697374-6f72-892d-8a6f-696e2d666900', '/joined/old.txt', CAST('one' AS BYTEA))",
                 &[],
             )
             .await
@@ -1237,8 +1237,8 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, content) VALUES \
-                    ('01940000-0000-7000-8000-000000000004', '/history/in-a.txt', X'61'), \
-                    ('01940000-0000-7000-8000-000000000005', '/history/in-b.txt', X'62')",
+                    ('01940000-0000-7000-8000-000000000004', '/history/in-a.txt', CAST('a' AS BYTEA)), \
+                    ('01940000-0000-7000-8000-000000000005', '/history/in-b.txt', CAST('b' AS BYTEA))",
             &[],
         )
         .await
@@ -1296,7 +1296,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('6161612d-6f6c-8465-822d-686973746f00', '/older.txt', X'6F6C646572')",
+                 VALUES ('6161612d-6f6c-8465-822d-686973746f00', '/older.txt', CAST('older' AS BYTEA))",
                 &[],
             )
             .await
@@ -1304,7 +1304,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('7a7a7a2d-6e65-8765-822d-686973746f00', '/newer.txt', X'6E65776572')",
+                 VALUES ('7a7a7a2d-6e65-8765-822d-686973746f00', '/newer.txt', CAST('newer' AS BYTEA))",
                 &[],
             )
             .await
@@ -1354,9 +1354,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) VALUES \
-                    ('a71ca839-a7d4-7529-899d-470f3e2d56eb', '/noise/one.txt', X'6F6E65'), \
-                    ('4fa4f740-1d46-781f-87b7-8d6347ada462', '/noise/two.txt', X'74776F'), \
-                    ('74242a12-7491-7df8-8cfc-0a484bbfd0cb', '/target/three.txt', X'7468726565')",
+                    ('a71ca839-a7d4-7529-899d-470f3e2d56eb', '/noise/one.txt', CAST('one' AS BYTEA)), \
+                    ('4fa4f740-1d46-781f-87b7-8d6347ada462', '/noise/two.txt', CAST('two' AS BYTEA)), \
+                    ('74242a12-7491-7df8-8cfc-0a484bbfd0cb', '/target/three.txt', CAST('three' AS BYTEA))",
                 &[],
             )
             .await
@@ -1404,7 +1404,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default.txt', X'64656661756C74')",
+                 VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default.txt', CAST('default' AS BYTEA))",
             &[],
         )
         .await
@@ -1443,7 +1443,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('6f726469-6e61-8279-8d68-6973746f7200', '/ordinary-history.txt', X'68656C6C6F')",
+                 VALUES ('6f726469-6e61-8279-8d68-6973746f7200', '/ordinary-history.txt', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -1501,14 +1501,14 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('68697374-6f72-892d-8669-6c652d626c00', '/blob-filter.txt', X'626C6F62')",
+                 VALUES ('68697374-6f72-892d-8669-6c652d626c00', '/blob-filter.txt', CAST('blob' AS BYTEA))",
                 &[],
             )
             .await
             .expect("file insert should succeed");
         session
             .execute(
-                "UPDATE lix_file SET content = X'626C6F6232' \
+                "UPDATE lix_file SET content = CAST('blob2' AS BYTEA) \
                  WHERE id = '68697374-6f72-892d-8669-6c652d626c00'",
                 &[],
             )
