@@ -346,8 +346,8 @@ where
     session: SessionContext<CountingStorage<S>>,
     rows: Vec<WorkloadRow>,
     selected: Vec<usize>,
-    batches: [PreparedDmlParameterBatch; 2],
-    updated: bool,
+    batches: Vec<PreparedDmlParameterBatch>,
+    operation: usize,
 }
 
 struct ReplacementFixture<S>
@@ -357,8 +357,8 @@ where
     tree: ForkTree<CountingStorage<S>>,
     rows: Vec<WorkloadRow>,
     selected: Vec<usize>,
-    updates: [Vec<Update>; 2],
-    updated: bool,
+    updates: Vec<Vec<Update>>,
+    operation: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -494,10 +494,12 @@ where
         .map(lix::ExecuteResult::rows_affected)
         .sum::<u64>();
     assert_eq!(affected, parameters.rows as u64);
-    let batches = [
-        update_batch(&rows, &selected, false),
-        update_batch(&rows, &selected, true),
-    ];
+    let operation_count = parameters
+        .warmups
+        .saturating_add(parameters.samples.saturating_mul(parameters.iterations));
+    let batches = (1..=operation_count)
+        .map(|generation| update_batch(&rows, &selected, generation))
+        .collect();
     println!(
         "forktree_setup,backend={},layout=current_lix,rows={},updates={},wall_ms={:.3}",
         parameters.backend.label(),
@@ -510,7 +512,7 @@ where
         rows,
         selected,
         batches,
-        updated: false,
+        operation: 0,
     }
 }
 
@@ -537,10 +539,12 @@ where
     tree.initialize(&initial)
         .await
         .expect("initialize ForkTree fixture");
-    let updates = [
-        replacement_updates(&rows, &selected, false),
-        replacement_updates(&rows, &selected, true),
-    ];
+    let operation_count = parameters
+        .warmups
+        .saturating_add(parameters.samples.saturating_mul(parameters.iterations));
+    let updates = (1..=operation_count)
+        .map(|generation| replacement_updates(&rows, &selected, generation))
+        .collect();
     let (objects, bytes) = tree
         .object_inventory()
         .await
@@ -559,7 +563,7 @@ where
         rows,
         selected,
         updates,
-        updated: false,
+        operation: 0,
     }
 }
 
@@ -601,7 +605,7 @@ async fn measure_current<S>(
     let _ = take_stats(stats);
     let _ = lix::storage_bench::take_crud_physical_write_accounting();
     for _ in 0..parameters.warmups {
-        apply_current(&mut fixture).await;
+        let _ = apply_current(&mut fixture).await;
     }
     verify_current(&fixture).await;
     let _ = take_stats(stats);
@@ -614,8 +618,9 @@ async fn measure_current<S>(
         let cpu_before = process_cpu_ticks();
         begin_allocation_profile();
         let started = Instant::now();
+        let mut logical_bytes = 0_u64;
         for _ in 0..parameters.iterations {
-            apply_current(&mut fixture).await;
+            logical_bytes += apply_current(&mut fixture).await;
         }
         let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
         let (allocated_bytes, allocation_calls) = end_allocation_profile();
@@ -641,7 +646,7 @@ async fn measure_current<S>(
             ApplyAccounting {
                 object_writes: current_physical.puts,
                 object_bytes: current_physical.written_bytes,
-                logical_bytes: logical_update_bytes(&fixture.rows, &fixture.selected),
+                logical_bytes,
                 ..ApplyAccounting::default()
             },
             rss_before,
@@ -729,12 +734,16 @@ async fn measure_replacement<S>(
     print_summary(parameters, &mut samples);
 }
 
-async fn apply_current<S>(fixture: &mut CurrentFixture<S>)
+async fn apply_current<S>(fixture: &mut CurrentFixture<S>) -> u64
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fixture.updated = !fixture.updated;
-    let batch = fixture.batches[usize::from(fixture.updated)].clone();
+    let batch = fixture
+        .batches
+        .get(fixture.operation)
+        .expect("current Lix operation sequence is exhausted")
+        .clone();
+    fixture.operation += 1;
     let affected = fixture
         .session
         .execute_prepared_dml_batch(
@@ -747,16 +756,21 @@ where
         .map(lix::ExecuteResult::rows_affected)
         .sum::<u64>();
     assert_eq!(affected, fixture.selected.len() as u64);
+    logical_update_bytes(&fixture.rows, &fixture.selected, fixture.operation)
 }
 
 async fn apply_replacement<S>(fixture: &mut ReplacementFixture<S>) -> ApplyAccounting
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fixture.updated = !fixture.updated;
+    let updates = fixture
+        .updates
+        .get(fixture.operation)
+        .expect("ForkTree operation sequence is exhausted");
+    fixture.operation += 1;
     fixture
         .tree
-        .apply_sorted_updates(&fixture.updates[usize::from(fixture.updated)])
+        .apply_sorted_updates(updates)
         .await
         .expect("apply ForkTree update batch")
         .1
@@ -782,15 +796,12 @@ where
         if is_selected {
             selected.next();
         }
-        let expected_value = if is_selected && fixture.updated {
-            &expected.updated_value_json
+        let expected_value = if is_selected && fixture.operation > 0 {
+            value_for_generation(expected, fixture.operation)
         } else {
-            &expected.value_json
+            expected.value_json.clone()
         };
-        assert_eq!(
-            actual.get_index(1),
-            Some(&Value::Text(expected_value.clone()))
-        );
+        assert_eq!(actual.get_index(1), Some(&Value::Text(expected_value)));
     }
 }
 
@@ -811,10 +822,10 @@ where
         if is_selected {
             selected.next();
         }
-        let expected_value = if is_selected && fixture.updated {
-            &expected.updated_value_json
+        let expected_value = if is_selected && fixture.operation > 0 {
+            value_for_generation(expected, fixture.operation)
         } else {
-            &expected.value_json
+            expected.value_json.clone()
         };
         assert_eq!(value.as_slice(), expected_value.as_bytes());
     }
@@ -823,34 +834,26 @@ where
 fn update_batch(
     rows: &[WorkloadRow],
     selected: &[usize],
-    updated: bool,
+    generation: usize,
 ) -> PreparedDmlParameterBatch {
     PreparedDmlParameterBatch::from_rows(selected.iter().map(|&index| {
         let row = &rows[index];
         vec![
-            Value::Text(if updated {
-                row.updated_value_json.clone()
-            } else {
-                row.value_json.clone()
-            }),
+            Value::Text(value_for_generation(row, generation)),
             Value::Text(row.path.clone()),
         ]
     }))
     .expect("build current Lix update batch")
 }
 
-fn replacement_updates(rows: &[WorkloadRow], selected: &[usize], updated: bool) -> Vec<Update> {
+fn replacement_updates(rows: &[WorkloadRow], selected: &[usize], generation: usize) -> Vec<Update> {
     selected
         .iter()
         .map(|&index| {
             let row = &rows[index];
             Update {
                 key: row.path.as_bytes().to_vec(),
-                value: if updated {
-                    row.updated_value_json.as_bytes().to_vec()
-                } else {
-                    row.value_json.as_bytes().to_vec()
-                },
+                value: value_for_generation(row, generation).into_bytes(),
             }
         })
         .collect()
@@ -867,14 +870,21 @@ fn selected_indices(rows: usize, updates: usize) -> Vec<usize> {
     selected
 }
 
-fn logical_update_bytes(rows: &[WorkloadRow], selected: &[usize]) -> u64 {
+fn logical_update_bytes(rows: &[WorkloadRow], selected: &[usize], generation: usize) -> u64 {
     selected
         .iter()
         .map(|&index| {
             let row = &rows[index];
-            (row.path.len() + row.updated_value_json.len()) as u64
+            (row.path.len() + value_for_generation(row, generation).len()) as u64
         })
         .sum()
+}
+
+fn value_for_generation(row: &WorkloadRow, generation: usize) -> String {
+    format!(
+        "{}#forktree-generation-{generation}",
+        row.updated_value_json
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

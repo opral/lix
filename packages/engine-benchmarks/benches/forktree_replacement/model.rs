@@ -15,7 +15,8 @@ const LEAF_TAG: u8 = 1;
 const INTERNAL_TAG: u8 = 2;
 const DELTA_TAG: u8 = 3;
 const COMMIT_TAG: u8 = 4;
-const LEAF_ROWS: usize = 64;
+const VALUE_TAG: u8 = 5;
+const LEAF_ROWS: usize = 8;
 const INTERNAL_CHILDREN: usize = 32;
 
 pub const OBJECT_SPACE: StorageSpace =
@@ -69,8 +70,14 @@ struct NodeRef {
 
 #[derive(Clone, Debug)]
 enum Node {
-    Leaf(Vec<(Vec<u8>, Vec<u8>)>),
+    Leaf(Vec<LeafEntry>),
     Internal(Vec<NodeRef>),
+}
+
+#[derive(Clone, Debug)]
+struct LeafEntry {
+    key: Vec<u8>,
+    value: ObjectId,
 }
 
 #[derive(Clone, Copy)]
@@ -323,20 +330,20 @@ where
                 Node::Leaf(mut rows) => {
                     for update in updates {
                         let index = rows
-                            .binary_search_by(|(key, _)| key.as_slice().cmp(update.key.as_slice()))
+                            .binary_search_by(|row| row.key.as_slice().cmp(update.key.as_slice()))
                             .map_err(|_| {
                                 format!(
                                     "focused prototype update key is absent: {}",
                                     String::from_utf8_lossy(&update.key)
                                 )
                             })?;
-                        rows[index].1.clone_from(&update.value);
+                        rows[index].value = stage_object(encode_value(&update.value), pending);
                     }
                     let bytes = encode_leaf(&rows);
                     let id = stage_object(bytes, pending);
                     Ok(NodeRef {
                         id,
-                        max_key: rows.last().expect("leaf nodes are nonempty").0.clone(),
+                        max_key: rows.last().expect("leaf nodes are nonempty").key.clone(),
                         rows: rows.len() as u64,
                     })
                 }
@@ -380,7 +387,13 @@ where
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             match decode_node(&self.load_object(id).await?)? {
-                Node::Leaf(rows) => output.extend(rows),
+                Node::Leaf(rows) => {
+                    let ids = rows.iter().map(|row| row.value).collect::<Vec<_>>();
+                    let values = self.load_objects(&ids).await?;
+                    for (row, value) in rows.into_iter().zip(values) {
+                        output.push((row.key, decode_value(&value)?));
+                    }
+                }
                 Node::Internal(children) => {
                     for child in children {
                         self.collect_rows(child.id, output).await?;
@@ -434,7 +447,17 @@ where
     }
 
     async fn load_object(&self, id: ObjectId) -> Result<Bytes, String> {
-        let keys = [Key(Bytes::copy_from_slice(&id.0))];
+        self.load_objects(&[id])
+            .await?
+            .pop()
+            .ok_or_else(|| "ForkTree object batch unexpectedly empty".to_string())
+    }
+
+    async fn load_objects(&self, ids: &[ObjectId]) -> Result<Vec<Bytes>, String> {
+        let keys = ids
+            .iter()
+            .map(|id| Key(Bytes::copy_from_slice(&id.0)))
+            .collect::<Vec<_>>();
         let read = self
             .storage
             .begin_read(ReadOptions::default())
@@ -448,15 +471,18 @@ where
             }])
             .await
             .map_err(storage_error)?;
-        let value = result
+        result
             .values
             .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| format!("missing ForkTree object {}", hex_id(id)))?;
-        let bytes = projected_bytes(&value)?.clone();
-        authenticate(id, &bytes)?;
-        Ok(bytes)
+            .zip(ids)
+            .map(|(value, &id)| {
+                let value =
+                    value.ok_or_else(|| format!("missing ForkTree object {}", hex_id(id)))?;
+                let bytes = projected_bytes(&value)?.clone();
+                authenticate(id, &bytes)?;
+                Ok(bytes)
+            })
+            .collect()
     }
 
     async fn remove_existing_objects(
@@ -506,13 +532,20 @@ fn build_tree(
     if rows.is_empty() {
         return Err("ForkTree requires at least one row".to_string());
     }
-    let mut level = rows
+    let leaf_rows = rows
+        .iter()
+        .map(|(key, value)| LeafEntry {
+            key: key.clone(),
+            value: stage_object(encode_value(value), pending),
+        })
+        .collect::<Vec<_>>();
+    let mut level = leaf_rows
         .chunks(LEAF_ROWS)
         .map(|chunk| {
             let id = stage_object(encode_leaf(chunk), pending);
             NodeRef {
                 id,
-                max_key: chunk.last().expect("leaf chunk is nonempty").0.clone(),
+                max_key: chunk.last().expect("leaf chunk is nonempty").key.clone(),
                 rows: chunk.len() as u64,
             }
         })
@@ -577,13 +610,23 @@ fn object_batch(objects: &BTreeMap<ObjectId, Bytes>) -> PutBatch {
     }
 }
 
-fn encode_leaf(rows: &[(Vec<u8>, Vec<u8>)]) -> Bytes {
-    let mut bytes = object_prefix(LEAF_TAG);
-    put_u32(&mut bytes, rows.len());
-    for (key, value) in rows {
-        put_bytes(&mut bytes, key);
-        put_bytes(&mut bytes, value);
+fn encode_leaf(rows: &[LeafEntry]) -> Bytes {
+    let mut body = Vec::new();
+    put_u32(&mut body, rows.len());
+    for row in rows {
+        put_bytes(&mut body, &row.key);
+        body.extend_from_slice(&row.value.0);
     }
+    let compressed = zstd::bulk::compress(&body, 1).expect("compress canonical ForkTree leaf");
+    let mut bytes = object_prefix(LEAF_TAG);
+    put_u32(&mut bytes, body.len());
+    bytes.extend_from_slice(&compressed);
+    Bytes::from(bytes)
+}
+
+fn encode_value(value: &[u8]) -> Bytes {
+    let mut bytes = object_prefix(VALUE_TAG);
+    put_bytes(&mut bytes, value);
     Bytes::from(bytes)
 }
 
@@ -624,13 +667,24 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
     let mut decoder = Decoder::new(bytes);
     match decoder.object_tag()? {
         LEAF_TAG => {
-            let count = decoder.u32()?;
+            let decoded_length = decoder.u32()?;
+            let compressed = decoder.remaining();
+            let decoded = zstd::bulk::decompress(compressed, decoded_length)
+                .map_err(|error| format!("decompress ForkTree leaf: {error}"))?;
+            decoder.finish()?;
+            let mut body = Decoder::new(&decoded);
+            let count = body.u32()?;
             let mut rows = Vec::with_capacity(count);
             for _ in 0..count {
-                rows.push((decoder.bytes()?, decoder.bytes()?));
+                rows.push(LeafEntry {
+                    key: body.bytes()?,
+                    value: body.id()?,
+                });
             }
-            decoder.finish()?;
-            validate_sorted_rows(&rows)?;
+            body.finish()?;
+            if rows.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+                return Err("ForkTree leaf keys are not sorted".to_string());
+            }
             Ok(Node::Leaf(rows))
         }
         INTERNAL_TAG => {
@@ -657,6 +711,16 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
         }
         tag => Err(format!("object tag {tag} is not a tree node")),
     }
+}
+
+fn decode_value(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.object_tag()? != VALUE_TAG {
+        return Err("ForkTree leaf does not reference a value object".to_string());
+    }
+    let value = decoder.bytes()?;
+    decoder.finish()?;
+    Ok(value)
 }
 
 fn decode_commit(bytes: &[u8]) -> Result<Commit, String> {
@@ -836,5 +900,11 @@ impl<'a> Decoder<'a> {
         } else {
             Err("trailing bytes in ForkTree object".to_string())
         }
+    }
+
+    fn remaining(&mut self) -> &'a [u8] {
+        let remaining = &self.bytes[self.offset..];
+        self.offset = self.bytes.len();
+        remaining
     }
 }

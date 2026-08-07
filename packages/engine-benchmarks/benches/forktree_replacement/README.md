@@ -13,8 +13,11 @@ production index and is deliberately not registered with Lix serving paths.
   one publication/GC epoch. A root move and epoch rotation are one adapter
   commit guarded by exact preconditions.
 - Every commit names one tree root and one semantic delta. Nodes use canonical
-  encodings and sorted entries. Initial trees are deterministically bulk packed;
-  value-only updates rewrite only touched leaves and their ancestor paths.
+  encodings and sorted entries. Leaves use deterministic 8-row blocks with
+  level-1 Zstandard packing and store sorted key-to-authenticated-value-object
+  mappings. Values remain in the same object space and reachability graph; they
+  are not a side index or second format. Initial trees are deterministically
+  bulk packed; value-only updates rewrite only touched leaves and ancestor paths.
 - Derived caches or indexes are outside the authoritative model and must be
   rebuildable from pinned commit roots.
 
