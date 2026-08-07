@@ -178,6 +178,86 @@ versus 832.2 MiB on SlateDB (+3.9%).
 All timed cells completed far below 20 minutes. Every final cell cold-reopened
 and reconstructed exact successor bytes.
 
+## One-copy exact-extent model result
+
+Status: **accept for the ForkTree implementer contract; model only.** The
+follow-up descends exact model head
+`b448d1d3c7ebb961e8bd92e219203a0f4a969f88`. It changes no production or
+Stage-1 source.
+
+The Slate model mirrors its existing immutable segment framing, groups one
+bounded leaf batch by physical segment, reads one owned contiguous span, and
+returns `Bytes` slices into that owner. The path-copy primitive authenticates
+the complete old encoded leaf against its parent `ObjectId`, makes exactly one
+mutable successor buffer, hashes the complete successor object, and atomically
+publishes objects plus selector. Placement and routing never participate in
+`ObjectId` derivation.
+
+The locator is disposable routing, not authority. New locators become visible
+only after the authoritative transaction commits. Object retirement removes
+them only after the authoritative delete commits. Cold rebuild first scans
+authoritative live object keys, then frames and hashes immutable segment bytes,
+and retains only their intersection. Missing, malformed, mis-sized, misrouted,
+or retired entries fail closed. Thus residual physical bytes cannot resurrect
+a retired object, and dropping the locator changes neither identity nor
+reachability.
+
+Exact-base and candidate steady sample 3 results are below. The focused 64/1
+wall boundary uses the more conservative median of seven interleaved base /
+candidate steady pairs because independent process runs varied at sub-millisecond
+scale.
+
+| Adapter | Size/edit | Wall | CPU | Allocated bytes | Allocation calls | RSS/HWM | Physical reads | Logical read/write | Settled disk |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| RocksDB | 64/1% | +0.3% | +0.3% | unchanged | unchanged | +0.8% | unchanged | unchanged | unchanged |
+| RocksDB | 64/10% | -0.9% | -0.9% | unchanged | unchanged | +0.6% | unchanged | unchanged | unchanged |
+| RocksDB | 512/1% | +0.4% | +0.4% | unchanged | unchanged | -0.2% | unchanged | unchanged | unchanged |
+| RocksDB | 512/10% | +1.3% | +1.1% | unchanged | unchanged | +0.1% | unchanged | unchanged | unchanged |
+| SlateDB | 64/1% | +4.84% paired | +4.87% paired | 7,398,239 -> 6,344,310 (-14.25%) | 301 -> 290 | +0.4% | 5 / 3,155,111 B, unchanged | 1,051,175 / 1,051,280 B, unchanged | unchanged |
+| SlateDB | 64/10% | -6.6% | -6.6% | 51,451,545 -> 44,104,234 (-14.28%) | 421 -> 382 | -1.1% | 5 / 22,030,073 B, unchanged | 7,342,733 / 7,343,030 B, unchanged | unchanged |
+| SlateDB | 512/1% | +1.0% | +0.2% | 44,125,263 -> 37,824,037 (-14.28%) | 495 -> 455 | -0.9% | 6 / 18,885,320 B, unchanged | 6,294,482 / 6,294,779 B, unchanged | unchanged |
+| SlateDB | 512/10% | -0.2% | -0.4% | 381,966,434 -> 327,379,156 (-14.29%) | 2,004 -> 1,611 | -0.2% | 13 / 163,601,156 B, unchanged | 54,532,342 / 54,534,143 B, unchanged | unchanged |
+
+The measured focused allocation falls 5,336 bytes below the prior 6,349,646
+projection. One old-leaf reconstruction owner is gone; the required
+successor buffer and Slate publication ownership remain. Physical read bytes
+do not change because the model accounts the direct extent read instead of
+hiding it behind the adapter counter. Seed and settled disk differ only by
+run-to-run file metadata bytes; logical object/write bytes are exact.
+
+Complexity remains `O(KL + P*F*D)` CPU/hash work and
+`O(KL + P*F)` authenticated read bytes (`L=1 MiB`, `F=64`, `Q=8`). The cut
+removes one `O(KL)` allocation/copy coefficient, not the complete-byte hash.
+At 64/1 the irreducible reader-equivalent work remains one 1 MiB leaf plus path
+metadata: 1,051,175 logical bytes and 3,155,111 measured Slate physical bytes
+including publication/settle work. The perfect-elimination ceiling was the
+single reconstructed encoded-leaf owner; the measured total reduction is
+1,053,929 bytes in the focused steady sample.
+
+### One-copy implementer contract for Ryzen-V
+
+1. Add one read-only immutable-value result that owns a fetched contiguous
+   extent and returns exact value `Bytes` slices. Fragmented values may retain
+   the current bounded reconstruction path.
+2. Keep fixed 1 MiB leaves, fanout 64, and at most eight leaves per coherent
+   path-level fetch. Do not add another payload format, extent format, cache,
+   or content authority.
+3. Before decode or reuse, hash every complete returned canonical object and
+   require equality with the parent `ObjectId`; validate frame, range, declared
+   length, tree level, and child length fail closed.
+4. Allocate exactly one successor leaf, apply the edit, hash all successor
+   bytes, path-copy changed ancestors, and publish new objects plus the one root
+   selector in the existing atomic transaction.
+5. If explicit routing metadata is needed, derive it from existing immutable
+   segments. Publish it only after authoritative commit, retire it only after
+   authoritative deletion, and rebuild it by intersecting framed/hash-derived
+   placements with authoritative live object keys. It must be droppable and
+   must never authorize a read, write, root, or GC decision.
+6. Test exact and fragmented spans; malformed/truncated frame, range and
+   locator substitution; complete-object hash mismatch; commit rollback/CAS;
+   cold locator rebuild; shared-reference survival; final-reference retirement;
+   and both adapters at 64/512 MiB with 1%/10% edits.
+
 ## Correctness result
 
 The dual-adapter model proves:

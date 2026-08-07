@@ -7,13 +7,16 @@
 use std::alloc::GlobalAlloc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Bound;
-use std::path::Path;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
+use lix::storage::immutable::{ImmutableSegmentWriter, decode_immutable_value};
 use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
     Precondition, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
@@ -28,6 +31,7 @@ const DATA_GENERATION_BLOCK_BYTES: usize = 1 << 20;
 const FANOUT: usize = 64;
 const AUTH_LEAF_BATCH: usize = 8;
 const OBJECT_MAGIC: &[u8; 8] = b"LIXMMO\0\x01";
+const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXIVS1\0";
 const LEAF_DOMAIN: u8 = 1;
 const INTERNAL_DOMAIN: u8 = 2;
 const FLAT_DOMAIN: u8 = 3;
@@ -102,6 +106,7 @@ struct IoStats {
 struct CountingStorage<S> {
     inner: S,
     stats: Arc<Mutex<IoStats>>,
+    exact_extents: Option<Arc<ExactExtentIndex>>,
 }
 
 struct CountingRead<R> {
@@ -112,6 +117,35 @@ struct CountingRead<R> {
 struct CountingWrite<W> {
     inner: W,
     stats: Arc<Mutex<IoStats>>,
+    exact_extents: Option<Arc<ExactExtentIndex>>,
+    staged_objects: Vec<(Key, Bytes)>,
+    staged_object_deletes: Vec<Key>,
+}
+
+#[derive(Clone)]
+struct ExactExtentLocator {
+    segment_id: Key,
+    segment_len: usize,
+    range: Range<usize>,
+}
+
+#[derive(Default)]
+struct ExactExtentCounters {
+    read_objects: AtomicU64,
+    read_bytes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ExactExtentSnapshot {
+    read_objects: u64,
+    read_bytes: u64,
+}
+
+struct ExactExtentIndex {
+    root: PathBuf,
+    locators: Mutex<BTreeMap<Key, ExactExtentLocator>>,
+    counters: ExactExtentCounters,
+    logical_stats: Arc<Mutex<IoStats>>,
 }
 
 impl<S> CountingStorage<S> {
@@ -121,9 +155,326 @@ impl<S> CountingStorage<S> {
             Self {
                 inner,
                 stats: Arc::clone(&stats),
+                exact_extents: None,
             },
             stats,
         )
+    }
+
+    fn new_with_exact_extents(
+        inner: S,
+        path: &Path,
+    ) -> (Self, Arc<Mutex<IoStats>>, Arc<ExactExtentIndex>) {
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        let exact_extents = Arc::new(ExactExtentIndex::new(
+            path.join("db").join("lix-immutable-value-segment-v1"),
+            Arc::clone(&stats),
+        ));
+        (
+            Self {
+                inner,
+                stats: Arc::clone(&stats),
+                exact_extents: Some(Arc::clone(&exact_extents)),
+            },
+            stats,
+            exact_extents,
+        )
+    }
+}
+
+impl ExactExtentSnapshot {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            read_objects: self.read_objects.saturating_sub(earlier.read_objects),
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+        }
+    }
+}
+
+impl ExactExtentIndex {
+    fn new(root: PathBuf, logical_stats: Arc<Mutex<IoStats>>) -> Self {
+        Self {
+            root,
+            locators: Mutex::new(BTreeMap::new()),
+            counters: ExactExtentCounters::default(),
+            logical_stats,
+        }
+    }
+
+    fn rebuild(
+        root: PathBuf,
+        logical_stats: Arc<Mutex<IoStats>>,
+        live_keys: &BTreeSet<Key>,
+    ) -> Result<Self, StorageError> {
+        let index = Self::new(root, logical_stats);
+        let entries = std::fs::read_dir(&index.root).map_err(|error| {
+            StorageError::Io(format!(
+                "scan immutable extent directory {}: {error}",
+                index.root.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                StorageError::Io(format!("read immutable extent directory entry: {error}"))
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|error| {
+                    StorageError::Io(format!("read immutable extent entry type: {error}"))
+                })?
+                .is_file()
+            {
+                continue;
+            }
+            let segment_id = parse_hex_key(&entry.file_name().to_string_lossy())?;
+            let segment_len = usize::try_from(
+                entry
+                    .metadata()
+                    .map_err(|error| StorageError::Io(format!("stat immutable extent: {error}")))?
+                    .len(),
+            )
+            .map_err(|_| StorageError::Corruption("extent length exceeds usize".to_string()))?;
+            let mut file = std::fs::File::open(entry.path()).map_err(|error| {
+                StorageError::Io(format!("open immutable extent for rebuild: {error}"))
+            })?;
+            let mut offset = 0_usize;
+            while offset < segment_len {
+                let mut header = [0_u8; 16];
+                file.read_exact(&mut header).map_err(|error| {
+                    StorageError::Corruption(format!(
+                        "immutable extent frame header is truncated: {error}"
+                    ))
+                })?;
+                if &header[..IMMUTABLE_VALUE_MAGIC.len()] != IMMUTABLE_VALUE_MAGIC {
+                    return Err(StorageError::Corruption(
+                        "immutable extent frame magic is malformed".to_string(),
+                    ));
+                }
+                let value_len = usize::try_from(u64::from_le_bytes(
+                    header[IMMUTABLE_VALUE_MAGIC.len()..]
+                        .try_into()
+                        .expect("fixed immutable extent frame length"),
+                ))
+                .map_err(|_| {
+                    StorageError::Corruption(
+                        "immutable extent frame length exceeds usize".to_string(),
+                    )
+                })?;
+                let end = offset
+                    .checked_add(header.len())
+                    .and_then(|value| value.checked_add(value_len))
+                    .ok_or_else(|| {
+                        StorageError::Corruption(
+                            "immutable extent frame range overflows".to_string(),
+                        )
+                    })?;
+                if end > segment_len {
+                    return Err(StorageError::Corruption(
+                        "immutable extent frame exceeds its segment".to_string(),
+                    ));
+                }
+                let mut value = vec![0_u8; value_len];
+                file.read_exact(&mut value).map_err(|error| {
+                    StorageError::Corruption(format!(
+                        "immutable extent object is truncated: {error}"
+                    ))
+                })?;
+                let id = object_id(&value);
+                if live_keys.contains(&id.key()) {
+                    index
+                        .locators
+                        .lock()
+                        .expect("exact extent locator mutex")
+                        .insert(
+                            id.key(),
+                            ExactExtentLocator {
+                                segment_id: segment_id.clone(),
+                                segment_len,
+                                range: offset..end,
+                            },
+                        );
+                }
+                offset = end;
+            }
+            if offset != segment_len {
+                return Err(StorageError::Corruption(
+                    "immutable extent rebuild did not consume the segment".to_string(),
+                ));
+            }
+        }
+        Ok(index)
+    }
+
+    fn snapshot(&self) -> ExactExtentSnapshot {
+        ExactExtentSnapshot {
+            read_objects: self.counters.read_objects.load(Ordering::Relaxed),
+            read_bytes: self.counters.read_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn prepare_locators(
+        &self,
+        entries: Vec<(Key, Bytes)>,
+    ) -> Result<Vec<(Key, ExactExtentLocator)>, StorageError> {
+        let locators = self.locators.lock().expect("exact extent locator mutex");
+        let missing = entries
+            .into_iter()
+            .filter(|(key, _)| !locators.contains_key(key))
+            .collect::<Vec<_>>();
+        drop(locators);
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut writer = ImmutableSegmentWriter::default();
+        for (key, value) in missing {
+            let mut physical_key = Vec::with_capacity(4 + key.0.len());
+            physical_key.extend_from_slice(&OBJECT_SPACE.id.0.to_be_bytes());
+            physical_key.extend_from_slice(&key.0);
+            writer.insert(Key(Bytes::from(physical_key)), value)?;
+        }
+        let mut prepared = Vec::new();
+        for segment in writer.finish(|_| true)? {
+            let segment_len = segment.values.last().map_or(0, |(_, range)| range.end);
+            for (physical_key, range) in segment.values {
+                let logical_key = physical_key.0.get(4..).ok_or_else(|| {
+                    StorageError::Corruption(
+                        "exact extent physical key omits the space prefix".to_string(),
+                    )
+                })?;
+                prepared.push((
+                    Key(Bytes::copy_from_slice(logical_key)),
+                    ExactExtentLocator {
+                        segment_id: segment.id.clone(),
+                        segment_len,
+                        range,
+                    },
+                ));
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn publish_locators(&self, prepared: Vec<(Key, ExactExtentLocator)>) {
+        self.locators
+            .lock()
+            .expect("exact extent locator mutex")
+            .extend(prepared);
+    }
+
+    fn retire_locators(&self, keys: &[Key]) {
+        let mut locators = self.locators.lock().expect("exact extent locator mutex");
+        for key in keys {
+            locators.remove(key);
+        }
+    }
+
+    fn read_many(&self, keys: &[Key]) -> Result<Vec<Bytes>, StorageError> {
+        let locators = self.locators.lock().expect("exact extent locator mutex");
+        let mut by_segment = BTreeMap::<Key, Vec<(usize, ExactExtentLocator)>>::new();
+        for (index, key) in keys.iter().enumerate() {
+            let locator = locators.get(key).cloned().ok_or_else(|| {
+                StorageError::Corruption(
+                    "authenticated object has no rebuildable exact-extent locator".to_string(),
+                )
+            })?;
+            by_segment
+                .entry(locator.segment_id.clone())
+                .or_default()
+                .push((index, locator));
+        }
+        drop(locators);
+
+        let mut values = vec![None; keys.len()];
+        for (segment_id, mut requests) in by_segment {
+            requests.sort_unstable_by_key(|(_, locator)| locator.range.start);
+            let segment_len = requests[0].1.segment_len;
+            if requests
+                .iter()
+                .any(|(_, locator)| locator.segment_len != segment_len)
+            {
+                return Err(StorageError::Corruption(
+                    "exact-extent locators disagree on segment length".to_string(),
+                ));
+            }
+            let start = requests[0].1.range.start;
+            let end = requests
+                .last()
+                .map(|(_, locator)| locator.range.end)
+                .expect("non-empty exact extent request group");
+            if start >= end || end > segment_len {
+                return Err(StorageError::Corruption(
+                    "exact-extent locator range is invalid".to_string(),
+                ));
+            }
+            let path = self.root.join(hex_key(&segment_id));
+            let mut file = std::fs::File::open(&path).map_err(|error| {
+                StorageError::Io(format!(
+                    "open exact immutable extent {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let file_len = usize::try_from(
+                file.metadata()
+                    .map_err(|error| {
+                        StorageError::Io(format!(
+                            "stat exact immutable extent {}: {error}",
+                            path.display()
+                        ))
+                    })?
+                    .len(),
+            )
+            .map_err(|_| {
+                StorageError::Corruption("exact extent length exceeds usize".to_string())
+            })?;
+            if file_len != segment_len {
+                return Err(StorageError::Corruption(
+                    "exact extent file length differs from its locator".to_string(),
+                ));
+            }
+            file.seek(SeekFrom::Start(start as u64)).map_err(|error| {
+                StorageError::Io(format!(
+                    "seek exact immutable extent {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let mut owned = vec![0_u8; end - start];
+            file.read_exact(&mut owned).map_err(|error| {
+                StorageError::Io(format!(
+                    "read exact immutable extent {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let owned = Bytes::from(owned);
+            self.counters.read_objects.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .read_bytes
+                .fetch_add(owned.len() as u64, Ordering::Relaxed);
+            for (index, locator) in requests {
+                if locator.range.start < start || locator.range.end > end {
+                    return Err(StorageError::Corruption(
+                        "exact-extent placement falls outside its owned span".to_string(),
+                    ));
+                }
+                let encoded = owned.slice(locator.range.start - start..locator.range.end - start);
+                values[index] = Some(decode_immutable_value(encoded)?);
+            }
+        }
+        let values = values
+            .into_iter()
+            .map(|value| {
+                value.ok_or_else(|| {
+                    StorageError::Corruption("exact extent omitted a requested object".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut stats = self.logical_stats.lock().expect("I/O stats mutex");
+        stats.get_calls += 1;
+        stats.get_keys += keys.len() as u64;
+        stats.get_values += values.len() as u64;
+        stats.get_value_bytes += values.iter().map(|value| value.len() as u64).sum::<u64>();
+        drop(stats);
+        Ok(values)
     }
 }
 
@@ -148,6 +499,9 @@ impl<S: Storage> Storage for CountingStorage<S> {
         Ok(CountingWrite {
             inner: self.inner.begin_write(options).await?,
             stats: Arc::clone(&self.stats),
+            exact_extents: self.exact_extents.clone(),
+            staged_objects: Vec::new(),
+            staged_object_deletes: Vec::new(),
         })
     }
 }
@@ -211,7 +565,18 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
                 .map(|entry| (entry.key.0.len() + entry.value.bytes.len()) as u64)
                 .sum::<u64>();
         }
-        self.inner.put_many(space, entries).await
+        let staged = if space == OBJECT_SPACE && self.exact_extents.is_some() {
+            entries
+                .entries
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.value.bytes.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.inner.put_many(space, entries).await?;
+        self.staged_objects.extend(staged);
+        Ok(())
     }
 
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
@@ -221,7 +586,11 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
             stats.write_deletes += keys.len() as u64;
             stats.write_bytes += keys.iter().map(|key| key.0.len() as u64).sum::<u64>();
         }
-        self.inner.delete_many(space, keys).await
+        self.inner.delete_many(space, keys).await?;
+        if space == OBJECT_SPACE && self.exact_extents.is_some() {
+            self.staged_object_deletes.extend_from_slice(keys);
+        }
+        Ok(())
     }
 
     async fn delete_range(
@@ -233,7 +602,17 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
     }
 
     async fn commit(self) -> Result<CommitResult, StorageError> {
-        self.inner.commit().await
+        let prepared = self
+            .exact_extents
+            .as_ref()
+            .map(|exact_extents| exact_extents.prepare_locators(self.staged_objects))
+            .transpose()?;
+        let result = self.inner.commit().await?;
+        if let (Some(exact_extents), Some(prepared)) = (self.exact_extents, prepared) {
+            exact_extents.publish_locators(prepared);
+            exact_extents.retire_locators(&self.staged_object_deletes);
+        }
+        Ok(result)
     }
 
     async fn rollback(self) -> Result<(), StorageError> {
@@ -413,7 +792,8 @@ async fn perf_slate(parameters: Parameters) {
     let path = directory.path().join("database");
     let counters = SlateDBIoCounters::default();
     let database = SlateDB::open_with_io_counters(&path, counters.clone()).expect("open SlateDB");
-    let (storage, stats) = CountingStorage::new(database.clone());
+    let (storage, stats, exact_extents) =
+        CountingStorage::new_with_exact_extents(database.clone(), &path);
     let fixture = seed_fixture(&storage, parameters).await;
     database
         .flush_memtable_for_diagnostics()
@@ -427,15 +807,30 @@ async fn perf_slate(parameters: Parameters) {
         directory_bytes(&path),
     );
     measure_slate(
-        parameters, &storage, &fixture, &stats, &path, &database, &counters,
+        parameters,
+        &storage,
+        &fixture,
+        &stats,
+        &path,
+        &database,
+        &counters,
+        &exact_extents,
     )
     .await;
     drop(storage);
     drop(database);
     let reopened = SlateDB::open(&path).expect("reopen SlateDB");
     assert_cold_reopen(&reopened, parameters.layout, &fixture).await;
+    let live_keys = live_object_keys(&reopened).await;
+    let rebuilt = ExactExtentIndex::rebuild(
+        path.join("db").join("lix-immutable-value-segment-v1"),
+        Arc::new(Mutex::new(IoStats::default())),
+        &live_keys,
+    )
+    .expect("rebuild exact-extent routing after reopen");
+    assert_exact_extent_cold_reopen(&reopened, &rebuilt, &fixture).await;
     println!(
-        "forktree_media_reopen,backend=slatedb,layout={},cold_reopen=true,exact_bytes=true",
+        "forktree_media_reopen,backend=slatedb,layout={},cold_reopen=true,exact_bytes=true,extent_locator_rebuilt=true",
         parameters.layout.name()
     );
 }
@@ -467,6 +862,7 @@ async fn measure<S, F>(
             parameters.layout,
             &fixture.selector_keys[sample],
             fixture,
+            None,
         )
         .await;
         let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
@@ -513,10 +909,12 @@ async fn measure_slate<S: Storage>(
     path: &Path,
     database: &SlateDB,
     counters: &SlateDBIoCounters,
+    exact_extents: &ExactExtentIndex,
 ) {
     for sample in 0..parameters.samples {
         let _ = take_stats(stats);
         let physical_before = counters.snapshot();
+        let exact_extent_before = exact_extents.snapshot();
         let disk_before = directory_bytes(path);
         let rss_before = process_resident_bytes();
         let high_water_before = process_high_water_bytes();
@@ -528,6 +926,7 @@ async fn measure_slate<S: Storage>(
             parameters.layout,
             &fixture.selector_keys[sample],
             fixture,
+            Some(exact_extents),
         )
         .await;
         let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
@@ -541,7 +940,12 @@ async fn measure_slate<S: Storage>(
             .flush_memtable_for_diagnostics()
             .await
             .expect("flush sample");
-        let physical = counters.snapshot().saturating_sub(physical_before);
+        let mut physical = counters.snapshot().saturating_sub(physical_before);
+        let exact_extent = exact_extents.snapshot().saturating_sub(exact_extent_before);
+        physical.read_objects = physical
+            .read_objects
+            .saturating_add(exact_extent.read_objects);
+        physical.read_bytes = physical.read_bytes.saturating_add(exact_extent.read_bytes);
         let disk_after = directory_bytes(path);
         print_sample(
             "slatedb",
@@ -745,11 +1149,12 @@ async fn publish_edit<S: Storage>(
     layout: Layout,
     selector_key: &Key,
     fixture: &Fixture,
+    exact_extents: Option<&ExactExtentIndex>,
 ) -> (ObjectId, HashWork) {
     match layout {
         Layout::Current => publish_current(storage, selector_key, fixture).await,
         Layout::Flat => publish_flat(storage, selector_key, fixture).await,
-        Layout::Blocked => publish_blocked(storage, selector_key, fixture).await,
+        Layout::Blocked => publish_blocked(storage, selector_key, fixture, exact_extents).await,
     }
 }
 
@@ -907,6 +1312,7 @@ async fn publish_blocked<S: Storage>(
     storage: &S,
     selector_key: &Key,
     fixture: &Fixture,
+    exact_extents: Option<&ExactExtentIndex>,
 ) -> (ObjectId, HashWork) {
     let changed = changed_chunk_indices(
         fixture.base.len(),
@@ -944,7 +1350,7 @@ async fn publish_blocked<S: Storage>(
                 .map(|index| children[*index].id.key())
                 .collect::<Vec<_>>();
             let leaf_read_started = profile_snapshot();
-            let leaf_values = get_many_values(storage, OBJECT_SPACE, &leaf_keys).await;
+            let leaf_values = get_many_leaf_values(storage, &leaf_keys, exact_extents).await;
             add_profile_delta(
                 leaf_read_started,
                 profile_snapshot(),
@@ -1017,7 +1423,7 @@ async fn publish_blocked<S: Storage>(
                 .map(|(_, _, _, child)| child.id.key())
                 .collect::<Vec<_>>();
             let leaf_read_started = profile_snapshot();
-            let leaf_values = get_many_values(storage, OBJECT_SPACE, &leaf_keys).await;
+            let leaf_values = get_many_leaf_values(storage, &leaf_keys, exact_extents).await;
             add_profile_delta(
                 leaf_read_started,
                 profile_snapshot(),
@@ -1630,6 +2036,19 @@ async fn get_many_values<S: Storage>(storage: &S, space: StorageSpace, keys: &[K
         .collect()
 }
 
+async fn get_many_leaf_values<S: Storage>(
+    storage: &S,
+    keys: &[Key],
+    exact_extents: Option<&ExactExtentIndex>,
+) -> Vec<Bytes> {
+    match exact_extents {
+        Some(exact_extents) => exact_extents
+            .read_many(keys)
+            .expect("read one-copy authenticated leaf extents"),
+        None => get_many_values(storage, OBJECT_SPACE, keys).await,
+    }
+}
+
 async fn assert_cold_reopen<S: Storage>(storage: &S, layout: Layout, fixture: &Fixture) {
     for selector in &fixture.selector_keys {
         let raw = get_one(storage, SELECTOR_SPACE, selector.clone())
@@ -1639,6 +2058,25 @@ async fn assert_cold_reopen<S: Storage>(storage: &S, layout: Layout, fixture: &F
         assert_eq!(root, fixture.expected_root);
         let reconstructed = reconstruct(storage, layout, root).await;
         assert_eq!(reconstructed.len(), fixture.base.len());
+        let mut expected = fixture.base.as_ref().clone();
+        expected[fixture.edit_offset..fixture.edit_offset + fixture.edit.len()]
+            .copy_from_slice(&fixture.edit);
+        assert_eq!(reconstructed, expected);
+    }
+}
+
+async fn assert_exact_extent_cold_reopen<S: Storage>(
+    storage: &S,
+    exact_extents: &ExactExtentIndex,
+    fixture: &Fixture,
+) {
+    for selector in &fixture.selector_keys {
+        let raw = get_one(storage, SELECTOR_SPACE, selector.clone())
+            .await
+            .expect("selector survives exact-extent reopen");
+        let root = ObjectId(raw.as_ref().try_into().expect("selector ID width"));
+        assert_eq!(root, fixture.expected_root);
+        let reconstructed = reconstruct_blocked_exact(exact_extents, root);
         let mut expected = fixture.base.as_ref().clone();
         expected[fixture.edit_offset..fixture.edit_offset + fixture.edit.len()]
             .copy_from_slice(&fixture.edit);
@@ -1722,11 +2160,31 @@ fn reconstruct_blocked<S: Storage>(
     }
 }
 
+fn reconstruct_blocked_exact(exact_extents: &ExactExtentIndex, root: ObjectId) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        let raw = exact_extents
+            .read_many(&[id.key()])
+            .expect("exact-extent object exists")
+            .pop()
+            .expect("one exact-extent object");
+        match decode_object(id, &raw).expect("authenticate exact-extent object") {
+            Object::Leaf(payload) => result.extend_from_slice(&payload),
+            Object::Internal { children, .. } => {
+                pending.extend(children.into_iter().rev().map(|child| child.id));
+            }
+            Object::Flat { .. } => panic!("flat object in blocked tree"),
+        }
+    }
+    result
+}
+
 async fn correctness_rocks() {
     let directory = tempfile::tempdir().expect("create correctness RocksDB directory");
     let path = directory.path().join("database");
     let storage = RocksDB::open(&path).expect("open correctness RocksDB");
-    run_correctness(&storage, "rocksdb").await;
+    run_correctness(&storage, "rocksdb", None).await;
     storage.flush().expect("flush correctness RocksDB");
     drop(storage);
     let reopened = RocksDB::open(&path).expect("reopen correctness RocksDB");
@@ -1736,18 +2194,50 @@ async fn correctness_rocks() {
 async fn correctness_slate() {
     let directory = tempfile::tempdir().expect("create correctness SlateDB directory");
     let path = directory.path().join("database");
-    let storage = SlateDB::open(&path).expect("open correctness SlateDB");
-    run_correctness(&storage, "slatedb").await;
-    storage
+    let database = SlateDB::open(&path).expect("open correctness SlateDB");
+    let (storage, _, exact_extents) =
+        CountingStorage::new_with_exact_extents(database.clone(), &path);
+    run_correctness(&storage, "slatedb", Some(&exact_extents)).await;
+    database
         .flush_memtable_for_diagnostics()
         .await
         .expect("flush correctness SlateDB");
     drop(storage);
+    drop(database);
     let reopened = SlateDB::open(&path).expect("reopen correctness SlateDB");
     assert_correctness_reopen(&reopened).await;
+    let live_keys = live_object_keys(&reopened).await;
+    let rebuilt = ExactExtentIndex::rebuild(
+        path.join("db").join("lix-immutable-value-segment-v1"),
+        Arc::new(Mutex::new(IoStats::default())),
+        &live_keys,
+    )
+    .expect("rebuild correctness exact-extent routing");
+    let key = Key(Bytes::from_static(b"correctness-reopen"));
+    let root = ObjectId(
+        get_one(&reopened, SELECTOR_SPACE, key)
+            .await
+            .expect("correctness selector survives exact rebuild")
+            .as_ref()
+            .try_into()
+            .expect("correctness root width"),
+    );
+    assert_eq!(
+        reconstruct_blocked_exact(&rebuilt, root).len(),
+        4 * BLOCKED_LEAF_BYTES
+    );
+    let retired_corrupt_id = object_id(b"corrupt immutable leaf");
+    assert!(matches!(
+        rebuilt.read_many(&[retired_corrupt_id.key()]),
+        Err(StorageError::Corruption(_))
+    ));
 }
 
-async fn run_correctness<S: Storage>(storage: &S, backend: &str) {
+async fn run_correctness<S: Storage>(
+    storage: &S,
+    backend: &str,
+    exact_extents: Option<&ExactExtentIndex>,
+) {
     let parameters = Parameters {
         layout: Layout::Blocked,
         size_mib: 64,
@@ -1760,6 +2250,7 @@ async fn run_correctness<S: Storage>(storage: &S, backend: &str) {
         Layout::Blocked,
         &fixture.selector_keys[0],
         &fixture,
+        exact_extents,
     )
     .await;
     assert_eq!(successor, fixture.expected_root);
@@ -1808,11 +2299,23 @@ async fn run_correctness<S: Storage>(storage: &S, backend: &str) {
     assert!(first_sweep > 0);
     for id in &shared {
         assert!(get_one(storage, OBJECT_SPACE, id.key()).await.is_some());
+        if let Some(exact_extents) = exact_extents {
+            let raw = exact_extents
+                .read_many(&[id.key()])
+                .expect("shared object remains routed");
+            decode_object(*id, &raw[0]).expect("shared routed object remains authenticated");
+        }
     }
     let second_sweep = sweep_objects(storage, &[]).await;
     assert!(second_sweep >= successor_objects.len());
     for id in successor_objects {
         assert!(get_one(storage, OBJECT_SPACE, id.key()).await.is_none());
+        if let Some(exact_extents) = exact_extents {
+            assert!(matches!(
+                exact_extents.read_many(&[id.key()]),
+                Err(StorageError::Corruption(_))
+            ));
+        }
     }
 
     let reopen_key = Key(Bytes::from_static(b"correctness-reopen"));
@@ -1915,6 +2418,37 @@ async fn sweep_objects<S: Storage>(storage: &S, roots: &[ObjectId]) -> usize {
         write.commit().await.expect("commit sweep");
     }
     dead.len()
+}
+
+async fn live_object_keys<S: Storage>(storage: &S) -> BTreeSet<Key> {
+    let mut keys = BTreeSet::new();
+    let mut resume_after = None;
+    loop {
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("begin live object key scan");
+        let chunk = read
+            .scan(
+                OBJECT_SPACE,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                ScanOptions {
+                    projection: CoreProjection::KeyOnly,
+                    limit_rows: 1024,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await
+            .expect("scan live object keys");
+        keys.extend(chunk.entries.iter().map(|entry| entry.key.clone()));
+        if !chunk.has_more {
+            return keys;
+        }
+        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
+    }
 }
 
 fn deterministic_bytes(size: usize, seed: u64) -> Vec<u8> {
@@ -2098,6 +2632,36 @@ fn directory_bytes(path: &Path) -> u64 {
 
 fn hex_id(id: ObjectId) -> String {
     id.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_key(key: &Key) -> String {
+    key.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hex_key(value: &str) -> Result<Key, StorageError> {
+    let encoded = value.as_bytes();
+    if encoded.len() != 64 {
+        return Err(StorageError::Corruption(
+            "immutable extent file name is not a 32-byte ID".to_string(),
+        ));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let high = decode_hex_nibble(encoded[index * 2])?;
+        let low = decode_hex_nibble(encoded[index * 2 + 1])?;
+        *byte = (high << 4) | low;
+    }
+    Ok(Key(Bytes::copy_from_slice(&bytes)))
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, StorageError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(StorageError::Corruption(
+            "immutable extent file name is not lowercase hexadecimal".to_string(),
+        )),
+    }
 }
 
 fn parse_positive(value: Option<&String>, name: &str, default: usize) -> usize {
