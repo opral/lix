@@ -1,0 +1,36 @@
+# Independent ForkTree bounded-GC oracle.
+# Every cell is capped at 20 minutes. This package makes no production edit.
+
+timeout 20m rustfmt --edition 2024 --check packages/lix/tests/forktree_bounded_gc_oracle.rs
+timeout 20m rustc --edition=2024 -D warnings packages/lix/tests/forktree_bounded_gc_oracle.rs -O -o /tmp/forktree_bounded_gc_oracle
+timeout 20m /tmp/forktree_bounded_gc_oracle conformance
+
+timeout 20m /tmp/forktree_bounded_gc_oracle scale 1000 32 normal memory
+timeout 20m /tmp/forktree_bounded_gc_oracle scale 1000 4097 adversarial memory
+timeout 20m /tmp/forktree_bounded_gc_oracle scale 50000 32 normal memory
+timeout 20m /tmp/forktree_bounded_gc_oracle scale 50000 32 adversarial memory
+timeout 20m /tmp/forktree_bounded_gc_oracle scale 1000 32 normal file
+timeout 20m /tmp/forktree_bounded_gc_oracle scale 1000 4097 adversarial file
+
+# Run unchanged against Ryzen-V's next immutable checkout. It must pass only
+# after V1/in-memory residues are deleted and the descriptor/API seal lands.
+timeout 20m /tmp/forktree_bounded_gc_oracle source-gate "$CHECKOUT"
+
+# Reuse the frozen external safe-Rust compile-fail probes. Both commands must
+# exit nonzero against the immutable successor because neither import nor
+# equivalent-token construction may compile.
+timeout 20m rustc --edition=2024 \
+  packages/lix/tests/forktree_stage1_external_space_import_rejection.rs \
+  --extern "lix=$LIX_RLIB" -L "dependency=$DEPS" \
+  -o /tmp/forktree_external_space_import_rejection
+
+timeout 20m rustc --edition=2024 -D warnings \
+  packages/lix/tests/forktree_stage1_external_space_forge_rejection.rs \
+  --extern "lix=$LIX_RLIB" -L "dependency=$DEPS" \
+  -o /tmp/forktree_external_space_forge_rejection
+
+sha256sum \
+  packages/lix/tests/forktree_bounded_gc_oracle.rs \
+  /tmp/forktree_bounded_gc_oracle \
+  packages/lix/tests/FORKTREE_BOUNDED_GC_ORACLE_RESULTS.md \
+  packages/lix/tests/forktree_bounded_gc_oracle_invocations.txt
