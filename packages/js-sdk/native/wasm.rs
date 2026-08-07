@@ -789,7 +789,7 @@ impl TryFrom<RsExecuteResult> for ExecuteResultDto {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            statement_index: result.statement_index().map(js_number),
+            statement_index: result.statement_index().map(js_index),
             label: result.label().map(str::to_owned),
             columns: result.columns().to_vec(),
             rows,
@@ -832,6 +832,14 @@ fn execute_result_to_js(result: RsExecuteResult) -> Result<JsValue, JsValue> {
     reason = "the public JavaScript SDK represents counts and sequences as numbers"
 )]
 fn js_number(value: u64) -> f64 {
+    value as f64
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "WASM32 statement indexes are exactly representable as JavaScript numbers"
+)]
+fn js_index(value: usize) -> f64 {
     value as f64
 }
 
