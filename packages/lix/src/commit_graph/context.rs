@@ -333,21 +333,13 @@ where
             match left.generation.cmp(&right.generation) {
                 Ordering::Greater => {
                     let [parent_id] = left.parent_commit_ids.as_slice() else {
-                        return Ok(if left.parent_commit_ids.is_empty() {
-                            LinearMergeBase::Disconnected
-                        } else {
-                            LinearMergeBase::GeneralGraph
-                        });
+                        return Ok(LinearMergeBase::GeneralGraph);
                     };
                     left = self.load_linear_parent(&left, *parent_id).await?;
                 }
                 Ordering::Less => {
                     let [parent_id] = right.parent_commit_ids.as_slice() else {
-                        return Ok(if right.parent_commit_ids.is_empty() {
-                            LinearMergeBase::Disconnected
-                        } else {
-                            LinearMergeBase::GeneralGraph
-                        });
+                        return Ok(LinearMergeBase::GeneralGraph);
                     };
                     right = self.load_linear_parent(&right, *parent_id).await?;
                 }

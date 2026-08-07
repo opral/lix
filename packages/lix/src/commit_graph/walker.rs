@@ -678,6 +678,12 @@ mod tests {
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-child-change", "commit-child", &[], &["commit-root"]),
+                commit_change(
+                    "commit-grandchild-change",
+                    "commit-grandchild",
+                    &[],
+                    &["commit-child"],
+                ),
             ],
         )
         .await;
@@ -714,6 +720,17 @@ mod tests {
             .await
             .expect_err("invalid generations should fail the graph walk");
 
+        assert!(error.message.contains("does not have a lower generation"));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .merge_base(&commit_id("commit-root"), &commit_id("commit-grandchild"))
+            .await
+            .expect_err("linear merge-base fast path should preserve generation validation");
         assert!(error.message.contains("does not have a lower generation"));
     }
 
@@ -966,6 +983,30 @@ mod tests {
                     &[],
                     &["commit-right", "commit-left"],
                 ),
+                commit_change(
+                    "commit-left-tail-1-change",
+                    "commit-left-tail-1",
+                    &[],
+                    &["commit-head-left"],
+                ),
+                commit_change(
+                    "commit-left-tail-2-change",
+                    "commit-left-tail-2",
+                    &[],
+                    &["commit-left-tail-1"],
+                ),
+                commit_change(
+                    "commit-right-tail-1-change",
+                    "commit-right-tail-1",
+                    &[],
+                    &["commit-head-right"],
+                ),
+                commit_change(
+                    "commit-right-tail-2-change",
+                    "commit-right-tail-2",
+                    &[],
+                    &["commit-right-tail-1"],
+                ),
             ],
         )
         .await;
@@ -976,8 +1017,8 @@ mod tests {
             .await
             .expect("read should open");
         let mut reader = graph.reader(read);
-        let commit_head_left = commit_id("commit-head-left");
-        let commit_head_right = commit_id("commit-head-right");
+        let commit_head_left = commit_id("commit-left-tail-2");
+        let commit_head_right = commit_id("commit-right-tail-2");
         let error = reader
             .merge_base(&commit_head_left, &commit_head_right)
             .await
@@ -989,14 +1030,14 @@ mod tests {
                 .details
                 .as_ref()
                 .and_then(|details| details.get("left_commit_id")),
-            Some(&json!(commit_id("commit-head-left").to_string()))
+            Some(&json!(commit_id("commit-left-tail-2").to_string()))
         );
         assert_eq!(
             error
                 .details
                 .as_ref()
                 .and_then(|details| details.get("right_commit_id")),
-            Some(&json!(commit_id("commit-head-right").to_string()))
+            Some(&json!(commit_id("commit-right-tail-2").to_string()))
         );
         assert_eq!(
             error
