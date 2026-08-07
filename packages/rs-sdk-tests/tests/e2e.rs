@@ -1234,6 +1234,78 @@ fn markdown_byte_roundtrip_fixture() -> Vec<u8> {
     source
 }
 
+async fn qualify_markdown_semantic_child_edit_after_reopen<S>(lix: &Lix<S>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let path = "/company/competitors.md";
+    let file_id = file_id_at_path(lix, path).await;
+    let paragraphs = lix
+        .execute(
+            "SELECT id, payload_json FROM markdown_node \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("restored Markdown paragraphs should query");
+    let paragraph_count = paragraphs.rows().len();
+    let edited_id = paragraphs
+        .rows()
+        .iter()
+        .find(|row| {
+            row.get::<String>("payload_json")
+                .is_ok_and(|payload| payload.contains("Peer 12 has"))
+        })
+        .and_then(|row| row.get::<String>("id").ok())
+        .expect("restored Markdown target paragraph");
+    lix.execute(
+        "UPDATE markdown_node SET payload_json = $1 \
+         WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Text(
+                serde_json::json!({
+                    "inline": [{
+                        "type": "text",
+                        "value": "Peer 12 was edited after durable restore."
+                    }]
+                })
+                .to_string(),
+            ),
+            Value::Text(edited_id),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("semantic child edit after durable restore should commit");
+
+    let rendered = String::from_utf8(
+        read_file(lix, path)
+            .await
+            .expect("restored Markdown file should read")
+            .expect("restored Markdown file should exist"),
+    )
+    .expect("rendered Markdown should be UTF-8");
+    assert!(rendered.contains("Peer 12 was edited after durable restore."));
+    for index in (0..24).filter(|index| *index != 12) {
+        assert!(
+            rendered.contains(&format!("Peer {index} has")),
+            "unrelated Peer {index} block was lost"
+        );
+    }
+    let successor_count = lix
+        .execute(
+            "SELECT COUNT(*) AS count FROM markdown_node \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .expect("successor Markdown paragraphs should query")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("successor Markdown paragraph count");
+    assert_eq!(successor_count, paragraph_count as i64);
+}
+
 async fn qualify_markdown_server_style_branch<S>(lix: &Lix<S>, expected: &[u8])
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1379,6 +1451,7 @@ async fn v3_markdown_byte_roundtrip_rocksdb_lifecycle_and_17_file_batch() {
             .unwrap(),
         Some(expected)
     );
+    qualify_markdown_semantic_child_edit_after_reopen(&reopened).await;
     reopened.close().await.unwrap();
 }
 
@@ -1414,6 +1487,7 @@ fn v3_markdown_byte_roundtrip_slatedb_lifecycle_and_17_file_batch() {
                         .unwrap(),
                     Some(expected)
                 );
+                qualify_markdown_semantic_child_edit_after_reopen(&reopened).await;
                 reopened.close().await.unwrap();
             });
         })
@@ -1455,6 +1529,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_runtime_stack_guard() {
             .unwrap(),
         Some(expected)
     );
+    qualify_markdown_semantic_child_edit_after_reopen(&reopened).await;
     reopened.close().await.unwrap();
 }
 

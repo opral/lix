@@ -1577,6 +1577,10 @@ impl PersistentTree {
             .or_else(|| self.base.children.get(index))
     }
 
+    fn top_level_len(&self) -> usize {
+        self.base.children.len()
+    }
+
     fn replace_top_level_node(&self, index: usize, node: NodeSnapshot) -> Self {
         let mut tree = self
             .top_level_tree(index)
@@ -2215,9 +2219,21 @@ impl Document {
         root_json.extend(serde_json::to_vec(&root).map_err(|error| {
             PluginError::Internal(format!("serialize Markdown arena root: {error}"))
         })?);
-        let mut blocks = Vec::with_capacity(self.top_level_ranges.len());
+        let top_level_len = self.tree.top_level_len();
+        let ranges_are_addressable = self.top_level_ranges.len() == top_level_len;
+        let mut blocks = Vec::with_capacity(top_level_len);
         let bytes_len = self.bytes.len;
-        for (index, range) in self.top_level_ranges.iter().enumerate() {
+        for index in 0..top_level_len {
+            // Accepted noncanonical bytes are the only lexical authority, so
+            // restore cannot derive source ranges by parsing or rendering.
+            // Keep every semantic child with an empty, non-addressable range;
+            // sparse edit lookup will decline it and use the full correctness
+            // path with the accepted bytes and complete semantic tree.
+            let range = if ranges_are_addressable {
+                self.top_level_ranges[index].clone()
+            } else {
+                0..0
+            };
             let tree = self.tree.top_level_tree(index).ok_or_else(|| {
                 PluginError::Internal("Markdown arena range has no matching block".to_owned())
             })?;
@@ -3015,5 +3031,84 @@ Another paragraph with *single-asterisk emphasis* and `inline code`.
                 .expect("second reopen");
             assert_eq!(third.bytes.materialize(), source);
         }
+    }
+
+    #[test]
+    fn accepted_restore_preserves_semantic_children_for_reopen_and_edit() {
+        let source = br#"# Competitors
+
+*Counter:
+
+(~26 users)
+
+The remaining document keeps every semantic block.
+
+Another paragraph must survive an unrelated semantic edit.
+"#
+        .to_vec();
+        let records = semantic_records_without_raw_source(source.clone());
+        let (restored, edits) =
+            Document::open_entities(records, Some(source.clone())).expect("accepted bytes restore");
+        assert!(edits.is_empty());
+        let expected_tree = restored.tree.materialize();
+        let expected_child_count = expected_tree.children.len();
+        assert!(expected_child_count > 1, "fixture needs unrelated blocks");
+
+        let (root, blocks) = restored.arena_state().expect("restored arena state");
+        assert_eq!(blocks.len(), expected_child_count);
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.start == 0 && block.end == 0),
+            "restored lexical ranges must be explicitly non-addressable"
+        );
+        let reopened = Document::open_arena(source, &root, blocks).expect("arena reopen");
+        assert_eq!(reopened.tree.materialize(), expected_tree);
+
+        let mut edited = expected_tree
+            .children
+            .iter()
+            .find(|child| {
+                serde_json::to_string(&child.node.payload)
+                    .is_ok_and(|payload| payload.contains("remaining document"))
+            })
+            .expect("editable paragraph")
+            .node
+            .clone();
+        let payload = serde_json::to_string(&edited.payload).expect("paragraph payload");
+        let successor_payload = payload.replacen("remaining document", "retained document", 1);
+        assert_ne!(successor_payload, payload);
+        edited.payload = serde_json::from_str(&successor_payload).expect("edited payload");
+        let edited_id = edited.id.clone();
+        let snapshot = logical_to_wire(
+            &serde_json::to_string(&edited).expect("edited logical Markdown snapshot"),
+        )
+        .expect("edited wire Markdown snapshot");
+        let (successor, _) = reopened
+            .entities_changed(vec![EntityChange {
+                schema_key: NODE_SCHEMA_KEY.to_owned(),
+                entity_pk: vec![edited_id.clone()],
+                snapshot: Some(snapshot),
+                effect: ChangeEffect::Content,
+            }])
+            .expect("semantic child edit after restore");
+        let successor_tree = successor.tree.materialize();
+        assert_eq!(successor_tree.children.len(), expected_child_count);
+        for (before, after) in expected_tree.children.iter().zip(&successor_tree.children) {
+            if before.node.id != edited_id {
+                assert_eq!(after, before, "unrelated semantic block changed");
+            }
+        }
+        assert!(
+            successor_tree
+                .node
+                .format
+                .get(LEXICAL_FALLBACK_FIELD)
+                .is_none(),
+            "semantic successor must clear the lexical fallback"
+        );
+        let rendered = String::from_utf8(successor.bytes()).expect("rendered Markdown is UTF-8");
+        assert!(rendered.contains("retained document"));
+        assert!(rendered.contains("Another paragraph must survive"));
     }
 }
