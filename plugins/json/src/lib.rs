@@ -76,7 +76,6 @@ impl sdk::Plugin for JsonPlugin {
                 .entity_records()
                 .map_err(sdk::Error::invalid_input)?,
         )?;
-        store_scalar_state(sink, &document)?;
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
     }

@@ -4330,6 +4330,229 @@ fn component_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lix::wasm::{
+        WasmByteSource, WasmEntityPage, WasmEntitySource, WasmFileDescriptor, WasmInputSplice,
+        WasmPluginSelection,
+    };
+
+    #[derive(Clone, Debug)]
+    struct JsonTestSource(Vec<u8>);
+
+    impl WasmByteSource for JsonTestSource {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
+            let start = usize::try_from(offset)
+                .map_err(|_| component_error("JSON test source offset exceeds usize"))?;
+            let end = start
+                .checked_add(length as usize)
+                .ok_or_else(|| component_error("JSON test source range overflowed"))?;
+            self.0
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| component_error("JSON test source range is out of bounds"))
+        }
+    }
+
+    struct JsonTestEntitySource {
+        entities: Option<Vec<WasmEntity<WasmHostBytes>>>,
+    }
+
+    impl WasmEntitySource for JsonTestEntitySource {
+        fn next_page(&mut self, _max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
+            Ok(self
+                .entities
+                .take()
+                .map(|entities| WasmEntityPage { entities }))
+        }
+    }
+
+    fn assert_json_full_fallback_state_only(checkpoint: &WasmDocumentCheckpoint) {
+        let root = checkpoint
+            .downcast_ref::<ArenaRoot>()
+            .expect("default runtime checkpoint should contain an arena root");
+        let keys = root.state.keys().collect::<Vec<_>>();
+        assert_eq!(
+            keys.len(),
+            3,
+            "cold fallback should retain only namespace, fallback manifest, and one fallback page"
+        );
+        assert!(keys.contains(&b"json/fallback-entities".as_slice()));
+        assert!(
+            keys.iter()
+                .any(|key| key.starts_with(b"json/fallback-entity-page/"))
+        );
+        assert!(!keys.contains(&b"json/scalar-index".as_slice()));
+        assert!(
+            !keys
+                .iter()
+                .any(|key| key.starts_with(b"json/scalar-index-page/"))
+        );
+        assert!(!keys.iter().any(|key| key.starts_with(b"json/scalar-page/")));
+    }
+
+    #[tokio::test]
+    async fn json_cold_full_fallback_checkpoint_omits_scalar_state() {
+        let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"))
+            .expect("read JSON component");
+        let factory = crate::default_wasm_runtime()
+            .expect("default Wasm runtime")
+            .compile_component(wasm, WasmLimits::default())
+            .await
+            .expect("compile JSON component");
+        let descriptor = WasmFileDescriptor {
+            path: Some("/direct-cold-fallback.json".to_owned()),
+            plugin: WasmPluginSelection {
+                plugin_key: "plugin_json".to_owned(),
+                generation: "direct".to_owned(),
+            },
+        };
+        let creates = WasmCreateContext { high: 13, low: 17 };
+        let before = br#"{"a":"one","b":"two"}"#.to_vec();
+        let cold_after = br#"{"a":"ONE","b":"two"}"#.to_vec();
+        let entities = vec![
+            WasmEntity {
+                key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                    br#"{"id":"root","kind":"object"}"#,
+                )),
+            },
+            WasmEntity {
+                key: WasmEntityKey::from_owned_parts(
+                    "json_object_member",
+                    vec!["root".to_owned(), "a".to_owned()],
+                ),
+                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                    br#"{"parent_id":"root","key":"a","order_key":"40","kind":"string","scalar_json":"\"one\""}"#,
+                )),
+            },
+            WasmEntity {
+                key: WasmEntityKey::from_owned_parts(
+                    "json_object_member",
+                    vec!["root".to_owned(), "b".to_owned()],
+                ),
+                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                    br#"{"parent_id":"root","key":"b","order_key":"80","kind":"string","scalar_json":"\"two\""}"#,
+                )),
+            },
+        ];
+        let limits = WasmTransitionLimits::default();
+        let mut actor = factory.instantiate_actor().await.unwrap();
+        let cold = actor
+            .cold_file_changed(
+                limits,
+                WasmColdFileUpdate {
+                    before_descriptor: descriptor.clone(),
+                    after_descriptor: descriptor.clone(),
+                    before: Some(Arc::new(JsonTestSource(before))),
+                    edits: vec![WasmInputSplice {
+                        offset: 6,
+                        delete_len: 3,
+                        insert: WasmInputBytes::Inline(b"ONE".to_vec()),
+                    }],
+                    after: Arc::new(JsonTestSource(cold_after.clone())),
+                    creates,
+                    entities: Box::new(JsonTestEntitySource {
+                        entities: Some(entities),
+                    }),
+                },
+            )
+            .await
+            .expect("cold full-fallback transition should succeed");
+        while actor
+            .next_change_page(cold.transition, cold.changes, 2 * 1024 * 1024)
+            .await
+            .unwrap()
+            .is_some()
+        {}
+        actor.finish_transition(cold.transition).await.unwrap();
+
+        let checkpoint = actor
+            .checkpoint_document(cold.document)
+            .await
+            .unwrap()
+            .expect("component actor should expose a checkpoint");
+        assert_json_full_fallback_state_only(&checkpoint);
+        let durable = checkpoint
+            .durable_checkpoint()
+            .expect("small JSON checkpoint should be durable");
+        let decoded = WasmDurableDocumentCheckpoint::decode(durable.bytes().as_ref())
+            .expect("durable JSON checkpoint should decode");
+        actor.retire().await.unwrap();
+
+        let mut reopened = factory.instantiate_actor().await.unwrap();
+        let document = reopened
+            .restore_durable_document(&decoded, &cold_after)
+            .await
+            .expect("durable fallback checkpoint should reopen against accepted bytes");
+        let successor_after = br#"{"a":"ONE","b":"TWO"}"#.to_vec();
+        let edit_offset = cold_after
+            .windows(3)
+            .position(|window| window == b"two")
+            .expect("fixture should contain edited scalar");
+        let successor = reopened
+            .file_changed(
+                document,
+                limits,
+                WasmFileUpdate {
+                    before_descriptor: descriptor.clone(),
+                    after_descriptor: descriptor,
+                    before: Arc::new(JsonTestSource(cold_after)),
+                    edits: vec![WasmInputSplice {
+                        offset: edit_offset as u64,
+                        delete_len: 3,
+                        insert: WasmInputBytes::Inline(b"TWO".to_vec()),
+                    }],
+                    after: Arc::new(JsonTestSource(successor_after.clone())),
+                    creates,
+                },
+            )
+            .await
+            .expect("full-path successor should read fallback state");
+        let mut changes = Vec::new();
+        while let Some(page) = reopened
+            .next_change_page(successor.transition, successor.changes, 2 * 1024 * 1024)
+            .await
+            .unwrap()
+        {
+            changes.extend(page.changes.changes);
+        }
+        let counters = reopened
+            .finish_transition(successor.transition)
+            .await
+            .unwrap();
+        assert!(
+            counters.state_read_calls >= 3,
+            "reopened successor should read namespace, fallback manifest, and fallback page"
+        );
+        assert_eq!(changes.len(), 1);
+        let WasmEntityChange::Upsert { entity, effect } = &changes[0] else {
+            panic!("successor should upsert the edited JSON member");
+        };
+        assert_eq!(*effect, WasmChangeEffect::Content);
+        assert_eq!(entity.key.schema_key.as_str(), "json_object_member");
+        assert_eq!(entity.key.entity_pk[1].as_str(), "b");
+        let WasmGuestBytes::Inline(snapshot) = &entity.snapshot_content else {
+            panic!("small JSON snapshot should remain inline");
+        };
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(snapshot).expect("successor snapshot should be JSON");
+        assert_eq!(snapshot["scalar_json"], r#""TWO""#);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&successor_after).unwrap(),
+            serde_json::json!({"a": "ONE", "b": "TWO"})
+        );
+
+        let successor_checkpoint = reopened
+            .checkpoint_document(successor.document)
+            .await
+            .unwrap()
+            .expect("successor should expose a checkpoint");
+        assert_json_full_fallback_state_only(&successor_checkpoint);
+        reopened.retire().await.unwrap();
+    }
 
     #[test]
     fn plugin_lifecycle_boundary_requires_a_resolved_path() {
