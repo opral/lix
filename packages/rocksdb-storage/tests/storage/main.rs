@@ -1,3 +1,4 @@
+mod file_sql;
 mod native_file_read;
 mod native_file_upsert;
 mod rocksdb_specific;

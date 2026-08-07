@@ -1962,17 +1962,6 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_hex_literals() {
-        let statement =
-            parse_statement("INSERT INTO lix_file (id, content) VALUES ('file1', X'4142')");
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("hex literals should be removed from the SQL surface");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("unsupported SQL literal"));
-    }
-
-    #[test]
     fn bind_statement_predecodes_lix_json_literal_values() {
         let statement = parse_statement(
             "INSERT INTO app_json (id, payload, metadata) VALUES ('e1', lix_json('{\"id\":\"e1\"}'), lix_json('{\"source\":\"test\"}'))",
