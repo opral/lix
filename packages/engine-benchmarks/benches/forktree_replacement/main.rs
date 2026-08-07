@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 mod branch_diff_scaling;
+mod cold_diff_extent;
 mod model;
 mod multimedia_acceptance;
 mod multimedia_fanout;
@@ -414,6 +415,10 @@ async fn main() {
     }
     if std::env::args().nth(1).as_deref() == Some("branch-diff-corruption") {
         branch_diff_scaling::run_corruption().await;
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("branch-diff-memory") {
+        cold_diff_extent::run().await;
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("multimedia-fanout") {
