@@ -365,7 +365,10 @@ impl WorkloadFamily {
             Self::Image => size / 3 + 12_345,
             Self::Audio => size / 2 + 12_345,
             Self::Archive => size / 2,
-            Self::Video => GOP_BYTES * 15 + 256 * 1024,
+            Self::Video => {
+                let middle_gop = (size / GOP_BYTES / 2).saturating_sub(1);
+                middle_gop * GOP_BYTES + 256 * 1024
+            }
         }
     }
 
@@ -414,8 +417,8 @@ async fn large_media_foreground_lifecycle() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(64);
     assert!(
-        matches!(size_mib, 64 | 512),
-        "qualification size must be 64 or 512 MiB"
+        matches!(size_mib, 8 | 64 | 512),
+        "qualification size must be 8, 64, or 512 MiB"
     );
     let mode = QualificationMode::from_env();
     let persistent_root = std::env::var_os("LIX_MEDIA_QUAL_FIXTURE_PATH").map(PathBuf::from);
@@ -450,6 +453,7 @@ async fn large_media_foreground_lifecycle() {
                     "rocksdb",
                     &database,
                     RocksDB::open(&database).expect("open qualification RocksDB seed"),
+                    None,
                     size_mib,
                 )
                 .await;
@@ -475,10 +479,13 @@ async fn large_media_foreground_lifecycle() {
         }
         Ok("slatedb") => {
             if mode == QualificationMode::Seed {
+                let counters = SlateDBIoCounters::default();
                 seed_visible_fixture(
                     "slatedb",
                     &database,
-                    SlateDB::open(&database).expect("open qualification SlateDB seed"),
+                    SlateDB::open_with_io_counters(&database, counters.clone())
+                        .expect("open qualification SlateDB seed"),
+                    Some(counters),
                     size_mib,
                 )
                 .await;
@@ -511,8 +518,13 @@ async fn large_media_foreground_lifecycle() {
     }
 }
 
-async fn seed_visible_fixture<S>(backend: &str, database: &Path, raw_storage: S, size_mib: usize)
-where
+async fn seed_visible_fixture<S>(
+    backend: &str,
+    database: &Path,
+    raw_storage: S,
+    slate_counters: Option<SlateDBIoCounters>,
+    size_mib: usize,
+) where
     S: QualificationStorage,
 {
     let prepared = prepare_payload(size_mib * 1024 * 1024);
@@ -527,8 +539,26 @@ where
         .open_session(&receipt.main_branch_id)
         .await
         .expect("open media qualification seed session");
-    upload_parts(&main, &prepared).await;
-    storage.inner().qualification_flush().await;
+    measured(
+        backend,
+        size_mib,
+        "ingest",
+        database,
+        &storage,
+        slate_counters.as_ref(),
+        upload_parts(&main, &prepared),
+    )
+    .await;
+    measured(
+        backend,
+        size_mib,
+        "post_ingest_flush",
+        database,
+        &storage,
+        slate_counters.as_ref(),
+        storage.inner().qualification_flush(),
+    )
+    .await;
     let layout = cas_layout(&storage).await;
     assert_eq!(layout.manifest.rows, 1);
     assert_eq!(layout.manifest_chunk.rows, size_mib as u64);
@@ -862,6 +892,25 @@ where
             .saturating_sub(branch_layout.payload.rows)
             <= edited_chunk_count as u64,
         "localized edit rewrote unchanged payload chunks"
+    );
+    let total_chunks = prepared.size / CAS_CHUNK_BYTES;
+    let unchanged_chunks = total_chunks - edited_chunk_count;
+    println!(
+        "media_unchanged_sharing,backend={backend},family={},size_mib={size_mib},\
+         total_chunks={total_chunks},edited_chunks={edited_chunk_count},minimum_reused_manifest_refs={unchanged_chunks},\
+         minimum_reused_chunk_bytes={},unchanged_content_bytes={},new_payload_rows={},\
+         base_blake3={},edited_blake3={},base_sha256={},edited_sha256={}",
+        prepared.family.label(),
+        unchanged_chunks * CAS_CHUNK_BYTES,
+        prepared.size - prepared.edit_bytes,
+        edit_layout
+            .payload
+            .rows
+            .saturating_sub(branch_layout.payload.rows),
+        prepared.base_blake3,
+        prepared.edited_blake3,
+        prepared.base_sha256,
+        prepared.edited_sha256,
     );
 
     let source_head = active_commit_id(&source).await;
@@ -1275,8 +1324,10 @@ where
 }
 
 fn prepare_payload(size: usize) -> PreparedPayload {
-    assert_eq!(size % FILE_UPLOAD_PART_BYTES, 0);
-    assert_eq!(size, 64 * 1024 * 1024, "family oracle is fixed at 64 MiB");
+    assert!(
+        matches!(size / (1024 * 1024), 8 | 64 | 512),
+        "family oracle size must be 8, 64, or 512 MiB"
+    );
     let edit_percent = std::env::var("LIX_MEDIA_QUAL_EDIT_PERCENT").map_or(1, |value| {
         value
             .parse::<usize>()
@@ -1299,13 +1350,14 @@ fn prepare_payload(size: usize) -> PreparedPayload {
         edit_bytes,
         SEED ^ 0x6a09_e667_f3bc_c909,
     );
-    let mut parts = Vec::with_capacity(size / FILE_UPLOAD_PART_BYTES);
+    let mut parts = Vec::with_capacity(size.div_ceil(FILE_UPLOAD_PART_BYTES));
     let mut base_blake3 = blake3::Hasher::new();
     let mut edited_blake3 = blake3::Hasher::new();
     let mut base_sha256 = Sha256::new();
     let mut edited_sha256 = Sha256::new();
     for offset in (0..size).step_by(FILE_UPLOAD_PART_BYTES) {
-        let bytes = family_bytes(family, offset, FILE_UPLOAD_PART_BYTES, SEED);
+        let part_len = (size - offset).min(FILE_UPLOAD_PART_BYTES);
+        let bytes = family_bytes(family, offset, part_len, SEED);
         base_blake3.update(&bytes);
         base_sha256.update(&bytes);
         if offset < edit_end && offset + bytes.len() > edit_offset {
