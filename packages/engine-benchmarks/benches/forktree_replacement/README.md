@@ -30,13 +30,19 @@ production index and is deliberately not registered with Lix serving paths.
   deterministically bulk packed; value-only updates rewrite only touched leaves
   and ancestor paths.
 - Blob manifests and canonical FastCDC chunks use the same object keys, commit
-  edge, and reachability walk as row objects. Ingest recycles one 8 MiB window,
-  performs one bounded KeyOnly presence read per window, and commits immutable
-  chunks before the small root publication. Exact matches to the current
-  authenticated manifest bypass CDC and redundant presence reads; a mismatch
-  uses the one canonical chunker and resynchronizes by content ID. An unchanged
-  branch copies only a selector; a localized edit writes only newly identified
-  chunks and metadata.
+  edge, and reachability walk as row objects. One `SegmentedByteSource` boundary
+  transfers exact-length immutable `Bytes` spans to fresh ingest, repeat ingest,
+  localized edit, and reads. ForkTree authenticates the domain, declared length,
+  and every span incrementally. FastCDC scans directly within a span; only a
+  boundary-crossing candidate uses one reusable 2 MiB scratch, and only a
+  missing crossing chunk is packed into that same bounded allocation for the
+  existing raw chunk value. There is no full-payload arena or alternate
+  contiguous path. One bounded KeyOnly presence read and immutable commit are
+  issued per 8 MiB producer window before the small root publication. Exact
+  matches to the current authenticated manifest bypass CDC and presence reads.
+  Reads return the same segmented byte type; only an explicit outer consumer
+  may materialize requested bytes. An unchanged branch copies only a selector;
+  a localized edit writes only newly identified chunks and metadata.
 - Reclamation snapshots the epoch before discovering all selectors, authenticates
   every traversed object, scans the object space in bounded pages, and rotates
   the same epoch on each deleting page. A publication after root discovery
@@ -59,13 +65,18 @@ mutations, and `Z` newly materialized objects.
   when key-set edits change packing boundaries.
 - Branch/checkpoint/undo/redo movement: `O(1)` mutable ref writes plus one epoch
   rotation; no tree objects are copied.
-- Fresh blob ingest: `O(L)` CPU and physical bytes, `O(W + C)` payload memory
-  for fixed source window `W` and maximum chunk `C`, and `O(L/W)` bounded
-  emission commits. Exact-repeat/localized-edit ingest still reads and
-  authenticates `O(L)` bytes, but locality skipping makes CDC work proportional
-  to mismatch regions and writes only `O(Z + metadata)` immutable bytes.
-  Range read is `O(requested bytes + touched chunk bytes)` and bounded by the
-  maximum chunk size.
+- Fresh blob ingest: `O(L)` authentication/CDC and physical bytes, `O(C)` engine
+  payload memory for maximum chunk `C` (2 MiB here), two caller-owned `O(W)`
+  producer spans (`W = 8 MiB`), and `O(L/W)` bounded emission commits. Source
+  transfer itself is `O(spans)` reference movement. Canonical chunks wholly in
+  one span are borrowed; only source-boundary candidates scan a reusable `C`
+  scratch, and only missing crossing chunks require a bounded pack. Exact
+  repeat/localized-edit ingest still authenticates `O(L)` bytes, but performs
+  no payload copy for unchanged chunks, makes CDC proportional to mismatch
+  regions, and writes only `O(Z + metadata)` immutable bytes. Range read is
+  `O(requested bytes + touched chunk bytes)` authentication and returns
+  `O(touched chunks)` spans; an explicit outer materialization is
+  `O(requested bytes)`.
 - Global reclamation: `O(P + R + O)` for selectors `P`, reachable objects `R`,
   and scanned orphan candidates `O`. Scan memory is one page, but the prototype
   retains `O(R)` unique object IDs; a production implementation still needs a

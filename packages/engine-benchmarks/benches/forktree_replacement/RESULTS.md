@@ -249,6 +249,113 @@ production-cut gate rather than a property claimed by this benchmark.
   alone cost 239.8 ms. The single publication/GC epoch proves the same race
   invariant and restores publication to about 50 us.
 
+## Segmented authenticated byte-source phase
+
+This phase starts from frozen prototype `f69a91b09a8b8d088b45780caf7281f38d72133a`
+(tree `0c1f8a4870a2b803e145e7c5a95f743dd29245d9`, parent
+`143210be4a51f9af302fbf7febd11265701558d0`). The predecessor's fully
+deduplicated 64 MiB path spent approximately 2.06 ms Rocks / 2.44 ms Slate
+copying source bytes into the engine's contiguous window. Perfect elimination
+therefore capped the old 8.409/8.774 ms raw path at 6.349/6.334 ms, a
+24.5%/27.8% removable term and about a 20% win over the then-current
+comparator. Authentication itself is mandatory and is not part of that ceiling.
+
+The replacement is one interface and one format:
+
+- `SegmentedByteSource` declares exact length and yields immutable `Bytes`
+  spans. The same `SegmentedBytes` representation is returned by full/range
+  reads and can itself be fed to ingest/edit; only the range oracle explicitly
+  materializes at the outer consumer.
+- Domain-separated chunk IDs hash the declared chunk length and every span
+  incrementally. Matching prior-manifest chunks avoid CDC and presence work but
+  never avoid authentication.
+- FastCDC scans a span directly. A cut whose inspection window crosses a source
+  boundary uses one reusable 2 MiB scratch. If that crossing chunk is new, the
+  same bounded allocation packs the existing raw immutable chunk value and is
+  recovered after commit. This does not create a codec or persisted variant.
+- The producer owns two recycled 8 MiB spans outside the engine timing. Engine
+  payload scratch peaks at 2 MiB and does not grow from 64 to 512 MiB. There is
+  no whole-payload arena, second presence authority, alternate chunker, or
+  contiguous ingest fallback.
+
+### Exact 64 MiB medians
+
+Three fresh processes per cell on the final source semantics; setup and source
+prefetch initialization are excluded for both layouts. Times are raw wall.
+
+| Phase | Rocks current | Rocks segmented FT | Change | Slate current | Slate segmented FT | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Fresh ingest | 85.480 ms | 77.707 ms | -9.09% | 30.689 ms | 24.566 ms | -19.95% |
+| Fully deduplicated publication | 7.977 ms | 6.200 ms | -22.28% | 8.057 ms | 6.960 ms | -13.62% |
+| 4 KiB localized edit | 18.871 ms | 7.674 ms | -59.34% | 18.230 ms | 6.917 ms | -62.06% |
+| 64 KiB range read | 1.673 ms | 0.200 ms | -88.04% | 0.776 ms | 0.194 ms | -75.03% |
+| Segmented full read + owner authentication | 66.946 ms | 53.136 ms | -20.63% | 38.533 ms | 21.894 ms | -43.18% |
+
+Median repeat source wait is 0.051/0.038 ms, so source-delivery-excluded wall
+is 6.149/6.922 ms. The old source-copy artifact is gone: repeat allocation is
+36.7 KiB versus 1.346 MB on Rocks and 70.9 KiB versus 2.172 MB on Slate
+(-97.3%/-96.7%). Every one of 75 chunks is authenticated/reused, no chunk is
+written, no presence read is issued, and publication remains one existing
+atomic commit (four tiny puts / 331 logical bytes). Fresh allocation is
+4.56/5.06 MB versus 68.96/70.97 MB, phase RSS growth is 83.87/5.18 MB versus
+133.86/70.54 MB, and logical writes remain 67,114,612 bytes. Fresh CPU is 8/3
+ticks versus current 8/3; repeat is 1/1; edit is 2/1 versus current 3/2.
+
+The edit authenticates all 64 MiB, invokes CDC once, reuses 74/75 chunks, and
+writes one 725,608-byte chunk/metadata set. Full/range results preserve exact
+public bytes; full verification hashes the returned spans without a second
+contiguous allocation. Post-flush disk is 68.201 MB Rocks and 69.140 MB Slate,
+versus current 69.017/69.285 MB.
+
+### 512 MiB scaling
+
+Three-process ForkTree medians and three-process current medians:
+
+| Phase | Rocks current | Rocks segmented FT | Change | Slate current | Slate segmented FT | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Fresh ingest | 670.828 ms | 674.417 ms | +0.54% | 196.442 ms | 160.294 ms | -18.40% |
+| Fully deduplicated publication | 55.133 ms | 55.423 ms | +0.53% | 55.124 ms | 53.102 ms | -3.67% |
+| 4 KiB localized edit | 115.132 ms | 52.455 ms | -54.44% | 113.078 ms | 50.773 ms | -55.10% |
+| Segmented full read + owner authentication | 559.470 ms | 640.989 ms | +14.57% | 300.109 ms | 183.681 ms | -38.80% |
+
+The source/API bounds hold: fresh allocation is 5.17 MB Rocks / 10.07 MB Slate
+versus current 539.47/545.65 MB; repeat is 0.307/0.562 MB versus 1.347/2.209
+MB. Fresh phase RSS growth is 175.13/7.50 MB versus current 1,145/617.95 MB.
+All 675 repeat chunks and 674/675 edit chunks are reused. ForkTree writes
+536,919,860 logical bytes through 65 bounded commits; current writes
+536,950,516 through one commit. Post-flush disk is 538.396/539.263 MB versus
+current 538.946/539.001 MB, within 0.11% on both adapters.
+
+The 512 MiB Rocks full-read regression is real but is not attributed to the
+segmented source copy: before that read, 65 bounded emission commits leave
+about 1.017 GB of transient LSM files versus current's roughly 0.55 GB. After
+flush/close both converge near 539 MB. This lane does not alter the separately
+owned large-payload read path or compaction policy. The same bounded-commit
+tradeoff also leaves fresh Rocks CPU at 99 versus current 67 ticks even though
+raw fresh wall is within 0.6%; Slate fresh CPU improves to 21 from 46 ticks.
+
+### Correctness and race oracle
+
+Every measured ForkTree run performs branch, hash-pruned diff, merge,
+checkpoint, retained-root sweep, flush/drop/cold reopen/recovery, final release,
+and reclamation. The retained sweep deletes zero; final release reclaims the
+single changed chunk plus unreachable metadata while the merged range remains
+authenticated. Additional deterministic checks on both adapters prove:
+
+- publication-first rotates the single epoch and rejects a stale deleting
+  sweep;
+- GC-first rotates it and rejects stale root-only publication, while a public
+  retry after rereading state succeeds;
+- a crash-before-root authenticated orphan is reclaimed;
+- adapter immutable-identity overwrite protection fails closed, and a separate
+  forged new object key is rejected by ForkTree's owner-side hash/domain check.
+
+The segmented boundary therefore removes the last 64 MiB raw publication
+regression on both adapters while preserving one immutable object space, one
+selector/epoch plane, canonical chunk IDs, and 74/75 edit reuse. It is a GO for
+the manager's next architecture decision, not authorization for production
+wiring.
+
 ## Complexity and authority result
 
 - Current common tracked-state materialization is `O(N + D log_F N)` at a
@@ -257,12 +364,14 @@ production-cut gate rather than a property claimed by this benchmark.
 - Point/range are `O(log_F N + returned blocks)`. Aligned hash-pruned diff is
   `O(D log_F N + Z_d)`. Branch/checkpoint/undo/redo are `O(1)` selector plus
   epoch writes. Disjoint merge is diff plus changed-path apply.
-- Blob ingest is `O(L)` CPU and fresh physical bytes with `O(W + C)` payload
-  memory. Repeat/edit still read and authenticate `O(L)`, locality makes CDC
-  proportional to mismatch regions, and physical writes are `O(Z + metadata)`.
-  Final publication is `O(chunks)` manifest metadata but no longer performs
-  `O(chunks)` adapter preconditions. A range read is `O(requested bytes +
-  touched chunk bytes)`.
+- Blob ingest is `O(L)` authentication/CDC and fresh physical bytes with `O(C)`
+  engine payload memory plus two caller-owned `O(W)` source spans. Repeat/edit
+  still authenticate `O(L)`, but unchanged spans are never copied, locality
+  makes CDC proportional to mismatch regions, and physical writes are
+  `O(Z + metadata)`. Final publication is `O(chunks)` manifest metadata but no
+  longer performs `O(chunks)` adapter preconditions. A range read authenticates
+  `O(requested bytes + touched chunk bytes)`, returns `O(touched chunks)` spans,
+  and materializes `O(requested bytes)` only at an explicit outer consumer.
 - GC is `O(pins + reachable objects + scanned orphan candidates)`, scans in
   512-object pages, and keeps `O(reachable IDs + page)` memory. Production must
   replace the in-memory mark set for truly bounded large-repository GC.
@@ -287,14 +396,14 @@ the commit in the same object space.
 
 1. Add canonical local split/merge/repacking for inserts and deletes; prove
    shape-changing diff and bulk apply on both adapters.
-2. Design a segmented zero-copy source API so fully deduplicated publication
-   does not pay the prototype `Read` copy while preserving mandatory
-   authentication and bounded backpressure. Streaming immutable publication
-   and bounded ingest-owned memory are now demonstrated.
+2. Map the benchmark-only `SegmentedByteSource` contract onto public serving
+   callers without adding a compatibility path, and integrate with the
+   separately owned large-payload read work only after its physical-read cut is
+   stable. The architecture/API gate itself is now demonstrated.
 3. Implement general three-way conflicts and preserve semantic/rootless deltas
    required by plugins, audit, and metadata-only commits.
 4. Move the reachable mark set to bounded/external storage and qualify GC on a
    repository-scale object graph, especially SlateDB.
-5. Add deterministic corruption, crash-at-every-publication-point, concurrent
-   root publication versus sweep, and recovery tests before any production
-   serving cut.
+5. Extend the deterministic corruption and both-order epoch oracle demonstrated
+   here to crash-at-every-production-publication-point and true concurrent
+   scheduling before any serving cut.

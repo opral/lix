@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::io::Read;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 
 use bytes::{Bytes, BytesMut};
@@ -24,7 +23,6 @@ const INTERNAL_CHILDREN: usize = 8;
 const BLOB_MIN_BYTES: usize = 512 * 1024;
 const BLOB_AVG_BYTES: usize = 512 * 1024;
 const BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
-const BLOB_STREAM_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 
 pub const OBJECT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00f0_0001), "forktree_objects");
@@ -63,6 +61,68 @@ pub struct BlobAccounting {
     pub publication_us: u64,
     pub emission_batches: u64,
     pub peak_buffer_bytes: u64,
+}
+
+/// Canonical byte boundary for the replacement layout. Sources declare their
+/// exact logical length and transfer immutable spans without requiring a
+/// contiguous payload. Authentication remains owned by ForkTree and is
+/// incremental over these spans.
+pub trait SegmentedByteSource {
+    fn logical_bytes(&self) -> u64;
+    fn next_span(&mut self) -> Result<Option<Bytes>, String>;
+
+    /// A streaming producer may reclaim a consumed span's backing allocation.
+    /// Stored/read-backed sources can use the default drop behavior.
+    fn recycle_span(&mut self, _span: Bytes) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SegmentedBytes {
+    logical_bytes: u64,
+    spans: VecDeque<Bytes>,
+}
+
+impl SegmentedBytes {
+    fn new(logical_bytes: u64, spans: VecDeque<Bytes>) -> Self {
+        Self {
+            logical_bytes,
+            spans,
+        }
+    }
+
+    pub fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    pub fn authenticated_hash(&self) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        for span in &self.spans {
+            hasher.update(span);
+        }
+        hasher.finalize()
+    }
+
+    /// Explicit outer-consumer materialization. The object-space read path
+    /// itself remains segmented and does not allocate a second full payload.
+    pub fn materialize(self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.logical_bytes as usize);
+        for span in self.spans {
+            output.extend_from_slice(&span);
+        }
+        output
+    }
+}
+
+impl SegmentedByteSource for SegmentedBytes {
+    fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    fn next_span(&mut self) -> Result<Option<Bytes>, String> {
+        Ok(self.spans.pop_front())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -176,11 +236,207 @@ struct ChunkEmissionAccounting {
     emission_batches: u64,
 }
 
-#[derive(Clone, Copy)]
-struct WindowChunk {
+struct SegmentedChunk {
     id: ObjectId,
-    start: usize,
+    payload: ChunkPayload,
+}
+
+#[derive(Clone)]
+struct ChunkPayload {
+    spans: Vec<Bytes>,
     bytes: usize,
+}
+
+impl ChunkPayload {
+    fn into_contiguous(self, crossing_buffer: &mut BytesMut) -> (Bytes, bool) {
+        if self.spans.len() == 1 {
+            return (
+                self.spans.into_iter().next().expect("one chunk span"),
+                false,
+            );
+        }
+        let mut encoded = std::mem::take(crossing_buffer);
+        encoded.clear();
+        encoded.reserve(self.bytes);
+        for span in self.spans {
+            encoded.extend_from_slice(&span);
+        }
+        (encoded.freeze(), true)
+    }
+}
+
+struct SourceSpan {
+    bytes: Bytes,
+    offset: usize,
+}
+
+/// Bounded cursor over one authenticated segmented source. It retains only
+/// spans needed by the current chunk/emission batch. Runtime memory is
+/// O(source span window + BLOB_MAX_BYTES), independent of logical length.
+struct SegmentedCursor<R> {
+    source: R,
+    spans: VecDeque<SourceSpan>,
+    logical_bytes: u64,
+    delivered_bytes: u64,
+    consumed_bytes: u64,
+    available_bytes: usize,
+    source_read_us: u64,
+}
+
+impl<R> SegmentedCursor<R>
+where
+    R: SegmentedByteSource,
+{
+    fn new(source: R) -> Self {
+        let logical_bytes = source.logical_bytes();
+        Self {
+            source,
+            spans: VecDeque::new(),
+            logical_bytes,
+            delivered_bytes: 0,
+            consumed_bytes: 0,
+            available_bytes: 0,
+            source_read_us: 0,
+        }
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        self.logical_bytes.saturating_sub(self.consumed_bytes)
+    }
+
+    fn front_remaining(&self) -> usize {
+        self.spans
+            .front()
+            .map_or(0, |span| span.bytes.len().saturating_sub(span.offset))
+    }
+
+    fn front_consumed(&self) -> bool {
+        self.spans
+            .front()
+            .is_some_and(|span| span.offset == span.bytes.len())
+    }
+
+    fn ensure_available(&mut self, wanted: usize) -> Result<(), String> {
+        let wanted = wanted.min(self.remaining_bytes() as usize);
+        while self.available_bytes < wanted && self.delivered_bytes < self.logical_bytes {
+            let started = std::time::Instant::now();
+            let span = self.source.next_span()?;
+            self.source_read_us += started.elapsed().as_micros() as u64;
+            let span = span.ok_or_else(|| {
+                "ForkTree segmented source ended before its declared length".to_string()
+            })?;
+            if span.is_empty() {
+                return Err("ForkTree segmented source yielded an empty span".to_string());
+            }
+            let delivered = self
+                .delivered_bytes
+                .checked_add(span.len() as u64)
+                .ok_or_else(|| "ForkTree segmented source length overflow".to_string())?;
+            if delivered > self.logical_bytes {
+                return Err("ForkTree segmented source exceeded its declared length".to_string());
+            }
+            self.delivered_bytes = delivered;
+            self.available_bytes = self
+                .available_bytes
+                .checked_add(span.len())
+                .ok_or_else(|| "ForkTree segmented source window overflow".to_string())?;
+            self.spans.push_back(SourceSpan {
+                bytes: span,
+                offset: 0,
+            });
+        }
+        if self.available_bytes < wanted {
+            return Err("ForkTree segmented source is shorter than declared".to_string());
+        }
+        Ok(())
+    }
+
+    fn gather(&self, bytes: usize) -> Result<ChunkPayload, String> {
+        if bytes == 0 || bytes > self.available_bytes {
+            return Err("ForkTree segmented source gather is out of bounds".to_string());
+        }
+        let mut remaining = bytes;
+        let mut spans = Vec::new();
+        for source in &self.spans {
+            if source.offset == source.bytes.len() {
+                continue;
+            }
+            let available = source.bytes.len() - source.offset;
+            let take = available.min(remaining);
+            spans.push(source.bytes.slice(source.offset..source.offset + take));
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if remaining != 0 {
+            return Err("ForkTree segmented source has a discontinuous span window".to_string());
+        }
+        Ok(ChunkPayload { spans, bytes })
+    }
+
+    fn copy_prefix(&self, bytes: usize, output: &mut BytesMut) -> Result<(), String> {
+        let payload = self.gather(bytes)?;
+        output.clear();
+        output.reserve(bytes);
+        for span in payload.spans {
+            output.extend_from_slice(&span);
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, bytes: usize) -> Result<(), String> {
+        if bytes == 0 || bytes > self.available_bytes {
+            return Err("ForkTree segmented source advance is out of bounds".to_string());
+        }
+        let mut remaining = bytes;
+        for span in &mut self.spans {
+            let available = span.bytes.len().saturating_sub(span.offset);
+            let take = available.min(remaining);
+            span.offset += take;
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if remaining != 0 {
+            return Err("ForkTree segmented source advance crossed a gap".to_string());
+        }
+        self.available_bytes -= bytes;
+        self.consumed_bytes = self
+            .consumed_bytes
+            .checked_add(bytes as u64)
+            .ok_or_else(|| "ForkTree segmented source consumed length overflow".to_string())?;
+        Ok(())
+    }
+
+    fn recycle_consumed(&mut self) -> Result<(), String> {
+        while self.front_consumed() {
+            let span = self.spans.pop_front().expect("consumed source span");
+            self.source.recycle_span(span.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<u64, String> {
+        self.recycle_consumed()?;
+        if self.consumed_bytes != self.logical_bytes
+            || self.delivered_bytes != self.logical_bytes
+            || self.available_bytes != 0
+            || !self.spans.is_empty()
+        {
+            return Err("ForkTree segmented source did not finish exactly".to_string());
+        }
+        let started = std::time::Instant::now();
+        let trailing = self.source.next_span()?;
+        self.source_read_us += started.elapsed().as_micros() as u64;
+        if trailing.is_some() {
+            return Err(
+                "ForkTree segmented source has bytes beyond its declared length".to_string(),
+            );
+        }
+        Ok(self.source_read_us)
+    }
 }
 
 struct Head {
@@ -649,18 +905,20 @@ where
             .await
     }
 
-    /// Streams one blob through the single canonical CDC profile, emits
-    /// authenticated chunks in bounded immutable batches, then atomically
-    /// publishes only metadata, the branch selector, and the epoch. A crash
-    /// before publication can leave unreachable immutable objects, but cannot
-    /// expose a partial blob; reclamation owns those objects later.
+    /// Consumes one canonical segmented source through the single CDC profile,
+    /// incrementally authenticates borrowed spans, emits immutable chunks in
+    /// bounded batches, then atomically publishes only metadata, the branch
+    /// selector, and the epoch. FastCDC scans a source span directly; only a
+    /// boundary crossing uses a BLOB_MAX_BYTES scratch. A crash before final
+    /// publication can leave unreachable immutable objects, never a partial
+    /// live blob; reclamation owns those objects later.
     pub async fn ingest_blob<R>(
         &self,
         branch: &str,
-        mut source: R,
+        source: R,
     ) -> Result<(ObjectId, BlobAccounting), String>
     where
-        R: Read,
+        R: SegmentedByteSource,
     {
         let branch_key = selector_key(BRANCH_PREFIX, branch);
         let head = self.load_head_at_key(&branch_key).await?;
@@ -676,50 +934,33 @@ where
         let mut accounting = BlobAccounting::default();
         let mut chunks = Vec::new();
         let mut unique_chunks = std::collections::BTreeSet::new();
-        let mut buffer = BytesMut::zeroed(BLOB_STREAM_WINDOW_BYTES);
-        accounting.peak_buffer_bytes = buffer.len() as u64;
-        let mut buffered = 0_usize;
-        let mut eof = false;
+        let mut cursor = SegmentedCursor::new(source);
+        let mut boundary_scratch = BytesMut::new();
+        let mut crossing_buffer = BytesMut::new();
 
-        while buffered != 0 || !eof {
-            let source_started = std::time::Instant::now();
-            while buffered < buffer.len() && !eof {
-                let read = source
-                    .read(&mut buffer[buffered..])
-                    .map_err(|error| format!("read ForkTree blob stream: {error}"))?;
-                if read == 0 {
-                    eof = true;
-                } else {
-                    buffered += read;
-                }
+        while cursor.remaining_bytes() != 0 {
+            cursor.ensure_available(1)?;
+            if cursor.front_remaining() == 0 {
+                return Err("ForkTree segmented source made no progress".to_string());
             }
-            accounting.source_read_us += source_started.elapsed().as_micros() as u64;
-            if buffered == 0 {
-                break;
-            }
+            let mut segmented_chunks = Vec::new();
 
-            let mut consumed = 0_usize;
-            let mut window_chunks = Vec::new();
-            while consumed < buffered {
-                let remaining = buffered - consumed;
-                if !eof && remaining < BLOB_MAX_BYTES {
-                    break;
-                }
-
-                // A matching authenticated prior chunk is already a proven
-                // canonical boundary: FastCDC is deterministic from the last
-                // boundary and the bytes are identical. On a mismatch, run
-                // the one canonical chunker and resynchronize by object ID.
+            // One emission batch owns chunks beginning in the current source
+            // span. It may borrow following spans for a crossing chunk, then
+            // releases/recycles every fully consumed source allocation.
+            while !cursor.front_consumed() {
                 let previous = previous_manifest.chunks.get(previous_chunk_cursor);
                 let mut predicted = None;
                 if let Some(previous) = previous {
                     let previous_bytes = usize::try_from(previous.bytes)
                         .map_err(|_| "ForkTree prior blob chunk length exceeds usize")?;
-                    if previous_bytes <= remaining {
+                    if previous_bytes as u64 <= cursor.remaining_bytes() {
+                        cursor.ensure_available(previous_bytes)?;
+                        let payload = cursor.gather(previous_bytes)?;
                         let hash_started = std::time::Instant::now();
-                        let id = blob_chunk_id(&buffer[consumed..consumed + previous_bytes]);
+                        let id = blob_chunk_id_segments(&payload);
                         accounting.object_hash_us += hash_started.elapsed().as_micros() as u64;
-                        predicted = Some((previous_bytes, id));
+                        predicted = Some((previous_bytes, id, payload));
                         if id == previous.id {
                             accounting.locality_hits += 1;
                         } else {
@@ -728,43 +969,64 @@ where
                     }
                 }
 
-                let (chunk_bytes, id, known_existing) = match (previous, predicted) {
-                    (Some(previous), Some((bytes, id))) if id == previous.id => {
+                let (chunk_bytes, id, known_existing, payload) = match (previous, predicted) {
+                    (Some(previous), Some((bytes, id, payload))) if id == previous.id => {
                         previous_chunk_cursor += 1;
-                        (bytes, id, true)
+                        (bytes, id, true, payload)
                     }
-                    _ => {
+                    (previous, predicted) => {
+                        let inspect_bytes = BLOB_MAX_BYTES.min(cursor.remaining_bytes() as usize);
+                        cursor.ensure_available(inspect_bytes)?;
                         let chunking_started = std::time::Instant::now();
-                        let (_, chunk_bytes) = fastcdc::v2020::cut(
-                            &buffer[consumed..buffered],
-                            BLOB_MIN_BYTES,
-                            BLOB_AVG_BYTES,
-                            BLOB_MAX_BYTES,
-                            fastcdc::v2020::MASKS[20],
-                            fastcdc::v2020::MASKS[18],
-                            fastcdc::v2020::MASKS[20] << 1,
-                            fastcdc::v2020::MASKS[18] << 1,
-                        );
+                        let chunk_bytes = if cursor.front_remaining() >= inspect_bytes {
+                            let source = cursor
+                                .spans
+                                .front()
+                                .ok_or_else(|| "ForkTree CDC source span is missing".to_string())?;
+                            let (_, bytes) = fastcdc::v2020::cut(
+                                &source.bytes[source.offset..source.offset + inspect_bytes],
+                                BLOB_MIN_BYTES,
+                                BLOB_AVG_BYTES,
+                                BLOB_MAX_BYTES,
+                                fastcdc::v2020::MASKS[20],
+                                fastcdc::v2020::MASKS[18],
+                                fastcdc::v2020::MASKS[20] << 1,
+                                fastcdc::v2020::MASKS[18] << 1,
+                            );
+                            bytes
+                        } else {
+                            cursor.copy_prefix(inspect_bytes, &mut boundary_scratch)?;
+                            accounting.peak_buffer_bytes = accounting
+                                .peak_buffer_bytes
+                                .max(boundary_scratch.len() as u64);
+                            let (_, bytes) = fastcdc::v2020::cut(
+                                &boundary_scratch,
+                                BLOB_MIN_BYTES,
+                                BLOB_AVG_BYTES,
+                                BLOB_MAX_BYTES,
+                                fastcdc::v2020::MASKS[20],
+                                fastcdc::v2020::MASKS[18],
+                                fastcdc::v2020::MASKS[20] << 1,
+                                fastcdc::v2020::MASKS[18] << 1,
+                            );
+                            bytes
+                        };
                         accounting.chunking_us += chunking_started.elapsed().as_micros() as u64;
-                        if chunk_bytes == 0 || chunk_bytes > remaining {
+                        if chunk_bytes == 0 || chunk_bytes > inspect_bytes {
                             return Err("ForkTree CDC produced an invalid chunk size".to_string());
                         }
-                        let id = if let Some((predicted_bytes, id)) = predicted {
+                        let payload = if let Some((predicted_bytes, _, payload)) = predicted {
                             if predicted_bytes == chunk_bytes {
-                                id
+                                payload
                             } else {
-                                let hash_started = std::time::Instant::now();
-                                let id = blob_chunk_id(&buffer[consumed..consumed + chunk_bytes]);
-                                accounting.object_hash_us +=
-                                    hash_started.elapsed().as_micros() as u64;
-                                id
+                                cursor.gather(chunk_bytes)?
                             }
                         } else {
-                            let hash_started = std::time::Instant::now();
-                            let id = blob_chunk_id(&buffer[consumed..consumed + chunk_bytes]);
-                            accounting.object_hash_us += hash_started.elapsed().as_micros() as u64;
-                            id
+                            cursor.gather(chunk_bytes)?
                         };
+                        let hash_started = std::time::Instant::now();
+                        let id = blob_chunk_id_segments(&payload);
+                        accounting.object_hash_us += hash_started.elapsed().as_micros() as u64;
                         let known_existing = if let Some(index) = previous_chunk_positions.get(&id)
                         {
                             previous_chunk_cursor = index.saturating_add(1);
@@ -775,12 +1037,9 @@ where
                         } else {
                             false
                         };
-                        (chunk_bytes, id, known_existing)
+                        (chunk_bytes, id, known_existing, payload)
                     }
                 };
-                if chunk_bytes == 0 || chunk_bytes > remaining {
-                    return Err("ForkTree CDC produced an invalid chunk size".to_string());
-                }
                 chunks.push(BlobChunkRef {
                     id,
                     bytes: chunk_bytes as u64,
@@ -789,50 +1048,58 @@ where
                 if !unique_chunks.insert(id) || known_existing {
                     accounting.reused_chunks += 1;
                 } else {
-                    window_chunks.push(WindowChunk {
-                        id,
-                        start: consumed,
-                        bytes: chunk_bytes,
-                    });
+                    segmented_chunks.push(SegmentedChunk { id, payload });
                 }
-                consumed += chunk_bytes;
-            }
-            if consumed == 0 {
-                return Err("ForkTree CDC streaming window made no progress".to_string());
+                cursor.advance(chunk_bytes)?;
             }
 
-            let ids = window_chunks
+            let ids = segmented_chunks
                 .iter()
                 .map(|chunk| chunk.id)
                 .collect::<Vec<_>>();
             let dedup_started = std::time::Instant::now();
             let existing = self.existing_object_ids(&ids).await?;
             accounting.dedup_read_us += dedup_started.elapsed().as_micros() as u64;
-            let window = buffer.freeze();
             let mut pending_chunks = BTreeMap::new();
-            for chunk in window_chunks {
+            let mut crossing_id = None;
+            for chunk in segmented_chunks {
                 if existing.contains(&chunk.id) {
                     accounting.reused_chunks += 1;
                     continue;
                 }
-                pending_chunks.insert(
-                    chunk.id,
-                    window.slice(chunk.start..chunk.start + chunk.bytes),
-                );
+                let encode_started = std::time::Instant::now();
+                let (payload, crossed_source_span) =
+                    chunk.payload.into_contiguous(&mut crossing_buffer);
+                accounting.object_encode_us += encode_started.elapsed().as_micros() as u64;
+                accounting.peak_buffer_bytes = accounting
+                    .peak_buffer_bytes
+                    .max(payload.len() as u64 * u64::from(crossed_source_span));
+                if crossed_source_span {
+                    if crossing_id.replace(chunk.id).is_some() {
+                        return Err(
+                            "ForkTree emission batch has multiple crossing chunks".to_string()
+                        );
+                    }
+                }
+                pending_chunks.insert(chunk.id, payload);
             }
-            accounting.peak_buffer_bytes = accounting.peak_buffer_bytes.max(window.len() as u64);
             let emitted = self.emit_chunk_batch(&mut pending_chunks).await?;
             accounting.object_writes += emitted.object_writes;
             accounting.object_bytes += emitted.object_bytes;
             accounting.emission_us += emitted.emission_us;
             accounting.emission_batches += emitted.emission_batches;
-
-            buffer = window.try_into_mut().map_err(|_| {
-                "ForkTree chunk emission retained the completed streaming window".to_string()
-            })?;
-            buffer.copy_within(consumed..buffered, 0);
-            buffered -= consumed;
+            if let Some(id) = crossing_id {
+                let encoded = pending_chunks.remove(&id).ok_or_else(|| {
+                    "ForkTree crossing chunk disappeared after emission".to_string()
+                })?;
+                crossing_buffer = encoded.try_into_mut().map_err(|_| {
+                    "ForkTree storage retained a committed crossing chunk".to_string()
+                })?;
+            }
+            pending_chunks.clear();
+            cursor.recycle_consumed()?;
         }
+        accounting.source_read_us = cursor.finish()?;
 
         let manifest = BlobManifest {
             logical_bytes: accounting.logical_bytes,
@@ -949,11 +1216,10 @@ where
         write.commit().await.map_err(storage_error)?;
         accounting.emission_us = emission_started.elapsed().as_micros() as u64;
         accounting.emission_batches = 1;
-        pending.clear();
         Ok(accounting)
     }
 
-    pub async fn read_blob(&self, branch: &str) -> Result<Vec<u8>, String> {
+    pub async fn read_blob(&self, branch: &str) -> Result<SegmentedBytes, String> {
         let commit = self.load_commit(self.branch_head(branch).await?).await?;
         let manifest_id = commit
             .blob
@@ -968,7 +1234,7 @@ where
         branch: &str,
         start: u64,
         end: u64,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<SegmentedBytes, String> {
         let commit = self.load_commit(self.branch_head(branch).await?).await?;
         let manifest_id = commit
             .blob
@@ -1255,6 +1521,211 @@ where
             resume_after = page.entries.last().map(|entry| entry.key.clone());
         }
         Ok(accounting)
+    }
+
+    /// Deterministic prototype oracle for both epoch orderings. It stages an
+    /// unreachable authenticated object as the crash-before-root case, then
+    /// proves publication-first rejects a stale deleting sweep and GC-first
+    /// rejects a stale root-only publication. The retry uses the public owner
+    /// path after rereading the epoch.
+    pub async fn verify_publication_gc_races(&self) -> Result<(), String> {
+        let main = self.branch_head("main").await?;
+
+        let publication_first_orphan = self
+            .stage_test_orphan(b"ForkTree publication-first crash orphan")
+            .await?;
+        let (publication_epoch, publication_raw_epoch) = self.load_epoch().await?;
+        self.create_branch("race-publication-first", Some(main))
+            .await?;
+        if self
+            .attempt_test_delete(
+                publication_first_orphan,
+                publication_epoch,
+                publication_raw_epoch,
+            )
+            .await
+            .is_ok()
+        {
+            return Err("ForkTree stale GC committed after root publication".to_string());
+        }
+        self.delete_branch("race-publication-first").await?;
+        let swept = self.reclaim_unreachable().await?;
+        if swept.reclaimed_objects == 0 {
+            return Err("ForkTree crash orphan was not reclaimed after retry".to_string());
+        }
+
+        self.stage_test_orphan(b"ForkTree GC-first crash orphan")
+            .await?;
+        let (gc_epoch, gc_raw_epoch) = self.load_epoch().await?;
+        let selector = selector_key(BRANCH_PREFIX, "race-gc-first");
+        let raw_ref = encode_ref(main);
+        let next_epoch = encode_epoch(gc_epoch.saturating_add(1));
+        let swept = self.reclaim_unreachable().await?;
+        if swept.reclaimed_objects == 0 {
+            return Err("ForkTree GC-first oracle did not rotate the epoch".to_string());
+        }
+        let stale_publication = async {
+            let mut write = self
+                .storage
+                .begin_write(WriteOptions {
+                    preconditions: vec![
+                        Precondition::KeyAbsent {
+                            space: REF_SPACE,
+                            key: key(&selector),
+                        },
+                        Precondition::KeyValueEquals {
+                            space: REF_SPACE,
+                            key: key(EPOCH_KEY),
+                            expected: gc_raw_epoch,
+                        },
+                    ],
+                    batch_capacity_hint_bytes: raw_ref.len() + next_epoch.len(),
+                    ..WriteOptions::default()
+                })
+                .await
+                .map_err(storage_error)?;
+            write
+                .put_many(
+                    REF_SPACE,
+                    PutBatch {
+                        entries: vec![
+                            PutEntry {
+                                key: key(&selector),
+                                value: StoredValue { bytes: raw_ref },
+                            },
+                            PutEntry {
+                                key: key(EPOCH_KEY),
+                                value: StoredValue { bytes: next_epoch },
+                            },
+                        ],
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            write.commit().await.map_err(storage_error)?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if stale_publication.is_ok() {
+            return Err("ForkTree stale publication committed after GC".to_string());
+        }
+        self.create_branch("race-gc-first", Some(main)).await?;
+        self.delete_branch("race-gc-first").await?;
+        Ok(())
+    }
+
+    /// Corrupts one live chunk through the raw benchmark adapter and proves
+    /// that the next cold-cache owner read authenticates the object key before
+    /// returning bytes. This is destructive test injection and must run last.
+    pub async fn verify_blob_corruption_fail_closed(&self, branch: &str) -> Result<(), String> {
+        let commit = self.load_commit(self.branch_head(branch).await?).await?;
+        let manifest = self.load_blob_manifest(commit.blob).await?;
+        let chunk = manifest
+            .chunks
+            .first()
+            .ok_or_else(|| "ForkTree corruption oracle needs a blob chunk".to_string())?;
+        let mut corrupted = self.load_object(chunk.id).await?.to_vec();
+        corrupted[0] ^= 0x80;
+        let mut pending = BTreeMap::new();
+        pending.insert(chunk.id, Bytes::from(corrupted));
+        let overwrite = async {
+            let mut write = self
+                .storage
+                .begin_write(WriteOptions::default())
+                .await
+                .map_err(storage_error)?;
+            write
+                .put_many(OBJECT_SPACE, object_batch(&pending))
+                .await
+                .map_err(storage_error)?;
+            write.commit().await.map_err(storage_error)?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if overwrite.is_ok() && self.read_blob_range(branch, 0, 1).await.is_ok() {
+            return Err("ForkTree returned bytes from a corrupted chunk".to_string());
+        }
+
+        // A new forged key bypasses the adapter's duplicate-immutable check,
+        // so owner-side domain/hash validation must independently reject it.
+        let forged_id = ObjectId([0xa5; 32]);
+        let mut forged = BTreeMap::new();
+        forged.insert(
+            forged_id,
+            Bytes::from_static(b"ForkTree forged object bytes"),
+        );
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions::default())
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(OBJECT_SPACE, object_batch(&forged))
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        if self.load_object(forged_id).await.is_ok() {
+            return Err("ForkTree accepted bytes under a forged object identity".to_string());
+        }
+        Ok(())
+    }
+
+    async fn stage_test_orphan(&self, payload: &'static [u8]) -> Result<ObjectId, String> {
+        let payload = Bytes::from_static(payload);
+        let id = blob_chunk_id(&payload);
+        let mut pending = BTreeMap::new();
+        pending.insert(id, payload);
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions::default())
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(OBJECT_SPACE, object_batch(&pending))
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(id)
+    }
+
+    async fn attempt_test_delete(
+        &self,
+        id: ObjectId,
+        epoch: u64,
+        raw_epoch: Bytes,
+    ) -> Result<(), String> {
+        let next_epoch = encode_epoch(epoch.saturating_add(1));
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                preconditions: vec![Precondition::KeyValueEquals {
+                    space: REF_SPACE,
+                    key: key(EPOCH_KEY),
+                    expected: raw_epoch,
+                }],
+                batch_capacity_hint_bytes: next_epoch.len(),
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        write
+            .delete_many(OBJECT_SPACE, &[key(&id.0)])
+            .await
+            .map_err(storage_error)?;
+        write
+            .put_many(
+                REF_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key(EPOCH_KEY),
+                        value: StoredValue { bytes: next_epoch },
+                    }],
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(())
     }
 
     /// Publishes an authenticated retention boundary with the same state and
@@ -1564,12 +2035,12 @@ where
         manifest: &BlobManifest,
         start: u64,
         end: u64,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<SegmentedBytes, String> {
         if start > end || end > manifest.logical_bytes {
             return Err("ForkTree blob range is out of bounds".to_string());
         }
         if start == end {
-            return Ok(Vec::new());
+            return Ok(SegmentedBytes::default());
         }
         let mut offset = 0_u64;
         let mut selected = Vec::new();
@@ -1587,19 +2058,21 @@ where
             .map(|(chunk, _)| chunk.id)
             .collect::<Vec<_>>();
         let objects = self.load_objects(&ids).await?;
-        let mut output = Vec::with_capacity((end - start) as usize);
+        let mut output = VecDeque::with_capacity(selected.len());
+        let mut output_bytes = 0_u64;
         for ((chunk, chunk_start), object) in selected.into_iter().zip(objects) {
-            let payload = decode_blob_chunk(&object, chunk.bytes)?;
+            validate_blob_chunk(&object, chunk.bytes)?;
             let local_start = start.saturating_sub(chunk_start) as usize;
             let local_end = end
                 .min(chunk_start + chunk.bytes)
                 .saturating_sub(chunk_start) as usize;
-            output.extend_from_slice(&payload[local_start..local_end]);
+            output_bytes += (local_end - local_start) as u64;
+            output.push_back(object.slice(local_start..local_end));
         }
-        if output.len() as u64 != end - start {
+        if output_bytes != end - start {
             return Err("ForkTree blob manifest has a discontinuous layout".to_string());
         }
-        Ok(output)
+        Ok(SegmentedBytes::new(output_bytes, output))
     }
 
     fn collect_rows<'a>(
@@ -2106,6 +2579,17 @@ fn blob_chunk_id(payload: &[u8]) -> ObjectId {
     ObjectId(*hasher.finalize().as_bytes())
 }
 
+fn blob_chunk_id_segments(payload: &ChunkPayload) -> ObjectId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OBJECT_MAGIC);
+    hasher.update(&[BLOB_CHUNK_TAG]);
+    hasher.update(&(payload.bytes as u64).to_be_bytes());
+    for span in &payload.spans {
+        hasher.update(span);
+    }
+    ObjectId(*hasher.finalize().as_bytes())
+}
+
 fn encode_blob_manifest(manifest: &BlobManifest) -> Bytes {
     let mut bytes = object_prefix(BLOB_MANIFEST_TAG);
     put_u64(&mut bytes, manifest.logical_bytes);
@@ -2209,11 +2693,11 @@ fn decode_value_pack(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(values)
 }
 
-fn decode_blob_chunk(bytes: &[u8], expected_bytes: u64) -> Result<Vec<u8>, String> {
+fn validate_blob_chunk(bytes: &[u8], expected_bytes: u64) -> Result<(), String> {
     if bytes.len() as u64 != expected_bytes {
         return Err("ForkTree blob chunk declared size mismatch".to_string());
     }
-    Ok(bytes.to_vec())
+    Ok(())
 }
 
 fn decode_blob_manifest(bytes: &[u8]) -> Result<BlobManifest, String> {

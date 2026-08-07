@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use bytes::Bytes;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
@@ -9,7 +10,7 @@ use lix::{CreateBranchOptions, MergeBranchOptions, SwitchBranchOptions, Value};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
-use super::model::{ApplyAccounting, ForkTree, Update};
+use super::model::{ApplyAccounting, ForkTree, SegmentedByteSource, Update};
 use super::{
     Backend, CountingStorage, IoStats, Layout, Parameters, Scenario, apply_current,
     apply_replacement, begin_allocation_profile, directory_bytes, end_allocation_profile,
@@ -1006,16 +1007,15 @@ impl std::io::Read for DeterministicBlobReader {
 
 const BLOB_PREFETCH_BYTES: usize = 8 * 1024 * 1024;
 
-struct PrefetchedBlobReader {
-    current: Vec<u8>,
-    current_bytes: usize,
-    current_offset: usize,
-    current_is_last: bool,
+struct PrefetchedBlobSource {
+    logical_bytes: u64,
+    next: Option<(Vec<u8>, usize, bool)>,
+    finished: bool,
     ready: std::sync::mpsc::Receiver<(Vec<u8>, usize, bool)>,
     recycle: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
-impl PrefetchedBlobReader {
+impl PrefetchedBlobSource {
     fn new(bytes: usize, edit_start: Option<usize>) -> Self {
         let mut source = DeterministicBlobReader::new(bytes, edit_start);
         let mut first = vec![0_u8; BLOB_PREFETCH_BYTES];
@@ -1039,44 +1039,55 @@ impl PrefetchedBlobReader {
             });
         }
         Self {
-            current: first,
-            current_bytes: first_bytes,
-            current_offset: 0,
-            current_is_last: first_is_last,
+            logical_bytes: bytes as u64,
+            next: Some((first, first_bytes, first_is_last)),
+            finished: false,
             ready,
             recycle,
         }
     }
 }
 
-impl std::io::Read for PrefetchedBlobReader {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if self.current_offset == self.current_bytes {
-            if self.current_is_last {
-                return Ok(0);
-            }
-            let (next, next_bytes, next_is_last) = self.ready.recv().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "ForkTree blob prefetch producer stopped",
-                )
-            })?;
-            let previous = std::mem::replace(&mut self.current, next);
-            let _ = self.recycle.send(previous);
-            self.current_bytes = next_bytes;
-            self.current_offset = 0;
-            self.current_is_last = next_is_last;
-            if next_bytes == 0 {
-                return Ok(0);
-            }
+impl SegmentedByteSource for PrefetchedBlobSource {
+    fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    fn next_span(&mut self) -> Result<Option<Bytes>, String> {
+        if self.finished {
+            return Ok(None);
         }
-        let bytes = output
-            .len()
-            .min(self.current_bytes.saturating_sub(self.current_offset));
-        output[..bytes]
-            .copy_from_slice(&self.current[self.current_offset..self.current_offset + bytes]);
-        self.current_offset += bytes;
-        Ok(bytes)
+        let (mut buffer, bytes, is_last) = match self.next.take() {
+            Some(first) => first,
+            None => self.ready.recv().map_err(|_| {
+                "ForkTree segmented prefetch producer stopped before completion".to_string()
+            })?,
+        };
+        self.finished = is_last;
+        if bytes == 0 {
+            return if is_last {
+                Ok(None)
+            } else {
+                Err("ForkTree segmented prefetch yielded an empty non-final span".to_string())
+            };
+        }
+        buffer.truncate(bytes);
+        Ok(Some(Bytes::from(buffer)))
+    }
+
+    fn recycle_span(&mut self, span: Bytes) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        let mut buffer = span.try_into_mut().map_err(|_| {
+            "ForkTree segmented ingest retained a completed source span".to_string()
+        })?;
+        buffer.resize(BLOB_PREFETCH_BYTES, 0);
+        // The producer may already have emitted the empty terminal marker and
+        // exited for an exact-window payload. In that case this allocation no
+        // longer needs recycling.
+        let _ = self.recycle.send(Vec::from(buffer));
+        Ok(())
     }
 }
 
@@ -1275,7 +1286,7 @@ where
                 counters,
                 fixture
                     .tree
-                    .ingest_blob("main", PrefetchedBlobReader::new(blob_bytes, None)),
+                    .ingest_blob("main", PrefetchedBlobSource::new(blob_bytes, None)),
             )
             .await
             .expect("ingest ForkTree 64 MiB blob");
@@ -1289,7 +1300,7 @@ where
                 counters,
                 fixture
                     .tree
-                    .ingest_blob("main", PrefetchedBlobReader::new(blob_bytes, None)),
+                    .ingest_blob("main", PrefetchedBlobSource::new(blob_bytes, None)),
             )
             .await
             .expect("repeat ForkTree blob ingest");
@@ -1316,7 +1327,7 @@ where
                 counters,
                 fixture.tree.ingest_blob(
                     "source",
-                    PrefetchedBlobReader::new(blob_bytes, Some(edit_start)),
+                    PrefetchedBlobSource::new(blob_bytes, Some(edit_start)),
                 ),
             )
             .await
@@ -1366,7 +1377,8 @@ where
                     .read_blob_range("main", oracle.range_start, oracle.range_end),
             )
             .await
-            .expect("range-read ForkTree blob");
+            .expect("range-read ForkTree blob")
+            .materialize();
             assert_eq!(range, oracle.range);
             let full = measure_phase(
                 "blob_full_read_64m",
@@ -1379,7 +1391,8 @@ where
             )
             .await
             .expect("read ForkTree blob");
-            assert_eq!(blake3::hash(&full).as_bytes(), &oracle.hash);
+            assert_eq!(full.logical_bytes(), blob_bytes as u64);
+            assert_eq!(full.authenticated_hash().as_bytes(), &oracle.hash);
             measure_phase(
                 "blob_checkpoint",
                 parameters,
@@ -1494,7 +1507,7 @@ where
                 counters,
                 fixture
                     .tree
-                    .ingest_blob("main", PrefetchedBlobReader::new(bytes, None)),
+                    .ingest_blob("main", PrefetchedBlobSource::new(bytes, None)),
             )
             .await
             .expect("profile ForkTree blob ingest");
@@ -1602,11 +1615,12 @@ async fn run_blob_reopen<S>(
                     assert_eq!(
                         tree.read_blob_range("main", oracle.range_start, oracle.range_end)
                             .await
-                            .expect("cold ForkTree blob range"),
+                            .expect("cold ForkTree blob range")
+                            .materialize(),
                         oracle.range
                     );
                     let full = tree.read_blob("main").await.expect("cold ForkTree blob");
-                    assert_eq!(blake3::hash(&full).as_bytes(), &oracle.hash);
+                    assert_eq!(full.authenticated_hash().as_bytes(), &oracle.hash);
                     let recovery = tree
                         .checkpoint_head("blob")
                         .await
@@ -1621,7 +1635,8 @@ async fn run_blob_reopen<S>(
                             oracle.range_end
                         )
                         .await
-                        .expect("read recovered ForkTree blob"),
+                        .expect("read recovered ForkTree blob")
+                        .materialize(),
                         oracle.range
                     );
                 },
@@ -1651,7 +1666,8 @@ async fn run_blob_reopen<S>(
             assert_eq!(
                 tree.read_blob_range("main", oracle.range_start, oracle.range_end)
                     .await
-                    .expect("read ForkTree blob after reclamation"),
+                    .expect("read ForkTree blob after reclamation")
+                    .materialize(),
                 oracle.range
             );
             println!(
@@ -1663,6 +1679,16 @@ async fn run_blob_reopen<S>(
                 reclaimed.reclaimed_bytes,
                 reclaimed.pages,
                 reclaimed.peak_frontier
+            );
+            tree.verify_publication_gc_races()
+                .await
+                .expect("verify ForkTree publication/GC epoch orderings");
+            tree.verify_blob_corruption_fail_closed("main")
+                .await
+                .expect("verify ForkTree blob corruption fails closed");
+            println!(
+                "forktree_vertical_oracle,scenario=Blob,backend={},publication_gc_orderings=pass,crash_orphan_retry=pass,corruption=fail_closed",
+                parameters.backend.label()
             );
         }
     }
