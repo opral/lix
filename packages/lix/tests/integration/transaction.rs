@@ -503,6 +503,51 @@ async fn existing_workspace_session_ignores_later_selector_corruption() {
 }
 
 #[tokio::test]
+async fn explicit_transaction_open_uses_one_authoritative_snapshot_in_every_session_mode() {
+    let storage = RecordingStorage::new();
+    let receipt = Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("initialized storage should create an engine");
+    let workspace = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let before = storage.stats();
+    let workspace_transaction = workspace
+        .begin_transaction()
+        .await
+        .expect("workspace transaction should open");
+    let delta = storage.stats().delta_since(&before);
+    assert_eq!(delta.read_opened, 1, "workspace open must own one snapshot");
+    assert_eq!(delta.write_opened, 0, "transaction open must not write");
+    workspace_transaction
+        .rollback()
+        .await
+        .expect("workspace transaction should roll back");
+
+    let pinned = engine
+        .open_session(receipt.main_branch_id)
+        .await
+        .expect("pinned session should open");
+    let before = storage.stats();
+    let pinned_transaction = pinned
+        .begin_transaction()
+        .await
+        .expect("pinned transaction should open");
+    let delta = storage.stats().delta_since(&before);
+    assert_eq!(delta.read_opened, 1, "pinned open must own one snapshot");
+    assert_eq!(delta.write_opened, 0, "transaction open must not write");
+    pinned_transaction
+        .rollback()
+        .await
+        .expect("pinned transaction should roll back");
+}
+
+#[tokio::test]
 async fn existing_workspace_session_writes_to_its_pinned_branch() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())

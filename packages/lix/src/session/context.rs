@@ -367,15 +367,6 @@ where
         self.transaction_manager.ensure_open()
     }
 
-    pub(super) async fn deterministic_mode_enabled(&self) -> Result<bool, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        crate::functions::deterministic_mode_enabled(&read).await
-    }
-
     pub(super) async fn lock_deterministic_runtime(
         &self,
     ) -> crate::functions::DeterministicRuntimeGuard {
@@ -624,6 +615,10 @@ impl SessionWriteAccess {
                     .await,
             );
         }
+    }
+
+    pub(super) fn release_collaboration_write_serialization(&mut self) {
+        self.collaboration_write_guard.take();
     }
 }
 
