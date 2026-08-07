@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Bound, Deref, Range};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::changelog::ChangeRecordProjection;
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest};
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
@@ -35,6 +36,7 @@ use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
     TrackedStateCommitRoot, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
     TrackedStateKeyRef, TrackedStateRootId, TrackedStateSingleStringReplacementRef,
+    TrackedStateTreeScanRequest,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
@@ -519,6 +521,15 @@ pub(crate) struct CommitDeltaMember {
     pub(crate) authored: bool,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     selected_tombstone: bool,
+}
+
+/// One authenticated mutation snapshot from a retained rootless commit.
+/// Root consumers use this only when no dense tree root exists; it preserves
+/// the canonical packed-delta and JSON-store serving authorities.
+pub(crate) struct RetainedCommitSnapshot {
+    pub(crate) key: TrackedStateKey,
+    pub(crate) deleted: bool,
+    pub(crate) snapshot: Option<String>,
 }
 
 impl CommitDeltaMember {
@@ -7589,6 +7600,118 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         member.selected_tombstone = member.value.deleted;
     }
     Ok(Some(merge_selected_source_members(members, local)))
+}
+
+/// Materializes snapshots for selected schemas from one retained physical
+/// commit authority without depending on its rebuildable changelog projection.
+/// Rooted commits scan their authenticated snapshot tree; rootless commits use
+/// their authenticated bounded mutation delta. Work is O(selected tree rows or
+/// selected mutations + JSON payload bytes), with memory bounded by that one
+/// retained commit selection.
+pub(crate) async fn load_retained_commit_snapshots_for_schemas(
+    store: &impl StorageAdapterRead,
+    commit_id: CommitId,
+    schema_keys: &[String],
+) -> Result<Vec<RetainedCommitSnapshot>, LixError> {
+    let manifest = load_commit_state_manifest(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("retained tracked-state commit '{commit_id}' has no physical manifest"),
+            )
+        })?;
+    if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+        let request = TrackedStateTreeScanRequest {
+            schema_keys: schema_keys.to_vec(),
+            entity_pks: Vec::new(),
+            file_ids: Vec::new(),
+            include_tombstones: true,
+            limit: None,
+        };
+        let entries = crate::tracked_state::tree::TrackedStateTree::new()
+            .scan(store, &snapshot_root.root_id, &request)
+            .await?;
+        let rows = crate::tracked_state::materialize_batch_from_index_entries(
+            store,
+            entries,
+            &ChangeRecordProjection {
+                snapshot_content: true,
+                metadata: false,
+            },
+        )
+        .await?
+        .into_rows();
+        return Ok(rows
+            .into_iter()
+            .map(|row| RetainedCommitSnapshot {
+                key: TrackedStateKey {
+                    entity_pk: row.entity_pk,
+                    schema_key: row.schema_key,
+                    file_id: row.file_id,
+                },
+                deleted: row.deleted,
+                snapshot: row.snapshot_content.map(Into::into),
+            })
+            .collect());
+    }
+    let members = load_commit_delta_members_with_payloads_for_schemas(
+        store,
+        commit_id,
+        schema_keys,
+        usize::MAX,
+    )
+    .await?
+    .expect("unbounded retained snapshot scan cannot exceed its segment limit");
+    let json_refs = members
+        .iter()
+        .filter_map(|member| match &member.change.snapshot {
+            crate::json_store::JsonSlot::Ref(json_ref) => Some(*json_ref),
+            crate::json_store::JsonSlot::None | crate::json_store::JsonSlot::Inline(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let loaded = crate::json_store::JsonStoreContext::new()
+        .reader(store)
+        .load_bytes_many(crate::json_store::JsonLoadRequestRef {
+            refs: &json_refs,
+            scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+        })
+        .await?
+        .into_values();
+    let mut loaded = loaded.into_iter();
+    members
+        .into_iter()
+        .map(|member| {
+            let snapshot = match member.change.snapshot {
+                crate::json_store::JsonSlot::None => None,
+                crate::json_store::JsonSlot::Inline(snapshot) => Some(snapshot.into()),
+                crate::json_store::JsonSlot::Ref(json_ref) => {
+                    let bytes = loaded.next().flatten().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!(
+                                "retained commit '{commit_id}' references missing JSON '{}'",
+                                json_ref.to_hex()
+                            ),
+                        )
+                    })?;
+                    Some(String::from_utf8(bytes.to_vec()).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!(
+                                "retained commit '{commit_id}' references non-UTF-8 snapshot JSON"
+                            ),
+                        )
+                    })?)
+                }
+            };
+            Ok(RetainedCommitSnapshot {
+                key: member.key,
+                deleted: member.value.deleted,
+                snapshot,
+            })
+        })
+        .collect()
 }
 
 async fn load_authenticated_local_commit_delta_members_for_schemas(

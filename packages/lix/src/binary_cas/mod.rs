@@ -48,3 +48,17 @@ pub(crate) async fn stage_gc_reclamation(
 ) -> Result<BinaryCasGcSweep, crate::LixError> {
     kv::stage_reclaim_unreachable_binary_cas(store, writes, blob_roots, upload_chunks).await
 }
+
+/// Stages the single authenticated publication/reclamation epoch owned by the
+/// binary CAS. Every logical CAS publisher and every sweep rotates this row in
+/// the same atomic commit. A publisher and sweep planned from one snapshot can
+/// therefore never both commit, including when publication reuses every
+/// immutable payload row.
+pub(crate) async fn stage_mutation_epoch(
+    store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    writes: &mut crate::storage_adapter::StorageWriteSet,
+    preconditions: &mut Vec<crate::storage_adapter::StoragePrecondition>,
+) -> Result<(), crate::LixError> {
+    let (current, token) = kv::load_mutation_epoch(store).await?;
+    kv::stage_mutation_epoch(writes, preconditions, current, token)
+}

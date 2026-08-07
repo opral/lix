@@ -3473,6 +3473,7 @@ dependencies = [
  "datafusion",
  "duckdb",
  "futures-util",
+ "libc",
  "lix",
  "lix-storage-rocksdb",
  "lix-storage-slatedb",

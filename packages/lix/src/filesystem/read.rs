@@ -37,7 +37,13 @@ where
     let current = crate::live_state::TrackedHeadContext::new()
         .reader(store)
         .scan_live_batches_for_controls(controls, &request, Some(true))
-        .await?;
+        .await
+        .map_err(|error| {
+            LixError::new(
+                error.code,
+                format!("collect current binary blob roots: {}", error.message),
+            )
+        })?;
     for (_, rows) in current {
         for row in rows.iter() {
             let snapshot = row.snapshot_content().ok_or_else(|| {
@@ -50,22 +56,25 @@ where
         }
     }
 
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+    let retained_schema_keys = [BLOB_REF_SCHEMA_KEY.to_owned()];
     for commit_id in retained_commits {
-        let rows = reader
-            .scan_batch_at_commit(&commit_id.to_string(), &request)
-            .await?;
-        for row in rows.iter() {
-            if row.deleted() {
+        for row in crate::tracked_state::load_retained_commit_snapshots_for_schemas(
+            store,
+            *commit_id,
+            &retained_schema_keys,
+        )
+        .await?
+        {
+            if row.deleted {
                 continue;
             }
-            let snapshot = row.snapshot_content().ok_or_else(|| {
+            let snapshot = row.snapshot.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
                     format!("live binary blob reference in commit '{commit_id}' has no snapshot"),
                 )
             })?;
-            roots.insert(blob_id_from_snapshot(snapshot.as_str())?);
+            roots.insert(blob_id_from_snapshot(&snapshot)?);
         }
     }
     Ok(roots)

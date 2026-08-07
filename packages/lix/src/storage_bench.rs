@@ -880,51 +880,70 @@ pub struct RepositoryGcCommitBenchResult {
 
 /// Commits one production GC pass for the dual-adapter qualification lane.
 /// The helper exposes only maintenance accounting; it does not add a second
-/// reclamation implementation or bypass the repository write gate.
+/// reclamation implementation. Because benchmark callers operate below the
+/// session write gate, a concurrently spawned checkpoint sweep can win the
+/// authenticated publication fences. Retry that ordinary conflict from a new
+/// snapshot; all failed planning and commit work remains visible in whole-cell
+/// resource measurements.
 pub async fn collect_repository_gc_for_bench<StorageImpl>(
     storage: &StorageAdapter<StorageImpl>,
 ) -> Result<RepositoryGcCommitBenchResult, crate::LixError>
 where
     StorageImpl: Storage,
 {
-    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-        storage.begin_read(ReadOptions::default()).await?,
-    );
-    let mut writes = storage.new_write_set();
-    let mut preconditions = Vec::new();
-    let started = std::time::Instant::now();
-    let plan =
-        crate::gc::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
-            .await?;
-    let plan_us = started.elapsed().as_micros() as u64;
-    let stats = writes.stats();
-    let binary_cas = plan.sweep.binary_cas.clone();
-    let commit_started = std::time::Instant::now();
-    storage
-        .commit_write_set(
-            writes,
-            StorageWriteOptions {
-                preconditions,
-                ..StorageWriteOptions::default()
-            },
+    const MAX_CONFLICT_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_CONFLICT_ATTEMPTS {
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage.begin_read(ReadOptions::default()).await?,
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let started = std::time::Instant::now();
+        let plan = crate::gc::stage_repository_gc_with_preconditions(
+            read,
+            &mut writes,
+            &mut preconditions,
         )
-        .await
-        .map_err(crate::LixError::from)?;
-    Ok(RepositoryGcCommitBenchResult {
-        staged_deletes: stats.staged_deletes,
-        swept_commits: plan
-            .changelog
-            .sweep
-            .commits
-            .len()
-            .saturating_add(plan.sweep.tracked_commit_roots.len()),
-        reclaimed_manifest_rows: binary_cas.reclaimed_manifest_rows,
-        reclaimed_manifest_chunk_rows: binary_cas.reclaimed_manifest_chunk_rows,
-        reclaimed_chunk_rows: binary_cas.reclaimed_chunk_rows,
-        reclaimed_chunk_bytes: binary_cas.reclaimed_chunk_bytes,
-        plan_us,
-        commit_us: commit_started.elapsed().as_micros() as u64,
-    })
+        .await?;
+        let plan_us = started.elapsed().as_micros() as u64;
+        let stats = writes.stats();
+        let binary_cas = plan.sweep.binary_cas.clone();
+        let commit_started = std::time::Instant::now();
+        match storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                return Ok(RepositoryGcCommitBenchResult {
+                    staged_deletes: stats.staged_deletes,
+                    swept_commits: plan
+                        .changelog
+                        .sweep
+                        .commits
+                        .len()
+                        .saturating_add(plan.sweep.tracked_commit_roots.len()),
+                    reclaimed_manifest_rows: binary_cas.reclaimed_manifest_rows,
+                    reclaimed_manifest_chunk_rows: binary_cas.reclaimed_manifest_chunk_rows,
+                    reclaimed_chunk_rows: binary_cas.reclaimed_chunk_rows,
+                    reclaimed_chunk_bytes: binary_cas.reclaimed_chunk_bytes,
+                    plan_us,
+                    commit_us: commit_started.elapsed().as_micros() as u64,
+                });
+            }
+            Err(StorageWriteSetError::Storage(
+                crate::storage_adapter::StorageError::WriteConflict
+                | crate::storage_adapter::StorageError::PreconditionFailed(_),
+            )) if attempt + 1 < MAX_CONFLICT_ATTEMPTS => tokio::task::yield_now().await,
+            Err(error) => return Err(crate::LixError::from(error)),
+        }
+    }
+    unreachable!("bounded repository GC conflict loop must return")
 }
 
 /// Audits standalone semantic facts for the GC benchmark without adding the

@@ -28,7 +28,6 @@ use crate::json_store::JsonRef;
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
 };
-#[cfg(test)]
 use crate::live_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::live_state::stage_collect_stale_working_diff_indexes;
@@ -499,6 +498,10 @@ pub(crate) async fn stage_reachability_delta_batch(
     checkpoint_roots: &[CommitId],
     preconditions: &mut Vec<StoragePrecondition>,
 ) -> Result<(), LixError> {
+    // This is the central authenticated root-publication boundary. Rotate the
+    // binary-CAS epoch in this same atomic write even when the transition only
+    // revives an existing commit and stages no blob bytes.
+    crate::binary_cas::stage_mutation_epoch(read, writes, preconditions).await?;
     if deltas.is_empty() && checkpoint_roots.is_empty() {
         return Ok(());
     }
@@ -1771,71 +1774,51 @@ where
     // checkpoint-only authority.
     active_roots.extend(queue_checkpoint_roots);
 
-    let mut blob_roots =
-        crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &active_roots).await?;
-    blob_roots
-        .extend(crate::plugin::collect_gc_wasm_blob_roots(&store, &controls, &active_roots).await?);
-    let upload_chunks = crate::session::stage_reclaimable_upload_receipts(
-        &store,
-        writes,
-        &blob_roots,
-        preconditions,
-    )
-    .await?;
-    let binary_cas =
-        crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
-            .await?;
-    if batches.is_empty() {
-        return Ok(RepositoryGcPlan {
-            changelog: GcPlan {
-                roots: active_roots
-                    .iter()
-                    .copied()
-                    .map(GcRoot::BranchHead)
-                    .collect(),
-                live: GcLiveSet {
-                    commits: active_roots.iter().copied().collect(),
-                    changes: Vec::new(),
-                    payloads: Vec::new(),
-                },
-                sweep: GcSweepSet {
-                    commits: Vec::new(),
-                    commit_change_ids: Vec::new(),
-                    changes: Vec::new(),
-                    json_payloads: Vec::new(),
-                },
-                repair: GcRepairSet::default(),
-            },
-            sweep: RepositoryGcSweep {
-                tracked_commit_roots: Vec::new(),
-                standalone_changes: Vec::new(),
-                binary_cas,
-            },
-            profile: RepositoryGcProfile {
-                root_discovery_us: elapsed_micros(started),
-                changelog_us: 0,
-                tracked_root_stage_us: 0,
-                total_us: elapsed_micros(started),
-            },
-        });
-    }
-    let mut active_authority_ids = active_roots.clone();
-    let mut active_dependency_ids = BTreeSet::new();
+    // The branch control's tracked and untracked generations are authenticated
+    // current-state serving selectors, even when they differ from the public
+    // head after checkpoint/recovery publication. Keep them in the same root
+    // proof. A history-free untracked generation can legitimately have no
+    // tracked-state manifest; its rows are marked through the live-state owner
+    // below, while any selector with physical authority traverses normally.
+    let current_selector_ids = controls
+        .iter()
+        .flat_map(|(_, control)| [control.tracked_generation, control.untracked_generation])
+        .collect::<BTreeSet<_>>();
+    let current_base_ids = TrackedHeadContext::new()
+        .reader(store.clone())
+        .collect_gc_root_current_base_commits(&controls)
+        .await?;
+    let mut active_authority_ids = active_roots
+        .union(&current_selector_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let required_physical_root_ids = active_roots
+        .union(&current_base_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut active_dependency_ids = current_base_ids.clone();
     let mut active_semantic_dependency_ids = BTreeSet::new();
     let mut active_manifests = BTreeMap::new();
-    let mut pending = active_roots.iter().copied().collect::<Vec<_>>();
+    let mut pending = active_authority_ids
+        .iter()
+        .copied()
+        .chain(current_base_ids.iter().copied())
+        .collect::<Vec<_>>();
     while let Some(commit_id) = pending.pop() {
         if active_manifests.contains_key(&commit_id) {
             continue;
         }
-        let manifest = crate::tracked_state::load_commit_state_manifest(&store, commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
+        let Some(manifest) =
+            crate::tracked_state::load_commit_state_manifest(&store, commit_id).await?
+        else {
+            if required_physical_root_ids.contains(&commit_id) {
+                return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("active GC root '{commit_id}' has no authenticated physical manifest"),
-                )
-            })?;
+                ));
+            }
+            continue;
+        };
         if let Some(source) = manifest.mutations.selected_source_commit_id() {
             active_authority_ids.insert(source);
             pending.push(source);
@@ -1846,12 +1829,11 @@ where
             }
         }
         if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
-            active_dependency_ids.extend(
-                snapshot_root
-                    .parent_roots
-                    .iter()
-                    .map(|parent| parent.commit_id),
-            );
+            let parents = snapshot_root
+                .parent_roots
+                .iter()
+                .map(|parent| parent.commit_id);
+            active_dependency_ids.extend(parents);
         }
         active_manifests.insert(commit_id, manifest);
     }
@@ -1875,10 +1857,165 @@ where
             .await?;
         for (_, node) in replay_nodes.iter() {
             if let Some(node) = node {
-                active_dependency_ids.extend(node.parent_commit_ids.iter().copied());
-                active_semantic_dependency_ids.extend(node.parent_commit_ids.iter().copied());
+                let parents = node.parent_commit_ids.iter().copied();
+                active_dependency_ids.extend(parents.clone());
+                active_semantic_dependency_ids.extend(parents);
             }
         }
+    }
+    let mut blocked_sequences = BTreeSet::new();
+    let mut blocked_physical_dependency_ids = BTreeSet::new();
+    let mut blocked_history_dependency_ids = BTreeSet::new();
+    for (sequence, batch) in &batches {
+        for delta in &batch.deltas {
+            validate_stored_root_reachability_delta(delta)?;
+            let Some(old_root) = delta.old_root else {
+                continue;
+            };
+            if !retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_authority_ids,
+                &active_dependency_ids,
+            ) || replay_debt_ids.contains(&old_root)
+            {
+                blocked_sequences.insert(*sequence);
+                blocked_physical_dependency_ids.insert(old_root);
+            }
+            if !retirement_is_proven(
+                old_root,
+                delta.new_root,
+                &active_roots,
+                &active_semantic_dependency_ids,
+            ) || replay_debt_ids.contains(&old_root)
+            {
+                blocked_history_dependency_ids.insert(old_root);
+            }
+        }
+    }
+    // Project the one retirement proof into logical CAS roots. Physical
+    // selected-source/current-base dependencies still protect their manifests,
+    // but the tracked-state owner composes those rows at each logical root;
+    // marking a masked physical source independently would resurrect deleted
+    // file or plugin references. Genuine history/undo/replay parents remain
+    // logical roots and are followed here.
+    let mut active_historical_dependency_ids = BTreeSet::new();
+    let mut cas_pending = active_roots
+        .iter()
+        .copied()
+        .chain(blocked_history_dependency_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let mut cas_seen = BTreeSet::new();
+    while let Some(commit_id) = cas_pending.pop() {
+        if !cas_seen.insert(commit_id) {
+            continue;
+        }
+        let manifest = match active_manifests.get(&commit_id) {
+            Some(manifest) => Some(manifest.clone()),
+            None => crate::tracked_state::load_commit_state_manifest(&store, commit_id).await?,
+        };
+        let Some(manifest) = manifest else {
+            continue;
+        };
+        if manifest.replay_debt.depth != 0 {
+            let commit_ids = [commit_id];
+            let replay_nodes = CommitGraphContext::new()
+                .reader(store.clone())
+                .load_nodes(&commit_ids)
+                .await?;
+            let node = replay_nodes
+                .into_iter()
+                .next()
+                .and_then(|(_, node)| node)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("CAS replay root '{commit_id}' has no authenticated graph node"),
+                    )
+                })?;
+            for parent in node.parent_commit_ids {
+                if active_historical_dependency_ids.insert(parent) {
+                    cas_pending.push(parent);
+                }
+            }
+        }
+    }
+    // Physical retirement and logical CAS marking are role projections of the
+    // same authenticated controls/queue/dependency proof, not independent root
+    // authorities. Physical serving sources remain in `retained_root_ids` so
+    // their manifests cannot retire. CAS owners receive current/checkpoint and
+    // genuine history/undo/replay roots only; their owner-side retained-state
+    // loader composes selected sources and tombstones at each logical root.
+    let retained_root_ids = active_authority_ids
+        .union(&active_dependency_ids)
+        .copied()
+        .chain(blocked_physical_dependency_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let retained_cas_root_ids = active_roots
+        .iter()
+        .copied()
+        .chain(active_historical_dependency_ids.iter().copied())
+        .chain(blocked_history_dependency_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut retained_cas_root_manifests = BTreeMap::new();
+    for commit_id in &retained_cas_root_ids {
+        let manifest = match active_manifests.get(commit_id) {
+            Some(manifest) => Some(manifest.clone()),
+            None => crate::tracked_state::load_commit_state_manifest(&store, *commit_id).await?,
+        };
+        if let Some(manifest) = manifest {
+            retained_cas_root_manifests.insert(*commit_id, manifest);
+        }
+    }
+    let retained_cas_root_ids = retained_cas_root_manifests
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let mut blob_roots =
+        crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
+            .await?;
+    blob_roots.extend(
+        crate::plugin::collect_gc_wasm_blob_roots(&store, &controls, &retained_cas_root_ids)
+            .await?,
+    );
+    let upload_chunks =
+        crate::session::stage_reclaimable_upload_receipts(&store, writes, &blob_roots).await?;
+    let binary_cas =
+        crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
+            .await?;
+    crate::binary_cas::stage_mutation_epoch(&store, writes, preconditions).await?;
+    if batches.is_empty() {
+        return Ok(RepositoryGcPlan {
+            changelog: GcPlan {
+                roots: retained_root_ids
+                    .iter()
+                    .copied()
+                    .map(GcRoot::BranchHead)
+                    .collect(),
+                live: GcLiveSet {
+                    commits: retained_root_ids.into_iter().collect(),
+                    changes: Vec::new(),
+                    payloads: Vec::new(),
+                },
+                sweep: GcSweepSet {
+                    commits: Vec::new(),
+                    commit_change_ids: Vec::new(),
+                    changes: Vec::new(),
+                    json_payloads: Vec::new(),
+                },
+                repair: GcRepairSet::default(),
+            },
+            sweep: RepositoryGcSweep {
+                tracked_commit_roots: Vec::new(),
+                standalone_changes: Vec::new(),
+                binary_cas,
+            },
+            profile: RepositoryGcProfile {
+                root_discovery_us: elapsed_micros(started),
+                changelog_us: 0,
+                tracked_root_stage_us: 0,
+                total_us: elapsed_micros(started),
+            },
+        });
     }
     let scoped_roots = active_manifests
         .values()
@@ -1917,25 +2054,6 @@ where
     // unreclaimable after the pin is later released.  The whole batch remains
     // at the queue head; this intentionally delays later deltas but preserves
     // the authenticated publication order and retry semantics.
-    let mut blocked_sequences = BTreeSet::new();
-    for (sequence, batch) in &batches {
-        for delta in &batch.deltas {
-            validate_stored_root_reachability_delta(delta)?;
-            let Some(old_root) = delta.old_root else {
-                continue;
-            };
-            if !retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_authority_ids,
-                &active_dependency_ids,
-            ) || replay_debt_ids.contains(&old_root)
-            {
-                blocked_sequences.insert(*sequence);
-            }
-        }
-    }
-
     let mut next_queue = queue;
     let queue_head = next_queue.head_sequence;
     let mut consumed_through = queue_head;
@@ -3127,7 +3245,7 @@ mod tests {
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions,
+        StorageWriteOptions, StorageWriteSet,
     };
     use crate::storage_codec;
     use crate::tracked_state::{
@@ -3765,7 +3883,34 @@ mod tests {
         );
     }
 
-    async fn queue_publication_race_rejects_stale_sweep(blocked_queue: bool) {
+    async fn stage_root_only_branch_publication(
+        storage: &StorageAdapter<Memory>,
+        new_control: BranchHeadControl,
+    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("new branch publication read should open");
+        let mut publication = storage.new_write_set();
+        stage_branch_head_control(&mut publication, "queue-race-branch", new_control)
+            .expect("new branch control should stage");
+        let delta = RootReachabilityDelta {
+            branch_id: "queue-race-branch".to_owned(),
+            old_root: None,
+            new_root: Some(new_control.head_commit_id),
+            old_control: None,
+            new_control: Some(new_control),
+            old_control_digest: root_control_digest_for_control(None).unwrap(),
+            new_control_digest: root_control_digest_for_control(Some(&new_control)).unwrap(),
+        };
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(&read, &mut publication, &[delta], &[], &mut preconditions)
+            .await
+            .expect("new branch queue batch should stage");
+        (publication, preconditions)
+    }
+
+    async fn queue_publication_race_rejects_stale_peer(blocked_queue: bool, gc_first: bool) {
         let backend = Memory::new();
         Engine::initialize(backend.clone())
             .await
@@ -3853,33 +3998,68 @@ mod tests {
 
         let mut new_control = main_control;
         new_control.ref_change_id = ChangeId::for_test_label("queue-race-new-branch-ref");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("new branch publication read should open");
-        let mut publication = storage.new_write_set();
-        stage_branch_head_control(&mut publication, "queue-race-branch", new_control)
-            .expect("new branch control should stage");
-        let delta = RootReachabilityDelta {
-            branch_id: "queue-race-branch".to_owned(),
-            old_root: None,
-            new_root: Some(new_control.head_commit_id),
-            old_control: None,
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(None).unwrap(),
-            new_control_digest: root_control_digest_for_control(Some(&new_control)).unwrap(),
-        };
-        let mut publication_preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut publication,
-            &[delta],
-            &[],
-            &mut publication_preconditions,
-        )
-        .await
-        .expect("new branch queue batch should stage");
-        drop(read);
+        let (publication, publication_preconditions) =
+            stage_root_only_branch_publication(&storage, new_control).await;
+        if gc_first {
+            storage
+                .commit_write_set(
+                    stale_writes,
+                    StorageWriteOptions {
+                        preconditions: stale_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("GC should win the root-publication epoch");
+            let error = storage
+                .commit_write_set(
+                    publication,
+                    StorageWriteOptions {
+                        preconditions: publication_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect_err("stale root-only publication must lose after GC");
+            assert!(error.to_string().contains("precondition"));
+            let (retry, retry_preconditions) =
+                stage_root_only_branch_publication(&storage, new_control).await;
+            storage
+                .commit_write_set(
+                    retry,
+                    StorageWriteOptions {
+                        preconditions: retry_preconditions,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .expect("fresh root-only publication retry should commit");
+            let control = BranchHeadControlContext::new()
+                .reader(
+                    storage
+                        .begin_read(StorageReadOptions::default())
+                        .await
+                        .expect("root-only retry verification read should open"),
+                )
+                .load("queue-race-branch")
+                .await
+                .expect("root-only retry control should load");
+            assert_eq!(control, Some(new_control));
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("GC-first orphan verification read should open");
+            let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
+            assert!(
+                reader
+                    .load_bytes_many(&[orphan.hash])
+                    .await
+                    .expect("GC-first orphan verification should load")
+                    .into_vec()[0]
+                    .is_none()
+            );
+            return;
+        }
         storage
             .commit_write_set(
                 publication,
@@ -3918,9 +4098,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_gc_queue_fence_rejects_new_branch_races_for_empty_and_blocked_queues() {
-        queue_publication_race_rejects_stale_sweep(false).await;
-        queue_publication_race_rejects_stale_sweep(true).await;
+    async fn repository_gc_epoch_serializes_root_only_publication_in_both_orders() {
+        queue_publication_race_rejects_stale_peer(false, false).await;
+        queue_publication_race_rejects_stale_peer(true, false).await;
+        queue_publication_race_rejects_stale_peer(false, true).await;
+        queue_publication_race_rejects_stale_peer(true, true).await;
     }
 
     #[tokio::test]
@@ -4894,6 +5076,157 @@ mod tests {
         assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
         session.undo().await.expect("active undo should survive GC");
         session.redo().await.expect("active redo should survive GC");
+    }
+
+    #[tokio::test]
+    async fn repository_gc_retains_historical_file_blob_until_replay_dependency_releases() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("historical blob repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("historical blob repository should open");
+        let main = engine
+            .open_workspace_session()
+            .await
+            .expect("historical blob main session should open");
+        let branch = main
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-00000000000a".to_owned()),
+                name: "gc-history-disposable".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("historical disposable branch should create");
+        let branch_id = branch.id;
+        let session = engine
+            .open_session(branch_id.clone())
+            .await
+            .expect("historical disposable session should open");
+        let v1 = b"historical-file-v1";
+        let v2 = vec![0xa5; 256];
+        let v1_hash = crate::binary_cas::BlobId::from_content(v1);
+        let v2_hash = crate::binary_cas::BlobId::from_content(&v2);
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)",
+                &[Value::Blob(v1.to_vec().into())],
+            )
+            .await
+            .expect("historical file v1 should publish");
+        let root_a = session
+            .execute(
+                "SELECT commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id.clone())],
+            )
+            .await
+            .expect("historical root A should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("historical root A should exist");
+        session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = '/history.bin'",
+                &[Value::Blob(v2.clone().into())],
+            )
+            .await
+            .expect("historical file v2 should publish");
+        let root_b = session
+            .execute(
+                "SELECT commit_id FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id.clone())],
+            )
+            .await
+            .expect("historical root B should load")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("historical root B should exist");
+        let storage = StorageAdapter::new(backend.clone());
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, v1_hash, true).await;
+        assert_binary_cas_presence(&storage, v2_hash, true).await;
+
+        drop(session);
+        drop(main);
+        drop(engine);
+        let reopened = Engine::new(backend.clone())
+            .await
+            .expect("historical blob repository should cold reopen");
+        let session = reopened
+            .open_session(branch_id.clone())
+            .await
+            .expect("historical disposable branch should cold reopen");
+        let diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'lix_binary_blob_ref'",
+                &[Value::Text(root_a), Value::Text(root_b)],
+            )
+            .await
+            .expect("historical blob diff should remain authenticated");
+        assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
+        session
+            .undo()
+            .await
+            .expect("historical blob undo should remain available");
+        let undone = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/history.bin'",
+                &[],
+            )
+            .await
+            .expect("historical v1 should read after undo");
+        assert_eq!(undone.rows()[0].get::<Vec<u8>>("content").unwrap(), v1);
+        session
+            .redo()
+            .await
+            .expect("historical blob redo should remain available");
+        let redone = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/history.bin'",
+                &[],
+            )
+            .await
+            .expect("historical v2 should read after redo");
+        assert_eq!(redone.rows()[0].get::<Vec<u8>>("content").unwrap(), v2);
+        drop(session);
+
+        let main = reopened
+            .open_workspace_session()
+            .await
+            .expect("historical main session should reopen");
+        main.execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id.clone())],
+        )
+        .await
+        .expect("historical disposable branch should delete");
+        drop(main);
+        drop(reopened);
+
+        // Deletion publishes the authenticated B -> None retirement frontier.
+        // This fixture is below the queue page limit, so one production sweep
+        // must consume that frontier without creating a checkpoint alias for A.
+        run_binary_repository_gc(&storage).await;
+        assert_binary_cas_presence(&storage, v1_hash, false).await;
+        assert_binary_cas_presence(&storage, v2_hash, false).await;
+
+        let final_engine = Engine::new(backend)
+            .await
+            .expect("historical repository should reopen after branch retirement");
+        let final_main = final_engine
+            .open_workspace_session()
+            .await
+            .expect("historical main should open after branch retirement");
+        let branches = final_main
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch_id)],
+            )
+            .await
+            .expect("retired branch absence should read");
+        assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     }
 
     #[tokio::test]

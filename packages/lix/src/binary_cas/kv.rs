@@ -19,8 +19,8 @@ use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
 };
 use crate::storage_adapter::{
-    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
-    StorageScanOptions, StorageSpaceId, StorageValue,
+    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition,
+    StorageProjectedValue, StorageScanOptions, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -55,6 +55,80 @@ pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::m
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
+const BINARY_CAS_MUTATION_EPOCH_SPACE: StorageSpace =
+    StorageSpace::mutable(StorageSpaceId(0x0005_0005), "binary_cas.mutation_epoch.v1");
+const BINARY_CAS_MUTATION_EPOCH_KEY: &[u8] = b"epoch";
+
+pub(in crate::binary_cas) async fn load_mutation_epoch(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(u64, Option<Bytes>), LixError> {
+    let key = StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY));
+    let value = PointReadPlan::new(BINARY_CAS_MUTATION_EPOCH_SPACE, std::slice::from_ref(&key))
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::FullValue,
+            },
+        )
+        .await?
+        .value
+        .into_iter()
+        .next()
+        .flatten();
+    let Some(value) = value else {
+        return Ok((0, None));
+    };
+    let StorageProjectedValue::FullValue(value) = value else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS mutation epoch omitted its value",
+        ));
+    };
+    if value.len() != 8 {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS mutation epoch has an invalid width",
+        ));
+    }
+    Ok((
+        u64::from_be_bytes(value.as_ref().try_into().expect("checked epoch width")),
+        Some(value),
+    ))
+}
+
+pub(in crate::binary_cas) fn stage_mutation_epoch(
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    current: u64,
+    token: Option<Bytes>,
+) -> Result<(), LixError> {
+    let next = current.checked_add(1).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS mutation epoch exhausted",
+        )
+    })?;
+    let key = StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY));
+    writes.put(
+        BINARY_CAS_MUTATION_EPOCH_SPACE,
+        key.clone(),
+        StorageValue {
+            bytes: Bytes::copy_from_slice(&next.to_be_bytes()),
+        },
+    );
+    preconditions.push(match token {
+        Some(expected) => StoragePrecondition::KeyValueEquals {
+            space: BINARY_CAS_MUTATION_EPOCH_SPACE,
+            key,
+            expected,
+        },
+        None => StoragePrecondition::KeyAbsent {
+            space: BINARY_CAS_MUTATION_EPOCH_SPACE,
+            key,
+        },
+    });
+    Ok(())
+}
 
 #[derive(Debug)]
 struct BlobWritePlan {
@@ -2589,6 +2663,36 @@ mod tests {
         Memory, StorageError, StorageGetManyResult, StorageKeyRange, StorageReadOptions,
         StorageScanChunk, StorageWriteOptions, StorageWriteSet,
     };
+
+    #[tokio::test]
+    async fn corrupt_mutation_epoch_fails_publication_closed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            BINARY_CAS_MUTATION_EPOCH_SPACE,
+            StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY)),
+            StorageValue {
+                bytes: Bytes::from_static(b"bad"),
+            },
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("corrupt epoch fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt epoch read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let error = crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions)
+            .await
+            .expect_err("corrupt epoch must reject publication");
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
+        assert!(error.message.contains("invalid width"));
+        assert!(writes.is_empty());
+        assert!(preconditions.is_empty());
+    }
 
     struct DelayedManifestScanRead<R> {
         inner: R,

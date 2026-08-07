@@ -529,10 +529,36 @@ where
         }
     }
 
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+    let retained_schema_keys = [KEY_VALUE_SCHEMA_KEY.to_owned()];
     for commit_id in retained_commits {
-        let registry = load_plugin_registry_at_commit(&mut reader, &commit_id.to_string()).await?;
-        extend_registry_wasm_roots(&registry, &mut roots)?;
+        for row in crate::tracked_state::load_retained_commit_snapshots_for_schemas(
+            store,
+            *commit_id,
+            &retained_schema_keys,
+        )
+        .await?
+        {
+            if row.deleted
+                || row.key.file_id.is_some()
+                || row.key.entity_pk != EntityPk::single(PLUGIN_REGISTRY_KEY)
+            {
+                continue;
+            }
+            let snapshot: JsonValue = serde_json::from_str(
+                row.snapshot.as_deref().ok_or_else(|| {
+                    invalid_registry(format!(
+                        "historical plugin registry mutation in commit '{commit_id}' has no snapshot"
+                    ))
+                })?,
+            )
+            .map_err(|error| {
+                invalid_registry(format!(
+                    "historical plugin registry mutation in commit '{commit_id}' is invalid JSON: {error}"
+                ))
+            })?;
+            let registry = PluginRegistry::from_optional_snapshot(Some(&snapshot))?;
+            extend_registry_wasm_roots(&registry, &mut roots)?;
+        }
     }
     Ok(roots)
 }

@@ -3967,6 +3967,31 @@ impl<S> HotStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Returns the authenticated tracked-state commits selected as root-backed
+    /// current bases by the supplied branch controls. The control remains the
+    /// serving authority; this is only its owner-side GC dependency summary.
+    /// Work is O(controls) point reads and memory is O(unique base commits).
+    pub(crate) async fn collect_gc_root_current_base_commits(
+        &self,
+        controls: &[(String, BranchHeadControl)],
+    ) -> Result<BTreeSet<CommitId>, LixError> {
+        let mut bases = BTreeSet::new();
+        let mut observed = BTreeSet::new();
+        for (branch_id, control) in controls {
+            for generation in [control.tracked_generation, control.untracked_generation] {
+                if !observed.insert((branch_id.as_str(), generation)) {
+                    continue;
+                }
+                if let Some(base) =
+                    load_root_current_base_commit(&self.store, branch_id, generation).await?
+                {
+                    bases.insert(base);
+                }
+            }
+        }
+        Ok(bases)
+    }
+
     pub(crate) async fn prepare_packed_identity_membership(
         &self,
         branch_id: &str,
