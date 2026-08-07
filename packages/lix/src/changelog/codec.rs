@@ -126,9 +126,35 @@ pub(crate) fn decode_change_record(
 mod tests {
     use super::*;
     use crate::changelog::ChangeId;
+    use crate::changelog::CommitId;
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonSlot};
+
+    #[test]
+    fn commit_record_round_trip_preserves_linear_segment() {
+        let commit_id = CommitId::for_test_label("codec-segment-commit");
+        let base_commit_id = CommitId::for_test_label("codec-segment-base");
+        let record = CommitRecord {
+            format_version: 3,
+            commit_id,
+            generation: 70,
+            parent_commit_ids: vec![CommitId::for_test_label("codec-segment-parent")],
+            linear_segment_base_commit_id: base_commit_id,
+            linear_segment_depth: 6,
+            change_id: ChangeId::for_test_label("codec-segment-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "commit codec timestamp",
+                "2026-08-07T00:00:00Z",
+            ),
+        };
+
+        let encoded = encode_commit_record(&record).expect("commit should encode");
+        let decoded: CommitRecord =
+            storage_codec::decode("commit record", &encoded).expect("commit should decode");
+        assert_eq!(decoded, record);
+    }
 
     fn full_record() -> ChangeRecord {
         ChangeRecord {

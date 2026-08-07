@@ -1189,6 +1189,7 @@ async fn stage_changelog_commits(
         })
         .await?;
     let mut generations = BTreeMap::new();
+    let mut linear_segments = BTreeMap::new();
     let mut rootless_depths = BTreeMap::new();
     let mut rootless_rows = BTreeMap::new();
     let mut rootless_bytes = BTreeMap::new();
@@ -1220,6 +1221,13 @@ async fn stage_changelog_commits(
             ));
         }
         generations.insert(*commit_id, record.generation);
+        linear_segments.insert(
+            *commit_id,
+            (
+                record.linear_segment_base_commit_id,
+                record.linear_segment_depth,
+            ),
+        );
         let replay_debt = published.replay_debt();
         rootless_depths.insert(*commit_id, replay_debt.depth);
         rootless_rows.insert(*commit_id, replay_debt.rows);
@@ -1258,6 +1266,22 @@ async fn stage_changelog_commits(
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
             })?;
+        let parent_segment = match commit.parent_commit_ids.as_slice() {
+            [parent_commit_id] => {
+                Some(*linear_segments.get(parent_commit_id).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' has missing parent segment metadata"),
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        let linear_segment = crate::changelog::next_linear_segment(
+            commit_id,
+            &commit.parent_commit_ids,
+            parent_segment,
+        )?;
         let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
         let commit_delta_rows = tracked_row_indices_by_commit
             .get(&commit_id)
@@ -1385,6 +1409,7 @@ async fn stage_changelog_commits(
         rootless_rows.insert(commit_id, cumulative_rootless_rows);
         rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
+        linear_segments.insert(commit_id, linear_segment);
         for child in children.get(&commit_id).into_iter().flatten() {
             let remaining = staged_parent_count
                 .get_mut(child)
@@ -1443,10 +1468,12 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            linear_segment_base_commit_id: linear_segments[&commit_row.commit_id].0,
+            linear_segment_depth: linear_segments[&commit_row.commit_id].1,
             change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,

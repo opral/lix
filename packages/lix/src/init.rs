@@ -42,15 +42,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V59 adds the authenticated root-reachability frontier consumed by ordinary
-/// GC on top of the compact immutable commit-state authority. Semantic commit facts remain
-/// owned exclusively by `changelog.commit`; canonical snapshot metadata stays
-/// inside the immutable physical authority while its content-addressed tree
-/// chunks remain rebuildable.
+/// V61 adds the bounded linear topology segment to each immutable semantic
+/// commit record. The segment is published by the existing changelog owner;
+/// repositories with the superseded flat record must be recreated rather than
+/// decoded through a compatibility path.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v60";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v61";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -607,10 +606,12 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 2,
+        format_version: 3,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
+        linear_segment_base_commit_id: plan.commit.id,
+        linear_segment_depth: 0,
         change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,

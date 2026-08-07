@@ -355,10 +355,12 @@ mod tests {
             crate::changelog::COMMIT_SPACE,
             StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
             crate::changelog::encode_commit_record(&CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                linear_segment_base_commit_id: embedded,
+                linear_segment_depth: 0,
                 change_id: ChangeId::for_test_label("mismatched-key-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -394,10 +396,12 @@ mod tests {
         for (label, parent) in [("commit-a", "commit-b"), ("commit-b", "commit-a")] {
             let commit_id = commit_id(label);
             let record = CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id,
                 generation: 1,
                 parent_commit_ids: commit_ids([parent]),
+                linear_segment_base_commit_id: commit_id,
+                linear_segment_depth: 0,
                 change_id: ChangeId::for_test_label(&format!("{label}-change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -696,10 +700,12 @@ mod tests {
         let child = commit_id("commit-child");
         let mut writes = storage.new_write_set();
         let record = CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
+            linear_segment_base_commit_id: child,
+            linear_segment_depth: 0,
             change_id: ChangeId::for_test_label("commit-child-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -968,6 +974,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_base_segment_skips_refine_shared_fork_and_unequal_head() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut changes = Vec::new();
+        changes.push(commit_change(
+            "segment-root-change",
+            "segment-root",
+            &[],
+            &[],
+        ));
+        let mut trunk_parent = "segment-root".to_string();
+        for index in 1..=70 {
+            let label = format!("segment-trunk-{index}");
+            changes.push(commit_change(
+                &format!("{label}-change"),
+                &label,
+                &[],
+                &[&trunk_parent],
+            ));
+            trunk_parent = label;
+        }
+        let fork = trunk_parent.clone();
+        let mut left_parent = fork.clone();
+        let mut right_parent = fork.clone();
+        for index in 1..=130 {
+            let left = format!("segment-left-{index}");
+            changes.push(commit_change(
+                &format!("{left}-change"),
+                &left,
+                &[],
+                &[&left_parent],
+            ));
+            left_parent = left;
+            let right = format!("segment-right-{index}");
+            changes.push(commit_change(
+                &format!("{right}-change"),
+                &right,
+                &[],
+                &[&right_parent],
+            ));
+            right_parent = right;
+        }
+        append_changes(&storage, &changes).await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        assert_eq!(
+            reader
+                .merge_base(&commit_id(&left_parent), &commit_id(&right_parent))
+                .await
+                .expect("segmented fork should resolve exactly"),
+            commit_id(&fork)
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        assert_eq!(
+            reader
+                .merge_base(&commit_id("segment-trunk-10"), &commit_id(&left_parent))
+                .await
+                .expect("unequal segmented ancestor should resolve exactly"),
+            commit_id("segment-trunk-10")
+        );
+    }
+
+    #[tokio::test]
     async fn merge_base_errors_when_histories_have_no_common_commit() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
@@ -1109,6 +1186,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut append = ChangelogAppend::default();
         let mut generations = std::collections::BTreeMap::<CommitId, u64>::new();
+        let mut linear_segments = std::collections::BTreeMap::<CommitId, (CommitId, u8)>::new();
         for change in changes {
             let commit_id = change
                 .change
@@ -1123,16 +1201,37 @@ mod tests {
                 .max()
                 .map_or(0, |parent_generation| parent_generation + 1);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
+            let (linear_segment_base_commit_id, linear_segment_depth) =
+                match parent_commit_ids.as_slice() {
+                    [parent_commit_id] => linear_segments.get(parent_commit_id).map_or(
+                        (typed_commit_id, 0),
+                        |parent_segment| {
+                            crate::changelog::next_linear_segment(
+                                typed_commit_id,
+                                &parent_commit_ids,
+                                Some(*parent_segment),
+                            )
+                            .expect("known test parent segment should derive")
+                        },
+                    ),
+                    _ => (typed_commit_id, 0),
+                };
             append.commits.push(CommitRecord {
-                format_version: 2,
+                format_version: 3,
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
+                linear_segment_base_commit_id,
+                linear_segment_depth,
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             });
             generations.insert(typed_commit_id, generation);
+            linear_segments.insert(
+                typed_commit_id,
+                (linear_segment_base_commit_id, linear_segment_depth),
+            );
         }
         let commit_records = append.commits.clone();
         ChangelogContext::new()
@@ -1159,8 +1258,7 @@ mod tests {
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
                 replay_debt: CommitStateReplayDebt {
-                    depth: u16::try_from(record.generation + 1)
-                        .expect("test generation should fit replay depth"),
+                    depth: 1,
                     rows: 0,
                     bytes: 0,
                 },

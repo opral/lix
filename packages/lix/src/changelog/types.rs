@@ -313,16 +313,88 @@ pub(crate) struct ChangelogAppend {
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitRecord {
-    /// Version 2 removes physical replay policy from the semantic commit row.
+    /// Version 3 adds the bounded linear topology segment certified below.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
     /// smaller generation, enabling bounded priority graph walks.
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    /// Lowest commit reachable from this commit without crossing a merge or
+    /// more than one bounded linear segment. This is authoritative topology
+    /// metadata written with the parent list, not a separately published
+    /// index. Readers refine within a shared segment before choosing a base.
+    pub(crate) linear_segment_base_commit_id: CommitId,
+    /// Number of single-parent edges from this commit to the segment base.
+    pub(crate) linear_segment_depth: u8,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
+}
+
+pub(crate) const LINEAR_SEGMENT_MAX_DEPTH: u8 = 63;
+
+/// Derives the bounded linear segment owned by a new commit record.
+///
+/// Merge commits and roots start a segment. A single-parent commit extends its
+/// parent's segment until the fixed width is full, then starts the next one.
+/// Branches may share a base; merge-base readers detect that case and refine
+/// within the segment instead of skipping over the fork.
+pub(crate) fn next_linear_segment(
+    commit_id: CommitId,
+    parent_commit_ids: &[CommitId],
+    parent_segment: Option<(CommitId, u8)>,
+) -> Result<(CommitId, u8), LixError> {
+    match parent_commit_ids {
+        [_] => {
+            let (base_commit_id, depth) = parent_segment.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has no parent segment metadata"),
+                )
+            })?;
+            if depth < LINEAR_SEGMENT_MAX_DEPTH {
+                Ok((base_commit_id, depth + 1))
+            } else {
+                Ok((commit_id, 0))
+            }
+        }
+        _ => Ok((commit_id, 0)),
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::{CommitId, LINEAR_SEGMENT_MAX_DEPTH, next_linear_segment};
+
+    #[test]
+    fn linear_segments_are_bounded_and_merges_reset_them() {
+        let root = CommitId::for_test_label("segment-root");
+        let mut parent = root;
+        let mut segment = next_linear_segment(root, &[], None).expect("root should start segment");
+        assert_eq!(segment, (root, 0));
+
+        for depth in 1..=LINEAR_SEGMENT_MAX_DEPTH {
+            let commit = CommitId::for_test_label(&format!("segment-{depth}"));
+            segment = next_linear_segment(commit, &[parent], Some(segment))
+                .expect("linear child should extend segment");
+            assert_eq!(segment, (root, depth));
+            parent = commit;
+        }
+
+        let next = CommitId::for_test_label("next-segment");
+        assert_eq!(
+            next_linear_segment(next, &[parent], Some(segment))
+                .expect("full segment should roll over"),
+            (next, 0)
+        );
+
+        let merge = CommitId::for_test_label("segment-merge");
+        assert_eq!(
+            next_linear_segment(merge, &[root, next], None).expect("merge should reset segment"),
+            (merge, 0)
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

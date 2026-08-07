@@ -84,6 +84,8 @@ where
                     account_id: record.account_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
+                    linear_segment_base_commit_id: record.linear_segment_base_commit_id,
+                    linear_segment_depth: record.linear_segment_depth,
                     created_at: record.created_at,
                 },
             );
@@ -427,10 +429,12 @@ mod tests {
 
     fn commit_record(id: CommitId, generation: u64, parent: Option<CommitId>) -> CommitRecord {
         CommitRecord {
-            format_version: 2,
+            format_version: 3,
             commit_id: id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
+            linear_segment_base_commit_id: id,
+            linear_segment_depth: 0,
             change_id: ChangeId::for_test_label(&format!("{id}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: timestamp(),

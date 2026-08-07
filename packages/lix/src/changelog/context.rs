@@ -167,7 +167,7 @@ fn json_slot_ref_value_capacity(slot: JsonSlotRef<'_>) -> usize {
 }
 
 fn commit_value_capacity(commit: &CommitRecord) -> usize {
-    96usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
+    113usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
 }
 
 #[derive(Debug)]

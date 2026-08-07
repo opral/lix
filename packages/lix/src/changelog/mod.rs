@@ -30,7 +30,7 @@ pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,
-    CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
-    commit_row_snapshot_json,
+    CommitScanRequest, LINEAR_SEGMENT_MAX_DEPTH, TransactionChangeRecordRef,
+    TransactionChangelogAppend, commit_row_snapshot_json, next_linear_segment,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};

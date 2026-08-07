@@ -699,6 +699,21 @@ async fn stage_test_changelog_commit(
                 .checked_add(1)
                 .ok_or_else(|| crate::LixError::unknown("test commit generation exceeds u64"))
         })?;
+    let parent_segment = match typed_parent_ids.as_slice() {
+        [_] => parent_records
+            .iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .map(|record| {
+                (
+                    record.linear_segment_base_commit_id,
+                    record.linear_segment_depth,
+                )
+            }),
+        _ => None,
+    };
+    let (linear_segment_base_commit_id, linear_segment_depth) =
+        crate::changelog::next_linear_segment(typed_commit_id, &typed_parent_ids, parent_segment)?;
     let winner_indices = final_state_row_winner_indices(rows)?;
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
@@ -719,10 +734,12 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
-        format_version: 2,
+        format_version: 3,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,
+        linear_segment_base_commit_id,
+        linear_segment_depth,
         change_id: typed_commit_change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
