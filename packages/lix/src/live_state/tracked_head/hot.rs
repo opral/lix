@@ -4091,6 +4091,40 @@ where
             .map_err(|_| head_value_error("hot collection live count exceeds u64"))
     }
 
+    /// Validates that a selected generation's complete physical member set
+    /// still closes to its generation-local collection inventory.
+    ///
+    /// Exact point reads ordinarily treat a missing key as logical absence.
+    /// Required engine authority can call this after a point miss to
+    /// distinguish legitimate absence from a missing selected HOT member
+    /// without introducing another locator or persisted owner.
+    pub(crate) async fn validate_exact_collection_closure(
+        &self,
+        branch_id: &str,
+        branch_generation: CommitId,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<(), LixError> {
+        let control = self
+            .collection_control(branch_id, branch_generation, scope)
+            .await?;
+        if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
+            return Err(head_value_error(format!(
+                "selected collection '{}' has no exact member count",
+                scope.schema_key
+            )));
+        }
+        let actual = self
+            .exact_collection_live_count(branch_id, branch_generation, scope)
+            .await?;
+        if actual != control.live_count {
+            return Err(head_value_error(format!(
+                "selected collection '{}' declares {} live members but materializes {actual}",
+                scope.schema_key, control.live_count
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn scan_live_batch_for_retention(
         &self,
         branch_id: &str,
