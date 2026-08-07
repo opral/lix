@@ -51,6 +51,7 @@ pub(crate) mod domain;
 mod engine;
 pub(crate) mod entity_pk;
 pub(crate) mod filesystem;
+pub(crate) mod forktree;
 pub(crate) mod functions;
 pub(crate) mod gc;
 mod handle;
