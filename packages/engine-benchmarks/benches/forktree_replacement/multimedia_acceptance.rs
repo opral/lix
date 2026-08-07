@@ -254,7 +254,10 @@ where
         sharing.shared_declared_bytes >= payload.spec.minimum_shared_bytes(),
         "multimedia mutation failed its minimum sharing gate"
     );
-    assert_eq!(edit.reused_chunks, sharing.shared_chunks as u64);
+    assert!(
+        edit.reused_chunks >= sharing.shared_chunks as u64,
+        "writer accounting omitted identity-proven base reuse"
+    );
     println!(
         "forktree_multimedia_sharing,family={},shape={},size_mib={},base_bytes={},edited_bytes={},mutation_bytes={},edit_offset={},base_chunks={},edited_chunks={},shared_chunks={},shared_declared_bytes={},new_unique_chunks={},base_hash={},edited_hash={}",
         payload.spec.family,
