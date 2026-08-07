@@ -68,6 +68,11 @@ impl SqlWriteResult {
     }
 }
 
+#[cfg(feature = "storage-benches")]
+pub(crate) use datafusion::{
+    BatchRowCursor, execute_read_statement_in_session_with_batch_stream,
+    execute_read_statement_in_session_with_collected_batches,
+};
 pub(crate) use datafusion::{
     DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadResult, SessionReadSqlResult,
     execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,

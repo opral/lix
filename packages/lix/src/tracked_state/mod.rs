@@ -113,15 +113,16 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use tree::test_gc_leaf_chunk;
+#[cfg(test)]
+pub(crate) use types::TrackedStateCommitRootParent;
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
     TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
-    TrackedStateCommitRootParent, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
-    TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest,
-    TrackedStateSingleStringReplacementRef,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 
@@ -129,6 +130,7 @@ pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 /// tracked-state roots. This is deliberately a read-only maintenance helper:
 /// the returned hashes are a rebuildable sweep inventory, never serving
 /// authority or a replacement for the immutable root metadata.
+#[allow(dead_code)]
 pub(crate) async fn collect_reachable_tree_chunk_hashes<S>(
     store: &S,
     roots: &[TrackedStateRootId],

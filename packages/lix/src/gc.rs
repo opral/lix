@@ -77,9 +77,13 @@ const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
 const GC_REACHABILITY_FORMAT_VERSION: u32 = 2;
 const GC_REACHABILITY_QUEUE_KEY: &[u8] = b"queue";
 const GC_REACHABILITY_BATCH_LIMIT: usize = 64;
+#[allow(dead_code)]
 const GC_TREE_SWEEP_EPOCH_KEY: &[u8] = b"epoch";
+#[allow(dead_code)]
 const GC_TREE_SWEEP_CURSOR_KEY: &[u8] = b"cursor";
+#[allow(dead_code)]
 const GC_TREE_SWEEP_FORMAT_VERSION: u32 = 1;
+#[allow(dead_code)]
 const GC_TREE_SWEEP_PAGE_ROWS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,6 +208,7 @@ struct StoredReachabilityQueue {
 /// and branch/recovery controls remain the sole logical root authority.
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
+#[allow(dead_code)]
 struct StoredTreeSweepEpoch {
     format_version: u32,
     epoch_id: u64,
@@ -218,6 +223,7 @@ struct StoredTreeSweepEpoch {
 /// distinguish a resumable epoch from a fresh one.
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
+#[allow(dead_code)]
 struct StoredTreeSweepCursor {
     format_version: u32,
     epoch_id: u64,
@@ -233,6 +239,7 @@ struct StoredTreeSweepCursor {
 /// tree chunk.
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
+#[allow(dead_code)]
 struct StoredTreeSweepMark {
     format_version: u32,
     epoch_id: u64,
@@ -243,6 +250,7 @@ struct StoredTreeSweepMark {
 /// and verified once when the session starts or reopens; ordinary queue-prefix
 /// GC never consults it.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct TreeSweepEpochSession {
     epoch: StoredTreeSweepEpoch,
     cursor: StoredTreeSweepCursor,
@@ -599,10 +607,12 @@ async fn load_reachability_batches(
     Ok(batches)
 }
 
+#[allow(dead_code)]
 fn tree_sweep_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message)
 }
 
+#[allow(dead_code)]
 fn tree_sweep_digest(hashes: &BTreeSet<[u8; 32]>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     for hash in hashes {
@@ -611,6 +621,7 @@ fn tree_sweep_digest(hashes: &BTreeSet<[u8; 32]>) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+#[allow(dead_code)]
 async fn load_all_reachability_batches_for_tree_sweep<S>(
     store: &S,
     queue: &StoredReachabilityQueue,
@@ -665,6 +676,7 @@ where
     Ok(batches)
 }
 
+#[allow(dead_code)]
 async fn load_tree_sweep_root_closure<S>(
     store: &S,
 ) -> Result<([u8; 32], [u8; 32], Bytes, BTreeSet<[u8; 32]>), LixError>
@@ -751,6 +763,7 @@ where
     ))
 }
 
+#[allow(dead_code)]
 async fn scan_tree_sweep_marks<S>(
     store: &S,
     expected_epoch: Option<u64>,
@@ -838,6 +851,7 @@ where
     Ok((current, all))
 }
 
+#[allow(dead_code)]
 async fn load_optional_tree_sweep_row<S, T>(
     store: &S,
     space: StorageSpace,
@@ -866,6 +880,7 @@ where
 /// Starts a new authenticated tree sweep epoch. The expensive root closure
 /// and mark inventory are built once here; ordinary queue-prefix GC never
 /// calls this function.
+#[allow(dead_code)]
 pub(crate) async fn begin_tree_sweep_epoch<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -997,6 +1012,7 @@ where
 
 /// Reopens an active or completed epoch. Mark rows are fully authenticated
 /// against the persisted count/digest before any page may stage a delete.
+#[allow(dead_code)]
 pub(crate) async fn open_tree_sweep_epoch<S>(
     store: &S,
 ) -> Result<Option<TreeSweepEpochSession>, LixError>
@@ -1050,6 +1066,7 @@ where
 /// the authenticated epoch mark set. Every key/value and cursor transition is
 /// validated before staging; the queue and cursor CAS fences make interruption
 /// and root publication races fail closed.
+#[allow(dead_code)]
 pub(crate) async fn stage_tree_sweep_epoch_page<S>(
     store: &S,
     session: &mut TreeSweepEpochSession,
@@ -3155,7 +3172,7 @@ mod tests {
             .expect("fixture read should open");
         let mut writes = storage.new_write_set();
         let mut preconditions = Vec::<StoragePrecondition>::new();
-        let mut session = begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
+        let _session = begin_tree_sweep_epoch(&&read, &mut writes, &mut preconditions)
             .await
             .expect("epoch closure should build once");
         storage
@@ -4852,10 +4869,10 @@ mod tests {
         }
     }
 
-    fn test_snapshot_root(commit_id: CommitId) -> crate::tracked_state::TrackedStateCommitRoot {
-        crate::tracked_state::TrackedStateCommitRoot {
+    fn test_snapshot_root(commit_id: CommitId) -> TrackedStateCommitRoot {
+        TrackedStateCommitRoot {
             commit_id,
-            root_id: crate::tracked_state::TrackedStateRootId::new(
+            root_id: TrackedStateRootId::new(
                 *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
             ),
             parent_roots: Vec::new(),
