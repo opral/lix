@@ -877,6 +877,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_base_resolves_deep_linear_ancestor_and_fork() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-a-change", "commit-a", &[], &[]),
+                commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
+                commit_change("commit-c-change", "commit-c", &[], &["commit-b"]),
+                commit_change("commit-d-change", "commit-d", &[], &["commit-c"]),
+                commit_change("commit-e-change", "commit-e", &[], &["commit-d"]),
+                commit_change("commit-x-change", "commit-x", &[], &["commit-b"]),
+                commit_change("commit-y-change", "commit-y", &[], &["commit-x"]),
+                commit_change("commit-z-change", "commit-z", &[], &["commit-y"]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = graph.reader(read);
+
+        assert_eq!(
+            reader
+                .merge_base(&commit_id("commit-b"), &commit_id("commit-e"))
+                .await
+                .expect("deep ancestor should resolve"),
+            commit_id("commit-b")
+        );
+        assert_eq!(
+            reader
+                .merge_base(&commit_id("commit-e"), &commit_id("commit-z"))
+                .await
+                .expect("deep linear fork should resolve"),
+            commit_id("commit-b")
+        );
+    }
+
+    #[tokio::test]
     async fn merge_base_errors_when_histories_have_no_common_commit() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(

@@ -6,6 +6,7 @@
     clippy::unused_self
 )]
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -69,6 +70,12 @@ where
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
     member_changes_cache: HashMap<Vec<String>, HashMap<CommitId, Vec<CommitGraphChange>>>,
+}
+
+enum LinearMergeBase {
+    Resolved(CommitId),
+    Disconnected,
+    GeneralGraph,
 }
 
 impl<S> CommitGraphStoreReader<S>
@@ -241,16 +248,19 @@ where
             return Ok(*left_parent);
         }
 
+        match self.linear_merge_base(left, right).await? {
+            LinearMergeBase::Resolved(base) => return Ok(base),
+            LinearMergeBase::Disconnected => {
+                return Err(no_common_history_error(left_commit_id, right_commit_id));
+            }
+            LinearMergeBase::GeneralGraph => {}
+        }
+
         let ancestors = self
             .best_common_ancestors(left_commit_id, right_commit_id)
             .await?;
         match ancestors.as_slice() {
-            [] => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "commit_graph found no common history between '{left_commit_id}' and '{right_commit_id}'"
-                ),
-            )),
+            [] => Err(no_common_history_error(left_commit_id, right_commit_id)),
             [base] => Ok(base.commit_id),
             _ => Err(LixError::ambiguous_merge_base(
                 left_commit_id,
@@ -261,6 +271,87 @@ where
                     .collect(),
             )),
         }
+    }
+
+    /// Uses authoritative generation and parent facts to zip two linear
+    /// frontiers without allocating the general DAG walk's ordered sets. Two
+    /// same-generation parents are loaded together so remote and LSM-backed
+    /// adapters receive one point-read batch per frontier step. Encountering a
+    /// merge commit returns to the general algorithm with every observed node
+    /// retained in this reader's immutable node cache.
+    async fn linear_merge_base(
+        &mut self,
+        mut left: CommitGraphNode,
+        mut right: CommitGraphNode,
+    ) -> Result<LinearMergeBase, LixError> {
+        loop {
+            if left.commit_id == right.commit_id {
+                return Ok(LinearMergeBase::Resolved(left.commit_id));
+            }
+            match left.generation.cmp(&right.generation) {
+                Ordering::Greater => {
+                    let [parent_id] = left.parent_commit_ids.as_slice() else {
+                        return Ok(if left.parent_commit_ids.is_empty() {
+                            LinearMergeBase::Disconnected
+                        } else {
+                            LinearMergeBase::GeneralGraph
+                        });
+                    };
+                    left = self.load_linear_parent(&left, *parent_id).await?;
+                }
+                Ordering::Less => {
+                    let [parent_id] = right.parent_commit_ids.as_slice() else {
+                        return Ok(if right.parent_commit_ids.is_empty() {
+                            LinearMergeBase::Disconnected
+                        } else {
+                            LinearMergeBase::GeneralGraph
+                        });
+                    };
+                    right = self.load_linear_parent(&right, *parent_id).await?;
+                }
+                Ordering::Equal => match (
+                    left.parent_commit_ids.as_slice(),
+                    right.parent_commit_ids.as_slice(),
+                ) {
+                    ([], []) => return Ok(LinearMergeBase::Disconnected),
+                    ([left_parent_id], [right_parent_id]) => {
+                        let parent_ids = [*left_parent_id, *right_parent_id];
+                        let parents = self.load_nodes(&parent_ids).await?;
+                        let mut parents = parents.into_iter().map(|(_, parent)| parent);
+                        let left_parent = parents
+                            .next()
+                            .flatten()
+                            .ok_or_else(|| missing_commit_graph_error(left_parent_id))?;
+                        let right_parent = parents
+                            .next()
+                            .flatten()
+                            .ok_or_else(|| missing_commit_graph_error(right_parent_id))?;
+                        validate_parent_generation(&left, &left_parent)?;
+                        validate_parent_generation(&right, &right_parent)?;
+                        left = left_parent;
+                        right = right_parent;
+                    }
+                    _ => return Ok(LinearMergeBase::GeneralGraph),
+                },
+            }
+        }
+    }
+
+    async fn load_linear_parent(
+        &mut self,
+        child: &CommitGraphNode,
+        parent_id: CommitId,
+    ) -> Result<CommitGraphNode, LixError> {
+        let parent_ids = [parent_id];
+        let parent = self
+            .load_nodes(&parent_ids)
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, parent)| parent)
+            .ok_or_else(|| missing_commit_graph_error(&parent_id))?;
+        validate_parent_generation(child, &parent)?;
+        Ok(parent)
     }
 
     /// Returns canonical changes reachable from `start_commit_id`.
@@ -422,6 +513,28 @@ fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
     LixError::new(
         "LIX_ERROR_UNKNOWN",
         format!("commit_graph missing commit '{commit_id}'"),
+    )
+}
+
+fn validate_parent_generation(
+    child: &CommitGraphNode,
+    parent: &CommitGraphNode,
+) -> Result<(), LixError> {
+    if parent.generation >= child.generation {
+        return Err(LixError::unknown(format!(
+            "commit '{}' parent '{}' does not have a lower generation",
+            child.commit_id, parent.commit_id
+        )));
+    }
+    Ok(())
+}
+
+fn no_common_history_error(left_commit_id: &CommitId, right_commit_id: &CommitId) -> LixError {
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!(
+            "commit_graph found no common history between '{left_commit_id}' and '{right_commit_id}'"
+        ),
     )
 }
 
