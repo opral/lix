@@ -19,11 +19,14 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v10";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
+const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC1";
+const BRANCH_HEAD_CONTROL_DIGEST_BYTES: usize = 32;
+const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
 
 /// The one mutable publication record for a branch.
 ///
@@ -229,18 +232,20 @@ where
             .iter()
             .map(|branch_id| Ok(StorageKey(Bytes::from(encode_key(branch_id)?))))
             .collect::<Result<Vec<_>, LixError>>()?;
-        PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &keys)
+        let values = PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &keys)
             .materialize(&self.store, StorageGetOptions::default())
             .await?
-            .value
+            .value;
+        branch_ids
             .into_iter()
-            .map(|value| match value {
+            .zip(values)
+            .map(|(branch_id, value)| match value {
                 None => Ok(BranchHeadControlObservation {
                     control: None,
                     raw_token: None,
                 }),
                 Some(StorageProjectedValue::FullValue(bytes)) => {
-                    let control = storage_codec::decode("branch-head control", &bytes)?;
+                    let control = decode_control(branch_id, &bytes)?;
                     Ok(BranchHeadControlObservation {
                         control: Some(control),
                         raw_token: Some(bytes),
@@ -280,7 +285,7 @@ where
                     "branch-head control key",
                     entry.key.0.as_ref(),
                 )?;
-                let control = decode_projected_value(entry.value)?;
+                let control = decode_projected_value(&key.branch_id, entry.value)?;
                 rows.push((key.branch_id, control));
             }
             if !page.value.has_more || resume_after.is_none() {
@@ -319,7 +324,7 @@ pub(crate) fn stage_branch_head_control(
         BRANCH_HEAD_CONTROL_SPACE,
         StorageKey(Bytes::from(encode_key(branch_id)?)),
         StorageValue {
-            bytes: Bytes::from(storage_codec::encode("branch-head control", &control)?),
+            bytes: Bytes::from(encode_control(branch_id, &control)?),
         },
     );
     Ok(())
@@ -364,14 +369,61 @@ fn encode_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     )
 }
 
-fn decode_projected_value(value: StorageProjectedValue) -> Result<BranchHeadControl, LixError> {
+fn encode_control(branch_id: &str, control: &BranchHeadControl) -> Result<Vec<u8>, LixError> {
+    let payload = storage_codec::encode("branch-head control", control)?;
+    let mut encoded = Vec::with_capacity(
+        BRANCH_HEAD_CONTROL_MAGIC.len() + payload.len() + BRANCH_HEAD_CONTROL_DIGEST_BYTES,
+    );
+    encoded.extend_from_slice(BRANCH_HEAD_CONTROL_MAGIC);
+    encoded.extend_from_slice(&payload);
+    encoded.extend_from_slice(&control_digest(branch_id, &encoded));
+    Ok(encoded)
+}
+
+fn decode_control(branch_id: &str, bytes: &[u8]) -> Result<BranchHeadControl, LixError> {
+    let payload_end = bytes
+        .len()
+        .checked_sub(BRANCH_HEAD_CONTROL_DIGEST_BYTES)
+        .filter(|payload_end| *payload_end >= BRANCH_HEAD_CONTROL_MAGIC.len())
+        .ok_or_else(branch_head_control_corruption)?;
+    let (authenticated, stored_digest) = bytes.split_at(payload_end);
+    if !authenticated.starts_with(BRANCH_HEAD_CONTROL_MAGIC)
+        || stored_digest != control_digest(branch_id, authenticated)
+    {
+        return Err(branch_head_control_corruption());
+    }
+    storage_codec::decode(
+        "branch-head control",
+        &authenticated[BRANCH_HEAD_CONTROL_MAGIC.len()..],
+    )
+}
+
+fn control_digest(branch_id: &str, authenticated: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(BRANCH_HEAD_CONTROL_DIGEST_CONTEXT);
+    hasher.update(&(branch_id.len() as u64).to_be_bytes());
+    hasher.update(branch_id.as_bytes());
+    hasher.update(authenticated);
+    *hasher.finalize().as_bytes()
+}
+
+fn branch_head_control_corruption() -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        "branch-head control authentication digest mismatch",
+    )
+}
+
+fn decode_projected_value(
+    branch_id: &str,
+    value: StorageProjectedValue,
+) -> Result<BranchHeadControl, LixError> {
     let StorageProjectedValue::FullValue(bytes) = value else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "branch-head control read unexpectedly omitted its value",
         ));
     };
-    storage_codec::decode("branch-head control", &bytes)
+    decode_control(branch_id, &bytes)
 }
 
 #[cfg(test)]
@@ -488,5 +540,44 @@ mod tests {
                 crate::storage_adapter::StorageError::PreconditionFailed(_)
             )
         ));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corruption read should open");
+        let mut corrupted = BranchHeadControlContext::new()
+            .reader(read)
+            .load_observed(std::slice::from_ref(&branch_a))
+            .await
+            .expect("winner control should load")
+            .pop()
+            .and_then(|observation| observation.raw_token)
+            .expect("winner control should have authenticated bytes")
+            .to_vec();
+        let payload_byte = BRANCH_HEAD_CONTROL_MAGIC.len();
+        corrupted[payload_byte] ^= 1;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            BRANCH_HEAD_CONTROL_SPACE,
+            StorageKey(Bytes::from(encode_key(&branch_a).unwrap())),
+            StorageValue {
+                bytes: Bytes::from(corrupted),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mutable control corruption fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt control read should open");
+        let error = BranchHeadControlContext::new()
+            .reader(read)
+            .load(&branch_a)
+            .await
+            .expect_err("corrupt branch control must fail closed");
+        assert!(error.to_string().contains("authentication digest mismatch"));
     }
 }

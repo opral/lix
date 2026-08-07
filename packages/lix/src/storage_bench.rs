@@ -943,6 +943,40 @@ where
     Ok(())
 }
 
+/// Loads one checkpoint produced by [`seed_branch_plugin_checkpoints_for_bench`]
+/// through the production decoder. This keeps corruption qualification on the
+/// real persisted format without exposing checkpoint internals to applications.
+pub async fn load_seeded_branch_plugin_checkpoint_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    branch_id: &str,
+    file_id: &str,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let generation = crate::binary_cas::BlobId::from_content(b"checkpoint-bench-generation");
+    let blob_hash = crate::binary_cas::BlobId::from_content(b"checkpoint-bench-blob");
+    let semantic_root = uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0004);
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
+        &read,
+        branch_id,
+        file_id,
+        &generation.to_hex(),
+        &semantic_root.to_string(),
+        blob_hash,
+    )
+    .await
+    .map(|checkpoint| {
+        checkpoint.map(|checkpoint| {
+            (
+                checkpoint.runtime.as_ref().to_vec(),
+                checkpoint.authority.as_ref().to_vec(),
+            )
+        })
+    })
+}
+
 pub async fn delete_branch_plugin_checkpoints_for_bench<StorageImpl>(
     storage: &StorageAdapter<StorageImpl>,
     branch_id: &str,
