@@ -1645,7 +1645,7 @@ fn validate_stored_recovery_ref(
 pub(crate) struct RepositoryGcSweep {
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
-    pub(crate) binary_cas: crate::binary_cas::kv::BinaryCasReclamation,
+    pub(crate) binary_cas: crate::binary_cas::BinaryCasGcSweep,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1761,13 +1761,9 @@ where
         preconditions,
     )
     .await?;
-    let binary_cas = crate::binary_cas::kv::stage_reclaim_unreachable_binary_cas(
-        &store,
-        writes,
-        &blob_roots,
-        &upload_chunks,
-    )
-    .await?;
+    let binary_cas =
+        crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
+            .await?;
     if batches.is_empty() {
         return Ok(RepositoryGcPlan {
             changelog: GcPlan {

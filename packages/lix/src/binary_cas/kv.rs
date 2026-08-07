@@ -9,9 +9,9 @@ use crate::binary_cas::codec::{
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BinaryCasChunking, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
-    BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
-    BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
+    BinaryCasChunking, BinaryCasGcSweep, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment,
+    BlobEditSplice, BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes,
+    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -77,20 +77,6 @@ pub(crate) struct KvBlobManifestChunk {
     pub(crate) chunk_size: u64,
 }
 
-/// Result of one authenticated, offline binary-CAS sweep.
-///
-/// The live sets are rebuildable maintenance state. They are never consulted
-/// by serving reads and are not a refcount or a second payload authority.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct BinaryCasReclamation {
-    pub(crate) live_blob_count: usize,
-    pub(crate) live_chunk_count: usize,
-    pub(crate) reclaimed_manifest_rows: usize,
-    pub(crate) reclaimed_manifest_chunk_rows: usize,
-    pub(crate) reclaimed_chunk_rows: usize,
-    pub(crate) reclaimed_chunk_bytes: u64,
-}
-
 /// Stages deletion of binary-CAS rows not reachable from authenticated blob
 /// roots and active upload receipts.
 ///
@@ -104,7 +90,7 @@ pub(crate) async fn stage_reclaim_unreachable_binary_cas(
     writes: &mut StorageWriteSet,
     blob_roots: &BTreeSet<BlobId>,
     upload_chunks: &BTreeSet<ChunkHash>,
-) -> Result<BinaryCasReclamation, LixError> {
+) -> Result<BinaryCasGcSweep, LixError> {
     let mut live_blobs = BTreeSet::new();
     let mut live_chunks = upload_chunks.clone();
     let mut live_manifest_chunk_counts = BTreeMap::<BlobId, u64>::new();
@@ -120,10 +106,10 @@ pub(crate) async fn stage_reclaim_unreachable_binary_cas(
         .await?;
     }
 
-    let mut result = BinaryCasReclamation {
+    let mut result = BinaryCasGcSweep {
         live_blob_count: live_blobs.len(),
         live_chunk_count: live_chunks.len(),
-        ..BinaryCasReclamation::default()
+        ..BinaryCasGcSweep::default()
     };
 
     let mut resume_after = None;
