@@ -902,7 +902,7 @@ fn print_sample(
 ) {
     let iterations = parameters.iterations as f64;
     println!(
-        "forktree_gate,sample={sample},backend={},layout={},rows={},updates={},iterations={},wall_us_per_op={:.3},cpu_us_per_op={:.3},alloc_bytes_per_op={:.1},alloc_calls_per_op={:.1},rss_before_bytes={rss_before},rss_after_bytes={rss_after},begin_reads_per_op={:.2},begin_writes_per_op={:.2},get_calls_per_op={:.2},get_keys_per_op={:.2},get_values_per_op={:.2},get_value_bytes_per_op={:.1},scan_calls_per_op={:.2},scan_entries_per_op={:.2},scan_value_bytes_per_op={:.1},write_batches_per_op={:.2},write_puts_per_op={:.2},write_deletes_per_op={:.2},write_bytes_per_op={:.1},commits_per_op={:.2},logical_bytes_per_op={:.1},object_writes_per_op={:.2},object_bytes_per_op={:.1},node_writes_per_op={:.2},node_bytes_per_op={:.1},reused_objects_per_op={:.2},disk_before_bytes={disk_before},disk_after_bytes={disk_after},slate_read_objects_per_op={:.2},slate_read_bytes_per_op={:.1},slate_write_objects_per_op={:.2},slate_write_bytes_per_op={:.1}",
+        "forktree_gate,sample={sample},backend={},layout={},rows={},updates={},iterations={},wall_us_per_op={:.3},cpu_us_per_op={:.3},alloc_bytes_per_op={:.1},alloc_calls_per_op={:.1},rss_before_bytes={rss_before},rss_after_bytes={rss_after},begin_reads_per_op={:.2},begin_writes_per_op={:.2},get_calls_per_op={:.2},get_keys_per_op={:.2},get_values_per_op={:.2},get_value_bytes_per_op={:.1},scan_calls_per_op={:.2},scan_entries_per_op={:.2},scan_value_bytes_per_op={:.1},write_batches_per_op={:.2},write_puts_per_op={:.2},write_deletes_per_op={:.2},write_bytes_per_op={:.1},commits_per_op={:.2},logical_bytes_per_op={:.1},object_writes_per_op={:.2},object_bytes_per_op={:.1},node_writes_per_op={:.2},node_bytes_per_op={:.1},leaf_writes_per_op={:.2},leaf_bytes_per_op={:.1},internal_writes_per_op={:.2},internal_bytes_per_op={:.1},reused_objects_per_op={:.2},disk_before_bytes={disk_before},disk_after_bytes={disk_after},slate_read_objects_per_op={:.2},slate_read_bytes_per_op={:.1},slate_write_objects_per_op={:.2},slate_write_bytes_per_op={:.1}",
         parameters.backend.label(),
         parameters.layout.label(),
         parameters.rows,
@@ -931,6 +931,10 @@ fn print_sample(
         accounting.object_bytes as f64 / iterations,
         accounting.node_writes as f64 / iterations,
         accounting.node_bytes as f64 / iterations,
+        accounting.leaf_writes as f64 / iterations,
+        accounting.leaf_bytes as f64 / iterations,
+        accounting.internal_writes as f64 / iterations,
+        accounting.internal_bytes as f64 / iterations,
         accounting.reused_objects as f64 / iterations,
         physical.read_objects as f64 / iterations,
         physical.read_bytes as f64 / iterations,

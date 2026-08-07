@@ -15,8 +15,13 @@ production index and is deliberately not registered with Lix serving paths.
 - Every commit names one tree root and one semantic delta. Nodes use canonical
   encodings and sorted entries. Leaves use deterministic 8-row blocks with
   level-1 Zstandard packing and map sorted keys to authenticated `(value-pack
-  hash, slot)` references. Each transaction writes one deterministic value pack
-  for all changed values. Packs remain in the same object space and reachability
+  hash, slot)` references. Internal nodes use deterministic eight-child blocks
+  and front-coded separators; child hashes remain the authoritative links. Each
+  transaction writes one deterministic value pack
+  for all changed values. Ordinary semantic deltas name that pack once and list
+  its aligned sorted keys; the initial delta is a compact authenticated bulk-root
+  declaration rather than a redundant enumeration of the imported snapshot.
+  Packs remain in the same object space and reachability
   graph; they are not a side index or second format. Initial trees are
   deterministically bulk packed; value-only updates rewrite only touched leaves
   and ancestor paths.

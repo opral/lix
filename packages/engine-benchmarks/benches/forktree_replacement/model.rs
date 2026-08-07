@@ -17,7 +17,7 @@ const DELTA_TAG: u8 = 3;
 const COMMIT_TAG: u8 = 4;
 const VALUE_PACK_TAG: u8 = 5;
 const LEAF_ROWS: usize = 8;
-const INTERNAL_CHILDREN: usize = 32;
+const INTERNAL_CHILDREN: usize = 8;
 
 pub const OBJECT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00f0_0001), "forktree_objects");
@@ -41,6 +41,10 @@ pub struct ApplyAccounting {
     pub object_bytes: u64,
     pub node_writes: u64,
     pub node_bytes: u64,
+    pub leaf_writes: u64,
+    pub leaf_bytes: u64,
+    pub internal_writes: u64,
+    pub internal_bytes: u64,
     pub reused_objects: u64,
     pub logical_bytes: u64,
 }
@@ -51,6 +55,10 @@ impl std::ops::AddAssign for ApplyAccounting {
         self.object_bytes += other.object_bytes;
         self.node_writes += other.node_writes;
         self.node_bytes += other.node_bytes;
+        self.leaf_writes += other.leaf_writes;
+        self.leaf_bytes += other.leaf_bytes;
+        self.internal_writes += other.internal_writes;
+        self.internal_bytes += other.internal_bytes;
         self.reused_objects += other.reused_objects;
         self.logical_bytes += other.logical_bytes;
     }
@@ -65,7 +73,6 @@ pub struct ForkTree<S> {
 struct NodeRef {
     id: ObjectId,
     max_key: Vec<u8>,
-    rows: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -122,14 +129,7 @@ where
             &mut pending,
         );
         let root = build_tree(rows, value_pack, &mut pending)?;
-        let delta = stage_object(
-            encode_delta(
-                None,
-                rows.iter()
-                    .map(|(key, value)| (key.as_slice(), value.as_slice())),
-            ),
-            &mut pending,
-        );
+        let delta = stage_object(encode_initial_delta(root.id, rows.len()), &mut pending);
         let commit = stage_object(
             encode_commit(Commit {
                 parent: None,
@@ -227,10 +227,8 @@ where
             .await?;
         let delta = stage_object(
             encode_delta(
-                Some(head.commit),
-                updates
-                    .iter()
-                    .map(|update| (update.key.as_slice(), update.value.as_slice())),
+                value_pack,
+                updates.iter().map(|update| update.key.as_slice()),
             ),
             &mut pending,
         );
@@ -249,9 +247,20 @@ where
         for bytes in pending.values() {
             accounting.object_writes += 1;
             accounting.object_bytes += bytes.len() as u64;
-            if matches!(object_tag(bytes)?, LEAF_TAG | INTERNAL_TAG) {
-                accounting.node_writes += 1;
-                accounting.node_bytes += bytes.len() as u64;
+            match object_tag(bytes)? {
+                LEAF_TAG => {
+                    accounting.node_writes += 1;
+                    accounting.node_bytes += bytes.len() as u64;
+                    accounting.leaf_writes += 1;
+                    accounting.leaf_bytes += bytes.len() as u64;
+                }
+                INTERNAL_TAG => {
+                    accounting.node_writes += 1;
+                    accounting.node_bytes += bytes.len() as u64;
+                    accounting.internal_writes += 1;
+                    accounting.internal_bytes += bytes.len() as u64;
+                }
+                _ => {}
             }
         }
 
@@ -380,7 +389,6 @@ where
                     Ok(NodeRef {
                         id,
                         max_key: rows.last().expect("leaf nodes are nonempty").key.clone(),
-                        rows: rows.len() as u64,
                     })
                 }
                 Node::Internal(mut children) => {
@@ -409,7 +417,6 @@ where
                             .expect("internal nodes are nonempty")
                             .max_key
                             .clone(),
-                        rows: children.iter().map(|child| child.rows).sum(),
                     })
                 }
             }
@@ -606,7 +613,6 @@ fn build_tree(
             NodeRef {
                 id,
                 max_key: chunk.last().expect("leaf chunk is nonempty").key.clone(),
-                rows: chunk.len() as u64,
             }
         })
         .collect::<Vec<_>>();
@@ -622,7 +628,6 @@ fn build_tree(
                         .expect("internal chunk is nonempty")
                         .max_key
                         .clone(),
-                    rows: children.iter().map(|child| child.rows).sum(),
                 }
             })
             .collect();
@@ -702,24 +707,36 @@ fn encode_value_pack<'a>(values: impl ExactSizeIterator<Item = &'a [u8]>) -> Byt
 fn encode_internal(children: &[NodeRef]) -> Bytes {
     let mut bytes = object_prefix(INTERNAL_TAG);
     put_u32(&mut bytes, children.len());
+    let mut previous_key: &[u8] = &[];
     for child in children {
-        put_bytes(&mut bytes, &child.max_key);
+        let shared_prefix = previous_key
+            .iter()
+            .zip(&child.max_key)
+            .take_while(|(left, right)| left == right)
+            .count();
+        put_u32(&mut bytes, shared_prefix);
+        put_bytes(&mut bytes, &child.max_key[shared_prefix..]);
         bytes.extend_from_slice(&child.id.0);
-        bytes.extend_from_slice(&child.rows.to_be_bytes());
+        previous_key = &child.max_key;
     }
     Bytes::from(bytes)
 }
 
-fn encode_delta<'a>(
-    parent: Option<ObjectId>,
-    rows: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
-) -> Bytes {
+fn encode_initial_delta(root: ObjectId, rows: usize) -> Bytes {
     let mut bytes = object_prefix(DELTA_TAG);
-    put_optional_id(&mut bytes, parent);
-    put_u32(&mut bytes, rows.len());
-    for (key, value) in rows {
+    bytes.push(0);
+    bytes.extend_from_slice(&root.0);
+    put_u32(&mut bytes, rows);
+    Bytes::from(bytes)
+}
+
+fn encode_delta<'a>(value_pack: ObjectId, keys: impl ExactSizeIterator<Item = &'a [u8]>) -> Bytes {
+    let mut bytes = object_prefix(DELTA_TAG);
+    bytes.push(1);
+    bytes.extend_from_slice(&value_pack.0);
+    put_u32(&mut bytes, keys.len());
+    for key in keys {
         put_bytes(&mut bytes, key);
-        bytes.extend_from_slice(blake3::hash(value).as_bytes());
     }
     Bytes::from(bytes)
 }
@@ -766,10 +783,19 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
             }
             let mut children = Vec::with_capacity(count);
             for _ in 0..count {
+                let shared_prefix = decoder.u32()?;
+                let suffix = decoder.bytes()?;
+                let previous_key = children
+                    .last()
+                    .map_or(&[][..], |child: &NodeRef| child.max_key.as_slice());
+                if shared_prefix > previous_key.len() {
+                    return Err("ForkTree internal separator prefix is invalid".to_string());
+                }
+                let mut max_key = previous_key[..shared_prefix].to_vec();
+                max_key.extend_from_slice(&suffix);
                 children.push(NodeRef {
-                    max_key: decoder.bytes()?,
+                    max_key,
                     id: decoder.id()?,
-                    rows: decoder.u64()?,
                 });
             }
             decoder.finish()?;
@@ -938,14 +964,6 @@ impl<'a> Decoder<'a> {
             .try_into()
             .expect("decoder returns exact u32 width");
         Ok(u32::from_be_bytes(encoded))
-    }
-
-    fn u64(&mut self) -> Result<u64, String> {
-        let encoded: [u8; 8] = self
-            .take(8)?
-            .try_into()
-            .expect("decoder returns exact u64 width");
-        Ok(u64::from_be_bytes(encoded))
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, String> {
