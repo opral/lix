@@ -4867,9 +4867,7 @@ where
                                         &visible_materialization.semantic_root,
                                         checkpoint_blob_hash,
                                     )
-                                    .await
-                                    .ok()
-                                    .flatten()
+                                    .await?
                                     .and_then(|checkpoint| {
                                         Some(DecodedDurablePluginCheckpoint {
                                             runtime: WasmDurableDocumentCheckpoint::decode(

@@ -27,5 +27,7 @@ pub(crate) use self::planner::{
     plan_parsed_directory_path_update_with_resolvers, plan_parsed_file_path_update_with_resolvers,
     plan_parsed_file_path_write_with_resolvers, plan_recursive_directory_delete,
 };
-pub(crate) use self::read::{FilesystemIndex, filesystem_schema_keys};
+pub(crate) use self::read::{
+    FilesystemIndex, collect_gc_binary_blob_roots, filesystem_schema_keys,
+};
 pub(crate) use self::visibility::VisibleFilesystem;

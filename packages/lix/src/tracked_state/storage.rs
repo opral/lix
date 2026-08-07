@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Bound, Deref, Range};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::changelog::ChangeRecordProjection;
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest};
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
@@ -34,6 +35,7 @@ use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
     TrackedStateCommitRoot, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
     TrackedStateKeyRef, TrackedStateRootId, TrackedStateSingleStringReplacementRef,
+    TrackedStateTreeScanRequest,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
@@ -518,6 +520,15 @@ pub(crate) struct CommitDeltaMember {
     pub(crate) authored: bool,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     selected_tombstone: bool,
+}
+
+/// One authenticated mutation snapshot from a retained rootless commit.
+/// Root consumers use this only when no dense tree root exists; it preserves
+/// the canonical packed-delta and JSON-store serving authorities.
+pub(crate) struct RetainedCommitSnapshot {
+    pub(crate) key: TrackedStateKey,
+    pub(crate) deleted: bool,
+    pub(crate) snapshot: Option<String>,
 }
 
 impl CommitDeltaMember {
@@ -7561,6 +7572,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             &state,
             schema_keys,
             max_segment_count,
+            true,
         )
         .await?
     else {
@@ -7586,6 +7598,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         &source,
         schema_keys,
         max_segment_count.saturating_sub(local_segment_count),
+        true,
     )
     .await?
     else {
@@ -7599,11 +7612,309 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     Ok(Some(merge_selected_source_members(members, local)))
 }
 
+/// Resolves the immutable owners of finite selected members in one commit.
+///
+/// Whole-source aliases are already named by the authenticated manifest and
+/// are deliberately excluded here. Ordinary GC uses this bounded local
+/// inventory walk to retain canonical locator owners without scanning any
+/// repository-global change or commit space.
+pub(crate) async fn load_local_selected_change_owner_commit_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let state = load_point_replay_commit_state(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            replacement_payload_error(&format!(
+                "selected-owner dependency commit '{commit_id}' has no physical authority"
+            ))
+        })?;
+    let Some((members, _)) = load_authenticated_local_commit_delta_members_for_schemas(
+        store,
+        &state,
+        &[],
+        usize::MAX,
+        false,
+    )
+    .await?
+    else {
+        unreachable!("unbounded selected-owner inventory cannot exceed its segment limit")
+    };
+    let selected = members
+        .into_iter()
+        .filter(|member| !member.authored && !member.selected_tombstone)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    // Explicit locators are the canonical route for random change IDs. Probe
+    // them in one batch before trying the packed direct-address convention;
+    // otherwise each random UUID looks like a distinct speculative commit and
+    // turns one finite selection into one manifest probe per row.
+    let locator_keys = selected
+        .iter()
+        .map(|member| {
+            StorageKey(Bytes::copy_from_slice(
+                member.value.change_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let locator_values = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &locator_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let explicit_locators = selected
+        .iter()
+        .zip(locator_values.value)
+        .map(|(member, value)| {
+            value
+                .and_then(full_value_bytes)
+                .map(|bytes| decode_change_locator(member.value.change_id, &bytes))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let direct_locators = selected
+        .iter()
+        .map(|member| direct_change_locator(member.value.change_id))
+        .collect::<Vec<_>>();
+
+    // Direct addressing remains canonical when its physical commit really
+    // owns the coordinate. Probe all syntactic candidates in one request so
+    // random explicit IDs cannot reintroduce one backend request per row.
+    let direct_candidate_ids = direct_locators
+        .iter()
+        .flatten()
+        .map(|locator| locator.commit_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let direct_candidate_manifests =
+        load_commit_state_manifests(store, &direct_candidate_ids).await?;
+    let present_direct_candidates = direct_candidate_ids
+        .into_iter()
+        .zip(direct_candidate_manifests)
+        .filter_map(|(commit_id, manifest)| manifest.map(|_| commit_id))
+        .collect::<BTreeSet<_>>();
+
+    let mut direct_by_commit = BTreeMap::<
+        CommitId,
+        (
+            Arc<AuthenticatedReplayCommitStateManifest>,
+            Vec<(usize, CommitDeltaChangeLocator)>,
+        ),
+    >::new();
+    let mut non_owning_direct_candidates = BTreeSet::new();
+    let mut explicit_indices = BTreeSet::new();
+    for (index, locator) in direct_locators.iter().copied().enumerate() {
+        let Some(locator) =
+            locator.filter(|locator| present_direct_candidates.contains(&locator.commit_id))
+        else {
+            explicit_indices.insert(index);
+            continue;
+        };
+        if let Some((_, requests)) = direct_by_commit.get_mut(&locator.commit_id) {
+            requests.push((index, locator));
+            continue;
+        }
+        if non_owning_direct_candidates.contains(&locator.commit_id) {
+            explicit_indices.insert(index);
+            continue;
+        }
+        match load_direct_change_authority(store, locator.commit_id).await? {
+            DirectChangeAuthority::Candidate(authority) => {
+                direct_by_commit
+                    .entry(locator.commit_id)
+                    .or_insert_with(|| (authority, Vec::new()))
+                    .1
+                    .push((index, locator));
+            }
+            DirectChangeAuthority::NotOwned(_) => {
+                non_owning_direct_candidates.insert(locator.commit_id);
+                explicit_indices.insert(index);
+            }
+        }
+    }
+
+    let mut owners = BTreeSet::new();
+    for (commit_id, (authority, requests)) in direct_by_commit {
+        let locators = requests
+            .iter()
+            .map(|(_, locator)| *locator)
+            .collect::<Vec<_>>();
+        let routes = route_direct_change_records_for_state(store, &authority, &locators).await?;
+        for ((index, _), route) in requests.into_iter().zip(routes) {
+            match route {
+                DirectChangeRecordRoute::Owned(record) => {
+                    validate_selected_owner_record(&selected[index], &record)?;
+                    owners.insert(commit_id);
+                }
+                DirectChangeRecordRoute::NotOwned(_) => {
+                    explicit_indices.insert(index);
+                }
+            }
+        }
+    }
+
+    let explicit = explicit_indices
+        .into_iter()
+        .map(|index| {
+            explicit_locators[index]
+                .map(|locator| (index, locator))
+                .ok_or_else(|| {
+                    replacement_payload_error(&format!(
+                        "selected change '{}' has no authoritative locator",
+                        selected[index].value.change_id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let locators = explicit
+        .iter()
+        .map(|(_, locator)| *locator)
+        .collect::<Vec<_>>();
+    let records = load_explicit_change_records_at_locators(store, &locators).await?;
+    for ((index, locator), record) in explicit.into_iter().zip(records) {
+        validate_selected_owner_record(&selected[index], &record)?;
+        owners.insert(locator.commit_id);
+    }
+    Ok(owners)
+}
+
+fn validate_selected_owner_record(
+    member: &CommitDeltaMember,
+    record: &crate::changelog::ChangeRecord,
+) -> Result<(), LixError> {
+    if record.change_id != member.value.change_id
+        || record.schema_key != member.key.schema_key
+        || record.file_id != member.key.file_id
+        || record.entity_pk != member.key.entity_pk
+    {
+        return Err(replacement_payload_error(&format!(
+            "selected change '{}' references canonical authority for a different identity",
+            member.value.change_id
+        )));
+    }
+    Ok(())
+}
+
+/// Materializes snapshots for selected schemas from one retained physical
+/// commit authority without depending on its rebuildable changelog projection.
+/// Rooted commits scan their authenticated snapshot tree; rootless commits use
+/// their authenticated bounded mutation delta. Work is O(selected tree rows or
+/// selected mutations + JSON payload bytes), with memory bounded by that one
+/// retained commit selection.
+pub(crate) async fn load_retained_commit_snapshots_for_schemas(
+    store: &impl StorageAdapterRead,
+    commit_id: CommitId,
+    schema_keys: &[String],
+) -> Result<Vec<RetainedCommitSnapshot>, LixError> {
+    let manifest = load_commit_state_manifest(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("retained tracked-state commit '{commit_id}' has no physical manifest"),
+            )
+        })?;
+    if let Some(snapshot_root) = manifest.snapshot_root.as_ref() {
+        let request = TrackedStateTreeScanRequest {
+            schema_keys: schema_keys.to_vec(),
+            entity_pks: Vec::new(),
+            file_ids: Vec::new(),
+            include_tombstones: true,
+            limit: None,
+        };
+        let entries = crate::tracked_state::tree::TrackedStateTree::new()
+            .scan(store, &snapshot_root.root_id, &request)
+            .await?;
+        let rows = crate::tracked_state::materialize_batch_from_index_entries(
+            store,
+            entries,
+            &ChangeRecordProjection {
+                snapshot_content: true,
+                metadata: false,
+            },
+        )
+        .await?
+        .into_rows();
+        return Ok(rows
+            .into_iter()
+            .map(|row| RetainedCommitSnapshot {
+                key: TrackedStateKey {
+                    entity_pk: row.entity_pk,
+                    schema_key: row.schema_key,
+                    file_id: row.file_id,
+                },
+                deleted: row.deleted,
+                snapshot: row.snapshot_content.map(Into::into),
+            })
+            .collect());
+    }
+    let members = load_commit_delta_members_with_payloads_for_schemas(
+        store,
+        commit_id,
+        schema_keys,
+        usize::MAX,
+    )
+    .await?
+    .expect("unbounded retained snapshot scan cannot exceed its segment limit");
+    let json_refs = members
+        .iter()
+        .filter_map(|member| match &member.change.snapshot {
+            crate::json_store::JsonSlot::Ref(json_ref) => Some(*json_ref),
+            crate::json_store::JsonSlot::None | crate::json_store::JsonSlot::Inline(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let loaded = crate::json_store::JsonStoreContext::new()
+        .reader(store)
+        .load_bytes_many(crate::json_store::JsonLoadRequestRef {
+            refs: &json_refs,
+            scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+        })
+        .await?
+        .into_values();
+    let mut loaded = loaded.into_iter();
+    members
+        .into_iter()
+        .map(|member| {
+            let snapshot = match member.change.snapshot {
+                crate::json_store::JsonSlot::None => None,
+                crate::json_store::JsonSlot::Inline(snapshot) => Some(snapshot.into()),
+                crate::json_store::JsonSlot::Ref(json_ref) => {
+                    let bytes = loaded.next().flatten().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!(
+                                "retained commit '{commit_id}' references missing JSON '{}'",
+                                json_ref.to_hex()
+                            ),
+                        )
+                    })?;
+                    Some(String::from_utf8(bytes.to_vec()).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!(
+                                "retained commit '{commit_id}' references non-UTF-8 snapshot JSON"
+                            ),
+                        )
+                    })?)
+                }
+            };
+            Ok(RetainedCommitSnapshot {
+                key: member.key,
+                deleted: member.value.deleted,
+                snapshot,
+            })
+        })
+        .collect()
+}
+
 async fn load_authenticated_local_commit_delta_members_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
     max_segment_count: usize,
+    hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let Some(root) = state.mutation_directory_root.as_ref() else {
         let manifest = commit_delta_manifest_from_commit_state(state);
@@ -7612,8 +7923,14 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             return Ok(None);
         }
         return Ok(Some((
-            load_commit_delta_members_from_manifest(store, state.commit_id, &manifest, schema_keys)
-                .await?,
+            load_commit_delta_members_from_manifest(
+                store,
+                state.commit_id,
+                &manifest,
+                schema_keys,
+                hydrate_selected_payloads,
+            )
+            .await?,
             segment_count,
         )));
     };
@@ -7625,14 +7942,21 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             state,
             schema_keys,
             max_segment_count,
+            hydrate_selected_payloads,
         )
         .await;
     }
     if root.layout == super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY {
         let manifest = commit_delta_manifest_from_commit_state(state);
         return Ok(Some((
-            load_commit_delta_members_from_manifest(store, state.commit_id, &manifest, schema_keys)
-                .await?,
+            load_commit_delta_members_from_manifest(
+                store,
+                state.commit_id,
+                &manifest,
+                schema_keys,
+                hydrate_selected_payloads,
+            )
+            .await?,
             0,
         )));
     }
@@ -7677,8 +8001,14 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     let manifest = expanded_commit_delta_manifest_from_commit_state(store, &expanded_state).await?;
     validate_commit_delta_manifest(&manifest)?;
     Ok(Some((
-        load_commit_delta_members_from_manifest(store, state.commit_id, &manifest, schema_keys)
-            .await?,
+        load_commit_delta_members_from_manifest(
+            store,
+            state.commit_id,
+            &manifest,
+            schema_keys,
+            hydrate_selected_payloads,
+        )
+        .await?,
         segment_count,
     )))
 }
@@ -7688,6 +8018,7 @@ async fn load_bounded_commit_delta_members_for_schemas(
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
     max_segment_count: usize,
+    hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded payload scan omitted its mutation-directory root")
@@ -7779,7 +8110,9 @@ async fn load_bounded_commit_delta_members_for_schemas(
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
-    hydrate_selected_members(store, &mut members).await?;
+    if hydrate_selected_payloads {
+        hydrate_selected_members(store, &mut members).await?;
+    }
     validate_commit_delta_member_order_and_ids(state.commit_id, &members)?;
     Ok(Some((members, segment_count)))
 }
@@ -7826,6 +8159,7 @@ async fn load_commit_delta_members_from_manifest(
     commit_id: CommitId,
     manifest: &CommitDeltaManifest,
     schema_keys: &[String],
+    hydrate_selected_payloads: bool,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     if let Some(parts) = manifest.columnar_parts.as_ref() {
         if !schema_keys.is_empty() && !schema_keys.iter().any(|schema| schema == &parts.schema_key)
@@ -7886,7 +8220,9 @@ async fn load_commit_delta_members_from_manifest(
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
-    hydrate_selected_members(store, &mut members).await?;
+    if hydrate_selected_payloads {
+        hydrate_selected_members(store, &mut members).await?;
+    }
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
     Ok(members)
 }
@@ -9388,7 +9724,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     continue;
                 }
                 let members =
-                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[])
+                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[], true)
                         .await?;
                 for member in members {
                     if member.authored {
@@ -12625,7 +12961,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::LixError;
-    use crate::binary_cas::kv::{
+    use crate::binary_cas::{
         BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
         BINARY_CAS_MANIFEST_SPACE,
     };

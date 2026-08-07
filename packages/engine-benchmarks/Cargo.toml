@@ -48,6 +48,7 @@ criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
+libc = "0.2"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -55,6 +56,7 @@ smallvec = "1.15"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[example]]
@@ -65,6 +67,16 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "revision_pack_oracle"
 path = "examples/revision_pack_oracle.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_gc_qualification"
+path = "examples/cas_gc_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_publication_epoch_qualification"
+path = "examples/cas_publication_epoch_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
@@ -83,6 +95,11 @@ path = "tests/movie_workspace_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
+name = "corruption_recovery_qualification"
+path = "tests/corruption_recovery_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
 name = "large_payload_read_qualification"
 path = "tests/large_payload_read_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
@@ -91,6 +108,16 @@ required-features = ["storage-benches", "slatedb"]
 name = "certified_replacement_delete_reopen"
 path = "tests/certified_replacement_delete_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "checkpoint_gc_replay_reopen"
+path = "tests/checkpoint_gc_replay_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "cas_gc_history_retention"
+path = "tests/cas_gc_history_retention.rs"
+required-features = ["storage-benches", "slatedb"]
 
 [[test]]
 name = "tpch_overlay_helpers"

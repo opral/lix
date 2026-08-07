@@ -27,6 +27,8 @@ mod switch_branch;
 mod transaction;
 mod undo_redo;
 
+pub(crate) use media_upload::stage_reclaimable_upload_receipts;
+
 pub use crate::common::{
     ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
 };

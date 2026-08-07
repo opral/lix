@@ -6,6 +6,7 @@
 //! a rebuildable serving accelerator.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use bytes::Bytes;
 
@@ -227,6 +228,16 @@ pub(crate) fn decode_current_state_data_part(
         .collect::<Result<Vec<_>, LixError>>()?;
     validate_rows(&rows)?;
     Ok(rows)
+}
+
+pub(crate) fn decode_current_state_data_part_commit_ids(
+    expected_digest: &[u8; 32],
+    encoded: &[u8],
+) -> Result<BTreeSet<crate::changelog::CommitId>, LixError> {
+    Ok(decode_current_state_data_part(expected_digest, encoded)?
+        .into_iter()
+        .map(|row| row.value.commit_id)
+        .collect())
 }
 
 fn validate_rows(rows: &[CurrentStateDataRow]) -> Result<(), LixError> {

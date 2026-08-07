@@ -677,9 +677,10 @@ mod tests {
 
         let point_update = fixture.update_one_by_pk_accounting().await;
         assert_eq!(point_update.logical_rows, 1);
-        // The point write keeps the compact current-state certificate and
-        // publishes its authenticated branch/control and reachability state.
-        assert_eq!(point_update.staged_puts, 11, "{point_update:?}");
+        // The point write keeps the compact current-state certificate,
+        // publishes its authenticated branch/control and reachability state,
+        // and rotates the mandatory binary-CAS publication/reclamation epoch.
+        assert_eq!(point_update.staged_puts, 12, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement

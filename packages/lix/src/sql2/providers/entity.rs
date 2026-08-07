@@ -3055,7 +3055,6 @@ mod tests {
         LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter,
         LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
     };
-    use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
         EntityColumnType, EntitySurfaceShape, derive_entity_surface_spec_from_schema,
         entity_surface_schema, schema_exposed_as_entity_history_surface,
@@ -3225,14 +3224,11 @@ mod tests {
         let session = datafusion::prelude::SessionContext::new();
         let mut write_context = DummyWriteContext;
         let write_ctx = crate::sql2::SqlWriteContext::new(&mut write_context);
-        let provider = SpecTableProvider::new(
-            Arc::new(super::EntitySpec::active_with_write(
-                entity_insert_spec_with_primary_key(),
-                write_ctx.clone(),
-                empty_branch_ref(),
-            )),
-            WriteAccess::write(write_ctx),
-        );
+        let provider = SpecTableProvider::new(Arc::new(super::EntitySpec::active_with_write(
+            entity_insert_spec_with_primary_key(),
+            write_ctx.clone(),
+            empty_branch_ref(),
+        )));
         let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
             provider.schema(),
         )) as Arc<dyn datafusion::physical_plan::ExecutionPlan>;
@@ -3254,9 +3250,7 @@ mod tests {
             "rejection should keep the NotImplemented error type: {error:?}"
         );
         assert!(
-            error
-                .to_string()
-                .contains("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline"),
+            error.to_string().contains("not implemented"),
             "unexpected error: {error}"
         );
     }
@@ -4094,15 +4088,12 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let provider = SpecTableProvider::new(
-            Arc::new(super::EntitySpec::by_branch(
-                spec,
-                Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
-                empty_branch_ref(),
-                None,
-            )),
-            WriteAccess::read_only(),
-        );
+        let provider = SpecTableProvider::new(Arc::new(super::EntitySpec::by_branch(
+            spec,
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+            None,
+        )));
 
         assert!(
             provider

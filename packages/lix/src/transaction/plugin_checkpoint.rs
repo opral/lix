@@ -9,10 +9,12 @@ use crate::storage_adapter::{
 use crate::{Blob, LixError};
 
 pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
+    StorageSpace::mutable(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v2");
 
-const MAGIC: &[u8; 4] = b"LPC2";
+const MAGIC: &[u8; 4] = b"LPC3";
 const HEADER_BYTES: usize = 4 + 32 + 32 + 16 + 4 + 4;
+const DIGEST_BYTES: usize = 32;
+const DIGEST_CONTEXT: &str = "lix plugin current checkpoint v3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CurrentPluginCheckpoint {
@@ -37,6 +39,7 @@ pub(crate) fn stage_current_plugin_checkpoint(
     let capacity = HEADER_BYTES
         .checked_add(runtime.len())
         .and_then(|length| length.checked_add(authority.len()))
+        .and_then(|length| length.checked_add(DIGEST_BYTES))
         .ok_or_else(checkpoint_too_large)?;
     let mut value = Vec::with_capacity(capacity);
     value.extend_from_slice(MAGIC);
@@ -47,6 +50,7 @@ pub(crate) fn stage_current_plugin_checkpoint(
     value.extend_from_slice(&authority_len.to_le_bytes());
     value.extend_from_slice(runtime);
     value.extend_from_slice(authority);
+    value.extend_from_slice(&checkpoint_digest(branch_id, file_id, &value));
     writes.put(
         PLUGIN_CHECKPOINT_SPACE,
         checkpoint_key(branch_id, file_id)?,
@@ -160,11 +164,20 @@ pub(crate) async fn load_current_plugin_checkpoint(
     let Some(StorageProjectedValue::FullValue(value)) = values.into_iter().next().flatten() else {
         return Ok(None);
     };
-    let Some(header) = value.get(..HEADER_BYTES) else {
-        return Ok(None);
-    };
-    if &header[..4] != MAGIC
-        || header[4..36] != expected_generation.as_bytes()[..]
+    let authenticated_end = value
+        .len()
+        .checked_sub(DIGEST_BYTES)
+        .filter(|end| *end >= HEADER_BYTES)
+        .ok_or_else(checkpoint_corruption)?;
+    let (authenticated, stored_digest) = value.split_at(authenticated_end);
+    if stored_digest != checkpoint_digest(branch_id, file_id, authenticated) {
+        return Err(checkpoint_corruption());
+    }
+    let header = &authenticated[..HEADER_BYTES];
+    if &header[..4] != MAGIC {
+        return Err(checkpoint_corruption());
+    }
+    if header[4..36] != expected_generation.as_bytes()[..]
         || header[36..68] != blob_hash.as_bytes()[..]
         || header[68..84] != expected_semantic_root.as_bytes()[..]
     {
@@ -176,17 +189,34 @@ pub(crate) async fn load_current_plugin_checkpoint(
     let authority_len = authority_len as usize;
     let runtime_end = HEADER_BYTES
         .checked_add(runtime_len)
-        .filter(|end| *end <= value.len());
+        .filter(|end| *end <= authenticated.len());
     let value_end = runtime_end
         .and_then(|end| end.checked_add(authority_len))
-        .filter(|end| *end == value.len());
+        .filter(|end| *end == authenticated.len());
     let (Some(runtime_end), Some(value_end)) = (runtime_end, value_end) else {
-        return Ok(None);
+        return Err(checkpoint_corruption());
     };
     Ok(Some(CurrentPluginCheckpoint {
         runtime: value.slice(HEADER_BYTES..runtime_end).into(),
         authority: value.slice(runtime_end..value_end).into(),
     }))
+}
+
+fn checkpoint_digest(branch_id: &str, file_id: &str, authenticated: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(DIGEST_CONTEXT);
+    for owner in [branch_id, file_id] {
+        hasher.update(&(owner.len() as u64).to_be_bytes());
+        hasher.update(owner.as_bytes());
+    }
+    hasher.update(authenticated);
+    *hasher.finalize().as_bytes()
+}
+
+fn checkpoint_corruption() -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        "plugin current checkpoint authentication digest mismatch",
+    )
 }
 
 fn parse_semantic_root(semantic_root: &str) -> Result<uuid::Uuid, LixError> {
@@ -427,5 +457,76 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn present_corrupt_checkpoint_fails_closed_instead_of_becoming_a_cache_miss() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = BlobId::from_content(b"generation");
+        let blob_hash = BlobId::from_content(b"file");
+        let mut writes = storage.new_write_set();
+        stage_current_plugin_checkpoint(
+            &mut writes,
+            BRANCH_ID,
+            FILE_ID,
+            &generation.to_hex(),
+            SEMANTIC_ROOT,
+            blob_hash,
+            b"runtime",
+            b"authority",
+        )
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let key = checkpoint_key(BRANCH_ID, FILE_ID).unwrap();
+        let mut value = PointReadPlan::new(PLUGIN_CHECKPOINT_SPACE, std::slice::from_ref(&key))
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .unwrap()
+            .value
+            .pop()
+            .flatten()
+            .and_then(|value| match value {
+                StorageProjectedValue::FullValue(value) => Some(value.to_vec()),
+                StorageProjectedValue::KeyOnly => None,
+            })
+            .expect("checkpoint value should exist");
+        drop(read);
+        value[HEADER_BYTES] ^= 1;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            PLUGIN_CHECKPOINT_SPACE,
+            key,
+            StorageValue {
+                bytes: Bytes::from(value),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = load_current_plugin_checkpoint(
+            &read,
+            BRANCH_ID,
+            FILE_ID,
+            &generation.to_hex(),
+            SEMANTIC_ROOT,
+            blob_hash,
+        )
+        .await
+        .expect_err("present corrupt checkpoint must fail closed");
+        assert!(error.to_string().contains("authentication digest mismatch"));
     }
 }

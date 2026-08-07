@@ -420,6 +420,21 @@ impl CommitStateMutationInventory {
                 self.replacement_part_digests.len()
             }
     }
+
+    /// Whether this local inventory can contain a finite selected member whose
+    /// payload owner must be resolved through the canonical change locator.
+    ///
+    /// A selected-source alias is whole-source authority, not a finite
+    /// selection. A non-empty direct-address inventory proves every member
+    /// owns its encoded slot, and columnar parts are authored history by
+    /// contract. Only the remaining mixed/generic layouts require decoding
+    /// local members to distinguish authored rows from finite selections.
+    pub(crate) fn may_contain_finite_selected_members(&self) -> bool {
+        self.member_count != 0
+            && self.selected_source_commit_id.is_none()
+            && self.direct_part_row_counts.is_empty()
+            && self.columnar_parts.is_none()
+    }
 }
 
 /// Immutable physical authority for one tracked commit.
