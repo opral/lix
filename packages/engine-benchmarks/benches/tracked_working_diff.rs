@@ -33,7 +33,10 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
-use lix::storage_bench::diff_tracked_commits_for_bench;
+use lix::storage_bench::{
+    diff_rooted_tracked_commits_for_bench, diff_tracked_commits_for_bench,
+    has_durable_commit_root_for_bench,
+};
 use lix::tracked_state::bench::seed_packed_history;
 use lix::{
     CreateBranchOptions, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
@@ -247,6 +250,54 @@ fn main() {
                 }
             });
         }
+        "measure-rooted-history" => {
+            let Some(base_commit_id) = args.get(4) else {
+                print_usage();
+                return;
+            };
+            let Some(head_commit_id) = args.get(5) else {
+                print_usage();
+                return;
+            };
+            let Some(expected_changes) = args.get(6) else {
+                print_usage();
+                return;
+            };
+            let expected_changes = parse_usize(Some(expected_changes), 1, "expected changes");
+            let repetitions = parse_usize(
+                args.get(7),
+                DEFAULT_MEASURE_REPETITIONS,
+                "measurement repetitions",
+            );
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        measure_rooted_history(
+                            RocksDB::open(path).expect("open rooted-diff RocksDB"),
+                            backend,
+                            Path::new(path),
+                            base_commit_id,
+                            head_commit_id,
+                            expected_changes,
+                            repetitions,
+                        )
+                        .await;
+                    }
+                    Backend::Slate => {
+                        measure_rooted_history(
+                            SlateDB::open(path).expect("open rooted-diff SlateDB"),
+                            backend,
+                            Path::new(path),
+                            base_commit_id,
+                            head_commit_id,
+                            expected_changes,
+                            repetitions,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
         "merge-preview" => {
             assert!(
                 !Path::new(path).exists(),
@@ -366,6 +417,7 @@ fn print_usage() {
          [rows] [commits] [changes-per-commit]\n  \
          tracked_working_diff measure <rocksdb|slatedb> <directory> [repetitions]\n  \
          tracked_working_diff measure-history <rocksdb|slatedb> <directory> <base-commit-id> <head-commit-id> [repetitions]\n  \
+         tracked_working_diff measure-rooted-history <rocksdb|slatedb> <directory> <base-commit-id> <head-commit-id> <expected-changes> [repetitions]\n  \
          tracked_working_diff merge-preview <rocksdb|slatedb> <directory> [rows] [commits-per-side] [changes-per-commit] [repetitions]\n  \
          tracked_working_diff merge-commit <rocksdb|slatedb> <directory> [repetitions] [changes-per-side]\n  \
          tracked_working_diff checkpoint <rocksdb|slatedb> <directory>"
@@ -564,6 +616,62 @@ async fn measure_history<StorageImpl>(
     );
 }
 
+/// Measures only the production commit diff after proving both endpoint
+/// manifests outside the timed region. A setup fixture becomes eligible after
+/// the separate `checkpoint` command publishes its populated head root.
+async fn measure_rooted_history<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
+    path: &Path,
+    base_commit_id: &str,
+    head_commit_id: &str,
+    expected_changes: usize,
+    repetitions: usize,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    assert!(path.exists(), "fixture {} does not exist", path.display());
+    assert!(
+        has_durable_commit_root_for_bench(storage.clone(), base_commit_id)
+            .await
+            .expect("qualify rooted-diff base"),
+        "measure-rooted-history requires a durable base root"
+    );
+    assert!(
+        has_durable_commit_root_for_bench(storage.clone(), head_commit_id)
+            .await
+            .expect("qualify rooted-diff head"),
+        "measure-rooted-history requires a durable head root"
+    );
+    let adapter = StorageAdapter::new(storage);
+    let warm = diff_rooted_tracked_commits_for_bench(&adapter, base_commit_id, head_commit_id)
+        .await
+        .expect("warm rooted historical tracked diff");
+    assert_eq!(warm, expected_changes);
+
+    let mut latencies = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        let start = Instant::now();
+        let entries =
+            diff_rooted_tracked_commits_for_bench(&adapter, base_commit_id, head_commit_id)
+                .await
+                .expect("measure rooted historical tracked diff");
+        latencies.push(start.elapsed());
+        assert_eq!(entries, expected_changes);
+    }
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    println!(
+        "tracked_working_diff measure-rooted-history backend={} expected_changes={expected_changes} \
+         repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        backend.name(),
+        millis(sorted[sorted.len() / 2]),
+        mean_millis(&latencies),
+        millis(sorted[0]),
+        millis(*sorted.last().expect("measurement samples are non-empty")),
+    );
+}
+
 async fn checkpoint<StorageImpl>(storage: StorageImpl, backend: Backend, path: &Path)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -579,7 +687,7 @@ where
     let before = working_diff_count(&session).await;
     assert!(before > 0, "fixture has no populated working diffs");
     let start = Instant::now();
-    session
+    let checkpoint = session
         .create_checkpoint()
         .await
         .expect("checkpoint populated working-diff fixture");
@@ -587,8 +695,9 @@ where
     assert_eq!(working_diff_count(&session).await, 0);
     println!(
         "tracked_working_diff checkpoint backend={} working_diffs_before={before} \
-         checkpoint_ms={:.3}",
+         commit_id={} checkpoint_ms={:.3}",
         backend.name(),
+        checkpoint.commit_id,
         millis(elapsed),
     );
 }

@@ -1208,6 +1208,34 @@ where
     })
 }
 
+/// Diffs two already-qualified durable roots without benchmark-only layout
+/// probes in the measured operation.
+///
+/// The caller must prove both endpoints with
+/// [`has_durable_commit_root_for_bench`] before timing this bridge. Keeping
+/// those probes outside the operation makes endpoint-owner read cuts visible.
+#[inline(never)]
+pub async fn diff_rooted_tracked_commits_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    left_commit_id: &str,
+    right_commit_id: &str,
+) -> Result<usize, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(read);
+    Ok(reader
+        .diff_commits(
+            left_commit_id,
+            right_commit_id,
+            &crate::tracked_state::TrackedStateDiffRequest::default(),
+        )
+        .await?
+        .entries
+        .len())
+}
+
 /// Reports whether one semantic commit currently owns an authenticated
 /// durable tracked-state root. This keeps layout admission observable to
 /// storage benchmarks without expanding the production engine API.
