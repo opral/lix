@@ -64,7 +64,6 @@ pub(crate) enum BoundLiteral {
     },
     Text(String),
     Json(serde_json::Value),
-    Blob(Vec<u8>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

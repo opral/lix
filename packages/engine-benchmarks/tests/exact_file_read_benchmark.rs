@@ -22,7 +22,7 @@ const WARMUPS: usize = 30;
 const ROUNDS: usize = 300;
 const DEFAULT_FILE_COUNT: usize = 2;
 const CORPUS_INSERT_CHUNK_SIZE: usize = 500;
-const CORPUS_FILE_DATA_HEX: &str = "43434343434343434343434343434343";
+const CORPUS_FILE_DATA: &str = "CCCCCCCCCCCCCCCC";
 
 fn benchmark_file_id(index: usize) -> String {
     format!("01920000-0000-7000-8000-{index:012x}")
@@ -120,7 +120,7 @@ where
             }
             write!(
                 &mut sql,
-                "('{}','/exact-read-corpus/{index:05}.bin',X'{CORPUS_FILE_DATA_HEX}')",
+                "('{}','/exact-read-corpus/{index:05}.bin',CAST('{CORPUS_FILE_DATA}' AS BYTEA))",
                 benchmark_file_id(index)
             )
             .expect("format corpus file insert");

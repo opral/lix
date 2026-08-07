@@ -22,7 +22,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file (id, path, content) \
-                     VALUES ('{file_id}', '/timestamps.txt', X'6F6E65')"
+                     VALUES ('{file_id}', '/timestamps.txt', CAST('one' AS BYTEA))"
                 ),
                 &[],
             )
@@ -51,7 +51,9 @@ simulation_test!(
 
         session
             .execute(
-                &format!("UPDATE lix_file SET content = X'74776F' WHERE id = '{file_id}'"),
+                &format!(
+                    "UPDATE lix_file SET content = CAST('two' AS BYTEA) WHERE id = '{file_id}'"
+                ),
                 &[],
             )
             .await
@@ -84,7 +86,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file (id, path, content) \
-                     VALUES ('{renamed_file_id}', '/before-rename.txt', X'6F6E65')"
+                     VALUES ('{renamed_file_id}', '/before-rename.txt', CAST('one' AS BYTEA))"
                 ),
                 &[],
             )
@@ -175,7 +177,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file (id, path, content) \
-                     VALUES ('{file_id}', '/readme.md', X'68656C6C6F')"
+                     VALUES ('{file_id}', '/readme.md', CAST('hello' AS BYTEA))"
                 ),
                 &[],
             )
@@ -322,7 +324,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ('67756172-6465-842d-8669-6c6500000000', '/guarded.txt', X'6265666F7265')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('67756172-6465-842d-8669-6c6500000000', '/guarded.txt', CAST('before' AS BYTEA))",
                 &[],
             )
             .await
@@ -344,7 +346,7 @@ simulation_test!(
 
         let applied = session
             .execute(
-                "UPDATE lix_file SET content = X'6166746572' WHERE path = '/guarded.txt' AND lixcol_change_id = $1",
+                "UPDATE lix_file SET content = CAST('after' AS BYTEA) WHERE path = '/guarded.txt' AND lixcol_change_id = $1",
                 &[Value::Text(change_id)],
             )
             .await
@@ -353,7 +355,7 @@ simulation_test!(
 
         let stale = session
             .execute(
-                "UPDATE lix_file SET content = X'7374616C65' WHERE path = '/guarded.txt' AND lixcol_change_id = 'stale'",
+                "UPDATE lix_file SET content = CAST('stale' AS BYTEA) WHERE path = '/guarded.txt' AND lixcol_change_id = 'stale'",
                 &[],
             )
             .await
@@ -487,21 +489,21 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ('67756172-6465-842d-8365-617263682d00', '/Docs/Guarded-Readme.md', X'6265666F7265')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('67756172-6465-842d-8365-617263682d00', '/Docs/Guarded-Readme.md', CAST('before' AS BYTEA))",
                 &[],
             )
             .await
             .expect("search fixture insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ('6f746865-722d-8365-8172-63682d666900', '/Docs/other.md', X'6F74686572')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('6f746865-722d-8365-8172-63682d666900', '/Docs/other.md', CAST('other' AS BYTEA))",
                 &[],
             )
             .await
             .expect("non-matching search fixture insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ('756e6963-6f64-852d-8365-617263682d00', '/Ä/Readme.md', X'756E69636F6465')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('756e6963-6f64-852d-8365-617263682d00', '/Ä/Readme.md', CAST('unicode' AS BYTEA))",
                 &[],
             )
             .await
@@ -548,7 +550,7 @@ simulation_test!(
 
         let updated = session
             .execute(
-                "UPDATE lix_file SET content = X'6166746572' WHERE path = '/Docs/Guarded-Readme.md' AND lixcol_change_id = $1",
+                "UPDATE lix_file SET content = CAST('after' AS BYTEA) WHERE path = '/Docs/Guarded-Readme.md' AND lixcol_change_id = $1",
                 &[Value::Text(change_id)],
             )
             .await
@@ -673,7 +675,7 @@ simulation_test!(
         let insert_error = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('plugin-poison', '/.lix/plugins/nested/plugin_sentinel.lixplugin', X'626164')",
+                 VALUES ('plugin-poison', '/.lix/plugins/nested/plugin_sentinel.lixplugin', CAST('bad' AS BYTEA))",
                 &[],
             )
             .await
@@ -688,7 +690,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('73616665-2d66-896c-8500-000000000000', '/safe.bin', X'6F6B')",
+                 VALUES ('73616665-2d66-896c-8500-000000000000', '/safe.bin', CAST('ok' AS BYTEA))",
                 &[],
             )
             .await
@@ -1019,7 +1021,7 @@ simulation_test!(
         let file_result = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
+             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -1211,7 +1213,7 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/docs/readme.md', X'68656C6C6F')",
+                "INSERT INTO lix_file (path, content) VALUES ('/docs/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -1356,6 +1358,11 @@ simulation_test!(
                 .expect_err("non-binary data literal should be rejected");
 
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
+            assert_eq!(
+                error.hint(),
+                Some("Use CAST(? AS BYTEA) with a text parameter for file contents."),
+                "{id}"
+            );
         }
 
         let result = session
@@ -1397,6 +1404,10 @@ simulation_test!(
             .await
             .expect_err("non-binary content from SELECT should be rejected");
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert_eq!(
+            error.hint(),
+            Some("Use CAST(? AS BYTEA) with a text parameter for file contents.")
+        );
 
         let result = session
             .execute(
@@ -1442,6 +1453,11 @@ simulation_test!(
                 .await
                 .expect_err("non-binary data parameter should be rejected");
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
+            assert_eq!(
+                error.hint(),
+                Some("Use CAST(? AS BYTEA) with a text parameter for file contents."),
+                "{id}"
+            );
         }
     }
 );
@@ -1487,6 +1503,51 @@ simulation_test!(
             .await
             .expect("cast file read should succeed");
         assert_rows_eq(result, vec![vec![Value::Blob(b"updated".to_vec().into())]]);
+
+        let unicode_content = "äöü, —, →, €, ↔";
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/cast-unicode.txt', CAST($1 AS BYTEA))",
+                &[Value::Text(unicode_content.to_string())],
+            )
+            .await
+            .expect("UTF-8 text cast insert should succeed");
+
+        let result = session
+            .execute(
+                "SELECT CAST(content AS TEXT) FROM lix_file WHERE path = '/cast-unicode.txt'",
+                &[],
+            )
+            .await
+            .expect("UTF-8 cast file read should succeed");
+        assert_rows_eq(result, vec![vec![Value::Text(unicode_content.to_string())]]);
+
+        let lengths = session
+            .execute(
+                "SELECT length(content), OCTET_LENGTH(content) \
+                 FROM lix_file WHERE path = '/cast-unicode.txt'",
+                &[],
+            )
+            .await
+            .expect("file length query should succeed");
+        assert_rows_eq(lengths, vec![vec![Value::Integer(15), Value::Integer(26)]]);
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/raw-bytes.bin', $1)",
+                &[Value::Blob(vec![0xff, 0x00, 0x61].into())],
+            )
+            .await
+            .expect("raw binary file insert should succeed");
+        let raw_length = session
+            .execute(
+                "SELECT OCTET_LENGTH(content) FROM lix_file WHERE path = '/raw-bytes.bin'",
+                &[],
+            )
+            .await
+            .expect("raw binary length query should succeed");
+        assert_rows_eq(raw_length, vec![vec![Value::Integer(3)]]);
     }
 );
 
@@ -1576,7 +1637,7 @@ simulation_test!(
         let insert_result = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-             VALUES ('656d7074-792d-8461-8461-2d66696c6500', '/empty.bin', X'')",
+             VALUES ('656d7074-792d-8461-8461-2d66696c6500', '/empty.bin', CAST('' AS BYTEA))",
                 &[],
             )
             .await
@@ -1654,7 +1715,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01')",
+                 VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', CAST('byte-01' AS BYTEA))",
                 &[],
             )
             .await
@@ -1663,7 +1724,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02')",
+                 VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', CAST('byte-02' AS BYTEA))",
                 &[],
             )
             .await
@@ -1736,8 +1797,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) VALUES \
-                 ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01'), \
-                 ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02')",
+                 ('73616d65-2d66-896c-8500-000000000000', '/a.bin', CAST('byte-01' AS BYTEA)), \
+                 ('73616d65-2d66-896c-8500-000000000000', '/b.bin', CAST('byte-02' AS BYTEA))",
                 &[],
             )
             .await
@@ -1773,7 +1834,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, content, lixcol_branch_id) \
-                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01', '{branch_id}')"
+                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', CAST('byte-01' AS BYTEA), '{branch_id}')"
                 ),
                 &[],
             )
@@ -1785,7 +1846,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, content, lixcol_branch_id) \
-                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02', '{branch_id}')"
+                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', CAST('byte-02' AS BYTEA), '{branch_id}')"
                 ),
                 &[],
             )
@@ -2105,7 +2166,7 @@ simulation_test!(
         let insert_result = session
             .execute(
                 "INSERT INTO lix_file (directory_id, name, content) \
-             VALUES ('6469722d-646f-8373-8000-000000000000', 'readme.md', X'68656C6C6F')",
+             VALUES ('6469722d-646f-8373-8000-000000000000', 'readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -2146,7 +2207,7 @@ simulation_test!(lix_file_path_update_preserves_content, |sim| async move {
     let insert_result = session
         .execute(
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
+             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', CAST('hello' AS BYTEA))",
             &[],
         )
         .await
@@ -2217,8 +2278,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) VALUES \
-             ('66696c65-2d74-8172-8765-740000000000', '/docs/target.md', X'746172676574'), \
-             ('66696c65-2d6f-8468-8572-000000000000', '/docs/other.md', X'6F74686572')",
+             ('66696c65-2d74-8172-8765-740000000000', '/docs/target.md', CAST('target' AS BYTEA)), \
+             ('66696c65-2d6f-8468-8572-000000000000', '/docs/other.md', CAST('other' AS BYTEA))",
                 &[],
             )
             .await
@@ -2307,7 +2368,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('6272616e-6368-8d68-8561-642d66696c00', '/branch-head.txt', X'68656164')",
+                 VALUES ('6272616e-6368-8d68-8561-642d66696c00', '/branch-head.txt', CAST('head' AS BYTEA))",
                 &[],
             )
             .await
@@ -2409,10 +2470,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) VALUES \
-             ('01950000-0000-7000-8000-000000000008', '/.lix/app_data/atelier/extensions/demo/a.js', X'61'), \
-             ('01950000-0000-7000-8000-000000000009', '/.lix/app_data/atelier/extensions/demo/b.js', X'62'), \
-             ('01950000-0000-7000-8000-00000000000a', '/.lix/app_data/atelier/extensions0/out.js', X'78'), \
-             ('01940000-0000-7000-8000-000000000003', '/docs/readme.md', X'72')",
+             ('01950000-0000-7000-8000-000000000008', '/.lix/app_data/atelier/extensions/demo/a.js', CAST('a' AS BYTEA)), \
+             ('01950000-0000-7000-8000-000000000009', '/.lix/app_data/atelier/extensions/demo/b.js', CAST('b' AS BYTEA)), \
+             ('01950000-0000-7000-8000-00000000000a', '/.lix/app_data/atelier/extensions0/out.js', CAST('x' AS BYTEA)), \
+             ('01940000-0000-7000-8000-000000000003', '/docs/readme.md', CAST('r' AS BYTEA))",
                 &[],
             )
             .await
@@ -2512,7 +2573,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('75706461-7465-8d6e-856c-6c2d66696c00', '/update-null.bin', X'68656C6C6F')",
+                 VALUES ('75706461-7465-8d6e-856c-6c2d66696c00', '/update-null.bin', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -2579,7 +2640,7 @@ simulation_test!(
                 .execute(
                     &format!(
                         "INSERT INTO lix_file (id, path, content) \
-                         VALUES ('{id}', '/{id}.bin', X'68656C6C6F')"
+                         VALUES ('{id}', '/{id}.bin', CAST('hello' AS BYTEA))"
                     ),
                     &[],
                 )
@@ -2667,7 +2728,7 @@ simulation_test!(
                 .execute(
                     &format!(
                         "INSERT INTO lix_file (id, path, content) \
-                         VALUES ('{id}', '/{id}.bin', X'68656C6C6F')"
+                         VALUES ('{id}', '/{id}.bin', CAST('hello' AS BYTEA))"
                     ),
                     &[],
                 )
@@ -2724,7 +2785,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-             VALUES ('656d7074-792d-8570-8461-74652d666900', '/empty-update.bin', X'68656C6C6F')",
+             VALUES ('656d7074-792d-8570-8461-74652d666900', '/empty-update.bin', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -2732,7 +2793,7 @@ simulation_test!(
 
         let update_result = session
         .execute(
-            "UPDATE lix_file SET content = X'' WHERE id = '656d7074-792d-8570-8461-74652d666900'",
+            "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE id = '656d7074-792d-8570-8461-74652d666900'",
             &[],
         )
         .await
@@ -3000,7 +3061,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_file SET content = X'' WHERE id = '616c7265-6164-892d-856d-7074792d6600'",
+                "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE id = '616c7265-6164-892d-856d-7074792d6600'",
                 &[],
             )
             .await
@@ -3032,7 +3093,7 @@ simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, content, lixcol_global, lixcol_untracked) \
-             VALUES ('66696c65-2d67-8c6f-8261-6c2d6f766500', '/global.txt', X'67', true, false)",
+             VALUES ('66696c65-2d67-8c6f-8261-6c2d6f766500', '/global.txt', CAST('g' AS BYTEA), true, false)",
             &[],
         )
         .await
@@ -3254,7 +3315,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', X'6F6C64')",
+                 VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', CAST('old' AS BYTEA))",
                 &[],
             )
             .await
@@ -3263,7 +3324,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', X'6E6577') \
+                 VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', CAST('new' AS BYTEA)) \
                  ON CONFLICT (id) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3304,7 +3365,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', X'6B656570')",
+                 VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', CAST('keep' AS BYTEA))",
                 &[],
             )
             .await
@@ -3313,7 +3374,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', X'6967') \
+                 VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', CAST('ig' AS BYTEA)) \
                  ON CONFLICT (id) DO NOTHING",
                 &[],
             )
@@ -3354,7 +3415,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d66-8265-8368-000000000000', '/docs/fresh.md', X'6E6577') \
+                 VALUES ('66696c65-2d66-8265-8368-000000000000', '/docs/fresh.md', CAST('new' AS BYTEA)) \
                  ON CONFLICT (id) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3395,7 +3456,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/docs/path-fresh.md', X'6E6577') \
+                 VALUES ('/docs/path-fresh.md', CAST('new' AS BYTEA)) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3435,7 +3496,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d70-8174-882d-757073657200', '/docs/path-upsert.md', X'6F6C64')",
+                 VALUES ('66696c65-2d70-8174-882d-757073657200', '/docs/path-upsert.md', CAST('old' AS BYTEA))",
                 &[],
             )
             .await
@@ -3444,7 +3505,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/docs/path-upsert.md', X'6E6577') \
+                 VALUES ('/docs/path-upsert.md', CAST('new' AS BYTEA)) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3497,7 +3558,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, content, lixcol_branch_id) \
-                     VALUES ('66696c65-2d62-8261-8e63-682d70617400', '/docs/branch.md', X'6F6C64', '{branch_id}')"
+                     VALUES ('66696c65-2d62-8261-8e63-682d70617400', '/docs/branch.md', CAST('old' AS BYTEA), '{branch_id}')"
                 ),
                 &[],
             )
@@ -3509,7 +3570,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (path, content, lixcol_branch_id) \
-                     VALUES ('/docs/branch.md', X'6E6577', '{branch_id}') \
+                     VALUES ('/docs/branch.md', CAST('new' AS BYTEA), '{branch_id}') \
                      ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET content = excluded.content"
                 ),
                 &[],
@@ -3553,7 +3614,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (path, content, lixcol_branch_id) \
-                     VALUES ('/docs/reject.md', X'00', '{branch_id}') \
+                     VALUES ('/docs/reject.md', CAST('byte-00' AS BYTEA), '{branch_id}') \
                      ON CONFLICT (path) DO UPDATE SET content = excluded.content"
                 ),
                 &[],
@@ -3583,7 +3644,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, content) \
-                 VALUES ('66696c65-2d6d-8973-8369-6e672d706100', X'00') \
+                 VALUES ('66696c65-2d6d-8973-8369-6e672d706100', CAST('byte-00' AS BYTEA)) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3608,7 +3669,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('66696c65-2d74-8261-836b-65642d636f00', '/docs/collision.md', X'00')",
+                 VALUES ('66696c65-2d74-8261-836b-65642d636f00', '/docs/collision.md', CAST('byte-00' AS BYTEA))",
                 &[],
             )
             .await
@@ -3617,7 +3678,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (path, content, lixcol_untracked) \
-                 VALUES ('/docs/collision.md', X'01', true) \
+                 VALUES ('/docs/collision.md', CAST('byte-01' AS BYTEA), true) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3643,7 +3704,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content, lixcol_global) \
-                 VALUES ('66696c65-2d67-8c6f-8261-6c2d70617400', '/docs/global.md', X'6F6C64', true)",
+                 VALUES ('66696c65-2d67-8c6f-8261-6c2d70617400', '/docs/global.md', CAST('old' AS BYTEA), true)",
                 &[],
             )
             .await
@@ -3652,7 +3713,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/docs/global.md', X'6E6577') \
+                 VALUES ('/docs/global.md', CAST('new' AS BYTEA)) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3696,7 +3757,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
-                 VALUES ('/docs/duplicate-target.md', X'00') \
+                 VALUES ('/docs/duplicate-target.md', CAST('byte-00' AS BYTEA)) \
                  ON CONFLICT (path, path) DO UPDATE SET content = excluded.content",
                 &[],
             )
@@ -3726,7 +3787,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01950000-0000-7000-8000-000000000002', '/docs/target.md', X'6265666F7265')",
+                 VALUES ('01950000-0000-7000-8000-000000000002', '/docs/target.md', CAST('before' AS BYTEA))",
                 &[],
             )
             .await
@@ -3747,7 +3808,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01950000-0000-7000-8000-00000000000b', '/01950000-0000-7000-8000-00000000000b.md', X'01')",
+                 VALUES ('01950000-0000-7000-8000-00000000000b', '/01950000-0000-7000-8000-00000000000b.md', CAST('byte-01' AS BYTEA))",
                 &[],
             )
             .await
@@ -3755,7 +3816,7 @@ simulation_test!(
 
         let update = transaction
             .execute(
-                "UPDATE lix_file SET content = X'6166746572' \
+                "UPDATE lix_file SET content = CAST('after' AS BYTEA) \
                  WHERE path = '/docs/target.md'",
                 &[],
             )
@@ -3780,7 +3841,7 @@ simulation_test!(
 
         transaction
             .execute(
-                "UPDATE lix_file SET content = X'616761696E' \
+                "UPDATE lix_file SET content = CAST('again' AS BYTEA) \
                  WHERE path = '/docs/target.md'",
                 &[],
             )
@@ -3870,7 +3931,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file_by_branch \
                  (id, path, content, lixcol_global, lixcol_branch_id) \
-                 VALUES ('6c616e65-2d66-896c-8500-000000000000', '/global.md', X'01', true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
+                 VALUES ('6c616e65-2d66-896c-8500-000000000000', '/global.md', CAST('byte-01' AS BYTEA), true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
                 &[],
             )
             .await
@@ -3880,7 +3941,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, content, lixcol_branch_id) \
-                     VALUES ('6c616e65-2d66-896c-8500-000000000000', '/branch.md', X'02', '{branch_id}')"
+                     VALUES ('6c616e65-2d66-896c-8500-000000000000', '/branch.md', CAST('byte-02' AS BYTEA), '{branch_id}')"
                 ),
                 &[],
             )
@@ -3894,7 +3955,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01950000-0000-7000-8000-000000000003', '/01950000-0000-7000-8000-000000000003.md', X'03')",
+                 VALUES ('01950000-0000-7000-8000-000000000003', '/01950000-0000-7000-8000-000000000003.md', CAST('byte-03' AS BYTEA))",
                 &[],
             )
             .await
@@ -3990,7 +4051,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01950000-0000-7000-8000-000000000004', '/01950000-0000-7000-8000-000000000004.md', X'01')",
+                 VALUES ('01950000-0000-7000-8000-000000000004', '/01950000-0000-7000-8000-000000000004.md', CAST('byte-01' AS BYTEA))",
                 &[],
             )
             .await
@@ -4008,7 +4069,7 @@ simulation_test!(
         other_session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('6f746865-722d-8365-8373-696f6e2d6600', '/other-session.md', X'02')",
+                 VALUES ('6f746865-722d-8365-8373-696f6e2d6600', '/other-session.md', CAST('byte-02' AS BYTEA))",
                 &[],
             )
             .await
@@ -4085,7 +4146,7 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('6d657267-652d-8d61-896e-2d66696c6500', '/main.md', X'01')",
+             VALUES ('6d657267-652d-8d61-896e-2d66696c6500', '/main.md', CAST('byte-01' AS BYTEA))",
             &[],
         )
         .await
@@ -4093,7 +4154,7 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('6d657267-652d-8472-8166-742d66696c00', '/merged.md', X'02')",
+                 VALUES ('6d657267-652d-8472-8166-742d66696c00', '/merged.md', CAST('byte-02' AS BYTEA))",
                 &[],
             )
             .await
@@ -4113,7 +4174,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01950000-0000-7000-8000-000000000005', '/01950000-0000-7000-8000-000000000005.md', X'03')",
+                 VALUES ('01950000-0000-7000-8000-000000000005', '/01950000-0000-7000-8000-000000000005.md', CAST('byte-03' AS BYTEA))",
                 &[],
             )
             .await

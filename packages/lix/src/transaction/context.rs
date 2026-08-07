@@ -12351,7 +12351,7 @@ mod tests {
             .expect("workspace session should open");
 
         let values = (0..32)
-            .map(|index| format!("('/seed-{index:02}.md', X'01')"))
+            .map(|index| format!("('/seed-{index:02}.md', CAST('byte-01' AS BYTEA))"))
             .collect::<Vec<_>>()
             .join(", ");
         session
@@ -12371,7 +12371,7 @@ mod tests {
             transaction
                 .execute(
                     &format!(
-                        "INSERT INTO lix_file (path, content) VALUES ('/staged-{index}.md', X'02')"
+                        "INSERT INTO lix_file (path, content) VALUES ('/staged-{index}.md', CAST('byte-02' AS BYTEA))"
                     ),
                     &[],
                 )
@@ -12379,7 +12379,7 @@ mod tests {
                 .expect("descriptor batch should stage");
             transaction
                 .execute(
-                    "UPDATE lix_file SET content = X'03' WHERE path = '/seed-00.md'",
+                    "UPDATE lix_file SET content = CAST('byte-03' AS BYTEA) WHERE path = '/seed-00.md'",
                     &[],
                 )
                 .await
@@ -12440,7 +12440,7 @@ mod tests {
             .expect("workspace session should open");
 
         let values = (0..file_count)
-            .map(|index| format!("('/seed-{index:05}.md', X'01')"))
+            .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
             .collect::<Vec<_>>()
             .join(", ");
         session
@@ -12457,14 +12457,15 @@ mod tests {
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/transaction-anchor.md', X'01')",
+                "INSERT INTO lix_file (path, content) VALUES ('/transaction-anchor.md', CAST('byte-01' AS BYTEA))",
                 &[],
             )
             .await
             .expect("transaction anchor descriptor should stage");
 
         reset_transaction_path_index_build_stats();
-        let sql = "UPDATE lix_file SET content = X'02' WHERE path = '/seed-00000.md'";
+        let sql =
+            "UPDATE lix_file SET content = CAST('byte-02' AS BYTEA) WHERE path = '/seed-00000.md'";
         for _ in 0..warmup_rounds {
             transaction
                 .execute(sql, &[])
@@ -12536,7 +12537,9 @@ mod tests {
             .expect("workspace session should open");
 
         let values = (0..file_count)
-            .map(|index| format!("('file-{index:05}', '/seed-{index:05}.md', X'01')"))
+            .map(|index| {
+                format!("('file-{index:05}', '/seed-{index:05}.md', CAST('byte-01' AS BYTEA))")
+            })
             .collect::<Vec<_>>()
             .join(", ");
         session
@@ -12569,7 +12572,7 @@ mod tests {
             let started = Instant::now();
             session
                 .execute(
-                    &format!("UPDATE lix_file SET content = X'02' WHERE path = '{path}'"),
+                    &format!("UPDATE lix_file SET content = CAST('byte-02' AS BYTEA) WHERE path = '{path}'"),
                     &[],
                 )
                 .await

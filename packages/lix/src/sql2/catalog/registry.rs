@@ -590,7 +590,7 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::public("path", false).conditional_on_insert(),
         PublicColumn::public("directory_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
-        PublicColumn::public("content", false).with_default("X''"),
+        PublicColumn::public("content", false).with_default("CAST('' AS BYTEA)"),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
     columns

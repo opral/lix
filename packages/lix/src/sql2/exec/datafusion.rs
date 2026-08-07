@@ -1984,7 +1984,6 @@ fn validate_lix_file_content_write_expr(
     allow_excluded_column: bool,
 ) -> Result<(), LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Blob(_)) => Ok(()),
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
             Some(Value::Blob(_)) => Ok(()),
             _ => Err(lix_file_content_type_lix_error()),
@@ -2511,7 +2510,6 @@ fn scalar_from_bound_literal(literal: &BoundLiteral) -> Result<ScalarValue, LixE
         ),
         BoundLiteral::Text(value) => ScalarValue::Utf8(Some(value.clone())),
         BoundLiteral::Json(value) => ScalarValue::Utf8(Some(value.to_string())),
-        BoundLiteral::Blob(value) => ScalarValue::LargeBinary(Some(value.clone())),
     })
 }
 
@@ -3656,9 +3654,9 @@ mod tests {
     #[tokio::test]
     async fn target_only_write_shapes_construct_only_the_target_provider() {
         for sql in [
-            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "DELETE FROM lix_file WHERE id = '01920000-0000-7000-8000-0000000000d2' RETURNING id, path",
-            "INSERT INTO lix_file (path, content) VALUES ('/readme.md', X'41') \
+            "INSERT INTO lix_file (path, content) VALUES ('/readme.md', CAST('A' AS BYTEA)) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         ] {
             let (mut ctx, _, _) = counting_write_context(Vec::new());
@@ -4727,7 +4725,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('01920000-0000-7000-8000-0000000000a2', '/docs/readme.md', X'68656C6C6F')",
+                 VALUES ('01920000-0000-7000-8000-0000000000a2', '/docs/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await?;
@@ -5202,7 +5200,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000302', $1, X'41')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000302', $1, CAST('A' AS BYTEA))",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
@@ -5233,7 +5231,7 @@ mod tests {
 
         let update_result = session
             .execute(
-                "UPDATE lix_file SET content = X'42' WHERE path = $1",
+                "UPDATE lix_file SET content = CAST('B' AS BYTEA) WHERE path = $1",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
@@ -5992,7 +5990,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content, lixcol_metadata) \
-             VALUES ('/docs/target.md', X'6E6577', '{\"size\":3}') \
+             VALUES ('/docs/target.md', CAST('new' AS BYTEA), '{\"size\":3}') \
              ON CONFLICT (path) DO UPDATE \
              SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata",
             &[],
@@ -6481,7 +6479,7 @@ mod tests {
             &mut ctx,
             "INSERT INTO lix_file_by_branch (\
              id, directory_id, name, content, lixcol_branch_id\
-             ) VALUES ('01920000-0000-7000-8000-0000000000d2', '01920000-0000-7000-8000-0000000000d3', 'readme.md', X'4142', '01920000-0000-7000-8000-0000000000b1')",
+             ) VALUES ('01920000-0000-7000-8000-0000000000d2', '01920000-0000-7000-8000-0000000000d3', 'readme.md', CAST('AB' AS BYTEA), '01920000-0000-7000-8000-0000000000b1')",
             &[],
         )
         .await
@@ -6534,7 +6532,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/multi/a.md', X'61'), ('/multi/b.md', X'62')",
+             VALUES ('/multi/a.md', CAST('a' AS BYTEA)), ('/multi/b.md', CAST('b' AS BYTEA))",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -6791,7 +6789,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/existing.md', X'6e6577'), ('/fresh.md', X'6672657368') \
+             VALUES ('/existing.md', CAST('new' AS BYTEA)), ('/fresh.md', CAST('fresh' AS BYTEA)) \
              ON CONFLICT (path) DO NOTHING",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6833,7 +6831,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/existing.md', X'6e6577'), ('/fresh.md', X'6672657368') \
+             VALUES ('/existing.md', CAST('new' AS BYTEA)), ('/fresh.md', CAST('fresh' AS BYTEA)) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6880,8 +6878,8 @@ mod tests {
         ];
         let (mut fast_ctx, fast_staged, _) = counting_write_context(rows);
         let sql = "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES \
-            ('01920000-0000-7000-8000-000000000322', '/ignored.md', X'6e6577', '{\"source\":\"update\"}'), \
-            ('01920000-0000-7000-8000-000000000323', '/fresh.md', X'6672657368', '{\"source\":\"insert\"}') \
+            ('01920000-0000-7000-8000-000000000322', '/ignored.md', CAST('new' AS BYTEA), '{\"source\":\"update\"}'), \
+            ('01920000-0000-7000-8000-000000000323', '/fresh.md', CAST('fresh' AS BYTEA), '{\"source\":\"insert\"}') \
             ON CONFLICT (id) DO UPDATE SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata";
 
         let (fast_result, fast_path) =
@@ -6919,7 +6917,7 @@ mod tests {
         let error = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (id, path, content) VALUES \
-             ('01920000-0000-7000-8000-000000000323', '/existing.md', X'6e6577') \
+             ('01920000-0000-7000-8000-000000000323', '/existing.md', CAST('new' AS BYTEA)) \
              ON CONFLICT (id) DO UPDATE SET content = excluded.content",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6941,12 +6939,12 @@ mod tests {
     async fn execute_sql_multi_row_lix_file_duplicate_insert_paths_reject_before_staging() {
         for sql in [
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62')",
+             VALUES ('/dupe.md', CAST('a' AS BYTEA)), ('/dupe.md', CAST('b' AS BYTEA))",
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62') \
+             VALUES ('/dupe.md', CAST('a' AS BYTEA)), ('/dupe.md', CAST('b' AS BYTEA)) \
              ON CONFLICT (path) DO NOTHING",
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62') \
+             VALUES ('/dupe.md', CAST('a' AS BYTEA)), ('/dupe.md', CAST('b' AS BYTEA)) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         ] {
             let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
@@ -6989,7 +6987,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/existing.md', X'61'), ('/existing.md', X'62') \
+             VALUES ('/existing.md', CAST('a' AS BYTEA)), ('/existing.md', CAST('b' AS BYTEA)) \
              ON CONFLICT (path) DO NOTHING",
             &[],
             WriteExecutorMode::ForceFast,
@@ -7016,7 +7014,7 @@ mod tests {
         let error = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/folder', X'61'), ('/folder/file.md', X'62')",
+             VALUES ('/folder', CAST('a' AS BYTEA)), ('/folder/file.md', CAST('b' AS BYTEA))",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7041,7 +7039,7 @@ mod tests {
         execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/ok.md', X'6f6b'), ('relative.md', X'626164')",
+             VALUES ('/ok.md', CAST('ok' AS BYTEA)), ('relative.md', CAST('bad' AS BYTEA))",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7100,7 +7098,7 @@ mod tests {
         let error = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (path, content) \
-             VALUES ('/untracked.md', X'6e6577'), ('/fresh.md', X'6672657368') \
+             VALUES ('/untracked.md', CAST('new' AS BYTEA)), ('/fresh.md', CAST('fresh' AS BYTEA)) \
              ON CONFLICT (path) DO NOTHING",
             &[],
             WriteExecutorMode::ForceFast,
@@ -7126,7 +7124,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (id, path, content) \
-             VALUES ('01920000-0000-7000-8000-0000000000a2', '/a.md', X'61'), ('01920000-0000-7000-8000-0000000000b2', '/b.md', X'62')",
+             VALUES ('01920000-0000-7000-8000-0000000000a2', '/a.md', CAST('a' AS BYTEA)), ('01920000-0000-7000-8000-0000000000b2', '/b.md', CAST('b' AS BYTEA))",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7163,7 +7161,7 @@ mod tests {
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (id, path, content, lixcol_metadata) \
-             VALUES ('01920000-0000-7000-8000-0000000000a2', '/a.md', X'61', '{\"source\":\"test\"}')",
+             VALUES ('01920000-0000-7000-8000-0000000000a2', '/a.md', CAST('a' AS BYTEA), '{\"source\":\"test\"}')",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7288,7 +7286,7 @@ mod tests {
         let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows.clone());
         let (mut datafusion_ctx, datafusion_staged, datafusion_scans) =
             counting_write_context(rows);
-        let sql = "UPDATE lix_file SET content = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+        let sql = "UPDATE lix_file SET content = CAST('AB' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'";
 
         let (fast_result, fast_path) =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -7425,7 +7423,7 @@ mod tests {
         let rows = vec![root, scoped];
         let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
         let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);
-        let sql = "UPDATE lix_file SET content = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+        let sql = "UPDATE lix_file SET content = CAST('AB' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'";
 
         let (fast_result, fast_path) =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -7470,8 +7468,7 @@ mod tests {
                 schema_definitions: vec![],
             }
         };
-        let sql =
-            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+        let sql = "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'";
         let mut fast_ctx = make_context();
         let mut datafusion_ctx = make_context();
 
@@ -7502,8 +7499,7 @@ mod tests {
         malformed.snapshot_content = Some("not-json".into());
         let (mut fast_ctx, _, _) = counting_write_context(vec![malformed.clone()]);
         let (mut datafusion_ctx, _, _) = counting_write_context(vec![malformed]);
-        let sql =
-            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+        let sql = "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'";
 
         let fast_error =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -7666,7 +7662,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET content = X'' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7691,7 +7687,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-000000000582'",
+            "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-000000000582'",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7741,7 +7737,7 @@ mod tests {
 
         let error = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-000000000352'",
+            "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-000000000352'",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7767,10 +7763,10 @@ mod tests {
     async fn bound_file_content_update_fast_path_rejects_broader_shapes() {
         let (mut ctx, _, _) = counting_write_context(Vec::new());
         for sql in [
-            "UPDATE lix_file SET content = X'41' WHERE path = '/readme.md'",
-            "UPDATE lix_file SET content = X'41', name = 'renamed.md' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE path = '/readme.md'",
+            "UPDATE lix_file SET content = CAST('A' AS BYTEA), name = 'renamed.md' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "UPDATE lix_file SET content = content WHERE id = '01920000-0000-7000-8000-0000000000d2'",
-            "UPDATE lix_file_by_branch SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
+            "UPDATE lix_file_by_branch SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
         ] {
             let plan = create_write_logical_plan(&mut ctx, sql)
                 .await
@@ -7815,7 +7811,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_file SET content = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = CAST('AB' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             &[],
         )
         .await

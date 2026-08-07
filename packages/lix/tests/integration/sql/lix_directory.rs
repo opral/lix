@@ -799,7 +799,7 @@ simulation_test!(
         let file_result = session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
+             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -1622,7 +1622,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content) \
-                 VALUES ('7472616e-7361-8374-896f-6e2d73756200', '/old/sub/readme.md', X'726561646D65')",
+                 VALUES ('7472616e-7361-8374-896f-6e2d73756200', '/old/sub/readme.md', CAST('readme' AS BYTEA))",
                 &[],
             )
             .await
