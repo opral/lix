@@ -16,6 +16,7 @@ use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWri
 pub(crate) struct FunctionContext {
     functions: FunctionProviderHandle,
     bookkeeping_timestamp: LixTimestamp,
+    deterministic_mode_enabled: bool,
 }
 
 impl FunctionContext {
@@ -27,6 +28,7 @@ impl FunctionContext {
         Self {
             functions: FunctionProviderHandle::system(),
             bookkeeping_timestamp: bookkeeping_functions.timestamp(),
+            deterministic_mode_enabled: false,
         }
     }
 
@@ -59,7 +61,12 @@ impl FunctionContext {
             ))
                 as Box<dyn FunctionProvider + Send>),
             bookkeeping_timestamp,
+            deterministic_mode_enabled: true,
         })
+    }
+
+    pub(crate) fn deterministic_mode_enabled(&self) -> bool {
+        self.deterministic_mode_enabled
     }
 
     /// Returns the engine-owned provider used by SQL and transaction staging.
