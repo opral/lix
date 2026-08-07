@@ -8,12 +8,12 @@ use lix::sql_dml_bench::{
     SqlDmlBenchExactRowRequest, SqlDmlBenchFileFilter, SqlDmlBenchReadTarget, SqlDmlBenchRow,
     SqlDmlBenchScanRequest, SqlDmlBenchStatement, execute_sql_dml_batch_with_read_target_for_bench,
 };
-use lix::storage::Storage;
+use lix::storage::{Memory, Storage};
 use lix::{ExecuteBatchStatement, LixError, Value};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
-use super::model::{ForkTree, Mutation, RelationalValue};
+use super::model::{ForkTree, ForkTreeReadView, Mutation, RelationalValue};
 use super::{
     Backend, CountingStorage, IoStats, Layout, Parameters, begin_allocation_profile,
     directory_bytes, end_allocation_profile, physical_delta, process_cpu_nanos,
@@ -39,6 +39,9 @@ const SCHEMA: &str = r#"{
 }"#;
 
 pub async fn run(parameters: Parameters) {
+    if parameters.rows == 1_000 {
+        run_filter_pushdown_oracle().await;
+    }
     match (parameters.backend, parameters.layout) {
         (Backend::RocksDb, Layout::Current) => run_current_rocks(parameters).await,
         (Backend::RocksDb, Layout::ForkTree) => run_model_rocks(parameters).await,
@@ -127,6 +130,68 @@ async fn run_model_slate(parameters: Parameters) {
     println!(
         "forktree_dml_settled,backend=slatedb,layout=forktree,disk_bytes={}",
         directory_bytes(directory.path())
+    );
+}
+
+async fn run_filter_pushdown_oracle() {
+    let (storage, _) = CountingStorage::new(Memory::new());
+    let tree = prepare_model(storage, 1_000).await;
+    let mut target = ForkTreeDmlReadTarget::new(&tree)
+        .await
+        .expect("open ForkTree filter-pushdown oracle view");
+    let statements = [
+        (
+            "pk-equality",
+            "UPDATE forktree_dml_row SET counter = counter + 1 WHERE id = 'seed-000000' RETURNING id",
+        ),
+        (
+            "pk-in",
+            "UPDATE forktree_dml_row SET counter = counter + 1 WHERE id IN ('seed-000001', 'seed-000002') RETURNING id",
+        ),
+        (
+            "mixed-or-residual",
+            "UPDATE forktree_dml_row SET counter = counter + 1 WHERE id = 'seed-000003' OR value = 'absent' RETURNING id",
+        ),
+        (
+            "null-residual",
+            "UPDATE forktree_dml_row SET counter = counter + 1 WHERE nullable IS NOT NULL RETURNING id",
+        ),
+        (
+            "noncanonical-like-residual",
+            "UPDATE forktree_dml_row SET counter = counter + 1 WHERE id LIKE 'missing-%' RETURNING id",
+        ),
+    ]
+    .into_iter()
+    .map(|(label, sql)| SqlDmlBenchStatement {
+        label: label.to_string(),
+        sql: sql.to_string(),
+        params: Vec::new(),
+    })
+    .collect::<Vec<_>>();
+    let result = execute_sql_dml_batch_with_read_target_for_bench(
+        ACTIVE_BRANCH,
+        &[SCHEMA.to_string()],
+        &mut target,
+        &statements,
+    )
+    .await
+    .expect("execute ForkTree filter-pushdown oracle");
+    assert_eq!(
+        result
+            .results
+            .iter()
+            .map(|result| result.rows_affected)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 1, 0, 0]
+    );
+    assert_eq!(target.broad_scans, 3);
+    assert_eq!(target.point_reads, 7);
+    println!(
+        "forktree_dml_pushdown_oracle,result_digest={},live_scans={},point_reads={},broad_scans={},pk_equality=exact,pk_in=exact,mixed_or=residual,null=residual,noncanonical_like=residual",
+        digest_model(&result.results),
+        result.live_scans,
+        target.point_reads,
+        target.broad_scans,
     );
 }
 
@@ -322,7 +387,9 @@ async fn measure_model<S>(
     let mut publication_us = 0_u128;
     for generation in 0..parameters.iterations {
         let phase = Instant::now();
-        let mut target = ForkTreeDmlReadTarget::new(&tree);
+        let mut target = ForkTreeDmlReadTarget::new(&tree)
+            .await
+            .expect("open coherent ForkTree DML read view");
         let result = execute_sql_dml_batch_with_read_target_for_bench(
             ACTIVE_BRANCH,
             &[SCHEMA.to_string()],
@@ -334,6 +401,7 @@ async fn measure_model<S>(
         binder_us = binder_us.saturating_add(phase.elapsed().as_micros());
         target_point_reads = target_point_reads.saturating_add(target.point_reads);
         target_broad_scans = target_broad_scans.saturating_add(target.broad_scans);
+        drop(target);
         digest = digest_model(&result.results);
         binder_scans = binder_scans.saturating_add(result.live_scans);
         binder_exact = binder_exact.saturating_add(result.exact_reads);
@@ -532,19 +600,26 @@ where
         .collect()
 }
 
-struct ForkTreeDmlReadTarget<'a, S> {
-    tree: &'a ForkTree<CountingStorage<S>>,
+struct ForkTreeDmlReadTarget<'a, S: Storage> {
+    view: ForkTreeReadView<'a, CountingStorage<S>>,
+    global: bool,
+    untracked: bool,
     point_reads: u64,
     broad_scans: u64,
 }
 
-impl<'a, S> ForkTreeDmlReadTarget<'a, S> {
-    fn new(tree: &'a ForkTree<CountingStorage<S>>) -> Self {
-        Self {
-            tree,
+impl<'a, S: Storage> ForkTreeDmlReadTarget<'a, S> {
+    async fn new(tree: &'a ForkTree<CountingStorage<S>>) -> Result<Self, String>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        Ok(Self {
+            view: tree.read_view("main").await?,
+            global: false,
+            untracked: false,
             point_reads: 0,
             broad_scans: 0,
-        }
+        })
     }
 }
 
@@ -560,29 +635,29 @@ where
         if request.rows_none {
             return Ok(Vec::new());
         }
-        if can_point_expand(request) {
-            let mut rows = Vec::new();
+        if can_point_expand(request, self.untracked) {
+            let mut identities = Vec::new();
             for branch_id in &request.branch_ids {
                 for schema_key in &request.schema_keys {
                     for entity_pk in &request.entity_pks {
                         for file_id in point_file_ids(&request.file_ids) {
-                            let identity = SqlDmlBenchExactRowRequest {
+                            identities.push(SqlDmlBenchExactRowRequest {
                                 schema_key: schema_key.clone(),
                                 entity_pk: entity_pk.clone(),
                                 branch_id: branch_id.clone(),
                                 file_id,
-                            };
-                            if let Some(row) = self
-                                .point_row(&identity, request.untracked.unwrap_or(false))
-                                .await?
-                                .filter(|row| request.include_tombstones || !row.deleted)
-                            {
-                                rows.push(row);
-                            }
+                            });
                         }
                     }
                 }
             }
+            let mut rows = self
+                .load_identity_rows(&identities, self.untracked)
+                .await?
+                .into_iter()
+                .flatten()
+                .filter(|row| request.include_tombstones || !row.deleted)
+                .collect::<Vec<_>>();
             if let Some(limit) = request.limit {
                 rows.truncate(limit);
             }
@@ -591,20 +666,16 @@ where
 
         self.broad_scans = self.broad_scans.saturating_add(1);
         let rows = self
-            .tree
-            .read_all()
+            .view
+            .read_projected_range(b"", &[0xff], |value| {
+                serde_json::from_slice::<SqlDmlBenchRow>(value)
+                    .map_err(|error| format!("malformed authenticated ForkTree SQL row: {error}"))
+            })
             .await
             .map_err(model_read_error)?
             .into_iter()
-            .map(|(_, value)| {
-                serde_json::from_slice::<SqlDmlBenchRow>(&value).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        format!("malformed authenticated ForkTree SQL row: {error}"),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>();
         let mut rows = rows
             .into_iter()
             .filter(|row| bench_request_matches(request, row))
@@ -621,15 +692,12 @@ where
         untracked: Option<bool>,
         include_tombstones: bool,
     ) -> Result<Vec<Option<SqlDmlBenchRow>>, LixError> {
-        let mut loaded = Vec::with_capacity(rows.len());
-        for identity in rows {
-            let row = self
-                .point_row(identity, untracked.unwrap_or(false))
-                .await?
-                .filter(|row| include_tombstones || !row.deleted);
-            loaded.push(row);
-        }
-        Ok(loaded)
+        Ok(self
+            .load_identity_rows(rows, untracked.unwrap_or(self.untracked))
+            .await?
+            .into_iter()
+            .map(|row| row.filter(|row| include_tombstones || !row.deleted))
+            .collect())
     }
 }
 
@@ -637,41 +705,33 @@ impl<S> ForkTreeDmlReadTarget<'_, S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    async fn point_row(
+    async fn load_identity_rows(
         &mut self,
-        identity: &SqlDmlBenchExactRowRequest,
+        identities: &[SqlDmlBenchExactRowRequest],
         untracked: bool,
-    ) -> Result<Option<SqlDmlBenchRow>, LixError> {
-        self.point_reads = self.point_reads.saturating_add(1);
-        let key = identity_key(identity, false, untracked);
-        let value = self
-            .tree
-            .read_relational_point("main", &key)
+    ) -> Result<Vec<Option<SqlDmlBenchRow>>, LixError> {
+        self.point_reads = self.point_reads.saturating_add(identities.len() as u64);
+        let keys = identities
+            .iter()
+            .map(|identity| identity_key(identity, self.global, untracked))
+            .collect::<Vec<_>>();
+        self.view
+            .read_projected_points(&keys, |bytes| {
+                serde_json::from_slice::<SqlDmlBenchRow>(bytes)
+                    .map_err(|error| format!("malformed authenticated ForkTree SQL row: {error}"))
+            })
             .await
-            .map_err(model_read_error)?;
-        match value {
-            None => Ok(None),
-            Some(RelationalValue::Bytes(bytes)) => {
-                serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_STORAGE_ERROR,
-                        format!("malformed authenticated ForkTree SQL row: {error}"),
-                    )
-                })
-            }
-            Some(RelationalValue::Null) => Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "ForkTree SQL row unexpectedly references a null relational value",
-            )),
-        }
+            .map_err(model_read_error)
     }
 }
 
-fn can_point_expand(request: &SqlDmlBenchScanRequest) -> bool {
+fn can_point_expand(request: &SqlDmlBenchScanRequest, target_untracked: bool) -> bool {
     !request.schema_keys.is_empty()
         && !request.entity_pks.is_empty()
         && !request.branch_ids.is_empty()
-        && request.untracked.is_some()
+        && request
+            .untracked
+            .is_none_or(|untracked| untracked == target_untracked)
         && request
             .file_ids
             .iter()
@@ -716,22 +776,30 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let mut mutations = Vec::with_capacity(rows.len());
-    for row in rows {
-        let key = row_key(&row);
-        let prior = tree
-            .read_relational_point("main", &key)
-            .await
-            .expect("read prior ForkTree DML row");
+    let keys = rows.iter().map(row_key).collect::<Vec<_>>();
+    let prior = tree
+        .read_projected_points("main", &keys, |value| Ok(value.to_vec()))
+        .await
+        .expect("read prior ForkTree DML rows");
+    for ((row, key), prior) in rows.into_iter().zip(keys).zip(prior) {
         if row.deleted {
             if prior.is_some() {
                 mutations.push(Mutation::Delete { key });
             }
             continue;
         }
-        let value = RelationalValue::Bytes(serde_json::to_vec(&row).expect("encode postimage"));
+        let encoded = serde_json::to_vec(&row).expect("encode postimage");
         match prior {
-            None => mutations.push(Mutation::Insert { key, value }),
-            Some(old) if old != value => mutations.push(Mutation::Update { key, value }),
+            None => mutations.push(Mutation::Insert {
+                key,
+                value: RelationalValue::Bytes(encoded),
+            }),
+            Some(old) if old != encoded => {
+                mutations.push(Mutation::Update {
+                    key,
+                    value: RelationalValue::Bytes(encoded),
+                });
+            }
             Some(_) => {}
         }
     }

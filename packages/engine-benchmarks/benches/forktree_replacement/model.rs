@@ -277,6 +277,21 @@ pub struct ForkTree<S> {
     storage: S,
 }
 
+/// Transaction-scoped coherent read view. Cached immutable objects remain
+/// authenticated by their `ObjectId`; the view owns no selector or write
+/// authority and is discarded before publication.
+pub struct ForkTreeReadView<'a, S>
+where
+    S: Storage,
+{
+    tree: &'a ForkTree<S>,
+    read: S::Read<'a>,
+    root: ObjectId,
+    objects: BTreeMap<ObjectId, Bytes>,
+    nodes: BTreeMap<ObjectId, Node>,
+    value_packs: BTreeMap<ObjectId, Vec<RelationalValue>>,
+}
+
 #[derive(Clone, Debug)]
 struct NodeRef {
     id: ObjectId,
@@ -1002,6 +1017,44 @@ where
             .map(|head| head.commit)
     }
 
+    pub async fn read_view(&self, branch: &str) -> Result<ForkTreeReadView<'_, S>, String> {
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let selector_keys = [key(&branch_key)];
+        let selector = read
+            .get_many(&[GetManyRequest {
+                space: REF_SPACE,
+                keys: &selector_keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .map_err(storage_error)?
+            .values
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| format!("missing ForkTree branch '{branch}'"))?;
+        let commit_id = decode_ref(projected_bytes(&selector)?)?;
+        let commit_bytes = self.load_objects_from_read(&read, &[commit_id]).await?;
+        let commit = decode_commit(
+            commit_bytes
+                .first()
+                .ok_or_else(|| "ForkTree commit batch unexpectedly empty".to_string())?,
+        )?;
+        Ok(ForkTreeReadView {
+            tree: self,
+            read,
+            root: commit.root,
+            objects: BTreeMap::from([(commit_id, commit_bytes[0].clone())]),
+            nodes: BTreeMap::new(),
+            value_packs: BTreeMap::new(),
+        })
+    }
+
     pub async fn read_point(&self, branch: &str, key: &[u8]) -> Result<Vec<u8>, String> {
         let commit = self.load_commit(self.branch_head(branch).await?).await?;
         let value = self.find_value(commit.root, key).await?;
@@ -1128,6 +1181,122 @@ where
                     .cloned()
                     .map(|value| (entry.key, value))
                     .ok_or_else(|| "ForkTree projected value-pack reference is invalid".to_string())
+            })
+            .collect()
+    }
+
+    /// Reads correlated point identities from one coherent storage view.
+    /// Every path level and distinct value pack is fetched as one batch; the
+    /// aligned result preserves input order and duplicate identities.
+    pub async fn read_projected_points<T, F>(
+        &self,
+        branch: &str,
+        keys: &[Vec<u8>],
+        mut project: F,
+    ) -> Result<Vec<Option<T>>, String>
+    where
+        T: Clone,
+        F: FnMut(&[u8]) -> Result<T, String>,
+    {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let branch_key = selector_key(BRANCH_PREFIX, branch);
+        let selector_keys = [key(&branch_key)];
+        let selector = read
+            .get_many(&[GetManyRequest {
+                space: REF_SPACE,
+                keys: &selector_keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .map_err(storage_error)?
+            .values
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| format!("missing ForkTree branch '{branch}'"))?;
+        let commit_id = decode_ref(projected_bytes(&selector)?)?;
+        let commit = decode_commit(
+            &self
+                .load_objects_from_read(&read, &[commit_id])
+                .await?
+                .pop()
+                .ok_or_else(|| "ForkTree commit batch unexpectedly empty".to_string())?,
+        )?;
+
+        let mut frontier = BTreeMap::from([(commit.root, (0..keys.len()).collect::<Vec<_>>())]);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut values = vec![None::<ValueRef>; keys.len()];
+        while !frontier.is_empty() {
+            let ids = frontier.keys().copied().collect::<Vec<_>>();
+            if ids.iter().any(|id| !seen.insert(*id)) {
+                return Err("ForkTree point batch contains a repeated or cyclic node".to_string());
+            }
+            let objects = self.load_objects_from_read(&read, &ids).await?;
+            let mut next = BTreeMap::<ObjectId, Vec<usize>>::new();
+            for ((_, key_indices), bytes) in frontier.into_iter().zip(objects) {
+                match decode_node(&bytes)? {
+                    Node::Leaf(rows) => {
+                        for key_index in key_indices {
+                            if let Ok(row_index) = rows.binary_search_by(|row| {
+                                row.key.as_slice().cmp(keys[key_index].as_slice())
+                            }) {
+                                values[key_index] = Some(rows[row_index].value);
+                            }
+                        }
+                    }
+                    Node::Internal(children) => {
+                        for key_index in key_indices {
+                            if let Some(child) = children.iter().find(|child| {
+                                keys[key_index].as_slice() <= child.max_key.as_slice()
+                            }) {
+                                next.entry(child.id).or_default().push(key_index);
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        let requested = values.iter().flatten().fold(
+            BTreeMap::<ObjectId, std::collections::BTreeSet<u32>>::new(),
+            |mut requested, value| {
+                requested.entry(value.pack).or_default().insert(value.index);
+                requested
+            },
+        );
+        let pack_ids = requested.keys().copied().collect::<Vec<_>>();
+        let pack_bytes = self.load_objects_from_read(&read, &pack_ids).await?;
+        let mut projected = BTreeMap::new();
+        for (id, bytes) in pack_ids.into_iter().zip(pack_bytes) {
+            let indices = requested
+                .get(&id)
+                .expect("loaded pack was requested by this point batch");
+            for (index, value) in decode_value_pack_projected(&bytes, indices, &mut project)? {
+                projected.insert((id, index), value);
+            }
+        }
+        values
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|value| {
+                        projected
+                            .get(&(value.pack, value.index))
+                            .cloned()
+                            .ok_or_else(|| {
+                                "ForkTree projected point value-pack reference is invalid"
+                                    .to_string()
+                            })
+                    })
+                    .transpose()
             })
             .collect()
     }
@@ -3375,6 +3544,193 @@ where
             existing.insert(id);
         }
         Ok(existing)
+    }
+}
+
+impl<'a, S> ForkTreeReadView<'a, S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    async fn load_objects_cached(&mut self, ids: &[ObjectId]) -> Result<Vec<Bytes>, String> {
+        let missing = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.objects.contains_key(id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let loaded = self
+                .tree
+                .load_objects_from_read(&self.read, &missing)
+                .await?;
+            self.objects.extend(missing.into_iter().zip(loaded));
+        }
+        ids.iter()
+            .map(|id| {
+                self.objects
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("ForkTree read view lost object {}", hex_id(*id)))
+            })
+            .collect()
+    }
+
+    async fn ensure_nodes(&mut self, ids: &[ObjectId]) -> Result<(), String> {
+        let missing = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.nodes.contains_key(id))
+            .collect::<Vec<_>>();
+        let objects = self.load_objects_cached(&missing).await?;
+        for (id, bytes) in missing.into_iter().zip(objects) {
+            self.nodes.insert(id, decode_node(&bytes)?);
+        }
+        Ok(())
+    }
+
+    async fn ensure_value_packs(&mut self, ids: &[ObjectId]) -> Result<(), String> {
+        let missing = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.value_packs.contains_key(id))
+            .collect::<Vec<_>>();
+        let objects = self.load_objects_cached(&missing).await?;
+        for (id, bytes) in missing.into_iter().zip(objects) {
+            self.value_packs.insert(id, decode_value_pack(&bytes)?);
+        }
+        Ok(())
+    }
+
+    pub async fn read_projected_points<T, F>(
+        &mut self,
+        keys: &[Vec<u8>],
+        mut project: F,
+    ) -> Result<Vec<Option<T>>, String>
+    where
+        T: Clone,
+        F: FnMut(&[u8]) -> Result<T, String>,
+    {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut frontier = BTreeMap::from([(self.root, (0..keys.len()).collect::<Vec<_>>())]);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut values = vec![None::<ValueRef>; keys.len()];
+        while !frontier.is_empty() {
+            let ids = frontier.keys().copied().collect::<Vec<_>>();
+            if ids.iter().any(|id| !seen.insert(*id)) {
+                return Err("ForkTree point batch contains a repeated or cyclic node".to_string());
+            }
+            self.ensure_nodes(&ids).await?;
+            let mut next = BTreeMap::<ObjectId, Vec<usize>>::new();
+            for (id, key_indices) in frontier {
+                match self
+                    .nodes
+                    .get(&id)
+                    .ok_or_else(|| format!("ForkTree read view lost node {}", hex_id(id)))?
+                {
+                    Node::Leaf(rows) => {
+                        for key_index in key_indices {
+                            if let Ok(row_index) = rows.binary_search_by(|row| {
+                                row.key.as_slice().cmp(keys[key_index].as_slice())
+                            }) {
+                                values[key_index] = Some(rows[row_index].value);
+                            }
+                        }
+                    }
+                    Node::Internal(children) => {
+                        for key_index in key_indices {
+                            if let Some(child) = children.iter().find(|child| {
+                                keys[key_index].as_slice() <= child.max_key.as_slice()
+                            }) {
+                                next.entry(child.id).or_default().push(key_index);
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let requested = values.iter().flatten().fold(
+            BTreeMap::<ObjectId, std::collections::BTreeSet<u32>>::new(),
+            |mut requested, value| {
+                requested.entry(value.pack).or_default().insert(value.index);
+                requested
+            },
+        );
+        let pack_ids = requested.keys().copied().collect::<Vec<_>>();
+        self.ensure_value_packs(&pack_ids).await?;
+        values
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|value| {
+                        match self
+                            .value_packs
+                            .get(&value.pack)
+                            .and_then(|values| values.get(value.index as usize))
+                        {
+                            Some(RelationalValue::Bytes(bytes)) => project(bytes),
+                            Some(RelationalValue::Null) => {
+                                Err("ForkTree projected point encountered a null value".to_string())
+                            }
+                            None => Err("ForkTree projected point value-pack reference is invalid"
+                                .to_string()),
+                        }
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
+    pub async fn read_projected_range<T, F>(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        mut project: F,
+    ) -> Result<Vec<(Vec<u8>, T)>, String>
+    where
+        T: Clone,
+        F: FnMut(&[u8]) -> Result<T, String>,
+    {
+        if start > end {
+            return Err("ForkTree range start exceeds end".to_string());
+        }
+        let entries = self
+            .tree
+            .collect_range_entries_batched(&self.read, self.root, start, end)
+            .await?;
+        let requested = entries.iter().fold(
+            BTreeMap::<ObjectId, std::collections::BTreeSet<u32>>::new(),
+            |mut requested, entry| {
+                requested
+                    .entry(entry.value.pack)
+                    .or_default()
+                    .insert(entry.value.index);
+                requested
+            },
+        );
+        let pack_ids = requested.keys().copied().collect::<Vec<_>>();
+        self.ensure_value_packs(&pack_ids).await?;
+        entries
+            .into_iter()
+            .map(|entry| {
+                match self
+                    .value_packs
+                    .get(&entry.value.pack)
+                    .and_then(|values| values.get(entry.value.index as usize))
+                {
+                    Some(RelationalValue::Bytes(bytes)) => {
+                        project(bytes).map(|value| (entry.key, value))
+                    }
+                    Some(RelationalValue::Null) => {
+                        Err("ForkTree projected range encountered a null value".to_string())
+                    }
+                    None => Err("ForkTree projected range reference is invalid".to_string()),
+                }
+            })
+            .collect()
     }
 }
 
