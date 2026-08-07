@@ -30,10 +30,13 @@ pub(crate) use commit_root_rebuild::{
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
-#[cfg(test)]
-pub(crate) use current_state_data_part::decode_current_state_data_part_refs;
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
+    decode_current_state_data_part_commit_ids,
+};
+#[cfg(test)]
+pub(crate) use current_state_data_part::{
+    CurrentStateDataRow, decode_current_state_data_part_refs, encode_current_state_data_part,
 };
 pub(crate) use current_state_envelope::current_state_descriptor_from_scoped_range_part;
 pub(crate) use diff::{
@@ -76,10 +79,11 @@ pub(crate) use storage::{
     load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
     load_commit_delta_selection_certificate, load_commit_mutation_directory_roots,
     load_commit_state_authority_ids, load_commit_state_manifest, load_commit_state_manifests,
-    load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
-    load_published_commit_state_topology, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, scan_commit_delta_values, selected_change_selection_fingerprint,
-    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
+    load_local_selected_change_owner_commit_ids, load_owned_commit_delta_entries,
+    load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
+    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
+    selected_change_selection_fingerprint, stage_addressable_commit_deltas,
+    stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_published_parent,
@@ -113,8 +117,6 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use tree::test_gc_leaf_chunk;
-#[cfg(test)]
-pub(crate) use types::TrackedStateCommitRootParent;
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
@@ -124,6 +126,8 @@ pub(crate) use types::{
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
 };
+#[cfg(test)]
+pub(crate) use types::{CurrentStatePartDescriptor, TrackedStateCommitRootParent};
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 
 /// Builds an authenticated content-addressed closure for a set of retained
