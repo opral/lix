@@ -1,0 +1,63 @@
+# ForkTree replacement-layout prototype
+
+This benchmark-only prototype tests a replacement physical model. It is not a
+production index and is deliberately not registered with Lix serving paths.
+
+## Authority and invariants
+
+- One immutable `forktree_objects` key space stores every authenticated object.
+  The key is BLAKE3 of the complete tagged encoding. Tree nodes, semantic
+  deltas, commits, blob manifests, and blob chunks therefore share one object
+  identity and one prospective reachability universe.
+- One tiny mutable `forktree_refs` key space stores branch/checkpoint pins and
+  one publication/GC epoch. A root move and epoch rotation are one adapter
+  commit guarded by exact preconditions.
+- Every commit names one tree root and one semantic delta. Nodes use canonical
+  encodings and sorted entries. Initial trees are deterministically bulk packed;
+  value-only updates rewrite only touched leaves and their ancestor paths.
+- Derived caches or indexes are outside the authoritative model and must be
+  rebuildable from pinned commit roots.
+
+## Complexity
+
+Let `B` be leaf capacity, `F` internal fanout, `N` live rows, `K` sorted
+mutations, and `Z` newly materialized objects.
+
+- Bulk build: `O(N)` CPU/reads, `O(N/B)` node objects, and bounded encoder
+  working memory apart from the caller-owned sorted fixture.
+- Focused value-only apply: `O(K log_F N + Z)` object reads/writes and
+  `O(K + B log_F N)` working memory. Unchanged subtrees are referenced by hash.
+- Point read: `O(log_F N)` object reads and `O(B + log_F N)` decoded memory.
+- Hash-skipping diff synthesis: equal hashes stop traversal; aligned trees cost
+  `O(D log_F N + Z_d)` for changed regions, with a full-tree fallback required
+  when key-set edits change packing boundaries.
+- Branch/checkpoint/undo movement: `O(1)` mutable ref writes plus one epoch
+  rotation; no tree objects are copied.
+- A future global mark is necessarily `O(reachable objects + pins)` with page
+  bounded scan memory. This prototype does not claim continuous-GC results
+  before that vertical slice exists.
+
+The current update gate intentionally excludes key-set edits. Canonical local
+repacking for inserts/deletes is a subsequent prototype question, not a hidden
+compatibility path.
+
+## Evidence boundary
+
+Properties taken from prior work are kept separate from this synthesis:
+
+- Fully persistent B-trees establish external-memory persistence bounds.
+- PaC-trees establish that purely functional ordered trees can combine blocked
+  leaves, compression, and batch operations.
+- ForkBase POS-trees and Dolt Prolly-trees establish content-addressed,
+  content-defined blocked Merkle trees with structural sharing and hash-skipping
+  comparison.
+- Persistent B-epsilon trees establish buffered persistent update bounds, but
+  the recent construction is partially persistent rather than fully persistent.
+- cMVBT establishes a continuous-GC design for a concurrent multiversion B-tree;
+  it does not prove GC behavior for this immutable object synthesis.
+- Sapling's segmented commit graph motivates keeping high-level graph traversal
+  separate from lazily loaded commit detail; it does not determine row layout.
+
+ForkTree's single object space, fixed canonical bulk packing, semantic delta
+objects, and tiny ref/epoch plane are our synthesis and must be judged by the
+measurements and invariants in this benchmark.
