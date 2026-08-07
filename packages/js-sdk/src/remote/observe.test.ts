@@ -11,12 +11,14 @@ test("remote observe streams native Lix results", async () => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				if (request.method === "DELETE") return closedSession();
-				return new URL(request.url).pathname.endsWith("/lix/v1/")
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/execute")) return executeValueResponse("hello");
+				return pathname.endsWith("/lix/v1/")
 					? handshake()
 					: sseResponse(
 							sseFrame(
 								"next",
-								multiplexObservePayload("observe-1", "hello", 0, 7),
+								multiplexObservePayload("observe-1", "stale", 0, 7),
 							),
 						);
 			},
@@ -93,7 +95,11 @@ test("remote observe applies every blob delta before coalescing delivery", async
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE") return closedSession();
-				return new URL(request.url).pathname.endsWith("/lix/v1/")
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/execute")) {
+					return executeBlobResponse(new TextEncoder().encode("abcdef"));
+				}
+				return pathname.endsWith("/lix/v1/")
 					? handshake()
 					: sseResponse(body);
 			},
@@ -164,7 +170,11 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE") return closedSession();
-				return new URL(request.url).pathname.endsWith("/lix/v1/")
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/execute")) {
+					return executeValuesResponse(["a", "b", "c"]);
+				}
+				return pathname.endsWith("/lix/v1/")
 					? handshake()
 					: sseResponse(body);
 			},
@@ -206,12 +216,11 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 				if (pathname.endsWith("/lix/v1/")) return handshake();
 				if (request.method === "DELETE") return closedSession();
 				if (pathname.endsWith("/execute")) {
-					return Response.json({
-						columns: ["value"],
-						rows: [[{ kind: "text", value: "executed" }]],
-						rowsAffected: 0,
-						notices: [],
-					});
+					const body = (await request.json()) as { sql: string };
+					const value = /SELECT (\d+) AS value/.exec(body.sql)?.[1];
+					return executeValueResponse(
+						value === undefined ? "executed" : `value-${value}`,
+					);
 				}
 
 				observeRequests.push(request.clone());
@@ -268,7 +277,7 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 	expect(liveObserveRequests).toBe(1);
 	expect(maximumLiveObserveRequests).toBe(1);
 	expect(observeRequests).toHaveLength(1);
-	expect(headerResolutions).toBe(1);
+	expect(headerResolutions).toBe(9);
 	let submittedSubscriptions = 0;
 	for (const request of observeRequests) {
 		const body = (await request.clone().json()) as { subscriptions: unknown[] };
@@ -308,6 +317,9 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 						return handshake();
 					}
 					if (request.method === "DELETE") return closedSession();
+					if (new URL(request.url).pathname.endsWith("/execute")) {
+						return executeValueResponse("recovered");
+					}
 					observeRequests += 1;
 					liveObserveRequests += 1;
 					request.signal.addEventListener(
@@ -353,6 +365,9 @@ test("remote observe can continue after a semantic SSE error", async () => {
 						return handshake();
 					}
 					if (request.method === "DELETE") return closedSession();
+					if (new URL(request.url).pathname.endsWith("/execute")) {
+						return executeValueResponse("recovered");
+					}
 					observeRequests += 1;
 					return observeRequests === 1
 						? sseResponse(
@@ -455,6 +470,11 @@ test("a successful branch switch restarts observations on the pinned session", a
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) return handshake();
 				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) {
+					return executeValueResponse(
+						observeRequests === 1 ? "main-id" : "draft-id",
+					);
+				}
 				if (pathname.endsWith("/branch/switch")) {
 					const body = (await request.json()) as { branchId: string };
 					if (body.branchId === "missing-id") {
@@ -534,6 +554,7 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/")) return handshake();
 				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) return executeValueResponse("main-id");
 				if (pathname.endsWith("/branch/switch")) {
 					branchSwitchRequests += 1;
 					return Response.json({ branchId: "draft-id" });
@@ -584,8 +605,13 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
 						return handshake();
 					}
-					if (request.method === "DELETE") return closedSession();
-					observeRequests += 1;
+				if (request.method === "DELETE") return closedSession();
+				if (new URL(request.url).pathname.endsWith("/execute")) {
+					return executeValueResponse(
+						observeRequests <= 1 ? "first" : "second",
+					);
+				}
+				observeRequests += 1;
 					observedAuthorization.push(request.headers.get("authorization"));
 					observedSessionIds.push(request.headers.get("lix-session-id"));
 					if (observeRequests <= 2) {
@@ -600,7 +626,12 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 					return heldSseResponse(
 						sseFrame(
 							"next",
-							multiplexObservePayload("observe-1", "second", 0, 0),
+							multiplexObservePayload(
+								"observe-1",
+								"stale-after-reconnect",
+								0,
+								0,
+							),
 						),
 						request.signal,
 					);
@@ -620,8 +651,8 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		expect(reconnected?.mutationSequence).toBe(0);
 		expect(observedAuthorization).toEqual([
 			"Bearer token-2",
-			"Bearer token-3",
 			"Bearer token-4",
+			"Bearer token-6",
 		]);
 		expect(observedSessionIds).toEqual(["session-1", "session-1", "session-1"]);
 
@@ -702,6 +733,35 @@ function handshake(): Response {
 
 function closedSession(): Response {
 	return new Response(null, { status: 204 });
+}
+
+function executeValueResponse(value: string): Response {
+	return Response.json({
+		columns: ["value"],
+		rows: [[{ kind: "text", value }]],
+		rowsAffected: 0,
+		notices: [],
+	});
+}
+
+function executeValuesResponse(values: string[]): Response {
+	return Response.json({
+		columns: ["value"],
+		rows: values.map((value) => [{ kind: "text", value }]),
+		rowsAffected: 0,
+		notices: [],
+	});
+}
+
+function executeBlobResponse(bytes: Uint8Array): Response {
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return Response.json({
+		columns: ["content"],
+		rows: [[{ kind: "blob", base64: btoa(binary) }]],
+		rowsAffected: 0,
+		notices: [],
+	});
 }
 
 function observePayload(
