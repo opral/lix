@@ -51,6 +51,7 @@ criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
+libc = "0.2"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -68,6 +69,16 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "revision_pack_oracle"
 path = "examples/revision_pack_oracle.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_gc_qualification"
+path = "examples/cas_gc_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "cas_publication_epoch_qualification"
+path = "examples/cas_publication_epoch_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
@@ -94,6 +105,16 @@ required-features = ["storage-benches", "slatedb"]
 name = "certified_replacement_delete_reopen"
 path = "tests/certified_replacement_delete_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "checkpoint_gc_replay_reopen"
+path = "tests/checkpoint_gc_replay_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
+name = "cas_gc_history_retention"
+path = "tests/cas_gc_history_retention.rs"
+required-features = ["storage-benches", "slatedb"]
 
 [[test]]
 name = "tpch_overlay_helpers"

@@ -3530,6 +3530,12 @@ async fn scan_packed_current_base_rows(
     if base_refs.is_empty() {
         return Ok(MaterializedLiveStateBatch::default());
     }
+    if request.read_columns.columns.as_slice() == ["commit_id"] {
+        return scan_packed_current_base_provenance_rows(
+            store, branch_id, base_refs, request, limit,
+        )
+        .await;
+    }
     let single_base = base_refs.len() == 1;
     let mut winners = BTreeMap::new();
     let mut ordered_winners = None;
@@ -3731,6 +3737,83 @@ async fn scan_packed_current_base_rows(
             DeferredJsonField::Snapshot => rows.set_snapshot_content(deferred.row_index, json),
             DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
         }
+    }
+    Ok(rows.finish())
+}
+
+/// Provenance-only scan for authenticated packed current-state bases.
+///
+/// The compact identity/value plane already carries the owning commit ID.
+/// Loading each payload-bearing commit member again would add one point-read
+/// request and decoded change record per live row even though destructive
+/// reachability needs no payload. Preserve the normal winner rule while
+/// decoding each packed segment once and materializing only fixed provenance.
+async fn scan_packed_current_base_provenance_rows(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    base_refs: Vec<PackedCurrentBaseRef>,
+    request: &TrackedStateScanRequest,
+    limit: Option<usize>,
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    let mut winners = BTreeMap::new();
+    for base_ref in base_refs {
+        let compact = crate::tracked_state::scan_commit_delta_values(
+            store,
+            base_ref.commit_id,
+            &request.filter.schema_keys,
+        )
+        .await?;
+        for row in compact.iter() {
+            let key = row.key_ref();
+            let value = row.value();
+            if value.deleted
+                || !packed_identity_matches_filter(
+                    key.schema_key,
+                    key.entity_pk,
+                    key.file_id,
+                    &request.filter,
+                )
+            {
+                continue;
+            }
+            let identity = (
+                key.schema_key.to_owned(),
+                key.entity_pk.clone(),
+                key.file_id.map(str::to_owned),
+            );
+            match winners.entry(identity) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(value.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if entry.get().commit_id < value.commit_id =>
+                {
+                    entry.insert(value.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+
+    let row_capacity = limit.map_or(winners.len(), |limit| limit.min(winners.len()));
+    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(row_capacity);
+    let global = branch_id == crate::GLOBAL_BRANCH_ID;
+    for ((schema_key, entity_pk, file_id), value) in winners.into_iter().take(row_capacity) {
+        rows.push_materialized(
+            entity_pk,
+            schema_key,
+            file_id,
+            None,
+            None,
+            false,
+            value.created_at,
+            value.updated_at,
+            global,
+            Some(value.change_id),
+            Some(value.commit_id),
+            false,
+            branch_id,
+        );
     }
     Ok(rows.finish())
 }
@@ -4504,6 +4587,50 @@ where
             rows.push((branch_id.clone(), branch_rows));
         }
         Ok(rows)
+    }
+
+    /// Resolves the semantic owners named by every authenticated tracked
+    /// current-serving generation.
+    ///
+    /// A generation UUID is branch-scoped serving state, not a commit. Route
+    /// through the normal tracked reader so root-backed, packed, columnar, and
+    /// native parts all apply their existing authentication and visibility
+    /// rules. Only the fixed-width commit provenance column is requested; the
+    /// returned set is a read-only dependency projection for destructive GC.
+    pub(crate) async fn tracked_serving_commit_dependencies(
+        &self,
+        projections: &[(String, BranchHeadTrackedReachability)],
+    ) -> Result<BTreeSet<CommitId>, LixError> {
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter::default(),
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["commit_id".to_owned()],
+            },
+            limit: None,
+        };
+        let mut dependencies = BTreeSet::new();
+        for (branch_id, projection) in projections {
+            let batch = self
+                .scan_live_batch_for_generation(
+                    branch_id,
+                    projection.serving_generation,
+                    projection.serving_checkpoint_commit_id,
+                    &request,
+                )
+                .await?;
+            for row in batch.iter() {
+                if row.untracked() {
+                    continue;
+                }
+                let commit_id = row.commit_id().ok_or_else(|| {
+                    head_value_error(
+                        "authenticated tracked current-state row has no semantic commit owner",
+                    )
+                })?;
+                dependencies.insert(commit_id);
+            }
+        }
+        Ok(dependencies)
     }
 
     pub(crate) async fn has_schema_rows(

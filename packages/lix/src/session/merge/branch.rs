@@ -10,8 +10,8 @@ use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::entity_pk::EntityPk;
 use crate::plugin::{
-    ConflictRank, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
-    PluginRegistryEntry,
+    ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+    load_plugin_registry_at_commit,
 };
 use crate::storage_adapter::Storage;
 #[cfg(test)]
@@ -637,29 +637,15 @@ where
     let candidate_file_ids = common_owners.keys().cloned().collect::<BTreeSet<_>>();
     let common_descriptors =
         historical_conflict_file_descriptors(reader, analysis, &candidate_file_ids).await?;
-    let registry_key = TrackedStateKey {
-        schema_key: "lix_key_value".to_owned(),
-        file_id: None,
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
-    };
-    let base_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.base_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-    let target_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.target_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-    let source_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.source_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
+    let base_registry =
+        load_plugin_registry_at_commit(reader, &analysis.commits.base_commit_id.to_string())
+            .await?;
+    let target_registry =
+        load_plugin_registry_at_commit(reader, &analysis.commits.target_commit_id.to_string())
+            .await?;
+    let source_registry =
+        load_plugin_registry_at_commit(reader, &analysis.commits.source_commit_id.to_string())
+            .await?;
 
     let mut derived = BTreeMap::new();
     let mut derived_owners = BTreeMap::new();
@@ -1275,40 +1261,6 @@ where
         parent_path = Some(path);
     }
     Ok(compose_file_path(parent_path.as_deref(), &descriptor.name).ok())
-}
-
-async fn load_historical_plugin_registry<S>(
-    reader: &mut TrackedStateStoreReader<S>,
-    commit_id: &str,
-    registry_key: &TrackedStateKey,
-) -> Result<PluginRegistry, LixError>
-where
-    S: crate::storage_adapter::StorageAdapterRead,
-{
-    let rows = reader
-        .load_projected_batch_at_commit(
-            commit_id,
-            std::slice::from_ref(registry_key),
-            &ChangeRecordProjection::full(),
-        )
-        .await?
-        .into_rows();
-    let row = rows.into_iter().next().flatten();
-    let snapshot = match row {
-        None => None,
-        Some(row) if row.deleted || row.snapshot_content.is_none() => None,
-        Some(row) => Some(
-            serde_json::from_str(row.snapshot_content.as_deref().expect("checked")).map_err(
-                |error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!("historical plugin registry snapshot is invalid JSON: {error}"),
-                    )
-                },
-            )?,
-        ),
-    };
-    PluginRegistry::from_optional_snapshot(snapshot.as_ref())
 }
 
 fn pinned_conflict_plugin_entry(

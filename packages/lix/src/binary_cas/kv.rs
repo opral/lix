@@ -9,9 +9,9 @@ use crate::binary_cas::codec::{
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BinaryCasChunking, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
-    BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
-    BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
+    BinaryCasChunking, BinaryCasGcSweep, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment,
+    BlobEditSplice, BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes,
+    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -19,13 +19,13 @@ use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
 };
 use crate::storage_adapter::{
-    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
-    StorageScanOptions, StorageSpaceId, StorageValue,
+    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrecondition,
+    StorageProjectedValue, StorageScanOptions, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, Range};
 use web_time::Instant;
 
@@ -36,6 +36,8 @@ const MANIFEST_SCAN_CONCURRENCY: usize = 8;
 const MAX_DELTA_SEGMENTS: usize = 32;
 const MAX_DELTA_INSERT_BYTES: usize = 64 * 1024;
 const MAX_DELTA_INSERT_FRACTION_DIVISOR: usize = 8;
+const CAS_RECLAIM_MANIFEST_PAGE_ROWS: usize = 256;
+const CAS_RECLAIM_CHUNK_PAGE_ROWS: usize = 1;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -53,6 +55,80 @@ pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::m
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
+const BINARY_CAS_MUTATION_EPOCH_SPACE: StorageSpace =
+    StorageSpace::mutable(StorageSpaceId(0x0005_0005), "binary_cas.mutation_epoch.v1");
+const BINARY_CAS_MUTATION_EPOCH_KEY: &[u8] = b"epoch";
+
+pub(in crate::binary_cas) async fn load_mutation_epoch(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(u64, Option<Bytes>), LixError> {
+    let key = StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY));
+    let value = PointReadPlan::new(BINARY_CAS_MUTATION_EPOCH_SPACE, std::slice::from_ref(&key))
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::FullValue,
+            },
+        )
+        .await?
+        .value
+        .into_iter()
+        .next()
+        .flatten();
+    let Some(value) = value else {
+        return Ok((0, None));
+    };
+    let StorageProjectedValue::FullValue(value) = value else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS mutation epoch omitted its value",
+        ));
+    };
+    if value.len() != 8 {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS mutation epoch has an invalid width",
+        ));
+    }
+    Ok((
+        u64::from_be_bytes(value.as_ref().try_into().expect("checked epoch width")),
+        Some(value),
+    ))
+}
+
+pub(in crate::binary_cas) fn stage_mutation_epoch(
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    current: u64,
+    token: Option<Bytes>,
+) -> Result<(), LixError> {
+    let next = current.checked_add(1).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS mutation epoch exhausted",
+        )
+    })?;
+    let key = StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY));
+    writes.put(
+        BINARY_CAS_MUTATION_EPOCH_SPACE,
+        key.clone(),
+        StorageValue {
+            bytes: Bytes::copy_from_slice(&next.to_be_bytes()),
+        },
+    );
+    preconditions.push(match token {
+        Some(expected) => StoragePrecondition::KeyValueEquals {
+            space: BINARY_CAS_MUTATION_EPOCH_SPACE,
+            key,
+            expected,
+        },
+        None => StoragePrecondition::KeyAbsent {
+            space: BINARY_CAS_MUTATION_EPOCH_SPACE,
+            key,
+        },
+    });
+    Ok(())
+}
 
 #[derive(Debug)]
 struct BlobWritePlan {
@@ -73,6 +149,540 @@ struct PreparedChunk {
 pub(crate) struct KvBlobManifestChunk {
     pub(crate) chunk_hash: [u8; 32],
     pub(crate) chunk_size: u64,
+}
+
+/// Stages deletion of binary-CAS rows not reachable from authenticated blob
+/// roots and active upload receipts.
+///
+/// This is intentionally an explicit maintenance operation. It scans in
+/// single-row payload windows, retains only hashes and bounded manifest
+/// metadata in memory, and never reconstructs a full blob. Any malformed live
+/// manifest or missing live chunk fails closed before the caller can commit
+/// the write set.
+pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    blob_roots: &BTreeSet<BlobId>,
+    upload_chunks: &BTreeMap<ChunkHash, u64>,
+) -> Result<BinaryCasGcSweep, LixError> {
+    let mut live_blobs = BTreeSet::new();
+    let mut live_chunks = BTreeMap::new();
+    for (chunk_hash, expected_size) in upload_chunks {
+        mark_live_chunk_expectation(
+            &mut live_chunks,
+            *chunk_hash,
+            *expected_size,
+            "active upload receipt",
+        )?;
+    }
+    let mut live_manifest_chunk_counts = BTreeMap::<BlobId, u64>::new();
+
+    for root in blob_roots {
+        mark_live_blob(
+            store,
+            *root,
+            &mut live_blobs,
+            &mut live_chunks,
+            &mut live_manifest_chunk_counts,
+        )
+        .await?;
+    }
+
+    let mut result = BinaryCasGcSweep {
+        live_blob_count: live_blobs.len(),
+        live_chunk_count: live_chunks.len(),
+        ..BinaryCasGcSweep::default()
+    };
+
+    // Authenticate every declared live payload before staging any orphan
+    // mutation. The caller commits one atomic write set, but keeping a failed
+    // plan empty also prevents accidental reuse of partially staged sweep
+    // work after corruption is reported.
+    verify_live_chunk_presence(store, &live_chunks).await?;
+
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                BINARY_CAS_MANIFEST_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: CAS_RECLAIM_MANIFEST_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let blob_id = BlobId::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS manifest key is not a 32-byte blob hash",
+                )
+            })?);
+            let StorageProjectedValue::FullValue(bytes) = entry.value else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS manifest scan omitted its value",
+                ));
+            };
+            let manifest = decode_binary_cas_manifest(&bytes)?;
+            if !live_blobs.contains(&blob_id) {
+                writes.delete(
+                    BINARY_CAS_MANIFEST_SPACE,
+                    StorageKey(Bytes::copy_from_slice(blob_id.as_bytes())),
+                );
+                result.reclaimed_manifest_rows += 1;
+            } else {
+                validate_live_manifest_identity(blob_id, &manifest)?;
+            }
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                BINARY_CAS_MANIFEST_CHUNK_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    limit_rows: CAS_RECLAIM_MANIFEST_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let (blob_id, ordinal) = decode_manifest_chunk_key(&entry.key)?;
+            let keep = live_manifest_chunk_counts
+                .get(&blob_id)
+                .is_some_and(|chunk_count| ordinal < *chunk_count);
+            if !keep {
+                writes.delete(BINARY_CAS_MANIFEST_CHUNK_SPACE, entry.key);
+                result.reclaimed_manifest_chunk_rows += 1;
+            }
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                BINARY_CAS_CHUNK_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: CAS_RECLAIM_CHUNK_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let chunk_hash =
+                ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "binary CAS chunk key is not a 32-byte chunk hash",
+                    )
+                })?);
+            if live_chunks.contains_key(&chunk_hash) {
+                continue;
+            }
+            let StorageProjectedValue::FullValue(bytes) = entry.value else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS chunk scan omitted its value",
+                ));
+            };
+            let byte_count = u64::try_from(bytes.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "binary CAS orphan chunk size exceeds u64",
+                )
+            })?;
+            writes.delete(BINARY_CAS_CHUNK_SPACE, entry.key.clone());
+            result.reclaimed_chunk_rows += 1;
+            result.reclaimed_chunk_bytes = result
+                .reclaimed_chunk_bytes
+                .checked_add(byte_count)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "binary CAS reclaimed byte count overflowed",
+                    )
+                })?;
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    let mut resume_after = None;
+    loop {
+        let page = store
+            .scan(
+                BINARY_CAS_CHUNK_PRESENCE_SPACE,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    limit_rows: CAS_RECLAIM_MANIFEST_PAGE_ROWS,
+                    resume_after: resume_after.clone(),
+                },
+            )
+            .await?;
+        let last_key = page.entries.last().map(|entry| entry.key.clone());
+        for entry in page.entries {
+            let chunk_hash =
+                ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "binary CAS chunk-presence key is not a 32-byte chunk hash",
+                    )
+                })?);
+            if !live_chunks.contains_key(&chunk_hash) {
+                writes.delete(BINARY_CAS_CHUNK_PRESENCE_SPACE, entry.key);
+            }
+        }
+        if !page.has_more || last_key.is_none() {
+            break;
+        }
+        resume_after = last_key;
+    }
+
+    Ok(result)
+}
+
+async fn mark_live_blob(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root_blob_id: BlobId,
+    live_blobs: &mut BTreeSet<BlobId>,
+    live_chunks: &mut BTreeMap<ChunkHash, u64>,
+    live_manifest_chunk_counts: &mut BTreeMap<BlobId, u64>,
+) -> Result<(), LixError> {
+    let mut pending = vec![root_blob_id];
+    while let Some(blob_id) = pending.pop() {
+        if !live_blobs.insert(blob_id) {
+            continue;
+        }
+        let bytes = get_one(store, BINARY_CAS_MANIFEST_SPACE, manifest_key(blob_id))
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "live binary CAS blob '{}' has no manifest",
+                        blob_id.to_hex()
+                    ),
+                )
+            })?;
+        let manifest = decode_binary_cas_manifest(&bytes)?;
+        let metadata = validate_live_manifest_identity(blob_id, &manifest)?;
+        match manifest {
+            BinaryCasManifest::Empty { .. } => {}
+            BinaryCasManifest::SingleChunk {
+                size_bytes,
+                chunk_hash,
+            } => {
+                mark_live_chunk_expectation(
+                    live_chunks,
+                    ChunkHash::from_bytes(chunk_hash),
+                    size_bytes,
+                    &format!("live blob '{}'", blob_id.to_hex()),
+                )?;
+            }
+            BinaryCasManifest::Chunked {
+                size_bytes: declared_size,
+                chunk_count,
+            } => {
+                live_manifest_chunk_counts.insert(blob_id, u64::from(chunk_count));
+                let chunks = load_declared_manifest_chunks(store, blob_id, chunk_count).await?;
+                if chunks.len() != chunk_count as usize {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "live binary CAS blob '{}' expected {} manifest chunks, found {}",
+                            blob_id.to_hex(),
+                            chunk_count,
+                            chunks.len()
+                        ),
+                    ));
+                }
+                let chunk_size_sum = chunks
+                    .iter()
+                    .try_fold(0_u64, |total, chunk| total.checked_add(chunk.chunk_size));
+                let chunk_size_sum = chunk_size_sum.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "binary CAS manifest chunk sizes overflowed",
+                    )
+                })?;
+                if chunk_size_sum != declared_size {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "live binary CAS blob '{}' declares {} bytes but its chunks declare {}",
+                            blob_id.to_hex(),
+                            declared_size,
+                            chunk_size_sum
+                        ),
+                    ));
+                }
+                if BlobId::from_chunks(
+                    declared_size,
+                    chunks
+                        .iter()
+                        .map(|chunk| (ChunkHash::from_bytes(chunk.chunk_hash), chunk.chunk_size)),
+                ) != blob_id
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "live binary CAS blob '{}' failed manifest content-address verification",
+                            blob_id.to_hex()
+                        ),
+                    ));
+                }
+                for chunk in chunks {
+                    mark_live_chunk_expectation(
+                        live_chunks,
+                        ChunkHash::from_bytes(chunk.chunk_hash),
+                        chunk.chunk_size,
+                        &format!("live blob '{}'", blob_id.to_hex()),
+                    )?;
+                }
+            }
+            BinaryCasManifest::Delta { .. } => {
+                let BlobLayout::Delta {
+                    base_blob_hash,
+                    base_size_bytes,
+                    base_layout,
+                    ..
+                } = metadata.layout
+                else {
+                    unreachable!("delta manifest produces delta metadata")
+                };
+                let base_manifest_bytes = get_one(
+                    store,
+                    BINARY_CAS_MANIFEST_SPACE,
+                    manifest_key(base_blob_hash),
+                )
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "live binary CAS delta '{}' has no base manifest '{}'",
+                            blob_id.to_hex(),
+                            base_blob_hash.to_hex()
+                        ),
+                    )
+                })?;
+                let base_manifest = decode_binary_cas_manifest(&base_manifest_bytes)?;
+                let base_metadata =
+                    validate_live_manifest_identity(base_blob_hash, &base_manifest)?;
+                let expected_layout = match base_layout {
+                    BlobDeltaBaseLayout::SingleChunk { chunk_hash } => {
+                        BlobLayout::SingleChunk { chunk_hash }
+                    }
+                    BlobDeltaBaseLayout::Chunked { chunk_count } => {
+                        BlobLayout::Chunked { chunk_count }
+                    }
+                };
+                if base_metadata.size_bytes != base_size_bytes
+                    || base_metadata.layout != expected_layout
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "live binary CAS delta '{}' disagrees with base '{}' size/layout",
+                            blob_id.to_hex(),
+                            base_blob_hash.to_hex()
+                        ),
+                    ));
+                }
+                pending.push(base_blob_hash);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_manifest_identity(
+    blob_id: BlobId,
+    manifest: &BinaryCasManifest,
+) -> Result<BlobMetadata, LixError> {
+    let metadata = metadata_from_manifest(blob_id, manifest.clone())?;
+    if matches!(manifest, BinaryCasManifest::Delta { .. }) {
+        return Ok(metadata);
+    }
+    match manifest {
+        BinaryCasManifest::Empty { size_bytes } if *size_bytes == 0 => {
+            if blob_id != BlobId::from_content(&[]) {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "binary CAS empty manifest '{}' has the wrong hash",
+                        blob_id.to_hex()
+                    ),
+                ));
+            }
+        }
+        BinaryCasManifest::SingleChunk {
+            size_bytes,
+            chunk_hash,
+        } => {
+            if *size_bytes == 0
+                || blob_id != BlobId::from_single_chunk(ChunkHash::from_bytes(*chunk_hash))
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "binary CAS single-chunk manifest '{}' has the wrong hash",
+                        blob_id.to_hex()
+                    ),
+                ));
+            }
+        }
+        BinaryCasManifest::Chunked {
+            size_bytes,
+            chunk_count,
+        } if *size_bytes == 0 || *chunk_count == 0 => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!(
+                    "binary CAS chunked manifest '{}' has invalid size/count",
+                    blob_id.to_hex()
+                ),
+            ));
+        }
+        BinaryCasManifest::Delta { .. } => unreachable!("delta returned above"),
+        _ => {}
+    }
+    Ok(metadata)
+}
+
+fn mark_live_chunk_expectation(
+    live_chunks: &mut BTreeMap<ChunkHash, u64>,
+    chunk_hash: ChunkHash,
+    expected_size: u64,
+    source: &str,
+) -> Result<(), LixError> {
+    if expected_size == 0 || expected_size > MAX_BINARY_CAS_CHUNK_BYTES as u64 {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "{source} declares invalid size {expected_size} for chunk '{}'",
+                chunk_hash.to_hex()
+            ),
+        ));
+    }
+    match live_chunks.entry(chunk_hash) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(expected_size);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != expected_size => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!(
+                    "live binary CAS chunk '{}' has conflicting declared sizes {} and {}",
+                    chunk_hash.to_hex(),
+                    entry.get(),
+                    expected_size
+                ),
+            ));
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
+    }
+    Ok(())
+}
+
+fn decode_manifest_chunk_key(key: &StorageKey) -> Result<(BlobId, u64), LixError> {
+    if key.0.len() != 40 {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "binary CAS manifest-chunk key is not 40 bytes",
+        ));
+    }
+    let blob_id = BlobId::from_bytes(key.0[..32].try_into().expect("checked blob hash width"));
+    let ordinal = u64::from_be_bytes(key.0[32..].try_into().expect("checked ordinal width"));
+    Ok((blob_id, ordinal))
+}
+
+async fn verify_live_chunk_presence(
+    store: &(impl StorageAdapterRead + ?Sized),
+    live_chunks: &BTreeMap<ChunkHash, u64>,
+) -> Result<(), LixError> {
+    for (hash, expected_size) in live_chunks {
+        let key = StorageKey(Bytes::copy_from_slice(hash.as_bytes()));
+        let payload_result = PointReadPlan::new(BINARY_CAS_CHUNK_SPACE, std::slice::from_ref(&key))
+            .materialize(
+                store,
+                StorageGetOptions {
+                    projection: StorageCoreProjection::FullValue,
+                },
+            )
+            .await?;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = payload_result.value.first()
+        else {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!(
+                    "live binary CAS chunk '{}' is missing its payload row",
+                    hash.to_hex()
+                ),
+            ));
+        };
+        decode_and_verify_chunk(
+            bytes,
+            persisted_size_to_usize(*expected_size, "live binary CAS chunk")?,
+            BlobId::from_bytes(hash.into_bytes()),
+            *hash,
+        )?;
+
+        let presence_result =
+            PointReadPlan::new(BINARY_CAS_CHUNK_PRESENCE_SPACE, std::slice::from_ref(&key))
+                .materialize(
+                    store,
+                    StorageGetOptions {
+                        projection: StorageCoreProjection::KeyOnly,
+                    },
+                )
+                .await?;
+        if presence_result.value.first().is_none_or(Option::is_none) {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!(
+                    "live binary CAS chunk '{}' is missing its presence row",
+                    hash.to_hex()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -402,9 +1012,8 @@ pub(in crate::binary_cas) fn stage_fixed_manifest(
     })
 }
 
-#[cfg(test)]
 async fn get_one(
-    store: &impl StorageAdapterRead,
+    store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
@@ -2090,6 +2699,36 @@ mod tests {
         StorageScanChunk, StorageWriteOptions, StorageWriteSet,
     };
 
+    #[tokio::test]
+    async fn corrupt_mutation_epoch_fails_publication_closed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut corrupt = storage.new_write_set();
+        corrupt.put(
+            BINARY_CAS_MUTATION_EPOCH_SPACE,
+            StorageKey(Bytes::from_static(BINARY_CAS_MUTATION_EPOCH_KEY)),
+            StorageValue {
+                bytes: Bytes::from_static(b"bad"),
+            },
+        );
+        storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("corrupt epoch fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt epoch read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let error = crate::binary_cas::stage_mutation_epoch(&read, &mut writes, &mut preconditions)
+            .await
+            .expect_err("corrupt epoch must reject publication");
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
+        assert!(error.message.contains("invalid width"));
+        assert!(writes.is_empty());
+        assert!(preconditions.is_empty());
+    }
+
     struct DelayedManifestScanRead<R> {
         inner: R,
         default_manifest_delay: Duration,
@@ -2317,6 +2956,465 @@ mod tests {
         bytes: &[u8],
     ) -> BlobWriteReceipt {
         stage_test_payload(storage, writes, &BlobPayload::from_bytes(bytes.to_vec())).await
+    }
+
+    fn stage_declared_chunked_manifest(
+        writes: &mut StorageWriteSet,
+        chunks: &[(ChunkHash, u64)],
+    ) -> BlobId {
+        let size_bytes = chunks.iter().map(|(_, size)| *size).sum::<u64>();
+        let blob_id = BlobId::from_chunks(size_bytes, chunks.iter().copied());
+        stage_manifest(
+            writes,
+            blob_id,
+            &BinaryCasManifest::Chunked {
+                size_bytes,
+                chunk_count: chunks.len() as u32,
+            },
+        );
+        for (index, (chunk_hash, chunk_size)) in chunks.iter().copied().enumerate() {
+            stage_manifest_chunk(
+                writes,
+                blob_id,
+                index as u64,
+                &KvBlobManifestChunk {
+                    chunk_hash: chunk_hash.into_bytes(),
+                    chunk_size,
+                },
+            );
+        }
+        blob_id
+    }
+
+    #[tokio::test]
+    async fn reclamation_keeps_live_payload_while_reclaiming_a_distinct_orphan() {
+        let storage = StorageAdapter::new(Memory::new());
+        let shared = b"shared chunk";
+        let orphan = b"orphan chunk";
+        let shared_hash = ChunkHash::from_content(shared);
+        let orphan_hash = ChunkHash::from_content(orphan);
+        let live_blob = BlobId::from_single_chunk(shared_hash);
+        let orphan_blob = BlobId::from_single_chunk(orphan_hash);
+
+        let mut initial = storage.new_write_set();
+        stage_manifest(
+            &mut initial,
+            live_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: shared.len() as u64,
+                chunk_hash: shared_hash.into_bytes(),
+            },
+        );
+        stage_manifest(
+            &mut initial,
+            orphan_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: orphan.len() as u64,
+                chunk_hash: orphan_hash.into_bytes(),
+            },
+        );
+        stage_chunk(
+            &mut initial,
+            shared_hash,
+            BinaryChunkCodec::Raw,
+            shared.len() as u64,
+            shared,
+        );
+        stage_chunk(
+            &mut initial,
+            orphan_hash,
+            BinaryChunkCodec::Raw,
+            orphan.len() as u64,
+            orphan,
+        );
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("initial CAS rows should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("CAS read should open");
+        let mut writes = storage.new_write_set();
+        let result = stage_reclaim_unreachable_binary_cas(
+            &store,
+            &mut writes,
+            &BTreeSet::from([live_blob]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("live CAS root should be sweepable");
+        assert_eq!(result.live_blob_count, 1);
+        assert_eq!(result.live_chunk_count, 1);
+        assert_eq!(result.reclaimed_manifest_rows, 1);
+        assert_eq!(result.reclaimed_chunk_rows, 1);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("CAS sweep should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("CAS read should reopen");
+        assert!(
+            load_manifest(&store, live_blob)
+                .await
+                .expect("live manifest read should succeed")
+                .is_some()
+        );
+        assert!(
+            load_manifest(&store, orphan_blob)
+                .await
+                .expect("orphan manifest read should succeed")
+                .is_none()
+        );
+        assert!(
+            load_chunk(&store, shared_hash)
+                .await
+                .expect("shared chunk read should succeed")
+                .is_some()
+        );
+        assert!(
+            load_chunk(&store, orphan_hash)
+                .await
+                .expect("orphan chunk read should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reclamation_keeps_a_truly_shared_chunk_until_the_final_manifest_releases_it() {
+        let storage = StorageAdapter::new(Memory::new());
+        let shared = b"shared payload";
+        let live_only = b"live-only payload";
+        let retired_only = b"retired-only payload";
+        let shared_hash = ChunkHash::from_content(shared);
+        let live_only_hash = ChunkHash::from_content(live_only);
+        let retired_only_hash = ChunkHash::from_content(retired_only);
+
+        let mut initial = storage.new_write_set();
+        let live_blob = stage_declared_chunked_manifest(
+            &mut initial,
+            &[
+                (shared_hash, shared.len() as u64),
+                (live_only_hash, live_only.len() as u64),
+            ],
+        );
+        let retired_blob = stage_declared_chunked_manifest(
+            &mut initial,
+            &[
+                (shared_hash, shared.len() as u64),
+                (retired_only_hash, retired_only.len() as u64),
+            ],
+        );
+        for (hash, payload) in [
+            (shared_hash, shared.as_slice()),
+            (live_only_hash, live_only.as_slice()),
+            (retired_only_hash, retired_only.as_slice()),
+        ] {
+            stage_chunk(
+                &mut initial,
+                hash,
+                BinaryChunkCodec::Raw,
+                payload.len() as u64,
+                payload,
+            );
+        }
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("shared CAS fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("first sweep read should open");
+        let mut writes = storage.new_write_set();
+        stage_reclaim_unreachable_binary_cas(
+            &read,
+            &mut writes,
+            &BTreeSet::from([live_blob]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("first shared sweep should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("first shared sweep should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("shared verification read should open");
+        assert!(load_manifest(&read, retired_blob).await.unwrap().is_none());
+        assert!(
+            load_chunk(&read, retired_only_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_chunk(&read, shared_hash).await.unwrap().is_some());
+        drop(read);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("final sweep read should open");
+        let mut writes = storage.new_write_set();
+        stage_reclaim_unreachable_binary_cas(
+            &read,
+            &mut writes,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("final shared sweep should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("final shared sweep should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("final verification read should open");
+        assert!(load_manifest(&read, live_blob).await.unwrap().is_none());
+        assert!(load_chunk(&read, shared_hash).await.unwrap().is_none());
+        assert!(load_chunk(&read, live_only_hash).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reclamation_rejects_wrong_single_and_chunked_declared_sizes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let single = b"single-size";
+        let single_hash = ChunkHash::from_content(single);
+        let single_blob = BlobId::from_single_chunk(single_hash);
+        let chunked = b"chunked-size";
+        let chunked_hash = ChunkHash::from_content(chunked);
+        let mut initial = storage.new_write_set();
+        stage_manifest(
+            &mut initial,
+            single_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: single.len() as u64 + 1,
+                chunk_hash: single_hash.into_bytes(),
+            },
+        );
+        let chunked_blob = stage_declared_chunked_manifest(
+            &mut initial,
+            &[(chunked_hash, chunked.len() as u64 + 1)],
+        );
+        for (hash, payload) in [
+            (single_hash, single.as_slice()),
+            (chunked_hash, chunked.as_slice()),
+        ] {
+            stage_chunk(
+                &mut initial,
+                hash,
+                BinaryChunkCodec::Raw,
+                payload.len() as u64,
+                payload,
+            );
+        }
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("declared-size fixture should commit");
+
+        for root in [single_blob, chunked_blob] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("declared-size read should open");
+            let mut writes = storage.new_write_set();
+            let error = stage_reclaim_unreachable_binary_cas(
+                &read,
+                &mut writes,
+                &BTreeSet::from([root]),
+                &BTreeMap::new(),
+            )
+            .await
+            .expect_err("wrong declared size must fail closed");
+            assert!(error.to_string().contains("expected"));
+        }
+    }
+
+    #[tokio::test]
+    async fn reclamation_rejects_conflicting_live_chunk_size_expectations() {
+        let storage = StorageAdapter::new(Memory::new());
+        let shared = b"conflicting-size";
+        let shared_hash = ChunkHash::from_content(shared);
+        let single_blob = BlobId::from_single_chunk(shared_hash);
+        let mut initial = storage.new_write_set();
+        stage_manifest(
+            &mut initial,
+            single_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: shared.len() as u64,
+                chunk_hash: shared_hash.into_bytes(),
+            },
+        );
+        let chunked_blob = stage_declared_chunked_manifest(
+            &mut initial,
+            &[(shared_hash, shared.len() as u64 + 1)],
+        );
+        stage_chunk(
+            &mut initial,
+            shared_hash,
+            BinaryChunkCodec::Raw,
+            shared.len() as u64,
+            shared,
+        );
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("conflicting-size fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("conflicting-size read should open");
+        let mut writes = storage.new_write_set();
+        let error = stage_reclaim_unreachable_binary_cas(
+            &read,
+            &mut writes,
+            &BTreeSet::from([single_blob, chunked_blob]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("conflicting live expectations must fail closed");
+        assert!(error.to_string().contains("conflicting declared sizes"));
+    }
+
+    #[tokio::test]
+    async fn reclamation_reuses_delta_validation_and_authenticates_the_persisted_base_layout() {
+        let storage = StorageAdapter::new(Memory::new());
+        let base = b"delta-base";
+        let base_hash = ChunkHash::from_content(base);
+        let base_blob = BlobId::from_single_chunk(base_hash);
+        let malformed_delta = BlobId::from_content(b"malformed-delta");
+        let mismatched_delta = BlobId::from_content(b"mismatched-delta");
+        let mut initial = storage.new_write_set();
+        stage_manifest(
+            &mut initial,
+            base_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: base.len() as u64,
+                chunk_hash: base_hash.into_bytes(),
+            },
+        );
+        stage_chunk(
+            &mut initial,
+            base_hash,
+            BinaryChunkCodec::Raw,
+            base.len() as u64,
+            base,
+        );
+        stage_manifest(
+            &mut initial,
+            malformed_delta,
+            &BinaryCasManifest::Delta {
+                size_bytes: base.len() as u64,
+                base_blob_hash: base_blob.into_bytes(),
+                base_size_bytes: base.len() as u64,
+                base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                    chunk_hash: base_hash.into_bytes(),
+                },
+                segments: vec![StorageBinaryCasDeltaSegment::Copy {
+                    offset: 1,
+                    length: base.len() as u64,
+                }],
+            },
+        );
+        stage_manifest(
+            &mut initial,
+            mismatched_delta,
+            &BinaryCasManifest::Delta {
+                size_bytes: base.len() as u64,
+                base_blob_hash: base_blob.into_bytes(),
+                base_size_bytes: base.len() as u64 + 1,
+                base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                    chunk_hash: base_hash.into_bytes(),
+                },
+                segments: vec![StorageBinaryCasDeltaSegment::Copy {
+                    offset: 0,
+                    length: base.len() as u64,
+                }],
+            },
+        );
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("delta validation fixture should commit");
+
+        for (root, message) in [
+            (malformed_delta, "invalid copy ranges"),
+            (mismatched_delta, "disagrees with base"),
+        ] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("delta validation read should open");
+            let mut writes = storage.new_write_set();
+            let error = stage_reclaim_unreachable_binary_cas(
+                &read,
+                &mut writes,
+                &BTreeSet::from([root]),
+                &BTreeMap::new(),
+            )
+            .await
+            .expect_err("invalid live delta must fail closed");
+            assert!(error.to_string().contains(message), "{error}");
+            assert!(writes.is_empty(), "failed validation must stage no deletes");
+        }
+    }
+
+    #[tokio::test]
+    async fn reclamation_rejects_a_tampered_live_payload_before_commit() {
+        let storage = StorageAdapter::new(Memory::new());
+        let expected = b"expected payload";
+        let tampered = b"tampered payload";
+        let chunk_hash = ChunkHash::from_content(expected);
+        let blob_id = BlobId::from_single_chunk(chunk_hash);
+
+        let mut initial = storage.new_write_set();
+        stage_manifest(
+            &mut initial,
+            blob_id,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: expected.len() as u64,
+                chunk_hash: chunk_hash.into_bytes(),
+            },
+        );
+        stage_chunk(
+            &mut initial,
+            chunk_hash,
+            BinaryChunkCodec::Raw,
+            tampered.len() as u64,
+            tampered,
+        );
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("tampered fixture should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("CAS read should open");
+        let mut writes = storage.new_write_set();
+        let error = stage_reclaim_unreachable_binary_cas(
+            &store,
+            &mut writes,
+            &BTreeSet::from([blob_id]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("sweep must fail closed on a tampered live payload");
+        assert!(error.to_string().contains("content-address verification"));
     }
 
     #[tokio::test]
