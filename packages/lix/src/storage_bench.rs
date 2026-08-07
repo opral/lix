@@ -485,6 +485,240 @@ pub struct CommitGraphBenchResult {
     pub member_changes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeBaseBenchScenario {
+    EqualHeads,
+    AncestorDescendant,
+    RecentFork,
+    DeepFork,
+    CrissCross,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeBaseBenchFixture {
+    pub left_head: String,
+    pub right_head: String,
+    pub expected_base: Option<String>,
+    pub commits: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergePreparationBenchResult {
+    pub base_commit_id: String,
+    pub target_entries: usize,
+    pub source_entries: usize,
+}
+
+/// Seeds an empty-state commit graph whose only varying dimension is ancestry.
+///
+/// The manifests deliberately contain no tracked mutations or durable roots so
+/// merge preparation isolates topology discovery plus the equal-root diff fast
+/// path. Commit generation and parent links remain the production authority.
+pub async fn seed_merge_base_fixture_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    ancestry: usize,
+    scenario: MergeBaseBenchScenario,
+) -> Result<MergeBaseBenchFixture, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    if ancestry == 0 {
+        return Err(crate::LixError::unknown(
+            "merge-base benchmark ancestry must be positive",
+        ));
+    }
+    let mut records = Vec::new();
+    let mut generations = std::collections::HashMap::new();
+    let scenario_name = match scenario {
+        MergeBaseBenchScenario::EqualHeads => "equal",
+        MergeBaseBenchScenario::AncestorDescendant => "ancestor",
+        MergeBaseBenchScenario::RecentFork => "recent",
+        MergeBaseBenchScenario::DeepFork => "deep",
+        MergeBaseBenchScenario::CrissCross => "criss-cross",
+    };
+    let prefix = format!("merge-base-bench-{scenario_name}-{ancestry}");
+    let mut append = |label: String,
+                      parents: Vec<crate::changelog::CommitId>|
+     -> Result<crate::changelog::CommitId, crate::LixError> {
+        let generation = parents
+            .iter()
+            .map(|parent| {
+                generations.get(parent).copied().ok_or_else(|| {
+                    crate::LixError::unknown("merge-base benchmark parent is not seeded")
+                })
+            })
+            .collect::<Result<Vec<u64>, _>>()?
+            .into_iter()
+            .max()
+            .map_or(0, |generation| generation.saturating_add(1));
+        let commit_id = crate::changelog::CommitId::for_test_label(&label);
+        records.push(crate::changelog::CommitRecord {
+            format_version: 2,
+            commit_id,
+            generation,
+            parent_commit_ids: parents,
+            change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "merge-base benchmark timestamp",
+                "2026-08-07T00:00:00Z",
+            ),
+        });
+        generations.insert(commit_id, generation);
+        Ok(commit_id)
+    };
+
+    let root = append(format!("{prefix}-root"), Vec::new())?;
+    let (left_head, right_head, expected_base) = match scenario {
+        MergeBaseBenchScenario::EqualHeads => {
+            let mut head = root;
+            for index in 1..ancestry {
+                head = append(format!("{prefix}-linear-{index}"), vec![head])?;
+            }
+            (head, head, Some(head))
+        }
+        MergeBaseBenchScenario::AncestorDescendant => {
+            let mut head = root;
+            for index in 0..ancestry {
+                head = append(format!("{prefix}-descendant-{index}"), vec![head])?;
+            }
+            (root, head, Some(root))
+        }
+        MergeBaseBenchScenario::RecentFork => {
+            let mut base = root;
+            for index in 1..ancestry {
+                base = append(format!("{prefix}-trunk-{index}"), vec![base])?;
+            }
+            let mut left = base;
+            let mut right = base;
+            for index in 0..8 {
+                left = append(format!("{prefix}-left-{index}"), vec![left])?;
+                right = append(format!("{prefix}-right-{index}"), vec![right])?;
+            }
+            (left, right, Some(base))
+        }
+        MergeBaseBenchScenario::DeepFork => {
+            let mut left = root;
+            let mut right = root;
+            for index in 0..ancestry {
+                left = append(format!("{prefix}-left-{index}"), vec![left])?;
+                right = append(format!("{prefix}-right-{index}"), vec![right])?;
+            }
+            (left, right, Some(root))
+        }
+        MergeBaseBenchScenario::CrissCross => {
+            let mut base = root;
+            for index in 1..ancestry {
+                base = append(format!("{prefix}-trunk-{index}"), vec![base])?;
+            }
+            let left = append(format!("{prefix}-left"), vec![base])?;
+            let right = append(format!("{prefix}-right"), vec![base])?;
+            let left_merge = append(format!("{prefix}-left-merge"), vec![left, right])?;
+            let right_merge = append(format!("{prefix}-right-merge"), vec![right, left])?;
+            (left_merge, right_merge, None)
+        }
+    };
+
+    let mut read = storage.begin_read(ReadOptions::default()).await?;
+    let mut writes = storage.new_write_set();
+    crate::changelog::ChangelogWriter::stage_append(
+        &mut crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes),
+        crate::changelog::ChangelogAppend {
+            commits: records.clone(),
+            changes: Vec::new(),
+        },
+    )
+    .await?;
+    for record in &records {
+        crate::tracked_state::stage_commit_state_manifest(
+            &mut writes,
+            &crate::tracked_state::CommitStateManifest {
+                commit_id: record.commit_id,
+                change_account_id: record.account_id.clone(),
+                replay_debt: crate::tracked_state::CommitStateReplayDebt {
+                    depth: 1,
+                    rows: 0,
+                    bytes: 0,
+                },
+                mutations: crate::tracked_state::CommitStateMutationInventory::default(),
+                touched_scope_filter: Default::default(),
+                current_state_scoped_ranges: None,
+                snapshot_root: None,
+            },
+        )?;
+    }
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await?;
+    Ok(MergeBaseBenchFixture {
+        left_head: left_head.to_string(),
+        right_head: right_head.to_string(),
+        expected_base: expected_base.map(|commit_id| commit_id.to_string()),
+        commits: records.len(),
+    })
+}
+
+#[inline(never)]
+pub async fn merge_base_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    left_commit_id: &str,
+    right_commit_id: &str,
+) -> Result<String, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let mut reader = crate::commit_graph::CommitGraphContext::new().reader(read);
+    let left = crate::changelog::CommitId::parse_lix(left_commit_id, "merge benchmark left")?;
+    let right = crate::changelog::CommitId::parse_lix(right_commit_id, "merge benchmark right")?;
+    reader
+        .merge_base(&left, &right)
+        .await
+        .map(|base| base.to_string())
+}
+
+#[inline(never)]
+pub async fn prepare_merge_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    left_commit_id: &str,
+    right_commit_id: &str,
+) -> Result<MergePreparationBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let left = crate::changelog::CommitId::parse_lix(left_commit_id, "merge benchmark left")?;
+    let right = crate::changelog::CommitId::parse_lix(right_commit_id, "merge benchmark right")?;
+    let base = {
+        let mut reader = crate::commit_graph::CommitGraphContext::new().reader(&read);
+        reader.merge_base(&left, &right).await?
+    };
+    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
+    let target_entries = reader
+        .diff_commits(
+            &base.to_string(),
+            left_commit_id,
+            &crate::tracked_state::TrackedStateDiffRequest::default(),
+        )
+        .await?
+        .entries
+        .len();
+    let source_entries = reader
+        .diff_commits(
+            &base.to_string(),
+            right_commit_id,
+            &crate::tracked_state::TrackedStateDiffRequest::default(),
+        )
+        .await?
+        .entries
+        .len();
+    Ok(MergePreparationBenchResult {
+        base_commit_id: base.to_string(),
+        target_entries,
+        source_entries,
+    })
+}
+
 /// Measures topology reads against the superseded eager commit shape.
 ///
 /// Legacy modes deliberately reproduce the removed work: synthesized commit

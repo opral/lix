@@ -3803,7 +3803,7 @@ pub(crate) async fn load_commit_state_authority_ids(
 ) -> Result<Vec<Option<CommitId>>, LixError> {
     let keys = commit_ids
         .iter()
-        .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
+        .map(|commit_id| commit_state_authority_key(*commit_id))
         .collect::<Vec<_>>();
     let request = [StorageGetManyRequest {
         space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
@@ -3814,23 +3814,32 @@ pub(crate) async fn load_commit_state_authority_ids(
         .iter()
         .copied()
         .zip(exact_get_many(store, &request).await?.values)
-        .map(|(commit_id, value)| {
-            let Some(bytes) = value.and_then(full_value_bytes) else {
-                return Ok(None);
-            };
-            let stored = decode_stored_commit_state_manifest(&bytes)?;
-            if stored.commit_id != commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state authority-header key for commit '{commit_id}' contains '{}'",
-                        stored.commit_id
-                    ),
-                ));
-            }
-            Ok(Some(stored.commit_id))
-        })
+        .map(|(commit_id, value)| decode_commit_state_authority_id(commit_id, value))
         .collect()
+}
+
+pub(crate) fn commit_state_authority_key(commit_id: CommitId) -> StorageKey {
+    StorageKey(Bytes::from(commit_state_manifest_key(commit_id)))
+}
+
+pub(crate) fn decode_commit_state_authority_id(
+    commit_id: CommitId,
+    value: Option<StorageProjectedValue>,
+) -> Result<Option<CommitId>, LixError> {
+    let Some(bytes) = value.and_then(full_value_bytes) else {
+        return Ok(None);
+    };
+    let stored = decode_stored_commit_state_manifest(&bytes)?;
+    if stored.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state authority-header key for commit '{commit_id}' contains '{}'",
+                stored.commit_id
+            ),
+        ));
+    }
+    Ok(Some(stored.commit_id))
 }
 
 /// Loads authenticated mutation-directory roots without reading catalogs or

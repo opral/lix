@@ -85,6 +85,11 @@ path = "tests/movie_workspace_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
+name = "certified_replacement_delete_reopen"
+path = "tests/certified_replacement_delete_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
 name = "tpch_overlay_helpers"
 path = "tests/tpch_overlay_helpers.rs"
 
@@ -216,6 +221,12 @@ name = "commit_graph_scale"
 path = "benches/commit_graph_scale.rs"
 harness = false
 required-features = ["storage-benches"]
+
+[[bench]]
+name = "merge_base_scale"
+path = "benches/merge_base_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
 name = "repository_gc_scale"
