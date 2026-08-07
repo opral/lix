@@ -112,6 +112,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "forktree_gc_mark_pack_scale"
+path = "benches/forktree_gc_mark_pack_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "changelog_scorecard"
 path = "benches/changelog/scorecard.rs"
 harness = false
