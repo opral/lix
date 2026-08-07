@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::storage::{
     CoreProjection, GetOptions, Key, KeyRange, Memory, Prefix, ProjectedValue, ReadOptions,
-    ScanOptions, SpaceId, StoredValue, WriteOptions,
+    ScanOptions, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageReadStats, StorageReadStatsCollector,
@@ -329,7 +329,11 @@ async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanc
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
     writes.put(
-        StorageSpace::mutable(SpaceId(1), "storage.conformance.renamed"),
+        StorageSpace::engine_declared(
+            1,
+            "storage.conformance.renamed",
+            crate::storage::ValueSemantics::Mutable,
+        ),
         key("b"),
         value("B"),
     );
@@ -340,7 +344,12 @@ async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanc
     {
         Err(StorageWriteSetError::ConflictingSpaceDeclaration { existing, incoming })
             if existing == space_one()
-                && incoming == StorageSpace::mutable(SpaceId(1), "storage.conformance.renamed") =>
+                && incoming
+                    == StorageSpace::engine_declared(
+                        1,
+                        "storage.conformance.renamed",
+                        crate::storage::ValueSemantics::Mutable,
+                    ) =>
         {
             Ok(())
         }
@@ -351,11 +360,19 @@ async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanc
 }
 
 fn space_one() -> StorageSpace {
-    StorageSpace::mutable(SpaceId(1), "storage.conformance.one")
+    StorageSpace::engine_declared(
+        1,
+        "storage.conformance.one",
+        crate::storage::ValueSemantics::Mutable,
+    )
 }
 
 fn space_two() -> StorageSpace {
-    StorageSpace::mutable(SpaceId(2), "storage.conformance.two")
+    StorageSpace::engine_declared(
+        2,
+        "storage.conformance.two",
+        crate::storage::ValueSemantics::Mutable,
+    )
 }
 
 fn key(bytes: &'static str) -> Key {

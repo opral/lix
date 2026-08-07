@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{
-    BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, SpaceId,
-    Storage, StorageError, StorageWrite, StoredValue, WriteOptions,
+    BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, Storage,
+    StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
@@ -79,7 +79,7 @@ impl IntoStorageValue for &[u8] {
 pub struct StorageWriteSet {
     identity: u64,
     groups: Vec<StorageWriteGroup>,
-    group_index: HashMap<SpaceId, usize, FastHashBuilder>,
+    group_index: HashMap<u32, usize, FastHashBuilder>,
     exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
     deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
     stats: StorageWriteSetStats,
@@ -422,14 +422,14 @@ impl StorageWriteSet {
         for &space in source.target_spaces() {
             if self
                 .group_index
-                .get(&space.id)
+                .get(&space.id())
                 .and_then(|index| self.groups.get(*index))
                 .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
                 || self.deferred_final_puts.iter().any(|existing| {
                     existing
                         .target_spaces()
                         .iter()
-                        .any(|target| target.id == space.id)
+                        .any(|target| target.id() == space.id())
                 })
             {
                 return Err(StorageWriteSetError::DuplicateMutation {
@@ -548,18 +548,18 @@ impl StorageWriteSet {
     ) -> Result<(), StorageWriteSetError> {
         let has_points = self
             .group_index
-            .get(&space.id)
+            .get(&space.id())
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty());
         let has_range = self
             .exclusive_range_deletes
             .iter()
-            .any(|(existing, _)| existing.id == space.id);
+            .any(|(existing, _)| existing.id() == space.id());
         let has_deferred = self.deferred_final_puts.iter().any(|source| {
             source
                 .target_spaces()
                 .iter()
-                .any(|target| target.id == space.id)
+                .any(|target| target.id() == space.id())
         });
         if has_points || has_range || has_deferred {
             return Err(StorageWriteSetError::DuplicateMutation {
@@ -598,7 +598,7 @@ impl StorageWriteSet {
     /// normal data rows must remain unique and are validated by [`Self::validate`].
     pub(crate) fn contains_put(&self, space: StorageSpace, key: &[u8]) -> bool {
         self.group_index
-            .get(&space.id)
+            .get(&space.id())
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| group.puts.iter().any(|put| group.key_bytes(put.key) == key))
     }
@@ -608,7 +608,7 @@ impl StorageWriteSet {
     pub(crate) fn staged_value(&self, space: StorageSpace, key: &[u8]) -> Option<Bytes> {
         let group = self
             .group_index
-            .get(&space.id)
+            .get(&space.id())
             .and_then(|index| self.groups.get(*index))?;
         let put = group
             .puts
@@ -623,7 +623,7 @@ impl StorageWriteSet {
     pub(crate) fn staged_values_in_space(&self, space: StorageSpace) -> Vec<(Bytes, Bytes)> {
         let Some(group) = self
             .group_index
-            .get(&space.id)
+            .get(&space.id())
             .and_then(|index| self.groups.get(*index))
         else {
             return Vec::new();
@@ -663,7 +663,7 @@ impl StorageWriteSet {
             for &space in source.target_spaces() {
                 assert!(
                     self.group_index
-                        .get(&space.id)
+                        .get(&space.id())
                         .and_then(|index| self.groups.get(*index))
                         .is_none_or(|group| group.puts.is_empty() && group.deletes.is_empty()),
                     "extended deferred spaces remain exclusive"
@@ -673,7 +673,7 @@ impl StorageWriteSet {
                         existing
                             .target_spaces()
                             .iter()
-                            .all(|target| target.id != space.id)
+                            .all(|target| target.id() != space.id())
                     }),
                     "extended deferred sources remain exclusive"
                 );
@@ -732,7 +732,7 @@ impl StorageWriteSet {
     #[cfg(test)]
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
         self.group_index
-            .get(&space.id)
+            .get(&space.id())
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
     }
@@ -821,7 +821,7 @@ impl StorageWriteSet {
             if order_stats_enabled() && !group.puts.is_empty() {
                 eprintln!(
                     "write-set-order space={} puts={} puts_sorted={puts_sorted} deletes={} deletes_sorted={deletes_sorted}",
-                    group.space.name,
+                    group.space.name(),
                     group.puts.len(),
                     group.deletes.len(),
                 );
@@ -877,7 +877,7 @@ impl StorageWriteSet {
                     .sum::<usize>();
                 eprintln!(
                     "write-set-space space={} puts={} deletes={} key_bytes={} value_bytes={}",
-                    group.space.name,
+                    group.space.name(),
                     group.puts.len(),
                     group.deletes.len(),
                     key_bytes,
@@ -956,7 +956,7 @@ impl StorageWriteSet {
     }
 
     fn group_mut(&mut self, space: StorageSpace) -> &mut StorageWriteGroup {
-        if let Some(index) = self.group_index.get(&space.id).copied() {
+        if let Some(index) = self.group_index.get(&space.id()).copied() {
             let group = &mut self.groups[index];
             if group.space != space {
                 group.conflicting_declarations.push(space);
@@ -965,7 +965,7 @@ impl StorageWriteSet {
         }
 
         let index = self.groups.len();
-        self.group_index.insert(space.id, index);
+        self.group_index.insert(space.id(), index);
         self.stats.touched_spaces += 1;
         self.groups.push(StorageWriteGroup::new(space));
         let group = &mut self.groups[index];
@@ -979,17 +979,17 @@ impl StorageWriteSet {
         for (index, (space, _)) in self.exclusive_range_deletes.iter().enumerate() {
             let conflicts_with_points = self
                 .group_index
-                .get(&space.id)
+                .get(&space.id())
                 .and_then(|group_index| self.groups.get(*group_index))
                 .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty());
             let conflicts_with_range = self.exclusive_range_deletes[index + 1..]
                 .iter()
-                .any(|(other, _)| other.id == space.id);
+                .any(|(other, _)| other.id() == space.id());
             let conflicts_with_deferred = self.deferred_final_puts.iter().any(|source| {
                 source
                     .target_spaces()
                     .iter()
-                    .any(|target| target.id == space.id)
+                    .any(|target| target.id() == space.id())
             });
             if conflicts_with_points || conflicts_with_range || conflicts_with_deferred {
                 return Err(StorageWriteSetError::DuplicateMutation {
@@ -1149,7 +1149,7 @@ impl StorageWriteGroup {
             deletes,
             conflicting_declarations,
         } = other;
-        debug_assert_eq!(self.space.id, space.id);
+        debug_assert_eq!(self.space.id(), space.id());
         self.puts.reserve(puts.len());
         self.deletes.reserve(deletes.len());
         let key_remap = self.key_arena.append(key_arena);
@@ -1263,7 +1263,7 @@ impl fmt::Display for StorageWriteSetError {
             Self::ConflictingSpaceDeclaration { existing, incoming } => write!(
                 f,
                 "conflicting storage space declarations for {:?}: {existing} vs {incoming}",
-                existing.id
+                existing.id()
             ),
             Self::DuplicateMutation { space, key } => {
                 write!(f, "duplicate storage mutation for {space}/{key:?}")
@@ -1295,8 +1295,7 @@ mod tests {
 
     use crate::storage::{
         BufferRange, CommitResult, EncodedMutationBatch, EncodedMutationBatchError, EncodedPut,
-        Key, KeyRange, Memory, PutBatch, SpaceId, StorageError, StorageWrite, StoredValue,
-        WriteOptions,
+        Key, KeyRange, Memory, PutBatch, StorageError, StorageWrite, StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -1311,7 +1310,7 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::mutable(SpaceId(1), "test.space")
+        StorageSpace::engine_declared(1, "test.space", crate::storage::ValueSemantics::Mutable)
     }
 
     #[derive(Default)]
@@ -1740,7 +1739,11 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         writes.put(space(), key("mutable"), value("A"));
         writes.put(
-            StorageSpace::immutable(SpaceId(1), "test.space"),
+            StorageSpace::engine_declared(
+                1,
+                "test.space",
+                crate::storage::ValueSemantics::Immutable,
+            ),
             key("immutable"),
             value("B"),
         );

@@ -25,8 +25,8 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::LixError;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapterRead,
-    StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace, StorageSpaceId,
-    StorageValue, StorageWriteSet,
+    StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace, StorageValue,
+    StorageWriteSet,
 };
 
 pub(crate) const ROW_GROUP_MAX_ROWS: usize = 64 * 1024;
@@ -41,13 +41,15 @@ pub(crate) struct RowGroupRowLocation {
     pub(crate) group_index: u32,
     pub(crate) row_index: u32,
 }
-pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_0029),
+pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0029,
     "entity.columnar_row_group_manifest.v1",
+    crate::storage::ValueSemantics::Immutable,
 );
-pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_002a),
+pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_002a,
     "entity.columnar_row_group_column.v1",
+    crate::storage::ValueSemantics::Immutable,
 );
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM004";

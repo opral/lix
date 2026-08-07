@@ -392,7 +392,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::storage::{
-        GetOptions, Key, Memory, ProjectedValue, ReadOptions, SpaceId, StoredValue, WriteOptions,
+        GetOptions, Key, Memory, ProjectedValue, ReadOptions, StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{PointReadPlan, StorageAdapter, StorageSpace};
 
@@ -407,7 +407,7 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::mutable(SpaceId(1), "test.space")
+        StorageSpace::engine_declared(1, "test.space", crate::storage::ValueSemantics::Mutable)
     }
 
     #[tokio::test]

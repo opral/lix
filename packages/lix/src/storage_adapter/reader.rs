@@ -14,7 +14,7 @@ mod tests {
 
     use crate::storage::{
         CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory, Prefix,
-        ProjectedValue, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
+        ProjectedValue, ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead,
         StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{
@@ -37,7 +37,7 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::mutable(SpaceId(1), "test.space")
+        StorageSpace::engine_declared(1, "test.space", crate::storage::ValueSemantics::Mutable)
     }
 
     #[derive(Clone, Default)]
@@ -148,7 +148,11 @@ mod tests {
         let left = shared.clone();
         let left_task = tokio::spawn(async move {
             left.get_many(&[GetManyRequest {
-                space: StorageSpace::mutable(SpaceId(1), "test.mutable"),
+                space: StorageSpace::engine_declared(
+                    1,
+                    "test.mutable",
+                    crate::storage::ValueSemantics::Mutable,
+                ),
                 keys: &[],
                 opts: GetOptions::default(),
             }])
@@ -158,7 +162,11 @@ mod tests {
         let right_task = tokio::spawn(async move {
             right
                 .get_many(&[GetManyRequest {
-                    space: StorageSpace::mutable(SpaceId(1), "test.mutable"),
+                    space: StorageSpace::engine_declared(
+                        1,
+                        "test.mutable",
+                        crate::storage::ValueSemantics::Mutable,
+                    ),
                     keys: &[],
                     opts: GetOptions::default(),
                 }])

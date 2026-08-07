@@ -15,13 +15,16 @@ use crate::common::LixTimestamp;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey,
     StoragePrecondition, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
-    StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
 
 pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v9";
-pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
+pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0020,
+    BRANCH_HEAD_CONTROL_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
 

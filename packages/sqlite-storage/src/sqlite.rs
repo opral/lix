@@ -14,7 +14,7 @@ use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfi
 use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
+    ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, ValueSemantics, WriteOptions, WriteStats,
 };
 use rusqlite::types::ValueRef as SqlValueRef;
@@ -35,8 +35,8 @@ const PUT_CHUNK_ROWS: usize = 128;
 const _: () = assert!(POINT_READ_CHUNK_KEYS * 2 < 999);
 const _: () = assert!(PUT_CHUNK_ROWS * 2 < 999);
 
-fn space_table(space: SpaceId) -> String {
-    format!("s{:08x}", space.0)
+fn space_table(space: u32) -> String {
+    format!("s{:08x}", space)
 }
 
 #[derive(Debug)]
@@ -235,23 +235,23 @@ fn check_preconditions(
     for (index, precondition) in preconditions.iter().enumerate() {
         let matches = match precondition {
             Precondition::KeyAbsent { space, key } => {
-                precondition_value(conn, space.id, key)?.is_none()
+                precondition_value(conn, space.id(), key)?.is_none()
             }
             Precondition::KeyPresent { space, key } => {
-                precondition_value(conn, space.id, key)?.is_some()
+                precondition_value(conn, space.id(), key)?.is_some()
             }
             Precondition::KeyValueHashEquals { space, key, hash } => {
-                precondition_value(conn, space.id, key)?
+                precondition_value(conn, space.id(), key)?
                     .is_some_and(|value| blake3::hash(&value).as_bytes() == hash)
             }
             Precondition::KeyValueEquals {
                 space,
                 key,
                 expected,
-            } => precondition_value(conn, space.id, key)?
+            } => precondition_value(conn, space.id(), key)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
             Precondition::RangeEmpty { space, range } => {
-                precondition_range_is_empty(conn, space.id, range)?
+                precondition_range_is_empty(conn, space.id(), range)?
             }
             Precondition::BranchEquals { .. } => false,
         };
@@ -268,7 +268,7 @@ fn check_preconditions(
 
 fn precondition_value(
     conn: &Connection,
-    space: SpaceId,
+    space: u32,
     key: &Key,
 ) -> Result<Option<Vec<u8>>, StorageError> {
     if !space_table_exists(conn, space)? {
@@ -289,7 +289,7 @@ fn precondition_value(
 
 fn precondition_range_is_empty(
     conn: &Connection,
-    space: SpaceId,
+    space: u32,
     range: &KeyRange,
 ) -> Result<bool, StorageError> {
     if !space_table_exists(conn, space)? {
@@ -332,13 +332,13 @@ impl StorageRead for SQLiteRead {
             for request in requests {
                 let offset = values.len();
                 values.resize(offset + request.keys.len(), None);
-                if !space_table_exists(conn, request.space.id)? {
+                if !space_table_exists(conn, request.space.id())? {
                     continue;
                 }
                 for (chunk_index, chunk) in request.keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
                     read_points_chunk(
                         conn,
-                        request.space.id,
+                        request.space.id(),
                         offset + chunk_index * POINT_READ_CHUNK_KEYS,
                         chunk,
                         request.opts.projection,
@@ -369,7 +369,7 @@ impl StorageRead for SQLiteRead {
             let conn = conn
                 .as_ref()
                 .ok_or_else(|| StorageError::Io("sqlite read is closed".to_string()))?;
-            let space = space.id;
+            let space = space.id();
             if !space_table_exists(conn, space)? {
                 return Ok(ScanChunk {
                     entries: Vec::new(),
@@ -463,8 +463,8 @@ impl StorageWrite for SQLiteWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let semantics = space.value_semantics;
-            let space = space.id;
+            let semantics = space.value_semantics();
+            let space = space.id();
             let mut entries = entries.entries;
             entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
             debug_assert!(
@@ -494,7 +494,7 @@ impl StorageWrite for SQLiteWrite {
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let space = space.id;
+            let space = space.id();
             if space_table_exists(self.conn(), space)? {
                 let table = space_table(space);
                 let sql = format!("DELETE FROM {table} WHERE key = ?1");
@@ -517,7 +517,7 @@ impl StorageWrite for SQLiteWrite {
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let space = space.id;
+            let space = space.id();
             let deleted = if !space_table_exists(self.conn(), space)? {
                 0
             } else {
@@ -573,7 +573,7 @@ impl SQLiteWrite {
     /// Unconditional CREATE IF NOT EXISTS: a few microseconds of DDL parse
     /// per batch buys freedom from existence caching and its rollback
     /// semantics.
-    fn ensure_space_table(&self, space: SpaceId) -> Result<(), StorageError> {
+    fn ensure_space_table(&self, space: u32) -> Result<(), StorageError> {
         let table = space_table(space);
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {table} (
@@ -585,7 +585,7 @@ impl SQLiteWrite {
         self.conn().execute_batch(&sql).map_err(sqlite_error)
     }
 
-    fn put_rows(&self, space: SpaceId, entries: &[PutEntry]) -> Result<(), StorageError> {
+    fn put_rows(&self, space: u32, entries: &[PutEntry]) -> Result<(), StorageError> {
         let table = space_table(space);
         let conn = self.conn();
         let mut chunks = entries.chunks_exact(PUT_CHUNK_ROWS);
@@ -623,7 +623,7 @@ impl SQLiteWrite {
 
     fn validate_immutable_rows(
         &self,
-        space: SpaceId,
+        space: u32,
         entries: &[PutEntry],
     ) -> Result<(), StorageError> {
         let table = space_table(space);
@@ -748,7 +748,7 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), StorageError> {
 
 /// One sqlite_master probe per call; reads cannot create tables, so a space
 /// without a table is simply empty.
-fn space_table_exists(conn: &Connection, space: SpaceId) -> Result<bool, StorageError> {
+fn space_table_exists(conn: &Connection, space: u32) -> Result<bool, StorageError> {
     let mut stmt = conn
         .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
         .map_err(sqlite_error)?;
@@ -761,7 +761,7 @@ fn space_table_exists(conn: &Connection, space: SpaceId) -> Result<bool, Storage
 #[expect(clippy::cast_possible_wrap)]
 fn read_points_chunk(
     conn: &Connection,
-    space: SpaceId,
+    space: u32,
     offset: usize,
     chunk: &[Key],
     projection: CoreProjection,

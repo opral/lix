@@ -9,7 +9,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
-    PutBatch, ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
+    PutBatch, ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOptions, Storage,
     StorageError, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
 use lix::{Lix, LixError, open_lix};
@@ -303,14 +303,14 @@ impl FileStorage {
 
 /// The CLI file storage keeps one flat map; spaces are scoped by prefixing
 /// the 4-byte big-endian space id internally. Reads return logical keys.
-fn physical_key(space: SpaceId, key: &Key) -> Vec<u8> {
+fn physical_key(space: u32, key: &Key) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     bytes
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+fn physical_range(space: u32, range: KeyRange) -> KeyRange {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
         Bound::Included(key) => Bound::Included(Key(Bytes::from(physical_key(space, &key)))),
         Bound::Excluded(key) => Bound::Excluded(Key(Bytes::from(physical_key(space, &key)))),
@@ -319,11 +319,11 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
     KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         ),
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         ),
@@ -342,7 +342,7 @@ impl StorageRead for FileStorageRead {
                     .flat_map(|request| {
                         request.keys.iter().map(|key| {
                             self.kv
-                                .get(physical_key(request.space.id, key).as_slice())
+                                .get(physical_key(request.space.id(), key).as_slice())
                                 .map(|value| project_value(value, request.opts.projection))
                         })
                     })
@@ -364,11 +364,11 @@ impl StorageRead for FileStorageRead {
                     has_more: false,
                 });
             }
-            let range = physical_range(space.id, range);
+            let range = physical_range(space.id(), range);
             let resume_after = opts
                 .resume_after
                 .as_ref()
-                .map(|key| Key(Bytes::from(physical_key(space.id, key))));
+                .map(|key| Key(Bytes::from(physical_key(space.id(), key))));
             let mut rows = self
                 .kv
                 .iter()
@@ -400,7 +400,7 @@ impl StorageWrite for FileStorageWrite {
                 self.stats.put_entries += 1;
                 self.stats.written_bytes += entry.value.bytes.len() as u64;
                 self.kv.insert(
-                    physical_key(space.id, &entry.key),
+                    physical_key(space.id(), &entry.key),
                     stored_value_bytes(entry.value),
                 );
             }
@@ -416,7 +416,7 @@ impl StorageWrite for FileStorageWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             for key in keys {
-                self.kv.remove(physical_key(space.id, key).as_slice());
+                self.kv.remove(physical_key(space.id(), key).as_slice());
             }
             self.stats.deleted_entries += keys.len() as u64;
             self.stats.storage_calls += 1;
@@ -430,7 +430,7 @@ impl StorageWrite for FileStorageWrite {
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let range = physical_range(space.id, range);
+            let range = physical_range(space.id(), range);
             let before = self.kv.len();
             self.kv
                 .retain(|key, _| !key_matches_range(key, &range, None));

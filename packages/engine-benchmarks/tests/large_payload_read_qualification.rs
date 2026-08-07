@@ -13,13 +13,13 @@ use bytes::Bytes;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-    ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
+    ProjectedValue, PutBatch, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError,
     StorageRead, StorageSpace, StorageWrite, WriteOptions,
 };
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
-    binary_cas_owner_layout_accounting, binary_cas_write_accounting,
-    reset_binary_cas_write_accounting, take_media_structural_accounting,
+    OwnerSpaceForBench, binary_cas_owner_layout_accounting, binary_cas_write_accounting,
+    owner_space_for_bench, reset_binary_cas_write_accounting, take_media_structural_accounting,
 };
 use lix::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, FILE_UPLOAD_PART_BYTES,
@@ -29,10 +29,10 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 use sha2::{Digest as _, Sha256};
 
-const MANIFEST_SPACE: SpaceId = SpaceId(0x0005_0001);
-const MANIFEST_CHUNK_SPACE: SpaceId = SpaceId(0x0005_0002);
-const PAYLOAD_SPACE: SpaceId = SpaceId(0x0005_0003);
-const PRESENCE_SPACE: SpaceId = SpaceId(0x0005_0004);
+const MANIFEST_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasManifest;
+const MANIFEST_CHUNK_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasManifestChunk;
+const PAYLOAD_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasPayload;
+const PRESENCE_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasPresence;
 const PATH: &str = "/media/foreground.mov";
 const EDIT_BYTES: usize = 4 * 1024;
 const RANGE_BYTES: u64 = 4 * 1024;
@@ -1051,22 +1051,18 @@ where
     S: Storage,
 {
     CasLayout {
-        manifest: space_accounting(storage, MANIFEST_SPACE, false).await,
-        manifest_chunk: space_accounting(storage, MANIFEST_CHUNK_SPACE, false).await,
-        payload: space_accounting(storage, PAYLOAD_SPACE, true).await,
-        presence: space_accounting(storage, PRESENCE_SPACE, false).await,
+        manifest: space_accounting(storage, MANIFEST_SPACE).await,
+        manifest_chunk: space_accounting(storage, MANIFEST_CHUNK_SPACE).await,
+        payload: space_accounting(storage, PAYLOAD_SPACE).await,
+        presence: space_accounting(storage, PRESENCE_SPACE).await,
     }
 }
 
-async fn space_accounting<S>(storage: &S, id: SpaceId, immutable: bool) -> SpaceAccounting
+async fn space_accounting<S>(storage: &S, role: OwnerSpaceForBench) -> SpaceAccounting
 where
     S: Storage,
 {
-    let space = if immutable {
-        StorageSpace::immutable(id, "qualification.binary_cas_payload")
-    } else {
-        StorageSpace::mutable(id, "qualification.binary_cas_metadata")
-    };
+    let space = owner_space_for_bench(role);
     let read = storage
         .begin_read(ReadOptions::default())
         .await

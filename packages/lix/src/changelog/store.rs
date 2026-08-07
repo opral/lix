@@ -4,7 +4,7 @@ use super::types::{
     CommitScanRequest,
 };
 use crate::common::LixError;
-use crate::storage_adapter::{StorageSpace, StorageSpaceId};
+use crate::storage_adapter::StorageSpace;
 use async_trait::async_trait;
 
 pub(crate) const COMMIT_NAMESPACE: &str = "changelog.commit";
@@ -17,18 +17,27 @@ pub(crate) const COMMIT_CHANGE_ID_NAMESPACE: &str = "changelog.commit_change_id"
 pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_KEY: &[u8] = b"format-v1";
 pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE: &[u8] = b"1";
 
-pub(crate) const COMMIT_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0006_0001), COMMIT_NAMESPACE);
-pub(crate) const CHANGE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0006_0002), CHANGE_NAMESPACE);
+pub(crate) const COMMIT_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0006_0001,
+    COMMIT_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
+pub(crate) const CHANGE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0006_0002,
+    CHANGE_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 // The former commit-membership storage space is intentionally retired. Packed
 // tracked-state commit deltas are the sole commit-membership authority.
 /// Immutable reverse lookup from a commit-derived change id to its commit id.
 ///
 /// The changelog write path uses this to enforce the globally unique
 /// `CommitRecord::change_id` invariant without scanning every commit record.
-pub(crate) const COMMIT_CHANGE_ID_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0006_0004), COMMIT_CHANGE_ID_NAMESPACE);
+pub(crate) const COMMIT_CHANGE_ID_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0006_0004,
+    COMMIT_CHANGE_ID_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 
 // Identity keys are the raw 16 UUID bytes. UUIDv7's big-endian byte order
 // matches the lexicographic order of its lowercase hyphenated text, so range

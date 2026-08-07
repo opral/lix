@@ -32,50 +32,65 @@ pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
-pub(crate) const HOT_ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
+pub(crate) const HOT_ROW_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_001b,
+    HOT_ROW_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 /// Conservative `(branch, generation, schema)` file-membership markers.
 ///
 /// The authoritative hot row owns every value and file identity. Markers are
 /// never removed within a generation, so they may produce a harmless false
 /// positive after the last file member is deleted but cannot hide live rows.
-pub(crate) const HOT_FILE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001c), HOT_FILE_NAMESPACE);
+pub(crate) const HOT_FILE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_001c,
+    HOT_FILE_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 /// Reserved for the row-level first-before working-diff index.
-pub(crate) const HOT_DIFF_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
-pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0023),
+pub(crate) const HOT_DIFF_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_001d,
+    HOT_DIFF_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
+pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0023,
     HOT_COLLECTION_CONTROL_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
 /// Generation-local immutable current-state bases.
 ///
 /// Each tiny record points at one already-authored packed commit delta. Fresh
 /// validated inserts publish the reference instead of duplicating every row
 /// into `HOT_ROW`; later updates and deletes remain sparse HOT overlays.
-pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0024),
+pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0024,
     "live_state.packed_current_base.v1",
+    crate::storage::ValueSemantics::Mutable,
 );
-pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0025),
+pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0025,
     "live_state.packed_current_base_control.v1",
+    crate::storage::ValueSemantics::Mutable,
 );
 /// Generation-local index of packed bases containing exactly one schema.
 ///
 /// Complete collection replacements retire every indexed predecessor for the
 /// schema without inspecting or risking packed bases shared by unrelated
 /// schemas.
-pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0027),
-    "live_state.packed_current_exclusive_schema_base.v1",
-);
+pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace =
+    StorageSpace::engine_declared(
+        0x0004_0027,
+        "live_state.packed_current_exclusive_schema_base.v1",
+        crate::storage::ValueSemantics::Mutable,
+    );
 /// One immutable tracked-state root used as the baseline for a sparse branch
 /// generation. Branch creation publishes this 16-byte reference instead of
 /// copying every tracked row into branch-local HOT storage.
-pub(crate) const ROOT_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0028),
+pub(crate) const ROOT_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0028,
     "live_state.root_current_base.v1",
+    crate::storage::ValueSemantics::Mutable,
 );
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
@@ -88,17 +103,21 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
-pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_001f),
+pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_001f,
     "live_state.certified_entity_batch.v1",
+    crate::storage::ValueSemantics::Mutable,
 );
-pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0021),
-    "live_state.certified_entity_batch_manifest.v1",
-);
-pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0022),
+pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace =
+    StorageSpace::engine_declared(
+        0x0004_0021,
+        "live_state.certified_entity_batch_manifest.v1",
+        crate::storage::ValueSemantics::Mutable,
+    );
+pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0022,
     "live_state.certified_entity_batch_page.v1",
+    crate::storage::ValueSemantics::Mutable,
 );
 const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
 const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =

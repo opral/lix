@@ -19,14 +19,15 @@ use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-    WriteOptions,
+    ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageWrite,
+    ValueSemantics, WriteOptions,
 };
 use lix::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions,
 };
+use lix::storage_bench::synthetic_space_for_bench;
 use lix::{PreparedDmlParameterBatch, Value};
 use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
@@ -137,7 +138,7 @@ const REAL_WORKLOAD_ROWS: usize = 10_000;
 const PNPM_LOCK_JSON: &str = include_str!("../fixtures/pnpm-lock.fixture.json");
 const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../fixtures/json_pointer.schema.json");
 const SESSION_INSERT_CHUNK_SIZE: usize = 500;
-const ROW_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x00ff_0001), "bench.untracked_row");
+const ROW_SPACE: StorageSpace = synthetic_space_for_bench(1, ValueSemantics::Mutable);
 
 #[derive(Clone)]
 struct PointerRow {

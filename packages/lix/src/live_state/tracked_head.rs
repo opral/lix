@@ -58,7 +58,7 @@ use crate::live_state::{
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
-    StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
 use crate::tracked_state::{
@@ -68,9 +68,10 @@ use crate::tracked_state::{
 };
 
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v16";
-pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_001e),
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_001e,
     TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
 
 /// The active checkpoint epoch for the sparse working-diff indexes.

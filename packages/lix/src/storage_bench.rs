@@ -2,13 +2,57 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::storage::{ReadOptions, WriteOptions};
+use crate::storage::{ReadOptions, StorageSpace, ValueSemantics, WriteOptions};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
     StorageProjectedValue, StorageScanOptions, StorageWriteOptions, StorageWriteSet,
     StorageWriteSetError,
 };
+
+/// Narrow feature-gated bridge for benchmarks that inspect an existing owner
+/// space. Normal production builds do not export this module, and no variant
+/// names either reserved ForkTree space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerSpaceForBench {
+    BinaryCasManifest,
+    BinaryCasManifestChunk,
+    BinaryCasPayload,
+    BinaryCasPresence,
+    CertifiedEntityBatch,
+    CertifiedEntityBatchPage,
+}
+
+pub const fn owner_space_for_bench(role: OwnerSpaceForBench) -> StorageSpace {
+    match role {
+        OwnerSpaceForBench::BinaryCasManifest => crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
+        OwnerSpaceForBench::BinaryCasManifestChunk => {
+            crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE
+        }
+        OwnerSpaceForBench::BinaryCasPayload => crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
+        OwnerSpaceForBench::BinaryCasPresence => {
+            crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE
+        }
+        OwnerSpaceForBench::CertifiedEntityBatch => crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
+        OwnerSpaceForBench::CertifiedEntityBatchPage => {
+            crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE
+        }
+    }
+}
+
+/// Engine-minted synthetic descriptor in a dedicated benchmark-only ID range.
+/// The caller supplies only a small index, so it cannot reproduce any engine
+/// production or ForkTree reserved descriptor.
+pub const fn synthetic_space_for_bench(
+    index: u16,
+    value_semantics: ValueSemantics,
+) -> StorageSpace {
+    StorageSpace::engine_declared(
+        0x00ff_1000 + index as u32,
+        "storage.bench.synthetic",
+        value_semantics,
+    )
+}
 
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
@@ -1033,7 +1077,7 @@ where
     let mut delete_counts_by_space: Vec<(u32, usize)> = writes
         .delete_counts_by_space()
         .into_iter()
-        .map(|(space, count)| (space.id.0, count))
+        .map(|(space, count)| (space.id(), count))
         .collect();
     delete_counts_by_space.sort_unstable_by_key(|(space_id, _)| *space_id);
     let delete_count = |space_id| {
@@ -1042,20 +1086,14 @@ where
             .find_map(|(candidate, count)| (*candidate == space_id).then_some(*count))
             .unwrap_or_default()
     };
-    let deleted_commit_state_manifests = delete_count(
-        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
-            .id
-            .0,
-    );
-    let deleted_mutation_inventories = delete_count(
-        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-            .id
-            .0,
-    );
-    let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
-    let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
+    let deleted_commit_state_manifests =
+        delete_count(crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id());
+    let deleted_mutation_inventories =
+        delete_count(crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id());
+    let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id());
+    let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id());
     let deleted_semantic_reverse_index_rows =
-        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
+        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id());
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -2069,7 +2107,7 @@ where
 {
     let space = *native_storage_spaces()
         .iter()
-        .find(|space| space.name == space_name)
+        .find(|space| space.name() == space_name)
         .expect("space name should exist");
     scan_layout_entries(read, space)
         .await
@@ -2093,11 +2131,11 @@ where
 pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
     native_storage_spaces()
         .iter()
-        .map(|space| (space.id.0, space.name))
+        .map(|space| (space.id(), space.name()))
         .collect()
 }
 
-fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
+fn native_storage_spaces() -> &'static [StorageSpace] {
     &[
         crate::init::REPOSITORY_PROTOCOL_SPACE,
         crate::branch::BRANCH_HEAD_CONTROL_SPACE,
@@ -2134,10 +2172,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     ]
 }
 
-async fn scan_layout_space<R>(
-    read: &R,
-    space: crate::storage_adapter::StorageSpace,
-) -> StorageLayoutAccounting
+async fn scan_layout_space<R>(read: &R, space: StorageSpace) -> StorageLayoutAccounting
 where
     R: StorageAdapterRead,
 {
@@ -2148,8 +2183,8 @@ where
         },
     );
     let mut accounting = StorageLayoutAccounting {
-        space_id: space.id.0,
-        space: space.name,
+        space_id: space.id(),
+        space: space.name(),
         rows: 0,
         key_bytes: 0,
         value_bytes: 0,
@@ -2198,7 +2233,7 @@ where
 
 async fn scan_layout_entries<R>(
     read: &R,
-    space: crate::storage_adapter::StorageSpace,
+    space: StorageSpace,
 ) -> Vec<crate::storage_adapter::StorageReadEntry>
 where
     R: StorageAdapterRead,
@@ -2285,11 +2320,11 @@ mod tests {
             .await
             .expect("begin layout accounting read");
 
-        let inventory = super::space_inventory(&read, crate::changelog::COMMIT_SPACE.name).await;
+        let inventory = super::space_inventory(&read, crate::changelog::COMMIT_SPACE.name()).await;
         let accounting = super::layout_accounting(&read)
             .await
             .into_iter()
-            .find(|space| space.space == crate::changelog::COMMIT_SPACE.name)
+            .find(|space| space.space == crate::changelog::COMMIT_SPACE.name())
             .expect("commit space is accounted");
         assert_eq!(accounting.rows, inventory.len() as u64);
         assert_eq!(
@@ -2473,20 +2508,16 @@ mod tests {
             first.delete_counts_by_space,
             vec![
                 (
-                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
-                        .id
-                        .0,
+                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id(),
                     10,
                 ), // commit-state manifest authority
                 (
-                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-                        .id
-                        .0,
+                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id(),
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 11), // semantic commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 21), // semantic change facts
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 11), // commit -> change reverse index
+                (crate::changelog::COMMIT_SPACE.id(), 11), // semantic commit projections
+                (crate::changelog::CHANGE_SPACE.id(), 21), // semantic change facts
+                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id(), 11), // commit -> change reverse index
             ]
         );
         assert_eq!(

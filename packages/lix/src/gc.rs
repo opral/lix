@@ -35,41 +35,60 @@ use crate::live_state::stage_collect_stale_working_diff_indexes;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StorageKeyRange, StoragePrecondition, StoragePrefix, StorageProjectedValue,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageScanOptions, StorageSpace, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
 pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v3";
-pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0008_0001),
+pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0001,
     CHECKPOINT_RECOVERY_REF_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
 pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
-pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
+pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0002,
+    CHECKPOINT_GC_STATE_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 /// Authenticated publication deltas are the sole ordinary-GC input.  The
 /// queue is mutable because its head/tail are CAS-protected, while each
 /// record is immutable after publication and addressed by a monotonic slot.
 pub(crate) const GC_REACHABILITY_DELTA_NAMESPACE: &str = "gc.reachability_delta.v1";
-pub(crate) const GC_REACHABILITY_DELTA_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0003), GC_REACHABILITY_DELTA_NAMESPACE);
+pub(crate) const GC_REACHABILITY_DELTA_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0003,
+    GC_REACHABILITY_DELTA_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 pub(crate) const GC_REACHABILITY_QUEUE_NAMESPACE: &str = "gc.reachability_queue.v1";
-pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0004), GC_REACHABILITY_QUEUE_NAMESPACE);
+pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0004,
+    GC_REACHABILITY_QUEUE_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 /// Rebuildable metadata for an explicit tree-chunk sweep epoch. It is never
 /// consulted as a serving root; the active root closure is re-derived from
 /// branch/recovery controls and authenticated commit manifests.
 pub(crate) const GC_TREE_SWEEP_EPOCH_NAMESPACE: &str = "gc.tree_sweep_epoch.v1";
-pub(crate) const GC_TREE_SWEEP_EPOCH_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0005), GC_TREE_SWEEP_EPOCH_NAMESPACE);
+pub(crate) const GC_TREE_SWEEP_EPOCH_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0005,
+    GC_TREE_SWEEP_EPOCH_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 /// One rebuildable live-chunk mark per content hash for the current epoch.
 pub(crate) const GC_TREE_SWEEP_MARK_NAMESPACE: &str = "gc.tree_sweep_mark.v1";
-pub(crate) const GC_TREE_SWEEP_MARK_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0006), GC_TREE_SWEEP_MARK_NAMESPACE);
+pub(crate) const GC_TREE_SWEEP_MARK_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0006,
+    GC_TREE_SWEEP_MARK_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 /// CAS-protected bounded cursor for an in-progress tree-chunk enumeration.
 pub(crate) const GC_TREE_SWEEP_CURSOR_NAMESPACE: &str = "gc.tree_sweep_cursor.v1";
-pub(crate) const GC_TREE_SWEEP_CURSOR_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0007), GC_TREE_SWEEP_CURSOR_NAMESPACE);
+pub(crate) const GC_TREE_SWEEP_CURSOR_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0008_0007,
+    GC_TREE_SWEEP_CURSOR_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
 
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
@@ -1518,7 +1537,7 @@ async fn stage_sweep_unreachable_content_nodes(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
                         "content-addressed space '{}' contains a malformed key",
-                        space.name
+                        space.name()
                     ),
                 )
             })?;

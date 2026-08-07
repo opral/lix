@@ -16,13 +16,14 @@ use criterion::{
 };
 use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
-    Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, Storage,
+    StorageError, StorageRead, StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 use lix::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterReadScope, StorageReadStats,
     StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
+use lix::storage_bench::synthetic_space_for_bench;
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_sqlite::SQLite;
 use rustc_hash::FxBuildHasher;
@@ -150,7 +151,7 @@ trait StorageBenchStorage {
 
     fn open_empty(&self) -> Self::Storage;
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage;
+    fn seed_points(&self, space: StorageSpace, rows: u32, value_size: usize) -> Self::Storage;
 
     fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage;
 }
@@ -169,8 +170,8 @@ impl StorageBenchStorage for InMemoryBenchStorage {
         Memory::new()
     }
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
-        seeded_memory_with_value_size(space.0, rows, value_size)
+    fn seed_points(&self, space: StorageSpace, rows: u32, value_size: usize) -> Self::Storage {
+        seeded_memory_with_value_size(space, rows, value_size)
     }
 
     fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
@@ -212,7 +213,7 @@ impl StorageBenchStorage for SQLiteTempBenchStorage {
         SQLite::open(self.next_path()).expect("open empty sqlite bench storage")
     }
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
+    fn seed_points(&self, space: StorageSpace, rows: u32, value_size: usize) -> Self::Storage {
         let storage = self.open_empty();
         seed_storage_points(&storage, space, rows, value_size, "sqlite bench storage");
         storage
@@ -263,7 +264,7 @@ impl StorageBenchStorage for RocksDBTempBenchStorage {
         RocksDB::open(self.next_path()).expect("open empty rocksdb bench storage")
     }
 
-    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Storage {
+    fn seed_points(&self, space: StorageSpace, rows: u32, value_size: usize) -> Self::Storage {
         let storage = self.open_empty();
         seed_storage_points(&storage, space, rows, value_size, "rocksdb bench storage");
         storage.flush().expect("flush seeded rocksdb bench storage");
@@ -650,7 +651,7 @@ fn bench_hash_algorithm<S>(
             for mutation in black_box(write_mutations) {
                 match mutation {
                     WriteMutation::Put(space, key, _) | WriteMutation::Delete(space, key) => {
-                        assert!(seen.insert((space.id, key.clone())));
+                        assert!(seen.insert((space.id(), key.clone())));
                     }
                 }
             }
@@ -959,7 +960,7 @@ where
     }
 
     for case in DELETE_RANGE_CASES {
-        let seed = storage_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        let seed = storage_family.seed_points(space(1), case.rows as u32, 32);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
@@ -1003,7 +1004,7 @@ where
     }
 
     for case in DELETE_RANGE_CASES {
-        let seed = storage_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        let seed = storage_family.seed_points(space(1), case.rows as u32, 32);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
@@ -1043,7 +1044,7 @@ where
     }
 
     for case in DELETE_RANGE_CASES {
-        let seed = storage_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        let seed = storage_family.seed_points(space(1), case.rows as u32, 32);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(
             BenchmarkId::new("delete_range", case.name),
@@ -1135,7 +1136,7 @@ where
         group.measurement_time(Duration::from_millis(250));
     }
 
-    let seed = storage_family.seed_points(SpaceId(1), 10_000, 32);
+    let seed = storage_family.seed_points(space(1), 10_000, 32);
     let read = block_on(seed.begin_read(ReadOptions::default())).expect("begin chunked scan read");
     let scope = StorageAdapterReadScope::new(read);
 
@@ -1343,7 +1344,7 @@ where
     if should_run(touched_case.name) {
         let touched_mutations = write_mutations(&touched_case);
         let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
-        let touched_seed = storage_family.seed_points(SpaceId(1), 10_000, 32);
+        let touched_seed = storage_family.seed_points(space(1), 10_000, 32);
         let warm_storage = storage_family.fork_for_write(&touched_seed);
         block_on(commit_direct_write_batches(
             &warm_storage,
@@ -1373,7 +1374,7 @@ where
     }
 
     if should_run("direct_get_many_m1000_u100") {
-        let point_storage = storage_family.seed_points(SpaceId(1), 100, 32);
+        let point_storage = storage_family.seed_points(space(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 100);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_m1000_u100") {
@@ -1400,7 +1401,7 @@ where
     }
 
     if should_run("direct_get_many_unique_u100") {
-        let point_storage = storage_family.seed_points(SpaceId(1), 100, 32);
+        let point_storage = storage_family.seed_points(space(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 100, 100);
         group.throughput(Throughput::Elements(100));
         if should_run("direct_get_many_unique_u100") {
@@ -1433,7 +1434,7 @@ where
         ("direct_get_many_unique_u100_v65536", 100, 65_536),
     ] {
         if should_run(case_name) {
-            let point_storage = storage_family.seed_points(SpaceId(1), rows, value_size);
+            let point_storage = storage_family.seed_points(space(1), rows, value_size);
             let point_keys = physical_point_request_keys(1, rows as usize, rows as usize);
             group.throughput(Throughput::Bytes(
                 u64::from(rows)
@@ -1465,7 +1466,7 @@ where
         for requested_keys in [1_usize, 32] {
             let case_name = format!("direct_get_many_missing_m{requested_keys}_s{rows}");
             if should_run(&case_name) {
-                let point_storage = storage_family.seed_points(SpaceId(1), rows, 32);
+                let point_storage = storage_family.seed_points(space(1), rows, 32);
                 let point_keys = missing_point_request_keys(requested_keys);
                 group.throughput(Throughput::Elements(
                     u64::try_from(requested_keys).expect("requested key count fits u64"),
@@ -1491,7 +1492,7 @@ where
     }
 
     if should_run("direct_get_many_unique_u1000") {
-        let point_storage = storage_family.seed_points(SpaceId(1), 1_000, 32);
+        let point_storage = storage_family.seed_points(space(1), 1_000, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 1_000);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_unique_u1000") {
@@ -1518,7 +1519,7 @@ where
     }
 
     if should_run("direct_scan_materialized_q1000") {
-        let scan_storage = storage_family.seed_points(SpaceId(1), 1_000, 32);
+        let scan_storage = storage_family.seed_points(space(1), 1_000, 32);
         let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_scan_materialized_q1000") {
@@ -1550,7 +1551,7 @@ where
         ("direct_scan_full_q100_v65536", 100),
     ] {
         if should_run(case_name) {
-            let scan_storage = storage_family.seed_points(SpaceId(1), rows, 65_536);
+            let scan_storage = storage_family.seed_points(space(1), rows, 65_536);
             let scan_range = physical_point_scan_range(1);
             group.throughput(Throughput::Bytes(u64::from(rows) * 65_536));
             group.bench_function(case_name, |b| {
@@ -1581,7 +1582,7 @@ where
         ("direct_scan_full_q10000_v32", 10_000),
     ] {
         if should_run(case_name) {
-            let scan_storage = storage_family.seed_points(SpaceId(1), rows, 32);
+            let scan_storage = storage_family.seed_points(space(1), rows, 32);
             let scan_range = physical_point_scan_range(1);
             group.throughput(Throughput::Bytes(u64::from(rows) * 32));
             group.bench_function(case_name, |b| {
@@ -1729,21 +1730,15 @@ impl WriteCase {
     }
 }
 
-fn seeded_memory_with_value_size(space_id: u32, rows: u32, value_size: usize) -> Memory {
+fn seeded_memory_with_value_size(space: StorageSpace, rows: u32, value_size: usize) -> Memory {
     let storage = Memory::new();
-    seed_storage_points(
-        &storage,
-        SpaceId(space_id),
-        rows,
-        value_size,
-        "in-memory storage",
-    );
+    seed_storage_points(&storage, space, rows, value_size, "in-memory storage");
     storage
 }
 
 fn seed_storage_points<StorageImpl>(
     storage: &StorageImpl,
-    space_id: SpaceId,
+    space: StorageSpace,
     rows: u32,
     value_size: usize,
     storage_name: &str,
@@ -1754,7 +1749,7 @@ fn seed_storage_points<StorageImpl>(
     let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
     for index in 0..rows {
         writes.put(
-            space(space_id.0),
+            space,
             key(format!("point-{index:04}")),
             value(index, value_size),
         );
@@ -2038,13 +2033,13 @@ fn checked_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWrite
 }
 
 fn canonical_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWriteSet {
-    let mut counts = HashMap::<SpaceId, (StorageSpace, usize, usize)>::new();
+    let mut counts = HashMap::<u32, (StorageSpace, usize, usize)>::new();
     let mut space_order = Vec::<StorageSpace>::new();
     for mutation in mutations {
         match mutation {
             WriteMutation::Put(space, _, _) => {
                 counts
-                    .entry(space.id)
+                    .entry(space.id())
                     .and_modify(|(_, puts, _)| *puts += 1)
                     .or_insert_with(|| {
                         space_order.push(*space);
@@ -2053,7 +2048,7 @@ fn canonical_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWri
             }
             WriteMutation::Delete(space, _) => {
                 counts
-                    .entry(space.id)
+                    .entry(space.id())
                     .and_modify(|(_, _, deletes)| *deletes += 1)
                     .or_insert_with(|| {
                         space_order.push(*space);
@@ -2065,7 +2060,7 @@ fn canonical_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWri
 
     let mut writes = StorageWriteSet::with_capacity(mutations.len(), counts.len());
     for space in space_order {
-        if let Some((_, puts, deletes)) = counts.get(&space.id).copied() {
+        if let Some((_, puts, deletes)) = counts.get(&space.id()).copied() {
             writes.reserve_space(space, puts, deletes);
         }
     }
@@ -2088,7 +2083,7 @@ fn unique_space_count(mutations: &[WriteMutation]) -> usize {
     for mutation in mutations {
         match mutation {
             WriteMutation::Put(space, _, _) | WriteMutation::Delete(space, _) => {
-                spaces.insert(space.id);
+                spaces.insert(space.id());
             }
         }
     }
@@ -2194,7 +2189,10 @@ fn physical_point_scan_range(_space_id: u32) -> KeyRange {
 }
 
 fn space(id: u32) -> StorageSpace {
-    StorageSpace::mutable(SpaceId(id), "bench.storage_v2")
+    synthetic_space_for_bench(
+        u16::try_from(id).expect("storage-v2 space index fits u16") + 128,
+        ValueSemantics::Mutable,
+    )
 }
 
 fn key(bytes: impl Into<String>) -> Key {

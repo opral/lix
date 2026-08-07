@@ -3,8 +3,9 @@ mod benchmark_metrics;
 use bytes::Bytes;
 use lix::storage::{
     CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOptions,
-    SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+    Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
+use lix::storage_bench::{OwnerSpaceForBench, owner_space_for_bench};
 use lix::wasm::{
     WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
     WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
@@ -7194,11 +7195,9 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 }
 
 const CERTIFIED_ENTITY_BATCH_TEST_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0004_001f), "live_state.certified_entity_batch.v1");
-const CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE: StorageSpace = StorageSpace::mutable(
-    SpaceId(0x0004_0022),
-    "live_state.certified_entity_batch_page.v1",
-);
+    owner_space_for_bench(OwnerSpaceForBench::CertifiedEntityBatch);
+const CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE: StorageSpace =
+    owner_space_for_bench(OwnerSpaceForBench::CertifiedEntityBatchPage);
 const CEB2_FIXTURE_PATH: &str = "/ceb2-hard-cut.excalidraw";
 const CEB2_FIXTURE_BYTES: &[u8] = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#;
 

@@ -12,13 +12,11 @@ use super::blob::CompletedUpload;
 use super::codec::corruption;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeObjectV1,
-    CommitObjectV1, GcMarkPackV1, GcProgressSelectorV1, GcProgressV1, GlobalSelectorV1,
-    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
-    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
-    upload_selector_key,
+    CommitObjectV1, GlobalSelectorV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1,
+    UploadProgressV1, UploadSelectorV1, branch_selector_key, gc_progress_selector_key,
+    global_selector_key, snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::reachability::SweepPlan;
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
@@ -59,7 +57,6 @@ pub(crate) struct PreparedPublication {
     selector_puts: BTreeMap<Bytes, Bytes>,
     selector_deletes: BTreeSet<Bytes>,
     object_puts: ImmutableObjectSet,
-    object_deletes: BTreeSet<ObjectId>,
     untracked_puts: BTreeMap<Bytes, Bytes>,
     untracked_deletes: BTreeSet<Bytes>,
 }
@@ -93,7 +90,6 @@ impl PreparedPublication {
             selector_puts: BTreeMap::new(),
             selector_deletes: BTreeSet::new(),
             object_puts: ImmutableObjectSet::default(),
-            object_deletes: BTreeSet::new(),
             untracked_puts: BTreeMap::new(),
             untracked_deletes: BTreeSet::new(),
         })
@@ -163,9 +159,6 @@ impl PreparedPublication {
     }
 
     fn stage_encoded_object(&mut self, id: ObjectId, bytes: Bytes) -> Result<(), StorageError> {
-        if self.object_deletes.contains(&id) {
-            return Err(corruption("publication both puts and deletes one object"));
-        }
         self.object_puts.insert(id, bytes)
     }
 
@@ -231,24 +224,6 @@ impl PreparedPublication {
     pub(super) fn stage_snapshot_target(
         &mut self,
         value: SnapshotTargetV1,
-    ) -> Result<ObjectId, StorageError> {
-        let (id, bytes) = value.encode()?;
-        self.stage_encoded_object(id, bytes)?;
-        Ok(id)
-    }
-
-    pub(super) fn stage_gc_mark_pack(
-        &mut self,
-        value: &GcMarkPackV1,
-    ) -> Result<ObjectId, StorageError> {
-        let (id, bytes) = value.encode()?;
-        self.stage_encoded_object(id, bytes)?;
-        Ok(id)
-    }
-
-    pub(super) fn stage_gc_progress(
-        &mut self,
-        value: &GcProgressV1,
     ) -> Result<ObjectId, StorageError> {
         let (id, bytes) = value.encode()?;
         self.stage_encoded_object(id, bytes)?;
@@ -360,7 +335,7 @@ impl PreparedPublication {
         Ok(target_id)
     }
 
-    pub(crate) fn release_snapshot_pin(
+    fn release_snapshot_pin(
         &mut self,
         selector: SnapshotSelectorV1,
         raw_selector: Bytes,
@@ -373,42 +348,41 @@ impl PreparedPublication {
         self.delete_snapshot_selector(selector, raw_selector)
     }
 
-    pub(crate) fn publish_gc_progress(
+    /// Atomically releases the final retained selector and removes the exact
+    /// catalog edges whose objects were retained only by that selector.
+    ///
+    /// The caller derives both path-copy edits from the same coherent view;
+    /// moving the epoch, selector, RepositoryRoot, and catalog roots in one
+    /// commit prevents either a dangling back-edge or an early reclamation
+    /// window.
+    pub(crate) fn release_snapshot_pin_with_catalog_retirement<R>(
         &mut self,
-        mark_pack: &GcMarkPackV1,
-        object_scan_after: Option<Vec<u8>>,
-        discovered_epoch: u64,
-        selector_generation: u64,
-        expected: SelectorExpectation,
-    ) -> Result<ObjectId, StorageError> {
-        let mark_pack_object_id = self.stage_gc_mark_pack(mark_pack)?;
-        let progress = GcProgressV1 {
-            mark_pack_object_id,
-            object_scan_after,
-            discovered_epoch,
-        };
-        let progress_object_id = self.stage_gc_progress(&progress)?;
-        self.put_gc_progress_selector(
-            GcProgressSelectorV1 {
-                progress_object_id,
-                selector_generation,
-            },
-            expected,
-        )?;
-        Ok(progress_object_id)
-    }
-
-    pub(crate) fn release_gc_progress(
-        &mut self,
-        selector: GcProgressSelectorV1,
+        view: &CoherentView<R>,
+        selector: SnapshotSelectorV1,
         raw_selector: Bytes,
-    ) -> Result<(), StorageError> {
-        if GcProgressSelectorV1::decode(&raw_selector)? != selector {
+        commit_catalog_edit: CatalogTreeEdit,
+        change_catalog_edit: CatalogTreeEdit,
+        repository_root: super::model::RepositoryRootV1,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        if self.expected_global.as_ref() != view.raw_global_selector().as_ref()
+            || commit_catalog_edit.base_root != view.repository_root().commit_catalog_root
+            || change_catalog_edit.base_root != view.repository_root().change_catalog_root
+            || repository_root.commit_catalog_root != commit_catalog_edit.root
+            || repository_root.change_catalog_root != change_catalog_edit.root
+            || repository_root.global_state_root != view.repository_root().global_state_root
+            || repository_root.retention_policy_root != view.repository_root().retention_policy_root
+        {
             return Err(corruption(
-                "GC progress release raw selector does not match typed selector",
+                "snapshot release catalog retirement was derived from another coherent view",
             ));
         }
-        self.delete_gc_progress_selector(raw_selector)
+        self.stage_catalog_edit(commit_catalog_edit)?;
+        self.stage_catalog_edit(change_catalog_edit)?;
+        self.stage_repository_root(repository_root)?;
+        self.release_snapshot_pin(selector, raw_selector)
     }
 
     /// Publishes one fully authenticated branch/state transition. This owner
@@ -632,7 +606,7 @@ impl PreparedPublication {
         if !transition
             .state_edit
             .added_blob_roots
-            .contains(&manifest_id)
+            .contains_key(&manifest_id)
         {
             return Err(corruption(
                 "completed blob manifest is absent from the published state edit",
@@ -704,14 +678,6 @@ impl PreparedPublication {
         )
     }
 
-    pub(super) fn put_gc_progress_selector(
-        &mut self,
-        value: GcProgressSelectorV1,
-        expected: SelectorExpectation,
-    ) -> Result<(), StorageError> {
-        self.put_selector(gc_progress_selector_key(), value.encode()?, expected)
-    }
-
     pub(super) fn delete_upload_selector(
         &mut self,
         value: &UploadSelectorV1,
@@ -737,13 +703,6 @@ impl PreparedPublication {
             snapshot_selector_key(value.role, value.selector_id),
             expected,
         )
-    }
-
-    pub(super) fn delete_gc_progress_selector(
-        &mut self,
-        expected: Bytes,
-    ) -> Result<(), StorageError> {
-        self.delete_selector(gc_progress_selector_key(), expected)
     }
 
     /// Stages one current untracked row under the same global epoch as every
@@ -791,23 +750,6 @@ impl PreparedPublication {
         Ok(())
     }
 
-    pub(crate) fn apply_sweep_plan(&mut self, plan: SweepPlan) -> Result<(), StorageError> {
-        if plan.expected_global != self.expected_global {
-            return Err(corruption(
-                "sweep proof was discovered under another global selector",
-            ));
-        }
-        for id in plan.orphan_object_ids {
-            if id == ObjectId::ZERO || self.object_puts.get(id).is_some() {
-                return Err(corruption(
-                    "sweep proof contains an invalid object deletion",
-                ));
-            }
-            self.object_deletes.insert(id);
-        }
-        Ok(())
-    }
-
     /// Retires one selected branch and atomically installs owner-produced
     /// catalog pruning under the same epoch. The path-copied catalog edits are
     /// the retirement proof; immutable branch/commit/state objects become
@@ -846,6 +788,11 @@ impl PreparedPublication {
             key: Key(global_selector_key()),
             expected: self.expected_global.clone(),
         });
+        // The exact global bytes are also the GC publication fence: every GC
+        // checkpoint rotates them atomically with its progress selector. A
+        // logical publication that wins first discards that now-stale,
+        // rebuildable selector in this same commit. A GC checkpoint that wins
+        // first changes the expected global bytes and rejects this writer.
         for (key, expected) in &self.selector_expectations {
             preconditions.push(match expected {
                 SelectorExpectation::Absent => Precondition::KeyAbsent {
@@ -921,14 +868,10 @@ impl PreparedPublication {
                 },
             )
             .await?;
-        if !self.selector_deletes.is_empty() {
-            let keys = self
-                .selector_deletes
-                .into_iter()
-                .map(Key)
-                .collect::<Vec<_>>();
-            write.delete_many(SELECTOR_SPACE, &keys).await?;
-        }
+        let mut selector_deletes = Vec::with_capacity(self.selector_deletes.len() + 1);
+        selector_deletes.push(Key(gc_progress_selector_key()));
+        selector_deletes.extend(self.selector_deletes.into_iter().map(Key));
+        write.delete_many(SELECTOR_SPACE, &selector_deletes).await?;
         if !self.untracked_puts.is_empty() {
             write
                 .put_many(
@@ -953,14 +896,6 @@ impl PreparedPublication {
                 .map(Key)
                 .collect::<Vec<_>>();
             write.delete_many(UNTRACKED_ROW_SPACE, &keys).await?;
-        }
-        if !self.object_deletes.is_empty() {
-            let keys = self
-                .object_deletes
-                .into_iter()
-                .map(|id| Key(Bytes::copy_from_slice(id.as_bytes())))
-                .collect::<Vec<_>>();
-            write.delete_many(OBJECT_SPACE, &keys).await?;
         }
         write.commit().await?;
         Ok(())

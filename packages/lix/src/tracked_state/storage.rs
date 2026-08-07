@@ -16,8 +16,7 @@ use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapterRead,
     StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
     StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
-    exact_get_many,
+    StorageScanOptions, StorageSpace, StorageValue, StorageWriteSet, exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -48,21 +47,25 @@ pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
 pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE: &str =
     "tracked_state.commit_mutation_catalog.v1";
 const MIN_CURRENT_STATE_SCOPED_RANGE_POINT_READS: u16 = 4;
-pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0001),
+pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0001,
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
-pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_001a),
-    TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
-);
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace =
+    StorageSpace::engine_declared(
+        0x0004_001a,
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
+        crate::storage::ValueSemantics::Immutable,
+    );
 /// Keep every high-volume packed-history plane below the live-row spaces
 /// (`0x0004_001b..=0x0004_001d`). Backends order the space prefix first, so a
 /// locator above those spaces makes each mixed manifest/locator SST overlap
 /// unrelated live-state point reads.
-pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0018),
+pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0018,
     TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
 /// Hard-cut tracked commit authority.
 ///
@@ -71,14 +74,17 @@ pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace
 /// separately keyed mutation catalog and its optional hierarchical directory.
 /// The former topology, flat delta-directory, and root authority spaces are
 /// not part of the current protocol.
-pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_002b),
-    TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
-);
+pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace =
+    StorageSpace::engine_declared(
+        0x0004_002b,
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
+        crate::storage::ValueSemantics::Immutable,
+    );
 pub(crate) const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
-    StorageSpace::immutable(
-        StorageSpaceId(0x0004_002c),
+    StorageSpace::engine_declared(
+        0x0004_002c,
         TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+        crate::storage::ValueSemantics::Immutable,
     );
 
 // The canonical ordered mutation-part width and durable direct-ChangeId
@@ -4021,17 +4027,19 @@ pub(crate) fn stage_resealed_commit_state_manifest_for_test(
         directory.stage(writes)?;
     }
     writes.put(
-        StorageSpace::mutable(
-            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
+        StorageSpace::engine_declared(
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id(),
             TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
+            crate::storage::ValueSemantics::Mutable,
         ),
         key(commit_state_manifest_key(manifest.commit_id)),
         value(encoded.header),
     );
     writes.put(
-        StorageSpace::mutable(
-            TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+        StorageSpace::engine_declared(
+            TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id(),
             TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+            crate::storage::ValueSemantics::Mutable,
         ),
         key(commit_mutation_inventory_key(manifest.commit_id)),
         value(encoded.mutation_inventory),
@@ -11756,18 +11764,18 @@ where
         })
     }
 
-    fn staged_bytes(&self, space: StorageSpaceId, key: &StorageKey) -> Option<Bytes> {
-        if space == TRACKED_STATE_TREE_CHUNK_SPACE.id {
+    fn staged_bytes(&self, space: u32, key: &StorageKey) -> Option<Bytes> {
+        if space == TRACKED_STATE_TREE_CHUNK_SPACE.id() {
             let key = <&[u8; TRACKED_STATE_HASH_BYTES]>::try_from(key.0.as_ref()).ok()?;
             return self.chunks.staged_chunk_bytes(key);
         }
-        if space == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id {
+        if space == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id() {
             return self.commit_states.get(key.0.as_ref()).cloned();
         }
-        if space == TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id {
+        if space == TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id() {
             return self.mutation_inventories.get(key.0.as_ref()).cloned();
         }
-        if space == super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id {
+        if space == super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id() {
             return self.mutation_directory_nodes.get(key.0.as_ref()).cloned();
         }
         None
@@ -11786,7 +11794,7 @@ where
         let mut slots = result.values.iter_mut();
         for request in requests {
             for (key, slot) in request.keys.iter().zip(slots.by_ref()) {
-                let Some(bytes) = self.staged_bytes(request.space.id, key) else {
+                let Some(bytes) = self.staged_bytes(request.space.id(), key) else {
                     continue;
                 };
                 *slot = Some(match request.opts.projection {
@@ -16689,12 +16697,12 @@ mod tests {
         let mut seen = BTreeMap::new();
         for space in spaces {
             assert_eq!(
-                seen.insert(space.id, space.name),
+                seen.insert(space.id(), space.name()),
                 None,
                 "storage space id {:?} is reused by {} and {}",
-                space.id,
-                seen.get(&space.id).copied().unwrap_or(space.name),
-                space.name
+                space.id(),
+                seen.get(&space.id()).copied().unwrap_or(space.name()),
+                space.name()
             );
         }
     }
@@ -17028,9 +17036,10 @@ mod tests {
 
         let mut corrupt = storage.new_write_set();
         corrupt.delete(
-            StorageSpace::mutable(
-                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+            StorageSpace::engine_declared(
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id(),
                 super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+                crate::storage::ValueSemantics::Mutable,
             ),
             key(super::commit_mutation_inventory_key(manifest.commit_id)),
         );
@@ -17082,9 +17091,10 @@ mod tests {
         *last ^= 1;
         let mut corrupt = storage.new_write_set();
         corrupt.put(
-            StorageSpace::mutable(
-                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+            StorageSpace::engine_declared(
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id(),
                 super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+                crate::storage::ValueSemantics::Mutable,
             ),
             key(super::commit_mutation_inventory_key(manifest.commit_id)),
             value(tampered_catalog),
@@ -17105,17 +17115,19 @@ mod tests {
 
         let mut repair = storage.new_write_set();
         repair.put(
-            StorageSpace::mutable(
-                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id,
+            StorageSpace::engine_declared(
+                super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id(),
                 super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_NAMESPACE,
+                crate::storage::ValueSemantics::Mutable,
             ),
             key(super::commit_mutation_inventory_key(manifest.commit_id)),
             value(encoded.mutation_inventory),
         );
         repair.put(
-            StorageSpace::mutable(
-                super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id,
-                super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.name,
+            StorageSpace::engine_declared(
+                super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.id(),
+                super::super::mutation_directory::MUTATION_DIRECTORY_NODE_SPACE.name(),
+                crate::storage::ValueSemantics::Mutable,
             ),
             key(root_id.to_vec()),
             value(b"forged-directory-node".to_vec()),

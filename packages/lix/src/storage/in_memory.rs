@@ -9,8 +9,8 @@ use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestCon
 use crate::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageSpace, StorageWrite,
+    StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = PersistentMap<Key, Bytes>;
@@ -22,14 +22,14 @@ const SNAPSHOT_ENTRY_HEADER_BYTES: usize = size_of::<u32>() * 2;
 /// The in-memory storage has no native namespaces; it scopes keys to spaces
 /// by prefixing the 4-byte big-endian space id internally. The prefix never
 /// crosses the trait boundary: reads return logical keys.
-fn physical_key(space: SpaceId, key: &Key) -> Key {
+fn physical_key(space: u32, key: &Key) -> Key {
     let mut bytes = bytes::BytesMut::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Key(bytes.freeze())
 }
 
-fn physical_bound(space: SpaceId, bound: Bound<Key>, unbounded: Bound<Key>) -> Bound<Key> {
+fn physical_bound(space: u32, bound: Bound<Key>, unbounded: Bound<Key>) -> Bound<Key> {
     match bound {
         Bound::Included(key) => Bound::Included(physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)),
@@ -37,9 +37,9 @@ fn physical_bound(space: SpaceId, bound: Bound<Key>, unbounded: Bound<Key>) -> B
     }
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
-    let lower_unbounded = Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes())));
-    let upper_unbounded = space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+fn physical_range(space: u32, range: KeyRange) -> KeyRange {
+    let lower_unbounded = Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes())));
+    let upper_unbounded = space.checked_add(1).map_or(Bound::Unbounded, |next| {
         Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
     });
     KeyRange {
@@ -301,7 +301,7 @@ impl StorageRead for MemoryRead {
             .flat_map(|request| {
                 request.keys.iter().map(|key| {
                     self.entries
-                        .get(&physical_key(request.space.id, key))
+                        .get(&physical_key(request.space.id(), key))
                         .map(|value| project_value(value, request.opts.projection))
                 })
             })
@@ -315,12 +315,12 @@ impl StorageRead for MemoryRead {
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
-        let physical = physical_range(space.id, range);
+        let physical = physical_range(space.id(), range);
         let physical_opts = ScanOptions {
             resume_after: opts
                 .resume_after
                 .as_ref()
-                .map(|key| physical_key(space.id, key)),
+                .map(|key| physical_key(space.id(), key)),
             ..opts
         };
         let mut chunk = collect_range_chunk(&self.entries, physical, &physical_opts);
@@ -338,9 +338,9 @@ impl StorageWrite for MemoryWrite {
         entries: PutBatch,
     ) -> Result<(), StorageError> {
         for entry in entries.entries {
-            let key = physical_key(space.id, &entry.key);
+            let key = physical_key(space.id(), &entry.key);
             let value = stored_value_bytes(entry.value);
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 if let Some(existing) = self.immutable_values.get(&key) {
                     if existing != &value {
                         return Err(StorageError::Corruption(
@@ -372,7 +372,7 @@ impl StorageWrite for MemoryWrite {
 
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         for key in keys {
-            let key = physical_key(space.id, key);
+            let key = physical_key(space.id(), key);
             if !self.overlay.puts.is_empty() {
                 self.overlay.puts.remove(&key);
             }
@@ -388,7 +388,7 @@ impl StorageWrite for MemoryWrite {
         space: StorageSpace,
         range: KeyRange,
     ) -> Result<(), StorageError> {
-        let range = physical_range(space.id, range);
+        let range = physical_range(space.id(), range);
         let mut base_keys = Vec::new();
         let mut resume_after = None;
         loop {
@@ -469,24 +469,24 @@ fn check_preconditions(
         .filter_map(|(index, precondition)| {
             let matches = match precondition {
                 Precondition::KeyAbsent { space, key } => {
-                    entries.get(&physical_key(space.id, key)).is_none()
+                    entries.get(&physical_key(space.id(), key)).is_none()
                 }
                 Precondition::KeyPresent { space, key } => {
-                    entries.get(&physical_key(space.id, key)).is_some()
+                    entries.get(&physical_key(space.id(), key)).is_some()
                 }
                 Precondition::KeyValueHashEquals { space, key, hash } => entries
-                    .get(&physical_key(space.id, key))
+                    .get(&physical_key(space.id(), key))
                     .is_some_and(|value| blake3::hash(value).as_bytes() == hash),
                 Precondition::KeyValueEquals {
                     space,
                     key,
                     expected,
                 } => entries
-                    .get(&physical_key(space.id, key))
+                    .get(&physical_key(space.id(), key))
                     .is_some_and(|value| value == expected),
                 Precondition::RangeEmpty { space, range } => collect_range_chunk(
                     entries,
-                    physical_range(space.id, range.clone()),
+                    physical_range(space.id(), range.clone()),
                     &ScanOptions {
                         limit_rows: 1,
                         projection: CoreProjection::KeyOnly,
@@ -617,7 +617,7 @@ mod tests {
     use crate::storage::conformance::{ConformanceStatus, run_storage_conformance};
     use crate::storage::{
         GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory, ProjectedValue,
-        PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
+        PutBatch, PutEntry, ReadOptions, ScanOptions, Storage, StorageError, StorageRead,
         StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
 
@@ -639,7 +639,11 @@ mod tests {
     #[tokio::test]
     async fn delete_range_covers_more_than_one_scan_page() {
         let storage = Memory::new();
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = StorageSpace::engine_declared(
+            7,
+            "test.mutable",
+            crate::storage::ValueSemantics::Mutable,
+        );
         let mut write = storage
             .begin_write(WriteOptions::default())
             .await
@@ -703,7 +707,11 @@ mod tests {
     #[tokio::test]
     async fn snapshot_roundtrip_is_deterministic_and_point_in_time() {
         let storage = Memory::new();
-        let space = StorageSpace::mutable(SpaceId(17), "test.mutable");
+        let space = StorageSpace::engine_declared(
+            17,
+            "test.mutable",
+            crate::storage::ValueSemantics::Mutable,
+        );
         let key_a = Key(Bytes::from_static(b"a"));
         let key_b = Key(Bytes::from_static(b"b"));
         let mut write = storage

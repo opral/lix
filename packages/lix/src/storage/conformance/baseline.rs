@@ -3,8 +3,16 @@ use std::ops::Bound;
 
 /// Single space used by most baseline fixtures; the cross-space tests at
 /// the bottom of this file pin space isolation.
-const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(7), "storage.conformance.test");
-const OTHER_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(8), "storage.conformance.other");
+const TEST_SPACE: StorageSpace = StorageSpace::engine_declared(
+    7,
+    "storage.conformance.test",
+    crate::storage::ValueSemantics::Mutable,
+);
+const OTHER_SPACE: StorageSpace = StorageSpace::engine_declared(
+    8,
+    "storage.conformance.other",
+    crate::storage::ValueSemantics::Mutable,
+);
 
 use bytes::Bytes;
 
@@ -15,7 +23,7 @@ use crate::storage::conformance::{
 };
 use crate::storage::{
     CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition, ProjectedValue,
-    ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
+    ReadEntry, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError, StorageRead,
     StorageSpace, StorageWrite, WriteOptions,
 };
 
@@ -136,7 +144,11 @@ where
     F: StorageFactory,
 {
     let storage = open_storage(factory).await;
-    let immutable = StorageSpace::immutable(SpaceId(9), "storage.conformance.immutable");
+    let immutable = StorageSpace::engine_declared(
+        9,
+        "storage.conformance.immutable",
+        crate::storage::ValueSemantics::Immutable,
+    );
     let target = key("content-id");
     for value in [
         Bytes::from_static(b"payload"),

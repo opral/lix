@@ -1,6 +1,7 @@
 //! Conformance harness for storage implementations.
 
 mod baseline;
+mod declared;
 mod factory;
 #[cfg(test)]
 mod failure_tests;
@@ -10,6 +11,7 @@ mod model_based;
 mod persistence;
 mod runner;
 
+pub use declared::*;
 pub(crate) use factory::open_storage;
 pub use factory::{StorageFactory, StorageFixture, StorageTestConfig};
 pub use runner::{

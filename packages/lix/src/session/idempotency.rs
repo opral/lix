@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::storage_adapter::StorageSpaceId;
 use crate::storage_adapter::{
     StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StorageProjectedValue, StorageSpace, exact_get_many,
@@ -71,9 +70,10 @@ impl ExecuteIdempotency {
 /// This is not a user table. A receipt is staged into the same storage write
 /// set as the mutation and guarded by `KeyAbsent`, so a published receipt and
 /// its mutation have one atomic storage outcome.
-pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0007_0005),
+pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0007_0005,
     "session.execute_idempotency_receipt.v1",
+    crate::storage::ValueSemantics::Mutable,
 );
 
 const RECEIPT_VERSION: u8 = 2;

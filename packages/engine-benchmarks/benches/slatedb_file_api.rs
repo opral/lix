@@ -13,11 +13,12 @@ use futures_util::stream::{self, BoxStream};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     GetManyRequest, GetOptions as StorageGetOptions, Key, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
     WriteOptions,
 };
 #[cfg(feature = "storage-benches")]
 use lix::storage_adapter::StorageAdapter;
+use lix::storage_bench::synthetic_space_for_bench;
 #[cfg(feature = "storage-benches")]
 use lix::transaction::bench::{BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting};
 use lix::{Blob, Value};
@@ -44,8 +45,7 @@ const FRESH_ENGINE_DELAYS_MS: &[u64] = &[0, 25];
 const CONCURRENCY_DELAY_MS: u64 = 10;
 const CONCURRENCY_REQUESTS: usize = 4;
 const CONCURRENCY_VALUE_BYTES: usize = 16 * 1024;
-const CONCURRENCY_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x00ff_0001), "bench.concurrency");
+const CONCURRENCY_SPACE: StorageSpace = synthetic_space_for_bench(6, ValueSemantics::Mutable);
 #[cfg(feature = "storage-benches")]
 const SINGLETON_ACCOUNTING_ROWS: usize = 1_000;
 #[cfg(feature = "storage-benches")]

@@ -10,16 +10,21 @@ use super::object::{
     encode_optional_id,
 };
 
+/// Maximum authenticated outgoing edges decoded from one immutable envelope.
+/// Larger logical values must use a blocked tree rather than an unbounded
+/// vector in one object.
+pub(crate) const AUTHENTICATED_EDGE_PAGE_ENTRIES: usize = 256;
+
 const GLOBAL_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTG\0\x01";
 const BRANCH_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTB\0\x01";
 const UPLOAD_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTU\0\x01";
 const SNAPSHOT_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTS\0\x01";
-const GC_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTC\0\x01";
+const GC_SELECTOR_MAGIC: &[u8; 8] = b"LIXFTC\0\x02";
 const GLOBAL_SELECTOR_DOMAIN: &str = "lix forktree global selector v1";
 const BRANCH_SELECTOR_DOMAIN: &str = "lix forktree branch selector v1";
 const UPLOAD_SELECTOR_DOMAIN: &str = "lix forktree upload selector v1";
 const SNAPSHOT_SELECTOR_DOMAIN: &str = "lix forktree snapshot selector v1";
-const GC_SELECTOR_DOMAIN: &str = "lix forktree gc-progress selector v1";
+const GC_SELECTOR_DOMAIN: &str = "lix forktree gc-progress selector v2";
 const UPLOAD_BINDING_DOMAIN: &str = "lix forktree upload binding v1";
 
 macro_rules! raw_uuid_id {
@@ -183,6 +188,7 @@ pub(crate) struct CommitObjectV1 {
 
 impl CommitObjectV1 {
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        self.validate_edge_bound()?;
         validate_nonzero_ids("commit parent", &self.parent_commit_object_ids)?;
         validate_nonzero_ids("commit member", &self.member_change_object_ids)?;
         validate_nonzero_ids(
@@ -242,7 +248,23 @@ impl CommitObjectV1 {
             "commit state",
             &[value.global_state_root, value.local_state_root],
         )?;
+        value.validate_edge_bound()?;
         Ok(value)
+    }
+
+    fn validate_edge_bound(&self) -> Result<(), StorageError> {
+        if self
+            .parent_commit_object_ids
+            .len()
+            .checked_add(self.member_change_object_ids.len())
+            .and_then(|count| count.checked_add(2))
+            .is_none_or(|count| count > AUTHENTICATED_EDGE_PAGE_ENTRIES)
+        {
+            return Err(corruption(
+                "commit edge list exceeds one authenticated edge page",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -646,6 +668,11 @@ impl BlobManifestV1 {
     }
 
     fn validate(&self) -> Result<(), StorageError> {
+        if self.ordered_chunks.len() > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+            return Err(corruption(
+                "blob manifest exceeds one authenticated edge page; use a blocked manifest",
+            ));
+        }
         let mut total = 0_u64;
         for chunk in &self.ordered_chunks {
             if chunk.chunk_object_id == ObjectId::ZERO || chunk.declared_len == 0 {
@@ -733,6 +760,11 @@ impl UploadPartV1 {
     }
 
     fn validate(&self) -> Result<(), StorageError> {
+        if self.ordered_chunks.len() > AUTHENTICATED_EDGE_PAGE_ENTRIES {
+            return Err(corruption(
+                "upload part exceeds one authenticated edge page; split the part",
+            ));
+        }
         let mut encoded_len = 0_u64;
         for chunk in &self.ordered_chunks {
             if chunk.chunk_object_id == ObjectId::ZERO || chunk.declared_len == 0 {
@@ -979,63 +1011,308 @@ impl SnapshotSelectorV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GcMarkPackV1 {
-    pub(crate) object_ids: Vec<ObjectId>,
-    pub(crate) next_pack_object_id: Option<ObjectId>,
+pub(super) const GC_CURSOR_MAX_BYTES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum GcPhaseV2 {
+    RootSelectors = 1,
+    RootUntracked = 2,
+    Traverse = 3,
+    Sweep = 4,
+    Cleanup = 5,
 }
 
-impl GcMarkPackV1 {
-    pub(crate) const MAX_OBJECT_IDS: usize = 4096;
+impl GcPhaseV2 {
+    fn decode(value: u8) -> Result<Self, StorageError> {
+        match value {
+            1 => Ok(Self::RootSelectors),
+            2 => Ok(Self::RootUntracked),
+            3 => Ok(Self::Traverse),
+            4 => Ok(Self::Sweep),
+            5 => Ok(Self::Cleanup),
+            _ => Err(corruption(format!("unknown GC phase {value}"))),
+        }
+    }
+}
 
-    pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum GcRadixKindV1 {
+    LiveBranch = 1,
+    Mark = 2,
+    Queue = 3,
+}
+
+impl GcRadixKindV1 {
+    fn decode(value: u8) -> Result<Self, StorageError> {
+        match value {
+            1 => Ok(Self::LiveBranch),
+            2 => Ok(Self::Mark),
+            3 => Ok(Self::Queue),
+            _ => Err(corruption(format!("unknown GC radix kind {value}"))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GcMarkEntryV2 {
+    pub(super) object_id: ObjectId,
+    pub(super) expected_domain: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GcMarkPackV2 {
+    pub(super) cycle_id: [u8; 16],
+    pub(super) consumed_prefix: Vec<u8>,
+    pub(super) entries: Vec<GcMarkEntryV2>,
+}
+
+impl GcMarkPackV2 {
+    pub(super) const MAX_ENTRIES: usize = 4096;
+
+    pub(super) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate()?;
-        encode_object(ObjectDomain::GcMarkPack, |encoder| {
-            encoder.u32(
-                u32::try_from(self.object_ids.len())
-                    .map_err(|_| corruption("GC mark pack count exceeds u32"))?,
-            );
-            for id in &self.object_ids {
-                encode_id(encoder, *id);
+        encode_object(ObjectDomain::GcMarkPackV2, |encoder| {
+            encoder.fixed(&self.cycle_id);
+            encoder.bytes(&self.consumed_prefix)?;
+            encoder.u32(self.entries.len() as u32);
+            for entry in &self.entries {
+                encode_id(encoder, entry.object_id);
+                encoder.u32(u32::from(entry.expected_domain));
             }
-            encode_optional_id(encoder, self.next_pack_object_id);
             Ok(())
         })
     }
 
-    pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut decoder = decode_object(id, ObjectDomain::GcMarkPack, bytes)?;
-        let count = decoder.usize("GC mark pack count")?;
-        if count > Self::MAX_OBJECT_IDS || count > decoder.remaining() / 32 {
+    pub(super) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::GcMarkPackV2, bytes)?;
+        let cycle_id = decoder.fixed()?;
+        let consumed_prefix = decoder.bytes("GC mark consumed prefix")?;
+        let count = decoder.usize("GC mark entry count")?;
+        if count == 0 || count > Self::MAX_ENTRIES || count > decoder.remaining() / 36 {
             return Err(corruption("GC mark pack count is invalid"));
         }
-        let mut object_ids = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            object_ids.push(decode_id(&mut decoder)?);
+            entries.push(GcMarkEntryV2 {
+                object_id: decode_id(&mut decoder)?,
+                expected_domain: u16::try_from(decoder.u32()?)
+                    .map_err(|_| corruption("GC mark domain exceeds u16"))?,
+            });
         }
-        let value = Self {
-            object_ids,
-            next_pack_object_id: decode_optional_id(&mut decoder, "GC mark next pack")?,
-        };
         decoder.finish()?;
+        let value = Self {
+            cycle_id,
+            consumed_prefix,
+            entries,
+        };
         value.validate()?;
         Ok(value)
     }
 
     fn validate(&self) -> Result<(), StorageError> {
-        if self.object_ids.is_empty() || self.object_ids.len() > Self::MAX_OBJECT_IDS {
+        validate_gc_cycle(self.cycle_id)?;
+        if self.consumed_prefix.len() > 32
+            || self.entries.is_empty()
+            || self.entries.len() > Self::MAX_ENTRIES
+        {
+            return Err(corruption("GC mark pack exceeds its bounded contract"));
+        }
+        let mut previous = None;
+        for entry in &self.entries {
+            validate_gc_object_claim(entry.object_id, entry.expected_domain)?;
+            if previous.is_some_and(|id| id >= entry.object_id) {
+                return Err(corruption("GC mark entries are not strictly ordered"));
+            }
+            if !entry
+                .object_id
+                .as_bytes()
+                .starts_with(&self.consumed_prefix)
+            {
+                return Err(corruption("GC mark entry is outside its consumed prefix"));
+            }
+            previous = Some(entry.object_id);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GcEdgeCursorV1 {
+    pub(super) source_object_id: ObjectId,
+    pub(super) source_domain: u16,
+    pub(super) next_edge_ordinal: u64,
+    pub(super) owner_cursor: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GcQueueEntryV1 {
+    pub(super) sequence: u64,
+    pub(super) object_id: ObjectId,
+    pub(super) expected_domain: u16,
+    pub(super) edge_cursor: Option<GcEdgeCursorV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GcQueuePackV1 {
+    pub(super) cycle_id: [u8; 16],
+    pub(super) entries: Vec<GcQueueEntryV1>,
+}
+
+impl GcQueuePackV1 {
+    pub(super) const MAX_ENTRIES: usize = 1024;
+
+    pub(super) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        self.validate()?;
+        encode_object(ObjectDomain::GcQueuePackV1, |encoder| {
+            encoder.fixed(&self.cycle_id);
+            encoder.u32(self.entries.len() as u32);
+            for entry in &self.entries {
+                encoder.u64(entry.sequence);
+                encode_id(encoder, entry.object_id);
+                encoder.u32(u32::from(entry.expected_domain));
+                match &entry.edge_cursor {
+                    None => encoder.u8(0),
+                    Some(cursor) => {
+                        encoder.u8(1);
+                        encode_id(encoder, cursor.source_object_id);
+                        encoder.u32(u32::from(cursor.source_domain));
+                        encoder.u64(cursor.next_edge_ordinal);
+                        encoder.bytes(&cursor.owner_cursor)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::GcQueuePackV1, bytes)?;
+        let cycle_id = decoder.fixed()?;
+        let count = decoder.usize("GC queue entry count")?;
+        if count == 0 || count > Self::MAX_ENTRIES || count > decoder.remaining() / 44 {
+            return Err(corruption("GC queue pack count is invalid"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let sequence = decoder.u64()?;
+            let object_id = decode_id(&mut decoder)?;
+            let expected_domain = u16::try_from(decoder.u32()?)
+                .map_err(|_| corruption("GC queue domain exceeds u16"))?;
+            let edge_cursor = match decoder.u8()? {
+                0 => None,
+                1 => Some(GcEdgeCursorV1 {
+                    source_object_id: decode_id(&mut decoder)?,
+                    source_domain: u16::try_from(decoder.u32()?)
+                        .map_err(|_| corruption("GC edge cursor domain exceeds u16"))?,
+                    next_edge_ordinal: decoder.u64()?,
+                    owner_cursor: decoder.bytes("GC edge owner cursor")?,
+                }),
+                tag => return Err(corruption(format!("GC edge cursor tag {tag} is invalid"))),
+            };
+            entries.push(GcQueueEntryV1 {
+                sequence,
+                object_id,
+                expected_domain,
+                edge_cursor,
+            });
+        }
+        decoder.finish()?;
+        let value = Self { cycle_id, entries };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        validate_gc_cycle(self.cycle_id)?;
+        if self.entries.is_empty() || self.entries.len() > Self::MAX_ENTRIES {
+            return Err(corruption("GC queue pack exceeds its bounded contract"));
+        }
+        let mut previous = None;
+        for entry in &self.entries {
+            if previous.is_some_and(|sequence| sequence >= entry.sequence) {
+                return Err(corruption("GC queue sequences are not strictly increasing"));
+            }
+            validate_gc_object_claim(entry.object_id, entry.expected_domain)?;
+            if let Some(cursor) = &entry.edge_cursor {
+                validate_gc_object_claim(cursor.source_object_id, cursor.source_domain)?;
+                if cursor.source_object_id != entry.object_id
+                    || cursor.source_domain != entry.expected_domain
+                    || cursor.next_edge_ordinal == 0
+                    || cursor.owner_cursor.len() > GC_CURSOR_MAX_BYTES
+                {
+                    return Err(corruption("GC edge cursor is inconsistent or unbounded"));
+                }
+            }
+            previous = Some(entry.sequence);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GcLiveBranchEntryV1 {
+    pub(super) key_digest: [u8; 32],
+    pub(super) branch_id: CanonicalBranchId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GcLiveBranchPackV1 {
+    pub(super) cycle_id: [u8; 16],
+    pub(super) entries: Vec<GcLiveBranchEntryV1>,
+}
+
+impl GcLiveBranchPackV1 {
+    pub(super) const MAX_ENTRIES: usize = 4096;
+
+    pub(super) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        self.validate()?;
+        encode_object(ObjectDomain::GcLiveBranchPackV1, |encoder| {
+            encoder.fixed(&self.cycle_id);
+            encoder.u32(self.entries.len() as u32);
+            for entry in &self.entries {
+                encoder.fixed(&entry.key_digest);
+                encoder.fixed(entry.branch_id.as_bytes());
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::GcLiveBranchPackV1, bytes)?;
+        let cycle_id = decoder.fixed()?;
+        let count = decoder.usize("GC live branch count")?;
+        if count == 0 || count > Self::MAX_ENTRIES || count > decoder.remaining() / 48 {
+            return Err(corruption("GC live branch pack count is invalid"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(GcLiveBranchEntryV1 {
+                key_digest: decoder.fixed()?,
+                branch_id: CanonicalBranchId::from_bytes(decoder.fixed()?),
+            });
+        }
+        decoder.finish()?;
+        let value = Self { cycle_id, entries };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        validate_gc_cycle(self.cycle_id)?;
+        if self.entries.is_empty() || self.entries.len() > Self::MAX_ENTRIES {
             return Err(corruption(
-                "GC mark pack size is outside its bounded contract",
+                "GC live branch pack exceeds its bounded contract",
             ));
         }
-        if self.object_ids.contains(&ObjectId::ZERO)
-            || self.next_pack_object_id == Some(ObjectId::ZERO)
+        if self
+            .entries
+            .windows(2)
+            .any(|pair| pair[0].key_digest >= pair[1].key_digest)
         {
-            return Err(corruption("GC mark pack contains a zero object id"));
-        }
-        if self.object_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(corruption(
-                "GC mark pack object IDs are not strictly ordered",
+                "GC live branch entries are not strictly ordered",
             ));
         }
         Ok(())
@@ -1043,70 +1320,265 @@ impl GcMarkPackV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GcProgressV1 {
-    pub(crate) mark_pack_object_id: ObjectId,
-    pub(crate) object_scan_after: Option<Vec<u8>>,
-    pub(crate) discovered_epoch: u64,
+pub(super) struct GcRadixNodeV1 {
+    pub(super) cycle_id: [u8; 16],
+    pub(super) kind: GcRadixKindV1,
+    pub(super) consumed_prefix: Vec<u8>,
+    pub(super) child_bitmap: [u8; 32],
+    pub(super) child_object_ids: Vec<ObjectId>,
 }
 
-impl GcProgressV1 {
-    pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
-        if self.mark_pack_object_id == ObjectId::ZERO {
-            return Err(corruption("GC progress has a zero mark-pack root"));
-        }
-        encode_object(ObjectDomain::GcProgress, |encoder| {
-            encode_id(encoder, self.mark_pack_object_id);
-            match &self.object_scan_after {
-                Some(value) => {
-                    encoder.u8(1);
-                    encoder.bytes(value)?;
-                }
-                None => encoder.u8(0),
+impl GcRadixNodeV1 {
+    pub(super) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        self.validate()?;
+        encode_object(ObjectDomain::GcRadixNodeV1, |encoder| {
+            encoder.fixed(&self.cycle_id);
+            encoder.u8(self.kind as u8);
+            encoder.u8(self.consumed_prefix.len() as u8);
+            encoder.fixed(&self.consumed_prefix);
+            encoder.fixed(&self.child_bitmap);
+            for child in &self.child_object_ids {
+                encode_id(encoder, *child);
             }
-            encoder.u64(self.discovered_epoch);
             Ok(())
         })
     }
 
-    pub(crate) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut decoder = decode_object(id, ObjectDomain::GcProgress, bytes)?;
-        let mark_pack_object_id = decode_id(&mut decoder)?;
-        let object_scan_after = match decoder.u8()? {
-            0 => None,
-            1 => Some(decoder.bytes("GC object scan cursor")?),
-            other => {
-                return Err(corruption(format!(
-                    "GC cursor option tag {other} is invalid"
-                )));
-            }
-        };
+    pub(super) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::GcRadixNodeV1, bytes)?;
+        let cycle_id = decoder.fixed()?;
+        let kind = GcRadixKindV1::decode(decoder.u8()?)?;
+        let prefix_len = usize::from(decoder.u8()?);
+        if prefix_len > 32 {
+            return Err(corruption("GC radix prefix exceeds ObjectId width"));
+        }
+        let consumed_prefix = decoder.take(prefix_len)?.to_vec();
+        let child_bitmap = decoder.fixed()?;
+        let child_count = child_bitmap
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum();
+        if child_count == 0 || child_count > 256 || child_count > decoder.remaining() / 32 {
+            return Err(corruption("GC radix child bitmap is invalid"));
+        }
+        let mut child_object_ids = Vec::with_capacity(child_count);
+        for _ in 0..child_count {
+            child_object_ids.push(decode_id(&mut decoder)?);
+        }
+        decoder.finish()?;
         let value = Self {
-            mark_pack_object_id,
-            object_scan_after,
-            discovered_epoch: decoder.u64()?,
+            cycle_id,
+            kind,
+            consumed_prefix,
+            child_bitmap,
+            child_object_ids,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        validate_gc_cycle(self.cycle_id)?;
+        let child_count = self
+            .child_bitmap
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum::<usize>();
+        if self.consumed_prefix.len() > 32
+            || child_count == 0
+            || child_count != self.child_object_ids.len()
+            || self.child_object_ids.contains(&ObjectId::ZERO)
+        {
+            return Err(corruption("GC radix node violates its bounded shape"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GcProgressV2 {
+    pub(super) cycle_id: [u8; 16],
+    pub(super) phase: GcPhaseV2,
+    pub(super) expected_global_digest: [u8; 32],
+    pub(super) expected_global_epoch: u64,
+    pub(super) selector_resume_after: Option<Vec<u8>>,
+    pub(super) untracked_resume_after: Option<Vec<u8>>,
+    pub(super) object_resume_after: Option<ObjectId>,
+    pub(super) maintenance_resume_after: Option<ObjectId>,
+    pub(super) saw_global_selector: bool,
+    pub(super) live_branch_index_root: Option<ObjectId>,
+    pub(super) mark_index_root: Option<ObjectId>,
+    pub(super) queue_index_root: Option<ObjectId>,
+    pub(super) queue_pop_sequence: u64,
+    pub(super) queue_push_sequence: u64,
+    pub(super) marked_count: u64,
+    pub(super) validated_count: u64,
+    pub(super) reclaimed_count: u64,
+}
+
+impl GcProgressV2 {
+    pub(super) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
+        self.validate()?;
+        encode_object(ObjectDomain::GcProgressV2, |encoder| {
+            encoder.fixed(&self.cycle_id);
+            encoder.u8(self.phase as u8);
+            encoder.fixed(&self.expected_global_digest);
+            encoder.u64(self.expected_global_epoch);
+            encode_optional_bounded_bytes(encoder, self.selector_resume_after.as_deref())?;
+            encode_optional_bounded_bytes(encoder, self.untracked_resume_after.as_deref())?;
+            encode_optional_id(encoder, self.object_resume_after);
+            encode_optional_id(encoder, self.maintenance_resume_after);
+            encoder.u8(u8::from(self.saw_global_selector));
+            encode_optional_id(encoder, self.live_branch_index_root);
+            encode_optional_id(encoder, self.mark_index_root);
+            encode_optional_id(encoder, self.queue_index_root);
+            encoder.u64(self.queue_pop_sequence);
+            encoder.u64(self.queue_push_sequence);
+            encoder.u64(self.marked_count);
+            encoder.u64(self.validated_count);
+            encoder.u64(self.reclaimed_count);
+            Ok(())
+        })
+    }
+
+    pub(super) fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut decoder = decode_object(id, ObjectDomain::GcProgressV2, bytes)?;
+        let value = Self {
+            cycle_id: decoder.fixed()?,
+            phase: GcPhaseV2::decode(decoder.u8()?)?,
+            expected_global_digest: decoder.fixed()?,
+            expected_global_epoch: decoder.u64()?,
+            selector_resume_after: decode_optional_bounded_bytes(
+                &mut decoder,
+                "GC selector cursor",
+            )?,
+            untracked_resume_after: decode_optional_bounded_bytes(
+                &mut decoder,
+                "GC untracked cursor",
+            )?,
+            object_resume_after: decode_optional_id(&mut decoder, "GC object cursor")?,
+            maintenance_resume_after: decode_optional_id(&mut decoder, "GC maintenance cursor")?,
+            saw_global_selector: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                tag => return Err(corruption(format!("GC global-seen tag {tag} is invalid"))),
+            },
+            live_branch_index_root: decode_optional_id(&mut decoder, "GC live branch root")?,
+            mark_index_root: decode_optional_id(&mut decoder, "GC mark root")?,
+            queue_index_root: decode_optional_id(&mut decoder, "GC queue root")?,
+            queue_pop_sequence: decoder.u64()?,
+            queue_push_sequence: decoder.u64()?,
+            marked_count: decoder.u64()?,
+            validated_count: decoder.u64()?,
+            reclaimed_count: decoder.u64()?,
         };
         decoder.finish()?;
-        if value.mark_pack_object_id == ObjectId::ZERO {
-            return Err(corruption("GC progress has a zero mark-pack root"));
-        }
+        value.validate()?;
         Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        validate_gc_cycle(self.cycle_id)?;
+        if self.expected_global_digest == [0; 32]
+            || self.expected_global_epoch == 0
+            || self
+                .selector_resume_after
+                .as_ref()
+                .is_some_and(|value| value.len() > GC_CURSOR_MAX_BYTES)
+            || self
+                .untracked_resume_after
+                .as_ref()
+                .is_some_and(|value| value.len() > GC_CURSOR_MAX_BYTES)
+            || self.object_resume_after == Some(ObjectId::ZERO)
+            || self.maintenance_resume_after == Some(ObjectId::ZERO)
+            || self.live_branch_index_root == Some(ObjectId::ZERO)
+            || self.mark_index_root == Some(ObjectId::ZERO)
+            || self.queue_index_root == Some(ObjectId::ZERO)
+            || self.queue_pop_sequence > self.queue_push_sequence
+            || self.validated_count > self.marked_count
+        {
+            return Err(corruption(
+                "GC progress violates its authenticated invariants",
+            ));
+        }
+        let queue_nonempty = self.queue_pop_sequence < self.queue_push_sequence;
+        if queue_nonempty != self.queue_index_root.is_some()
+            || (self.phase != GcPhaseV2::Cleanup
+                && (self.marked_count == 0) != self.mark_index_root.is_none())
+        {
+            return Err(corruption(
+                "GC progress queue/mark roots disagree with their authenticated counts",
+            ));
+        }
+        let phase_valid = match self.phase {
+            GcPhaseV2::RootSelectors => {
+                self.untracked_resume_after.is_none()
+                    && self.object_resume_after.is_none()
+                    && self.maintenance_resume_after.is_none()
+                    && self.validated_count == 0
+            }
+            GcPhaseV2::RootUntracked => {
+                self.saw_global_selector
+                    && self.selector_resume_after.is_none()
+                    && self.object_resume_after.is_none()
+                    && self.maintenance_resume_after.is_none()
+            }
+            GcPhaseV2::Traverse => {
+                self.saw_global_selector
+                    && self.selector_resume_after.is_none()
+                    && self.untracked_resume_after.is_none()
+                    && self.object_resume_after.is_none()
+                    && self.maintenance_resume_after.is_none()
+                    && self.mark_index_root.is_some()
+            }
+            GcPhaseV2::Sweep => {
+                self.saw_global_selector
+                    && self.selector_resume_after.is_none()
+                    && self.untracked_resume_after.is_none()
+                    && self.maintenance_resume_after.is_none()
+                    && self.mark_index_root.is_some()
+                    && self.queue_index_root.is_none()
+                    && self.queue_pop_sequence == self.queue_push_sequence
+                    && self.validated_count == self.marked_count
+            }
+            GcPhaseV2::Cleanup => {
+                self.saw_global_selector
+                    && self.selector_resume_after.is_none()
+                    && self.untracked_resume_after.is_none()
+                    && self.object_resume_after.is_none()
+                    && self.live_branch_index_root.is_none()
+                    && self.mark_index_root.is_none()
+                    && self.queue_index_root.is_none()
+                    && self.queue_pop_sequence == self.queue_push_sequence
+                    && self.validated_count == self.marked_count
+            }
+        };
+        if !phase_valid {
+            return Err(corruption(
+                "GC progress phase disagrees with its authenticated cursors or roots",
+            ));
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GcProgressSelectorV1 {
-    pub(crate) progress_object_id: ObjectId,
-    pub(crate) selector_generation: u64,
+pub(super) struct GcProgressSelectorV2 {
+    pub(super) cycle_id: [u8; 16],
+    pub(super) progress_object_id: ObjectId,
+    pub(super) selector_generation: u64,
 }
 
-impl GcProgressSelectorV1 {
-    pub(crate) fn encode(self) -> Result<Bytes, StorageError> {
+impl GcProgressSelectorV2 {
+    pub(super) fn encode(self) -> Result<Bytes, StorageError> {
+        validate_gc_cycle(self.cycle_id)?;
         validate_selector(
             self.progress_object_id,
             self.selector_generation,
             "GC progress",
         )?;
         encode_authenticated(GC_SELECTOR_DOMAIN, GC_SELECTOR_MAGIC, |encoder| {
+            encoder.fixed(&self.cycle_id);
             encode_id(encoder, self.progress_object_id);
             encoder.u64(self.selector_generation);
             Ok(())
@@ -1114,19 +1586,71 @@ impl GcProgressSelectorV1 {
         .map(Bytes::from)
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let mut decoder = authenticated_body(GC_SELECTOR_DOMAIN, GC_SELECTOR_MAGIC, bytes)?;
         let value = Self {
+            cycle_id: decoder.fixed()?,
             progress_object_id: decode_id(&mut decoder)?,
             selector_generation: decoder.u64()?,
         };
         decoder.finish()?;
+        validate_gc_cycle(value.cycle_id)?;
         validate_selector(
             value.progress_object_id,
             value.selector_generation,
             "GC progress",
         )?;
         Ok(value)
+    }
+}
+
+fn validate_gc_cycle(cycle_id: [u8; 16]) -> Result<(), StorageError> {
+    if cycle_id == [0; 16] {
+        Err(corruption("GC cycle ID is zero"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_gc_object_claim(id: ObjectId, domain: u16) -> Result<(), StorageError> {
+    if id == ObjectId::ZERO {
+        return Err(corruption("GC object claim contains a zero ID"));
+    }
+    let _ = ObjectDomain::decode(domain)?;
+    Ok(())
+}
+
+fn encode_optional_bounded_bytes(
+    encoder: &mut Encoder,
+    value: Option<&[u8]>,
+) -> Result<(), StorageError> {
+    match value {
+        None => encoder.u8(0),
+        Some(value) => {
+            if value.len() > GC_CURSOR_MAX_BYTES {
+                return Err(corruption("GC cursor exceeds its protocol maximum"));
+            }
+            encoder.u8(1);
+            encoder.bytes(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_optional_bounded_bytes(
+    decoder: &mut Decoder<'_>,
+    label: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => {
+            let value = decoder.bytes(label)?;
+            if value.len() > GC_CURSOR_MAX_BYTES {
+                return Err(corruption(format!("{label} exceeds its protocol maximum")));
+            }
+            Ok(Some(value))
+        }
+        tag => Err(corruption(format!("{label} has invalid option tag {tag}"))),
     }
 }
 

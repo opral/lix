@@ -21,7 +21,7 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageProjectedValue, StorageSpace, StorageValue, StorageWriteSet,
 };
 
 use super::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
@@ -31,9 +31,10 @@ use super::keys::{
 use super::persistent_map::PersistentMap;
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey};
 
-const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0007_0002),
+const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0007_0002,
     "filesystem.path_index_revision",
+    crate::storage::ValueSemantics::Mutable,
 );
 const FILESYSTEM_PATH_REVISION_KEY: &[u8] = b"global";
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;

@@ -20,7 +20,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_adapter::{
     StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
-    StorageScanOptions, StorageSpaceId, StorageValue,
+    StorageScanOptions, StorageValue,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -41,17 +41,25 @@ pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
-pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
-pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0005_0002),
-    BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0005_0001,
+    BINARY_CAS_MANIFEST_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
-pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
-    StorageSpace::immutable(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
-pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0005_0004),
+pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0005_0002,
+    BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
+);
+pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0005_0003,
+    BINARY_CAS_CHUNK_NAMESPACE,
+    crate::storage::ValueSemantics::Immutable,
+);
+pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0005_0004,
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
+    crate::storage::ValueSemantics::Mutable,
 );
 
 #[derive(Debug)]

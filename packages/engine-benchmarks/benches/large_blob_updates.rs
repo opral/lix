@@ -10,10 +10,13 @@ use lix::Value;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     CoreProjection, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions, ScanOptions,
-    SpaceId, Storage, StorageRead, StoredValue, WriteOptions,
+    Storage, StorageRead, StoredValue, ValueSemantics, WriteOptions,
 };
-use lix::storage_adapter::{StorageAdapter, StorageSpace};
-use lix::storage_bench::{binary_cas_write_accounting, reset_binary_cas_write_accounting};
+use lix::storage_adapter::StorageAdapter;
+use lix::storage_bench::{
+    OwnerSpaceForBench, binary_cas_write_accounting, owner_space_for_bench,
+    reset_binary_cas_write_accounting, synthetic_space_for_bench,
+};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use tempfile::TempDir;
@@ -28,10 +31,10 @@ const OPERATIONS: &[Operation] = &[
     Operation::RawBackendInitialWrite,
 ];
 const LOCAL_EDIT_BYTES: usize = 4 << 10;
-const MANIFEST_SPACE: SpaceId = SpaceId(0x0005_0001);
-const MANIFEST_CHUNK_SPACE: SpaceId = SpaceId(0x0005_0002);
-const PAYLOAD_SPACE: SpaceId = SpaceId(0x0005_0003);
-const PRESENCE_SPACE: SpaceId = SpaceId(0x0005_0004);
+const MANIFEST_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasManifest;
+const MANIFEST_CHUNK_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasManifestChunk;
+const PAYLOAD_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasPayload;
+const PRESENCE_SPACE: OwnerSpaceForBench = OwnerSpaceForBench::BinaryCasPresence;
 const UPSERT_SQL: &str = "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                           ON CONFLICT (path) DO UPDATE SET content = excluded.content";
 
@@ -375,7 +378,7 @@ where
     async fn write(&self, prepared: PreparedWrite) -> u64 {
         if matches!(self.workload.operation, Operation::RawBackendInitialWrite) {
             let adapter = StorageAdapter::new(self.storage.clone());
-            let payload_space = StorageSpace::mutable(SpaceId(0x0005_0003), "bench.raw_payload");
+            let payload_space = synthetic_space_for_bench(64, ValueSemantics::Mutable);
             let mut offset = 0usize;
             while offset < self.workload.size {
                 let len = (self.workload.size - offset).min(lix::FILE_UPLOAD_PART_BYTES);
@@ -443,7 +446,7 @@ where
         result.rows_affected()
     }
 
-    async fn space_accounting(&self, space: SpaceId) -> SpaceAccounting {
+    async fn space_accounting(&self, space: OwnerSpaceForBench) -> SpaceAccounting {
         space_accounting(&self.storage, space).await
     }
 }
@@ -501,7 +504,7 @@ impl Fixture {
         }
     }
 
-    async fn space_accounting(&self, space: SpaceId) -> SpaceAccounting {
+    async fn space_accounting(&self, space: OwnerSpaceForBench) -> SpaceAccounting {
         match self {
             Self::Rocks(fixture) => fixture.space_accounting(space).await,
             Self::Slate(fixture) => fixture.space_accounting(space).await,
@@ -515,15 +518,11 @@ struct SpaceAccounting {
     value_bytes: u64,
 }
 
-async fn space_accounting<S>(storage: &S, space: SpaceId) -> SpaceAccounting
+async fn space_accounting<S>(storage: &S, space: OwnerSpaceForBench) -> SpaceAccounting
 where
     S: Storage,
 {
-    let space = if space == PAYLOAD_SPACE {
-        StorageSpace::immutable(space, "benchmark.binary_cas_payload")
-    } else {
-        StorageSpace::mutable(space, "benchmark.binary_cas_metadata")
-    };
+    let space = owner_space_for_bench(space);
     let read = storage
         .begin_read(ReadOptions::default())
         .await

@@ -1,21 +1,22 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
-    CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead,
-    MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
+    MemoryRead, MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, Storage,
+    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
 use super::model::{
-    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
-    upload_binding_digest, upload_selector_key,
+    GcProgressSelectorV2, GcProgressV2, branch_selector_key, gc_progress_selector_key,
+    global_selector_key, snapshot_selector_key, upload_binding_digest, upload_selector_key,
 };
+use super::object::OBJECT_SPACE;
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
@@ -29,12 +30,12 @@ use super::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
-    CommitObjectV1, GcMarkPackV1, GcProgressSelectorV1, GlobalSelectorV1, OBJECT_SPACE, ObjectId,
-    PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
-    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource,
-    StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1,
-    UploadProgressV1, UploadSelectorV1, VisibleStateRow, discover_sweep_plan, edit_state_tree,
+    CommitObjectV1, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication,
+    RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
+    RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
+    SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource, StateTreeMutation,
+    StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1,
+    UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree,
     encode_state_key, encode_state_value, load_change, load_commit, open_coherent_view,
     page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
     put_commit_catalog_entries, state_point, state_range,
@@ -266,6 +267,63 @@ fn build_seed() -> SeedData {
     }
 }
 
+fn replace_selected_history_graph(
+    seed: &mut SeedData,
+    commits: &[(CommitId, CommitCatalogEntry)],
+    changes: &[(ChangeId, ChangeCatalogEntry)],
+    semantic_head_commit_object_id: ObjectId,
+    latest_ref_change_object_id: ObjectId,
+) {
+    let commit_catalog = build_commit_catalog(commits).expect("replacement commit catalog");
+    let commit_catalog_root = commit_catalog.root.object_id;
+    seed.objects
+        .extend(commit_catalog.objects)
+        .expect("replacement commit catalog objects");
+    let change_catalog = build_change_catalog(changes).expect("replacement change catalog");
+    let change_catalog_root = change_catalog.root.object_id;
+    seed.objects
+        .extend(change_catalog.objects)
+        .expect("replacement change catalog objects");
+    let current_repository = RepositoryRootV1::decode(
+        seed.repository_root_id,
+        seed.objects
+            .get(seed.repository_root_id)
+            .expect("current repository root"),
+    )
+    .expect("decode current repository root");
+    let repository = RepositoryRootV1 {
+        commit_catalog_root,
+        change_catalog_root,
+        ..current_repository
+    };
+    let (repository_id, repository_bytes) = repository.encode().expect("replacement repository");
+    seed.objects
+        .insert(repository_id, repository_bytes)
+        .expect("replacement repository object");
+    let current_snapshot = BranchSnapshotV1::decode(
+        seed.branch_snapshot_id,
+        seed.objects
+            .get(seed.branch_snapshot_id)
+            .expect("current branch snapshot"),
+    )
+    .expect("decode current branch snapshot");
+    let snapshot = BranchSnapshotV1 {
+        semantic_head_commit_object_id,
+        latest_ref_change_object_id: Some(latest_ref_change_object_id),
+        ..current_snapshot
+    };
+    let (snapshot_id, snapshot_bytes) = snapshot.encode().expect("replacement snapshot");
+    seed.objects
+        .insert(snapshot_id, snapshot_bytes)
+        .expect("replacement snapshot object");
+    seed.repository_root_id = repository_id;
+    seed.branch_snapshot_id = snapshot_id;
+    seed.global_selector.repository_root = repository_id;
+    seed.global_selector.selector_generation += 1;
+    seed.branch_selector.branch_snapshot_object_id = snapshot_id;
+    seed.branch_selector.selector_generation += 1;
+}
+
 async fn seed_storage<S>(storage: &S, seed: &SeedData)
 where
     S: Storage,
@@ -347,15 +405,40 @@ async fn object_present<S: Storage>(storage: &S, id: ObjectId) -> bool {
         .is_some()
 }
 
-async fn sweep<S: Storage>(storage: &S, branch_id: CanonicalBranchId) {
-    let view = open_coherent_view(storage, branch_id)
+async fn selector_present<S: Storage>(storage: &S, key: Bytes) -> bool {
+    let read = storage
+        .begin_read(ReadOptions::default())
         .await
-        .expect("sweep view");
-    let plan = discover_sweep_plan(&view).await.expect("sweep discovery");
-    let mut publication = PreparedPublication::from_global_epoch(&view).expect("sweep epoch");
-    publication.apply_sweep_plan(plan).expect("sweep proof");
-    drop(view);
-    publication.commit(storage).await.expect("sweep commit");
+        .expect("selector read");
+    read.get_many(&[GetManyRequest {
+        space: SELECTOR_SPACE,
+        keys: &[Key(key)],
+        opts: GetOptions {
+            projection: CoreProjection::FullValue,
+        },
+    }])
+    .await
+    .expect("selector point")
+    .values[0]
+        .is_some()
+}
+
+async fn sweep_result<S: Storage>(storage: &S) -> Result<(), StorageError> {
+    for _ in 0..20_000 {
+        if matches!(
+            advance_gc(storage, GcBudget::default()).await?,
+            GcStepStatus::Complete { .. }
+        ) {
+            return Ok(());
+        }
+    }
+    Err(StorageError::Corruption(
+        "bounded GC did not finish within the test step ceiling".to_owned(),
+    ))
+}
+
+async fn sweep<S: Storage>(storage: &S, _branch_id: CanonicalBranchId) {
+    sweep_result(storage).await.expect("bounded sweep");
 }
 
 async fn branch_transition<R: StorageAdapterRead>(
@@ -694,8 +777,105 @@ impl Storage for CountingStorage {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CommitCrash {
+    Before = 1,
+    After = 2,
+}
+
+#[derive(Clone)]
+struct CrashStorage {
+    inner: Memory,
+    crash: Arc<AtomicU8>,
+}
+
+struct CrashWrite {
+    inner: MemoryWrite,
+    crash: Arc<AtomicU8>,
+}
+
+impl CrashStorage {
+    fn new() -> Self {
+        Self {
+            inner: Memory::new(),
+            crash: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn reopen(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            crash: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    fn inject(&self, crash: CommitCrash) {
+        assert_eq!(self.crash.swap(crash as u8, Ordering::SeqCst), 0);
+    }
+}
+
+impl StorageWrite for CrashWrite {
+    async fn put_many(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.inner.put_many(space, entries).await
+    }
+
+    async fn delete_many(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        keys: &[Key],
+    ) -> Result<(), StorageError> {
+        self.inner.delete_many(space, keys).await
+    }
+
+    async fn delete_range(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_range(space, range).await
+    }
+
+    async fn commit(self) -> Result<CommitResult, StorageError> {
+        match self.crash.swap(0, Ordering::SeqCst) {
+            value if value == CommitCrash::Before as u8 => {
+                self.inner.rollback().await?;
+                Err(StorageError::Io("injected pre-commit crash".to_owned()))
+            }
+            value if value == CommitCrash::After as u8 => {
+                self.inner.commit().await?;
+                Err(StorageError::Io("injected post-commit crash".to_owned()))
+            }
+            _ => self.inner.commit().await,
+        }
+    }
+
+    async fn rollback(self) -> Result<(), StorageError> {
+        self.inner.rollback().await
+    }
+}
+
+impl Storage for CrashStorage {
+    type Read<'a> = MemoryRead;
+    type Write<'a> = CrashWrite;
+
+    async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        self.inner.begin_read(options).await
+    }
+
+    async fn begin_write(&self, options: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        Ok(CrashWrite {
+            inner: self.inner.begin_write(options).await?,
+            crash: self.crash.clone(),
+        })
+    }
+}
+
 #[tokio::test]
-async fn coherent_open_uses_one_read_and_authenticates_the_complete_graph() {
+async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
     let seed = build_seed();
     let storage = CountingStorage::new();
     seed_storage(&storage, &seed).await;
@@ -740,11 +920,14 @@ async fn coherent_open_uses_one_read_and_authenticates_the_complete_graph() {
         .await
         .expect("delete selected member");
     write.commit().await.expect("commit corruption");
-    assert!(open_coherent_view(&storage, seed.branch_id).await.is_err());
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("bounded open does not traverse an unrelated catalog member");
+    assert!(load_change(&view, seed.semantic_change_id).await.is_err());
 }
 
 #[tokio::test]
-async fn coherent_open_rejects_ref_targets_outside_the_commit_domain() {
+async fn coherent_open_defers_ref_target_authentication_until_visited() {
     let mut seed = build_seed();
     let bad_ref = ChangeObjectV1::BranchRef {
         change_id: ChangeId::from_bytes(raw_id(0x40)),
@@ -830,7 +1013,211 @@ async fn coherent_open_rejects_ref_targets_outside_the_commit_domain() {
     seed.branch_selector.selector_generation += 1;
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
-    assert!(open_coherent_view(&storage, seed.branch_id).await.is_err());
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("bounded open authenticates only selected root envelopes");
+    assert!(load_change(&view, bad_ref.change_id()).await.is_err());
+}
+
+#[tokio::test]
+async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corruption() {
+    // A retained semantic member must have the exact reverse owner/ordinal in
+    // the one unified ChangeCatalog.
+    let mut wrong_owner = build_seed();
+    let commit_id = wrong_owner.commit_id;
+    let commit_object_id = wrong_owner.commit_object_id;
+    let semantic_change_id = wrong_owner.semantic_change_id;
+    let semantic_change_object_id = wrong_owner.semantic_change_object_id;
+    let ref_change_id = wrong_owner.ref_change_id;
+    let ref_change_object_id = wrong_owner.ref_change_object_id;
+    let branch_id = wrong_owner.branch_id;
+    replace_selected_history_graph(
+        &mut wrong_owner,
+        &[(commit_id, CommitCatalogEntry { commit_object_id })],
+        &[
+            (
+                semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: 1,
+                    },
+                },
+            ),
+            (
+                ref_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: ref_change_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id,
+                        branch_id,
+                    },
+                },
+            ),
+        ],
+        commit_object_id,
+        ref_change_object_id,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &wrong_owner).await;
+    assert!(sweep_result(&storage).await.is_err());
+
+    // A RefChange predecessor must be on the same branch and its after target
+    // must equal the successor's before target.
+    let mut bad_ref_history = build_seed();
+    let latest = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x33)),
+        branch_id: bad_ref_history.branch_id,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(bad_ref_history.commit_object_id),
+        previous_ref_change_object_id: Some(bad_ref_history.ref_change_object_id),
+        payload: b"broken-ref-chronology".to_vec(),
+    };
+    let (latest_id, latest_bytes) = latest.encode().expect("bad chronology ref");
+    bad_ref_history
+        .objects
+        .insert(latest_id, latest_bytes)
+        .expect("bad chronology ref object");
+    let commit_id = bad_ref_history.commit_id;
+    let commit_object_id = bad_ref_history.commit_object_id;
+    let semantic_change_id = bad_ref_history.semantic_change_id;
+    let semantic_change_object_id = bad_ref_history.semantic_change_object_id;
+    let ref_change_id = bad_ref_history.ref_change_id;
+    let ref_change_object_id = bad_ref_history.ref_change_object_id;
+    let branch_id = bad_ref_history.branch_id;
+    replace_selected_history_graph(
+        &mut bad_ref_history,
+        &[(commit_id, CommitCatalogEntry { commit_object_id })],
+        &[
+            (
+                semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                ref_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: ref_change_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id,
+                        branch_id,
+                    },
+                },
+            ),
+            (
+                latest.change_id(),
+                ChangeCatalogEntry {
+                    change_object_id: latest_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: latest_id,
+                        branch_id,
+                    },
+                },
+            ),
+        ],
+        commit_object_id,
+        latest_id,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &bad_ref_history).await;
+    assert!(sweep_result(&storage).await.is_err());
+
+    // Every retained parent generation must be strictly less than its child.
+    let mut bad_generation = build_seed();
+    let parent = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x41)),
+        generation: 2,
+        parent_commit_object_ids: Vec::new(),
+        member_change_object_ids: Vec::new(),
+        global_state_root: bad_generation.global_state_root,
+        local_state_root: bad_generation.local_state_root,
+        metadata: b"parent".to_vec(),
+    };
+    let (parent_id, parent_bytes) = parent.encode().expect("parent commit");
+    bad_generation
+        .objects
+        .insert(parent_id, parent_bytes)
+        .expect("parent object");
+    let child = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x42)),
+        generation: 2,
+        parent_commit_object_ids: vec![parent_id],
+        member_change_object_ids: vec![bad_generation.semantic_change_object_id],
+        global_state_root: bad_generation.global_state_root,
+        local_state_root: bad_generation.local_state_root,
+        metadata: b"child".to_vec(),
+    };
+    let (child_id, child_bytes) = child.encode().expect("child commit");
+    bad_generation
+        .objects
+        .insert(child_id, child_bytes)
+        .expect("child object");
+    let creation = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x43)),
+        branch_id: bad_generation.branch_id,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(child_id),
+        previous_ref_change_object_id: None,
+        payload: b"generation-branch".to_vec(),
+    };
+    let (creation_id, creation_bytes) = creation.encode().expect("creation ref");
+    bad_generation
+        .objects
+        .insert(creation_id, creation_bytes)
+        .expect("creation ref object");
+    let semantic_change_id = bad_generation.semantic_change_id;
+    let semantic_change_object_id = bad_generation.semantic_change_object_id;
+    let branch_id = bad_generation.branch_id;
+    replace_selected_history_graph(
+        &mut bad_generation,
+        &[
+            (
+                parent.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: parent_id,
+                },
+            ),
+            (
+                child.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: child_id,
+                },
+            ),
+        ],
+        &[
+            (
+                semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id: child_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                creation.change_id(),
+                ChangeCatalogEntry {
+                    change_object_id: creation_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: creation_id,
+                        branch_id,
+                    },
+                },
+            ),
+        ],
+        child_id,
+        creation_id,
+    );
+    let storage = Memory::new();
+    seed_storage(&storage, &bad_generation).await;
+    assert!(sweep_result(&storage).await.is_err());
 }
 
 fn make_part(
@@ -1013,21 +1400,11 @@ async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     let publish_view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("publish view");
-    let gc_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("GC view");
-    let stale_plan = discover_sweep_plan(&gc_view).await.expect("stale plan");
     let mut publish = PreparedPublication::from_global_epoch(&publish_view).expect("publish");
     stage_upload(&mut publish, &upload);
-    let mut stale_gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
-    stale_gc.apply_sweep_plan(stale_plan).expect("sweep proof");
     drop(publish_view);
-    drop(gc_view);
     publish.commit(&storage).await.expect("receipt first");
-    assert!(matches!(
-        stale_gc.commit(&storage).await,
-        Err(StorageError::PreconditionFailed(_))
-    ));
+    sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, upload.progress_id).await);
 
     let storage = Memory::new();
@@ -1035,17 +1412,10 @@ async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     let publish_view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("publish view");
-    let gc_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("GC view");
     let mut stale_publish = PreparedPublication::from_global_epoch(&publish_view).expect("publish");
     stage_upload(&mut stale_publish, &upload);
-    let plan = discover_sweep_plan(&gc_view).await.expect("plan");
-    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
-    gc.apply_sweep_plan(plan).expect("proof");
     drop(publish_view);
-    drop(gc_view);
-    gc.commit(&storage).await.expect("GC first");
+    sweep(&storage, seed.branch_id).await;
     assert!(matches!(
         stale_publish.commit(&storage).await,
         Err(StorageError::PreconditionFailed(_))
@@ -1058,6 +1428,310 @@ async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     drop(retry_view);
     retry.commit(&storage).await.expect("retry publication");
     assert!(object_present(&storage, upload.chunk_id).await);
+}
+
+#[tokio::test]
+async fn publication_cancels_active_gc_without_becoming_a_global_writer_lock() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    assert_eq!(
+        advance_gc(&storage, GcBudget::default())
+            .await
+            .expect("start GC"),
+        GcStepStatus::Started
+    );
+    assert!(
+        selector_present(&storage, gc_progress_selector_key()).await,
+        "active bounded GC must publish its rebuildable continuation"
+    );
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("publication view during GC");
+    let publication = PreparedPublication::from_global_epoch(&view).expect("publication");
+    drop(view);
+    publication
+        .commit(&storage)
+        .await
+        .expect("publication must atomically invalidate active GC");
+    assert!(
+        !selector_present(&storage, gc_progress_selector_key()).await,
+        "semantic publication must discard only the rebuildable GC selector"
+    );
+    assert_eq!(
+        advance_gc(&storage, GcBudget::default())
+            .await
+            .expect("restart GC"),
+        GcStepStatus::Started
+    );
+    sweep(&storage, seed.branch_id).await;
+}
+
+#[tokio::test]
+async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let checkpoint_id = SnapshotSelectorId::from_bytes(raw_id(0xe0));
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("checkpoint view");
+    let mut checkpoint = PreparedPublication::from_global_epoch(&view).expect("checkpoint");
+    let target_id = checkpoint
+        .publish_current_snapshot_pin(
+            &view,
+            SnapshotRole::Checkpoint,
+            checkpoint_id,
+            SelectorExpectation::Absent,
+        )
+        .expect("checkpoint target");
+    drop(view);
+    checkpoint
+        .commit(&storage)
+        .await
+        .expect("checkpoint commit");
+
+    let old_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("old coherent view");
+    let old_catalog_root = old_view.repository_root().change_catalog_root;
+    let old_resume = old_view.bind_resume_key(old_catalog_root, seed.semantic_change_id.as_bytes());
+    assert!(old_view.load_object_bytes(target_id).await.is_ok());
+
+    let current = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("release view");
+    let selector_key = snapshot_selector_key(SnapshotRole::Checkpoint, checkpoint_id);
+    let keys = [Key(selector_key)];
+    let loaded = current
+        .read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("checkpoint selector");
+    let raw_selector = match loaded.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
+        other => panic!("expected checkpoint selector, got {other:?}"),
+    };
+    let selector = SnapshotSelectorV1::decode(&raw_selector).expect("checkpoint selector");
+    let commit_catalog_edit = retire_commit_catalog_entries(
+        current.repository_root().commit_catalog_root,
+        &[],
+        current.read(),
+    )
+    .await
+    .expect("unchanged commit catalog");
+    let change_catalog_edit = retire_change_catalog_entries(
+        current.repository_root().change_catalog_root,
+        &[],
+        current.read(),
+    )
+    .await
+    .expect("unchanged change catalog");
+    let repository = RepositoryRootV1 {
+        commit_catalog_root: commit_catalog_edit.root,
+        change_catalog_root: change_catalog_edit.root,
+        ..current.repository_root()
+    };
+    let mut release = PreparedPublication::from_global_epoch(&current).expect("release");
+    release
+        .release_snapshot_pin_with_catalog_retirement(
+            &current,
+            selector,
+            raw_selector,
+            commit_catalog_edit,
+            change_catalog_edit,
+            repository,
+        )
+        .expect("release checkpoint");
+    drop(current);
+    release.commit(&storage).await.expect("release commit");
+    sweep(&storage, seed.branch_id).await;
+
+    assert!(!object_present(&storage, target_id).await);
+    assert!(
+        old_view.load_object_bytes(target_id).await.is_ok(),
+        "the retained StorageRead must continue to authenticate its old object version"
+    );
+    assert_eq!(
+        old_view
+            .validate_resume_key(old_catalog_root, &old_resume)
+            .expect("old cursor"),
+        seed.semantic_change_id.as_bytes()
+    );
+    let new_view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("new coherent view");
+    assert!(matches!(
+        new_view.validate_resume_key(old_catalog_root, &old_resume),
+        Err(StorageError::InvalidCursor)
+    ));
+    drop(new_view);
+    drop(old_view);
+
+    let reopened = storage.clone();
+    assert!(!object_present(&reopened, target_id).await);
+}
+
+#[tokio::test]
+async fn deterministic_crash_recovery_publication_and_gc_oracle() {
+    let seed = build_seed();
+    for (crash, committed) in [(CommitCrash::Before, false), (CommitCrash::After, true)] {
+        let storage = CrashStorage::new();
+        seed_storage(&storage, &seed).await;
+        let checkpoint_id =
+            SnapshotSelectorId::from_bytes(raw_id(if committed { 0xf1 } else { 0xf0 }));
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("publication view");
+        let mut publication = PreparedPublication::from_global_epoch(&view).expect("publication");
+        let target_id = publication
+            .publish_current_snapshot_pin(
+                &view,
+                SnapshotRole::Recovery,
+                checkpoint_id,
+                SelectorExpectation::Absent,
+            )
+            .expect("recovery pin");
+        drop(view);
+        storage.inject(crash);
+        assert!(publication.commit(&storage).await.is_err());
+
+        let reopened = storage.reopen();
+        assert_eq!(
+            selector_present(
+                &reopened,
+                snapshot_selector_key(SnapshotRole::Recovery, checkpoint_id),
+            )
+            .await,
+            committed
+        );
+        assert_eq!(object_present(&reopened, target_id).await, committed);
+        open_coherent_view(&reopened, seed.branch_id)
+            .await
+            .expect("repository must reopen entirely old or entirely new");
+    }
+
+    for crash in [CommitCrash::Before, CommitCrash::After] {
+        let storage = CrashStorage::new();
+        seed_storage(&storage, &seed).await;
+        let view = open_coherent_view(&storage, seed.branch_id)
+            .await
+            .expect("orphan view");
+        let mut orphan = PreparedPublication::from_global_epoch(&view).expect("orphan");
+        let target = SnapshotTargetV1 {
+            role: SnapshotRole::Checkpoint,
+            selector_id: SnapshotSelectorId::from_bytes(raw_id(0xf2)),
+            branch_id: seed.branch_id,
+            branch_snapshot_object_id: seed.branch_snapshot_id,
+            semantic_commit_object_id: seed.commit_object_id,
+        };
+        let orphan_id = orphan.stage_snapshot_target(target).expect("orphan target");
+        drop(view);
+        orphan.commit(&storage).await.expect("stage orphan");
+
+        storage.inject(crash);
+        assert!(advance_gc(&storage, GcBudget::default()).await.is_err());
+        let reopened = storage.reopen();
+        assert!(object_present(&reopened, orphan_id).await);
+        sweep(&reopened, seed.branch_id).await;
+        assert!(!object_present(&reopened, orphan_id).await);
+        open_coherent_view(&reopened, seed.branch_id)
+            .await
+            .expect("GC crash recovery must preserve the selected graph");
+    }
+}
+
+#[tokio::test]
+async fn corrupted_persisted_gc_index_aborts_without_authorizing_deletion() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    assert_eq!(
+        advance_gc(&storage, GcBudget::default())
+            .await
+            .expect("start GC"),
+        GcStepStatus::Started
+    );
+    advance_gc(&storage, GcBudget::default())
+        .await
+        .expect("collect selector roots");
+
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("GC state read");
+    let selector_keys = [Key(gc_progress_selector_key())];
+    let selector_result = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &selector_keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("GC selector");
+    let raw_selector = match selector_result.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes,
+        other => panic!("expected GC selector, got {other:?}"),
+    };
+    let selector = GcProgressSelectorV2::decode(raw_selector).expect("GC selector decode");
+    let progress_keys = [Key(Bytes::copy_from_slice(
+        selector.progress_object_id.as_bytes(),
+    ))];
+    let progress_result = read
+        .get_many(&[GetManyRequest {
+            space: OBJECT_SPACE,
+            keys: &progress_keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("GC progress");
+    let raw_progress = match progress_result.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes,
+        other => panic!("expected GC progress object, got {other:?}"),
+    };
+    let progress = GcProgressV2::decode(selector.progress_object_id, raw_progress)
+        .expect("GC progress decode");
+    let mark_root = progress
+        .mark_index_root
+        .expect("selector roots produced marks");
+    drop(read);
+
+    let mut corrupt = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("corruption write");
+    corrupt
+        .delete_many(
+            OBJECT_SPACE,
+            &[Key(Bytes::copy_from_slice(mark_root.as_bytes()))],
+        )
+        .await
+        .expect("remove mark root");
+    corrupt.commit().await.expect("commit corruption");
+
+    assert!(advance_gc(&storage, GcBudget::default()).await.is_err());
+    assert!(object_present(&storage, seed.repository_root_id).await);
+    assert_eq!(
+        abort_corrupt_gc(&storage).await.expect("abort corrupt GC"),
+        GcStepStatus::AbortedCorruptProgress
+    );
+    assert!(!selector_present(&storage, gc_progress_selector_key()).await);
+    sweep(&storage, seed.branch_id).await;
+    open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("semantic graph survives maintenance corruption");
 }
 
 #[tokio::test]
@@ -1535,20 +2209,14 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let view = open_coherent_view(&storage, disposable)
         .await
         .expect("retirement view");
-    let commit_catalog_edit = retire_commit_catalog_entries(
-        view.repository_root().commit_catalog_root,
-        &[CommitId::from_bytes(raw_id(0x80))],
-        view.read(),
-    )
-    .await
-    .expect("retire commit");
-    let change_catalog_edit = retire_change_catalog_entries(
-        view.repository_root().change_catalog_root,
-        &[initial_ref_id, ChangeId::from_bytes(raw_id(0x81))],
-        view.read(),
-    )
-    .await
-    .expect("retire changes");
+    let commit_catalog_edit =
+        retire_commit_catalog_entries(view.repository_root().commit_catalog_root, &[], view.read())
+            .await
+            .expect("retire commit");
+    let change_catalog_edit =
+        retire_change_catalog_entries(view.repository_root().change_catalog_root, &[], view.read())
+            .await
+            .expect("retire changes");
     let repository = RepositoryRootV1 {
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
@@ -1585,9 +2253,35 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         other => panic!("expected checkpoint selector, got {other:?}"),
     };
     let selector = SnapshotSelectorV1::decode(&raw).expect("checkpoint selector");
+    let commit_catalog_edit = retire_commit_catalog_entries(
+        view.repository_root().commit_catalog_root,
+        &[CommitId::from_bytes(raw_id(0x80))],
+        view.read(),
+    )
+    .await
+    .expect("final commit retirement");
+    let change_catalog_edit = retire_change_catalog_entries(
+        view.repository_root().change_catalog_root,
+        &[initial_ref_id, ChangeId::from_bytes(raw_id(0x81))],
+        view.read(),
+    )
+    .await
+    .expect("final change retirement");
+    let repository = RepositoryRootV1 {
+        commit_catalog_root: commit_catalog_edit.root,
+        change_catalog_root: change_catalog_edit.root,
+        ..view.repository_root()
+    };
     let mut release = PreparedPublication::from_global_epoch(&view).expect("release");
     release
-        .release_snapshot_pin(selector, raw)
+        .release_snapshot_pin_with_catalog_retirement(
+            &view,
+            selector,
+            raw,
+            commit_catalog_edit,
+            change_catalog_edit,
+            repository,
+        )
         .expect("release checkpoint");
     drop(view);
     release.commit(&storage).await.expect("release commit");
@@ -1699,9 +2393,6 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
     let publish_view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("publish view");
-    let gc_view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("GC view");
     let mut root_only = PreparedPublication::from_global_epoch(&publish_view).expect("root move");
     assert_eq!(
         root_only
@@ -1714,16 +2405,9 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
             .expect("checkpoint selector"),
         target_id
     );
-    let plan = discover_sweep_plan(&gc_view).await.expect("stale plan");
-    let mut stale_gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
-    stale_gc.apply_sweep_plan(plan).expect("proof");
     drop(publish_view);
-    drop(gc_view);
     root_only.commit(&storage).await.expect("root first");
-    assert!(matches!(
-        stale_gc.commit(&storage).await,
-        Err(StorageError::PreconditionFailed(_))
-    ));
+    sweep(&storage, seed.branch_id).await;
 
     let inverse = Memory::new();
     seed_storage(&inverse, &seed).await;
@@ -1742,9 +2426,6 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
     let publish_view = open_coherent_view(&inverse, seed.branch_id)
         .await
         .expect("publish view");
-    let gc_view = open_coherent_view(&inverse, seed.branch_id)
-        .await
-        .expect("GC view");
     let mut stale_root = PreparedPublication::from_global_epoch(&publish_view).expect("root move");
     stale_root
         .publish_current_snapshot_pin(
@@ -1754,12 +2435,8 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
             SelectorExpectation::Absent,
         )
         .expect("root selector");
-    let plan = discover_sweep_plan(&gc_view).await.expect("GC plan");
-    let mut gc = PreparedPublication::from_global_epoch(&gc_view).expect("GC");
-    gc.apply_sweep_plan(plan).expect("proof");
     drop(publish_view);
-    drop(gc_view);
-    gc.commit(&inverse).await.expect("GC first");
+    sweep(&inverse, seed.branch_id).await;
     assert!(matches!(
         stale_root.commit(&inverse).await,
         Err(StorageError::PreconditionFailed(_))
@@ -1801,52 +2478,10 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
             .publish_current_snapshot_pin(&view, role, selector_id, SelectorExpectation::Absent)
             .expect("role selector");
     }
-    let mark_pack = GcMarkPackV1 {
-        object_ids: vec![target_id],
-        next_pack_object_id: None,
-    };
-    let progress_id = roles
-        .publish_gc_progress(
-            &mark_pack,
-            None,
-            view.global_selector().epoch,
-            1,
-            SelectorExpectation::Absent,
-        )
-        .expect("GC selector");
     drop(view);
     roles.commit(&storage).await.expect("all roles");
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, target_id).await);
-    assert!(object_present(&storage, progress_id).await);
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("release GC progress view");
-    let keys = [Key(gc_progress_selector_key())];
-    let loaded = view
-        .read()
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await
-        .expect("GC selector read");
-    let raw = match loaded.values.as_slice() {
-        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
-        other => panic!("expected GC selector, got {other:?}"),
-    };
-    let selector = GcProgressSelectorV1::decode(&raw).expect("GC selector");
-    let mut release = PreparedPublication::from_global_epoch(&view).expect("GC release");
-    release
-        .release_gc_progress(selector, raw)
-        .expect("release GC progress");
-    drop(view);
-    release.commit(&storage).await.expect("GC release commit");
-    sweep(&storage, seed.branch_id).await;
-    assert!(!object_present(&storage, progress_id).await);
 }
 
 #[tokio::test]
@@ -1908,10 +2543,7 @@ async fn full_selector_scan_crosses_storage_page_and_corruption_fails_closed() {
         .commit(&storage)
         .await
         .expect("publish authenticated corruption");
-    let view = open_coherent_view(&storage, seed.branch_id)
-        .await
-        .expect("view after corruption");
-    assert!(discover_sweep_plan(&view).await.is_err());
+    assert!(sweep_result(&storage).await.is_err());
 }
 
 #[test]

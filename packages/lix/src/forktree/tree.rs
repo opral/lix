@@ -192,7 +192,7 @@ pub(crate) struct OrderedTreeEdit {
 /// for state, catalog, receipt, or retention values.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct OrderedTreeEdges {
-    pub(super) object_ids: Vec<ObjectId>,
+    pub(super) object_ids: Vec<(ObjectId, ObjectDomain)>,
     pub(super) commit_entries: Vec<(CommitId, CommitCatalogEntry)>,
     pub(super) change_entries: Vec<(ChangeId, ChangeCatalogEntry)>,
 }
@@ -207,7 +207,11 @@ pub(super) fn ordered_tree_edges(
     let mut change_entries = Vec::new();
     match node.body {
         NodeBody::Internal(children) => {
-            object_ids.extend(children.into_iter().map(|child| child.id));
+            object_ids.extend(
+                children
+                    .into_iter()
+                    .map(|child| (child.id, ObjectDomain::OrderedTreeNode)),
+            );
         }
         NodeBody::Leaf(entries) => {
             for entry in entries {
@@ -215,7 +219,12 @@ pub(super) fn ordered_tree_edges(
                     TreeKind::State => {
                         let value = super::state::decode_state_value(&entry.value)
                             .map_err(|error| corruption(error.to_string()))?;
-                        object_ids.extend(value.blob_manifest_object_ids);
+                        object_ids.extend(
+                            value
+                                .blob_manifest_object_ids
+                                .into_iter()
+                                .map(|id| (id, ObjectDomain::BlobManifest)),
+                        );
                     }
                     TreeKind::CommitCatalog => {
                         let key = CommitId::from_bytes(
@@ -226,7 +235,7 @@ pub(super) fn ordered_tree_edges(
                                 .map_err(|_| corruption("CommitCatalog key is not a UUID"))?,
                         );
                         let value = CommitCatalogEntry::decode(&entry.value)?;
-                        object_ids.push(value.commit_object_id);
+                        object_ids.push((value.commit_object_id, ObjectDomain::Commit));
                         commit_entries.push((key, value));
                     }
                     TreeKind::ChangeCatalog => {
@@ -238,35 +247,61 @@ pub(super) fn ordered_tree_edges(
                                 .map_err(|_| corruption("ChangeCatalog key is not a UUID"))?,
                         );
                         let value = ChangeCatalogEntry::decode(&entry.value)?;
-                        object_ids.push(value.change_object_id);
-                        object_ids.push(match value.owner {
+                        let change_domain = match value.owner {
                             ChangeCatalogOwner::CommitMember {
                                 commit_object_id, ..
-                            } => commit_object_id,
+                            } => {
+                                object_ids.push((commit_object_id, ObjectDomain::Commit));
+                                ObjectDomain::SemanticChange
+                            }
                             ChangeCatalogOwner::BranchRef {
                                 ref_change_object_id,
                                 ..
-                            } => ref_change_object_id,
-                        });
+                            } => {
+                                if ref_change_object_id != value.change_object_id {
+                                    return Err(corruption(
+                                        "branch-ref catalog owner does not equal its Change object",
+                                    ));
+                                }
+                                ObjectDomain::BranchRefChange
+                            }
+                        };
+                        object_ids.push((value.change_object_id, change_domain));
                         change_entries.push((key, value));
                     }
                     TreeKind::Receipt | TreeKind::Retention => {
-                        object_ids.push(ObjectId::from_bytes(
+                        let id = ObjectId::from_bytes(
                             entry
                                 .value
                                 .as_slice()
                                 .try_into()
                                 .map_err(|_| corruption("tree object edge is not 32 bytes"))?,
+                        );
+                        object_ids.push((
+                            id,
+                            if node.kind == TreeKind::Receipt {
+                                ObjectDomain::UploadPart
+                            } else {
+                                ObjectDomain::SnapshotTarget
+                            },
                         ));
                     }
                 }
             }
         }
     }
-    if object_ids.contains(&ObjectId::ZERO) {
+    if object_ids.iter().any(|(id, _)| *id == ObjectId::ZERO) {
         return Err(corruption("ordered-tree node contains a zero object edge"));
     }
-    object_ids.sort_unstable();
+    object_ids.sort_unstable_by_key(|(id, domain)| (*id, domain.code()));
+    if object_ids
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+    {
+        return Err(corruption(
+            "ordered-tree object edge has conflicting authenticated domains",
+        ));
+    }
     object_ids.dedup();
     Ok(OrderedTreeEdges {
         object_ids,

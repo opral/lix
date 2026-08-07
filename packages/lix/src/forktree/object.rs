@@ -1,14 +1,17 @@
 use bytes::Bytes;
 
-use crate::storage::{SpaceId, StorageError, StorageSpace};
+use crate::storage::{StorageError, StorageSpace};
 
 use super::codec::{Decoder, Encoder, corruption, keyed_hash};
 
 const OBJECT_MAGIC: &[u8; 8] = b"LIXFTO\0\x01";
 const OBJECT_HASH_DOMAIN: &str = "lix forktree immutable object id v1";
 
-pub(crate) const OBJECT_SPACE: StorageSpace =
-    StorageSpace::immutable(SpaceId(0x0009_0001), "forktree.object.v1");
+pub(crate) const OBJECT_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0009_0001,
+    "forktree.object.v1",
+    crate::storage::ValueSemantics::Immutable,
+);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ObjectId([u8; 32]);
@@ -48,12 +51,15 @@ pub(super) enum ObjectDomain {
     BlobChunk = 9,
     BlobManifest = 10,
     SnapshotTarget = 11,
-    GcMarkPack = 12,
-    GcProgress = 13,
+    GcMarkPackV2 = 12,
+    GcProgressV2 = 13,
+    GcRadixNodeV1 = 14,
+    GcQueuePackV1 = 15,
+    GcLiveBranchPackV1 = 16,
 }
 
 impl ObjectDomain {
-    fn decode(value: u16) -> Result<Self, StorageError> {
+    pub(super) fn decode(value: u16) -> Result<Self, StorageError> {
         match value {
             1 => Ok(Self::RepositoryRoot),
             2 => Ok(Self::BranchSnapshot),
@@ -66,10 +72,17 @@ impl ObjectDomain {
             9 => Ok(Self::BlobChunk),
             10 => Ok(Self::BlobManifest),
             11 => Ok(Self::SnapshotTarget),
-            12 => Ok(Self::GcMarkPack),
-            13 => Ok(Self::GcProgress),
+            12 => Ok(Self::GcMarkPackV2),
+            13 => Ok(Self::GcProgressV2),
+            14 => Ok(Self::GcRadixNodeV1),
+            15 => Ok(Self::GcQueuePackV1),
+            16 => Ok(Self::GcLiveBranchPackV1),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
+    }
+
+    pub(super) const fn code(self) -> u16 {
+        self as u16
     }
 }
 

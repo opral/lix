@@ -12,15 +12,16 @@ use bytes::Bytes;
 
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageSpace, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
 use super::types::CommitStateMutationPart;
 
-pub(crate) const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_002d),
+pub(crate) const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_002d,
     "tracked_state.commit_mutation_directory_node.v1",
+    crate::storage::ValueSemantics::Immutable,
 );
 
 const NODE_MAGIC: &[u8] = b"LXMD1";

@@ -10,18 +10,20 @@ use std::borrow::Cow;
 use bytes::Bytes;
 
 use crate::json_store::JsonSlot;
-use crate::storage_adapter::{StorageSpace, StorageSpaceId};
+use crate::storage_adapter::StorageSpace;
 use crate::tracked_state::codec::decode_value;
 use crate::tracked_state::types::TrackedStateIndexValue;
 use crate::{LixError, storage_codec};
 
-pub(crate) const CURRENT_STATE_DATA_PART_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_002f),
+pub(crate) const CURRENT_STATE_DATA_PART_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_002f,
     "tracked_state.current_state_data_part.v1",
+    crate::storage::ValueSemantics::Immutable,
 );
-pub(crate) const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace = StorageSpace::immutable(
-    StorageSpaceId(0x0004_0030),
+pub(crate) const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0030,
     "tracked_state.current_state_data_part_refs.v1",
+    crate::storage::ValueSemantics::Immutable,
 );
 
 pub(crate) const CURRENT_STATE_DATA_PART_MAX_ROWS: usize = 512;

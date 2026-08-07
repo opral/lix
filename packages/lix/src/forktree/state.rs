@@ -3,10 +3,14 @@ use std::borrow::Cow;
 use crate::LixError;
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
-use crate::storage::{SpaceId, StorageSpace};
+use crate::storage::StorageSpace;
 
 use super::model::CanonicalBranchId;
 use super::object::ObjectId;
+
+// A state-tree leaf contains at most 64 rows. Four roots per row keeps the
+// authenticated leaf edge page at or below the owner-wide 256-edge bound.
+const MAX_BLOB_ROOTS_PER_STATE_ROW: usize = 4;
 
 const STATE_VALUE_MAGIC: &[u8; 8] = b"LIXFTV\0\x01";
 const UNTRACKED_KEY_MAGIC: &[u8; 8] = b"LIXFTU\0\x01";
@@ -26,8 +30,11 @@ const ENTITY_PK_BYTES: u8 = 0x03;
 /// Mutable authority retained only for rows whose schema explicitly declares
 /// them untracked. Tracked rows, selectors, catalogs, and roots are forbidden
 /// from this space.
-pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0009_0003), "forktree.untracked_row.v1");
+pub(crate) const UNTRACKED_ROW_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0009_0003,
+    "forktree.untracked_row.v1",
+    crate::storage::ValueSemantics::Mutable,
+);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StateKeyRef<'a> {
@@ -531,6 +538,11 @@ fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), LixError> {
 }
 
 fn put_object_ids(output: &mut Vec<u8>, values: &[ObjectId]) -> Result<(), LixError> {
+    if values.len() > MAX_BLOB_ROOTS_PER_STATE_ROW {
+        return Err(state_error(
+            "ForkTree state row exceeds its authenticated blob-root edge bound",
+        ));
+    }
     let count = u32::try_from(values.len())
         .map_err(|_| state_error("ForkTree state blob-root count exceeds u32"))?;
     output.extend_from_slice(&count.to_be_bytes());
@@ -619,7 +631,9 @@ impl<'a> ValueDecoder<'a> {
                 .try_into()
                 .expect("decoder returned fixed u32 width"),
         ) as usize;
-        if count > self.bytes.len().saturating_sub(self.offset) / 32 {
+        if count > MAX_BLOB_ROOTS_PER_STATE_ROW
+            || count > self.bytes.len().saturating_sub(self.offset) / 32
+        {
             return Err(state_error(format!("{field} count exceeds encoded body")));
         }
         let mut values = Vec::with_capacity(count);

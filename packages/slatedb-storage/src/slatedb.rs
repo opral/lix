@@ -25,8 +25,8 @@ use lix::storage::immutable::{
 use lix::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    ScanChunk, ScanOptions, Storage, StorageError, StorageRead, StorageSpace, StorageWrite,
+    StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -2638,7 +2638,7 @@ async fn check_preconditions(
                         .filter_map(|(offset, precondition)| match precondition {
                             Precondition::KeyValueHashEquals { space, .. }
                             | Precondition::KeyValueEquals { space, .. }
-                                if space.value_semantics == ValueSemantics::Immutable =>
+                                if space.value_semantics() == ValueSemantics::Immutable =>
                             {
                                 values[offset]
                                     .as_ref()
@@ -2670,7 +2670,7 @@ async fn check_preconditions(
 
                 let matches_precondition = match &preconditions[index] {
                     Precondition::RangeEmpty { space, range } => {
-                        let range = physical_range(space.id, range.clone())?;
+                        let range = physical_range(space.id(), range.clone())?;
                         let bounds = EncodedBounds::new(range.clone(), None);
                         let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
                         let visible_writes =
@@ -2754,7 +2754,9 @@ fn point_precondition_physical_key(
         Precondition::KeyAbsent { space, key }
         | Precondition::KeyPresent { space, key }
         | Precondition::KeyValueHashEquals { space, key, .. }
-        | Precondition::KeyValueEquals { space, key, .. } => physical_key(space.id, key).map(Some),
+        | Precondition::KeyValueEquals { space, key, .. } => {
+            physical_key(space.id(), key).map(Some)
+        }
         Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => Ok(None),
     }
 }
@@ -2793,7 +2795,7 @@ impl StorageRead for SlateDBRead {
             if let [request] = requests
                 && let [key] = request.keys
             {
-                let key = physical_key(request.space.id, key)?;
+                let key = physical_key(request.space.id(), key)?;
                 let snapshot = Arc::clone(&self.snapshot);
                 let durability = self.durability;
                 let mut value = if durability == ReadDurability::Visible {
@@ -2843,7 +2845,7 @@ impl StorageRead for SlateDBRead {
             );
             for request in requests {
                 for key in request.keys {
-                    physical_keys.push(physical_key(request.space.id, key)?);
+                    physical_keys.push(physical_key(request.space.id(), key)?);
                 }
             }
             if physical_keys.is_empty() {
@@ -2936,11 +2938,11 @@ impl StorageRead for SlateDBRead {
             }
 
             let cursor_range = range.clone();
-            let range = physical_range(space.id, range)?;
+            let range = physical_range(space.id(), range)?;
             let resume_after = opts
                 .resume_after
                 .as_ref()
-                .map(|key| physical_key(space.id, key))
+                .map(|key| physical_key(space.id(), key))
                 .transpose()?;
             let bounds = EncodedBounds::new(range, resume_after.as_ref());
             if bounds.is_empty() {
@@ -3108,7 +3110,7 @@ async fn hydrate_immutable_value_gets(
     let mut result_index = 0usize;
     for request in requests {
         for _ in request.keys {
-            if request.space.value_semantics == ValueSemantics::Immutable
+            if request.space.value_semantics() == ValueSemantics::Immutable
                 && request.opts.projection == CoreProjection::FullValue
                 && let Some(Some(ProjectedValue::FullValue(marker))) = results.get(result_index)
             {
@@ -3135,7 +3137,8 @@ async fn hydrate_immutable_value_scan(
     projection: CoreProjection,
     chunk: &mut ScanChunk,
 ) -> Result<(), StorageError> {
-    if space.value_semantics != ValueSemantics::Immutable || projection != CoreProjection::FullValue
+    if space.value_semantics() != ValueSemantics::Immutable
+        || projection != CoreProjection::FullValue
     {
         return Ok(());
     }
@@ -3266,7 +3269,7 @@ impl StorageWrite for SlateDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 let put_entries = entries.entries.len() as u64;
                 let mut segment_writer = ImmutableSegmentWriter::default();
                 let mut written_bytes = 0_u64;
@@ -3275,7 +3278,7 @@ impl StorageWrite for SlateDBWrite {
                     .into_iter()
                     .map(|entry| {
                         Ok((
-                            physical_key(space.id, &entry.key)?,
+                            physical_key(space.id(), &entry.key)?,
                             stored_value_bytes(entry.value),
                         ))
                     })
@@ -3361,7 +3364,7 @@ impl StorageWrite for SlateDBWrite {
                 }
                 total.checked_add(key_len).ok_or(StorageError::InvalidKey)
             })?;
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for entry in &entries.entries {
                 physical_keys.extend_from_slice(&space_prefix);
@@ -3398,7 +3401,7 @@ impl StorageWrite for SlateDBWrite {
                 }
                 total.checked_add(key_len).ok_or(StorageError::InvalidKey)
             })?;
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for key in keys {
                 physical_keys.extend_from_slice(&space_prefix);
@@ -3425,7 +3428,7 @@ impl StorageWrite for SlateDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             self.serialize_publication().await?;
-            let range = physical_range(space.id, range)?;
+            let range = physical_range(space.id(), range)?;
             let bounds = EncodedBounds::new(range.clone(), None);
             if bounds.is_empty() {
                 self.stats.deleted_ranges += 1;
@@ -4228,18 +4231,18 @@ fn db_cache(block_cache_bytes: u64, metadata_cache_bytes: u64) -> Arc<dyn DbCach
     )
 }
 
-fn physical_key(space: SpaceId, key: &Key) -> Result<Key, StorageError> {
+fn physical_key(space: u32, key: &Key) -> Result<Key, StorageError> {
     let len = SPACE_PREFIX_LEN + key.0.len();
     if len > MAX_SLATEDB_KEY_LEN {
         return Err(StorageError::InvalidKey);
     }
     let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Ok(Key(Bytes::from(bytes)))
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageError> {
+fn physical_range(space: u32, range: KeyRange) -> Result<KeyRange, StorageError> {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| -> Result<Bound<Key>, StorageError> {
         Ok(match bound {
             Bound::Included(key) => Bound::Included(physical_key(space, &key)?),
@@ -4250,11 +4253,11 @@ fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageEr
     Ok(KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         )?,
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         )?,
@@ -4782,8 +4785,7 @@ impl WriteGate {
 mod tests {
     use super::*;
 
-    const TEST_IMMUTABLE_SPACE: StorageSpace =
-        StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
+    const TEST_IMMUTABLE_SPACE: StorageSpace = lix::storage::conformance::IMMUTABLE_BENCH_1;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use lix::storage::{
@@ -5209,7 +5211,7 @@ mod tests {
             .expect("seed immutable object for blocked listing");
         let blocked = store.block_immutable_lists();
 
-        let mutable_space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let mutable_space = lix::storage::conformance::MUTABLE_7;
         let mut write = tokio::time::timeout(
             Duration::from_secs(1),
             storage.begin_write(WriteOptions::default()),
@@ -5318,7 +5320,7 @@ mod tests {
             .expect("begin first write after reopen");
         write
             .put_many(
-                StorageSpace::mutable(SpaceId(8), "test.mutable"),
+                lix::storage::conformance::MUTABLE_8,
                 PutBatch {
                     entries: vec![PutEntry {
                         key: Key(Bytes::from_static(b"trigger")),
@@ -5374,7 +5376,7 @@ mod tests {
             .expect("first write starts before background failure");
         write
             .put_many(
-                StorageSpace::mutable(SpaceId(9), "test.mutable"),
+                lix::storage::conformance::MUTABLE_9,
                 PutBatch {
                     entries: vec![PutEntry {
                         key: Key(Bytes::from_static(b"key")),
@@ -5731,7 +5733,7 @@ mod tests {
 
         let immutable_directory = directory.path().join(DB_PATH).join(IMMUTABLE_VALUE_PATH);
         let physical_key =
-            physical_key(TEST_IMMUTABLE_SPACE.id, &key).expect("derive physical immutable key");
+            physical_key(TEST_IMMUTABLE_SPACE.id(), &key).expect("derive physical immutable key");
         let (segment_key, encoded_value, _) = immutable_test_segment(physical_key, value.clone());
         let segment_hash: [u8; 32] = segment_key.0.as_ref().try_into().expect("segment hash");
         let stored_path =
@@ -5885,7 +5887,7 @@ mod tests {
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
         let physical_key =
-            physical_key(TEST_IMMUTABLE_SPACE.id, &key).expect("derive physical immutable key");
+            physical_key(TEST_IMMUTABLE_SPACE.id(), &key).expect("derive physical immutable key");
         let (segment_key, encoded_value, _range) =
             immutable_test_segment(physical_key, value.clone());
         let segment_hash: [u8; 32] = segment_key.0.as_ref().try_into().expect("segment hash");
@@ -5949,7 +5951,7 @@ mod tests {
             let mut write = block_on(storage.begin_write(WriteOptions::default()))
                 .expect("begin local GC write");
             block_on(write.put_many(
-                StorageSpace::mutable(SpaceId(7), "test.mutable"),
+                lix::storage::conformance::MUTABLE_7,
                 PutBatch {
                     entries: vec![PutEntry {
                         key: Key(Bytes::copy_from_slice(key)),
@@ -5999,7 +6001,7 @@ mod tests {
         let mut write =
             block_on(storage.begin_write(WriteOptions::default())).expect("begin publication");
         block_on(write.put_many(
-            StorageSpace::mutable(SpaceId(7), "test.mutable"),
+            lix::storage::conformance::MUTABLE_7,
             PutBatch {
                 entries: vec![PutEntry {
                     key: Key(Bytes::from_static(b"key")),
@@ -6171,7 +6173,7 @@ mod tests {
     fn fresh_storage_uses_versioned_segmented_format() {
         let store = Arc::new(InMemory::new());
         let db_path = "test-zstd-physical-format";
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_7;
         let storage = SlateDB::open_object_store_with_options(
             db_path,
             store.clone(),
@@ -6208,7 +6210,7 @@ mod tests {
             );
             assert!(
                 db.manifest()
-                    .segment(&space.id.0.to_be_bytes())
+                    .segment(&space.id().to_be_bytes())
                     .is_some_and(|segment| !segment.l0().is_empty()),
                 "the row must be isolated in its storage-space segment"
             );
@@ -6257,7 +6259,7 @@ mod tests {
         )
         .expect("open memory object-store slatedb storage");
 
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_7;
         let key = Key(Bytes::from_static(b"hello"));
         let value = Bytes::from_static(b"world");
 
@@ -6318,7 +6320,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open cursor-test storage");
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_7;
         let keys = [b"a", b"b", b"c"].map(|bytes| Key(Bytes::from_static(bytes)));
         let mut write = block_on(storage.begin_write(WriteOptions::default()))
             .expect("begin cursor-test write");
@@ -6391,7 +6393,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open memory object-store slatedb storage");
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_7;
         let present = Key(Bytes::from_static(b"present"));
         let missing = Key(Bytes::from_static(b"missing"));
         let value = Bytes::from_static(b"value");
@@ -6505,7 +6507,7 @@ mod tests {
             .expect("lock write pipeline")
             .tail = Some(Arc::clone(&blocker));
 
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_7;
         let key = Key(Bytes::from_static(b"pending"));
         let value = Bytes::from_static(b"value");
         let mut write =
@@ -6630,7 +6632,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open snapshot cache storage");
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_7;
         let key = Key(Bytes::from_static(b"versioned-key"));
 
         let mut initial =
@@ -6780,7 +6782,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open first SlateDB writer");
-        let space = StorageSpace::mutable(SpaceId(10), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_10;
 
         let mut seed =
             block_on(first.begin_write(WriteOptions::default())).expect("begin seed write");
@@ -6859,7 +6861,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open commit visibility storage");
-        let space = StorageSpace::mutable(SpaceId(8), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_8;
         let key = Key(Bytes::from_static(b"visible-before-durable"));
         let queued_key = Key(Bytes::from_static(b"visible-while-draining"));
 
@@ -6930,7 +6932,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open active-publication storage");
-        let space = StorageSpace::mutable(SpaceId(8), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_8;
         let key = Key(Bytes::from_static(b"active-view"));
         let value = Bytes::from_static(b"value");
 
@@ -7066,7 +7068,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open durable read storage");
-        let space = StorageSpace::mutable(SpaceId(8), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_8;
         let key = Key(Bytes::from_static(b"visible-before-remote-durable"));
         let value = Bytes::from_static(b"value");
 
@@ -7170,7 +7172,7 @@ mod tests {
             }))
             .expect("begin await-durable write");
             block_on(write.put_many(
-                StorageSpace::mutable(SpaceId(8), "test.mutable"),
+                lix::storage::conformance::MUTABLE_8,
                 PutBatch {
                     entries: vec![PutEntry {
                         key: Key(Bytes::from_static(b"durable-before-ack")),
@@ -7208,7 +7210,7 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open failed commit storage");
-        let space = StorageSpace::mutable(SpaceId(9), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_9;
         let key = Key(Bytes::from_static(b"rejected"));
 
         let blocked_write = store.block_next_write();
@@ -7242,7 +7244,7 @@ mod tests {
     fn dropping_last_handle_waits_for_background_flush() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let db_path = "test-close-background-durability";
-        let space = StorageSpace::mutable(SpaceId(8), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_8;
         let key = Key(Bytes::from_static(b"background-commit"));
         let value = Bytes::from_static(b"durable");
         let storage = SlateDB::open_object_store_with_options(
@@ -7309,7 +7311,7 @@ mod tests {
     fn cloned_snapshot_reads_overlap() {
         let inner = Arc::new(InMemory::new());
         let db_path = "test-concurrent-reads";
-        let space = StorageSpace::mutable(SpaceId(9), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_9;
         let left_key = Key(Bytes::from_static(b"left"));
         let right_key = Key(Bytes::from_static(b"right"));
         let value = Bytes::from(vec![b'x'; 128 * 1024]);
@@ -7400,7 +7402,7 @@ mod tests {
     async fn pending_object_store_read_yields_to_executor() {
         let inner = Arc::new(InMemory::new());
         let db_path = "test-async-read-yields";
-        let space = StorageSpace::mutable(SpaceId(10), "test.mutable");
+        let space = lix::storage::conformance::MUTABLE_10;
         let key = Key(Bytes::from_static(b"remote-key"));
         let value = Bytes::from(vec![b'x'; 128 * 1024]);
 
@@ -7658,7 +7660,7 @@ mod tests {
             .collect::<Vec<_>>();
         blocked.wait_for_entries(4, "four concurrent immutable uploads");
 
-        let mutable_space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let mutable_space = lix::storage::conformance::MUTABLE_7;
         let mutable_key = Key(Bytes::from_static(b"project-save"));
         let mut save = storage
             .begin_write(WriteOptions::default())

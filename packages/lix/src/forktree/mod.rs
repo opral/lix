@@ -6,6 +6,7 @@
 
 mod blob;
 mod codec;
+mod gc_index;
 mod model;
 mod object;
 mod publication;
@@ -19,13 +20,13 @@ pub(crate) use blob::{UploadBindingRef, prepare_upload_completion};
 pub(crate) use model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GcMarkPackV1,
-    GcProgressSelectorV1, GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
-pub(crate) use object::{OBJECT_SPACE, ObjectId};
+pub(crate) use object::ObjectId;
 pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
-pub(crate) use reachability::discover_sweep_plan;
+pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
     CatalogPage, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree, load_change,
     load_commit, page_changes, page_commits, put_change_catalog_entries,
@@ -65,8 +66,6 @@ const _: () = {
             CommitCatalogEntry,
             CommitId,
             CommitObjectV1,
-            GcMarkPackV1,
-            GcProgressSelectorV1,
             GlobalSelectorV1,
             RepositoryRootV1,
             SnapshotRole,
@@ -98,11 +97,13 @@ const _: () = {
             CoherentView<R>,
             UploadBindingRef<'static>,
         )> = None;
-        let _ = OBJECT_SPACE;
         let _ = RECEIPT_TREE_FANOUT;
         let _ = RECEIPT_TREE_LEAF_ENTRIES;
         let _ = prepare_upload_completion::<R>;
-        let _ = discover_sweep_plan::<R>;
+        let _ = advance_gc::<S>;
+        let _ = abort_corrupt_gc::<S>;
+        let _ = GcBudget::default;
+        let _: Option<GcStepStatus> = None;
         let _ = edit_state_tree::<R>;
         let _ = load_change::<R>;
         let _ = load_commit::<R>;
@@ -128,14 +129,11 @@ const _: () = {
         let _ = PreparedPublication::stage_receipt_tree_edit;
         let _ = PreparedPublication::abort_upload;
         let _ = PreparedPublication::publish_current_snapshot_pin::<R>;
-        let _ = PreparedPublication::release_snapshot_pin;
-        let _ = PreparedPublication::publish_gc_progress;
-        let _ = PreparedPublication::release_gc_progress;
+        let _ = PreparedPublication::release_snapshot_pin_with_catalog_retirement::<R>;
         let _ = PreparedPublication::publish_state_transition::<R>;
         let _ = PreparedPublication::publish_completed_upload::<R>;
         let _ = PreparedPublication::put_untracked_row;
         let _ = PreparedPublication::delete_untracked_row;
-        let _ = PreparedPublication::apply_sweep_plan;
         let _ = PreparedPublication::publish_branch_retirement::<R>;
         let _ = PreparedPublication::commit::<S>;
         let _ = StateTreeMutation::insert;

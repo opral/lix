@@ -6483,7 +6483,7 @@ mod tests {
         LiveStateProjection, LiveStateRowRequest, PACKED_CURRENT_BASE_SPACE,
     };
     use crate::storage::{
-        CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, SpaceId, Storage,
+        CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, Storage,
         StorageError, StorageRead, StorageWrite,
     };
     use crate::storage_adapter::{
@@ -6755,20 +6755,22 @@ mod tests {
     const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
     // `tracked_state::storage` intentionally keeps this internal; this test
     // observes the durable space rather than reaching through that module.
-    const TRACKED_STATE_TREE_CHUNK_SPACE_ID: SpaceId = SpaceId(0x0004_0001);
-    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID: SpaceId = SpaceId(0x0004_002b);
-    const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
+    const TRACKED_STATE_TREE_CHUNK_SPACE_ID: u32 = 0x0004_0001;
+    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID: u32 = 0x0004_002b;
+    const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::engine_declared(
         TRACKED_STATE_TREE_CHUNK_SPACE_ID,
         "tracked_state.tree_chunk",
+        crate::storage::ValueSemantics::Mutable,
     );
-    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::engine_declared(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
         "tracked_state.commit_state_manifest.v7",
+        crate::storage::ValueSemantics::Mutable,
     );
     // V11 has no tracked-head marker space. Keep the retired v10 ID here only
     // as a negative test sentinel: normal serving and staging must never read
     // it after the branch control became the publication authority.
-    const V10_TRACKED_HEAD_MARKER_SPACE_ID: SpaceId = SpaceId(0x0004_0014);
+    const V10_TRACKED_HEAD_MARKER_SPACE_ID: u32 = 0x0004_0014;
 
     fn mixed_certified_guard_write_set() -> PreparedWriteSet {
         let branch_id = "01960000-0000-7000-8000-0000000000c1";
@@ -6929,7 +6931,7 @@ mod tests {
                         .branch_control_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space.id == V10_TRACKED_HEAD_MARKER_SPACE_ID {
+                if space.id() == V10_TRACKED_HEAD_MARKER_SPACE_ID {
                     self.counts
                         .v10_marker_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -6939,12 +6941,12 @@ mod tests {
                         .row_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space.id == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
+                if space.id() == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
                     self.counts
                         .tree_chunk_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space.id == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID {
+                if space.id() == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID {
                     self.counts
                         .commit_root_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -6962,12 +6964,12 @@ mod tests {
             if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
-            if space.id == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
+            if space.id() == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
                 self.counts
                     .tree_chunk_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if space.id == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID {
+            if space.id() == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID {
                 self.counts
                     .commit_root_scan_calls
                     .fetch_add(1, Ordering::Relaxed);

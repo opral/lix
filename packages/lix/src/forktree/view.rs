@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
@@ -10,16 +10,16 @@ use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
-    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
-    ChangeObjectV1, CommitCatalogEntry, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1,
-    branch_selector_key, global_selector_key,
+    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeObjectV1, CommitObjectV1,
+    GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 
 pub(super) const SELECTOR_SPACE: crate::storage::StorageSpace =
-    crate::storage::StorageSpace::mutable(
-        crate::storage::SpaceId(0x0009_0002),
+    crate::storage::StorageSpace::engine_declared(
+        0x0009_0002,
         "forktree.selector.v1",
+        crate::storage::ValueSemantics::Mutable,
     );
 
 const VIEW_ID_DOMAIN: &str = "lix forktree coherent selector view v1";
@@ -264,21 +264,20 @@ pub(super) async fn load_object_bytes(
 
 async fn authenticate_selected_graph<R>(
     read: &R,
-    repository_id: ObjectId,
-    branch_snapshot_id: ObjectId,
+    _repository_id: ObjectId,
+    _branch_snapshot_id: ObjectId,
     repository: RepositoryRootV1,
     branch: BranchSnapshotV1,
 ) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    // Open authenticates the complete selected immutable closure, including
-    // every tree node, catalog/state edge, blob manifest/chunk, commit parent,
-    // and retained object reachable from the selected pair. No later read can
-    // discover a dangling or mistyped selected edge that open accepted.
-    let _ =
-        super::reachability::mark_reachable(read, vec![repository_id, branch_snapshot_id]).await?;
-    let mut ids = BTreeSet::from([
+    // Open authenticates only the selector pair and directly referenced root
+    // envelopes. Every deeper point/range/history traversal uses the same
+    // retained StorageRead and validates each child edge before output. This
+    // keeps transaction open O(1) in repository size without weakening the
+    // fail-closed boundary for any visited object.
+    let mut ids = vec![
         repository.global_state_root,
         repository.commit_catalog_root,
         repository.change_catalog_root,
@@ -286,11 +285,13 @@ where
         branch.local_state_root,
         branch.historical_global_state_root,
         branch.semantic_head_commit_object_id,
-    ]);
+    ];
     if let Some(id) = branch.latest_ref_change_object_id {
-        ids.insert(id);
+        ids.push(id);
     }
-    let objects = load_object_map(read, ids.into_iter()).await?;
+    ids.sort_unstable();
+    ids.dedup();
+    let objects = load_object_map(read, ids).await?;
     for (id, kind) in [
         (repository.global_state_root, "state"),
         (branch.local_state_root, "state"),
@@ -301,7 +302,6 @@ where
     ] {
         super::tree::validate_root_bytes(id, kind, required_object(&objects, id)?)?;
     }
-    validate_global_state_has_no_tombstones(read, repository.global_state_root).await?;
     let head = CommitObjectV1::decode(
         branch.semantic_head_commit_object_id,
         required_object(&objects, branch.semantic_head_commit_object_id)?,
@@ -313,22 +313,6 @@ where
             "selected semantic head does not authenticate the branch/global state pair",
         ));
     }
-    let commit_entry = super::tree::lookup_on_read(
-        repository.commit_catalog_root,
-        "commit",
-        head.commit_id.as_bytes(),
-        read,
-    )
-    .await?
-    .ok_or_else(|| corruption("selected semantic head is absent from CommitCatalog"))?;
-    if CommitCatalogEntry::decode(&commit_entry)?.commit_object_id
-        != branch.semantic_head_commit_object_id
-    {
-        return Err(corruption(
-            "selected semantic head CommitCatalog entry names another object",
-        ));
-    }
-
     let Some(ref_id) = branch.latest_ref_change_object_id else {
         return Ok(());
     };
@@ -336,9 +320,9 @@ where
     let ChangeObjectV1::BranchRef {
         change_id,
         branch_id,
-        before_semantic_head_commit_object_id,
+        before_semantic_head_commit_object_id: _,
         after_semantic_head_commit_object_id,
-        previous_ref_change_object_id,
+        previous_ref_change_object_id: _,
         ..
     } = change
     else {
@@ -353,87 +337,7 @@ where
             "branch snapshot latest ref-change does not match its branch/head",
         ));
     }
-    let catalog_entry = super::tree::lookup_on_read(
-        repository.change_catalog_root,
-        "change",
-        change_id.as_bytes(),
-        read,
-    )
-    .await?
-    .ok_or_else(|| corruption("selected branch RefChange is absent from ChangeCatalog"))?;
-    let catalog_entry = ChangeCatalogEntry::decode(&catalog_entry)?;
-    if catalog_entry.change_object_id != ref_id
-        || catalog_entry.owner
-            != (ChangeCatalogOwner::BranchRef {
-                ref_change_object_id: ref_id,
-                branch_id: branch.branch_id,
-            })
-    {
-        return Err(corruption(
-            "selected branch RefChange has an invalid ChangeCatalog owner edge",
-        ));
-    }
-
-    let mut target_ids = BTreeSet::new();
-    target_ids.extend(before_semantic_head_commit_object_id);
-    target_ids.extend(after_semantic_head_commit_object_id);
-    target_ids.extend(previous_ref_change_object_id);
-    let targets = load_object_map(read, target_ids.into_iter()).await?;
-    for target in [
-        before_semantic_head_commit_object_id,
-        after_semantic_head_commit_object_id,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let _ = CommitObjectV1::decode(target, required_object(&targets, target)?)?;
-    }
-    if let Some(previous) = previous_ref_change_object_id {
-        match ChangeObjectV1::decode(previous, required_object(&targets, previous)?)? {
-            ChangeObjectV1::BranchRef {
-                branch_id: previous_branch,
-                after_semantic_head_commit_object_id: previous_after,
-                ..
-            } if previous_branch == branch.branch_id
-                && previous_after == before_semantic_head_commit_object_id => {}
-            ChangeObjectV1::BranchRef { .. } => {
-                return Err(corruption(
-                    "branch RefChange predecessor does not join its before target",
-                ));
-            }
-            ChangeObjectV1::Semantic { .. } => {
-                return Err(corruption(
-                    "branch RefChange predecessor names a semantic Change",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn validate_global_state_has_no_tombstones<R>(
-    read: &R,
-    root: ObjectId,
-) -> Result<(), StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let mut start_after: Option<Vec<u8>> = None;
-    loop {
-        let page =
-            super::tree::scan_page_on_read(root, "state", start_after.as_deref(), 64, read).await?;
-        for (_, value) in &page {
-            let value = super::state::decode_state_value(value)
-                .map_err(|error| corruption(error.to_string()))?;
-            if value.cell.deleted() {
-                return Err(corruption("global state root contains a tombstone"));
-            }
-        }
-        start_after = page.last().map(|(key, _)| key.clone());
-        if page.len() < 64 {
-            break;
-        }
-    }
+    let _ = change_id;
     Ok(())
 }
 

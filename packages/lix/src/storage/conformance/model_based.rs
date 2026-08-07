@@ -11,15 +11,30 @@ use crate::storage::conformance::{
 };
 use crate::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, ReadEntry,
-    ReadOptions, ScanOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite,
-    WriteOptions,
+    ReadOptions, ScanOptions, Storage, StorageRead, StorageSpace, StorageWrite, WriteOptions,
 };
 
 const TEST_SPACES: [StorageSpace; 4] = [
-    StorageSpace::mutable(SpaceId(0), "storage.model.zero"),
-    StorageSpace::mutable(SpaceId(7), "storage.model.seven"),
-    StorageSpace::mutable(SpaceId(0x0102_0304), "storage.model.bytes"),
-    StorageSpace::mutable(SpaceId(u32::MAX), "storage.model.max"),
+    StorageSpace::engine_declared(
+        0,
+        "storage.model.zero",
+        crate::storage::ValueSemantics::Mutable,
+    ),
+    StorageSpace::engine_declared(
+        7,
+        "storage.model.seven",
+        crate::storage::ValueSemantics::Mutable,
+    ),
+    StorageSpace::engine_declared(
+        0x0102_0304,
+        "storage.model.bytes",
+        crate::storage::ValueSemantics::Mutable,
+    ),
+    StorageSpace::engine_declared(
+        u32::MAX,
+        "storage.model.max",
+        crate::storage::ValueSemantics::Mutable,
+    ),
 ];
 const SEQUENTIAL_MODEL_SEEDS: u64 = 64;
 const BOUNDARY_MODEL_SEEDS: [u64; 4] = [0x51ce_deed, 0xdead_beef_cafe_babe, u64::MAX - 1, u64::MAX];

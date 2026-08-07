@@ -501,7 +501,7 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{
         Memory, PointReadPlan, ScanPlan, StorageGetOptions, StorageKey, StoragePrefix,
-        StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+        StorageProjectedValue, StorageScanOptions, StorageSpace, StorageValue,
     };
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
@@ -551,10 +551,15 @@ mod tests {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let mut writes = storage_adapter.new_write_set();
         let predecessor_spaces = [
-            StorageSpace::mutable(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
-            StorageSpace::mutable(
-                StorageSpaceId(0x0004_0005),
+            StorageSpace::engine_declared(
+                0x0001_0002,
+                "untracked_state.row.v1",
+                crate::storage::ValueSemantics::Mutable,
+            ),
+            StorageSpace::engine_declared(
+                0x0004_0005,
                 "live_state.index.branch_root.v1",
+                crate::storage::ValueSemantics::Mutable,
             ),
         ];
         for space in predecessor_spaces {
@@ -610,9 +615,10 @@ mod tests {
     async fn predecessor_only_repository_is_uninitialized_and_untouched() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage.clone());
-        let predecessor_space = StorageSpace::mutable(
-            StorageSpaceId(0x0004_0005),
+        let predecessor_space = StorageSpace::engine_declared(
+            0x0004_0005,
             "live_state.index.branch_root.v1",
+            crate::storage::ValueSemantics::Mutable,
         );
         let predecessor_key = StorageKey(Bytes::from_static(b"legacy-current-root"));
         let predecessor_value = Bytes::from_static(b"legacy-root-bytes");

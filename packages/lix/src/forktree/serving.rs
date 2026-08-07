@@ -64,7 +64,7 @@ pub(crate) struct StateTreeEdit {
     pub(crate) root: ObjectId,
     entry_count: u64,
     copied_nodes: usize,
-    pub(crate) added_blob_roots: BTreeSet<ObjectId>,
+    pub(crate) added_blob_roots: BTreeMap<ObjectId, ()>,
     pub(super) wrote_tombstone: bool,
     pub(super) written_commit_ids: BTreeSet<[u8; 16]>,
     pub(super) objects: ImmutableObjectSet,
@@ -254,7 +254,7 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let root = validate_root_on_read(root, "state", read).await?;
-    let mut added_blob_roots = BTreeSet::new();
+    let mut added_blob_roots = BTreeMap::new();
     let mut wrote_tombstone = false;
     let mut written_commit_ids = BTreeSet::new();
     for mutation in &mutations {
@@ -269,7 +269,12 @@ where
             let value = decode_state_value_storage(value)?;
             wrote_tombstone |= value.cell.deleted();
             written_commit_ids.insert(*value.commit_id.as_uuid().as_bytes());
-            added_blob_roots.extend(value.blob_manifest_object_ids);
+            added_blob_roots.extend(
+                value
+                    .blob_manifest_object_ids
+                    .into_iter()
+                    .map(|object_id| (object_id, ())),
+            );
         }
     }
     let mutations = mutations
@@ -414,6 +419,13 @@ where
             "CommitCatalog key does not match embedded CommitId",
         ));
     }
+    validate_retained_commit(
+        view.read(),
+        view.repository_root().change_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
     Ok(Some(commit))
 }
 
@@ -473,6 +485,13 @@ where
                 "CommitCatalog page has a mismatched key/object ID",
             ));
         }
+        validate_retained_commit(
+            view.read(),
+            view.repository_root().change_catalog_root,
+            entry.commit_object_id,
+            &commit,
+        )
+        .await?;
         entries.push((id, commit));
     }
     Ok(CatalogPage {
@@ -581,25 +600,152 @@ where
             },
             ChangeObjectV1::BranchRef {
                 branch_id: object_branch,
-                before_semantic_head_commit_object_id,
-                after_semantic_head_commit_object_id,
                 ..
             },
         ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
-            for target in [
-                *before_semantic_head_commit_object_id,
-                *after_semantic_head_commit_object_id,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let bytes = view.load_object_bytes(target).await?;
-                let _ = CommitObjectV1::decode(target, &bytes)?;
-            }
+            validate_retained_ref_change(
+                view.read(),
+                view.repository_root().change_catalog_root,
+                entry.change_object_id,
+                &change,
+            )
+            .await?;
         }
         _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid")),
     }
     Ok(change)
+}
+
+/// Authenticates the immediate retained-history edges of one visited commit.
+/// Callers page deeper history separately; unrelated immutable corruption is
+/// intentionally latent until its edge is visited.
+pub(super) async fn validate_retained_commit<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    for parent_id in &commit.parent_commit_object_ids {
+        let bytes = super::view::load_object_bytes(read, *parent_id).await?;
+        let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
+        if parent.generation >= commit.generation {
+            return Err(corruption(
+                "retained commit parent generation is not strictly earlier",
+            ));
+        }
+    }
+    for (ordinal, change_object_id) in commit.member_change_object_ids.iter().enumerate() {
+        let bytes = super::view::load_object_bytes(read, *change_object_id).await?;
+        let change = ChangeObjectV1::decode(*change_object_id, &bytes)?;
+        if !matches!(change, ChangeObjectV1::Semantic { .. }) {
+            return Err(corruption("commit member edge names a RefChange object"));
+        }
+        let value = lookup_on_read(
+            change_catalog_root,
+            "change",
+            change.change_id().as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        let ordinal =
+            u32::try_from(ordinal).map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+        if entry.change_object_id != *change_object_id
+            || entry.owner
+                != (ChangeCatalogOwner::CommitMember {
+                    commit_object_id,
+                    ordinal,
+                })
+        {
+            return Err(corruption(
+                "retained Change object disagrees with its ChangeCatalog owner/back-edge",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Authenticates one visited standalone branch-ref fact and its immediate
+/// predecessor edge without eagerly materializing the full chronology.
+pub(super) async fn validate_retained_ref_change<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    ref_object_id: ObjectId,
+    change: &ChangeObjectV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let ChangeObjectV1::BranchRef {
+        change_id,
+        branch_id,
+        before_semantic_head_commit_object_id,
+        after_semantic_head_commit_object_id,
+        previous_ref_change_object_id,
+        ..
+    } = change
+    else {
+        return Err(corruption("RefChange chronology reached a semantic Change"));
+    };
+    let value = lookup_on_read(change_catalog_root, "change", change_id.as_bytes(), read)
+        .await?
+        .ok_or_else(|| corruption("retained RefChange has no ChangeCatalog owner"))?;
+    let entry = ChangeCatalogEntry::decode(&value)?;
+    if entry.change_object_id != ref_object_id
+        || entry.owner
+            != (ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: *branch_id,
+            })
+    {
+        return Err(corruption(
+            "retained RefChange disagrees with its ChangeCatalog owner/back-edge",
+        ));
+    }
+    for target in [
+        *before_semantic_head_commit_object_id,
+        *after_semantic_head_commit_object_id,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let bytes = super::view::load_object_bytes(read, target).await?;
+        let _ = CommitObjectV1::decode(target, &bytes)?;
+    }
+    match previous_ref_change_object_id {
+        Some(previous_id) => {
+            let bytes = super::view::load_object_bytes(read, *previous_id).await?;
+            let previous = ChangeObjectV1::decode(*previous_id, &bytes)?;
+            let ChangeObjectV1::BranchRef {
+                change_id: previous_change_id,
+                branch_id: previous_branch_id,
+                after_semantic_head_commit_object_id: previous_after,
+                ..
+            } = previous
+            else {
+                return Err(corruption("RefChange predecessor is a semantic Change"));
+            };
+            if previous_branch_id != *branch_id
+                || previous_after != *before_semantic_head_commit_object_id
+                || previous_change_id.as_bytes() >= change_id.as_bytes()
+            {
+                return Err(corruption(
+                    "RefChange predecessor chronology or branch binding is invalid",
+                ));
+            }
+        }
+        None if before_semantic_head_commit_object_id.is_some() => {
+            return Err(corruption(
+                "non-creation RefChange is missing its authenticated predecessor",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn decode_state_value_storage(bytes: &[u8]) -> Result<StateValue, StorageError> {

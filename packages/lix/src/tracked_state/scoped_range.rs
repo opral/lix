@@ -16,14 +16,17 @@ use bytes::Bytes;
 
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageSpace, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
 /// Hard-cut namespace: nodes from the former per-scope directory/catalog
 /// formats are neither readable nor hash-compatible with this tree.
-pub(crate) const SCOPED_RANGE_NODE_SPACE: StorageSpace =
-    StorageSpace::immutable(StorageSpaceId(0x0004_0032), "tracked_state.scoped_range.v3");
+pub(crate) const SCOPED_RANGE_NODE_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0032,
+    "tracked_state.scoped_range.v3",
+    crate::storage::ValueSemantics::Immutable,
+);
 
 const NODE_RAW_MAGIC: &[u8; 6] = b"LXSR3R";
 const NODE_ZSTD_MAGIC: &[u8; 6] = b"LXSR3Z";

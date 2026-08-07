@@ -4,12 +4,15 @@ use crate::binary_cas::BlobId;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
-    StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageValue, StorageWriteSet,
 };
 use crate::{Blob, LixError};
 
-pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
+pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0026,
+    "plugin.current_checkpoint.v1",
+    crate::storage::ValueSemantics::Mutable,
+);
 
 const MAGIC: &[u8; 4] = b"LPC2";
 const HEADER_BYTES: usize = 4 + 32 + 32 + 16 + 4 + 4;

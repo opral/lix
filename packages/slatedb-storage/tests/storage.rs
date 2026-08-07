@@ -15,8 +15,8 @@ use lix::storage::conformance::{
 };
 use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, WriteOptions,
+    ReadOptions, ScanOptions, Storage, StorageError, StorageRead, StorageSpace, StorageWrite,
+    StoredValue, WriteOptions,
 };
 use lix::{LixError, Value};
 use lix_storage_slatedb::{
@@ -198,7 +198,7 @@ async fn slatedb_rejects_keys_above_physical_limit() {
     let too_long_logical_key = Key(Bytes::from(vec![0; u16::MAX as usize - 3]));
     let error = write
         .put_many(
-            StorageSpace::mutable(SpaceId(1), "test.mutable"),
+            lix::storage::conformance::MUTABLE_1,
             PutBatch {
                 entries: vec![PutEntry {
                     key: too_long_logical_key,
@@ -226,7 +226,7 @@ async fn slatedb_streams_unbounded_scan_limits() {
 
     write
         .put_many(
-            StorageSpace::mutable(SpaceId(1), "test.mutable"),
+            lix::storage::conformance::MUTABLE_1,
             PutBatch {
                 entries: (0..10u8)
                     .map(|index| PutEntry {
@@ -248,7 +248,7 @@ async fn slatedb_streams_unbounded_scan_limits() {
         .expect("begin slatedb read");
     let result = read
         .scan(
-            StorageSpace::mutable(SpaceId(1), "test.mutable"),
+            lix::storage::conformance::MUTABLE_1,
             KeyRange {
                 lower: Bound::Unbounded,
                 upper: Bound::Unbounded,
@@ -278,7 +278,7 @@ async fn cached_slatedb_rebuilds_after_local_cache_is_deleted() {
     let db_path = "cached-slatedb-rebuild";
     let cache_parent = tempfile::tempdir().expect("create SlateDB cache parent");
     let cache_path = cache_parent.path().join("object-cache");
-    let space = StorageSpace::mutable(SpaceId(11), "test.mutable");
+    let space = lix::storage::conformance::MUTABLE_11;
 
     {
         let storage = SlateDB::open_object_store_with_options(
@@ -323,7 +323,7 @@ async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
     let db_path = "cached-slatedb-write-failure";
     let cache_parent = tempfile::tempdir().expect("create SlateDB failure cache parent");
     let cache_path = cache_parent.path().join("object-cache");
-    let space = StorageSpace::mutable(SpaceId(12), "test.mutable");
+    let space = lix::storage::conformance::MUTABLE_12;
     let durable_key = Key(Bytes::from_static(b"durable"));
     let rejected_key = Key(Bytes::from_static(b"rejected"));
 
@@ -406,7 +406,7 @@ async fn slatedb_explicit_flush_makes_visible_commit_durable() {
 
     write_one(
         &storage,
-        StorageSpace::mutable(SpaceId(13), "test.mutable"),
+        lix::storage::conformance::MUTABLE_13,
         Key(Bytes::from_static(b"durable")),
         b"value",
     )

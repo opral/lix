@@ -15,8 +15,7 @@ use super::{
 use crate::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
-    WriteStats,
+    Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -301,14 +300,14 @@ impl Storage for BrokenStorage {
     }
 }
 
-fn broken_physical_key(space: SpaceId, key: &Key) -> Key {
+fn broken_physical_key(space: u32, key: &Key) -> Key {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Key(Bytes::from(bytes))
 }
 
-fn broken_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+fn broken_physical_range(space: u32, range: KeyRange) -> KeyRange {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
         Bound::Included(key) => Bound::Included(broken_physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(broken_physical_key(space, &key)),
@@ -317,11 +316,11 @@ fn broken_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
     KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         ),
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         ),
@@ -357,7 +356,7 @@ impl StorageRead for BrokenRead {
                 let physical_keys = request
                     .keys
                     .iter()
-                    .map(|key| broken_physical_key(request.space.id, key))
+                    .map(|key| broken_physical_key(request.space.id(), key))
                     .collect::<Vec<_>>();
                 values.extend(
                     get_many_from_map(entries, self.mode, &physical_keys, request.opts).values,
@@ -374,12 +373,12 @@ impl StorageRead for BrokenRead {
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         async move {
-            let range = broken_physical_range(space.id, range);
+            let range = broken_physical_range(space.id(), range);
             let opts = ScanOptions {
                 resume_after: opts
                     .resume_after
                     .as_ref()
-                    .map(|key| broken_physical_key(space.id, key)),
+                    .map(|key| broken_physical_key(space.id(), key)),
                 ..opts
             };
             let live_entries;
@@ -410,7 +409,7 @@ impl StorageWrite for BrokenWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             for mut entry in entries.entries {
-                entry.key = broken_physical_key(space.id, &entry.key);
+                entry.key = broken_physical_key(space.id(), &entry.key);
                 let mut bytes = stored_value_bytes(entry.value);
                 if matches!(self.mode, BrokenMode::CorruptOpaqueBytes) {
                     bytes = Bytes::from(
@@ -434,7 +433,7 @@ impl StorageWrite for BrokenWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             for key in keys {
-                let key = &broken_physical_key(space.id, key);
+                let key = &broken_physical_key(space.id(), key);
                 if matches!(self.mode, BrokenMode::DeleteManyIgnoresExistingKeys)
                     && self.staged.contains_key(key)
                 {
@@ -452,7 +451,7 @@ impl StorageWrite for BrokenWrite {
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let range = broken_physical_range(space.id, range);
+            let range = broken_physical_range(space.id(), range);
             if matches!(self.mode, BrokenMode::DeleteRangeIgnoresUpperBound) {
                 self.staged.retain(|key, _value| match &range.lower {
                     Bound::Included(lower) => key < lower,
@@ -484,7 +483,7 @@ impl StorageWrite for BrokenWrite {
                             key,
                             expected,
                         } => parent
-                            .get(&broken_physical_key(space.id, key))
+                            .get(&broken_physical_key(space.id(), key))
                             .is_some_and(|value| value == expected),
                         _ => false,
                     };
