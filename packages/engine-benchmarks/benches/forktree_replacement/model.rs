@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
+use std::sync::{Arc, Mutex};
 use std::time::Instant as DiffInstant;
 
 use bytes::{Bytes, BytesMut};
@@ -24,10 +25,15 @@ pub(super) const INTERNAL_CHILDREN: usize = 32;
 const BLOB_MIN_BYTES: usize = 512 * 1024;
 const BLOB_AVG_BYTES: usize = 512 * 1024;
 const BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
+const PACK_MAGIC: &[u8; 4] = b"FKP1";
+const PACK_DIGEST_CONTEXT: &str = "lix forktree immutable object pack v1";
+const PACK_ENTRY_BYTES: usize = 32 + 8 + 8;
 
 pub const OBJECT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00f0_0001), "forktree_objects");
 pub const REF_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x00f0_0002), "forktree_refs");
+pub const PACK_SPACE: StorageSpace =
+    StorageSpace::immutable(SpaceId(0x00f0_0003), "forktree_object_packs");
 
 const MAIN_REF_KEY: &[u8] = b"branch/main";
 const EPOCH_KEY: &[u8] = b"epoch";
@@ -37,6 +43,38 @@ const REDO_PREFIX: &[u8] = b"redo/";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ObjectId([u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PackId([u8; 32]);
+
+#[derive(Clone, Copy, Debug)]
+struct ObjectPlacement {
+    pack: PackId,
+    offset: usize,
+    length: usize,
+}
+
+#[derive(Debug)]
+pub struct PackedObjectLocator {
+    placements: BTreeMap<ObjectId, ObjectPlacement>,
+    operation_extents: Mutex<BTreeMap<PackId, Bytes>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PackBuildAccounting {
+    pub objects: u64,
+    pub object_bytes: u64,
+    pub packs: u64,
+    pub pack_bytes: u64,
+    pub header_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocatorRebuildAccounting {
+    pub objects: u64,
+    pub packs: u64,
+    pub pack_bytes: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct Update {
@@ -324,6 +362,7 @@ impl std::ops::AddAssign for ApplyAccounting {
 #[derive(Clone)]
 pub struct ForkTree<S> {
     storage: S,
+    packed: Option<Arc<PackedObjectLocator>>,
 }
 
 #[derive(Clone, Debug)]
@@ -626,7 +665,17 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     pub fn new(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            packed: None,
+        }
+    }
+
+    pub fn new_packed(storage: S, locator: Arc<PackedObjectLocator>) -> Self {
+        Self {
+            storage,
+            packed: Some(locator),
+        }
     }
 
     pub async fn initialize(&self, rows: &[(Vec<u8>, Vec<u8>)]) -> Result<ObjectId, String> {
@@ -2556,6 +2605,178 @@ where
         Ok((rows, bytes))
     }
 
+    /// Benchmark-only hard conversion from one immutable KV per ObjectId to
+    /// bounded immutable packs. The conversion is atomic: after commit, packs
+    /// are the sole physical object bodies and the old object rows are absent.
+    pub async fn replace_objects_with_packs(
+        &self,
+        target_pack_bytes: usize,
+    ) -> Result<PackBuildAccounting, String> {
+        if self.packed.is_some() {
+            return Err("ForkTree object store is already packed".to_string());
+        }
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut resume_after = None;
+        let mut objects = Vec::new();
+        loop {
+            let page = read
+                .scan(
+                    OBJECT_SPACE,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: 1_024,
+                        resume_after: resume_after.clone(),
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            for entry in &page.entries {
+                let id = object_id_from_key(&entry.key)?;
+                let bytes = projected_bytes(&entry.value)?.clone();
+                authenticate(id, &bytes)?;
+                objects.push((id, bytes));
+            }
+            if !page.has_more {
+                break;
+            }
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+        }
+        drop(read);
+        objects.sort_by_key(|(id, _)| *id);
+        if objects.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err("ForkTree pack input contains duplicate object identities".to_string());
+        }
+
+        let mut accounting = PackBuildAccounting {
+            objects: objects.len() as u64,
+            object_bytes: objects.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+            ..PackBuildAccounting::default()
+        };
+        let mut packs = BTreeMap::new();
+        let mut current = Vec::new();
+        let mut current_bytes = 8_usize;
+        for object in objects.iter().cloned() {
+            let added = PACK_ENTRY_BYTES.saturating_add(object.1.len());
+            if !current.is_empty() && current_bytes.saturating_add(added) > target_pack_bytes {
+                let (id, bytes, header_bytes) = encode_object_pack(&current)?;
+                accounting.header_bytes += header_bytes as u64;
+                accounting.pack_bytes += bytes.len() as u64;
+                packs.insert(id, bytes);
+                current.clear();
+                current_bytes = 8;
+            }
+            current_bytes = current_bytes.saturating_add(added);
+            current.push(object);
+        }
+        if !current.is_empty() {
+            let (id, bytes, header_bytes) = encode_object_pack(&current)?;
+            accounting.header_bytes += header_bytes as u64;
+            accounting.pack_bytes += bytes.len() as u64;
+            packs.insert(id, bytes);
+        }
+        accounting.packs = packs.len() as u64;
+
+        let mut write = self
+            .storage
+            .begin_write(WriteOptions {
+                batch_capacity_hint_bytes: accounting.pack_bytes as usize,
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        for chunk in objects.chunks(1_024) {
+            let keys = chunk.iter().map(|(id, _)| key(&id.0)).collect::<Vec<_>>();
+            write
+                .delete_many(OBJECT_SPACE, &keys)
+                .await
+                .map_err(storage_error)?;
+        }
+        write
+            .put_many(PACK_SPACE, pack_batch(&packs))
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(accounting)
+    }
+
+    /// Rebuilds the disposable ObjectId-to-pack placement map exclusively from
+    /// authenticated immutable packs. The map is not persisted and can never
+    /// make bytes valid: every returned object is independently rehashed.
+    pub async fn rebuild_packed_locator(
+        &self,
+    ) -> Result<(Arc<PackedObjectLocator>, LocatorRebuildAccounting), String> {
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let mut resume_after = None;
+        let mut placements = BTreeMap::new();
+        let mut accounting = LocatorRebuildAccounting::default();
+        loop {
+            let page = read
+                .scan(
+                    PACK_SPACE,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: 1_024,
+                        resume_after: resume_after.clone(),
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            for entry in &page.entries {
+                let pack = pack_id_from_key(&entry.key)?;
+                let bytes = projected_bytes(&entry.value)?;
+                authenticate_pack(pack, bytes)?;
+                accounting.packs += 1;
+                accounting.pack_bytes += bytes.len() as u64;
+                for (object, offset, length) in decode_pack_index(bytes)? {
+                    if placements
+                        .insert(
+                            object,
+                            ObjectPlacement {
+                                pack,
+                                offset,
+                                length,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "ForkTree object {} occurs in multiple immutable packs",
+                            hex_id(object)
+                        ));
+                    }
+                    accounting.objects += 1;
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            resume_after = page.entries.last().map(|entry| entry.key.clone());
+        }
+        Ok((
+            Arc::new(PackedObjectLocator {
+                placements,
+                operation_extents: Mutex::new(BTreeMap::new()),
+            }),
+            accounting,
+        ))
+    }
+
     /// Derives physical-layout accounting from the authenticated object and
     /// selector authorities. The fold retains object identities and the mark
     /// frontier, but never retains object bodies: memory is
@@ -3041,6 +3262,13 @@ where
         before: ObjectId,
         after: ObjectId,
     ) -> Result<(Vec<RowChange>, DiffAccounting), String> {
+        if let Some(locator) = &self.packed {
+            locator
+                .operation_extents
+                .lock()
+                .expect("ForkTree pack extent buffer lock")
+                .clear();
+        }
         let mut accounting = DiffAccounting::default();
         if before == after {
             accounting.hash_pruned_nodes = 1;
@@ -3564,6 +3792,9 @@ where
     }
 
     async fn load_objects(&self, ids: &[ObjectId]) -> Result<Vec<Bytes>, String> {
+        if let Some(locator) = &self.packed {
+            return self.load_packed_objects(locator, ids).await;
+        }
         let keys = ids
             .iter()
             .map(|id| Key(Bytes::copy_from_slice(&id.0)))
@@ -3590,6 +3821,82 @@ where
                     value.ok_or_else(|| format!("missing ForkTree object {}", hex_id(id)))?;
                 let bytes = projected_bytes(&value)?.clone();
                 authenticate(id, &bytes)?;
+                Ok(bytes)
+            })
+            .collect()
+    }
+
+    async fn load_packed_objects(
+        &self,
+        locator: &PackedObjectLocator,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Bytes>, String> {
+        let mut required = BTreeMap::new();
+        for id in ids {
+            let placement = locator
+                .placements
+                .get(id)
+                .ok_or_else(|| format!("missing ForkTree packed locator for {}", hex_id(*id)))?;
+            required.insert(placement.pack, ());
+        }
+        let missing = {
+            let extents = locator
+                .operation_extents
+                .lock()
+                .expect("ForkTree pack extent buffer lock");
+            required
+                .keys()
+                .filter(|pack| !extents.contains_key(pack))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if !missing.is_empty() {
+            let keys = missing.iter().map(|pack| key(&pack.0)).collect::<Vec<_>>();
+            let read = self
+                .storage
+                .begin_read(ReadOptions::default())
+                .await
+                .map_err(storage_error)?;
+            let result = read
+                .get_many(&[GetManyRequest {
+                    space: PACK_SPACE,
+                    keys: &keys,
+                    opts: GetOptions::default(),
+                }])
+                .await
+                .map_err(storage_error)?;
+            let mut loaded = Vec::with_capacity(missing.len());
+            for (value, pack) in result.values.into_iter().zip(missing) {
+                let value = value.ok_or_else(|| "missing ForkTree immutable pack".to_string())?;
+                let bytes = projected_bytes(&value)?.clone();
+                authenticate_pack(pack, &bytes)?;
+                loaded.push((pack, bytes));
+            }
+            let mut extents = locator
+                .operation_extents
+                .lock()
+                .expect("ForkTree pack extent buffer lock");
+            extents.extend(loaded);
+        }
+        let extents = locator
+            .operation_extents
+            .lock()
+            .expect("ForkTree pack extent buffer lock");
+        ids.iter()
+            .map(|id| {
+                let placement = locator.placements.get(id).ok_or_else(|| {
+                    format!("missing ForkTree packed locator for {}", hex_id(*id))
+                })?;
+                let pack = extents
+                    .get(&placement.pack)
+                    .ok_or_else(|| "ForkTree extent buffer omitted a required pack".to_string())?;
+                let end = placement
+                    .offset
+                    .checked_add(placement.length)
+                    .filter(|end| *end <= pack.len())
+                    .ok_or_else(|| "ForkTree packed locator range is invalid".to_string())?;
+                let bytes = pack.slice(placement.offset..end);
+                authenticate(*id, &bytes)?;
                 Ok(bytes)
             })
             .collect()
@@ -3972,6 +4279,142 @@ fn object_batch(objects: &BTreeMap<ObjectId, Bytes>) -> PutBatch {
             })
             .collect(),
     }
+}
+
+fn pack_batch(packs: &BTreeMap<PackId, Bytes>) -> PutBatch {
+    PutBatch {
+        entries: packs
+            .iter()
+            .map(|(id, bytes)| PutEntry {
+                key: key(&id.0),
+                value: StoredValue {
+                    bytes: bytes.clone(),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn encode_object_pack(objects: &[(ObjectId, Bytes)]) -> Result<(PackId, Bytes, usize), String> {
+    let count = u32::try_from(objects.len())
+        .map_err(|_| "ForkTree immutable pack has too many objects".to_string())?;
+    let header_bytes = 8_usize
+        .checked_add(
+            objects
+                .len()
+                .checked_mul(PACK_ENTRY_BYTES)
+                .ok_or_else(|| "ForkTree immutable pack header overflow".to_string())?,
+        )
+        .ok_or_else(|| "ForkTree immutable pack header overflow".to_string())?;
+    let payload_bytes = objects
+        .iter()
+        .try_fold(0_usize, |total, (_, bytes)| total.checked_add(bytes.len()))
+        .ok_or_else(|| "ForkTree immutable pack payload overflow".to_string())?;
+    let mut encoded = Vec::with_capacity(
+        header_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| "ForkTree immutable pack length overflow".to_string())?,
+    );
+    encoded.extend_from_slice(PACK_MAGIC);
+    encoded.extend_from_slice(&count.to_le_bytes());
+    let mut offset = header_bytes;
+    for (id, bytes) in objects {
+        encoded.extend_from_slice(&id.0);
+        encoded.extend_from_slice(&(offset as u64).to_le_bytes());
+        encoded.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        offset = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| "ForkTree immutable pack offset overflow".to_string())?;
+    }
+    for (_, bytes) in objects {
+        encoded.extend_from_slice(bytes);
+    }
+    let bytes = Bytes::from(encoded);
+    let id = pack_id(&bytes);
+    Ok((id, bytes, header_bytes))
+}
+
+fn decode_pack_index(bytes: &[u8]) -> Result<Vec<(ObjectId, usize, usize)>, String> {
+    if bytes.len() < 8 || &bytes[..4] != PACK_MAGIC {
+        return Err("ForkTree immutable pack magic mismatch".to_string());
+    }
+    let count = u32::from_le_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| "ForkTree immutable pack count is truncated".to_string())?,
+    ) as usize;
+    let header_end = 8_usize
+        .checked_add(
+            count
+                .checked_mul(PACK_ENTRY_BYTES)
+                .ok_or_else(|| "ForkTree immutable pack header overflow".to_string())?,
+        )
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| "ForkTree immutable pack header is truncated".to_string())?;
+    let mut entries = Vec::with_capacity(count);
+    let mut cursor = 8;
+    let mut expected_offset = header_end;
+    let mut previous = None;
+    for _ in 0..count {
+        let id = ObjectId(
+            bytes[cursor..cursor + 32]
+                .try_into()
+                .map_err(|_| "ForkTree immutable pack object id is truncated".to_string())?,
+        );
+        cursor += 32;
+        let offset = usize::try_from(u64::from_le_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| "ForkTree immutable pack offset is truncated".to_string())?,
+        ))
+        .map_err(|_| "ForkTree immutable pack offset exceeds usize".to_string())?;
+        cursor += 8;
+        let length = usize::try_from(u64::from_le_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| "ForkTree immutable pack length is truncated".to_string())?,
+        ))
+        .map_err(|_| "ForkTree immutable pack length exceeds usize".to_string())?;
+        cursor += 8;
+        if previous.is_some_and(|previous| previous >= id) {
+            return Err("ForkTree immutable pack identities are not strictly ordered".to_string());
+        }
+        if offset != expected_offset {
+            return Err("ForkTree immutable pack payload is not contiguous".to_string());
+        }
+        expected_offset = offset
+            .checked_add(length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "ForkTree immutable pack object range is invalid".to_string())?;
+        previous = Some(id);
+        entries.push((id, offset, length));
+    }
+    if expected_offset != bytes.len() {
+        return Err("ForkTree immutable pack has trailing or missing bytes".to_string());
+    }
+    Ok(entries)
+}
+
+fn pack_id(bytes: &[u8]) -> PackId {
+    let mut hasher = blake3::Hasher::new_derive_key(PACK_DIGEST_CONTEXT);
+    hasher.update(bytes);
+    PackId(*hasher.finalize().as_bytes())
+}
+
+fn authenticate_pack(id: PackId, bytes: &[u8]) -> Result<(), String> {
+    if pack_id(bytes) != id {
+        return Err("ForkTree immutable pack failed authentication".to_string());
+    }
+    Ok(())
+}
+
+fn pack_id_from_key(key: &Key) -> Result<PackId, String> {
+    let id: [u8; 32] = key
+        .0
+        .as_ref()
+        .try_into()
+        .map_err(|_| "ForkTree immutable pack key length mismatch".to_string())?;
+    Ok(PackId(id))
 }
 
 fn encode_leaf(rows: &[LeafEntry]) -> Bytes {
