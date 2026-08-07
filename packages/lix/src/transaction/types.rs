@@ -4050,9 +4050,6 @@ pub(crate) struct StagedCommitChangeRefs {
     /// separate so staging/finalization clones only `Arc` owners rather than
     /// copying schema/file/entity or metadata columns.
     selected_change_batches: Vec<StagedCommitChangeBatch>,
-    /// Immutable commit whose complete logical state is certified as the
-    /// current-state base of this new semantic commit.
-    current_state_base_commit_id: Option<CommitId>,
     /// Certified immutable mutation columns for this commit. This owner is
     /// attached only at drain, after complete-replacement certification, and
     /// is cloned through commit finalization in O(1).
@@ -4069,7 +4066,6 @@ impl Default for StagedCommitChangeRefs {
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
             tracked_change_count: 0,
             selected_change_batches: Vec::new(),
-            current_state_base_commit_id: None,
             ordered_mutation_journal: None,
             allow_empty: false,
         }
@@ -4079,11 +4075,8 @@ impl Default for StagedCommitChangeRefs {
 impl StagedCommitChangeRefs {
     pub(crate) fn absorb_cohort_membership(&mut self, mut other: Self) {
         debug_assert!(
-            self.ordered_mutation_journal.is_none()
-                && other.ordered_mutation_journal.is_none()
-                && self.current_state_base_commit_id.is_none()
-                && other.current_state_base_commit_id.is_none(),
-            "certified publication routes cannot join commit cohorts"
+            self.ordered_mutation_journal.is_none() && other.ordered_mutation_journal.is_none(),
+            "immutable replacement journals cannot join commit cohorts"
         );
         self.tracked_change_count = self
             .tracked_change_count
@@ -4313,27 +4306,6 @@ impl StagedCommitChangeRefs {
         self.ordered_mutation_journal.take()
     }
 
-    pub(crate) fn certify_current_state_base(
-        &mut self,
-        commit_id: CommitId,
-    ) -> Result<(), LixError> {
-        if self
-            .current_state_base_commit_id
-            .replace(commit_id)
-            .is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "commit received more than one certified current-state base",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn current_state_base_commit_id(&self) -> Option<CommitId> {
-        self.current_state_base_commit_id
-    }
-
     pub(crate) fn new(
         commit_id: CommitId,
         commit_change_id: ChangeId,
@@ -4347,7 +4319,6 @@ impl StagedCommitChangeRefs {
             created_at,
             tracked_change_count: 0,
             selected_change_batches: Vec::new(),
-            current_state_base_commit_id: None,
             ordered_mutation_journal: None,
             allow_empty: false,
         }
