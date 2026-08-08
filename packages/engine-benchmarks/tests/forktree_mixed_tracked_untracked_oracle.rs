@@ -20,13 +20,13 @@ enum Cell {
     Tombstone,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Domain {
     Tracked,
     Untracked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Branch {
     Global,
     Local,
@@ -234,6 +234,53 @@ fn terminal_primary_keys<R: LiveStateReader>(reader: &mut R, request: &Request) 
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DomainSelector {
+    Combined,
+    Tracked,
+    Untracked,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ModelError {
+    DuplicateAuthority,
+    MalformedDomain,
+}
+
+fn decode_domain(byte: u8) -> Result<DomainSelector, ModelError> {
+    match byte {
+        0 => Ok(DomainSelector::Combined),
+        1 => Ok(DomainSelector::Tracked),
+        2 => Ok(DomainSelector::Untracked),
+        _ => Err(ModelError::MalformedDomain),
+    }
+}
+
+fn canonical_scan(
+    rows: &[Row],
+    selector: DomainSelector,
+    request: &Request,
+) -> Result<Vec<PublicRow>, ModelError> {
+    let selected = rows
+        .iter()
+        .filter(|row| match selector {
+            DomainSelector::Combined => true,
+            DomainSelector::Tracked => row.domain == Domain::Tracked,
+            DomainSelector::Untracked => row.domain == Domain::Untracked,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut authorities = BTreeMap::new();
+    for row in &selected {
+        let key = (&row.pk, row.branch, row.domain, row.sequence);
+        if authorities.insert(key, &row.cell).is_some() {
+            return Err(ModelError::DuplicateAuthority);
+        }
+    }
+    Ok(canonical_rows(&selected, request))
+}
+
 #[test]
 fn rejected_direct_route_omits_mixed_domain_rows_and_replacements() {
     let rows = fixture();
@@ -370,4 +417,50 @@ fn corrected_terminal_derivation_does_not_open_an_alternate_view() {
     let actual = terminal_snapshots(&mut reader, &request);
     assert_eq!(actual, expected);
     assert_eq!(reader.calls, 1);
+}
+
+#[test]
+fn domain_selector_contract_preserves_combined_overlay_and_explicit_narrow_modes() {
+    let request = Request {
+        exact_pks: None,
+        include_tombstones: true,
+        limit: None,
+    };
+    let combined = canonical_scan(&fixture(), DomainSelector::Combined, &request).unwrap();
+    let tracked = canonical_scan(&fixture(), DomainSelector::Tracked, &request).unwrap();
+    let untracked = canonical_scan(&fixture(), DomainSelector::Untracked, &request).unwrap();
+
+    assert!(combined.iter().any(|row| {
+        row.pk == TypedPk::Text("a".into()) && row.cell == Cell::Value("untracked-a".into())
+    }));
+    assert!(tracked.iter().any(|row| {
+        row.pk == TypedPk::Text("a".into()) && row.cell == Cell::Value("branch-a".into())
+    }));
+    assert!(untracked.iter().any(|row| {
+        row.pk == TypedPk::Text("a".into()) && row.cell == Cell::Value("untracked-a".into())
+    }));
+    assert!(
+        combined
+            .iter()
+            .any(|row| { row.pk == TypedPk::Text("d".into()) && row.cell == Cell::Tombstone })
+    );
+}
+
+#[test]
+fn duplicate_authority_and_malformed_domain_fail_closed() {
+    let mut rows = fixture();
+    rows.push(rows[0].clone());
+    assert_eq!(
+        canonical_scan(
+            &rows,
+            DomainSelector::Combined,
+            &Request {
+                exact_pks: None,
+                include_tombstones: true,
+                limit: None,
+            },
+        ),
+        Err(ModelError::DuplicateAuthority)
+    );
+    assert_eq!(decode_domain(9), Err(ModelError::MalformedDomain));
 }
