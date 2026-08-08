@@ -133,7 +133,7 @@ struct CachedCommitTopologyEnvelope {
 /// Reader-local authenticated topology working set. This cache is bound to the
 /// caller's retained StorageRead and is never persisted or used as authority.
 #[derive(Default)]
-pub(crate) struct CommitTopologyReadCache {
+struct CommitTopologyReadCache {
     by_commit_id: BTreeMap<crate::changelog::CommitId, CachedCommitTopologyEnvelope>,
     by_object_id: BTreeMap<ObjectId, crate::changelog::CommitId>,
     resolved: BTreeMap<crate::changelog::CommitId, CommitTopology>,
@@ -142,6 +142,36 @@ pub(crate) struct CommitTopologyReadCache {
 pub(crate) struct CommitTopologyBatch {
     pub(crate) requested: Vec<Option<CommitTopology>>,
     pub(crate) cache_seeded: Vec<CommitTopology>,
+}
+
+/// One snapshot-bound topology reader. The authenticated positive cache cannot
+/// be named, constructed, detached, or paired with a different StorageRead.
+pub(crate) struct CommitTopologyReader<R> {
+    read: R,
+    cache: CommitTopologyReadCache,
+}
+
+impl<R> CommitTopologyReader<R>
+where
+    R: StorageAdapterRead,
+{
+    pub(crate) fn new(read: R) -> Self {
+        Self {
+            read,
+            cache: CommitTopologyReadCache::default(),
+        }
+    }
+
+    pub(crate) fn read(&self) -> &R {
+        &self.read
+    }
+
+    pub(crate) async fn load(
+        &mut self,
+        ids: &[crate::changelog::CommitId],
+    ) -> Result<CommitTopologyBatch, crate::LixError> {
+        load_commit_topology_batch(&self.read, ids, &mut self.cache).await
+    }
 }
 
 /// Loads one authenticated moving branch head through the ForkTree selector
@@ -354,17 +384,15 @@ pub(crate) async fn load_commit_topologies<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut cache = CommitTopologyReadCache::default();
-    Ok(load_commit_topology_batch(read, ids, &mut cache)
-        .await?
-        .requested)
+    let mut reader = CommitTopologyReader::new(read);
+    Ok(reader.load(ids).await?.requested)
 }
 
 /// Loads one exact topology batch through one retained StorageRead. Requested
 /// Commit objects and the union of their immediate parent Commit objects are
 /// each authenticated at most once. Decoded parent envelopes remain in the
 /// reader-local cache so a later graph step never reloads the parent object.
-pub(crate) async fn load_commit_topology_batch<R>(
+async fn load_commit_topology_batch<R>(
     read: &R,
     ids: &[crate::changelog::CommitId],
     cache: &mut CommitTopologyReadCache,

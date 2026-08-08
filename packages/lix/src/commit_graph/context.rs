@@ -46,9 +46,8 @@ impl CommitGraphContext {
         S: StorageAdapterRead,
     {
         CommitGraphStoreReader {
-            store,
+            topology: crate::forktree::CommitTopologyReader::new(store),
             node_cache: HashMap::new(),
-            topology_cache: crate::forktree::CommitTopologyReadCache::default(),
             reachable_nodes_cache: HashMap::new(),
             member_changes_cache: HashMap::new(),
         }
@@ -60,9 +59,8 @@ pub(crate) struct CommitGraphStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    store: S,
-    node_cache: HashMap<CommitId, Option<CommitGraphNode>>,
-    topology_cache: crate::forktree::CommitTopologyReadCache,
+    topology: crate::forktree::CommitTopologyReader<S>,
+    node_cache: HashMap<CommitId, CommitGraphNode>,
     reachable_nodes_cache: HashMap<CommitId, Arc<[ReachableCommitGraphNode]>>,
     // A reader is bound to one pinned storage snapshot for the duration of a
     // SQL statement. File-history shaping asks the same reader for distinct
@@ -82,7 +80,7 @@ where
 {
     #[cfg(feature = "storage-benches")]
     pub(crate) fn store(&self) -> &S {
-        &self.store
+        self.topology.read()
     }
 
     /// Loads one topology node without reading its member delta or payloads.
@@ -110,26 +108,23 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         if !uncached_ids.is_empty() {
-            let loaded = crate::forktree::load_commit_topology_batch(
-                &self.store,
-                &uncached_ids,
-                &mut self.topology_cache,
-            )
-            .await?;
+            let loaded = self.topology.load(&uncached_ids).await?;
             for topology in loaded.cache_seeded {
                 let node = commit_graph_node_from_topology(topology);
-                self.node_cache.insert(node.commit_id, Some(node));
+                self.node_cache.insert(node.commit_id, node);
             }
             let batch =
                 ExactBatch::try_new("ForkTree commit graph", &uncached_ids, loaded.requested)?;
             for (commit_id, topology) in batch {
-                self.node_cache
-                    .insert(*commit_id, topology.map(commit_graph_node_from_topology));
+                if let Some(topology) = topology {
+                    self.node_cache
+                        .insert(*commit_id, commit_graph_node_from_topology(topology));
+                }
             }
         }
         let nodes = commit_ids
             .iter()
-            .map(|commit_id| self.node_cache.get(commit_id).cloned().unwrap_or(None))
+            .map(|commit_id| self.node_cache.get(commit_id).cloned())
             .collect();
         ExactBatch::try_new("commit graph", commit_ids, nodes)
     }
@@ -143,14 +138,15 @@ where
         let mut start_after = None;
         loop {
             let page =
-                crate::forktree::scan_commit_topologies(&self.store, start_after, 1024).await?;
+                crate::forktree::scan_commit_topologies(self.topology.read(), start_after, 1024)
+                    .await?;
             if page.is_empty() {
                 break;
             }
             let page_len = page.len();
             for topology in page {
                 let node = commit_graph_node_from_topology(topology);
-                self.node_cache.insert(node.commit_id, Some(node.clone()));
+                self.node_cache.insert(node.commit_id, node.clone());
                 commits.push(node);
             }
             if page_len < 1024 {
@@ -375,7 +371,7 @@ where
             let node = &reachable.commit;
             if may_include_commits {
                 let records = crate::forktree::load_commit_records(
-                    &self.store,
+                    self.topology.read(),
                     std::slice::from_ref(&node.commit_id),
                 )
                 .await?;
@@ -436,7 +432,7 @@ where
         {
             return Ok(changes.clone());
         }
-        let members = crate::forktree::load_commit_member_records(&self.store, commit_id)
+        let members = crate::forktree::load_commit_member_records(self.topology.read(), commit_id)
             .await?
             .ok_or_else(|| missing_commit_graph_error(&commit_id))?;
         let mut changes = members

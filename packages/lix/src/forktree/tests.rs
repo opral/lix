@@ -47,6 +47,20 @@ fn raw_id(byte: u8) -> [u8; 16] {
     [byte; 16]
 }
 
+#[test]
+fn topology_cache_is_private_and_inseparable_from_its_storage_read() {
+    let serving = include_str!("serving.rs");
+    let facade = include_str!("mod.rs");
+    assert!(serving.contains("pub(crate) struct CommitTopologyReader<R>"));
+    assert!(serving.contains("read: R,"));
+    assert!(serving.contains("cache: CommitTopologyReadCache,"));
+    assert!(serving.contains("struct CommitTopologyReadCache"));
+    assert!(!serving.contains("pub(crate) struct CommitTopologyReadCache"));
+    assert!(!serving.contains("pub(crate) async fn load_commit_topology_batch"));
+    assert!(!facade.contains("CommitTopologyReadCache"));
+    assert!(!facade.contains("load_commit_topology_batch"));
+}
+
 fn content_id(byte: u8) -> ObjectId {
     ObjectId::from_bytes([byte; 32])
 }

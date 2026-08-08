@@ -28,12 +28,12 @@ pub(crate) use object::ObjectId;
 pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
-    CatalogPage, CommitTopology, CommitTopologyReadCache, StateSource, StateTreeMutation,
+    CatalogPage, CommitTopology, CommitTopologyReader, StateSource, StateTreeMutation,
     VisibleStateRow, edit_state_tree, load_branch_head, load_change, load_change_records,
     load_commit, load_commit_member_records, load_commit_records, load_commit_topologies,
-    load_commit_topology_batch, page_changes, page_commits, put_change_catalog_entries,
-    put_commit_catalog_entries, scan_branch_heads, scan_change_records, scan_commit_records,
-    scan_commit_topologies, state_point, state_range,
+    page_changes, page_commits, put_change_catalog_entries, put_commit_catalog_entries,
+    scan_branch_heads, scan_change_records, scan_commit_records, scan_commit_topologies,
+    state_point, state_range,
 };
 pub(crate) use state::{
     StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef, UntrackedValueRef,
@@ -86,7 +86,7 @@ const _: () = {
             SelectorExpectation,
             CatalogPage<(CommitId, CommitObjectV1)>,
             CommitTopology,
-            CommitTopologyReadCache,
+            CommitTopologyReader<R>,
             StateSource,
             StateTreeMutation,
             VisibleStateRow,
