@@ -4461,3 +4461,59 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     (lower.contains("lix_file") || lower.contains("lix_directory")) && lower.contains("path")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Memory, engine::Engine};
+
+    async fn open_session() -> SessionContext<Memory> {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized storage should create engine");
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open")
+    }
+
+    #[tokio::test]
+    async fn active_branch_update_reads_global_overlay_through_one_forktree_view() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('overlay-key', 'before')",
+                &[],
+            )
+            .await
+            .expect("the seed row should commit");
+
+        let updated = session
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'overlay-key'",
+                &[],
+            )
+            .await
+            .expect("the active-branch update should resolve the global overlay");
+        assert_eq!(updated.rows_affected(), 1);
+
+        let result = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'overlay-key'",
+                &[],
+            )
+            .await
+            .expect("the updated row should remain readable");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("value should be JSON"),
+            serde_json::json!("after")
+        );
+    }
+}

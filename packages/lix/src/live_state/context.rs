@@ -1,5 +1,6 @@
 #![allow(clippy::borrow_deref_ref, clippy::clone_on_copy)]
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 #[cfg(test)]
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
@@ -163,15 +164,38 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let [branch_id] = request.filter.branch_ids.as_slice() else {
+        let branch_ids = &request.filter.branch_ids;
+        let non_global_branch_ids = branch_ids
+            .iter()
+            .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
+            .collect::<Vec<_>>();
+        let has_global = branch_ids
+            .iter()
+            .any(|branch_id| branch_id.as_str() == GLOBAL_BRANCH_ID);
+        let valid_branch_scope = match non_global_branch_ids.as_slice() {
+            [] => branch_ids.len() == 1 && has_global,
+            [branch_id] => {
+                branch_ids.len() == 1 + usize::from(has_global)
+                    && branch_ids.iter().all(|candidate| {
+                        candidate.as_str() == GLOBAL_BRANCH_ID || candidate == *branch_id
+                    })
+            }
+            _ => false,
+        };
+        if !valid_branch_scope {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "ForkTree live-state operation requires exactly one branch",
             ));
-        };
+        }
+        let branch_id = non_global_branch_ids
+            .first()
+            .map_or_else(|| GLOBAL_BRANCH_ID, |branch_id| branch_id.as_str());
+        let mut fork_tree_request = request.clone();
+        fork_tree_request.filter.branch_ids = vec![branch_id.to_owned()];
         let facade = crate::forktree::ForkTreeReadFacade::new(&self.store);
         let view = facade.branch(branch_id).await?;
-        crate::live_state::scan_forktree_view(&view, request).await
+        crate::live_state::scan_forktree_view(&view, &fork_tree_request).await
     }
 }
 
