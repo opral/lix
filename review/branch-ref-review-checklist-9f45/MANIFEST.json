@@ -1,0 +1,19 @@
+{
+  "kind": "test-report-only-branch-ref-successor-review-checklist",
+  "status": "frozen-review-contract",
+  "accepted_calibration": {
+    "ref": "origin/codex/review/branch-ref-calibration-contract-9f45",
+    "head": "32d7a024d8d060f9084a45116fbbfca294fdb454",
+    "normalized_sha256": "026fcd6b7aaa9afd8341fdca6451962d4addd5aedef63724b6f90d50b8b573bb"
+  },
+  "known_inputs": {
+    "base_commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "base_tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+    "candidate_commit": "9f45f77955317b8dd64fadb049d85c33ca109bf4",
+    "candidate_tree": "c38c4d60c74bf70994378029ad9e286a83cf2d69",
+    "handoff_sha256": "288926d43355526489908c84845ba2d30343e97117f04652f0d58754862c128b"
+  },
+  "checklist_sha256": "95cf846b760d2cfe826abc80e168980d02b37033e62313afb45a2c2aeb07b6a8",
+  "production_changes": false,
+  "runtime_claim": false
+}
