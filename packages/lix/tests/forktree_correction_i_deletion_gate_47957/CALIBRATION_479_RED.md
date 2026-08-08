@@ -39,6 +39,12 @@ The predecessor 39b normalized references are:
 The 479 candidate removed one stale `scan_certified_history_rows` diagnostic
 without adding a warning, but remains RED on the ownership/deletion contract.
 
+The successor gate also freezes the complete e26 reverse-dependency ledger,
+rejects every positive token delta, scans direct compatibility/fallback routes,
+and requires both consumers to bind the same retained
+`query_source.forktree_reader.clone()` identity. Exact 479 therefore remains a
+valid RED calibration even though its compiler frontier is monotonic.
+
 ## Successor pass definition
 
 A successor may report PASS only when the runner returns `RESULT=PASS` with

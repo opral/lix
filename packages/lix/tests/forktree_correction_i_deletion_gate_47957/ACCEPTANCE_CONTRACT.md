@@ -38,6 +38,17 @@ Correction I passes only when all of the following are true:
    a blocker.
 8. The candidate diff contains only this test/report package. No production
    path is accepted in this acceptance ref.
+9. The e26 baseline in `BASELINE_REVERSE_DEPENDENCIES_E26.md` is reproduced
+   exactly. Every listed owner/writer/chronology token must have a non-positive
+   signed delta; a new token or any increase is a blocker. Direct fallback,
+   compatibility, legacy, authority, and writer text is scanned in the
+   production route scope, not inferred from chronology seam names.
+10. The checkpoint and filesystem working-diff provider structs each carry the
+    same `forktree_reader: crate::forktree::ForkTreeReadFacade<S>` field and
+    bind it exactly as `query_source.forktree_reader.clone()`. Their production
+    scan closures must consume that field; neither may call `begin_read` or
+    construct a local ForkTree reader. This is the structural shared-view
+    identity proof.
 
 ## Exact 479 calibration
 

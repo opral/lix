@@ -17,6 +17,15 @@ candidate_tests_log="${8:?candidate test-aware log required}"
 package_rel="packages/lix/tests/forktree_correction_i_deletion_gate_47957"
 src="$candidate_root/packages/lix/src"
 failures=0
+route_files=(
+  packages/lix/src/checkpoint.rs
+  packages/lix/src/sql2/providers/working_diff.rs
+  packages/lix/src/sql2/providers/checkpoint.rs
+  packages/lix/src/sql2/providers/filesystem_working_diff.rs
+  packages/lix/src/sql2/history_route.rs
+  packages/lix/src/sql2/context.rs
+  packages/lix/src/sql2/mod.rs
+)
 
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
@@ -92,6 +101,44 @@ count_token() {
   count=$(rg -o -F "$pattern" "$path" 2>/dev/null | wc -l | tr -d ' ')
   printf 'RESIDUAL_COUNT token=%s count=%s path=%s\n' "$label" "$count" "${path#"$candidate_root/"}"
   printf '%s\n' "$count"
+}
+
+check_baseline_token() {
+  local label="$1"
+  local pattern="$2"
+  local expected="$3"
+  local count delta
+  count=$(rg -o -F "$pattern" "$src" 2>/dev/null | wc -l | tr -d ' ')
+  delta=$((count - expected))
+  printf 'REVERSE_DEP token=%s baseline=%s current=%s delta=%+d\n' "$label" "$expected" "$count" "$delta"
+  if ((delta > 0)); then
+    fail "reverse-dependency-increase=$label baseline=$expected current=$count"
+  else
+    pass "reverse-dependency-nonincreasing=$label delta=$delta"
+  fi
+}
+
+check_route_baseline_token() {
+  local label="$1"
+  local pattern="$2"
+  local expected="$3"
+  local count delta
+  local absolute_route_files=()
+  for file in "${route_files[@]}"; do
+    absolute_route_files+=("$candidate_root/$file")
+  done
+  count=$(awk '
+    FNR == 1 {next_file=0}
+    /^#[[:space:]]*\[cfg\(test\)\]/{next_file=1}
+    !next_file{print FILENAME ":" $0}
+  ' "${absolute_route_files[@]}" | rg -o -i -F "$pattern" | wc -l | tr -d ' ')
+  delta=$((count - expected))
+  printf 'ROUTE_DEP token=%s baseline=%s current=%s delta=%+d\n' "$label" "$expected" "$count" "$delta"
+  if ((delta > 0)); then
+    fail "route-dependency-increase=$label baseline=$expected current=$count"
+  else
+    pass "route-dependency-nonincreasing=$label delta=$delta"
+  fi
 }
 
 normalize_errors() {
@@ -235,6 +282,24 @@ done
 absent_production packages/lix/src/sql2/providers/checkpoint.rs 'ForkTreeReadFacade::new'
 absent_production packages/lix/src/sql2/providers/filesystem_working_diff.rs 'ForkTreeReadFacade::new'
 
+# Direct route scan: compatibility/fallback/authority words are checked in
+# production text rather than inferred from a seam-name count.
+for file in "${route_files[@]}"; do
+  for token in fallback compat compatibility legacy; do
+    absent_production "$file" "$token"
+  done
+done
+
+# Structural shared-view identity proof. Both providers must bind the exact
+# same retained reader field from the incoming HistoryQuerySource.
+for file in packages/lix/src/sql2/providers/checkpoint.rs packages/lix/src/sql2/providers/filesystem_working_diff.rs; do
+  required_regex "$file" 'forktree_reader:[[:space:]]+crate::forktree::ForkTreeReadFacade<S>'
+  required_regex "$file" 'forktree_reader:[[:space:]]+query_source\.forktree_reader\.clone\(\)'
+  required_regex "$file" 'forktree_reader[^\n]*(checkpoint|chronology)|checkpoint|chronology[^\n]*forktree_reader'
+  absent_production "$file" 'begin_read('
+  absent_production "$file" 'ForkTreeReadFacade::new'
+done
+
 required_regex packages/lix/src/sql2/providers/checkpoint.rs '(checkpoint|chronology)'
 required_regex packages/lix/src/sql2/providers/checkpoint.rs 'forktree_reader|coherent_view|ForkTreeReadFacade|checkpoint_(history|chronology)'
 required_regex packages/lix/src/sql2/providers/filesystem_working_diff.rs '(checkpoint|chronology)'
@@ -254,9 +319,25 @@ no_added_diagnostics tests-errors normalize_errors "$base_tests_log" "$candidate
 no_added_diagnostics library-warnings normalize_warnings "$base_lib_log" "$candidate_lib_log"
 no_added_diagnostics tests-warnings normalize_warnings "$base_tests_log" "$candidate_tests_log"
 
-for token in TrackedStateStoreReader TrackedHeadContext BranchHeadControlContext BranchHeadControlCache stage_branch_head_control branch_head_control_precondition untracked_lifecycle_generation; do
-  count_token "$token" "$token" "$src" >/tmp/correction-i-count
-  cat /tmp/correction-i-count
+baseline_tokens=(
+  TrackedStateStoreReader TrackedStateContext TrackedStateScanRequest
+  TrackedStateReadColumns TrackedStateWriter TrackedHeadContext
+  TrackedWorkingDiff TrackedWorkingDiffEpoch WorkingDiffIndexCoverage
+  BranchHeadControl BranchHeadControlContext BranchHeadControlCache
+  stage_branch_head_control branch_head_control_precondition
+  checkpoint_history_for_branch checkpoint_history_from_head
+  checkpoint_history_from_checkpoint is_checkpoint_commit
+  latest_checkpoint_for_branch scan_state_rows_at_commit
+)
+baseline_counts=(17 143 40 15 6 34 4 2 13 86 35 13 32 6 1 7 6 4 3 11)
+for i in "${!baseline_tokens[@]}"; do
+  check_baseline_token "${baseline_tokens[$i]}" "${baseline_tokens[$i]}" "${baseline_counts[$i]}"
+done
+
+route_tokens=(fallback compat compatibility legacy authority authoritative writer)
+route_counts=(1 0 0 0 1 0 3)
+for i in "${!route_tokens[@]}"; do
+  check_route_baseline_token "${route_tokens[$i]}" "${route_tokens[$i]}" "${route_counts[$i]}"
 done
 
 if ((failures == 0)); then
