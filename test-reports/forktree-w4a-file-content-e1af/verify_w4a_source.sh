@@ -52,6 +52,33 @@ operation_window() {
   ' "$1"
 }
 
+function_block() {
+  local file=$1
+  local function_name=$2
+  awk -v fn="$function_name" '
+    $0 ~ "fn[[:space:]]*" fn "[[:space:]]*[(]" { started = 1 }
+    started {
+      print
+      opens = gsub(/\{/, "{")
+      closes = gsub(/\}/, "}")
+      depth += opens - closes
+      if (index($0, "{") > 0) saw_body = 1
+      if (saw_body && depth <= 0) exit
+    }
+  ' "$file"
+}
+
+outside_operation() {
+  awk '
+    /async[[:space:]]+fn[[:space:]]+commit_prepared[[:space:]]*\(/ { skipping = 1 }
+    skipping {
+      if (/prepared_commit[.]commit[(][)]([.]await)?/) { skipping = 0 }
+      next
+    }
+    { print }
+  ' "$1"
+}
+
 source_baseline() {
   local root=$1
   local commit=$2
@@ -113,7 +140,7 @@ is_allowed_path() {
 }
 
 candidate_scope() {
-  local base_root=$1 base_commit=$2 candidate_root=$3 candidate_commit=$4
+  local candidate_root=$1 base_commit=$2 candidate_commit=$3
   mapfile -t changed < <(git -C "$candidate_root" diff --name-only "$base_commit" "$candidate_commit")
   ((${#changed[@]} > 0)) ||
     die "candidate has no source diff from base"
@@ -127,11 +154,24 @@ candidate_scope() {
   printf 'CANDIDATE-SCOPE paths=%s\n' "${changed[*]}"
 }
 
-candidate_forbidden_routes() {
+candidate_direct_writer_scan() {
   local root=$1
-  local scan_paths=(
+  local context_rs="$root/packages/lix/src/transaction/context.rs"
+  local outside
+  outside=$(outside_operation "$context_rs")
+  if printf '%s\n' "$outside" | rg -n -e 'begin_write[(]' \
+      -e 'prepare_write_set[(]' \
+      -e 'StorageWrite' \
+      -e 'storage[.]write[(]' \
+      -e 'storage[.](put|delete|commit)[(]' \
+      -e 'backend[.](put|delete|commit|write)[(]' \
+      -e 'PreparedPublication::commit'; then
+    echo "CANDIDATE-BLOCKER writer route outside commit_prepared"
+    return 1
+  fi
+
+  local paths=(
     "$root/packages/lix/src/transaction/commit.rs"
-    "$root/packages/lix/src/transaction/context.rs"
     "$root/packages/lix/src/transaction/staging.rs"
     "$root/packages/lix/src/transaction/types.rs"
     "$root/packages/lix/src/forktree/publication.rs"
@@ -139,18 +179,90 @@ candidate_forbidden_routes() {
     "$root/packages/lix/src/sql2/providers/file.rs"
   )
   local path
-  for path in "${scan_paths[@]}"; do
+  for path in "${paths[@]}"; do
     [[ -f "$path" ]] || continue
-    if rg -n -e 'PreparedPublication::commit' \
-      -e 'stage_atomic_cas_publication' \
-      -e 'execute_fast_lix_file_prepared_path_write' \
-      -e 'binary_cas::kv' \
-      -e 'fallback_full_write' \
-      -e 'legacy_file_content_writer' "$path"; then
-      echo "CANDIDATE-BLOCKER independent or legacy file/CAS route in $path"
+    if rg -n -e 'begin_read[(]' \
+      -e 'begin_write[(]' \
+      -e 'prepare_write_set[(]' \
+      -e 'StorageWrite' \
+      -e 'storage[.]write[(]' \
+      -e 'storage[.](put|delete|commit)[(]' \
+      -e 'backend[.](put|delete|commit|write)[(]' \
+      -e 'PreparedPublication::commit' \
+      -e 'FileContent(Cache|Index)' \
+      -e 'Blob(Content)?(Cache|Index)' \
+      -e 'Secondary.*Authority' \
+      -e 'Shadow.*(Writer|Index)' \
+      -e 'Legacy.*(Writer|Reader)' \
+      -e 'Fallback.*(Writer|Read)' "$path"; then
+      echo "CANDIDATE-BLOCKER alternate writer/cache/authority in $path"
       return 1
     fi
   done
+}
+
+candidate_blob_authority_scan() {
+  local root=$1
+  local publication_rs="$root/packages/lix/src/forktree/publication.rs"
+  local blob_rs="$root/packages/lix/src/forktree/blob.rs"
+  local closure="$publication_rs"$'\n'"$(cat "$blob_rs")"
+  local prep_body prep_header
+  prep_body=$(function_block "$publication_rs" "prepare_file_content")
+  [[ -n "$prep_body" ]] ||
+    { echo "CANDIDATE-BLOCKER prepare_file_content owner function missing"; return 1; }
+  prep_header=$(printf '%s\n' "$prep_body" | sed '/{/q')
+  if printf '%s\n' "$prep_header" | rg -q '(^|[^a-z_])blob_id[[:space:]]*:'; then
+    echo "CANDIDATE-BLOCKER caller-supplied blob_id argument"
+    return 1
+  fi
+  if rg -n 'pub[[:space:]]+(struct|enum|type)[[:space:]]+BlobId' "$publication_rs" "$blob_rs"; then
+    echo "CANDIDATE-BLOCKER BlobId owner is public"
+    return 1
+  fi
+  rg -n '^[[:space:]]*struct[[:space:]]+BlobId' "$publication_rs" "$blob_rs" >/dev/null ||
+    { echo "CANDIDATE-BLOCKER owner-private BlobId declaration missing"; return 1; }
+  rg -n '^[[:space:]]*fn[[:space:]]+from_ordered_manifest[[:space:]]*[(]' "$publication_rs" "$blob_rs" >/dev/null ||
+    { echo "CANDIDATE-BLOCKER canonical ordered BlobId derivation missing"; return 1; }
+
+  local auth_line derive_line compare_line bytes_line
+  auth_line=$(printf '%s\n' "$prep_body" | rg -n 'authenticate_ordered_chunks' | head -n1 | cut -d: -f1 || true)
+  derive_line=$(printf '%s\n' "$prep_body" | rg -n 'owner_blob_id[[:space:]]*=.*from_ordered_manifest' | head -n1 | cut -d: -f1 || true)
+  compare_line=$(printf '%s\n' "$prep_body" | rg -n 'row_blob_id.*(!=|==).*owner_blob_id|owner_blob_id.*(!=|==).*row_blob_id' | head -n1 | cut -d: -f1 || true)
+  bytes_line=$(printf '%s\n' "$prep_body" | rg -n 'read_authenticated_range|read_payload_bytes|payload_bytes|read_range' | head -n1 | cut -d: -f1 || true)
+  [[ -n "$auth_line" && -n "$derive_line" && -n "$compare_line" && -n "$bytes_line" ]] ||
+    { echo "CANDIDATE-BLOCKER authenticated derive/row compare/payload sequence missing"; return 1; }
+  ((auth_line < derive_line && derive_line < compare_line && compare_line < bytes_line)) ||
+    { echo "CANDIDATE-BLOCKER row identity is not checked before payload bytes"; return 1; }
+  printf '%s\n' "$prep_body" | rg -n 'read[^\n]*(row_identity|row_blob_id)|(row_identity|row_blob_id)[^\n]*read' >/dev/null ||
+    { echo "CANDIDATE-BLOCKER row identity is not sourced from the retained read"; return 1; }
+
+  for token in BlobManifestV1 BlobChunkV1 CoherentView ReadLease PreparedPublication; do
+    printf '%s\n' "$closure" | rg -Fq "$token" ||
+      { echo "CANDIDATE-BLOCKER missing view/manifest/chunk owner token: $token"; return 1; }
+  done
+  if printf '%s\n' "$closure" | rg -n 'derive[(][^)]*blob_id|caller_blob_id|supplied_blob_id'; then
+    echo "CANDIDATE-BLOCKER caller-supplied BlobId route"
+    return 1
+  fi
+  if printf '%s\n' "$closure" | rg -n '#\[derive\([^)]*(Copy|Clone)'; then
+    echo "CANDIDATE-BLOCKER view/lease is copyable"
+    return 1
+  fi
+  printf '%s\n' "$prep_body" | rg -n 'read_id|view_id' >/dev/null ||
+    { echo "CANDIDATE-BLOCKER publication does not bind read/view identity"; return 1; }
+}
+
+candidate_publication_scan() {
+  local root=$1
+  local publication_rs="$root/packages/lix/src/forktree/publication.rs"
+  local count
+  count=$(rg -n 'fn[[:space:]]+prepare_file_content[[:space:]]*[(]' "$publication_rs" | wc -l | tr -d ' ')
+  [[ "$count" == 1 ]] ||
+    { echo "CANDIDATE-BLOCKER expected one file-content publication constructor, got $count"; return 1; }
+  if rg -n 'fn[[:space:]]+(publish|write)_file_content[[:space:]]*[(]' "$publication_rs"; then
+    echo "CANDIDATE-BLOCKER second file-content publication route"
+    return 1
+  fi
 }
 
 candidate_green() {
@@ -160,9 +272,7 @@ candidate_green() {
   [[ "$(rev_at_head "$root")" == "$candidate_commit" ]] ||
     die "candidate root HEAD does not equal supplied candidate commit"
 
-  candidate_scope "$root" "$base_commit" "$root" "$candidate_commit" || return 1
-  candidate_forbidden_routes "$root" || return 1
-
+  candidate_scope "$root" "$base_commit" "$candidate_commit" || return 1
   local context_rs="$root/packages/lix/src/transaction/context.rs"
   local commit_rs="$root/packages/lix/src/transaction/commit.rs"
   local publication_rs="$root/packages/lix/src/forktree/publication.rs"
@@ -194,11 +304,15 @@ candidate_green() {
     started { print }
     started && /[)][.]await/ { exit }
   ' <<<"$window")
-  printf '%s\n' "$publication_call" | rg --quiet --regexp "\b${read_var}([.]clone[(][)])?" ||
+  printf '%s\n' "$publication_call" | rg --quiet --regexp "\b${read_var}\b" ||
     { echo "CANDIDATE-BLOCKER publication does not consume the operation-owned read"; return 1; }
+  if printf '%s\n' "$window" | rg -Fq "${read_var}.clone("; then
+    echo "CANDIDATE-BLOCKER operation copies the retained read/lease"
+    return 1
+  fi
 
   [[ "$(count_literal "$window" 'into_storage_plan()')" == 1 ]] ||
-    { echo "CANDIDATE-BLOCKER operation must consume one PreparedPublication into one storage plan"; return 1; }
+    { echo "CANDIDATE-BLOCKER operation must consume one publication into one storage plan"; return 1; }
   [[ "$(count_literal "$window" 'prepare_write_set(')" == 1 ]] ||
     { echo "CANDIDATE-BLOCKER operation must prepare exactly one transaction write set"; return 1; }
   [[ "$(count_literal "$window" 'prepared_commit.commit().await')" == 1 ]] ||
@@ -209,16 +323,13 @@ candidate_green() {
   ! rg -Fq "$BASELINE_REJECTION" "$commit_rs" ||
     { echo "CANDIDATE-BLOCKER baseline file-content rejection remains"; return 1; }
 
-  local closure="$publication_rs"$'\n'"$(cat "$blob_rs")"
-  local token
-  for token in BlobId BlobManifestV1 BlobChunkV1 CoherentView PreparedPublication; do
-    printf '%s\n' "$closure" | rg -Fq "$token" ||
-      { echo "CANDIDATE-BLOCKER missing authenticated ownership token: $token"; return 1; }
-  done
-  candidate_forbidden_routes "$root" || return 1
-  echo "CANDIDATE-PASS-01 scope and no legacy/independent route"
+  candidate_publication_scan "$root" || return 1
+  candidate_blob_authority_scan "$root" || return 1
+  candidate_direct_writer_scan "$root" || return 1
+  echo "CANDIDATE-PASS-01 whole allowlisted closure has no second writer/cache/authority"
   echo "CANDIDATE-PASS-02 one read -> one publication -> one plan -> one prepare -> one commit"
-  echo "CANDIDATE-PASS-03 BlobId/manifest/chunk/CoherentView closure is visible"
+  echo "CANDIDATE-PASS-03 private BlobId derives from authenticated ordered closure before payload bytes"
+  echo "CANDIDATE-PASS-04 non-copy read/lease identity is argument-bound"
   echo "CANDIDATE-GREEN-RESULT=GREEN"
 }
 
@@ -240,15 +351,43 @@ fn reject_not_yet_lowered_cohorts() {
 }
 EOF
   cat >"$temp/packages/lix/src/forktree/publication.rs" <<'EOF'
-struct CoherentView;
+struct CoherentView { view_id: u64 }
+struct ReadLease { view: CoherentView, read_id: u64, row_identity: BlobId }
 struct BlobManifestV1;
 struct BlobChunkV1;
-struct BlobId;
+struct BlobId([u8; 32]);
 struct PreparedPublication;
-fn prepare_file_content(_view: &CoherentView, _m: BlobManifestV1, _c: &[BlobChunkV1], _id: BlobId) -> PreparedPublication { PreparedPublication }
+impl BlobId {
+    fn from_ordered_manifest(_manifest: &BlobManifestV1, _chunks: &[BlobChunkV1]) -> Result<Self, Error> {
+        Ok(BlobId([0; 32]))
+    }
+}
+fn authenticate_ordered_chunks(_manifest: &BlobManifestV1, _chunks: &[BlobChunkV1]) -> Result<(), Error> {
+    Ok(())
+}
+fn read_authenticated_range(_read: &ReadLease) -> Result<Vec<u8>, Error> {
+    Ok(Vec::new())
+}
+fn prepare_file_content(
+    read: &ReadLease,
+    manifest: BlobManifestV1,
+    chunks: Vec<BlobChunkV1>,
+) -> Result<PreparedPublication, Error> {
+    authenticate_ordered_chunks(&manifest, &chunks)?;
+    let owner_blob_id = BlobId::from_ordered_manifest(&manifest, &chunks)?;
+    let row_blob_id = read.row_identity;
+    if row_blob_id != owner_blob_id {
+        return Err(Error);
+    }
+    let _bytes = read_authenticated_range(read)?;
+    let _ = read.view.view_id;
+    let _ = read.read_id;
+    Ok(PreparedPublication)
+}
+struct Error;
 EOF
   cat >"$temp/packages/lix/src/forktree/blob.rs" <<'EOF'
-use super::{BlobChunkV1, BlobId, BlobManifestV1, CoherentView, PreparedPublication};
+use super::{BlobChunkV1, BlobId, BlobManifestV1, CoherentView, PreparedPublication, ReadLease};
 EOF
   git -C "$temp" init -q
   git -C "$temp" config user.email w4a@example.invalid
@@ -260,7 +399,7 @@ EOF
 async fn commit_prepared() {
     let commit_read = storage.begin_read().await?;
     let prepared_forktree_plan =
-        prepare_forktree_publication_with_parent_heads(commit_read.clone()).await?;
+        prepare_forktree_publication_with_parent_heads(commit_read).await?;
     let (writes, _) = prepared_forktree_plan.into_storage_plan()?;
     let prepared_commit = storage.prepare_write_set(writes).await?;
     let _ = prepared_commit.commit().await?;
