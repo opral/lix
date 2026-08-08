@@ -1,0 +1,13 @@
+{
+  "binary_search_ok_allowed": true,
+  "decode_hits": [
+    "fixture.rs:decode_lookup:.ok:unknown"
+  ],
+  "decode_ok_rejected": true,
+  "evidence_sha256": "427f25b088b441b4335a9b6c806ad34107139af8885d9083395fdfd57b5ac428",
+  "schema": 1,
+  "storage_hits": [
+    "fixture.rs:storage_lookup:.ok:unknown"
+  ],
+  "storage_ok_rejected": true
+}
