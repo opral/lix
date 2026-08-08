@@ -1,0 +1,72 @@
+{
+  "package": "forktree-sqlite-oltp-optimization-target-b59",
+  "status": "test-report-only-unrun",
+  "binding": {
+    "forktree_head": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "forktree_tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+    "forktree_parent": "713455a3557907ce705d06f720fcdc4486bddd4a",
+    "parent_head_full_index_sha256": "4b2885709ba09034068b321be2fe5f27348d6681b1060133af1df0b7d76bb8d4",
+    "semantic_seams": [
+      "ForkTreeReadFacade::load_state_value_at_commit",
+      "ForkTreeReadFacade::load_state_rows_at_commit",
+      "ForkTree::load_commit_member_records",
+      "ForkTree::state_point_on_read",
+      "ForkTree::state_range"
+    ]
+  },
+  "fixture": {
+    "schema_key": "app.sqlite_oltp",
+    "file_id": "sqlite-oltp-target-v1",
+    "seed_rows": 1000,
+    "primary_key": "typed-text-r-plus-six-decimal-digits",
+    "overlay_controls": {
+      "r000007": "local-value",
+      "r000011": "local-tombstone",
+      "r000013": "local-null"
+    },
+    "digest": {
+      "algorithm": "sha256",
+      "domain": "lix.sqlite-oltp.target.b59.v1\\0",
+      "golden_status": "unmeasured-until-authorized-future-run",
+      "warm_equals_cold": true,
+      "warm_equals_model": true
+    }
+  },
+  "cells": [
+    {"id": "point-1000", "logical_ops": 1000, "returned_rows": 1000, "writes": 0, "commits": 0},
+    {"id": "range-128x32", "ranges": 128, "returned_rows": 4096, "writes": 0, "commits": 0},
+    {"id": "insert-256-returning", "inputs": 256, "returning_rows": 256, "plans": 1, "commits": 1},
+    {"id": "update-256-returning", "inputs": 256, "returning_rows": 256, "plans": 1, "commits": 1},
+    {"id": "delete-128-returning", "inputs": 128, "returning_rows": 128, "plans": 1, "commits": 1},
+    {"id": "upsert-256-returning", "inputs": 256, "updates": 128, "inserts": 128, "returning_rows": 256, "plans": 1, "commits": 1},
+    {"id": "mixed-savepoint", "rolled_back_mutations": 8, "committed_mutations": 160, "plans": 1, "commits": 1},
+    {"id": "overlay-precedence", "controls": 3, "writes": 0, "commits": 0},
+    {"id": "historical-fail-closed", "corruption_classes": 4, "writes": 0, "commits": 0}
+  ],
+  "required_zero_counters": [
+    "legacy_reads",
+    "legacy_writes",
+    "fallback_reads",
+    "retries",
+    "cache_refreshes"
+  ],
+  "required_write_shape": {
+    "prepared_publications": 1,
+    "storage_plans": 1,
+    "prepared_write_sets": 1,
+    "backend_commits": 1,
+    "selector_cas": 1,
+    "epoch_cas": 1
+  },
+  "future_order": [
+    "static-binding",
+    "memory-model-and-vector",
+    "sqlite-shaped-control",
+    "forktree-target",
+    "rocksdb",
+    "slatedb"
+  ],
+  "runs_claimed": false,
+  "production_edits": false,
+  "current_main_comparison": false
+}
