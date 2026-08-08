@@ -90,9 +90,9 @@ def mask_non_code(text: str) -> str:
                 output.append(" ")
                 index += 1
             continue
-        raw = re.match(r"(?:br|r)(#+)\"", text[index:])
+        raw = re.match(r"(?:br|r)(#+)?\"", text[index:])
         if raw:
-            hashes = raw.group(1)
+            hashes = raw.group(1) or ""
             end = "\"" + hashes
             output.extend(" " * len(raw.group(0)))
             index += len(raw.group(0))
@@ -103,7 +103,7 @@ def mask_non_code(text: str) -> str:
                 output.extend(" " * len(end))
                 index += len(end)
             continue
-        if text[index] in {'"', "'"}:
+        if text[index] == '"':
             quote = text[index]
             output.append(" ")
             index += 1
@@ -182,26 +182,29 @@ def exact_facade_constructor(body_code: str) -> str:
 
 
 def forbidden_operation_tokens(body_code: str) -> list[str]:
-    forbidden = [
-        "begin_read(",
-        "commit_graph_reader",
-        "tracked_state_reader",
-        "TrackedStateStoreReader",
-        "StorageRead::",
-        "read_store",
-        ".refresh(",
-        "fallback",
-        "retry",
-        "cache",
-        "raw_store",
-        "forktree_read.clone()",
-        "opening_read().clone()",
-        "ForkTreeReadFacade::new",
-    ]
-    return [token for token in forbidden if token in body_code]
+    code = mask_non_code(body_code)
+    forbidden = {
+        "begin_read": r"\bbegin_read\s*\(",
+        "commit_graph_reader": r"\bcommit_graph_reader\s*\(",
+        "tracked_state_reader": r"\btracked_state_reader\s*\(",
+        "TrackedStateStoreReader": r"\bTrackedStateStoreReader\b",
+        "StorageRead": r"\bStorageRead\s*::",
+        "read_store": r"\bread_store\b",
+        "refresh": r"\.\s*refresh\s*\(",
+        "fallback": r"\bfallback\b",
+        "retry": r"\bretry\b",
+        "cache": r"\bcache\b",
+        "raw_store": r"\braw_store\b",
+        "forktree_read.clone": r"\bforktree_read\s*\.\s*clone\s*\(",
+        "opening_read.clone": r"\bopening_read\s*\(\s*\)\s*\.\s*clone\s*\(",
+        "ForkTreeReadFacade::new": r"\bForkTreeReadFacade\s*::\s*new\s*\(",
+        "compatibility": r"\bcompatibility\b|\bcompat\b",
+    }
+    return [name for name, pattern in forbidden.items() if re.search(pattern, code)]
 
 
 def aliases_facade(body_code: str) -> list[str]:
+    body_code = mask_non_code(body_code)
     aliases = []
     aliases.extend(
         re.findall(r"\blet\s+(\w+)\s*=\s*(?:&\s*)?forktree_read\b", body_code)
@@ -244,9 +247,13 @@ if "commit_graph_reader()" in session:
     reds.append("undo/redo still opens a fresh commit-graph reader")
 
 facade_bodies = [undo_code, redo_code]
-facade_count = sum(body.count("ForkTreeReadFacade::from_opening_read") for body in facade_bodies)
+facade_count = sum(
+    mask_non_code(body).count("ForkTreeReadFacade::from_opening_read")
+    for body in facade_bodies
+)
 if facade_count != 2 or not all(
-    re.search(exact_facade_constructor(body), body) for body in facade_bodies
+    re.search(exact_facade_constructor(mask_non_code(body)), mask_non_code(body))
+    for body in facade_bodies
 ):
     reds.append("undo/redo lacks the retained ForkTree facade anchor")
 
@@ -294,12 +301,20 @@ if not reds:
                 raise SystemExit(1)
 
     required_calls = helper_names + ["execute_tracked_state_transition"]
-    for name, _signature, code in closure:
-        for helper in required_calls:
-            for arguments in matching_call_arguments(code, helper):
-                if not re.search(r"\bforktree_read\b", arguments):
-                    print(f"RED-STRUCT {name} {helper} lacks retained facade argument")
-                    raise SystemExit(1)
+    for helper in required_calls:
+        occurrences = []
+        for name, _signature, code in closure:
+            occurrences.extend(
+                (name, arguments)
+                for arguments in matching_call_arguments(mask_non_code(code), helper)
+            )
+        if not occurrences:
+            print(f"RED-STRUCT required helper/commit call is absent: {helper}")
+            raise SystemExit(1)
+        for name, arguments in occurrences:
+            if not re.search(r"\bforktree_read\b", arguments):
+                print(f"RED-STRUCT {name} {helper} lacks retained facade argument")
+                raise SystemExit(1)
     if "forktree_read" not in transition_signature or not facade_parameter(transition_signature):
         print("RED-STRUCT typed transition facade argument is not explicit")
         raise SystemExit(1)
@@ -307,18 +322,10 @@ if not reds:
     for path in FORKTREE_PATHS:
         additions = "\n".join(added_lines(path))
         additions_code = mask_non_code(additions)
-        forbidden_additions = [
-            "begin_read(",
-            "commit_graph_reader",
-            "tracked_state_reader",
-            "TrackedStateStoreReader",
-            "StorageRead::",
-            "read_store",
-            "raw_store",
-            "ForkTreeReadFacade::from_opening_read",
-            "ForkTreeReadFacade::new",
-        ]
-        hits = [token for token in forbidden_additions if token in additions_code]
+        forbidden_additions = forbidden_operation_tokens(additions_code)
+        if "ForkTreeReadFacade::from_opening_read" in additions_code:
+            forbidden_additions.append("ForkTreeReadFacade::from_opening_read")
+        hits = forbidden_additions
         if hits:
             print(f"RED-STRUCT {path} new reader/authority tokens={','.join(hits)}")
             raise SystemExit(1)
@@ -329,17 +336,7 @@ if not reds:
             print(f"RED-STRUCT {path} adds an opening facade outside undo/redo")
             raise SystemExit(1)
         allowed_code = re.sub(exact_facade_constructor(additions_code), "", additions_code)
-        forbidden_additions = [
-            "begin_read(",
-            "commit_graph_reader",
-            "tracked_state_reader",
-            "TrackedStateStoreReader",
-            "StorageRead::",
-            "read_store",
-            "raw_store",
-            "ForkTreeReadFacade::new",
-        ]
-        hits = [token for token in forbidden_additions if token in allowed_code]
+        hits = forbidden_operation_tokens(allowed_code)
         if hits:
             print(f"RED-STRUCT {path} new reader/authority tokens={','.join(hits)}")
             raise SystemExit(1)
@@ -366,11 +363,11 @@ if not reds:
     print("STRUCTURAL GREEN one opening facade, propagated helper arguments, and no alternate authority")
 
 positive_anchors = [
-    (session, "async fn undo_in_transaction", "undo state-machine entry anchor"),
-    (session, "async fn redo_in_transaction", "redo state-machine entry anchor"),
-    (session, "apply_state_diff", "inverse/replay transition anchor"),
-    (context, "execute_typed_state_transitions", "typed atomic staging anchor"),
-    (session, "CHECKPOINT_MARKER_SCHEMA_KEY", "checkpoint-floor marker anchor"),
+    (mask_non_code(session), "async fn undo_in_transaction", "undo state-machine entry anchor"),
+    (mask_non_code(session), "async fn redo_in_transaction", "redo state-machine entry anchor"),
+    (mask_non_code(session), "apply_state_diff", "inverse/replay transition anchor"),
+    (mask_non_code(context), "execute_typed_state_transitions", "typed atomic staging anchor"),
+    (mask_non_code(session), "CHECKPOINT_MARKER_SCHEMA_KEY", "checkpoint-floor marker anchor"),
 ]
 for text, token, label in positive_anchors:
     if token not in text:

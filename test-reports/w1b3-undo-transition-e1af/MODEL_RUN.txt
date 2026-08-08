@@ -1,24 +1,28 @@
-Standalone corrected v2 model qualification only; no Lix or adapter target
-was built or run.
+Standalone corrected v3 model and compiled structural-fixture qualification
+only; no Lix or adapter target was built or run.
 
-Command:
+Model command:
   timeout 1200s rustc --edition=2024 --test -D warnings undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af-correction
   timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af-correction --nocapture
 
-Binary SHA-256:
-  bcb6cebd4064dde71eb7541346e0e52091fa294c4f3393a044f716a67fb6c692
+Independent model run: 15 passed, 0 failed, including authenticated
+commit/topology/marker/cursor/floor envelopes, same-key substitution, and
+multi-row prepared-publication rollback/success counters.
 
-Result:
-  running 11 tests
-  test absence_null_and_tombstone_are_distinct_valid_transition_values ... ok
-  test fresh_alias_raw_store_fallback_and_cache_reads_fail_closed ... ok
-  test duplicate_empty_missing_and_cold_reopen_fail_closed_or_preserve_state ... ok
-  test ordered_checkpoint_floor_allows_to_floor_but_not_below ... ok
-  test atomic_failure_leaves_selector_cursor_and_rows_unchanged ... ok
-  test generation_first_parent_root_and_merge_fail_closed ... ok
-  test ordinary_commit_after_undo_discards_redo_cursor ... ok
-  test undo_and_redo_preserve_exact_inverse_state_identity ... ok
-  test redo_cursor_mismatch_fails_closed_without_selector_update ... ok
+Model binary SHA-256 for the independent review build:
+  4eaafc495694cd296ac1864bc767364cea7799228598144389efc1f9649333e9
 
-  test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+Compiled fixture command:
+  timeout 1200s rustc --edition=2024 --test -D warnings structural_fixtures.rs -o /tmp/w1b3-structural-fixtures
+  timeout 1200s /tmp/w1b3-structural-fixtures --nocapture
+
+Structural fixture run: 4 passed, 0 failed. Fixture binary SHA-256 for the
+independent review build:
+  0c327bdd27d1fbfb41657e68f461f763941072d5e6ba4b3a0da3d5381e5865f7
+
+Exact e1af source verifier:
+  exit 1 (intentional RED), four predicates, raw output SHA-256
+  8741d99516d096b41f06813c7afdc2dc1ff74fa3b286f45cbfe81c6e2b2dc652
+
   rustfmt --edition 2024 --check: PASS
+  git diff --check: PASS

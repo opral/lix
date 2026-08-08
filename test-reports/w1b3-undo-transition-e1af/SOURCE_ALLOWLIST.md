@@ -61,3 +61,20 @@ a different comment or function.
 The exact e1af source remains RED on the original four predicates. Structural
 GREEN checks run only after those legacy-reader predicates are absent, so the
 original four-RED calibration remains unchanged.
+
+The structural gate now masks comments, ordinary/raw strings, and balanced
+delimiters before matching. It requires every listed historical helper and
+`execute_tracked_state_transition` call to exist in the reachable closure and
+to receive the exact `forktree_read` variable; an omitted call is RED. It also
+rejects aliases, second facade/read/graph/raw-store/cache/fallback/
+compatibility paths and checks the exact allowed paths. The compiled
+`structural_fixtures.rs` suite contains one positive fixture plus negatives for
+comment/string fakes, omitted calls, aliases, second reads, and legacy paths.
+The fixture command is:
+
+    timeout 1200s rustc --edition=2024 --test -D warnings structural_fixtures.rs -o /tmp/w1b3-structural-fixtures
+    timeout 1200s /tmp/w1b3-structural-fixtures --nocapture
+
+The source parser is not accepted as GREEN on token presence alone: a future
+candidate must pass both this executable fixture suite and the candidate
+invocation of `verify_source_contract.sh`.

@@ -1,4 +1,4 @@
-# W1b-3 undo/redo and typed-transition corrected readiness package v2
+# W1b-3 undo/redo and typed-transition corrected readiness package v3
 
 This package is test/report-only. It is anchored to exact e1af and contains
 no production source, Cargo manifest, adapter, benchmark, or Lix runtime
@@ -10,7 +10,8 @@ change.
 - Tree: bfa0d271a723da8250ab76ada16fda90926f1099
 - Parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
 - Direct correction predecessor: fc01cd1ddb4a2b5e3ca26a55290a511be83f11c8
-- Successor package ref: origin/w1b3-undo-transition-oracle-e1af-correction-v2
+- Direct predecessor: ce3f2d52c1f45fd814f28303c93b42a106c8f820
+- Successor package ref: origin/w1b3-undo-transition-oracle-e1af-correction-v3
 
 ## Package files
 
@@ -19,13 +20,16 @@ change.
 - SOURCE_ALLOWLIST.md: exact candidate production path allowlist and forbidden
   widening.
 - undo_transition_oracle.rs: standalone warnings-denied stateful model and
-  positive/discriminating negative fixtures for ancestry, identity, and
-  reopen corruption.
+  positive/discriminating negative fixtures for authenticated envelopes,
+  ancestry, identity, atomic staging, and reopen corruption.
+- structural_fixtures.rs: compiled parser fixtures for real helper/argument,
+  one-plan/one-commit, masking, alias, and second-authority rejection.
 - MODEL_RUN.txt: standalone model command, corrected binary hash, and 11/11
   result.
 - verify_source_contract.sh: source-only structural/argument-aware,
-  closure-following candidate-parametric verifier; exact e1af is intentionally
-  RED because undo/redo and transitions still use legacy readers.
+  closure-following candidate-parametric verifier with required-call presence
+  and masked negative checks; exact e1af is intentionally RED because
+  undo/redo and transitions still use legacy readers.
 - EXPECTED_RED.txt: exact source-only calibration from e1af.
 - SHA256SUMS: hashes of all package files except this checksum file.
 

@@ -1,6 +1,6 @@
-# W1b-3 undo/redo and typed-transition readiness package — exact e1af v2
+# W1b-3 undo/redo and typed-transition readiness package — exact e1af v3
 
-Status: corrected test/report-only successor v2. No production edit, Lix build,
+Status: corrected test/report-only successor v3. No production edit, Lix build,
 adapter runtime, benchmark, PR, or merge was performed. The standalone model
 is the only artifact compiled/run in this task.
 
@@ -10,9 +10,11 @@ is the only artifact compiled/run in this task.
 - Anchor tree: bfa0d271a723da8250ab76ada16fda90926f1099
 - Anchor parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
 - Direct correction predecessor: fc01cd1ddb4a2b5e3ca26a55290a511be83f11c8
+- v2 blocker predecessor: ce3f2d52c1f45fd814f28303c93b42a106c8f820
 - Source worktree: /tmp/lix-w1b3-correction
 - Exact production allowlist: SOURCE_ALLOWLIST.md
 - Package-only path: test-reports/w1b3-undo-transition-e1af/
+- Successor ref: origin/w1b3-undo-transition-oracle-e1af-correction-v3
 
 This is W1b-3 only. W1a/W1b-1/W1b-2, checkpoint reconstruction,
 working-diff, changelog, selectors/BranchRef, writer/publication, GC,
@@ -114,9 +116,13 @@ non-ancestor rejection, root/merge rejection, ordinary-commit redo
 invalidation, explicit redo-cursor mismatch rejection, atomic
 selector/cursor rollback, stale/read/alias/raw-store/fallback/cache poisoning,
 explicit absence/NULL/tombstone, missing history, duplicate/empty identities,
-commit map-key/record identity, malformed/missing cursor and floor state, and
-cold reopen. Its eleven tests are a contract oracle, not production
-qualification.
+commit map-key/record identity, authenticated object domain/kind/content hash,
+same-key substitution, malformed/missing/reordered topology, marker/cursor/
+head/floor/generation cold-reopen identity, and a mutable multi-row prepared
+publication model. The model injects a failure after one staged row and proves
+that rows, selector, head, receipt, and counters remain unchanged; successful
+execution proves exactly one prepared publication, plan, and atomic commit.
+Its tests are a contract oracle, not production qualification.
 
 ## Expected exact-e1af RED calibration
 
@@ -151,15 +157,16 @@ and complete target-diff scope. No Lix compiler or adapter result is inferred.
 
 ## Future commands, each capped at 1200 seconds
 
-The standalone model and rustfmt are the only local qualification commands run
-in this task:
+The standalone model, compiled structural fixtures, and rustfmt are the local
+qualification commands for this package:
 
     timeout 1200s rustfmt --edition 2024 --check test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs
     timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af-correction
     timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af-correction --nocapture
+    timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b3-undo-transition-e1af/structural_fixtures.rs -o /tmp/w1b3-structural-fixtures
+    timeout 1200s /tmp/w1b3-structural-fixtures --nocapture
 
-Corrected model evidence: 11/11 passed; executable SHA-256
-`bcb6cebd4064dde71eb7541346e0e52091fa294c4f3393a044f716a67fb6c692`.
+Corrected v3 model and fixture evidence are recorded in MODEL_RUN.txt.
 The exact e1af source verifier output SHA-256 is
 `8741d99516d096b41f06813c7afdc2dc1ff74fa3b286f45cbfe81c6e2b2dc652` and
 exits 1 with the preserved four RED predicates.

@@ -93,6 +93,8 @@ enum Reject {
     NoRedo,
     CursorMismatch,
     SelectorMismatch,
+    CorruptEnvelope,
+    InjectedFailure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -751,4 +753,498 @@ fn duplicate_empty_missing_and_cold_reopen_fail_closed_or_preserve_state() {
         Err(Reject::MissingCommit)
     );
     assert_eq!(repository.cold_reopen(), Ok(repository.clone()));
+}
+
+// The following model is deliberately separate from the compact history model
+// above. It represents the authenticated object envelope and the mutable
+// publication boundary that a production candidate must preserve. Object IDs
+// and content hashes are a deterministic model hash, not a production codec.
+const AUTH_DOMAIN: u64 = 0x5741_4243_3341_5554;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuthKind {
+    Commit,
+    Marker,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthCommitPayload {
+    logical_id: String,
+    generation: u64,
+    parents: Vec<u64>,
+    rows: BTreeMap<String, Row>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthMarkerPayload {
+    owner: String,
+    head: u64,
+    undo_target: u64,
+    redo_cursor: Option<u64>,
+    redo_target: Option<u64>,
+    checkpoint_floor: Option<u64>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuthPayload {
+    Commit(AuthCommitPayload),
+    Marker(AuthMarkerPayload),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthObject {
+    object_id: u64,
+    domain: u64,
+    kind: AuthKind,
+    payload: AuthPayload,
+    content_hash: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthStore {
+    objects: BTreeMap<u64, AuthObject>,
+    selector_head: u64,
+    marker: u64,
+    selector_generation: u64,
+}
+
+fn model_digest<T: std::fmt::Debug>(value: &T) -> u64 {
+    let bytes = format!("{value:?}").into_bytes();
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        hash.rotate_left(5) ^ u64::from(*byte).wrapping_add(0x9e3779b97f4a7c15)
+    })
+}
+
+fn seal_auth_object(domain: u64, kind: AuthKind, payload: AuthPayload) -> AuthObject {
+    let object_id = model_digest(&(domain, &kind, &payload));
+    let content_hash = model_digest(&(domain, &kind, &payload, object_id));
+    AuthObject {
+        object_id,
+        domain,
+        kind,
+        payload,
+        content_hash,
+    }
+}
+
+fn auth_commit(object: &AuthObject) -> Result<&AuthCommitPayload, Reject> {
+    if object.kind != AuthKind::Commit {
+        return Err(Reject::CorruptEnvelope);
+    }
+    match &object.payload {
+        AuthPayload::Commit(payload) => Ok(payload),
+        AuthPayload::Marker(_) => Err(Reject::CorruptEnvelope),
+    }
+}
+
+fn auth_marker(object: &AuthObject) -> Result<&AuthMarkerPayload, Reject> {
+    if object.kind != AuthKind::Marker {
+        return Err(Reject::CorruptEnvelope);
+    }
+    match &object.payload {
+        AuthPayload::Marker(payload) => Ok(payload),
+        AuthPayload::Commit(_) => Err(Reject::CorruptEnvelope),
+    }
+}
+
+fn validate_auth_object(map_id: u64, object: &AuthObject) -> Result<(), Reject> {
+    if map_id != object.object_id
+        || object.domain != AUTH_DOMAIN
+        || object.content_hash
+            != model_digest(&(
+                object.domain,
+                &object.kind,
+                &object.payload,
+                object.object_id,
+            ))
+    {
+        return Err(Reject::CorruptEnvelope);
+    }
+    match (&object.kind, &object.payload) {
+        (AuthKind::Commit, AuthPayload::Commit(_)) | (AuthKind::Marker, AuthPayload::Marker(_)) => {
+            Ok(())
+        }
+        _ => Err(Reject::CorruptEnvelope),
+    }
+}
+
+fn auth_parent(store: &AuthStore, id: u64) -> Result<&AuthCommitPayload, Reject> {
+    let object = store.objects.get(&id).ok_or(Reject::MissingCommit)?;
+    auth_commit(object)
+}
+
+fn validate_first_parent_chain(
+    store: &AuthStore,
+    descendant: u64,
+    ancestor: u64,
+    seen: &mut BTreeSet<u64>,
+) -> Result<bool, Reject> {
+    if descendant == ancestor {
+        return Ok(true);
+    }
+    if !seen.insert(descendant) {
+        return Err(Reject::Chronology);
+    }
+    let commit = auth_parent(store, descendant)?;
+    match commit.parents.as_slice() {
+        [parent] => validate_first_parent_chain(store, *parent, ancestor, seen),
+        [] | [_, ..] => Ok(false),
+    }
+}
+
+fn validate_auth_store(store: &AuthStore) -> Result<(), Reject> {
+    let head = auth_parent(store, store.selector_head)?;
+    for (map_id, object) in &store.objects {
+        validate_auth_object(*map_id, object)?;
+        if let AuthPayload::Commit(payload) = &object.payload {
+            let mut parents = BTreeSet::new();
+            let mut maximum_generation = None;
+            for parent_id in &payload.parents {
+                if !parents.insert(*parent_id) {
+                    return Err(Reject::Chronology);
+                }
+                let parent = auth_parent(store, *parent_id)?;
+                maximum_generation = Some(
+                    maximum_generation.map_or(parent.generation, |current: u64| {
+                        current.max(parent.generation)
+                    }),
+                );
+            }
+            match maximum_generation {
+                None if payload.generation != 0 => return Err(Reject::Chronology),
+                Some(parent_generation) if payload.generation <= parent_generation => {
+                    return Err(Reject::Chronology);
+                }
+                Some(parent_generation) if payload.parents.len() == 1 => {
+                    if payload.generation != parent_generation + 1 {
+                        return Err(Reject::Chronology);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let marker_object = store
+        .objects
+        .get(&store.marker)
+        .ok_or(Reject::MissingCommit)?;
+    let marker = auth_marker(marker_object)?;
+    if marker.owner != "undo-redo"
+        || marker.head != store.selector_head
+        || marker.undo_target != store.selector_head
+        || marker.generation != head.generation
+        || marker.generation != store.selector_generation
+    {
+        return Err(Reject::CorruptEnvelope);
+    }
+    for id in [
+        marker.redo_cursor,
+        marker.redo_target,
+        marker.checkpoint_floor,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        auth_parent(store, id)?;
+    }
+    if let Some(cursor) = marker.redo_cursor {
+        if cursor != store.selector_head {
+            return Err(Reject::CursorMismatch);
+        }
+    }
+    if let Some(target) = marker.redo_target {
+        let target_payload = auth_parent(store, target)?;
+        if target_payload.parents.as_slice() != [store.selector_head] {
+            return Err(Reject::CursorMismatch);
+        }
+    }
+    if let Some(floor) = marker.checkpoint_floor {
+        if !validate_first_parent_chain(store, store.selector_head, floor, &mut BTreeSet::new())? {
+            return Err(Reject::CheckpointFloor);
+        }
+    }
+    Ok(())
+}
+
+fn authenticated_linear_store() -> AuthStore {
+    let root = seal_auth_object(
+        AUTH_DOMAIN,
+        AuthKind::Commit,
+        AuthPayload::Commit(AuthCommitPayload {
+            logical_id: "A".into(),
+            generation: 0,
+            parents: Vec::new(),
+            rows: BTreeMap::from([(String::from("x"), row("x", 1, Value::Null))]),
+        }),
+    );
+    let target = seal_auth_object(
+        AUTH_DOMAIN,
+        AuthKind::Commit,
+        AuthPayload::Commit(AuthCommitPayload {
+            logical_id: "B".into(),
+            generation: 1,
+            parents: vec![root.object_id],
+            rows: BTreeMap::from([(String::from("x"), row("x", 2, Value::Text("new".into())))]),
+        }),
+    );
+    let marker = seal_auth_object(
+        AUTH_DOMAIN,
+        AuthKind::Marker,
+        AuthPayload::Marker(AuthMarkerPayload {
+            owner: "undo-redo".into(),
+            head: target.object_id,
+            undo_target: target.object_id,
+            redo_cursor: None,
+            redo_target: None,
+            checkpoint_floor: Some(root.object_id),
+            generation: 1,
+        }),
+    );
+    AuthStore {
+        objects: BTreeMap::from([
+            (root.object_id, root),
+            (target.object_id, target),
+            (marker.object_id, marker.clone()),
+        ]),
+        selector_head: marker
+            .payload
+            .clone()
+            .into_marker_head()
+            .expect("marker payload"),
+        marker: marker.object_id,
+        selector_generation: 1,
+    }
+}
+
+trait MarkerHead {
+    fn into_marker_head(self) -> Result<u64, Reject>;
+}
+
+impl MarkerHead for AuthPayload {
+    fn into_marker_head(self) -> Result<u64, Reject> {
+        match self {
+            AuthPayload::Marker(payload) => Ok(payload.head),
+            AuthPayload::Commit(_) => Err(Reject::CorruptEnvelope),
+        }
+    }
+}
+
+fn cold_reopen_authenticated(store: &AuthStore) -> Result<AuthStore, Reject> {
+    validate_auth_store(store)?;
+    Ok(store.clone())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedPublication {
+    expected_head: String,
+    desired_head: String,
+    expected_receipt: u64,
+    plan: TransitionPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AtomicTransitionState {
+    head: String,
+    rows: BTreeMap<String, Row>,
+    receipt: u64,
+    prepared_publications: u64,
+    plans: u64,
+    atomic_commits: u64,
+}
+
+fn prepare_publication(
+    state: &AtomicTransitionState,
+    request: TransitionRequest,
+) -> Result<PreparedPublication, Reject> {
+    let plan = execute_transition(request)?;
+    if plan.current_head != state.head {
+        return Err(Reject::StaleHead);
+    }
+    Ok(PreparedPublication {
+        expected_head: state.head.clone(),
+        desired_head: plan.desired_head.clone(),
+        expected_receipt: state.receipt,
+        plan,
+    })
+}
+
+fn apply_prepared_publication(
+    state: &mut AtomicTransitionState,
+    prepared: PreparedPublication,
+    fail_after_row: Option<usize>,
+) -> Result<(), Reject> {
+    if state.head != prepared.expected_head || state.receipt != prepared.expected_receipt {
+        return Err(Reject::StaleHead);
+    }
+    let mut staged_rows = state.rows.clone();
+    for (index, row) in prepared.plan.rows.iter().enumerate() {
+        if fail_after_row == Some(index) {
+            return Err(Reject::InjectedFailure);
+        }
+        match &row.target_value {
+            Some(value) => {
+                staged_rows.insert(
+                    row.identity.clone(),
+                    Row {
+                        identity: row.identity.clone(),
+                        change_id: row.target_change_id.ok_or(Reject::CorruptEnvelope)?,
+                        value: value.clone(),
+                    },
+                );
+            }
+            None => {
+                staged_rows.remove(&row.identity);
+            }
+        }
+    }
+    state.rows = staged_rows;
+    state.head = prepared.desired_head;
+    state.receipt += 1;
+    state.prepared_publications += 1;
+    state.plans += 1;
+    state.atomic_commits += 1;
+    Ok(())
+}
+
+#[test]
+fn authenticated_envelopes_reject_substitution_kind_and_topology_corruption() {
+    let baseline = authenticated_linear_store();
+    assert_eq!(cold_reopen_authenticated(&baseline), Ok(baseline.clone()));
+
+    let mut same_key = baseline.clone();
+    let target_id = same_key
+        .objects
+        .values()
+        .find_map(|object| match &object.payload {
+            AuthPayload::Commit(payload) if payload.logical_id == "B" => Some(object.object_id),
+            _ => None,
+        })
+        .expect("target");
+    let target = same_key.objects.get_mut(&target_id).expect("target object");
+    if let AuthPayload::Commit(payload) = &mut target.payload {
+        payload.rows.insert(
+            "x".into(),
+            row("x", 2, Value::Text("same-size forged".into())),
+        );
+    }
+    assert_eq!(
+        cold_reopen_authenticated(&same_key),
+        Err(Reject::CorruptEnvelope)
+    );
+
+    let mut wrong_kind = baseline.clone();
+    let marker_id = wrong_kind.marker;
+    wrong_kind.objects.get_mut(&marker_id).expect("marker").kind = AuthKind::Commit;
+    assert_eq!(
+        cold_reopen_authenticated(&wrong_kind),
+        Err(Reject::CorruptEnvelope)
+    );
+
+    let mut missing = baseline.clone();
+    missing.objects.remove(&missing.marker);
+    assert_eq!(
+        cold_reopen_authenticated(&missing),
+        Err(Reject::MissingCommit)
+    );
+
+    let mut reordered = baseline.clone();
+    let commit_id = reordered.selector_head;
+    let commit = reordered.objects.get_mut(&commit_id).expect("head");
+    if let AuthPayload::Commit(payload) = &mut commit.payload {
+        let parent = payload.parents[0];
+        payload.parents.push(parent);
+    }
+    assert_eq!(
+        cold_reopen_authenticated(&reordered),
+        Err(Reject::CorruptEnvelope)
+    );
+}
+
+#[test]
+fn marker_cursor_head_floor_and_generation_are_authenticated_on_reopen() {
+    let baseline = authenticated_linear_store();
+    let mut forged_marker = baseline.clone();
+    let marker = forged_marker
+        .objects
+        .get_mut(&forged_marker.marker)
+        .expect("marker");
+    if let AuthPayload::Marker(payload) = &mut marker.payload {
+        payload.redo_cursor = Some(payload.head);
+        payload.redo_target = Some(payload.head);
+    }
+    assert_eq!(
+        cold_reopen_authenticated(&forged_marker),
+        Err(Reject::CorruptEnvelope)
+    );
+
+    let mut forged_generation = baseline.clone();
+    forged_generation.selector_generation = 9;
+    assert_eq!(
+        cold_reopen_authenticated(&forged_generation),
+        Err(Reject::CorruptEnvelope)
+    );
+}
+
+fn atomic_request(state: &AtomicTransitionState) -> TransitionRequest {
+    let mut desired = state.rows.clone();
+    desired.insert("x".into(), row("x", 2, Value::Text("updated".into())));
+    desired.remove("y");
+    TransitionRequest {
+        observed_head: state.head.clone(),
+        expected_head: state.head.clone(),
+        desired_head: "next".into(),
+        keys: vec!["x".into(), "y".into()],
+        current_rows: state.rows.clone(),
+        desired_rows: desired,
+        read: read(),
+        staged_writes: false,
+    }
+}
+
+#[test]
+fn typed_transition_failure_after_partial_staging_rolls_back_everything() {
+    let state = AtomicTransitionState {
+        head: "current".into(),
+        rows: BTreeMap::from([
+            (String::from("x"), row("x", 1, Value::Null)),
+            (String::from("y"), row("y", 2, Value::Text("old".into()))),
+        ]),
+        receipt: 41,
+        prepared_publications: 0,
+        plans: 0,
+        atomic_commits: 0,
+    };
+    let before = state.clone();
+    let prepared = prepare_publication(&state, atomic_request(&state)).expect("prepare");
+    let mut failed = state.clone();
+    assert_eq!(
+        apply_prepared_publication(&mut failed, prepared, Some(1)),
+        Err(Reject::InjectedFailure)
+    );
+    assert_eq!(failed, before);
+}
+
+#[test]
+fn typed_transition_success_is_one_prepared_plan_and_atomic_commit() {
+    let mut state = AtomicTransitionState {
+        head: "current".into(),
+        rows: BTreeMap::from([
+            (String::from("x"), row("x", 1, Value::Null)),
+            (String::from("y"), row("y", 2, Value::Text("old".into()))),
+        ]),
+        receipt: 41,
+        prepared_publications: 0,
+        plans: 0,
+        atomic_commits: 0,
+    };
+    let prepared = prepare_publication(&state, atomic_request(&state)).expect("prepare");
+    apply_prepared_publication(&mut state, prepared, None).expect("one commit");
+    assert_eq!(state.head, "next");
+    assert_eq!(state.receipt, 42);
+    assert_eq!(state.rows["x"].value, Value::Text("updated".into()));
+    assert!(!state.rows.contains_key("y"));
+    assert_eq!(state.prepared_publications, 1);
+    assert_eq!(state.plans, 1);
+    assert_eq!(state.atomic_commits, 1);
 }
