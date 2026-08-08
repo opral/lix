@@ -12,46 +12,64 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::LixError;
-use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
-use crate::common::{SharedStr, compose_file_path};
+use crate::common::{compose_file_path, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::forktree::ForkTreeReadFacade;
 use crate::plugin::{
-    PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
+    PluginFileOwner, PluginRegistry, PluginRuntimeHost, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
 };
 use crate::tracked_state::TrackedStateFilter;
+use crate::LixError;
+use crate::NullableKeyFilter;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
+    entity_pk_json_array, ObservedTrackedStateOrdinal, ObservedTrackedStateRows,
 };
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
-use crate::sql2::SqlHistoryQuerySource;
-use crate::sql2::WriteAccess;
+use super::spec::{projected_schema, register_spec_table, scan_row_source, PlannedScan, TableSpec};
 use crate::sql2::change_materialization::MaterializedChange;
-use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
+use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
 use crate::sql2::history_route::{
-    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
-    HistoryViewDescriptor, load_history_entries, parse_history_filter,
-    serialize_history_source_changes, validate_history_anchor_filter,
+    load_history_entries, parse_history_filter, serialize_history_source_changes,
+    validate_history_anchor_filter, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
+    HistoryViewDescriptor, HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT,
+    HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED,
+    HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SOURCE_CHANGES,
 };
 use crate::sql2::providers::filesystem_history_path::{
-    DirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
-    resolve_observed_directory_path,
+    load_history_commit_parents, resolve_observed_directory_path, DirectoryPathRecord,
+    HistoryDirectoryTree,
 };
 use crate::sql2::result_metadata::json_field;
+use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::WriteAccess;
 use crate::storage_adapter::StorageAdapterRead;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
+
+fn file_history_owner_schema_keys(
+    state: &FileHistoryObservedState,
+    owner: &PluginFileOwner,
+) -> Result<Vec<String>, LixError> {
+    state
+        .plugin_registry
+        .get(owner.plugin_key())
+        .map(crate::plugin::PluginRegistryEntry::schema_keys)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            invalid_file_history_state(format!(
+                "plugin owner '{}' references missing authenticated registry entry '{}'",
+                owner.file_id(),
+                owner.plugin_key(),
+            ))
+        })
+}
 
 pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
@@ -466,11 +484,7 @@ struct DirectoryDescriptorSnapshot {
 struct BlobRefSnapshot {
     id: String,
     blob_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HistoryIdentitySnapshot {
-    id: String,
+    size_bytes: u64,
 }
 
 struct FileHistoryFilesystemContext {
@@ -514,6 +528,8 @@ impl DirectoryPathRecord for FileHistoryObservedDirectoryRecord {
 struct FileHistoryObservedBlobRecord {
     file_id: String,
     blob_hash: Option<String>,
+    size_bytes: Option<u64>,
+    deleted: bool,
     row: ObservedTrackedStateOrdinal,
 }
 
@@ -730,7 +746,7 @@ where
         &event_plugin_owners,
         &observed_states,
         &plugin_discovery.parent_commit_ids_by_commit,
-    );
+    )?;
     let plugin_owner_events = event_plugin_owners
         .iter()
         .map(|record| file_history_event_from_entry(record.file_id.clone(), &record.entry));
@@ -748,33 +764,19 @@ where
             .chain(plugin_registry_events),
     );
     let prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
-    let blob_bytes = if needs_data {
-        load_file_history_blob_bytes(blob_reader, &prepared).await?
-    } else {
-        BTreeMap::new()
-    };
+    let blob_bytes = load_file_history_blob_bytes(blob_reader, &prepared).await?;
 
     let mut output = Vec::with_capacity(prepared.len());
     for prepared_row in prepared {
-        let data = if needs_data && prepared_row.descriptor().name.is_some() {
-            validate_file_history_materialization(&prepared_row)?;
-            let blob_hash = prepared_row.blob_hash.as_deref().ok_or_else(|| {
-                invalid_file_history_state(format!(
-                    "file '{}' has no authenticated blob reference at observed commit '{}'",
-                    prepared_row.id, prepared_row.event.observed_commit_id
-                ))
-            })?;
-            let bytes = blob_bytes
-                .get(blob_hash)
-                .cloned()
-                .flatten()
-                .ok_or_else(|| {
-                    invalid_file_history_state(format!(
-                        "file '{}' blob payload '{}' is missing at observed commit '{}'",
-                        prepared_row.id, blob_hash, prepared_row.event.observed_commit_id
-                    ))
-                })?;
-            Some(bytes)
+        let data = if prepared_row.descriptor().name.is_some() {
+            let blob_hash =
+                validate_exactly_one_blob_ref(&prepared_row.observed_state, &prepared_row.event)?
+                    .and_then(|reference| reference.blob_hash.as_deref());
+            let bytes = blob_hash
+                .and_then(|blob_hash| blob_bytes.get(blob_hash))
+                .and_then(Option::as_deref);
+            validate_file_history_materialization(&prepared_row, bytes)?;
+            needs_data.then(|| bytes.unwrap_or_default().to_vec())
         } else {
             None
         };
@@ -867,14 +869,8 @@ fn prepare_file_history_rows(
         ) {
             continue;
         }
-        let blob_hash = state
-            .blobs
-            .iter()
-            .find(|blob| blob.file_id == event.file_id)
-            .and_then(|blob| {
-                let _ = state.rows.row(blob.row);
-                blob.blob_hash.clone()
-            });
+        let blob_hash =
+            validate_exactly_one_blob_ref(state, &event)?.and_then(|blob| blob.blob_hash.clone());
         prepared.push(PreparedFileHistoryRow {
             id,
             path,
@@ -941,39 +937,112 @@ fn invalid_file_history_state(message: impl Into<String>) -> LixError {
 /// bytes instead of surfacing the corruption to the caller.
 fn validate_file_history_materialization(
     prepared: &PreparedFileHistoryRow,
+    payload: Option<&[u8]>,
 ) -> Result<(), LixError> {
     let observed_commit_id = prepared.event.observed_commit_id.as_str();
     let state = prepared.observed_state.as_ref();
     let descriptor = prepared.descriptor();
-    let has_blob = prepared.blob_hash.is_some();
-    if !has_blob {
-        return Err(invalid_file_history_state(format!(
-            "file '{}' at commit '{observed_commit_id}' has no authenticated blob reference",
-            descriptor.id
-        )));
-    }
-    let Some(owner) = live_file_history_plugin_owner(state, &descriptor.id) else {
+    let plugin = live_file_history_plugin_owner(state, &descriptor.id)
+        .map(|owner| {
+            state
+                .plugin_registry
+                .get(owner.plugin_key())
+                .ok_or_else(|| {
+                    invalid_file_history_state(format!(
+                        "plugin-owned file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
+                        descriptor.id,
+                        owner.plugin_key(),
+                    ))
+                })
+        })
+        .transpose()?;
+    let Some(blob) = validate_exactly_one_blob_ref(state, &prepared.event)? else {
+        if payload.is_some() {
+            return Err(invalid_file_history_state(format!(
+                "file '{}' at commit '{observed_commit_id}' has payload without an authenticated blob reference",
+                descriptor.id
+            )));
+        }
         return Ok(());
     };
-    let plugin = state
-        .plugin_registry
-        .get(owner.plugin_key())
-        .ok_or_else(|| {
-            invalid_file_history_state(format!(
-                "plugin-owned file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
-                descriptor.id,
-                owner.plugin_key(),
-            ))
-        })?;
-    if has_blob {
-        Ok(())
-    } else {
-        Err(invalid_file_history_state(format!(
-            "plugin '{}' owns file '{}' at commit '{observed_commit_id}' without exactly one blob reference",
-            plugin.key(),
-            descriptor.id,
-        )))
+    let blob_hash = blob.blob_hash.as_deref().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has no live blob identity",
+            descriptor.id
+        ))
+    })?;
+    let expected_blob_id = BlobId::from_hex(blob_hash).map_err(|error| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has an invalid BlobId: {error}",
+            descriptor.id
+        ))
+    })?;
+    let payload = payload.ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' blob payload '{}' is missing at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        ))
+    })?;
+    let declared_size = blob.size_bytes.ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' blob reference '{}' has no declared size at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        ))
+    })?;
+    let payload_size = u64::try_from(payload.len()).map_err(|_| {
+        invalid_file_history_state(format!(
+            "file '{}' blob payload '{}' exceeds the supported size at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        ))
+    })?;
+    if declared_size != payload_size || BlobId::from_content(payload) != expected_blob_id {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' blob reference '{}' does not authenticate its payload at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        )));
     }
+    let _ = plugin;
+    Ok(())
+}
+
+fn validate_exactly_one_blob_ref<'a>(
+    state: &'a FileHistoryObservedState,
+    event: &FileHistoryEvent,
+) -> Result<Option<&'a FileHistoryObservedBlobRecord>, LixError> {
+    let refs = state
+        .blobs
+        .iter()
+        .filter(|blob| blob.file_id == event.file_id)
+        .collect::<Vec<_>>();
+    if refs.len() > 1 {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{}' has duplicate or conflicting BlobRef rows",
+            event.file_id, event.observed_commit_id
+        )));
+    }
+    let Some(blob) = refs.into_iter().next() else {
+        let requires_materialization = event.source_changes.iter().any(|change| {
+            change.schema_key == BLOB_REF_SCHEMA_KEY && change.snapshot_content.is_some()
+        });
+        if requires_materialization {
+            return Err(invalid_file_history_state(format!(
+                "file '{}' at commit '{}' is missing its authenticated BlobRef",
+                event.file_id, event.observed_commit_id
+            )));
+        }
+        return Ok(None);
+    };
+    let _ = state.rows.row(blob.row);
+    if blob.deleted {
+        return Ok(None);
+    }
+    if blob.blob_hash.is_none() || blob.size_bytes.is_none() {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{}' has an incomplete authenticated BlobRef",
+            event.file_id, event.observed_commit_id
+        )));
+    }
+    Ok(Some(blob))
 }
 
 async fn load_file_history_filesystem_context<S>(
@@ -1664,7 +1733,7 @@ fn file_history_plugin_events(
     event_plugin_owners: &[FileHistoryPluginOwnerRecord],
     observed_states: &BTreeMap<String, Arc<FileHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
-) -> Vec<FileHistoryEvent> {
+) -> Result<Vec<FileHistoryEvent>, LixError> {
     let owner_changes = event_plugin_owners
         .iter()
         .map(|record| {
@@ -1675,59 +1744,70 @@ fn file_history_plugin_events(
         })
         .collect::<BTreeSet<_>>();
 
-    event_plugin_state
-        .iter()
-        .filter(|plugin_state| {
-            let observed_commit_id = plugin_state.entry.observed_commit_id.as_str();
-            let schema_key = plugin_state.entry.change.schema_key.as_str();
-            let live_owner_matches = observed_states
-                .get(observed_commit_id)
-                .and_then(|state| {
-                    live_file_history_plugin_owner(state, &plugin_state.file_id)
-                        .map(|owner| (state, owner))
-                })
-                .is_some_and(|(state, owner)| {
-                    file_history_owner_schema_keys(state, owner)
-                        .iter()
-                        .any(|owner_schema_key| owner_schema_key == schema_key)
-                });
-            if live_owner_matches {
-                return true;
-            }
+    let mut events = Vec::new();
+    for plugin_state in event_plugin_state {
+        let observed_commit_id = plugin_state.entry.observed_commit_id.as_str();
+        let schema_key = plugin_state.entry.change.schema_key.as_str();
+        let live_owner_matches = observed_states
+            .get(observed_commit_id)
+            .and_then(|state| {
+                live_file_history_plugin_owner(state, &plugin_state.file_id)
+                    .map(|owner| (state, owner))
+            })
+            .map_or(Ok::<bool, LixError>(false), |(state, owner)| {
+                Ok(file_history_owner_schema_keys(state, owner)?
+                    .iter()
+                    .any(|owner_schema_key| owner_schema_key == schema_key))
+            })?;
+        if live_owner_matches {
+            events.push(file_history_event_from_entry(
+                plugin_state.file_id.clone(),
+                &plugin_state.entry,
+            ));
+            continue;
+        }
 
-            // A non-owner live row cannot change the public file projection.
-            // A tombstone remains relevant only when this commit also changes
-            // the durable owner and a direct parent proves that the schema was
-            // part of the prior owner's rendering contract. This covers owner
-            // deletion, A -> B replacement, and same-key contract updates.
-            if plugin_state.entry.change.snapshot_content.is_some()
-                || !owner_changes.contains(&(observed_commit_id, plugin_state.file_id.as_str()))
-            {
-                return false;
-            }
-            parent_commit_ids_by_commit
-                .get(observed_commit_id)
-                .into_iter()
-                .flatten()
-                .any(|parent_commit_id| {
+        // A non-owner live row cannot change the public file projection.
+        // A tombstone remains relevant only when this commit also changes
+        // the durable owner and a direct parent proves that the schema was
+        // part of the prior owner's rendering contract. This covers owner
+        // deletion, A -> B replacement, and same-key contract updates.
+        if plugin_state.entry.change.snapshot_content.is_some()
+            || !owner_changes.contains(&(observed_commit_id, plugin_state.file_id.as_str()))
+        {
+            continue;
+        }
+        let prior_owner_matches = parent_commit_ids_by_commit
+            .get(observed_commit_id)
+            .into_iter()
+            .flatten()
+            .try_fold(
+                false,
+                |matched, parent_commit_id| -> Result<bool, LixError> {
+                    if matched {
+                        return Ok(true);
+                    }
                     observed_states
                         .get(parent_commit_id)
                         .and_then(|state| {
                             live_file_history_plugin_owner(state, &plugin_state.file_id)
                                 .map(|owner| (state, owner))
                         })
-                        .is_some_and(|(_state, owner)| {
-                            owner
-                                .schema_keys()
+                        .map_or(Ok(false), |(state, owner)| {
+                            Ok(file_history_owner_schema_keys(state, owner)?
                                 .iter()
-                                .any(|owner_schema_key| owner_schema_key == schema_key)
+                                .any(|owner_schema_key| owner_schema_key == schema_key))
                         })
-                })
-        })
-        .map(|plugin_state| {
-            file_history_event_from_entry(plugin_state.file_id.clone(), &plugin_state.entry)
-        })
-        .collect()
+                },
+            )?;
+        if prior_owner_matches {
+            events.push(file_history_event_from_entry(
+                plugin_state.file_id.clone(),
+                &plugin_state.entry,
+            ));
+        }
+    }
+    Ok(events)
 }
 
 fn live_file_history_plugin_owner<'a>(
@@ -1742,17 +1822,6 @@ fn live_file_history_plugin_owner<'a>(
             let _ = state.rows.row(record.row);
             record.owner.as_ref()
         })
-}
-
-fn file_history_owner_schema_keys<'a>(
-    state: &'a FileHistoryObservedState,
-    owner: &'a PluginFileOwner,
-) -> &'a [String] {
-    state
-        .plugin_registry
-        .get(owner.plugin_key())
-        .map(crate::plugin::PluginRegistryEntry::schema_keys)
-        .unwrap_or_else(|| owner.schema_keys())
 }
 
 fn file_history_plugin_registry_events(
@@ -1839,7 +1908,7 @@ fn parse_file_history_descriptors(
                     "file descriptor history row '{row_id}' has no authenticated payload"
                 ))
             })?;
-            let snapshot: HistoryIdentitySnapshot = serde_json::from_str(snapshot_content)
+            let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -1912,9 +1981,20 @@ fn parse_file_history_blobs(
         .filter(|entry| entry.change.schema_key == BLOB_REF_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            let file_id = entry.change.file_id.clone().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "blob reference history row '{row_id}' is missing file_id"
+                ))
+            })?;
             if entry.change.snapshot_content.is_none() {
+                if file_id != row_id {
+                    return Err(invalid_file_history_state(format!(
+                        "blob reference tombstone file identity '{}' does not match authenticated row key '{}'",
+                        file_id, row_id
+                    )));
+                }
                 return Ok(FileHistoryBlobRecord {
-                    file_id: entry.change.file_id.clone().unwrap_or(row_id),
+                    file_id,
                     entry: entry.clone(),
                 });
             }
@@ -1923,19 +2003,20 @@ fn parse_file_history_blobs(
                     "blob reference history row '{row_id}' has no authenticated payload"
                 ))
             })?;
-            let snapshot: HistoryIdentitySnapshot = serde_json::from_str(snapshot_content)
+            let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("invalid lix_binary_blob_ref history snapshot JSON: {error}"),
                     )
                 })?;
+            BlobId::from_hex(&snapshot.blob_hash).map_err(|error| {
+                invalid_file_history_state(format!(
+                    "blob reference history row '{row_id}' has an invalid BlobId: {error}"
+                ))
+            })?;
             if snapshot.id != row_id
-                || entry
-                    .change
-                    .file_id
-                    .as_deref()
-                    .is_some_and(|file_id| file_id != snapshot.id)
+                || file_id != snapshot.id
             {
                 return Err(invalid_file_history_state(format!(
                     "blob reference payload identity '{}' does not match authenticated row key '{}'",
@@ -1943,7 +2024,7 @@ fn parse_file_history_blobs(
                 )));
             }
             Ok(FileHistoryBlobRecord {
-                file_id: entry.change.file_id.clone().unwrap_or(row_id),
+                file_id,
                 entry: entry.clone(),
             })
         })
@@ -2097,11 +2178,24 @@ fn parse_file_history_observed_blobs(
         .map(|observed| {
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
+            let file_id = row.file_id().map(str::to_owned).ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "observed blob reference row '{row_id}' is missing file_id"
+                ))
+            })?;
+            if file_id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "observed blob reference file identity '{}' does not match authenticated row key '{}'",
+                    file_id, row_id
+                )));
+            }
             let Some(snapshot_content) = row.snapshot_content() else {
                 if row.deleted() {
                     return Ok(FileHistoryObservedBlobRecord {
-                        file_id: row.file_id().map(str::to_owned).unwrap_or(row_id),
+                        file_id,
                         blob_hash: None,
+                        size_bytes: None,
+                        deleted: true,
                         row: observed.ordinal(),
                     });
                 }
@@ -2116,16 +2210,22 @@ fn parse_file_history_observed_blobs(
                         format!("invalid lix_binary_blob_ref history snapshot JSON: {error}"),
                     )
                 })?;
-            if snapshot.id != row_id || row.file_id().is_some_and(|file_id| file_id != snapshot.id)
-            {
+            BlobId::from_hex(&snapshot.blob_hash).map_err(|error| {
+                invalid_file_history_state(format!(
+                    "observed blob reference row '{row_id}' has an invalid BlobId: {error}"
+                ))
+            })?;
+            if row.deleted() || snapshot.id != row_id || file_id != snapshot.id {
                 return Err(invalid_file_history_state(format!(
                     "observed blob reference payload identity '{}' does not match authenticated row key '{}'",
                     snapshot.id, row_id
                 )));
             }
             Ok(FileHistoryObservedBlobRecord {
-                file_id: row.file_id().map(str::to_owned).unwrap_or(row_id),
+                file_id,
                 blob_hash: Some(snapshot.blob_hash),
+                size_bytes: Some(snapshot.size_bytes),
+                deleted: false,
                 row: observed.ordinal(),
             })
         })
@@ -2335,39 +2435,39 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
-    use crate::LixError;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
     use crate::entity_pk::EntityPk;
     use crate::forktree::{HistoricalStateRow, StateKey};
     use crate::plugin::{
-        PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
-        plugin_storage_archive_file_id, plugin_storage_archive_path,
+        plugin_storage_archive_file_id, plugin_storage_archive_path, PluginFileOwner,
+        PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
     };
     use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::history_route::HistoryEntry;
+    use crate::LixError;
 
     use super::ObservedTrackedStateRows;
     use super::{
-        FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryDirectoryIndex,
-        FileHistoryDirectoryRecord, FileHistoryFilesystemContext, FileHistoryLookupIds,
-        FileHistoryObservedState, FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord,
-        FileHistoryPublicPredicate, HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
         file_history_descriptor_blob_route, file_history_event_from_entry, file_history_events,
         file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
         parse_file_history_observed_blobs, parse_file_history_observed_descriptors,
         parse_file_history_observed_directories, parse_file_history_observed_plugin_owners,
-        prepare_file_history_rows, sorted_grouped_file_history_events,
+        prepare_file_history_rows, sorted_grouped_file_history_events, FileHistoryBlobRecord,
+        FileHistoryDescriptorRecord, FileHistoryDirectoryIndex, FileHistoryDirectoryRecord,
+        FileHistoryFilesystemContext, FileHistoryLookupIds, FileHistoryObservedState,
+        FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord, FileHistoryPublicPredicate,
+        HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
     };
 
     fn history_entry(file_id: &str, depth: u32, snapshot_content: Option<String>) -> HistoryEntry {
@@ -2474,6 +2574,7 @@ mod tests {
             serde_json::json!({
                 "id": file_id,
                 "blob_hash": hash.to_hex(),
+                "size_bytes": 0,
             })
             .to_string()
             .into(),
@@ -3069,6 +3170,7 @@ mod tests {
                 &observed_states,
                 &parents,
             )
+            .unwrap()
             .is_empty(),
             "a prior-owner tombstone needs a durable owner change in the same commit"
         );
@@ -3077,7 +3179,8 @@ mod tests {
             &[replacement_owner],
             &observed_states,
             &parents,
-        );
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_changes[0].schema_key, "plugin_a_state");
     }
@@ -3126,7 +3229,8 @@ mod tests {
             &[updated_owner],
             &observed_states,
             &parents,
-        );
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_changes[0].schema_key, "plugin_a_removed");
     }

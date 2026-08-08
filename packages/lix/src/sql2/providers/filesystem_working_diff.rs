@@ -1,26 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
+use crate::LixError;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
+use super::file::{exact_string_column_constraint_from_filters, FileIdConstraint};
+use super::spec::{projected_schema, register_spec_table, scan_row_source, PlannedScan, TableSpec};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -494,11 +494,16 @@ where
         })
         .map(|row| {
             let row_id = row.key.entity_pk.as_single_string_owned()?;
+            validate_descriptor_row_identity(&row, schema_key, &row_id)?;
             if row.deleted {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("{schema_key} descriptor '{row_id}' is tombstoned"),
-                ));
+                // An authenticated tombstone is logical absence, not a malformed descriptor.
+                if row.snapshot_content.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("{schema_key} descriptor '{row_id}' tombstone has a payload"),
+                    ));
+                }
+                return Ok(None);
             }
             let snapshot = row.snapshot_content.ok_or_else(|| {
                 LixError::new(
@@ -530,14 +535,34 @@ where
                     ),
                 ));
             }
-            serde_json::from_value(payload).map_err(|error| {
+            serde_json::from_value(payload).map(Some).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("invalid {schema_key} snapshot shape: {error}"),
                 )
             })
         })
-        .collect()
+        .collect::<Result<Vec<Option<T>>, _>>()
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
+fn validate_descriptor_row_identity(
+    row: &HistoricalStateRow,
+    schema_key: &str,
+    row_id: &str,
+) -> Result<(), LixError> {
+    let valid = match schema_key {
+        FILE_DESCRIPTOR_SCHEMA_KEY => row.key.file_id.as_deref() == Some(row_id),
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => row.key.file_id.is_none(),
+        _ => false,
+    };
+    if !valid {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("{schema_key} descriptor row '{row_id}' has a mismatched file identity"),
+        ));
+    }
+    Ok(())
 }
 
 fn historical_rows_differ(
