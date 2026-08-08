@@ -535,6 +535,15 @@ impl WriteContextLiveStateReader {
 
 #[async_trait]
 impl LiveStateReader for WriteContextLiveStateReader {
+    async fn scan_tracked_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        let mut request = request.clone();
+        request.filter.untracked = Some(false);
+        self.ctx.scan_live_state_batch(&request).await
+    }
+
     async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,

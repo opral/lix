@@ -7,7 +7,7 @@ mod merge;
 mod row_materialization;
 mod types;
 
-pub(crate) use context::{TrackedStateContext, descriptor_dependency_cascade_file_ids};
+pub(crate) use context::descriptor_dependency_cascade_file_ids;
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,

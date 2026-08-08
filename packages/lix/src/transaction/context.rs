@@ -56,11 +56,11 @@ use crate::gc::{
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
-    BranchHeadControlCache, CertifiedCurrentStatePredecessor, LiveStateContext,
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    StagedLiveStateRows, overlay_load_exact_batch, overlay_scan_batch,
+    CertifiedCurrentStatePredecessor, LiveStateContext, LiveStateExactBatchRequest,
+    LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateExactBatch,
+    MaterializedLiveStateRow, MaterializedLiveStateRowRef, StagedLiveStateRows,
+    overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -97,9 +97,7 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef,
-};
+use crate::tracked_state::{TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     NormalizedRowFacts, REGISTERED_SCHEMA_KEY, normalize_raw_write_row_in_place,
@@ -513,7 +511,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
@@ -536,7 +533,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     /// Coherent storage snapshot retained for explicit transaction reads.
     /// This field is declared before `storage` so it is dropped first.
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
@@ -981,9 +977,7 @@ where
         // retain the zero-reconstruction direct path.
         let journal_descriptors = prepared_writes.ordered_mutation_journal_descriptors();
         if !journal_descriptors.is_empty() {
-            let base = self
-                .live_state
-                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            let base = self.live_state.transaction_reader(read);
             let mut predecessors_by_commit = BTreeMap::new();
             for descriptor in journal_descriptors {
                 let predecessors = load_immutable_mutation_predecessors(
@@ -1433,7 +1427,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
@@ -1540,7 +1533,6 @@ where
                     active_branch_id,
                     active_account_id,
                     live_state,
-                    tracked_state,
                     binary_cas,
                     plugin_host,
                     branch_ctx,
@@ -1554,7 +1546,6 @@ where
                     staged_writes,
                     filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                     filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
-                    branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
                     opening_read,
                     storage,
                     functions,
@@ -2478,9 +2469,7 @@ where
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
         let read = self.opening_read();
-        let base = self
-            .live_state
-            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+        let base = self.live_state.transaction_reader(read);
         overlay_scan_batch(&base, &staged, request).await
     }
 
@@ -2763,9 +2752,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let base = self
-            .live_state
-            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+        let base = self.live_state.transaction_reader(read);
         overlay_load_exact_batch(&base, &staged, request).await
     }
 
@@ -6654,7 +6641,6 @@ where
             generation_seed,
             self.opening_read(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.branch_head_control_cache),
             self.active_branch_id.clone(),
         )
         .await?
@@ -6717,7 +6703,6 @@ where
                 generation_seed,
                 self.opening_read(),
                 Arc::clone(&self.live_state),
-                Arc::clone(&self.branch_head_control_cache),
                 self.active_branch_id.clone(),
             )
             .await?
@@ -6946,7 +6931,6 @@ where
             let current = load_opening_exact_live_state_batch(
                 self.opening_read(),
                 Arc::clone(&self.live_state),
-                Arc::clone(&self.branch_head_control_cache),
                 &request,
             )
             .await?;
@@ -7002,7 +6986,6 @@ where
         let current = load_opening_exact_live_state_batch(
             self.opening_read(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.branch_head_control_cache),
             &request,
         )
         .await?;
@@ -7060,7 +7043,6 @@ where
         let staged_writes = Arc::clone(&self.staged_writes);
         let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
-        let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
         let plugin_host = self.plugin_host.clone();
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         let sql_catalog_fingerprint = self.sql_catalog_fingerprint().clone();
@@ -7078,7 +7060,6 @@ where
             staged_writes,
             filesystem_path_index_cache,
             filesystem_path_index_epoch,
-            branch_head_control_cache,
             plugin_host,
             sql_planning_cache,
             sql_catalog_fingerprint,
@@ -7877,7 +7858,6 @@ async fn resolve_prepared_mutation_collection_generation(
     seed: Option<(String, Option<(u64, [u8; 32])>)>,
     read: impl StorageAdapterRead + Send,
     live_state: Arc<LiveStateContext>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     branch_id: String,
 ) -> Result<Option<(String, (u64, [u8; 32]))>, LixError> {
     let Some((schema_key, generation)) = seed else {
@@ -7886,7 +7866,7 @@ async fn resolve_prepared_mutation_collection_generation(
     if let Some(generation) = generation {
         return Ok(Some((schema_key, generation)));
     }
-    let base = live_state.transaction_reader(read, branch_head_control_cache);
+    let base = live_state.transaction_reader(read);
     let generation = base
         .collection_generation(
             &branch_id,
@@ -7907,10 +7887,9 @@ async fn resolve_prepared_mutation_collection_generation(
 async fn load_opening_exact_live_state_batch(
     read: impl StorageAdapterRead + Send,
     live_state: Arc<LiveStateContext>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     request: &LiveStateExactBatchRequest,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-    let base = live_state.transaction_reader(read, branch_head_control_cache);
+    let base = live_state.transaction_reader(read);
     base.load_exact_batch(request).await
 }
 
@@ -7980,7 +7959,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     plugin_host: PluginRuntimeHost,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     sql_catalog_fingerprint: CatalogFingerprint,
@@ -8026,10 +8004,7 @@ where
 
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(TransactionReadLiveStateReader {
-            base: self.live_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
+            base: self.live_state.transaction_reader(self.read_store.clone()),
             read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
@@ -8039,10 +8014,7 @@ where
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(TransactionReadLiveStateReader {
-            base: self.live_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
+            base: self.live_state.transaction_reader(self.read_store.clone()),
             read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
@@ -8137,6 +8109,13 @@ impl<R> LiveStateReader for TransactionReadLiveStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
 {
+    async fn scan_tracked_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        overlay_scan_tracked_batch(&self.base, &self.staged, request).await
+    }
+
     async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
@@ -8565,7 +8544,6 @@ pub(crate) async fn open_transaction<StorageImpl>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
@@ -8581,7 +8559,6 @@ where
         active_account_id,
         storage,
         live_state,
-        tracked_state,
         binary_cas,
         plugin_host,
         branch_ctx,
@@ -8599,7 +8576,6 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
@@ -8617,7 +8593,6 @@ where
         active_account_id,
         storage,
         live_state,
-        tracked_state,
         binary_cas,
         plugin_host,
         branch_ctx,

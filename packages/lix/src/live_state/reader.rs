@@ -70,21 +70,13 @@ pub(crate) trait LiveStateReader: Send + Sync {
 
     /// Scans the immutable tracked head selected by the current branch ref.
     ///
-    /// Normal SQL reads use [`Self::scan_batch`] and therefore see exactly one
-    /// canonical current row. Validation and schema planning use this explicit
-    /// durability view when a tracked commit must not depend on untracked
-    /// live state. Readers that wrap canonical current scans must override
-    /// this method instead of relying on the fallback below.
-    /// The default keeps the explicit tracked filter in the batch
-    /// lane. Readers with a distinct immutable tracked source override this.
+    /// Every reader must choose and implement its tracked source explicitly;
+    /// silently lowering this request to the combined current-state scan would
+    /// make a missing tracked owner look like valid data.
     async fn scan_tracked_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let mut request = request.clone();
-        request.filter.untracked = Some(false);
-        self.scan_batch(&request).await
-    }
+    ) -> Result<MaterializedLiveStateBatch, LixError>;
 
     /// Loads concrete visible identities while preserving request alignment.
     ///
@@ -136,4 +128,17 @@ where
         );
     }
     MaterializedLiveStateExactBatch::new(rows.finish(), slots)
+}
+
+#[cfg(test)]
+pub(crate) async fn scan_tracked_batch_via_scan<R>(
+    reader: &R,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    let mut request = request.clone();
+    request.filter.untracked = Some(false);
+    reader.scan_batch(&request).await
 }
