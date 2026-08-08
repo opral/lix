@@ -30,7 +30,7 @@ use super::history_util::{
     ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
 };
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
-use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
@@ -74,8 +74,9 @@ fn file_history_owner_schema_keys(
 pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlHistoryQuerySource<S>,
+    commit_graph: super::SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
@@ -86,8 +87,9 @@ where
         session,
         surface_name,
         Arc::new(LixFileHistorySpec {
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
+            commit_graph,
             query_source,
+            default_as_of_commit_id,
             blob_reader,
             plugin_host,
         }),
@@ -102,7 +104,8 @@ where
 /// nearest descriptor/blob/directory events per file.
 struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
 }
@@ -166,7 +169,7 @@ where
             })
         });
         let mut route = HistoryRoute::from_filters(filters);
-        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
+        route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         let lookup_ids = FileHistoryLookupIds::from_public_predicate(&public_predicate);
@@ -607,7 +610,7 @@ struct FileHistoryPluginDiscovery {
 
 async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     blob_reader: &Arc<dyn BlobDataReader>,
     _plugin_host: &PluginRuntimeHost,
     route: &HistoryRoute,
@@ -1073,7 +1076,7 @@ fn absent_blob_ref<'a>() -> Result<Option<&'a FileHistoryObservedBlobRecord>, Li
 
 async fn load_file_history_filesystem_context<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
@@ -1395,7 +1398,7 @@ where
 
 async fn load_file_history_filesystem_entries<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
@@ -1476,7 +1479,7 @@ fn file_history_descriptor_blob_route(
 
 async fn load_file_history_plugin_state<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
     plugin_schema_keys: Vec<String>,
@@ -1523,7 +1526,7 @@ where
 
 async fn load_file_history_plugin_owner_events<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     event_route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
@@ -1714,7 +1717,7 @@ where
 
 async fn discover_file_history_plugins<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     historical: &ForkTreeReadFacade<S>,
     event_route: &HistoryRoute,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,

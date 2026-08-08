@@ -80,9 +80,8 @@ use crate::session::{
     encode_receipt,
 };
 use crate::sql2::{
-    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SessionFileViewKey,
-    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
-    SqlExecutionContext,
+    ChangelogQuerySource, DiffCommand, SessionFileViewKey, SessionFileViewMutation,
+    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -8217,15 +8216,6 @@ where
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
             forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
         }
-    }
-
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-        query_source: SqlChangelogQuerySource<Self::ReadStore>,
-    ) -> HistoryQuerySource<Self::ReadStore> {
-        let _ = self;
-        query_source.history_query_source(default_as_of_commit_id)
     }
 
     fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {

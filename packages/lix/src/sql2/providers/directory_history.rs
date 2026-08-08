@@ -18,7 +18,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
 use crate::forktree::ForkTreeReadFacade;
 
-use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::error::lix_error_to_datafusion_error;
@@ -48,8 +48,9 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 pub(super) async fn register_lix_directory_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlHistoryQuerySource<S>,
+    commit_graph: super::SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -59,8 +60,9 @@ where
         surface_name,
         Arc::new(LixDirectoryHistorySpec {
             schema: lix_directory_history_schema(),
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
+            commit_graph,
             query_source,
+            default_as_of_commit_id,
         }),
         WriteAccess::read_only(),
     )
@@ -69,7 +71,8 @@ where
 struct LixDirectoryHistorySpec<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 }
 
 #[async_trait]
@@ -115,7 +118,7 @@ where
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema, projection);
         let mut route = HistoryRoute::from_filters(filters);
-        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
+        route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
@@ -238,7 +241,7 @@ struct DirectoryDescriptorSnapshot {
 
 async fn load_directory_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError>

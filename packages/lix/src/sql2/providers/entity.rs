@@ -38,7 +38,7 @@ use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCe
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
-    EntitySnapshotReader, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
+    EntitySnapshotReader, SqlChangelogQuerySource, SqlWriteContext, WriteAccess,
     WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
@@ -65,7 +65,8 @@ pub(crate) async fn register_entity_providers<S>(
     entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
-    query_source: Option<SqlHistoryQuerySource<S>>,
+    query_source: Option<SqlChangelogQuerySource<S>>,
+    default_as_of_commit_id: Option<String>,
     catalog: &PublicCatalog,
     include_write_surfaces: bool,
     selection: &ProviderSelection,
@@ -123,6 +124,12 @@ where
                     spec,
                     Arc::clone(commit_graph),
                     query_source.clone(),
+                    default_as_of_commit_id.clone().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "selected entity history provider is missing its pinned commit anchor",
+                        )
+                    })?,
                 )?;
             }
             _ => {}

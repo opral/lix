@@ -3077,9 +3077,7 @@ mod tests {
     use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow};
-    use crate::sql2::{
-        ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
-    };
+    use crate::sql2::{ChangelogQuerySource, EntitySnapshotReader, SqlChangelogQuerySource};
     use crate::sql2::{
         PublicCatalog, WriteExecutorMode, WriteExecutorPath, create_write_logical_plan,
         execute_write_logical_plan, execute_write_logical_plan_with_mode_and_trace,
@@ -3369,15 +3367,6 @@ mod tests {
                 json_reader: JsonStoreContext::new().reader(read_scope.clone()),
                 forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
             }
-        }
-
-        fn history_query_source(
-            &self,
-            default_as_of_commit_id: String,
-            query_source: SqlChangelogQuerySource<Self::ReadStore>,
-        ) -> HistoryQuerySource<Self::ReadStore> {
-            let _ = self;
-            query_source.history_query_source(default_as_of_commit_id)
         }
 
         fn commit_graph(&self) -> Box<dyn CommitGraphReader> {

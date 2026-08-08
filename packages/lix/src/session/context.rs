@@ -27,8 +27,8 @@ use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
 use crate::sql2::{
-    ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlPlanningCache,
+    ChangelogQuerySource, SessionFileViews, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
@@ -729,15 +729,6 @@ where
             json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
             forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
         }
-    }
-
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-        query_source: SqlChangelogQuerySource<Self::ReadStore>,
-    ) -> HistoryQuerySource<Self::ReadStore> {
-        let _ = self;
-        query_source.history_query_source(default_as_of_commit_id)
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {

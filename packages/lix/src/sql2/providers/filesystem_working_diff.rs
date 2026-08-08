@@ -6,7 +6,7 @@ use crate::branch::BranchRefReader;
 use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
-use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
+use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -31,7 +31,7 @@ pub(super) async fn register_filesystem_working_diff_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     kind: FilesystemWorkingDiffKind,
 ) -> Result<(), LixError>
 where

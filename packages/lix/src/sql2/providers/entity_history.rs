@@ -17,7 +17,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
 use crate::sql2::change_materialization::MaterializedChange;
 
-use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, entity_surface_schema,
@@ -43,7 +43,8 @@ pub(super) fn register_entity_history_surface<S>(
     surface_name: &str,
     spec: Arc<EntitySurfaceSpec>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -57,6 +58,7 @@ where
             spec,
             commit_graph,
             query_source,
+            default_as_of_commit_id,
         }),
         WriteAccess::read_only(),
     )
@@ -71,7 +73,8 @@ struct EntityHistorySpec<S> {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 }
 
 #[async_trait]
@@ -120,7 +123,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let mut route = entity_history_route_from_filters(&self.spec, filters)?;
-        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
+        route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
@@ -185,7 +188,7 @@ struct EntityHistoryRow {
 async fn load_entity_history_rows<S>(
     spec: &EntitySurfaceSpec,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     limit: Option<usize>,
     metadata_projection: HistoryMetadataProjection,

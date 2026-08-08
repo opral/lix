@@ -12,7 +12,7 @@ use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 
-use super::SqlHistoryQuerySource;
+use super::SqlChangelogQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -339,7 +339,7 @@ pub(crate) fn commit_graph_history_request(
 pub(crate) async fn load_history_entries<S>(
     descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
     metadata_projection: HistoryMetadataProjection,
@@ -359,11 +359,13 @@ where
     let Some(request) = commit_graph_history_request(route, schema_keys) else {
         return Ok(Vec::new());
     };
-    let as_of_commit_ids = if route.as_of_commit_ids.is_empty() {
-        std::slice::from_ref(&query_source.default_as_of_commit_id)
-    } else {
-        route.as_of_commit_ids.as_slice()
-    };
+    if route.as_of_commit_ids.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "history provider omitted its pinned default commit anchor",
+        ));
+    }
+    let as_of_commit_ids = route.as_of_commit_ids.as_slice();
     let mut json_reader = query_source.json_reader;
 
     let mut rows = Vec::new();
@@ -930,7 +932,7 @@ mod tests {
     };
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
-    use crate::sql2::HistoryQuerySource;
+    use crate::sql2::ChangelogQuerySource;
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
     };
@@ -1034,14 +1036,16 @@ mod tests {
     async fn history_loader_defaults_to_pinned_head_without_metadata_walk() {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
         let start_commit_id = CommitId::for_test_label("start");
+        let mut route = HistoryRoute::default();
+        route.default_to_as_of_commit_id(&start_commit_id.to_string());
         let rows = load_history_entries(
             HistoryViewDescriptor {
                 view_name: "test_history",
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
-            empty_history_query_source(start_commit_id).await,
-            &HistoryRoute::default(),
+            empty_changelog_query_source(start_commit_id).await,
+            &route,
             vec!["message".to_string()],
             HistoryMetadataProjection::default(),
         )
@@ -1068,7 +1072,7 @@ mod tests {
                 as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
             },
             test_commit_graph(Arc::clone(&reachable_calls), start_commit_id),
-            empty_history_query_source(start_commit_id).await,
+            empty_changelog_query_source(start_commit_id).await,
             &HistoryRoute {
                 as_of_commit_ids: vec![start_commit_id.to_string()],
                 ..HistoryRoute::default()
@@ -1111,7 +1115,7 @@ mod tests {
                 start_commit_id: as_of_commit_id,
                 include_reachable_commit: false,
             }))),
-            empty_history_query_source(as_of_commit_id).await,
+            empty_changelog_query_source(as_of_commit_id).await,
             &HistoryRoute {
                 as_of_commit_ids: vec![as_of_commit_id.to_string()],
                 ..HistoryRoute::default()
@@ -1241,20 +1245,18 @@ mod tests {
         crate::common::LixTimestamp::expect_parse("commit timestamp", "2026-07-12T00:00:00Z")
     }
 
-    async fn empty_history_query_source(
-        default_as_of_commit_id: CommitId,
-    ) -> HistoryQuerySource<SharedStorageAdapterRead<MemoryRead>> {
+    async fn empty_changelog_query_source(
+        _default_as_of_commit_id: CommitId,
+    ) -> ChangelogQuerySource<SharedStorageAdapterRead<MemoryRead>> {
         let storage = StorageAdapter::new(Memory::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
         let read_scope = SharedStorageAdapterRead::new(read_scope);
-        HistoryQuerySource {
-            store: read_scope.clone(),
+        ChangelogQuerySource {
             json_reader: JsonStoreContext::new().reader(read_scope.clone()),
             forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
-            default_as_of_commit_id: default_as_of_commit_id.to_string(),
         }
     }
 

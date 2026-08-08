@@ -12,7 +12,7 @@ use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
+use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::encode_diff_id;
@@ -29,7 +29,7 @@ pub(super) async fn register_working_diff_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,

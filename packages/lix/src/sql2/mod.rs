@@ -44,10 +44,9 @@ pub(crate) use catalog::{
     entity_visible_fields,
 };
 pub(crate) use context::{
-    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
-    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
-    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
-    WriteContextLiveStateReader,
+    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, SqlChangelogQuerySource,
+    SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
+    WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use entity_columnar_layout::{

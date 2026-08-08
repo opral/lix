@@ -41,60 +41,6 @@ use datafusion::logical_expr::TableSource;
 
 pub(crate) type SharedCommitGraph = Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>;
 
-struct SharedCommitGraphReader {
-    inner: SharedCommitGraph,
-}
-
-#[async_trait::async_trait]
-impl CommitGraphReader for SharedCommitGraphReader {
-    async fn load_node(
-        &mut self,
-        commit_id: &crate::changelog::CommitId,
-    ) -> Result<Option<crate::commit_graph::CommitGraphNode>, LixError> {
-        self.inner.lock().await.load_node(commit_id).await
-    }
-
-    async fn reachable_nodes(
-        &mut self,
-        head_commit_id: &crate::changelog::CommitId,
-    ) -> Result<Arc<[crate::commit_graph::ReachableCommitGraphNode]>, LixError> {
-        self.inner
-            .lock()
-            .await
-            .reachable_nodes(head_commit_id)
-            .await
-    }
-
-    async fn load_commit_records(
-        &mut self,
-        commit_ids: &[crate::changelog::CommitId],
-    ) -> Result<Vec<Option<crate::changelog::CommitRecord>>, LixError> {
-        self.inner
-            .lock()
-            .await
-            .load_commit_records(commit_ids)
-            .await
-    }
-
-    async fn change_history_from_commit(
-        &mut self,
-        start_commit_id: &crate::changelog::CommitId,
-        request: &crate::commit_graph::CommitGraphChangeHistoryRequest,
-    ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
-        self.inner
-            .lock()
-            .await
-            .change_history_from_commit(start_commit_id, request)
-            .await
-    }
-}
-
-fn shared_commit_graph_reader(commit_graph: &SharedCommitGraph) -> Box<dyn CommitGraphReader> {
-    Box::new(SharedCommitGraphReader {
-        inner: Arc::clone(commit_graph),
-    })
-}
-
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
@@ -308,7 +254,7 @@ where
             )
     });
     let changelog_query_source = query_source;
-    let query_source = if needs_history_query_source {
+    let history_default_as_of_commit_id = if needs_history_query_source {
         let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
             LixError::branch_not_found(
                 ctx.active_branch_id(),
@@ -316,15 +262,24 @@ where
                 "active branch",
             )
         })?;
-        Some(changelog_query_source.history_query_source(active_branch_commit_id))
+        Some(active_branch_commit_id)
     } else {
         None
     };
     let query_source_for_provider = || {
-        query_source.clone().ok_or_else(|| {
-            LixError::new(
+        if history_default_as_of_commit_id.is_none() {
+            return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "selected history provider is missing its query source",
+            ));
+        }
+        Ok(changelog_query_source.clone())
+    };
+    let history_anchor_for_provider = || {
+        history_default_as_of_commit_id.clone().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected history provider is missing its pinned commit anchor",
             )
         })
     };
@@ -467,8 +422,9 @@ where
                 file_history::register_lix_file_history_surface(
                     session,
                     &surface.name,
-                    shared_commit_graph_reader(&commit_graph),
+                    Arc::clone(&commit_graph),
                     query_source_for_provider()?,
+                    history_anchor_for_provider()?,
                     ctx.blob_reader(),
                     ctx.plugin_host(),
                 )
@@ -501,8 +457,9 @@ where
                 directory_history::register_lix_directory_history_surface(
                     session,
                     &surface.name,
-                    shared_commit_graph_reader(&commit_graph),
+                    Arc::clone(&commit_graph),
                     query_source_for_provider()?,
+                    history_anchor_for_provider()?,
                 )
                 .await?;
             }
@@ -528,6 +485,11 @@ where
         needs_entity_history.then(|| Arc::clone(&commit_graph)),
         if needs_entity_history {
             Some(query_source_for_provider()?)
+        } else {
+            None
+        },
+        if needs_entity_history {
+            Some(history_anchor_for_provider()?)
         } else {
             None
         },
@@ -1074,7 +1036,8 @@ mod tests {
             Some(Arc::new(tokio::sync::Mutex::new(Box::new(
                 EmptyCommitGraphReader,
             )))),
-            Some(crate::sql2::empty_history_query_source_for_test().await),
+            None,
+            None,
             &catalog,
             true,
             &ProviderSelection::All,
