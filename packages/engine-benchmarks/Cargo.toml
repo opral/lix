@@ -8,6 +8,9 @@ license.workspace = true
 rust-version.workspace = true
 autobenches = false
 autotests = false
+[[test]]
+name = "forktree_w0_storage_boundary_oracle"
+path = "tests/forktree_w0_storage_boundary_oracle.rs"
 
 [lints]
 workspace = true

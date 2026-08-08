@@ -1,0 +1,34 @@
+W0 ForkTree StorageSpace/type-boundary oracle manifest
+status=TEST_REPORT_ONLY
+base=e92ea2e505ee3d96abbb529dbaedb23d4908ff42
+base_tree=0d0797c024706beb1510cb2f0f88f8414a9a0c96
+parent=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+parent_tree=641654079f60fcd1c9ff9ccbbd06d3edcabe4096
+accepted_w2_head=0a1955269c0d1fd5d23bac24f0a35f4e9a51d687
+
+retained_boundary=StorageSpace(engine_declared)+ObjectId+ObjectDomain+CoherentView
+retained_spaces=OBJECT_SPACE,SELECTOR_SPACE,UNTRACKED_ROW_SPACE
+public_semantics=StorageRead coherent point/range/cursor/reopen; zero writes during read
+forbidden=raw_space_forge,columnar_owner,tracked_physical_owner,changelog_physical_space,binary_cas_legacy_owner,compatibility_registry
+sql_scope=none
+
+static_gate=node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root <repo>
+format_gate=cargo fmt --all -- --check
+diff_gate=git diff --check
+clippy_gate=cargo clippy -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- -D warnings
+compile_gate=cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle --no-run
+model_gate=cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
+memory_gate=W0_BACKEND=memory cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
+rocks_gate=W0_BACKEND=rocksdb cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
+slate_gate=W0_BACKEND=slatedb cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
+negative_probes=tests/forktree_w0_compile_probes/negative_*.rs,negative_native_exports.ts
+positive_probes=tests/forktree_w0_compile_probes/positive_descriptor.rs
+cell_cap_minutes=20
+production_edits=none
+static_calibration=RED;565 residues;0 missing boundary tokens
+static_log_sha256=57ea9499e868c2611e892774e04175388a8aa6b8eba5ba99b41bfad10dc58e9c
+model_tests=5/5 GREEN
+model_binary_sha256=7d6d5f8cc646e21e3521b150950514ff1d1759f98f5d3d90c2cf2d9524b133e7
+package_no_run=RED inherited Cut B;190 errors;no test binary
+package_no_run_log_sha256=4539f7b4672df47c08f939a18d86732364749b214f2a271ff6eb3e41308e5232
+adapter_runtime=UNCLAIMED;compile gate failed before runtime
