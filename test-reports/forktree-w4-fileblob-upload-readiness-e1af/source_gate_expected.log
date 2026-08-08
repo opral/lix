@@ -1,0 +1,11 @@
+W4_SOURCE_GATE verdict=RED candidate=e1af471b9ab0f598dafa7c2ddec7867667c81740
+RED-01 file-content cohort is not lowered path=packages/lix/src/transaction/commit.rs pattern=reject_not_yet_lowered_cohorts|file_content_writes
+RED-02 legacy independent CAS publication seam path=packages/lix/src/transaction/context.rs pattern=stage_atomic_cas_publication
+RED-03 prepared-CAS file bridge path=packages/lix/src/sql2/providers/file.rs pattern=execute_fast_lix_file_prepared_path_write
+RED-04 legacy upload spaces/finalizer path=packages/lix/src/session/media_upload.rs pattern=UPLOAD_STATE_SPACE|UPLOAD_MANIFEST_LEAF_SPACE|stage_atomic_cas_publication
+RED-05 legacy Binary CAS writer path=packages/lix/src/binary_cas/context.rs pattern=ExistingChunkAwareBinaryCasWriter|stage_fixed_part|stage_fixed_manifest|stage_file_payload
+RED-06 stale missing Binary CAS KV owner reference path=packages/lix/src/binary_cas/context.rs pattern=binary_cas::kv
+RED-07 legacy Binary CAS benchmark owner path=packages/lix/src/storage_bench.rs pattern=BINARY_CAS_(CHUNK|MANIFEST)_SPACE
+RED-08 raw legacy upload space constructor path=packages/lix/src/session/media_upload.rs pattern=StorageSpace::mutable|StorageSpaceId\(
+RED-09 binary_cas/kv.rs is absent while binary_cas::kv references remain
+W4_SOURCE_GATE findings=9
