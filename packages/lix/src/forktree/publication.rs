@@ -841,25 +841,25 @@ impl PreparedPublication {
             3,
         );
         for (id, bytes) in self.object_puts.iter() {
-            writes.put(
-                OBJECT_SPACE,
-                Bytes::copy_from_slice(id.as_bytes()),
-                bytes.clone(),
-            );
+            writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
         }
-        writes.put(SELECTOR_SPACE, global_selector_key(), next_global);
+        writes.put(
+            SELECTOR_SPACE,
+            global_selector_key().to_vec(),
+            next_global.to_vec(),
+        );
         for (key, value) in self.selector_puts {
-            writes.put(SELECTOR_SPACE, key, value);
+            writes.put(SELECTOR_SPACE, key.to_vec(), value.to_vec());
         }
-        writes.delete(SELECTOR_SPACE, gc_progress_selector_key());
+        writes.delete(SELECTOR_SPACE, gc_progress_selector_key().to_vec());
         for key in self.selector_deletes {
-            writes.delete(SELECTOR_SPACE, key);
+            writes.delete(SELECTOR_SPACE, key.to_vec());
         }
         for (key, value) in self.untracked_puts {
-            writes.put(UNTRACKED_ROW_SPACE, key, value);
+            writes.put(UNTRACKED_ROW_SPACE, key.to_vec(), value.to_vec());
         }
         for key in self.untracked_deletes {
-            writes.delete(UNTRACKED_ROW_SPACE, key);
+            writes.delete(UNTRACKED_ROW_SPACE, key.to_vec());
         }
         Ok((writes, preconditions))
     }

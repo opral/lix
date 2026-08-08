@@ -1553,7 +1553,7 @@ where
 
     async fn commit_prepared(
         mut self,
-        runtime_functions: &FunctionContext,
+        _runtime_functions: &FunctionContext,
         mut prepared_writes: PreparedWriteSet,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let transaction = &mut self;
@@ -1588,7 +1588,7 @@ where
         // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
         // and the transaction drops this read before its storage field.
         let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
-        let mut read = SharedStorageAdapterRead::new(commit_read);
+        let read = SharedStorageAdapterRead::new(commit_read);
         // Commit-time reconciliation and validation must all observe this
         // current coherent snapshot, while user statements above observed the
         // snapshot retained from transaction open.
@@ -1658,31 +1658,33 @@ where
         } else {
             load_path_index_revision(&read).await.ok().flatten()
         };
+        let prepared_publication = match commit::prepare_forktree_publication_with_parent_heads(
+            &transaction.active_account_id,
+            &commit_parent_heads,
+            read.clone(),
+            prepared_writes,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_forktree_publication"
+        ))
+        .await
+        {
+            Ok(publication) => publication,
+            Err(error) => {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        };
+        // ForkTree never commits independently. Its authenticated objects,
+        // selectors, untracked rows, and exact CAS fences are lowered once
+        // into the transaction-owned in-memory plan. Runtime metadata and the
+        // idempotency receipt are appended below before the sole backend
+        // prepare/commit boundary.
         let (mut writes, materialization_preconditions) =
-            match commit::commit_prepared_writes_with_parent_heads(
-                &transaction.binary_cas,
-                &transaction.tracked_state,
-                Some(transaction.sql_schema_snapshot.as_ref()),
-                Some(runtime_functions),
-                &transaction.active_account_id,
-                &commit_parent_heads,
-                &mut read,
-                prepared_writes,
-            )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.transaction_materialization"
-            ))
-            .await
-            {
-                Ok(writes) => writes,
-                Err(error) => {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(error);
-                }
-            };
+            prepared_publication.into_storage_plan()?;
         if catalog_revision_changed {
             stage_catalog_revision(&mut writes);
         }
