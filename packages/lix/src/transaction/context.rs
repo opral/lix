@@ -483,11 +483,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
         Arc<str>,
         Arc<crate::sql2::PreparedPathValueReplacementProgram>,
     )>,
-    prepared_mutation_membership: PreparedMutationMembership,
-    /// Once proven, a homogeneous prepared generation can avoid locking the
-    /// generic row overlay for every independent scalar mutation. Changing
-    /// the prepared program invalidates this transaction-local proof.
-    prepared_mutation_overlay_empty: bool,
     /// One logical timestamp for a homogeneous columnar mutation generation.
     /// Immutable replacement parts require their post-image rows to share the
     /// same lifecycle boundary, so sealing must not preserve per-call clocks.
@@ -551,12 +546,6 @@ struct TransactionMutationJournal {
 const INITIAL_MUTATION_JOURNAL_ROWS: usize = 16;
 const INITIAL_MUTATION_JOURNAL_ARENA_BYTES: usize = 1_024;
 const MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS: usize = 16 * 1_024;
-
-enum PreparedMutationMembership {
-    Unprepared,
-    Unavailable,
-    Packed(crate::live_state::PackedIdentityMembership),
-}
 
 impl TransactionMutationJournal {
     fn len(&self) -> usize {
@@ -1429,8 +1418,6 @@ where
                     sql_schema_snapshot: sql_schema_catalog,
                     sql_planning_cache,
                     prepared_mutation_program: None,
-                    prepared_mutation_membership: PreparedMutationMembership::Unprepared,
-                    prepared_mutation_overlay_empty: false,
                     prepared_mutation_timestamp: None,
                     mutation_journal: None,
                     mutation_journal_compressor: None,
@@ -6440,61 +6427,12 @@ where
                 "prepared mutation order barrier was not flushed before statement checkpoint",
             ));
         }
-        if matches!(
-            self.prepared_mutation_membership,
-            PreparedMutationMembership::Unprepared
-        ) {
-            let read = self.opening_read();
-            let base = self
-                .live_state
-                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
-            self.prepared_mutation_membership = match base
-                .prepare_packed_identity_membership(&self.active_branch_id, &program.schema_key)
-                .await?
-            {
-                Some(membership) => PreparedMutationMembership::Packed(membership),
-                None => PreparedMutationMembership::Unavailable,
-            };
-        }
-        if !self.prepared_mutation_overlay_empty {
-            let entity_pk = EntityPk::single(primary_key.to_owned());
-            if self.staged_writes.staged_identity_may_affect(
-                &self.active_branch_id,
-                &program.schema_key,
-                None,
-                &entity_pk,
-            )? {
-                // A transaction-local predecessor is part of the mutable
-                // overlay, not durable history. Keep dependent statements on
-                // the generic executor so INSERT/UPDATE/DELETE coalescing
-                // retains lifecycle and constraint semantics.
-                return Ok(None);
-            }
-            self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
-        }
-        let opening_read = self.opening_read();
-        let cached_membership = match &mut self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => {
-                membership
-                    .contains_single_string(&opening_read, primary_key)
-                    .await?
-            }
-            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
-                None
-            }
+        let Some(row) =
+            crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
+        else {
+            return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
         };
-        let fallback_row = match cached_membership {
-            Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
-            Some(true) => None,
-            None => {
-                let Some(row) =
-                    crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
-                else {
-                    return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
-                };
-                Some(row)
-            }
-        };
+        let fallback_row = Some(row);
         debug_assert!(
             fallback_row
                 .as_ref()
@@ -6551,142 +6489,6 @@ where
             .is_some_and(|(cached_sql, _)| cached_sql.as_ref() == sql)
     }
 
-    pub(crate) fn prepared_literal_mutation_shape(&self) -> Option<(&str, usize)> {
-        let (shape, program) = self.prepared_mutation_program.as_ref()?;
-        Some((shape, program.parameter_count()))
-    }
-
-    /// Appends one shape-certified literal UPDATE without constructing public
-    /// `Value` DTOs. The explicit transaction has already admitted this plan;
-    /// borrowed literal slices flow directly into identity and snapshot
-    /// columns. Non-packed or dependent state returns to the generic path.
-    pub(crate) async fn try_execute_cached_literal_prepared_mutation(
-        &mut self,
-        next_origin_key: Option<&str>,
-        params: &[impl AsRef<str>],
-    ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
-        if let Some(error) = &self.mutation_journal_terminal_error {
-            return Err(error.clone());
-        }
-        let (primary_key, replacement_value) = {
-            let Some((_, program)) = self.prepared_mutation_program.as_ref() else {
-                return Ok(None);
-            };
-            (
-                program.primary_key_text(params)?,
-                program.replacement_value_text(params)?,
-            )
-        };
-
-        let same_origin = self
-            .mutation_journal
-            .as_ref()
-            .is_none_or(|journal| journal.origin_key.as_deref() == next_origin_key);
-        let ordered_append = same_origin
-            && self
-                .mutation_journal
-                .as_ref()
-                .and_then(TransactionMutationJournal::last_identity)
-                .is_none_or(|last| last < primary_key);
-        let chunk_has_capacity = self
-            .mutation_journal
-            .as_ref()
-            .is_none_or(|journal| journal.len() < 4_096);
-        if !same_origin || !ordered_append || !chunk_has_capacity {
-            self.flush_mutation_journal().await?;
-        }
-        if !same_origin || !ordered_append {
-            self.lower_provisional_mutations_to_prepared().await?;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
-        }
-
-        if !matches!(
-            self.prepared_mutation_membership,
-            PreparedMutationMembership::Packed(_)
-        ) {
-            return Ok(None);
-        }
-        if !self.prepared_mutation_overlay_empty {
-            let entity_pk = EntityPk::single(primary_key.to_owned());
-            let schema_key = &self
-                .prepared_mutation_program
-                .as_ref()
-                .expect("packed literal mutation retains its prepared program")
-                .1
-                .schema_key;
-            if self.staged_writes.staged_identity_may_affect(
-                &self.active_branch_id,
-                schema_key,
-                None,
-                &entity_pk,
-            )? {
-                return Ok(None);
-            }
-            self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
-        }
-        let opening_read = self.opening_read();
-        let PreparedMutationMembership::Packed(membership) = &mut self.prepared_mutation_membership
-        else {
-            unreachable!("packed literal mutation membership was checked above")
-        };
-        match membership
-            .contains_single_string(&opening_read, primary_key)
-            .await?
-        {
-            Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
-            Some(true) => {}
-            None => return Ok(None),
-        }
-
-        let origin_key = next_origin_key.map(SharedStr::from);
-        let journal_program = self.mutation_journal.is_none().then(|| {
-            Arc::clone(
-                &self
-                    .prepared_mutation_program
-                    .as_ref()
-                    .expect("packed literal mutation retains its prepared program")
-                    .1,
-            )
-        });
-        let timestamp = match self.prepared_mutation_timestamp {
-            Some(timestamp) => timestamp,
-            None => {
-                let timestamp = self.functions.call_timestamp();
-                self.prepared_mutation_timestamp = Some(timestamp);
-                timestamp
-            }
-        };
-        let journal = self
-            .mutation_journal
-            .get_or_insert_with(|| TransactionMutationJournal {
-                program: journal_program
-                    .expect("new mutation journal retains its prepared program"),
-                origin_key: origin_key.clone(),
-                identity_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
-                identity_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
-                snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
-                snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
-                timestamp: None,
-            });
-        debug_assert_eq!(journal.origin_key, origin_key);
-        let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
-            primary_key,
-            Some(replacement_value),
-            &mut journal.snapshot_arena,
-        )?;
-        journal.append_identity(primary_key);
-        journal.snapshot_offsets.push(snapshot_offset);
-        #[cfg(feature = "storage-benches")]
-        journal.record_row_ownership(
-            primary_key.len(),
-            snapshot_offset.1.saturating_sub(snapshot_offset.0),
-        );
-        let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
-        debug_assert_eq!(*journal_timestamp, timestamp);
-        Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
-    }
-
     pub(crate) fn remember_prepared_mutation(
         &mut self,
         sql: &str,
@@ -6698,16 +6500,12 @@ where
             .has_staged_schema_catalog_change(&domain)?
         {
             self.prepared_mutation_program = None;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
             self.prepared_mutation_timestamp = None;
             return Ok(());
         }
         self.prepared_mutation_program =
             crate::sql2::prepare_path_value_replacement_program(self, plan)
                 .map(|program| (Arc::<str>::from(sql), Arc::new(program)));
-        self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-        self.prepared_mutation_overlay_empty = false;
         self.prepared_mutation_timestamp = None;
         Ok(())
     }
@@ -6716,7 +6514,7 @@ where
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
-        let generation_seed = self.prepared_mutation_collection_generation_seed();
+        let generation_seed = None;
         let mut complete_generation = resolve_prepared_mutation_collection_generation(
             generation_seed,
             self.opening_read(),
@@ -6768,8 +6566,6 @@ where
             self.lower_provisional_mutations_to_prepared().await?;
         }
         self.prepared_mutation_program = None;
-        self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-        self.prepared_mutation_overlay_empty = false;
         self.prepared_mutation_timestamp = None;
         Ok(())
     }
@@ -6780,7 +6576,7 @@ where
     /// `PreparedStateBatch`.
     pub(crate) async fn flush_prepared_mutations_for_read(&mut self) -> Result<(), LixError> {
         self.flush_mutation_journal().await?;
-        let generation_seed = self.prepared_mutation_collection_generation_seed();
+        let generation_seed = None;
         let Some((schema_key, (live_count, ordered_identity_digest))) =
             resolve_prepared_mutation_collection_generation(
                 generation_seed,
@@ -6810,23 +6606,6 @@ where
             self.hydrate_provisional_mutation_predecessors().await?;
         }
         Ok(())
-    }
-
-    fn prepared_mutation_collection_generation_seed(
-        &self,
-    ) -> Option<(String, Option<(u64, [u8; 32])>)> {
-        let Some((_, program)) = &self.prepared_mutation_program else {
-            return None;
-        };
-        let generation = match &self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => {
-                Some(membership.complete_generation())
-            }
-            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
-                None
-            }
-        };
-        Some((program.schema_key.clone(), generation))
     }
 
     pub(crate) async fn flush_prepared_mutation_barrier(
@@ -6865,13 +6644,9 @@ where
         }
         if !same_program || !same_origin || !ordered_append {
             self.lower_provisional_mutations_to_prepared().await?;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
         }
         if !same_program {
             self.prepared_mutation_program = None;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
             self.prepared_mutation_timestamp = None;
         }
         Ok(())
@@ -6979,15 +6754,7 @@ where
                 0,
             );
         }
-        let eager_collection_is_bounded = match &self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => {
-                usize::try_from(membership.complete_generation().0)
-                    .is_ok_and(|rows| rows <= MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS)
-            }
-            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
-                false
-            }
-        };
+        let eager_collection_is_bounded = false;
         if !eager_collection_is_bounded {
             self.mutation_journal_seal_prefix_open = false;
         }

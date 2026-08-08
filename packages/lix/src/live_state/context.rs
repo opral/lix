@@ -134,26 +134,6 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    pub(crate) async fn prepare_packed_identity_membership(
-        &self,
-        branch_id: &str,
-        schema_key: &str,
-    ) -> Result<Option<crate::live_state::PackedIdentityMembership>, LixError> {
-        let Some(cache) = self.branch_head_control_cache.as_ref() else {
-            return Ok(None);
-        };
-        let controls =
-            load_branch_head_controls(&self.store, &[branch_id.to_owned()], Some(cache.as_ref()))
-                .await?;
-        let Some(control) = controls.get(branch_id).copied() else {
-            return Ok(None);
-        };
-        self.tracked_head
-            .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
-            .prepare_packed_identity_membership(branch_id, control.tracked_generation, schema_key)
-            .await
-    }
-
     pub(crate) async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,

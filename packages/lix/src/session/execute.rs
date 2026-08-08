@@ -2956,85 +2956,12 @@ where
     ) -> Result<ExecuteResult, LixError> {
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
-        let may_reuse_literal_shape = self.has_started_statement;
         self.has_started_statement = true;
         // The explicit write lease already keeps one transaction operation
         // active for this handle's lifetime, and `&mut self` excludes an
         // overlapping execute or commit. A second manager guard per statement
         // only repeated mutex/Notify traffic without adding a state boundary.
         let operation = async {
-            if may_reuse_literal_shape
-                && params.is_empty()
-                && let Some((normalized_shape, parameter_count)) = self
-                    .transaction
-                    .as_ref()
-                    .and_then(|transaction| transaction.prepared_literal_mutation_shape())
-            {
-                if let Some(decoded_values) = self
-                    .sql_planning_cache
-                    .decode_update_literals_for_cached_shape(
-                        sql,
-                        normalized_shape,
-                        parameter_count,
-                        &mut self.prepared_literal_escape_scratch,
-                        &mut self.prepared_literal_shape,
-                    )
-                {
-                    #[cfg(feature = "storage-benches")]
-                    {
-                        let key_bytes = decoded_values.first().map_or(0, |value| value.len());
-                        let value_bytes = decoded_values.get(1).map_or(0, |value| value.len());
-                        let owned_bytes = decoded_values
-                            .iter()
-                            .filter_map(|value| match value {
-                                std::borrow::Cow::Borrowed(_) => None,
-                                std::borrow::Cow::Owned(value) => Some(value.len()),
-                            })
-                            .sum::<usize>();
-                        crate::storage_bench::record_crud_ownership(
-                            crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
-                            1,
-                            key_bytes,
-                            value_bytes,
-                            decoded_values.len(),
-                            decoded_values
-                                .iter()
-                                .filter(|value| matches!(value, std::borrow::Cow::Owned(_)))
-                                .count(),
-                            0,
-                        );
-                        crate::storage_bench::record_crud_ownership_transfer(
-                            crate::storage_bench::CRUD_OWNERSHIP_SQL_BOUND,
-                            owned_bytes,
-                            0,
-                            owned_bytes,
-                            0,
-                        );
-                    }
-                    let transaction = self
-                        .transaction
-                        .as_mut()
-                        .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-                    let result = transaction
-                        .try_execute_cached_literal_prepared_mutation(
-                            options.origin_key.as_deref(),
-                            &decoded_values,
-                        )
-                        .await;
-                    for (index, value) in decoded_values.into_iter().enumerate() {
-                        if let std::borrow::Cow::Owned(value) = value {
-                            self.prepared_literal_escape_scratch[index] = value;
-                        }
-                    }
-                    match result {
-                        Ok(Some(result)) => {
-                            return Ok(ExecuteResult::from_sql_write_result(result));
-                        }
-                        Ok(None) => {}
-                        Err(error) => return Err(normalize_sql_surface_error(error, sql)),
-                    }
-                }
-            }
             let auto_parameterized = params
                 .is_empty()
                 .then(|| self.sql_planning_cache.auto_parameterized_update(sql))
