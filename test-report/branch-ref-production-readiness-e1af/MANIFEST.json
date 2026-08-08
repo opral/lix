@@ -1,5 +1,5 @@
 {
-  "kind": "test-report-only-branch-ref-production-readiness",
+  "kind": "test-report-only-branch-ref-production-readiness-candidate-aware-v2",
   "status": "dormant-until-source-and-compile-green",
   "production_anchor": {
     "commit": "e1af471b9ab0f598dafa7c2ddec7867667c81740",
@@ -17,15 +17,50 @@
     "report_sha256": "3cca3a49a4578720dfac22b59e2412916fa90a73cecdf5c9aa5daaa4d4aedec4"
   },
   "h4_production_map_report_sha256": "31f40c3d11db4baaac09f36263de2c55cdc356a912debcfe5d3e6aa2613fad66",
+  "successor_gate": {
+    "invocation": "verify_readiness_source.sh <base-root> <base-commit> <candidate-root> <candidate-commit>",
+    "identity_inputs": "explicit base and candidate roots/commits; no hardcoded e1af candidate",
+    "normalized_delta": "per selector-specific legacy category, candidate minus base; positive or nonzero candidate is RED",
+    "green_requires_zero_legacy_closure": true,
+    "required_owner_symbols": [
+      "GlobalSelectorV1",
+      "BranchSelectorV1",
+      "CoherentView",
+      "PreparedPublication",
+      "open_coherent_view_on_read",
+      "SELECTOR_SPACE",
+      "global_selector_key",
+      "branch_selector_key"
+    ],
+    "fixtures": [
+      "positive_selector_publication.rs",
+      "negative_mismatched_read.rs",
+      "negative_fresh_read.rs",
+      "negative_dual_authority.rs",
+      "negative_fallback.rs"
+    ],
+    "model_tests": 7
+  },
   "source_calibration": {
     "expected": "RED",
-    "legacy_control_generation": 58,
-    "checkpoint_history": 1139,
-    "snapshot_pin": 16,
-    "selector_epoch": 770,
-    "mutation_revision": 24,
-    "log_sha256": "ef6077659dca998b3a4030f19d61434fb4bb97c0f491c738851f4bdfad553c9e",
-    "wrapper_log_sha256": "29e2b611cd9f5584920dc74575a881b6e77c19d713b0594e8f30f41517c6c429"
+    "base_commit": "e1af471b9ab0f598dafa7c2ddec7867667c81740",
+    "candidate_commit": "e1af471b9ab0f598dafa7c2ddec7867667c81740",
+    "legacy_branch_head_control": 80,
+    "legacy_branch_head_cache": 45,
+    "legacy_branch_ref_reader": 196,
+    "legacy_branch_ref_stage": 38,
+    "legacy_mutation_revision": 48,
+    "legacy_tracked_generation": 48,
+    "legacy_raw_authority": 0,
+    "lix_branch_ref_occurrence_files": 15,
+    "non_derived_lix_branch_ref_files": 4,
+    "log_sha256": "54b5e706bfb460bb8e5b206c5fff56f9e77fc6a0e18772bf7b3bd985df7948d9",
+    "argument_probe": {
+      "base_commit": "f5eba0dc7a253581421950c43b68a49cd31422fc",
+      "candidate_commit": "f5eba0dc7a253581421950c43b68a49cd31422fc",
+      "expected": "RED",
+      "log_sha256": "bf1a4174d9d0e20d66bf8839c28bcb213f468a190f66a4d5cfc6b6ab928e1bbc"
+    }
   },
   "authority": {
     "selector_space": "one authenticated GlobalSelectorV1 and one BranchSelectorV1 per branch",
@@ -44,7 +79,11 @@
   "model": {
     "source_sha256": "38d8dbaea96a1e37e6abfbceb23e0c4ad8981b9f6ec46a0ff0321fb6f5a10c1d",
     "test_count": 7,
-    "runtime_claimed": false
+    "runtime_claimed": false,
+    "standalone_warnings_denied": true,
+    "calibration": "7/7 PASS",
+    "binary_sha256": "04c749d9d90f8134a791e8b095e8adcf5f3b153b9e324ec8cf44682b0a891f57",
+    "log_sha256": "ff7ec3a355b21a730a261525c30f223bd7dc4ab2c7410cda88da39dee0ea9789"
   },
   "runtime_claimed": false,
   "production_changes": false

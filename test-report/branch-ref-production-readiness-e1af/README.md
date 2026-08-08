@@ -1,10 +1,14 @@
 # BranchRef and selector production-readiness package
 
-Status: **TEST/REPORT-ONLY; e1af source gate RED by design**.
+Status: **TEST/REPORT-ONLY; candidate-aware source gate; e1af calibration RED by design**.
 
 This package is anchored to the accepted e1af production source and binds the
 approved semantic BranchRef v4 and H4 production map. It does not edit
-production, compile Cargo, run adapters, or claim runtime qualification.
+production, compile Cargo, run adapters, or claim runtime qualification. The
+gate takes independent base and candidate Git roots/commits; it never scans a
+hardcoded e1af candidate. It is intentionally RED for the e1af/e1af
+calibration and is capable of GREEN only for a candidate with the complete
+legacy closure removed.
 
 ## Immutable provenance
 
@@ -89,26 +93,59 @@ SecondBranchAuthority
 DualSelectorAuthority
 ~~~
 
+## Candidate-aware source gate
+
+The wrapper delegates to `verify_selector_readiness.py` and requires four
+arguments:
+
+~~~sh
+bash test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh \
+  <base-root> <base-commit> <candidate-root> <candidate-commit>
+~~~
+
+For every selector-specific legacy category the gate prints normalized
+base/candidate counts and `candidate - base` deltas. A positive delta is a
+failure, and any nonzero candidate count is a failure. It also rejects every
+legacy path still present in the candidate commit, requires the approved v4
+identity/tree, and checks the candidate is descended from the explicit base.
+The required ForkTree owner symbols are checked in the candidate's package
+code, and `lix_branch_ref` is allowed only in the documented derived schema /
+projection paths (or test/benchmark packages). Thus the gate cannot report
+GREEN while BranchRef/BranchHeadControl, old spaces, readers, caches,
+fallbacks, non-derived projections, or a second authority remain.
+
+The source gate includes one positive publication fixture and four
+discriminating negatives: mismatched read, fresh read, dual authority, and
+fallback. The fixtures require the same operation-owned read in both prepared
+publication and CAS; forbidden ownership/read patterns must be rejected. The
+standalone Rust model supplies the lifecycle, stale/unrelated-owner,
+cold-reopen, retained-root, corruption, and zero-write controls.
+
 ## e1af source RED calibration
 
 Run the source-only verifier:
 
 ~~~sh
-bash test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh \
-  /tmp/lix-branch-ref-readiness-e1af-1786195688
+python3 test-report/branch-ref-production-readiness-e1af/verify_selector_readiness.py \
+  /tmp/lix-branch-ref-readiness-e1af \
+  e1af471b9ab0f598dafa7c2ddec7867667c81740 \
+  /tmp/lix-branch-ref-readiness-e1af \
+  e1af471b9ab0f598dafa7c2ddec7867667c81740
 ~~~
 
-Expected exit status is 1. The exact inherited e1af calibration is:
+Expected exit status is 1. The exact e1af/e1af calibration is recorded in
+`SOURCE_GATE_RESULT.md`; its normalized counts are:
 
 ~~~text
-legacy_control_generation 58
-checkpoint_history 1139
-snapshot_pin 16
-selector_epoch 770
-mutation_revision 24
+legacy.branch_head_control 80
+legacy.branch_head_cache 25
+legacy.branch_ref_reader 196
+legacy.branch_ref_stage 38
+legacy.mutation_revision 48
+legacy.tracked_generation 47
 ~~~
 
-The source gate prints RED because old control/generation, mutation/revision,
+The gate prints RED because old control/generation, mutation/revision,
 reader/cache, and flat-row authority residues remain. Broad checkpoint and
-selector counts are inventory only; they are not silently treated as proof of
-deletion.
+selector counts from the predecessor report are historical context only; they
+are not silently treated as proof of deletion.

@@ -7,14 +7,22 @@ first compile, source, semantic, corruption, or authority failure.
 ## Static gates
 
 ~~~sh
-bash test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh <candidate-root>
+bash test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh \
+  <base-root> <base-commit> <candidate-root> <candidate-commit>
 cargo fmt --all -- --check
-git diff --check
+git diff --check <base-commit> <candidate-commit>
 ~~~
+
+The four identities are mandatory. The verifier checks both commit/tree
+identities, ancestry, selector-specific normalized deltas, complete legacy
+path deletion, and the approved v4 tree. It must be run against the exact
+candidate commit, not a mutable worktree or the e1af calibration alone.
 
 The candidate source gate must be GREEN only after all legacy symbols/spaces,
 flat-row writers/projections, caches, fallbacks, and second authorities are
-compiler-deleted. No allowlist suppression changes the authority contract.
+compiler-deleted. It also rejects `lix_branch_ref` outside the derived-only
+allowlist and tests/benchmarks. No allowlist suppression changes the authority
+contract.
 
 ## Standalone model (not production)
 
@@ -28,7 +36,11 @@ rustc --edition=2021 --test -D warnings \
 ```
 
 The package records the source identity but makes no model compile/runtime
-claim until a separately authorized review runs this command.
+claim until a separately authorized review runs this command. The model is
+warnings-denied and its seven tests cover one-read/one-commit authority,
+create/switch/advance/delete/retire/cold reopen, stale versus unrelated
+owners, malformed key/root/cycle/epoch, no fallback/dual authority, retained
+view GC, and empty undo/redo no-ops.
 
 ## Adapter order
 
