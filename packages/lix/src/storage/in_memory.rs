@@ -25,7 +25,7 @@ const SNAPSHOT_ENTRY_HEADER_BYTES: usize = size_of::<u32>() * 2;
 /// crosses the trait boundary: reads return logical keys.
 fn physical_key(space: SpaceId, key: &Key) -> Key {
     let mut bytes = bytes::BytesMut::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.value().to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Key(bytes.freeze())
 }
@@ -39,10 +39,14 @@ fn physical_bound(space: SpaceId, bound: Bound<Key>, unbounded: Bound<Key>) -> B
 }
 
 fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
-    let lower_unbounded = Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes())));
-    let upper_unbounded = space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
-        Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
-    });
+    let lower_unbounded =
+        Bound::Included(Key(Bytes::copy_from_slice(&space.value().to_be_bytes())));
+    let upper_unbounded = space
+        .value()
+        .checked_add(1)
+        .map_or(Bound::Unbounded, |next| {
+            Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+        });
     KeyRange {
         lower: physical_bound(space, range.lower, lower_unbounded),
         upper: physical_bound(space, range.upper, upper_unbounded),
@@ -614,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn delete_range_covers_more_than_one_scan_page() {
         let storage = Memory::new();
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = StorageSpace::engine_declared(7, "test.mutable", ValueSemantics::Mutable);
         let mut write = storage
             .begin_write(WriteOptions::default())
             .await
@@ -682,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_roundtrip_is_deterministic_and_point_in_time() {
         let storage = Memory::new();
-        let space = StorageSpace::mutable(SpaceId(17), "test.mutable");
+        let space = StorageSpace::engine_declared(17, "test.mutable", ValueSemantics::Mutable);
         let key_a = Key(Bytes::from_static(b"a"));
         let key_b = Key(Bytes::from_static(b"b"));
         let mut write = storage

@@ -1067,7 +1067,7 @@ where
     let mut delete_counts_by_space: Vec<(u32, usize)> = writes
         .delete_counts_by_space()
         .into_iter()
-        .map(|(space, count)| (space.id.0, count))
+        .map(|(space, count)| (space.id(), count))
         .collect();
     delete_counts_by_space.sort_unstable_by_key(|(space_id, _)| *space_id);
     let delete_count = |space_id| {
@@ -2180,7 +2180,7 @@ where
 {
     let space = *native_storage_spaces()
         .iter()
-        .find(|space| space.name == space_name)
+        .find(|space| space.name() == space_name)
         .expect("space name should exist");
     scan_layout_entries(read, space)
         .await
@@ -2204,7 +2204,7 @@ where
 pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
     native_storage_spaces()
         .iter()
-        .map(|space| (space.id.0, space.name))
+        .map(|space| (space.id(), space.name()))
         .collect()
 }
 
@@ -2258,8 +2258,8 @@ where
     .to_range()
     .expect("valid empty storage layout prefix");
     let mut accounting = StorageLayoutAccounting {
-        space_id: space.id.0,
-        space: space.name,
+        space_id: space.id(),
+        space: space.name(),
         rows: 0,
         key_bytes: 0,
         value_bytes: 0,
