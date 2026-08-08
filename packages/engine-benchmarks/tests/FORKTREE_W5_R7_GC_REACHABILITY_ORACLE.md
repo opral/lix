@@ -1,13 +1,20 @@
 # ForkTree W5/R7 GC + reachability oracle
 
-This is a test/report-only correction successor to immutable oracle head
-6487170dfa11b24411dbbd73e3c003439072df09. It contains no production
-implementation, adapter behavior, current-main benchmark, or PR mutation.
+This is a new test/report-only direct successor to the blocked immutable
+oracle head `409d14dbdc9e91b9cc6e2bd8c7bca4b487671113`. It contains no
+production implementation, adapter behavior, current-main benchmark, or PR
+mutation. The prior 409 ref is preserved unchanged; this package does not
+rewrite or replace it.
 
 ## Immutable lineage
 
-    correction parent/base: 6487170dfa11b24411dbbd73e3c003439072df09
-    parent tree:            94eefb7de3260a8c8a3217805a5372cb8670157c
+    correction parent/base: 409d14dbdc9e91b9cc6e2bd8c7bca4b487671113
+    parent tree:            218700eecc1808611a08b55768b4ac31ba9f0c82
+    parent parent:          b8098280eeb6c88820c8b3c2017d19caaff76480
+    parent full-index diff: bdcf3cb567a8633f01b7a0252399926820019090a54ca9f3ff310d806cddbe00
+    parent stable patch-id: 8799b698d7021b3f41b3638c13ec33deb5940efd
+    prior direct lineage:   6487170dfa11b24411dbbd73e3c003439072df09
+    prior parent tree:      94eefb7de3260a8c8a3217805a5372cb8670157c
     ancestry correction:    d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
     ancestry control:       1f742a382c755399b8a49ab536c4f6dc55fffdd8
 
@@ -35,10 +42,15 @@ checkpoint points to serving. The selector plane also covers branch control,
 upload, recovery alias, undo, plugin registry, and final-reference roots.
 Shared branch/upload roots survive until both selectors release them; final
 references survive independently until their selector is released.
-Reachability is transitive: H remains retained through selected S/C ancestry,
-and an unselected object is reclaimed without making the root graph appear
-fully reachable. The explicit H/S/C test drops selectors in dependency order
-and checks each exact release.
+Reachability is the full authenticated transitive closure over *every live selector*:
+`commit_gc`, queue-page processing, and direct removal all compute the full
+closure before mutation. H remains retained through selected S/C ancestry,
+including every ancestor in an H/S/C checkpoint chain, and an unselected
+object is reclaimed without making the root graph appear fully reachable. The
+explicit H/S/C test drops selectors in dependency order and checks each exact
+release. A still-live checkpoint selector continues protecting its closure
+after the originating view closes; only retirement of that selector permits
+the old serving object to be collected.
 
 The corruption suite performs concrete state mutations and requires failure
 for missing objects, wrong kinds, empty payloads, duplicate edges, non-
@@ -49,13 +61,17 @@ generation.
 The reader model authenticates the selected root's existence, kind, identity,
 and reachable parent graph before returning one operation-owned coherent read
 or recording a pin. It pins the complete authenticated closure, not only the
-selected root. Each root/object pin is reference-counted by view ID: poisoning
-or closing one view cannot release another view's root or an H/S/C ancestor.
-The publication-then-GC interleave cannot retire the old serving object while
-an active checkpoint read pins it; retirement succeeds only after that view
-releases the closure. Page failure poisons the view; a stale cursor expires;
-a fresh view accepts only an authenticated cursor whose restart is represented
-as `Excluded(last_authenticated_key)`.
+selected root. Pins are owner-scoped and view-scoped: each root/object pin is
+keyed by the pair `(owner, view_id)`; poisoning or closing one view cannot
+release another owner's root or an H/S/C ancestor. Cross-owner collision and
+unpin controls are negative tests and
+must fail without partial pin mutation. The publication-then-GC interleave
+cannot retire the old serving object while an active checkpoint read pins it;
+the still-live checkpoint selector also blocks retirement after view close.
+Page failure poisons the view; a stale cursor expires; a fresh view accepts
+only an authenticated cursor whose restart is represented as
+`Excluded(last_authenticated_key)` and whose proof includes its owner/view
+identity.
 
 Cold reopen serializes and strictly parses owner/fence, queue counters,
 reclamation counters, object count/digest, and selector digest. Malformed,
@@ -79,12 +95,28 @@ The prior immutable calibration was RED count 168 for both controls, with
 stdout SHA-256
 `af5cb87c2e9a7d3d144a50ba018f5d87c336458732dd6756d2d312b8eb71eec6`.
 
-This successor's source-only calibration remains RED 168 with the same stdout
-SHA. The bounded standalone compile passed with `-D warnings`; its compile-log
-SHA-256 is `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
-and the resulting unexecuted model binary SHA-256 is
-`fda45c8717763a21b7098c050024ed2bf30a170b815d9c6a542d8e9e7049cce9`.
-No model test process, adapter runtime, or production build was run.
+The legacy production-residue calibration remains RED 168 with the inherited
+stdout SHA above; that RED is intentionally preserved as a hard-cut control.
+The new package-local structural gate is separate and GREEN only when the
+full-closure and owner/view-pinning obligations are present:
+
+    node scripts/forktree_w5_r7_gc_structure_verify.mjs --root <checkout>
+
+The captured structural-gate output SHA-256 is
+`fe94eec334cb5255395b0a305add6912c82eca7e6a0d9e5d2e33ead6f8ff40f3`.
+The captured legacy-residue output SHA-256 is the inherited
+`af5cb87c2e9a7d3d144a50ba018f5d87c336458732dd6756d2d312b8eb71eec6` and exits
+1 with RED count 168, as required for the pre-landing hard-cut control.
+
+The bounded standalone model compile passed with `-D warnings` (compile log
+SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+The model test binary SHA-256 is
+`4837c40a89341bff40632aafaa0ac6cb67cef9b2be36c63c7b51afc6a55e5193`; its
+serial test log SHA-256 is
+`310c74b87e0cab8757d60952d248f031fa733ff3f13e8e51ce88fc3c301af9ac`.
+It reports 13 passed, 0 failed, including the checkpoint-after-view-close
+and cross-owner/view-ID collision controls. No adapter runtime or production
+build was run.
 
 The standalone model is source-checked with:
 
@@ -92,9 +124,8 @@ The standalone model is source-checked with:
       packages/engine-benchmarks/tests/forktree_w5_r7_gc_reachability_oracle.rs \
       -o <isolated-model-binary>
 
-No model binary or adapter runtime result is claimed by this package. The
-package-level Cargo no-run gate and future adapter runs remain dormant until a
-compile-green production candidate exists.
+The package-level Cargo no-run gate and future adapter runs remain dormant
+until a compile-green production candidate exists.
 
 ## Compile/runtime order
 
