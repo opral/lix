@@ -292,13 +292,56 @@ enum Node {
 #[derive(Clone, Debug)]
 struct LeafEntry {
     key: Vec<u8>,
-    value: ValueRef,
+    value: ValueLocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ValueRef {
     pack: ObjectId,
     index: u32,
+}
+
+const INLINE_VALUE_MAX_BYTES: usize = 96;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValueLocation {
+    Ref(ValueRef),
+    Inline(InlineValue),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineValue {
+    Null,
+    Bytes {
+        length: u8,
+        bytes: [u8; INLINE_VALUE_MAX_BYTES],
+    },
+}
+
+impl InlineValue {
+    fn from_relational(value: &RelationalValue) -> Option<Self> {
+        match value {
+            RelationalValue::Null => Some(Self::Null),
+            RelationalValue::Bytes(value) if value.len() <= INLINE_VALUE_MAX_BYTES => {
+                let mut bytes = [0; INLINE_VALUE_MAX_BYTES];
+                bytes[..value.len()].copy_from_slice(value);
+                Some(Self::Bytes {
+                    length: value.len() as u8,
+                    bytes,
+                })
+            }
+            RelationalValue::Bytes(_) => None,
+        }
+    }
+
+    fn into_relational(self) -> RelationalValue {
+        match self {
+            Self::Null => RelationalValue::Null,
+            Self::Bytes { length, bytes } => {
+                RelationalValue::Bytes(bytes[..length as usize].to_vec())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -309,8 +352,8 @@ struct ResolvedMutation {
 
 #[derive(Clone, Copy, Debug)]
 enum ResolvedOperation {
-    Insert(ValueRef),
-    Update(ValueRef),
+    Insert(ValueLocation),
+    Update(ValueLocation),
     Delete,
 }
 
@@ -848,34 +891,43 @@ where
                 .sum(),
             ..ApplyAccounting::default()
         };
-        let values = mutations
+        let external_values = mutations
             .iter()
             .filter_map(Mutation::value)
+            .filter(|value| InlineValue::from_relational(value).is_none())
             .collect::<Vec<_>>();
-        let value_pack = (!values.is_empty())
-            .then(|| stage_object(encode_value_pack(values.iter().copied()), &mut pending));
+        let value_pack = (!external_values.is_empty()).then(|| {
+            stage_object(
+                encode_value_pack(external_values.iter().copied()),
+                &mut pending,
+            )
+        });
         let mut value_index = 0_u32;
         let resolved_mutations = mutations
             .iter()
             .map(|mutation| {
-                let value_ref = mutation.value().map(|_| {
-                    let value = ValueRef {
-                        pack: value_pack.expect("nonempty values have a pack"),
-                        index: value_index,
-                    };
-                    value_index = value_index
-                        .checked_add(1)
-                        .expect("ForkTree value-pack index fits u32");
-                    value
+                let value_location = mutation.value().map(|value| {
+                    InlineValue::from_relational(value)
+                        .map(ValueLocation::Inline)
+                        .unwrap_or_else(|| {
+                            let value = ValueLocation::Ref(ValueRef {
+                                pack: value_pack.expect("external values have a pack"),
+                                index: value_index,
+                            });
+                            value_index = value_index
+                                .checked_add(1)
+                                .expect("ForkTree value-pack index fits u32");
+                            value
+                        })
                 });
                 ResolvedMutation {
                     key: mutation.key().to_vec(),
                     operation: match mutation {
                         Mutation::Insert { .. } => {
-                            ResolvedOperation::Insert(value_ref.expect("insert value"))
+                            ResolvedOperation::Insert(value_location.expect("insert value"))
                         }
                         Mutation::Update { .. } => {
-                            ResolvedOperation::Update(value_ref.expect("update value"))
+                            ResolvedOperation::Update(value_location.expect("update value"))
                         }
                         Mutation::Delete { .. } => ResolvedOperation::Delete,
                     },
@@ -1953,7 +2005,7 @@ where
         let leaf = stage_object(
             encode_leaf(&[LeafEntry {
                 key: orphan_key.clone(),
-                value: ValueRef { pack, index: 0 },
+                value: ValueLocation::Ref(ValueRef { pack, index: 0 }),
             }]),
             &mut pending,
         );
@@ -2204,7 +2256,26 @@ where
                         stats.leaf_decoded_bytes += decoded_bytes;
                         stats.leaf_key_bytes +=
                             rows.iter().map(|row| row.key.len() as u64).sum::<u64>();
-                        stats.leaf_value_ref_bytes += rows.len() as u64 * (32 + 4);
+                        stats.leaf_value_ref_bytes += rows
+                            .iter()
+                            .map(|row| match row.value {
+                                ValueLocation::Ref(_) => 1 + 32 + 4,
+                                ValueLocation::Inline(InlineValue::Null) => 1,
+                                ValueLocation::Inline(InlineValue::Bytes { length, .. }) => {
+                                    1 + 4 + u64::from(length)
+                                }
+                            })
+                            .sum::<u64>();
+                        stats.value_payload_bytes += rows
+                            .iter()
+                            .map(|row| match row.value {
+                                ValueLocation::Inline(InlineValue::Bytes { length, .. }) => {
+                                    u64::from(length)
+                                }
+                                ValueLocation::Inline(InlineValue::Null)
+                                | ValueLocation::Ref(_) => 0,
+                            })
+                            .sum::<u64>();
                     }
                     INTERNAL_TAG => {
                         let children = match decode_node(bytes)? {
@@ -2509,7 +2580,7 @@ where
         &'a self,
         id: ObjectId,
         key: &'a [u8],
-    ) -> BoxFuture<'a, Result<ValueRef, String>> {
+    ) -> BoxFuture<'a, Result<ValueLocation, String>> {
         Box::pin(async move {
             match decode_node(&self.load_object(id).await?)? {
                 Node::Leaf(rows) => rows
@@ -2531,7 +2602,7 @@ where
         &'a self,
         id: ObjectId,
         key: &'a [u8],
-    ) -> BoxFuture<'a, Result<Option<ValueRef>, String>> {
+    ) -> BoxFuture<'a, Result<Option<ValueLocation>, String>> {
         Box::pin(async move {
             match decode_node(&self.load_object(id).await?)? {
                 Node::Leaf(rows) => Ok(rows
@@ -2589,7 +2660,10 @@ where
                 Node::Leaf(rows) => {
                     let ids = rows
                         .iter()
-                        .map(|row| row.value.pack)
+                        .filter_map(|row| match row.value {
+                            ValueLocation::Ref(value) => Some(value.pack),
+                            ValueLocation::Inline(_) => None,
+                        })
                         .collect::<std::collections::BTreeSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
@@ -2600,13 +2674,17 @@ where
                         .map(|(id, bytes)| decode_value_pack(&bytes).map(|values| (id, values)))
                         .collect::<Result<BTreeMap<_, _>, _>>()?;
                     for row in rows {
-                        let value = packs
-                            .get(&row.value.pack)
-                            .and_then(|values| values.get(row.value.index as usize))
-                            .cloned()
-                            .ok_or_else(|| {
-                                "ForkTree relational value-pack reference is invalid".to_string()
-                            })?;
+                        let value = match row.value {
+                            ValueLocation::Inline(value) => value.into_relational(),
+                            ValueLocation::Ref(value) => packs
+                                .get(&value.pack)
+                                .and_then(|values| values.get(value.index as usize))
+                                .cloned()
+                                .ok_or_else(|| {
+                                    "ForkTree relational value-pack reference is invalid"
+                                        .to_string()
+                                })?,
+                        };
                         output.push((row.key, value));
                     }
                 }
@@ -2781,12 +2859,15 @@ where
         })
     }
 
-    async fn load_value(&self, value: ValueRef) -> Result<Vec<u8>, String> {
-        match decode_value_pack(&self.load_object(value.pack).await?)?
-            .get(value.index as usize)
-            .cloned()
-            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())?
-        {
+    async fn load_value(&self, value: ValueLocation) -> Result<Vec<u8>, String> {
+        let value = match value {
+            ValueLocation::Inline(value) => value.into_relational(),
+            ValueLocation::Ref(value) => decode_value_pack(&self.load_object(value.pack).await?)?
+                .get(value.index as usize)
+                .cloned()
+                .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())?,
+        };
+        match value {
             RelationalValue::Bytes(bytes) => Ok(bytes),
             RelationalValue::Null => {
                 Err("ForkTree byte-only reader encountered a relational NULL".to_string())
@@ -2794,11 +2875,14 @@ where
         }
     }
 
-    async fn load_relational_value(&self, value: ValueRef) -> Result<RelationalValue, String> {
-        decode_value_pack(&self.load_object(value.pack).await?)?
-            .get(value.index as usize)
-            .cloned()
-            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
+    async fn load_relational_value(&self, value: ValueLocation) -> Result<RelationalValue, String> {
+        match value {
+            ValueLocation::Inline(value) => Ok(value.into_relational()),
+            ValueLocation::Ref(value) => decode_value_pack(&self.load_object(value.pack).await?)?
+                .get(value.index as usize)
+                .cloned()
+                .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string()),
+        }
     }
 
     async fn load_blob_manifest(&self, id: Option<ObjectId>) -> Result<BlobManifest, String> {
@@ -2866,7 +2950,10 @@ where
                 Node::Leaf(rows) => {
                     let ids = rows
                         .iter()
-                        .map(|row| row.value.pack)
+                        .filter_map(|row| match row.value {
+                            ValueLocation::Ref(value) => Some(value.pack),
+                            ValueLocation::Inline(_) => None,
+                        })
                         .collect::<std::collections::BTreeSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
@@ -2877,15 +2964,19 @@ where
                         .map(|(id, bytes)| decode_value_pack(&bytes).map(|values| (id, values)))
                         .collect::<Result<BTreeMap<_, _>, _>>()?;
                     for row in rows {
-                        let values = packs
-                            .get(&row.value.pack)
-                            .ok_or_else(|| "ForkTree leaf value pack was not loaded".to_string())?;
-                        let value = values
-                            .get(row.value.index as usize)
-                            .ok_or_else(|| {
-                                "ForkTree value-pack index is out of bounds".to_string()
-                            })?
-                            .clone();
+                        let value = match row.value {
+                            ValueLocation::Inline(value) => value.into_relational(),
+                            ValueLocation::Ref(value) => packs
+                                .get(&value.pack)
+                                .ok_or_else(|| {
+                                    "ForkTree leaf value pack was not loaded".to_string()
+                                })?
+                                .get(value.index as usize)
+                                .ok_or_else(|| {
+                                    "ForkTree value-pack index is out of bounds".to_string()
+                                })?
+                                .clone(),
+                        };
                         match value {
                             RelationalValue::Bytes(bytes) => output.push((row.key, bytes)),
                             RelationalValue::Null => {
@@ -3223,20 +3314,32 @@ fn build_tree(
     let mut level = rows
         .chunks(LEAF_ROWS)
         .map(|chunk| {
-            let values = chunk
+            let external_values = chunk
                 .iter()
                 .map(|(_, value)| RelationalValue::Bytes(value.clone()))
+                .filter(|value| InlineValue::from_relational(value).is_none())
                 .collect::<Vec<_>>();
-            let value_pack = stage_object(encode_value_pack(values.iter()), pending);
+            let value_pack = (!external_values.is_empty())
+                .then(|| stage_object(encode_value_pack(external_values.iter()), pending));
+            let mut value_index = 0_u32;
             let leaf = chunk
                 .iter()
-                .enumerate()
-                .map(|(index, (key, _))| LeafEntry {
-                    key: key.clone(),
-                    value: ValueRef {
-                        pack: value_pack,
-                        index: index as u32,
-                    },
+                .map(|(key, value)| {
+                    let relational = RelationalValue::Bytes(value.clone());
+                    let location = InlineValue::from_relational(&relational)
+                        .map(ValueLocation::Inline)
+                        .unwrap_or_else(|| {
+                            let location = ValueLocation::Ref(ValueRef {
+                                pack: value_pack.expect("external values have a pack"),
+                                index: value_index,
+                            });
+                            value_index += 1;
+                            location
+                        });
+                    LeafEntry {
+                        key: key.clone(),
+                        value: location,
+                    }
                 })
                 .collect::<Vec<_>>();
             let id = stage_object(encode_leaf(&leaf), pending);
@@ -3372,8 +3475,18 @@ fn encode_leaf(rows: &[LeafEntry]) -> Bytes {
     put_u32(&mut body, rows.len());
     for row in rows {
         put_bytes(&mut body, &row.key);
-        body.extend_from_slice(&row.value.pack.0);
-        body.extend_from_slice(&row.value.index.to_be_bytes());
+        match row.value {
+            ValueLocation::Ref(value) => {
+                body.push(0);
+                body.extend_from_slice(&value.pack.0);
+                body.extend_from_slice(&value.index.to_be_bytes());
+            }
+            ValueLocation::Inline(InlineValue::Null) => body.push(1),
+            ValueLocation::Inline(InlineValue::Bytes { length, bytes }) => {
+                body.push(2);
+                put_bytes(&mut body, &bytes[..length as usize]);
+            }
+        }
     }
     let compressed = zstd::bulk::compress(&body, 1).expect("compress canonical ForkTree leaf");
     let mut bytes = object_prefix(LEAF_TAG);
@@ -3514,13 +3627,27 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
             let count = body.u32()?;
             let mut rows = Vec::with_capacity(count);
             for _ in 0..count {
-                rows.push(LeafEntry {
-                    key: body.bytes()?,
-                    value: ValueRef {
+                let key = body.bytes()?;
+                let value = match body.take(1)?[0] {
+                    0 => ValueLocation::Ref(ValueRef {
                         pack: body.id()?,
                         index: body.u32_raw()?,
-                    },
-                });
+                    }),
+                    1 => ValueLocation::Inline(InlineValue::Null),
+                    2 => {
+                        let value = body.bytes()?;
+                        if value.len() > INLINE_VALUE_MAX_BYTES {
+                            return Err("ForkTree inline value exceeds canonical bound".to_string());
+                        }
+                        let relational = RelationalValue::Bytes(value);
+                        ValueLocation::Inline(
+                            InlineValue::from_relational(&relational)
+                                .expect("bounded inline value is representable"),
+                        )
+                    }
+                    tag => return Err(format!("unknown ForkTree leaf value tag {tag}")),
+                };
+                rows.push(LeafEntry { key, value });
             }
             body.finish()?;
             if rows.windows(2).any(|pair| pair[0].key >= pair[1].key) {
@@ -3666,9 +3793,14 @@ impl ObjectEdges {
 fn object_edges(bytes: &[u8]) -> Result<ObjectEdges, String> {
     match object_tag(bytes)? {
         LEAF_TAG => match decode_node(bytes)? {
-            Node::Leaf(rows) => Ok(ObjectEdges::terminal(
-                rows.into_iter().map(|row| row.value.pack),
-            )),
+            Node::Leaf(rows) => {
+                Ok(ObjectEdges::terminal(rows.into_iter().filter_map(
+                    |row| match row.value {
+                        ValueLocation::Ref(value) => Some(value.pack),
+                        ValueLocation::Inline(_) => None,
+                    },
+                )))
+            }
             Node::Internal(_) => unreachable!(),
         },
         INTERNAL_TAG => match decode_node(bytes)? {
