@@ -306,6 +306,12 @@ blocked by derived/history empty-success and legacy TrackedHead/control
 acquisition in `load_exact_batch`; d6 remains the last approved base and the
 frontier cannot be promoted or run.
 
+The pending correction above blocked 9f3 is head
+`705440f55eccba9e2d55c0951d6a684737005d76`, tree
+`2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d`, parent 9f3, diff prefix
+`c68b9338`, patch prefix `7504d3c1`, expected compile frontier 185/7. Its
+transport remains unbound pending review; d6 remains the last approved base.
+
 This is the reduced non-negotiable landing gate for the first explicitly
 compile-green immutable candidate. It is test/report-only and does not authorize
 running current main, any compiler-red frontier, or any artifact branch. Every

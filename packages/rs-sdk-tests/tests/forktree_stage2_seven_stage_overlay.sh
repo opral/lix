@@ -211,7 +211,14 @@ verify_reader_frontier() {
   [[ "$(reader_value pending_diff_sha256_prefix)" == "6000f34f" ]] || die "reader frontier diff prefix mismatch"
   [[ "$(reader_value pending_patch_id_prefix)" == "3890dad2" ]] || die "reader frontier patch prefix mismatch"
   [[ "$(reader_value expected_cargo_errors)" == 185 && "$(reader_value expected_cargo_warnings)" == 7 ]] || die "reader frontier expected compile frontier mismatch"
-  note "reader-frontier\tBLOCKED\t9f3c703e953440cde1d60b1511467c4337648c8f\t51a0026c0c3eced6fdaa5e5ed4824111377f086c\tderived/history empty-success and legacy TrackedHead/control reader\tlast-approved=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768\tno runtime enabled"
+  [[ "$(reader_value successor_status)" == pending-correction-review ]] || die "reader successor status changed unexpectedly"
+  [[ "$(reader_value successor_ref)" == UNBOUND ]] || die "reader successor ref must remain unbound"
+  [[ "$(reader_value successor_head)" == "705440f55eccba9e2d55c0951d6a684737005d76" ]] || die "reader successor head mismatch"
+  [[ "$(reader_value successor_tree)" == "2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d" ]] || die "reader successor tree mismatch"
+  [[ "$(reader_value successor_parent)" == "9f3c703e953440cde1d60b1511467c4337648c8f" ]] || die "reader successor parent mismatch"
+  [[ "$(reader_value successor_diff_sha256_prefix)" == "c68b9338" ]] || die "reader successor diff prefix mismatch"
+  [[ "$(reader_value successor_patch_id_prefix)" == "7504d3c1" ]] || die "reader successor patch prefix mismatch"
+  note "reader-frontier\tBLOCKED\t9f3c703e953440cde1d60b1511467c4337648c8f\t51a0026c0c3eced6fdaa5e5ed4824111377f086c\tderived/history empty-success and legacy TrackedHead/control reader\tpending-correction=705440f55eccba9e2d55c0951d6a684737005d76\tlast-approved=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768\tno runtime enabled"
 }
 
 print_commands() {

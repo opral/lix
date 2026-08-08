@@ -117,6 +117,12 @@ TrackedHead/control state. Its transport ref is unbound; d6 remains the last
 approved base, and this frontier remains metadata-only and cannot enable
 runtime.
 
+Pending correction frontier above blocked 9f3 is
+`705440f55eccba9e2d55c0951d6a684737005d76` / tree
+`2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d`, parent 9f3, diff prefix
+`c68b9338`, patch prefix `7504d3c1`, expected compile frontier 185/7. Its
+transport ref is unbound and it is not promotable until review.
+
 The overlay consists only of this manifest, its TSV, the R1 binding, the R5
 correction hold, the W5/R7 binding, the reader frontier binding, and the dormant
 verifier script. Materialization creates a disposable detached

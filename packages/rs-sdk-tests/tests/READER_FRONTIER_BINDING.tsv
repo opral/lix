@@ -14,3 +14,12 @@ required_approvals	R2,R4,H4
 required_before_runtime	true
 block_reason	derived/history scans can return empty current-state success; load_exact_batch retains legacy TrackedHead/control reader
 last_approved_base	d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+successor_status	pending-correction-review
+successor_ref	UNBOUND
+successor_head	705440f55eccba9e2d55c0951d6a684737005d76
+successor_tree	2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d
+successor_parent	9f3c703e953440cde1d60b1511467c4337648c8f
+successor_diff_sha256_prefix	c68b9338
+successor_patch_id_prefix	7504d3c1
+successor_expected_cargo_errors	185
+successor_expected_cargo_warnings	7

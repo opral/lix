@@ -46,6 +46,12 @@ empty-success and legacy TrackedHead/control acquisition in `load_exact_batch`.
 Its transport ref is unbound, d6 remains the last approved base, and it cannot
 enable runtime.
 
+The pending correction above blocked 9f3 is
+`705440f55eccba9e2d55c0951d6a684737005d76` / tree
+`2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d`, parent 9f3, diff prefix
+`c68b9338`, patch prefix `7504d3c1`, expected compile frontier 185/7. Its
+transport remains unbound pending review, so it cannot be promoted or run.
+
 The historical artifact comparator remains exact a12
 `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
 `9a705d36392e88d8f5f363b2b23d373deec3321d`; all a12-based artifact diffs are
