@@ -1013,9 +1013,23 @@ where
         branch: &str,
         key: &[u8],
     ) -> Result<Option<RelationalValue>, String> {
-        let commit = self.load_commit(self.branch_head(branch).await?).await?;
-        match self.find_value_optional(commit.root, key).await? {
-            Some(value) => self.load_relational_value(value).await.map(Some),
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let head = self
+            .load_head_at_key_on_read(&read, &selector_key(BRANCH_PREFIX, branch))
+            .await?;
+        let commit = self.load_commit_on_read(&read, head.commit).await?;
+        match self
+            .find_value_optional_on_read(&read, commit.root, key)
+            .await?
+        {
+            Some(value) => self
+                .load_relational_value_on_read(&read, value)
+                .await
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -2527,13 +2541,17 @@ where
         })
     }
 
-    fn find_value_optional<'a>(
+    fn find_value_optional_on_read<'a, R>(
         &'a self,
+        read: &'a R,
         id: ObjectId,
         key: &'a [u8],
-    ) -> BoxFuture<'a, Result<Option<ValueRef>, String>> {
+    ) -> BoxFuture<'a, Result<Option<ValueRef>, String>>
+    where
+        R: StorageRead + ?Sized,
+    {
         Box::pin(async move {
-            match decode_node(&self.load_object(id).await?)? {
+            match decode_node(&self.load_object_on_read(read, id).await?)? {
                 Node::Leaf(rows) => Ok(rows
                     .binary_search_by(|row| row.key.as_slice().cmp(key))
                     .ok()
@@ -2542,7 +2560,7 @@ where
                     .iter()
                     .find(|child| key <= child.max_key.as_slice())
                 {
-                    Some(child) => self.find_value_optional(child.id, key).await,
+                    Some(child) => self.find_value_optional_on_read(read, child.id, key).await,
                     None => Ok(None),
                 },
             }
@@ -2795,7 +2813,23 @@ where
     }
 
     async fn load_relational_value(&self, value: ValueRef) -> Result<RelationalValue, String> {
-        decode_value_pack(&self.load_object(value.pack).await?)?
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        self.load_relational_value_on_read(&read, value).await
+    }
+
+    async fn load_relational_value_on_read<R>(
+        &self,
+        read: &R,
+        value: ValueRef,
+    ) -> Result<RelationalValue, String>
+    where
+        R: StorageRead + ?Sized,
+    {
+        decode_value_pack(&self.load_object_on_read(read, value.pack).await?)?
             .get(value.index as usize)
             .cloned()
             .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
@@ -3033,12 +3067,19 @@ where
     }
 
     async fn load_head_at_key(&self, selector: &[u8]) -> Result<Head, String> {
-        let keys = [key(selector), key(EPOCH_KEY)];
         let read = self
             .storage
             .begin_read(ReadOptions::default())
             .await
             .map_err(storage_error)?;
+        self.load_head_at_key_on_read(&read, selector).await
+    }
+
+    async fn load_head_at_key_on_read<R>(&self, read: &R, selector: &[u8]) -> Result<Head, String>
+    where
+        R: StorageRead + ?Sized,
+    {
+        let keys = [key(selector), key(EPOCH_KEY)];
         let result = read
             .get_many(&[GetManyRequest {
                 space: REF_SPACE,
@@ -3074,6 +3115,13 @@ where
         decode_commit(&self.load_object(id).await?)
     }
 
+    async fn load_commit_on_read<R>(&self, read: &R, id: ObjectId) -> Result<Commit, String>
+    where
+        R: StorageRead + ?Sized,
+    {
+        decode_commit(&self.load_object_on_read(read, id).await?)
+    }
+
     async fn load_object(&self, id: ObjectId) -> Result<Bytes, String> {
         self.load_objects(&[id])
             .await?
@@ -3081,16 +3129,37 @@ where
             .ok_or_else(|| "ForkTree object batch unexpectedly empty".to_string())
     }
 
+    async fn load_object_on_read<R>(&self, read: &R, id: ObjectId) -> Result<Bytes, String>
+    where
+        R: StorageRead + ?Sized,
+    {
+        self.load_objects_on_read(read, &[id])
+            .await?
+            .pop()
+            .ok_or_else(|| "ForkTree object batch unexpectedly empty".to_string())
+    }
+
     async fn load_objects(&self, ids: &[ObjectId]) -> Result<Vec<Bytes>, String> {
-        let keys = ids
-            .iter()
-            .map(|id| Key(Bytes::copy_from_slice(&id.0)))
-            .collect::<Vec<_>>();
         let read = self
             .storage
             .begin_read(ReadOptions::default())
             .await
             .map_err(storage_error)?;
+        self.load_objects_on_read(&read, ids).await
+    }
+
+    async fn load_objects_on_read<R>(
+        &self,
+        read: &R,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Bytes>, String>
+    where
+        R: StorageRead + ?Sized,
+    {
+        let keys = ids
+            .iter()
+            .map(|id| Key(Bytes::copy_from_slice(&id.0)))
+            .collect::<Vec<_>>();
         let result = read
             .get_many(&[GetManyRequest {
                 space: OBJECT_SPACE,
