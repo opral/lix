@@ -1,0 +1,4 @@
+TARGET head=705440f55eccba9e2d55c0951d6a684737005d76 tree=2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d
+RED 168 forbidden legacy GC/reachability residues
+verifier_exit=1
+full_output_sha256=cf15d78de7bd894a3e5dabffc0614aae8780300d3959c8bd1700efcf72c5f1f0
