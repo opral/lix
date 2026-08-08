@@ -939,6 +939,9 @@ where
     } else {
         view.branch_snapshot().local_state_root
     };
+    for content in &mut contents {
+        sort_state_mutations(&mut content.mutations)?;
+    }
     let state_edits = view
         .edit_state_tree_sequence(
             state_base,
@@ -1531,6 +1534,38 @@ mod intent_tests {
         ];
         let error = sort_state_mutations(&mut mutations)
             .expect_err("duplicate authenticated state keys must fail closed");
+        assert!(error.message.contains("duplicate encoded keys"));
+    }
+
+    #[test]
+    fn ordered_history_mutation_batches_sort_each_tree_edit_input() {
+        let mut batches = vec![
+            vec![
+                StateTreeMutation::remove(b"state/z".to_vec()),
+                StateTreeMutation::remove(b"state/a".to_vec()),
+            ],
+            vec![
+                StateTreeMutation::remove(b"state/y".to_vec()),
+                StateTreeMutation::remove(b"state/b".to_vec()),
+            ],
+        ];
+        for batch in &mut batches {
+            sort_state_mutations(batch).expect("each ordered edit input should be sorted");
+        }
+        assert_eq!(state_mutation_key(&batches[0][0]), b"state/a");
+        assert_eq!(state_mutation_key(&batches[0][1]), b"state/z");
+        assert_eq!(state_mutation_key(&batches[1][0]), b"state/b");
+        assert_eq!(state_mutation_key(&batches[1][1]), b"state/y");
+    }
+
+    #[test]
+    fn ordered_history_mutation_batches_reject_duplicate_encoded_keys() {
+        let mut batches = vec![vec![
+            StateTreeMutation::remove(b"state/a".to_vec()),
+            StateTreeMutation::insert(b"state/a".to_vec(), b"replacement".to_vec()),
+        ]];
+        let error = sort_state_mutations(&mut batches[0])
+            .expect_err("ordered edit input duplicates must fail closed");
         assert!(error.message.contains("duplicate encoded keys"));
     }
 }
