@@ -1,0 +1,59 @@
+{
+  "package": "cut-b-reader-correction-oracle-51ff",
+  "kind": "test-report-only",
+  "production_changes": false,
+  "anchor": {
+    "ref": "origin/codex/forktree-stage2-cut-b-reader-705",
+    "head": "51ff5dbc353cb0322bcedcd191d6e2082e7ed479",
+    "tree": "e3b8d765cee51d61744fabb4e54c9143c04257dc",
+    "parent": "705440f55eccba9e2d55c0951d6a684737005d76",
+    "parent_to_head_full_index_sha256": "873c60457007fe2494188b3e84d104e96b2e2b98d74dd4e4708fd6cd59e4cbad",
+    "parent_to_head_patch_id": "ff3cb28c8e62d2932aee906501ab19bcd051f4da"
+  },
+  "source_gate": "test-reports/stage2-filesystem-plugin-reader-correction-51ff/verify_source_contract.sh",
+  "source_gate_expected": {
+    "exit": 1,
+    "log_sha256": "d5c743d71990c06ddab65c5580be141e02da9c9679e1201153ba8c90e6ebeb3e",
+    "meaning": "51ff retains raw StorageAdapterRead/view-opening/empty-masking seams and is a deliberate red control"
+  },
+  "allowed_production_paths": [
+    "packages/lix/src/filesystem/read.rs",
+    "packages/lix/src/filesystem/mod.rs",
+    "packages/lix/src/plugin/registry.rs",
+    "packages/lix/src/plugin/mod.rs",
+    "packages/lix/src/session/merge/branch.rs",
+    "packages/lix/src/forktree/mod.rs",
+    "packages/lix/src/forktree/serving.rs",
+    "packages/lix/src/forktree/state.rs",
+    "packages/lix/src/forktree/view.rs",
+    "packages/lix/src/live_state/forktree_reader.rs",
+    "packages/lix/src/live_state/mod.rs",
+    "packages/lix/src/tracked_state/context.rs"
+  ],
+  "deletion_only_paths": [
+    "packages/lix/src/tracked_state/context.rs"
+  ],
+  "forbidden_widenings": [
+    "writer/transaction/publication",
+    "selector mutation",
+    "GC algorithm/scheduler",
+    "scalar/entity/W2/W3/W4/W5",
+    "CAS/storage owner",
+    "compatibility/migration/fallback",
+    "second view/cache/index/root authority"
+  ],
+  "required_invariants": [
+    "one retained CoherentView/read across branch and untracked loops",
+    "no raw StorageAdapterRead/store accessor/history loader",
+    "missing selected retained roots fail closed",
+    "explicit authenticated empty bootstrap remains valid",
+    "BlobId-only roots and no payload reads",
+    "corruption/reopen preserves zero writes and selector/epoch state"
+  ],
+  "artifacts": {
+    "acceptance": "b11390515103724f59c0ff4d86193790e7575ba6c27024bc74f916c1d2070df7",
+    "manifest": "self-hash-reported-in-freeze",
+    "verifier": "f8cc1a02415ccf2e474f32a000bdc7fa0bef2cd76b7d7ed664cc267df555117e",
+    "red_calibration": "8e66ebdf0bd0aef94f77b10a54410fd67cd952b8e91213c247fbeddbc0c6de71"
+  }
+}
