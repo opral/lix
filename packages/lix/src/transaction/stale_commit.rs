@@ -115,8 +115,11 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::catalog::SchemaPlanId;
+    use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::tracked_state::TrackedStateKey;
+    use crate::transaction::types::{PreparedRowFacts, PreparedStateBatch};
 
     fn test_key_ref(key: &TrackedStateKey) -> TrackedStateKeyRef<'_> {
         TrackedStateKeyRef {
@@ -172,6 +175,50 @@ mod tests {
         assert_eq!(
             indexed,
             legacy_nested_overlap_indices(&prepared, &concurrent)
+        );
+    }
+
+    #[test]
+    fn unrelated_owner_does_not_enter_stale_plan() {
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("row-a"),
+            "plugin_entity".to_owned(),
+            Some("file-a".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            false,
+            None,
+            false,
+            None,
+            false,
+            "main".to_owned(),
+        );
+        let prepared = PreparedWriteSet {
+            state_rows,
+            insert_selection: super::super::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: Default::default(),
+            first_commit_parent_override_by_branch: Default::default(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: Default::default(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+        let unrelated = TrackedStateKey {
+            schema_key: "plugin_entity".to_owned(),
+            file_id: Some("file-b".to_owned()),
+            entity_pk: EntityPk::single("row-a"),
+        };
+
+        assert_eq!(
+            classify_stale_commit(&prepared, std::iter::once(test_key_ref(&unrelated))),
+            StaleCommitPlan::Direct
         );
     }
 
