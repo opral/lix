@@ -1,13 +1,9 @@
-use std::cmp::Ordering;
-use std::sync::Arc;
-
-use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray,
-};
+use datafusion::arrow::array::{Array, BooleanArray, LargeStringArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
+use std::cmp::Ordering;
 use tracing::Instrument;
 
 use crate::catalog::{SchemaPlanId, TypedJsonScalarRef};
@@ -4571,49 +4567,6 @@ struct DirectParameterInsertColumn {
     read_nullable: bool,
 }
 
-fn direct_parameter_batch_needs_clustering(
-    spec: &EntitySurfaceSpec,
-    columns: &[DirectParameterInsertColumn],
-    parameter_batch: EntityInsertParameterBatch<'_>,
-) -> bool {
-    let primary_key_roots = spec
-        .primary_key_paths
-        .iter()
-        .filter_map(|path| path.first().map(String::as_str))
-        .collect::<std::collections::BTreeSet<_>>();
-    for spec_column in &spec.columns {
-        if spec_column.column_type == EntityColumnType::Boolean {
-            return true;
-        }
-        if spec_column.column_type != EntityColumnType::String
-            || primary_key_roots.contains(spec_column.name.as_str())
-        {
-            continue;
-        }
-        let Some(input) = columns
-            .iter()
-            .find(|column| column.name == spec_column.name)
-        else {
-            continue;
-        };
-        let mut values = std::collections::BTreeSet::new();
-        for row_index in 0..parameter_batch.num_rows() {
-            if let DirectParameterValue::String(value) =
-                parameter_batch.value(input.parameter_index, row_index)
-            {
-                values.insert(value);
-                if values.len() > crate::sql2::LOW_CARDINALITY_CLUSTER_MAX_VALUES {
-                    break;
-                }
-            }
-        }
-        if (2..=crate::sql2::LOW_CARDINALITY_CLUSTER_MAX_VALUES).contains(&values.len()) {
-            return true;
-        }
-    }
-    false
-}
-
 fn append_canonical_json_string(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
     if value
         .as_bytes()
@@ -4980,81 +4933,13 @@ fn certified_direct_parameter_insert_batch(
         tracked_keys_strictly_ordered,
         complete_collection_replacement: None,
     };
-    let entity_columnar = if use_typed_certified_insert(row_count)
-        && !direct_parameter_batch_needs_clustering(spec, &columns, parameter_batch)
-    {
-        let visible_columns = spec
-            .columns
-            .iter()
-            .map(|spec_column| -> Option<ArrayRef> {
-                let input = columns
-                    .iter()
-                    .find(|column| column.name == spec_column.name);
-                Some(match (spec_column.column_type, input) {
-                    (EntityColumnType::String, Some(input)) => {
-                        Arc::new(StringArray::from_iter((0..row_count).map(|row_index| {
-                            match parameter_batch.value(input.parameter_index, row_index) {
-                                DirectParameterValue::Null => None,
-                                DirectParameterValue::String(value) => Some(value),
-                                DirectParameterValue::Boolean(_) => unreachable!(),
-                            }
-                        })))
-                    }
-                    (EntityColumnType::Boolean, Some(input)) => {
-                        Arc::new(BooleanArray::from_iter((0..row_count).map(|row_index| {
-                            match parameter_batch.value(input.parameter_index, row_index) {
-                                DirectParameterValue::Null => None,
-                                DirectParameterValue::Boolean(value) => Some(value),
-                                DirectParameterValue::String(_) => unreachable!(),
-                            }
-                        })))
-                    }
-                    (EntityColumnType::String | EntityColumnType::Json, None) => {
-                        Arc::new(StringArray::new_null(row_count))
-                    }
-                    (EntityColumnType::Boolean, None) => {
-                        Arc::new(BooleanArray::new_null(row_count))
-                    }
-                    (EntityColumnType::Integer, None) => Arc::new(Int64Array::new_null(row_count)),
-                    (EntityColumnType::Number, None) => Arc::new(Float64Array::new_null(row_count)),
-                    (
-                        EntityColumnType::Json
-                        | EntityColumnType::Integer
-                        | EntityColumnType::Number,
-                        Some(_),
-                    ) => {
-                        return None;
-                    }
-                })
-            })
-            .collect::<Option<Vec<_>>>();
-        visible_columns.and_then(|visible_columns| {
-            let entity_pk_text = entity_pks
-                .iter()
-                .map(EntityPk::as_json_array_text)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            crate::sql2::encode_unclustered_registered_entity_row_groups(
-                spec,
-                visible_columns,
-                Arc::new(StringArray::from(entity_pk_text)),
-            )
-            .ok()
-            .flatten()
-        })
-    } else {
-        None
-    };
-    let mut rows = CertifiedParameterInsertBatch::new(
+    let rows = CertifiedParameterInsertBatch::new(
         entity_pks,
         snapshots,
         schema_key,
         branch_id,
         certificate,
     )?;
-    if let Some(entity_columnar) = entity_columnar {
-        rows = rows.with_entity_columnar(entity_columnar);
-    }
     Ok(Some(rows))
 }
 
@@ -5175,37 +5060,6 @@ fn certified_direct_path_value_insert_batch(
         snapshot_offsets.push((snapshot_start, normalized.len()));
     }
 
-    let entity_columnar = if !untracked && use_typed_certified_insert(row_count) {
-        let path_values = StringArray::from_iter(path_offsets.iter().map(|&(start, end)| {
-            Some(
-                std::str::from_utf8(&path_arena[start..end])
-                    .expect("certified INSERT path arena is UTF-8"),
-            )
-        }));
-        let json_values = StringArray::from_iter(value_offsets.iter().map(|&(start, end)| {
-            Some(
-                std::str::from_utf8(&normalized[start..end])
-                    .expect("certified INSERT JSON arena is UTF-8"),
-            )
-        }));
-        let entity_pk_values = StringArray::from_iter(path_offsets.iter().map(|&(start, end)| {
-            let path = std::str::from_utf8(&path_arena[start..end])
-                .expect("certified INSERT path arena is UTF-8");
-            Some(format!(
-                "[{}]",
-                serde_json::to_string(path).expect("path should encode")
-            ))
-        }));
-        crate::sql2::encode_unclustered_registered_entity_row_groups(
-            spec,
-            vec![Arc::new(path_values), Arc::new(json_values)],
-            Arc::new(entity_pk_values),
-        )
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
     let path_arena = SharedStr::from_utf8(bytes::Bytes::from(path_arena))
         .map_err(|_| LixError::unknown("certified INSERT path arena is not UTF-8"))?;
     let entity_pks = path_offsets
@@ -5220,7 +5074,7 @@ fn certified_direct_path_value_insert_batch(
         .collect::<Vec<_>>();
     let snapshots =
         TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-    let mut rows = CertifiedParameterInsertBatch::new_with_lane(
+    let rows = CertifiedParameterInsertBatch::new_with_lane(
         entity_pks,
         snapshots,
         layout.schema_key.as_str().into(),
@@ -5236,9 +5090,6 @@ fn certified_direct_path_value_insert_batch(
             complete_collection_replacement: None,
         },
     )?;
-    if let Some(entity_columnar) = entity_columnar {
-        rows = rows.with_entity_columnar(entity_columnar);
-    }
     Ok(Some(rows))
 }
 
