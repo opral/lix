@@ -1,0 +1,6 @@
+pattern\te1af_matches\tclassification
+BranchHeadControl|TrackedHead|current.?generation\t58\tlegacy control/generation residue
+checkpoint|recovery|snapshot.?pin|undo|redo\t1139\tbroad checkpoint/history inventory
+snapshot.?pin\t16\tsnapshot pin inventory
+GlobalSelectorV1|BranchSelectorV1|global.?epoch|selector\t770\towner and caller selector inventory
+stage_branch_head_control|branch_head_control_precondition|stage_mutation_revision|MUTATION_REVISION_SPACE|TRACKED_MUTATION_REVISION_SPACE\t24\tlegacy mutation/revision residue
