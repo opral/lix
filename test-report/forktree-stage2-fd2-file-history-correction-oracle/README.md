@@ -19,13 +19,15 @@ The model cases are executable identity and mutation negatives. They require:
 - historical file descriptors to bind `file_id == entity_pk == snapshot.id`;
 - historical directory descriptors to bind `file_id == NULL == directory row scope`;
 - exact BlobRef cardinality, file identity, BlobId/payload hash, and size;
+- missing, NULL, and tombstoned selected BlobRefs to fail closed;
 - deleted file, directory, and plugin-owner rows with payload to fail before projection;
 - payload-less tombstones to remain logical absence;
 - explicit live empty state to remain distinct from tombstone state.
 
 The source gate is deliberately function-scoped. On b484 it must report exactly
-the five known RED findings in the report: the two historical descriptor key
-bindings and the three observed tombstone-payload guards. It also checks that
+the six known RED findings in the report: the two historical descriptor key
+bindings, the three observed tombstone-payload guards, and the permissive
+selected-BlobRef/projection fallback. It also checks that
 the corrected working-diff identity/tombstone pattern is present and that the
 two changed production paths contain no raw `begin_read`, legacy reader, or
 `owner.schema_keys()` fallback.

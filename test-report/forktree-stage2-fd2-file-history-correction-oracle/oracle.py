@@ -32,6 +32,7 @@ RED_IDS = {
     "observed_file_descriptor_tombstone_payload",
     "observed_directory_descriptor_tombstone_payload",
     "observed_plugin_owner_tombstone_payload",
+    "selected_missing_or_tombstoned_blob_ref_fails_closed",
 }
 
 
@@ -50,6 +51,7 @@ class BlobRef:
     blob_hash: str
     size_bytes: int
     payload: bytes
+    deleted: bool = False
 
 
 def digest(path: Path) -> str:
@@ -57,7 +59,7 @@ def digest(path: Path) -> str:
 
 
 def function_body(source: str, name: str) -> str:
-    marker = re.search(rf"(?:fn|async fn)\s+{re.escape(name)}\s*\(", source)
+    marker = re.search(rf"(?:fn|async fn)\s+{re.escape(name)}\b", source)
     if not marker:
         return ""
     start = source.find("{", marker.end())
@@ -86,6 +88,8 @@ def source_findings(root: Path) -> set[str]:
     observed_file = function_body(fh, "parse_file_history_observed_descriptors")
     observed_directory = function_body(fh, "parse_file_history_observed_directories")
     observed_owner = function_body(fh, "parse_file_history_observed_plugin_owners")
+    blob_validator = function_body(fh, "validate_exactly_one_blob_ref")
+    row_loader = function_body(fh, "load_file_history_rows")
 
     # These are deliberately function-scoped: a global token elsewhere cannot
     # satisfy the ownership contract.
@@ -107,6 +111,15 @@ def source_findings(root: Path) -> set[str]:
         findings.add("observed_directory_descriptor_tombstone_payload")
     if not tombstone_guard(observed_owner):
         findings.add("observed_plugin_owner_tombstone_payload")
+
+    # A missing/NULL selected reference and a tombstoned reference are not the
+    # authenticated empty BlobRef. b484 returns Ok(None) for both and then
+    # turns the missing bytes into Some([]) in the projection path.
+    if (
+        "unwrap_or_default()" in row_loader
+        or ("blob.deleted" in blob_validator and "return Ok(None)" in blob_validator)
+    ):
+        findings.add("selected_missing_or_tombstoned_blob_ref_fails_closed")
 
     # The working-diff correction is the accepted identity/tombstone pattern.
     if "validate_descriptor_row_identity" not in wd:
@@ -156,22 +169,33 @@ def validate_plugin_owner(row: Row) -> str:
     return "live"
 
 
-def validate_blob_binding(row: Row, refs: list[BlobRef]) -> str:
+def validate_blob_binding(row: Row, refs: list[BlobRef] | None) -> str:
     state = validate_descriptor(row)
     if state == "absent":
         require(not refs, "deleted file cannot retain a BlobRef")
         return state
-    # A descriptor with no BlobRef is the authenticated explicit-empty file
-    # state.  It is distinct from a deleted row and from a live non-empty file.
+    # Only an explicit zero-length authenticated BlobRef is valid empty
+    # content. Missing/NULL selected references are corruption.
+    if refs is None:
+        raise AssertionError("NULL selected BlobRef")
     if not refs:
-        return "explicit-empty"
+        raise AssertionError("missing selected BlobRef")
     require(len(refs) == 1, "live file must have exactly one BlobRef")
     ref = refs[0]
+    require(not ref.deleted, "tombstoned selected BlobRef")
     require(ref.file_id == row.entity_pk, "BlobRef file identity mismatch")
     require(ref.size_bytes == len(ref.payload), "BlobRef size mismatch")
     actual = hashlib.sha256(ref.payload).hexdigest()
     require(ref.blob_hash == actual, "BlobRef payload hash mismatch")
     return "live-empty" if not ref.payload else "live"
+
+
+def project_file(row: Row, refs: list[BlobRef] | None, needs_data: bool) -> bytes | None:
+    """Validate before either metadata-only or data projection."""
+    state = validate_blob_binding(row, refs)
+    if state == "absent":
+        return None
+    return b"" if needs_data and state == "live-empty" else None
 
 
 def run_model_cases() -> list[str]:
@@ -223,10 +247,49 @@ def run_model_cases() -> list[str]:
     case(
         "observed_file_explicit_empty_is_distinct_and_valid",
         lambda: require(
-            validate_blob_binding(Row("file", file_id, file_id, {"id": file_id}), [])
-            == "explicit-empty",
-            "explicit empty file was not preserved",
+            validate_blob_binding(
+                Row("file", file_id, file_id, {"id": file_id}),
+                [BlobRef(file_id, empty_hash, 0, b"")],
+            )
+            == "live-empty",
+            "explicit zero-length BlobRef was not authenticated",
         ),
+    )
+    case(
+        "observed_file_missing_blob_ref_fails",
+        lambda: expect_error(
+            lambda: validate_blob_binding(
+                Row("file", file_id, file_id, {"id": file_id}), []
+            )
+        ),
+    )
+    case(
+        "observed_file_null_blob_ref_fails",
+        lambda: expect_error(
+            lambda: validate_blob_binding(
+                Row("file", file_id, file_id, {"id": file_id}), None
+            )
+        ),
+    )
+    case(
+        "observed_file_tombstoned_blob_ref_fails",
+        lambda: expect_error(
+            lambda: validate_blob_binding(
+                Row("file", file_id, file_id, {"id": file_id}),
+                [BlobRef(file_id, empty_hash, 0, b"", True)],
+            )
+        ),
+    )
+    case(
+        "observed_file_missing_blob_ref_fails_before_metadata_and_data_projection",
+        lambda: [
+            expect_error(
+                lambda: project_file(
+                    Row("file", file_id, file_id, {"id": file_id}), [], needs_data
+                )
+            )
+            for needs_data in (False, True)
+        ],
     )
     case(
         "observed_file_live_empty_blob_is_valid",
