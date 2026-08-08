@@ -38,6 +38,9 @@ identity is insufficient.
 with `state.plugin_registry.get(owner.plugin_key())` and fail closed when it is
 absent. The scope must contain no `unwrap_or`, `unwrap_or_else`,
 `owner.schema_keys()`, compatibility fallback, cache, or alternate authority.
+The executable `fixtures/registry_model.py` mutates one valid authenticated
+fixture for every negative case and rejects each mutation; it separately
+asserts that a present authenticated empty registry is valid.
 
 The registry model cases are:
 
@@ -50,8 +53,8 @@ The registry model cases are:
 | malformed registry payload | `FAIL_CLOSED_MALFORMED` |
 | substituted registry identity | `FAIL_CLOSED_SUBSTITUTED` |
 
-The model is a discriminator for the source contract; it is not a production
-reader or runtime acceptance test.
+The model is an executable discriminator for the source contract; it is not a
+production reader or runtime acceptance test.
 
 ## Stop conditions
 

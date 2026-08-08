@@ -15,7 +15,7 @@ fixtures/readers/fresh_read.rs
 fixtures/readers/legacy_reader.rs
 fixtures/readers/mismatched_argument.rs
 fixtures/readers/valid.rs
-fixtures/registry_cases.tsv
+fixtures/registry_model.py
 source_gate.py
 source_gate.sh
 ```

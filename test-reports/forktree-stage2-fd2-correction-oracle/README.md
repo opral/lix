@@ -10,8 +10,9 @@ covers only the two additional fd2 review seams:
    passes the tuple element derived from the caller-owned
    `forktree_reader.clone()` to the chronology receiver and `load_rows` reader
    argument; local/fresh/mismatched/legacy readers are rejected;
-2. the plugin-history registry contract rejects missing, wrong-kind, malformed,
-   and substituted authenticated registry entries without falling back to
+2. the plugin-history registry contract uses the executable mutation model in
+   `fixtures/registry_model.py` to reject missing, wrong-kind, malformed, and
+   substituted authenticated registry entries without falling back to
    `owner.schema_keys()`, while an authenticated present-empty registry remains
    valid.
 
@@ -26,6 +27,7 @@ bash test-reports/forktree-stage2-fd2-correction-oracle/source_gate.sh .
 
 The exact fd2 baseline is intentionally RED because its plugin-history helper
 still has the `owner.schema_keys()` fallback. The new balanced parser proves
-the actual destructured provider closure identity on fd2; the package records
-that green identity result, the RED registry result, and the complete file
-manifest.
+the actual destructured provider closure identity on fd2; the executable
+registry model prints and checks every valid/empty/fail-closed mutation. The
+captured output is preserved in `FD2_RED_CALIBRATION.log` and the complete
+file manifest/checksum set.

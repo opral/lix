@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -261,26 +262,21 @@ def check_plugin_source(gate: Gate, file: Path) -> None:
     gate.check("plugin-registry-fail-closed-source", owner_ok and validation_ok, str(file))
 
 
-def registry_result(state: str) -> str:
-    return {
-        "present-valid": "VALID",
-        "present-empty": "VALID_EMPTY",
-        "missing": "FAIL_CLOSED_MISSING",
-        "present-wrong-kind": "FAIL_CLOSED_WRONG_KIND",
-        "present-malformed": "FAIL_CLOSED_MALFORMED",
-        "present-substituted": "FAIL_CLOSED_SUBSTITUTED",
-    }.get(state, "FAIL_CLOSED_UNKNOWN")
-
-
 def check_registry_model(gate: Gate, path: Path) -> None:
-    rows = []
-    for line in path.read_text().splitlines():
-        if not line or line.startswith("case\t"):
-            continue
-        case, state, expected = line.split("\t")
-        rows.append((case, state, expected))
-    actual = [(case, registry_result(state), expected) for case, state, expected in rows]
-    gate.check("plugin-registry-discriminator", all(result == expected for _, result, expected in actual), f"cases={len(rows)}")
+    result = subprocess.run(
+        [sys.executable, str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    detail = result.stdout.strip().replace("\n", ",")
+    if result.stderr.strip():
+        detail += f" stderr={result.stderr.strip()}"
+    gate.check(
+        "plugin-registry-executable-model",
+        result.returncode == 0,
+        detail,
+    )
 
 
 def check_fixture(gate: Gate, path: Path, expected: bool) -> None:
@@ -313,7 +309,7 @@ def main() -> int:
     fixture_dir = root / PACKAGE / "fixtures/readers"
     for name, expected in (("valid.rs", True), ("distinct_view.rs", False), ("fresh_read.rs", False), ("legacy_reader.rs", False), ("mismatched_argument.rs", False)):
         check_fixture(gate, fixture_dir / name, expected)
-    check_registry_model(gate, root / PACKAGE / "fixtures/registry_cases.tsv")
+    check_registry_model(gate, root / PACKAGE / "fixtures/registry_model.py")
     print("GREEN" if not gate.failed else "RED")
     return 0 if not gate.failed else 1
 

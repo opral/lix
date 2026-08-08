@@ -1,0 +1,23 @@
+PASS	provenance	base=fd2be256d763f17e9f127d4c984e36fba191cb82 head=e2503fd1d43b95d3ebfd133b9868a4be0647ee3d
+PASS	path-present	packages/lix/src/sql2/providers/checkpoint.rs
+PASS	path-present	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+PASS	path-present	packages/lix/src/sql2/providers/working_diff.rs
+PASS	path-present	packages/lix/src/sql2/providers/file_history.rs
+PASS	destructured-reader-identity	/root/projects/lix-fd2-closure-plugin-correction1/packages/lix/src/sql2/providers/checkpoint.rs:plan_scan tuple_reader=historical receivers=['historical'] load_args=[] forbidden=[]
+PASS	destructured-reader-identity	/root/projects/lix-fd2-closure-plugin-correction1/packages/lix/src/sql2/providers/filesystem_working_diff.rs:plan_scan tuple_reader=historical receivers=['historical'] load_args=[['historical', 'checkpoint_id.to_string()', 'head.commit_id.to_string()', 'head.branch_id', 'kind', '']] forbidden=[]
+PASS	destructured-reader-identity	/root/projects/lix-fd2-closure-plugin-correction1/packages/lix/src/sql2/providers/working_diff.rs:plan_scan tuple_reader=historical receivers=['historical'] load_args=[] forbidden=[]
+RED	plugin-registry-fail-closed-source	/root/projects/lix-fd2-closure-plugin-correction1/packages/lix/src/sql2/providers/file_history.rs
+PASS	reader-negative-fixture	valid.rs reader=historical receivers=['historical']
+PASS	reader-negative-fixture	distinct_view.rs caller-owned reader tuple absent
+PASS	reader-negative-fixture	fresh_read.rs reader=historical receivers=['historical']
+PASS	reader-negative-fixture	legacy_reader.rs reader=historical receivers=['historical']
+PASS	reader-negative-fixture	mismatched_argument.rs reader=historical receivers=['other_reader']
+PASS	plugin-registry-executable-model	PASS registry-valid,PASS registry-explicit-empty,PASS registry-fail-closed-missing,PASS registry-fail-closed-wrong-kind,PASS registry-fail-closed-malformed,PASS registry-fail-closed-substituted
+RED
+RED	structural-source-oracle	/root/projects/lix-fd2-closure-plugin-correction1/test-reports/forktree-stage2-fd2-correction-oracle
+PASS	rustfmt	test-reports/forktree-stage2-fd2-correction-oracle/fixtures/readers/fresh_read.rs
+PASS	rustfmt	test-reports/forktree-stage2-fd2-correction-oracle/fixtures/readers/legacy_reader.rs
+PASS	rustfmt	test-reports/forktree-stage2-fd2-correction-oracle/fixtures/readers/valid.rs
+PASS	rustfmt	test-reports/forktree-stage2-fd2-correction-oracle/fixtures/readers/mismatched_argument.rs
+PASS	rustfmt	test-reports/forktree-stage2-fd2-correction-oracle/fixtures/readers/distinct_view.rs
+RED

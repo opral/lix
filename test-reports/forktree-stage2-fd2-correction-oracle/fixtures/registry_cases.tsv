@@ -1,7 +1,0 @@
-case	registry_state	expected
-valid	present-valid	VALID
-explicit_empty	present-empty	VALID_EMPTY
-missing	missing	FAIL_CLOSED_MISSING
-wrong_kind	present-wrong-kind	FAIL_CLOSED_WRONG_KIND
-malformed	present-malformed	FAIL_CLOSED_MALFORMED
-substituted	present-substituted	FAIL_CLOSED_SUBSTITUTED
