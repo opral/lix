@@ -35,8 +35,8 @@ void localConfig.lixDir;
 // @ts-expect-error removed native syncAllFiles option
 void localConfig.syncAllFiles;
 
-// @ts-expect-error removed worker manual import operation
 const oldImport: WorkerOperation = {
+	// @ts-expect-error removed worker manual import operation
 	kind: "importFilesystemPaths",
 	paths: ["note.md"],
 };
