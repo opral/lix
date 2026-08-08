@@ -51,8 +51,12 @@ non-runnable and receives no artifact application or build.
 
 The next eligible candidate must be an explicitly compile-green immutable
 writer/SPI head descending from `54e90dbf...`, unless the coordinator names a
-replacement lineage. The disposable preflight/application procedure is frozen
-in `FORKTREE_STAGE2_FIRST_RUNNABLE_RECIPE.md`.
+replacement lineage. Compile-green ordinary commit lowering is not sufficient:
+the same immutable head must have independent R2 atomicity approval, H2
+deletion/residue approval, and zero independent ForkTree publication points
+across transaction, upload, and GC families. The disposable
+preflight/application procedure is frozen in
+`FORKTREE_STAGE2_FIRST_RUNNABLE_RECIPE.md`.
 
 The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at

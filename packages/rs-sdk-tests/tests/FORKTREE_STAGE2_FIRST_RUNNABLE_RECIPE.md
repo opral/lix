@@ -81,8 +81,12 @@ ref, exact head and tree as compile-green. Before creating a worktree:
    coordinator explicitly names a replacement accepted lineage;
 4. require the BlobRef same-size manifest-substitution correction above to
    remain byte-identical in the candidate lineage;
-5. run the frozen ten-ref verifier and require every identity/file check green;
-6. check disk, then create a fresh detached disposable worktree and isolated
+5. require independent R2 approval that transaction, upload, and GC lower into
+   one atomic owner publication/epoch fence with no second commit boundary;
+6. require H2 deletion/residue approval and zero surviving independent ForkTree
+   publication entry points for those three writer families;
+7. run the frozen ten-ref verifier and require every identity/file check green;
+8. check disk, then create a fresh detached disposable worktree and isolated
    Cargo target outside Ryzen-V's production worktree.
 
 Example read-only preflight, with values supplied by the future handoff:
