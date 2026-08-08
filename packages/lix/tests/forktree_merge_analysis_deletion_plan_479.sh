@@ -3,8 +3,8 @@ set -u -o pipefail
 
 # TEST/REPORT-ONLY source verifier. It never edits, builds, or runs Lix.
 root="${1:?candidate worktree}"
-expected_head="${2:-47957d30ae7c16c89c3c523feea23e2f98461fed}"
-expected_tree="${3:-b2e0c8a355fcee64d24cd5fcf77d2351d6fe4170}"
+expected_head="${2:?expected report-package head}"
+expected_tree="${3:?expected report-package tree}"
 frontier="47957d30ae7c16c89c3c523feea23e2f98461fed"
 oracle="103e7fe29c60bcd675cee57f8a69986c133366a3"
 report="packages/lix/tests/FORKTREE_MERGE_ANALYSIS_DELETION_PLAN_479.md"
