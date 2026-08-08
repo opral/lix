@@ -271,9 +271,13 @@ fn canonical_scan(
         .cloned()
         .collect::<Vec<_>>();
 
+    // A current scan must contain at most one row for each logical identity
+    // within one authenticated stream. The same logical key in the tracked
+    // and untracked streams is deliberately allowed: that is the replacement
+    // and tombstone overlay tested below.
     let mut authorities = BTreeMap::new();
     for row in &selected {
-        let key = (&row.pk, row.branch, row.domain, row.sequence);
+        let key = (&row.pk, row.branch, row.domain);
         if authorities.insert(key, &row.cell).is_some() {
             return Err(ModelError::DuplicateAuthority);
         }
@@ -463,4 +467,67 @@ fn duplicate_authority_and_malformed_domain_fail_closed() {
         Err(ModelError::DuplicateAuthority)
     );
     assert_eq!(decode_domain(9), Err(ModelError::MalformedDomain));
+}
+
+#[test]
+fn same_stream_duplicates_fail_but_cross_stream_replacement_is_valid() {
+    let mut tracked_duplicate = fixture();
+    tracked_duplicate.push(Row {
+        pk: TypedPk::Text("a".into()),
+        branch: Branch::Local,
+        domain: Domain::Tracked,
+        cell: Cell::Value("conflicting-tracked-a".into()),
+        sequence: 99,
+    });
+    assert_eq!(
+        canonical_scan(
+            &tracked_duplicate,
+            DomainSelector::Combined,
+            &Request {
+                exact_pks: None,
+                include_tombstones: true,
+                limit: None,
+            },
+        ),
+        Err(ModelError::DuplicateAuthority)
+    );
+
+    let mut untracked_duplicate = fixture();
+    untracked_duplicate.push(Row {
+        pk: TypedPk::Text("a".into()),
+        branch: Branch::Local,
+        domain: Domain::Untracked,
+        cell: Cell::Tombstone,
+        sequence: 99,
+    });
+    assert_eq!(
+        canonical_scan(
+            &untracked_duplicate,
+            DomainSelector::Combined,
+            &Request {
+                exact_pks: None,
+                include_tombstones: true,
+                limit: None,
+            },
+        ),
+        Err(ModelError::DuplicateAuthority)
+    );
+
+    let cross_stream = canonical_scan(
+        &fixture(),
+        DomainSelector::Combined,
+        &Request {
+            exact_pks: Some(vec![TypedPk::Text("a".into())]),
+            include_tombstones: false,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cross_stream,
+        vec![PublicRow {
+            pk: TypedPk::Text("a".into()),
+            cell: Cell::Value("untracked-a".into()),
+        }]
+    );
 }

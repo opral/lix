@@ -61,10 +61,11 @@ overlay, which is why this discriminator is required.
 
 ## Pure model gate
 
-The std-only model includes six tests: rejected direct-route calibration,
+The std-only model includes seven tests: rejected direct-route calibration,
 combined overlay replacement, explicit tracked/untracked modes, typed PK
 ordering and `LIMIT`, NULL/tombstone projection, one-scan terminal
-projections, and duplicate/malformed-domain fail-closed behavior.
+projections, malformed-domain fail-closed behavior, and the distinction
+between same-stream duplicate rejection and valid cross-stream replacement.
 
 ```sh
 rustc --edition=2021 --test -D warnings \
@@ -73,7 +74,7 @@ rustc --edition=2021 --test -D warnings \
 /tmp/forktree-canonical-mixed-model --nocapture --test-threads=1
 ```
 
-The pure model is GREEN: 6/6. This is an executable logical contract, not
+The pure model is GREEN: 7/7. This is an executable logical contract, not
 evidence that 413's production reader satisfies it.
 
 ## Deferred adapter commands
@@ -109,9 +110,9 @@ view/read with no fallback acquisition.
 The final test-only source/script hashes before freezing are:
 
 - `scripts/forktree_canonical_mixed_scan_contract_verify.mjs`:
-  `9b679619b027a2147ac89b4cd0393cd3005a6dbccc652db59723412ea8410bf0`
+  `df79754d23dccd41da3ba8b488ab423da7dc8cf6ae12f3e7f31f41f020bb1a48`
 - `packages/engine-benchmarks/tests/forktree_mixed_tracked_untracked_oracle.rs`:
-  `00c60f10476b3ccd3531ac77cfb6ea10eec69a4f3204c86f6189c35ac1f8f509`
+  `af00f7088c4a17f1437364dc2e45876595fe3a34344d95585b1178756e8ad562`
 
 Exact 413 source-gate logs:
 
@@ -126,13 +127,29 @@ precedence in that path, and no duplicate/conflict fail-closed check. The
 one-view count, projection scan count, explicit domain contract, ordering,
 typed filter, and provider default request checks pass.
 
+Against immutable successor `ab90fc51e148611f5fdacde173dd6789ab22ab88`, the
+replayed discriminator remains RED, now for only the two same-stream duplicate
+checks:
+
+- source log SHA-256
+  `5f46940c6bc3aaed577084934e62af7fddfca660e6142d013f2edc0610176e10`
+- `untracked=None`, explicit modes, cross-stream replacement/tombstone
+  precedence, malformed decoding, one view, projection count, ordering, and
+  no alternate reader: **PASS**
+- duplicate tracked logical key fails closed: **FAIL**
+- duplicate untracked logical key fails closed: **FAIL**
+
+The candidate's `BTreeMap::insert` calls are valid for the cross-stream
+replacement rule, but they do not distinguish an invalid duplicate within one
+authenticated stream; both invalid classes remain last-write-wins.
+
 Pure model artifacts:
 
 - warnings-denied test binary SHA-256
-  `06be2b24a177b59a240d07b9f448705488e470ddc641022f101b32374bbe912e`
+  `3ddb6f0629c60987d34a32b1296b26264ad61dccc04635035dc0e19ba9d1c731`
 - model log SHA-256
-  `435a0a89266598e8a1bfad23fba2b37c0e5b4a02070ccf09a374d60ba77a60e7`
-- result: **6/6 GREEN**
+  `42a2386431809dc1f99268597629c017b17114550359c04ecf9f94e16be036df`
+- result: **7/7 GREEN**
 - `cargo fmt --all -- --check`: GREEN
 - `git diff --check`: GREEN
 

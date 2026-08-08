@@ -32,17 +32,21 @@ function countMatches(source, pattern) {
 }
 
 const readerPath = "packages/lix/src/live_state/forktree_reader.rs";
+const viewPath = "packages/lix/src/forktree/view.rs";
 const contextPath = "packages/lix/src/live_state/context.rs";
 const domainContractPath = "packages/lix/src/live_state/reader.rs";
 const entityPath = "packages/lix/src/sql2/entity_batch.rs";
 const providerPath = "packages/lix/src/sql2/providers/entity.rs";
 const reader = read(readerPath);
+const view = read(viewPath);
 const context = read(contextPath);
 const domainContract = read(domainContractPath);
 const entity = read(entityPath);
 const provider = read(providerPath);
 const scanView = functionBody(reader, "pub(crate) async fn scan_view");
 const operation = functionBody(context, "async fn scan_forktree_operation");
+const combinedScan = functionBody(reader, "async fn scan_combined_view");
+const overlayMerge = functionBody(reader, "fn merge_current_overlay");
 const snapshotProjection = functionBody(entity, "async fn canonical_snapshot_projection");
 const primaryKeyProjection = functionBody(entity, "async fn canonical_primary_key_projection");
 
@@ -56,12 +60,14 @@ function check(name, pass, detail) {
 // Some(false)/Some(true) are narrower modes only when the public reader
 // contract exposes them; this verifier records both independently.
 const hasCombinedSelector =
+  /None\s*=>\s*scan_combined_view/.test(scanView) ||
   /untracked\s*==\s*None/.test(scanView) ||
   /untracked\s*\.is_none\s*\(\)/.test(scanView) ||
-  /LiveStateReadDomain::Combined/.test(reader + context);
+  /LiveStateReadDomain::Combined/.test(domainContract + context);
 const combinesTrackedAndUntracked =
-  /state_range\s*\(/.test(scanView) && /scan_untracked_rows\s*\(\)/.test(scanView) &&
-  /(overlay|precedence|identity|merge|dedup|duplicate)/i.test(scanView);
+  /scan_tracked_view\s*\(/.test(combinedScan) &&
+  /scan_untracked_view\s*\(/.test(combinedScan) &&
+  /merge_current_overlay\s*\(/.test(combinedScan);
 check(
   "untracked=None complete overlay",
   hasCombinedSelector && combinesTrackedAndUntracked,
@@ -72,8 +78,8 @@ const hasTrackedOnlyMode =
   /LiveStateReadDomain::Tracked/.test(domainContract) &&
   !/untracked\s*==\s*Some\(false\)[\s\S]{0,240}unsupported/.test(scanView);
 const hasUntrackedOnlyMode =
-  /untracked\s*==\s*Some\(true\)/.test(scanView) &&
-  /scan_untracked_view/.test(scanView);
+  /Some\(true\)\s*=>\s*scan_untracked_view/.test(scanView) ||
+  (/untracked\s*==\s*Some\(true\)/.test(scanView) && /scan_untracked_view/.test(scanView));
 check(
   "explicit tracked-only mode",
   hasTrackedOnlyMode,
@@ -86,13 +92,22 @@ check(
 );
 
 const overlaySemantics =
-  /(untracked|tracked)/i.test(scanView) &&
-  /(deleted|tombstone)/i.test(scanView) &&
-  /(identity|precedence|overlay|dedup|duplicate)/i.test(scanView);
+  /(untracked|tracked)/i.test(combinedScan) &&
+  /(deleted|tombstone)/i.test(combinedScan) &&
+  /(identity|precedence|overlay|dedup|duplicate)/i.test(combinedScan + overlayMerge);
 check(
   "untracked replacement/tombstone precedence",
   combinesTrackedAndUntracked && overlaySemantics,
   "same canonical batch must resolve branch/global and tracked/untracked identity winners before projection",
+);
+
+const crossStreamReplacement =
+  /for row in tracked[\s\S]*for row in untracked[\s\S]*\.insert\(/.test(overlayMerge) &&
+  /BTreeMap/.test(reader);
+check(
+  "cross-stream same-key replacement is allowed",
+  crossStreamReplacement,
+  "tracked and untracked candidates may intentionally share one logical key; untracked precedence is resolved explicitly",
 );
 
 const orderingAndProjection =
@@ -106,14 +121,30 @@ check(
   orderingAndProjection ? "terminal projections and identity filters remain present" : "ordering/projection/LIMIT evidence is incomplete",
 );
 
-const corruptionAndDuplicates =
-  /decode_state_key\s*\(/.test(scanView) &&
-  /decode_untracked_key|decode_untracked_value/.test(reader) &&
-  /(duplicate|conflict|ambiguous|corrupt)/i.test(scanView + reader);
+const corruption =
+  /decode_state_key\s*\(/.test(reader) &&
+  /decode_untracked_key|decode_untracked_value/.test(view) &&
+  /\?/.test(reader + view);
 check(
-  "duplicate/corruption fail-closed",
-  corruptionAndDuplicates,
-  "both typed domains must decode under one view and reject duplicate/conflicting identity authority",
+  "malformed state fails closed",
+  corruption,
+  "both typed domains decode through fallible authenticated codecs",
+);
+
+const sameStreamDuplicateGuard =
+  /(duplicate|conflict|ambiguous|unique)/i.test(combinedScan + overlayMerge) &&
+  /(Result<|contains_key|Entry::Occupied|is_some\s*\(\)|return\s+Err)/.test(
+    combinedScan + overlayMerge,
+  );
+check(
+  "duplicate tracked logical key fails closed",
+  sameStreamDuplicateGuard,
+  "one authenticated tracked stream must reject duplicate/conflicting logical identities",
+);
+check(
+  "duplicate untracked logical key fails closed",
+  sameStreamDuplicateGuard,
+  "one authenticated untracked stream must reject duplicate/conflicting logical identities",
 );
 
 const oneView =
