@@ -1,0 +1,8 @@
+TARGET head=9f3c703e953440cde1d60b1511467c4337648c8f tree=51a0026c0c3eced6fdaa5e5ed4824111377f086c
+CONTROL-01 explicit untracked/constraint/rows=None guard is present
+RED-01 derived/history schema reaches current-state filtering and may return Ok(empty)
+RED-02 mixed/complex schema request has no boundary rejection and may return partial/empty current rows
+RED-03 load_exact_batch lowers derived rows through scan_batch and maps empty to None
+RED-04 load_exact_batch transitively acquires BranchHeadControlContext through scan_scope
+RED-05 load_exact_batch directly acquires TrackedHead through load_projected_live_batch_refs_for_domain
+ORACLE_STATUS=RED
