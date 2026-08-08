@@ -5,9 +5,11 @@ use bytes::Bytes;
 
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
-    ReadOptions, ScanOrder, Storage, StorageError,
+    ReadOptions, ScanOrder, Storage, StorageError, WriteOptions,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
+use crate::storage_adapter::{
+    StorageAdapterRead, StorageAdapterReadScope, StorageWriteSet, StorageWriteSetError,
+};
 
 use super::blob::authenticate_open_upload_progress;
 use super::codec::{corruption, keyed_hash};
@@ -24,6 +26,7 @@ use super::model::{
     gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_domain};
+use super::publication::PreparedPublication;
 use super::serving::{validate_retained_commit, validate_retained_ref_change};
 use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
 use super::tree::ordered_tree_edges;
@@ -105,8 +108,8 @@ impl SweepBatch {
         Ok(())
     }
 
-    fn keys(&self) -> impl Iterator<Item = Key> + '_ {
-        self.private.object_ids.iter().copied().map(object_key)
+    fn ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.private.object_ids.iter().copied()
     }
 
     fn len(&self) -> usize {
@@ -121,30 +124,62 @@ impl SweepBatch {
 /// orphan set survives the call in memory. The persisted maintenance graph is
 /// rebuildable and is never consulted by serving reads.
 pub(crate) async fn advance_gc<S>(
-    _storage: &S,
-    _budget: GcBudget,
+    storage: &S,
+    budget: GcBudget,
 ) -> Result<GcStepStatus, StorageError>
 where
     S: Storage,
 {
-    Err(StorageError::Io(
-        "ForkTree GC publication is deferred until its transaction-owned plan lowering wave"
-            .to_string(),
-    ))
+    let snapshot = load_gc_snapshot(storage).await?;
+    let Some(mut progress) = snapshot.progress.clone() else {
+        return start_cycle(storage, snapshot).await;
+    };
+    match progress.phase {
+        GcPhaseV2::RootSelectors => advance_selector_roots(storage, snapshot, &mut progress).await,
+        GcPhaseV2::RootUntracked => advance_untracked_roots(storage, snapshot, &mut progress).await,
+        GcPhaseV2::Traverse => advance_traversal(storage, snapshot, &mut progress, budget).await,
+        GcPhaseV2::Sweep => advance_sweep(storage, snapshot, &mut progress, budget).await,
+        GcPhaseV2::Cleanup => advance_cleanup(storage, snapshot, &mut progress, budget).await,
+    }
 }
 
 /// Removes only a malformed GC selector/progress edge under the exact current
 /// global epoch. It never accepts semantic object IDs and cannot stage a
 /// semantic deletion. Orphaned maintenance objects are reclaimed by a later
 /// complete cycle.
-pub(crate) async fn abort_corrupt_gc<S>(_storage: &S) -> Result<GcStepStatus, StorageError>
+pub(crate) async fn abort_corrupt_gc<S>(storage: &S) -> Result<GcStepStatus, StorageError>
 where
     S: Storage,
 {
-    Err(StorageError::Io(
-        "ForkTree corrupt-GC retirement is deferred until its transaction-owned plan lowering wave"
-            .to_string(),
-    ))
+    let read = StorageAdapterReadScope::new(storage.begin_read(ReadOptions::default()).await?);
+    let keys = [Key(global_selector_key()), Key(gc_progress_selector_key())];
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    if loaded.values.len() != keys.len() {
+        return Err(corruption(
+            "GC selector recovery read has invalid cardinality",
+        ));
+    }
+    let raw_global = required_full(loaded.values[0].clone(), "global selector is absent")?;
+    let global = GlobalSelectorV1::decode(&raw_global)?;
+    let raw_progress = match loaded.values[1].clone() {
+        None => return Err(corruption("GC progress selector is absent")),
+        Some(ProjectedValue::FullValue(bytes)) => bytes,
+        Some(ProjectedValue::KeyOnly) => {
+            return Err(corruption("GC selector recovery returned key-only data"));
+        }
+    };
+    let mut publication = PreparedPublication::from_global_selector_claim(raw_global, global)?;
+    publication.stage_gc_progress_selector(Some(raw_progress), None)?;
+    commit_publication_plan(storage, publication).await?;
+    Ok(GcStepStatus::AbortedCorruptProgress)
 }
 
 async fn load_gc_snapshot<S>(
@@ -287,7 +322,7 @@ where
     let progress = GcProgressV2 {
         cycle_id,
         phase: GcPhaseV2::RootSelectors,
-        expected_global_digest: [1; 32],
+        expected_global_digest: global_digest(&snapshot.raw_global),
         expected_global_epoch: snapshot.global.epoch,
         selector_resume_after: None,
         untracked_resume_after: None,
@@ -1241,21 +1276,73 @@ where
 }
 
 async fn commit_progress<S, R>(
-    _storage: &S,
-    _snapshot: GcSnapshot<R>,
-    _progress: GcProgressV2,
-    _edit: MaintenanceEdit,
-    _sweep: SweepBatch,
-    _finish: bool,
+    storage: &S,
+    snapshot: GcSnapshot<R>,
+    mut progress: GcProgressV2,
+    edit: MaintenanceEdit,
+    sweep: SweepBatch,
+    finish: bool,
 ) -> Result<(), StorageError>
 where
     S: Storage,
     R: StorageAdapterRead,
 {
-    Err(StorageError::Io(
-        "ForkTree reachability publication is deferred until its transaction-owned plan lowering wave"
-            .to_string(),
-    ))
+    let mut publication =
+        PreparedPublication::from_global_selector_claim(snapshot.raw_global, snapshot.global)?;
+    for (id, bytes) in edit.puts() {
+        publication.stage_gc_object_put(id, bytes.clone())?;
+    }
+    for id in edit.deletes().chain(sweep.ids()) {
+        publication.stage_gc_object_delete(id)?;
+    }
+    if finish {
+        publication.stage_gc_progress_selector(snapshot.raw_progress_selector, None)?;
+    } else {
+        let next_global = snapshot.global.rotated()?;
+        let next_global_bytes = next_global.encode()?;
+        progress.expected_global_digest = global_digest(&next_global_bytes);
+        progress.expected_global_epoch = next_global.epoch;
+        let (progress_id, progress_bytes) = progress.encode()?;
+        publication.stage_gc_object_put(progress_id, progress_bytes)?;
+        let selector = GcProgressSelectorV2 {
+            cycle_id: progress.cycle_id,
+            progress_object_id: progress_id,
+            selector_generation: snapshot
+                .global
+                .selector_generation
+                .checked_add(1)
+                .ok_or_else(|| corruption("GC selector generation overflowed"))?,
+        }
+        .encode()?;
+        publication.stage_gc_progress_selector(snapshot.raw_progress_selector, Some(selector))?;
+    }
+    commit_publication_plan(storage, publication).await
+}
+
+async fn commit_publication_plan<S>(
+    storage: &S,
+    publication: PreparedPublication,
+) -> Result<(), StorageError>
+where
+    S: Storage,
+{
+    let (writes, preconditions) = publication
+        .into_storage_plan()
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    StorageWriteSet::commit(
+        writes,
+        storage,
+        WriteOptions {
+            preconditions,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| match error {
+        StorageWriteSetError::Storage(error) => error,
+        error => StorageError::Io(error.to_string()),
+    })
 }
 
 fn maintenance_cycle(
