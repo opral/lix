@@ -2,12 +2,19 @@
 
 Status: **TEST/REPORT-ONLY; UNRUN**.
 
-This package freezes a deterministic SQLite-shaped OLTP target against the
-accepted ForkTree historical semantics at
+This package freezes a deterministic standalone SQLite 3.46.0 OLTP control and
+an equivalent target against the accepted ForkTree historical semantics at
 `b59e1f11a51153e0a787a81f0f25bf104d150aaf`. It is a hypothesis package, not a
-SQLite implementation, benchmark result, qualification, or production
-change. No current-main comparison is implied and no SQLite adapter/runtime
-is claimed.
+benchmark result, qualification, or production change. The SQLite control is
+not a Lix adapter and owns no ForkTree state, history, authentication,
+publication, selector, or epoch. No current-main comparison is implied.
+
+The standalone control is pinned to bundled `libsqlite3-sys 0.30.1`, SQLite
+`3.46.0`, source ID
+`2024-05-23 13:25:27 96c92aba00c8375bc32fafcdf12429c58bd8aabfcadab6683e35bbb9cdebf19e`,
+and the exact source/archive/static-artifact hashes in `MANIFEST.json`. The
+future executable hash is not fabricated: it must be recorded by the compile
+gate before any runtime cell.
 
 ## Immutable binding
 
@@ -36,6 +43,29 @@ functions:
 
 The package must never add a SQLite-side authority, historical fallback,
 whole-table rebuild, compatibility reader, or second publication path.
+
+## Standalone SQLite control boundary
+
+The SQLite control uses a fresh file per cell, the pinned bundled core, and
+these exact setup statements before seeding:
+
+```sql
+PRAGMA journal_mode = DELETE;
+PRAGMA synchronous = FULL;
+PRAGMA foreign_keys = ON;
+PRAGMA recursive_triggers = OFF;
+PRAGMA temp_store = MEMORY;
+PRAGMA locking_mode = NORMAL;
+PRAGMA busy_timeout = 0;
+```
+
+Write cells use `BEGIN IMMEDIATE`, named savepoints where specified, and a
+plain `COMMIT`. No SQLite `RETURNING` result is attached to `COMMIT`; each DML
+statement carries its own `RETURNING` clause. The control reports SQLite
+planning, execution, row materialization, file I/O, and transaction costs
+separately from ForkTree authentication, coherent-view, path-copy, selector,
+epoch, and publication counters. It never supplies a history/VC result to
+ForkTree or treats SQLite bytes as a comparable authority.
 
 ## Deterministic fixture
 
@@ -97,7 +127,7 @@ typed semantics.
 | `update-256-returning` | Seed state; update `r000000..r000255`, increment `version`, replace `value`, `RETURNING` all updated rows | 256 updates and 256 exact RETURNING rows |
 | `delete-128-returning` | Seed state; delete `r000256..r000383` with `RETURNING id,value,version,nullable` | 128 deletes and 128 exact pre-delete RETURNING rows |
 | `upsert-256-returning` | Seed state; 128 conflicting IDs `r000320..r000447` and 128 new IDs `r001000..r001127` through `ON CONFLICT(id) DO UPDATE`, `RETURNING` | 256 upsert inputs, 128 updates, 128 inserts, 256 exact RETURNING rows |
-| `mixed-savepoint` | Seed state; `BEGIN`, savepoint; stage 8 mutations then `ROLLBACK TO`; stage 64 inserts, 64 updates, 32 deletes, 32 upserts; `COMMIT ... RETURNING` | Rolled-back mutations have zero durable/result effect; committed cohort has 160 successful mutations and deterministic RETURNING order |
+| `mixed-savepoint` | Seed state; `BEGIN IMMEDIATE`, savepoint; stage 8 mutations then `ROLLBACK TO`; stage 64 inserts, 64 updates, 32 deletes, 32 upserts, each DML statement with `RETURNING`; `RELEASE` and plain `COMMIT` | Rolled-back mutations have zero durable/result effect; committed cohort has 192 successful mutations and 192 canonicalized RETURNING rows |
 | `overlay-precedence` | Open the separate overlay branch and point/range read the three control identities plus ordinary global rows | Local value wins, tombstone suppresses, NULL remains a value, global rows fall through, ordered output is deterministic |
 | `historical-fail-closed` | Against the seed commit, query an absent row, then independently remove/malformed-substitute the CommitCatalog entry, selected state root, and selected object kind | Absent row is `absent` only after authenticated roots; each damaged authority returns typed failure with zero fallback/retry/write |
 
@@ -106,6 +136,12 @@ mutation source, one `PreparedPublication`, one storage plan, one prepared
 write set, one backend commit, and one selector+epoch CAS. The target may
 report additional physical object puts from path copying, but never an
 independent commit or legacy tracked-head write.
+
+Every DML RETURNING stream is canonicalized before digest comparison by
+`(statement_index, primary_key_bytes)`. This is required because SQLite does
+not guarantee the physical order in which RETURNING rows are emitted. The
+ForkTree target must compare the same canonical stream, not incidental engine
+arrival order.
 
 ## Exact counters and reopen contract
 
@@ -142,6 +178,31 @@ Non-negotiable exact invariants are:
 Resource numbers are measured, not invented. The package freezes the exact
 counter schema and zero/one constraints; it does not claim a performance win
 before the authorized run.
+
+## Quantitative ceilings, targets, and guardrails
+
+The first report must compare each target cell with its named baseline and
+publish both measured work and the perfect call-elimination ceiling. The
+ceilings are not wall-time promises:
+
+* if the point baseline acquires one coherent view per operation,
+  `point-1000` has a snapshot-call ceiling of `(1000-1)/1000 = 99.9%` with a
+  one-view target;
+* if the mixed baseline commits one mutation at a time, the corrected
+  `mixed-savepoint` cohort has a commit-call ceiling of `(192-1)/192 =
+  99.479%` with one backend commit;
+* fallback, retry, legacy-read/write, and cache-refresh elimination is exactly
+  100% because the target count is zero; any nonzero count is a correctness
+  blocker;
+* range work must publish baseline and target scan rows/bytes, with measured
+  elimination `1 - target_authenticated_scan_work / baseline_scan_work`.
+
+A candidate experiment is meaningful only with **at least 10%** improvement in
+the targeted wall time, CPU, allocation, backend work, or settled disk measure.
+No primary guardrail may regress by more than **5%** in point/range latency,
+CPU, allocations, RSS, backend calls/keys/bytes, writes, settled disk, digest,
+or cold reopen on either RocksDB or SlateDB. Exact digest or authority failure
+overrides any performance win.
 
 ## Focused optimization hypotheses
 
