@@ -615,6 +615,7 @@ impl MaterializedTrackedStateBatchBuilder {
     }
 }
 
+#[cfg(test)]
 async fn materialize_index_payloads<'a, S>(
     store: &S,
     entries: impl Iterator<Item = (TrackedStateKeyRef<'a>, &'a TrackedStateIndexValue)>,
@@ -679,6 +680,7 @@ where
 /// routes exact identities to those packed deltas and retains the decoded
 /// records through JSON materialization; there is no global changelog
 /// fallback.
+#[cfg(test)]
 pub(crate) async fn materialize_batch_from_index_entries<S>(
     store: &S,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
@@ -743,6 +745,7 @@ where
 /// The caller retains one compact key-reference column through the async
 /// lookup. Identity strings are copied only when first inserted into the
 /// materialized batch dictionary, never once per requested row.
+#[cfg(test)]
 pub(crate) async fn materialize_batch_from_index_entry_refs<'a, S>(
     store: &S,
     entries: Vec<(TrackedStateKeyRef<'a>, TrackedStateIndexValue)>,

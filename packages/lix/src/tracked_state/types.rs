@@ -326,23 +326,6 @@ pub(crate) struct CurrentStatePartDescriptor {
     pub(crate) uniform_updated_at: LixTimestamp,
 }
 
-/// Manifest-attested root of the unified scope/part serving tree.
-///
-/// The generic tree owns only authenticated physical routing. These fields
-/// bind one result root to the physical serving base and certified mutation
-/// authority that produced it. Graph ancestry remains an independent semantic
-/// relationship and is not exposed to the tree.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CurrentStateScopedRangeRoot {
-    pub(crate) tree: super::scoped_range::ScopedRangeRoot,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) serving_base_commit_id: Option<CommitId>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) serving_base_root_id: Option<[u8; 32]>,
-    pub(crate) transition_digest: [u8; 32],
-}
-
 /// Cumulative negative-membership certificate for collection scopes.
 ///
 /// A complete filter may have false positives, but never false negatives: a
@@ -453,8 +436,6 @@ pub(crate) struct CommitStateManifest {
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
     /// Canonical snapshot metadata when this commit was published as a root
     /// fence. The tree chunks are rebuildable by content hash; this immutable
     /// pointer is the authority that permits readers to serve them.

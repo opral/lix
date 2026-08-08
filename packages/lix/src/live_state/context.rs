@@ -3,13 +3,11 @@
 use crate::LixError;
 #[cfg(test)]
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
-use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::commit_graph::CommitGraphContext;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
 };
-use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
@@ -20,10 +18,8 @@ use crate::tracked_state::TrackedStateContext;
 #[cfg(test)]
 use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns};
 use async_trait::async_trait;
+#[cfg(test)]
 use std::sync::Mutex as StdMutex;
-
-const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
-type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
 /// Transaction-local branch publication controls.
 ///
@@ -33,10 +29,7 @@ type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 /// creation rotates that revision and therefore conflicts with the pinned
 /// transaction before commit.
 #[derive(Default)]
-pub(crate) struct BranchHeadControlCache {
-    controls: StdMutex<std::collections::BTreeMap<String, Option<BranchHeadControl>>>,
-    hot_state: std::sync::Arc<HotStateTransactionCache>,
-}
+pub(crate) struct BranchHeadControlCache;
 
 /// Serving facade for visible live-state reads.
 ///
@@ -44,7 +37,6 @@ pub(crate) struct BranchHeadControlCache {
 /// carries its own tracked|untracked retention, so readers do not route
 /// through a separate retention index or merge retention candidates.
 pub(crate) struct LiveStateContext {
-    tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
@@ -55,7 +47,6 @@ impl LiveStateContext {
         commit_graph: CommitGraphContext,
     ) -> Self {
         Self {
-            tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
         }
@@ -68,10 +59,8 @@ impl LiveStateContext {
     {
         LiveStateStoreReader {
             store,
-            tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            branch_head_control_cache: None,
         }
     }
 
@@ -80,17 +69,15 @@ impl LiveStateContext {
     pub(crate) fn transaction_reader<S>(
         &self,
         store: S,
-        branch_head_control_cache: std::sync::Arc<BranchHeadControlCache>,
+        _branch_head_control_cache: std::sync::Arc<BranchHeadControlCache>,
     ) -> LiveStateStoreReader<S>
     where
         S: StorageAdapterRead,
     {
         LiveStateStoreReader {
             store,
-            tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            branch_head_control_cache: Some(branch_head_control_cache),
         }
     }
 
@@ -103,10 +90,8 @@ impl LiveStateContext {
     {
         LiveStateStoreReader {
             store,
-            tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
-            branch_head_control_cache: None,
         }
     }
 
@@ -124,10 +109,8 @@ impl LiveStateContext {
 /// Visible live-state reader backed by a caller-provided KV store.
 pub(crate) struct LiveStateStoreReader<S> {
     store: S,
-    tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
-    branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
 }
 
 impl<S> LiveStateStoreReader<S>
@@ -222,23 +205,13 @@ where
 
     async fn collection_generation(
         &self,
-        branch_id: &str,
-        scope: crate::collection_generation::CollectionScopeRef<'_>,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        let controls = load_branch_head_controls(
-            &self.store,
-            &[branch_id.to_owned()],
-            self.branch_head_control_cache.as_deref(),
-        )
-        .await?;
-        let Some(control) = controls.get(branch_id).copied() else {
-            return Ok(None);
-        };
-        self.tracked_head
-            .reader(&self.store)
-            .collection_generation(branch_id, control.untracked_generation, scope)
-            .await
-            .map(Some)
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "collection generation is deferred until its ForkTree publication owner is lowered",
+        ))
     }
 
     async fn scan_tracked_batch(
@@ -278,75 +251,6 @@ where
             .filesystem_path_index_cache
             .insert(request, revision.as_deref(), index))
     }
-}
-
-/// Loads branch-head controls without touching the mutable live-state index. A
-/// nonempty request is point-read; the empty request is the explicit
-/// all-branches scan used only by broad scans.
-async fn load_branch_head_controls(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_ids: &[String],
-    cache: Option<&BranchHeadControlCache>,
-) -> Result<BranchHeads, LixError> {
-    let reader = BranchHeadControlContext::new().reader(store);
-    if branch_ids.is_empty() {
-        return Ok(reader.scan().await?.into_iter().collect());
-    }
-    let Some(cache) = cache else {
-        let controls = reader.load_many(branch_ids).await?;
-        return Ok(branch_ids
-            .iter()
-            .cloned()
-            .zip(controls)
-            .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
-            .collect());
-    };
-    let missing = {
-        let controls = cache.controls.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "transaction branch-head control cache lock is poisoned",
-            )
-        })?;
-        branch_ids
-            .iter()
-            .filter(|branch_id| !controls.contains_key(*branch_id))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    let mut loaded_by_branch = std::collections::BTreeMap::new();
-    if !missing.is_empty() {
-        let loaded = reader.load_many(&missing).await?;
-        let mut controls = cache.controls.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "transaction branch-head control cache lock is poisoned",
-            )
-        })?;
-        for (branch_id, control) in missing.into_iter().zip(loaded) {
-            if controls.len() < TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
-                controls.entry(branch_id.clone()).or_insert(control);
-            }
-            loaded_by_branch.insert(branch_id, control);
-        }
-    }
-    let controls = cache.controls.lock().map_err(|_| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "transaction branch-head control cache lock is poisoned",
-        )
-    })?;
-    Ok(branch_ids
-        .iter()
-        .filter_map(|branch_id| {
-            controls
-                .get(branch_id)
-                .copied()
-                .or_else(|| loaded_by_branch.get(branch_id).copied())
-                .flatten()
-                .map(|control| (branch_id.clone(), control))
-        })
-        .collect())
 }
 
 #[cfg(test)]

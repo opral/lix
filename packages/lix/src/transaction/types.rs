@@ -16,7 +16,7 @@ use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance,
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
-use crate::tracked_state::{OrderedAddressableCommitDeltaStage, TrackedStateDiffIdentity};
+use crate::tracked_state::TrackedStateDiffIdentity;
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -708,7 +708,6 @@ impl CertifiedParameterBatch {
                 commit_id: None,
                 branch_id: branch_id_ordinal,
                 untracked,
-                direct_change_ids: None,
             }),
             entity_pks,
             strings,
@@ -2795,9 +2794,6 @@ struct DenseCertifiedParameterSlots {
     commit_id: Option<CommitId>,
     branch_id: u32,
     untracked: bool,
-    /// Absent until commit-delta publication assigns direct addresses. The
-    /// compact segment map derives every UUID without a million-row column.
-    direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
 }
 
 #[derive(Debug, Clone)]
@@ -3063,14 +3059,7 @@ impl PreparedStateBatch {
                 created_at: dense.timestamps.get(index),
                 updated_at: dense.timestamps.get(index),
                 global: false,
-                change_id: Some(dense.direct_change_ids.as_ref().map_or_else(
-                    ChangeId::default,
-                    |assignment| {
-                        assignment
-                            .change_id_at(index)
-                            .expect("dense direct change assignment covers every row")
-                    },
-                )),
+                change_id: Some(ChangeId::default()),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
                 untracked: dense.untracked,
@@ -3271,14 +3260,7 @@ impl PreparedStateBatch {
                 created_at: dense.timestamps.get(row_index),
                 updated_at: dense.timestamps.get(row_index),
                 global: false,
-                change_id: Some(dense.direct_change_ids.as_ref().map_or_else(
-                    ChangeId::default,
-                    |assignment| {
-                        assignment
-                            .change_id_at(row_index)
-                            .expect("dense direct change assignment covers every row")
-                    },
-                )),
+                change_id: Some(ChangeId::default()),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
                 untracked: false,
@@ -3328,8 +3310,6 @@ impl PreparedStateBatch {
                         == other.strings[right.branch_id as usize]
                     && same_origin_key
                     && left.commit_id == right.commit_id
-                    && left.direct_change_ids.is_none()
-                    && right.direct_change_ids.is_none()
                     && self.durable_predecessors.is_empty()
                     && other.durable_predecessors.is_empty()
                     && self.origins.is_empty()
@@ -3562,33 +3542,6 @@ impl PreparedStateBatch {
     pub(crate) fn set_change_id(&mut self, index: usize, change_id: Option<ChangeId>) {
         self.expand_dense_certified_parameter();
         self.slots[index].change_id = change_id;
-    }
-
-    pub(crate) fn set_ordered_addressable_change_ids(
-        &mut self,
-        row_indices: &[usize],
-        assignment: OrderedAddressableCommitDeltaStage,
-    ) -> Result<(), LixError> {
-        if assignment.row_count() != row_indices.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "ordered commit-delta assignment count changed during staging",
-            ));
-        }
-        if let Some(dense) = &mut self.dense_certified_parameter
-            && row_indices.len() == dense.len
-            && row_indices
-                .iter()
-                .enumerate()
-                .all(|(index, &row_index)| index == row_index)
-        {
-            dense.direct_change_ids = Some(assignment);
-            return Ok(());
-        }
-        for (&row_index, change_id) in row_indices.iter().zip(assignment.assigned_change_ids()) {
-            self.set_change_id(row_index, Some(change_id));
-        }
-        Ok(())
     }
 
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {

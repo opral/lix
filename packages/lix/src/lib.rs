@@ -80,6 +80,7 @@ pub mod storage_bench;
 pub(crate) mod storage_codec;
 pub mod telemetry;
 #[cfg(any(test, feature = "storage-benches"))]
+#[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(feature = "storage-benches")]
 pub mod tracked_state;

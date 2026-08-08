@@ -7,9 +7,7 @@ mod merge;
 mod row_materialization;
 mod types;
 
-pub(crate) use context::{
-    TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
-};
+pub(crate) use context::{TrackedStateContext, descriptor_dependency_cascade_file_ids};
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
@@ -21,8 +19,7 @@ pub(crate) use merge::{
 };
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
-    MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
-    materialize_batch_from_index_entry_refs,
+    MaterializedTrackedStateRowRef,
 };
 pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};

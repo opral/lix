@@ -11,7 +11,6 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::LixError;
-use crate::binary_cas::BlobId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -38,14 +37,6 @@ const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::engine_declar
 );
 const FILESYSTEM_PATH_REVISION_KEY: &[u8] = b"global";
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_EAGER_BLOB_BYTES: usize = 32 * 1024;
-const MAX_EAGER_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
-
-fn reserve_eager_blob_cache_bytes(reserved: usize, size: usize) -> Option<usize> {
-    reserved
-        .checked_add(size)
-        .filter(|total| *total <= MAX_EAGER_BLOB_CACHE_BYTES)
-}
 
 #[cfg(test)]
 static FULL_REBUILD_BUILDS: AtomicUsize = AtomicUsize::new(0);
@@ -573,80 +564,13 @@ impl FilesystemPathIndex {
     /// built. The manifest lookup is one batch for the whole view, so exact
     /// file reads do not pay another storage round trip after path selection.
     pub(crate) async fn hydrate_small_blob_data(
-        mut self,
-        store: &impl StorageAdapterRead,
+        self,
+        _store: &impl StorageAdapterRead,
     ) -> Result<Self, LixError> {
-        let mut requests =
-            BTreeMap::<String, (BlobId, usize, Vec<Arc<FilesystemPathEntry>>)>::new();
-        let mut reserved_cache_bytes = 0usize;
-        for entry in self.entries() {
-            let Some(row) = entry.blob_ref.as_ref() else {
-                continue;
-            };
-            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-                continue;
-            };
-            let snapshot: BlobRefSnapshot =
-                serde_json::from_str(snapshot_content).map_err(|error| {
-                    LixError::unknown(format!(
-                        "invalid lix_binary_blob_ref snapshot JSON: {error}"
-                    ))
-                })?;
-            let size_bytes = usize::try_from(snapshot.size_bytes)
-                .map_err(|_| LixError::unknown("lix_binary_blob_ref size_bytes exceeds usize"))?;
-            if size_bytes > MAX_EAGER_BLOB_BYTES {
-                continue;
-            }
-            let Some(next_reserved_cache_bytes) =
-                reserve_eager_blob_cache_bytes(reserved_cache_bytes, size_bytes)
-            else {
-                continue;
-            };
-            let hash = BlobId::from_hex(&snapshot.blob_hash)?;
-            requests
-                .entry(snapshot.blob_hash)
-                .or_insert_with(|| (hash, size_bytes, Vec::new()))
-                .2
-                .push(entry);
-            // Count each projected entry even when several entries share a
-            // blob. This matches estimated_heap_bytes and bounds the complete
-            // cached view rather than only the unique CAS payloads.
-            reserved_cache_bytes = next_reserved_cache_bytes;
-        }
-        if requests.is_empty() {
-            return Ok(self);
-        }
-
-        let hashes = requests
-            .values()
-            .map(|(hash, _, _)| *hash)
-            .collect::<Vec<_>>();
-        let Ok(values) = crate::binary_cas::load_bytes_many(store, &hashes).await else {
-            return Ok(self);
-        };
-        let values = values.into_vec();
-        if values.len() != requests.len() {
-            return Err(LixError::unknown(format!(
-                "binary CAS returned {} values for {} path-index blobs",
-                values.len(),
-                requests.len()
-            )));
-        }
-        for ((_, (hash, size_bytes, entries)), data) in requests.into_iter().zip(values) {
-            let Some(data) = data else {
-                continue;
-            };
-            if data.len() != size_bytes || BlobId::from_content(&data) != hash {
-                continue;
-            }
-            let data = crate::Blob::from(data);
-            for entry in entries {
-                let mut hydrated = (*entry).clone();
-                hydrated.cached_blob_data = Some(data.clone());
-                self.insert_entry(Arc::new(hydrated));
-            }
-        }
-        Ok(self)
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "path-index blob hydration is deferred until authenticated ForkTree BlobRef serving is lowered",
+        ))
     }
 
     /// Applies committed descriptor rows by path-copying only the affected AVL
@@ -1456,12 +1380,6 @@ struct FileSnapshot {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct BlobRefSnapshot {
-    blob_hash: String,
-    size_bytes: u64,
-}
-
 #[derive(Debug)]
 struct DirectoryRecord {
     key: FilesystemDescriptorKey,
@@ -1547,19 +1465,6 @@ mod tests {
         ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             unreachable!("path-index construction only scans live state")
         }
-    }
-
-    #[test]
-    fn eager_blob_hydration_has_an_aggregate_cache_budget() {
-        assert_eq!(
-            reserve_eager_blob_cache_bytes(MAX_EAGER_BLOB_CACHE_BYTES - 1, 1),
-            Some(MAX_EAGER_BLOB_CACHE_BYTES)
-        );
-        assert_eq!(
-            reserve_eager_blob_cache_bytes(MAX_EAGER_BLOB_CACHE_BYTES, 1),
-            None
-        );
-        assert_eq!(reserve_eager_blob_cache_bytes(usize::MAX, 1), None);
     }
 
     #[tokio::test]

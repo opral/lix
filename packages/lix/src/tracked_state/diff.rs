@@ -9,12 +9,21 @@ use std::sync::{Arc, OnceLock};
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
-use crate::tracked_state::codec::DecodedTrackedStateKeyShared;
+use crate::tracked_state::TrackedStateFilter;
+#[cfg(test)]
+use crate::tracked_state::TrackedStateStoreReader;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest,
 };
-use crate::tracked_state::{TrackedStateFilter, TrackedStateStoreReader};
+
+#[derive(Clone)]
+struct DecodedTrackedStateKeyShared {
+    schema_key: SharedStr,
+    file_id: Option<SharedStr>,
+    entity_pk: EntityPk,
+}
 
 /// Filter for comparing two tracked-state commit roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +355,7 @@ impl TrackedStateDiff {
 /// reachability, inherited creation time, and absence of omitted unchanged
 /// rows belong to the explicit full-root integrity audit; proving those here
 /// would make sparse diff O(total rows).
+#[cfg(test)]
 pub(crate) async fn diff_commits<S>(
     reader: &mut TrackedStateStoreReader<S>,
     left_commit_id: &str,

@@ -309,7 +309,12 @@ where
     /// heads restore content-addressed chunks only after their immutable root
     /// metadata passes a full changelog coverage audit. Rootless heads receive
     /// the same audit transiently and remain bounded-replay layouts.
-    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
+    pub async fn rebuild_tracked_state_for_branch(&self, _branch_id: &str) -> Result<(), LixError> {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "tracked-state root rebuild is removed until its ForkTree publication owner is lowered",
+        ));
+        /*
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
             .await?
@@ -362,6 +367,7 @@ where
             .await
             .map(|_| ())
             .map_err(LixError::from)
+        */
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {

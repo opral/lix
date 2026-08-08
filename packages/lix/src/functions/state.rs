@@ -1,24 +1,11 @@
-use serde_json::Value as JsonValue;
-use std::sync::Arc;
-
-use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::branch::{
-    BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
-    untracked_lifecycle_generation,
-};
-use crate::changelog::{ChangeId, ChangeRecordProjection};
-use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::NullableKeyFilter;
+use crate::commit_graph::CommitGraphContext;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::json_store::{
-    JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
-};
-use crate::live_state::{
-    CurrentStateDeltaRef, LiveStateReadDomain, MaterializedLiveStateRow, TrackedHeadContext,
-};
+use crate::live_state::{LiveStateContext, LiveStateRowRequest, MaterializedLiveStateRow};
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
+use crate::tracked_state::TrackedStateContext;
+use serde_json::Value as JsonValue;
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 pub(crate) const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -60,143 +47,31 @@ pub(crate) async fn load_sequence(
 /// The row is untracked global `lix_key_value` current state. It never enters
 /// the changelog or commit graph.
 pub(crate) async fn stage_sequence(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    sequence: DeterministicSequence,
-    timestamp: LixTimestamp,
-    _change_id: ChangeId,
+    _read: &(impl StorageAdapterRead + ?Sized),
+    _writes: &mut StorageWriteSet,
+    _sequence: DeterministicSequence,
+    _timestamp: crate::common::LixTimestamp,
+    _change_id: crate::changelog::ChangeId,
 ) -> Result<StoragePrecondition, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "key": DETERMINISTIC_SEQUENCE_KEY,
-        "value": sequence.highest_seen,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("deterministic sequence snapshot serialization failed: {error}"),
-        )
-    })?;
-    let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
-    let entity_pk = EntityPk::single(DETERMINISTIC_SEQUENCE_KEY);
-    let mut observations = BranchHeadControlContext::new()
-        .reader(read)
-        .load_observed(&[GLOBAL_BRANCH_ID.to_string()])
-        .await?;
-    let observation = observations.pop().expect("one global control observation");
-    let control = observation.control.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "global branch control is missing while staging deterministic state",
-        )
-    })?;
-    JsonStoreContext::new().writer().stage_batch(
-        writes,
-        JsonWritePlacementRef::OutOfBand,
-        [NormalizedJsonRef::from(&snapshot)],
-    )?;
-    let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
-    let next_revision = control
-        .next_current_state_revision()?
-        .current_state_revision;
-    let next_generation = untracked_lifecycle_generation(
-        GLOBAL_BRANCH_ID,
-        control.untracked_generation,
-        next_revision,
-    );
-    TrackedHeadContext::new()
-        .writer(read, writes)
-        .stage_untracked_generation(
-            GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_generation,
-            &[CurrentStateDeltaRef {
-                schema_key: KEY_VALUE_SCHEMA_KEY,
-                file_id: None,
-                entity_pk: &entity_pk,
-                change_id: None,
-                commit_id: None,
-                untracked: true,
-                deleted: false,
-                created_at: timestamp,
-                updated_at: timestamp,
-                snapshot: snapshot_slot.as_ref_slot(),
-                metadata: crate::json_store::JsonSlotRef::None,
-            }],
-            &std::collections::BTreeSet::new(),
-        )
-        .await?;
-    // The hot-state mutation is fenced by an actual control-byte
-    // change. Merely restaging the old control would let two writers both
-    // satisfy the same CAS after the first write, losing one group update.
-    let mut next_control = control;
-    next_control.untracked_generation = next_generation;
-    next_control.current_state_revision = next_revision;
-    next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
-    stage_branch_head_control(writes, GLOBAL_BRANCH_ID, next_control)?;
-    branch_head_control_precondition(GLOBAL_BRANCH_ID, observation.raw_token)
+    Err(LixError::new(
+        LixError::CODE_UNSUPPORTED_SQL,
+        "deterministic sequence publication is deferred until its ForkTree owner is lowered",
+    ))
 }
 
 async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
     key: &str,
 ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-    let Some(control) = BranchHeadControlContext::new()
+    LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
         .reader(read)
-        .load(GLOBAL_BRANCH_ID)
-        .await?
-    else {
-        return Ok(None);
-    };
-    let keys = [TrackedStateKey {
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-        entity_pk: EntityPk::single(key),
-        file_id: None,
-    }];
-    let projection = ChangeRecordProjection {
-        snapshot_content: true,
-        metadata: false,
-    };
-    let reader = TrackedHeadContext::new().reader(read);
-    let key_refs = keys
-        .iter()
-        .map(|key| TrackedStateKeyRef {
-            schema_key: key.schema_key.as_str(),
-            entity_pk: &key.entity_pk,
-            file_id: key.file_id.as_deref(),
+        .load_row(&LiveStateRowRequest {
+            schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+            entity_pk: crate::entity_pk::EntityPk::single(key),
+            file_id: NullableKeyFilter::Null,
         })
-        .collect::<Vec<_>>();
-    let rows = reader
-        .load_projected_live_batch_refs_for_domain(
-            GLOBAL_BRANCH_ID,
-            control,
-            &key_refs,
-            &projection,
-            LiveStateReadDomain::Untracked,
-        )
-        .await?;
-    let Some(row) = rows.row(0) else {
-        reader
-            .validate_exact_collection_closure(
-                GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key: KEY_VALUE_SCHEMA_KEY,
-                    file_id: None,
-                },
-                key_refs[0],
-                LiveStateReadDomain::Untracked,
-                control.current_state_revision == 0,
-            )
-            .await?;
-        return Ok(None);
-    };
-    if !row.untracked() || row.deleted() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("deterministic key-value row '{key}' is not a live untracked authority member"),
-        ));
-    }
-    Ok(Some(row.to_owned()))
+        .await
 }
 
 fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {

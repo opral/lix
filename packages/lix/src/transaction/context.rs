@@ -21,8 +21,8 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
-    BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
+    BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
@@ -54,7 +54,7 @@ use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    StagedLiveStateRows, TrackedHeadContext, overlay_load_exact_batch, overlay_scan_batch,
+    StagedLiveStateRows, overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -4773,35 +4773,9 @@ where
                             let decoded_checkpoint = cold_before.as_ref().and_then(|_| {
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
-                            let mut durable_checkpoint = if decoded_checkpoint.is_none() {
-                                if let Some(checkpoint_blob_hash) = checkpoint_blob_hash {
-                                    crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
-                                        &read,
-                                        &actor_key.branch_id,
-                                        &actor_key.file_id,
-                                        &actor_key.plugin_generation,
-                                        &visible_materialization.semantic_root,
-                                        checkpoint_blob_hash,
-                                    )
-                                    .await?
-                                    .and_then(|checkpoint| {
-                                        Some(DecodedDurablePluginCheckpoint {
-                                            runtime: WasmDurableDocumentCheckpoint::decode(
-                                                &checkpoint.runtime,
-                                            )
-                                            .ok()?,
-                                            authorities: PluginEntityAuthorities::decode_checkpoint(
-                                                &checkpoint.authority,
-                                            )
-                                            .ok()?,
-                                        })
-                                    })
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
+                            let _ = checkpoint_blob_hash;
+                            let mut durable_checkpoint: Option<DecodedDurablePluginCheckpoint> =
+                                None;
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -7260,25 +7234,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let packed_records =
-            futures_util::future::try_join_all(change_ids.iter().copied().map(|change_id| {
-                let read = &read;
-                async move {
-                    crate::tracked_state::load_change_record_by_id(read, change_id)
-                        .await
-                        .map(|record| (change_id, record))
-                }
-            }))
-            .await?;
-        let mut records = packed_records
-            .into_iter()
-            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
-            .collect::<HashMap<_, _>>();
-        let missing = change_ids
-            .into_iter()
-            .filter(|change_id| !records.contains_key(change_id))
-            .collect::<Vec<_>>();
-        records.extend(load_change_records(&read, missing.into_iter()).await?);
+        let records = load_change_records(&read, change_ids.into_iter()).await?;
         let mut payloads = materialize_known_change_payloads(
             &read,
             records.values().cloned(),
@@ -7736,37 +7692,13 @@ fn empty_state_transition(current: CommitId, desired: CommitId) -> LixError {
 }
 
 async fn opening_parent_complete_lifecycle_created_at(
-    read: &(impl StorageAdapterRead + ?Sized),
-    parent_commit_id: Option<CommitId>,
-    schema_key: &str,
-    live_count: u64,
-    ordered_identity_digest: [u8; 32],
+    _read: &(impl StorageAdapterRead + ?Sized),
+    _parent_commit_id: Option<CommitId>,
+    _schema_key: &str,
+    _live_count: u64,
+    _ordered_identity_digest: [u8; 32],
 ) -> Result<Option<LixTimestamp>, LixError> {
-    let Some(parent_commit_id) = parent_commit_id else {
-        return Ok(None);
-    };
-    let Some(metadata) =
-        crate::tracked_state::load_commit_delta_replay_metadata(read, parent_commit_id).await?
-    else {
-        return Ok(None);
-    };
-    let expected_scope = crate::tracked_state::CommitDeltaReplacementScope {
-        schema_key: schema_key.to_owned(),
-        file_id: None,
-    };
-    if metadata.member_count != u32::try_from(live_count).unwrap_or(u32::MAX)
-        || metadata.single_partition.as_ref() != Some(&expected_scope)
-    {
-        return Ok(None);
-    }
-    Ok(metadata
-        .lifecycle_summary
-        .as_ref()
-        .filter(|summary| {
-            summary.scope == expected_scope
-                && summary.ordered_identity_digest == ordered_identity_digest
-        })
-        .map(|summary| summary.uniform_created_at))
+    Ok(None)
 }
 
 async fn resolve_prepared_mutation_collection_generation(
@@ -8534,59 +8466,24 @@ where
 
     async fn load_collection_generation(
         &mut self,
-        branch_id: &str,
-        scope: crate::collection_generation::CollectionScopeRef<'_>,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let mut generation = TrackedHeadContext::new()
-            .reader(read)
-            .collection_generation(branch_id, control.untracked_generation, scope)
-            .await?;
-        let staged = self.staged_writes.staging_overlay()?;
-        if StagedLiveStateRows::collection_replaced(
-            &staged,
-            branch_id,
-            scope.schema_key,
-            scope.file_id,
-        )? {
-            generation.live_count = 0;
-        }
-        Ok(Some(generation))
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "collection generation is deferred until its ForkTree publication owner is lowered",
+        ))
     }
 
     async fn load_exact_collection_live_count(
         &mut self,
-        branch_id: &str,
-        scope: crate::collection_generation::CollectionScopeRef<'_>,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<u64>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        TrackedHeadContext::new()
-            .reader(read)
-            .exact_collection_live_count(branch_id, control.untracked_generation, scope)
-            .await
-            .map(Some)
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "collection live-count reads are deferred until their ForkTree publication owner is lowered",
+        ))
     }
 
     fn has_staged_collection_rows(
