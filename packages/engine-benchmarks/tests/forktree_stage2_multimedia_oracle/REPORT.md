@@ -9,11 +9,11 @@ production edit, branch, commit or PR mutation.
 - Harness source SHA-256:
   `cc0d3cfb14b562b7821ca124c67cbb8ead0da7287f9e0125ba39738304a4a09e`
 - Standalone Cargo manifest SHA-256:
-  `fe0f1ce9d7e43f23dbd419e59c2128a91ae956d7d703464c41b63394720dddaa`
+  `652b79169275e25180acb43b52602c546209f112e97ea9059a81ed71cab8fa27`
 - Compile/run manifest SHA-256:
-  `cdbfa509b4ea4153940a8fe1d473c58a0c1b2684de9c48e5434b59108cd5ef6c`
+  `2463197613022e9321e24f09f12211faae3cc85c5cb156ee6c9c7bb1667f2b4d`
 - Expected-gates SHA-256:
-  `30423e35495a724b3624d6576bd18025063c723a758bf287ed075e094e6400de`
+  `bac266cdcb648b4df04cff18c088a5b757455bd8aa41abcd207c5e0134398fc4`
 - Residue/format oracle SHA-256:
   `b689ad247523ee74491ea69a7f586c2831b8a63556615e6be80658af35cc9869`
 
@@ -71,4 +71,3 @@ When the first runnable immutable head arrives, the exact order is:
 2. run this package's residue oracle and warnings-clean compile probe;
 3. run only `image-64-1` on RocksDB under 20 minutes;
 4. stop and attribute any failure; widen only after that gate is green.
-

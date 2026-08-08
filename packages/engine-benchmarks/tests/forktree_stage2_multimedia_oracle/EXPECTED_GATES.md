@@ -119,4 +119,3 @@ Accepted ForkTree expectations:
 Model reference points are 500K retaining 100K and reclaiming 400K / 56.40 MB,
 and mixed lifecycle reclaiming 10,002 receipt/part objects after final release.
 They are semantic/scaling expectations, not production multimedia counts.
-

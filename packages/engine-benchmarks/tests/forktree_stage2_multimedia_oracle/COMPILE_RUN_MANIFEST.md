@@ -120,4 +120,3 @@ Run the identical command with only the listed environment values changed:
 
 Each cell gets a fresh explicit database directory and a 20-minute cap. The
 512 MiB cells are forbidden until both 64 MiB adapters are correctness-green.
-

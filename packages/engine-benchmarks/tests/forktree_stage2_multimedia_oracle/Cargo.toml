@@ -18,4 +18,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 lix = { path = "/root/repos/lix-forktree-stage2-runnable/packages/lix", features = ["storage-benches"] }
 lix_storage_rocksdb = { path = "/root/repos/lix-forktree-stage2-runnable/packages/rocksdb-storage" }
 lix_storage_slatedb = { path = "/root/repos/lix-forktree-stage2-runnable/packages/slatedb-storage" }
-
