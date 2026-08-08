@@ -1,0 +1,6 @@
+{
+  "case": "missing_catalog_record",
+  "expected": "typed_corruption",
+  "request": {"commit_id": "commit-missing"},
+  "catalog": {"enumerated": true, "record": null}
+}

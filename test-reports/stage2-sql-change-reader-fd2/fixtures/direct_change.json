@@ -1,0 +1,6 @@
+{
+  "case": "direct_change",
+  "expected": "return_authenticated_change",
+  "request": {"change_id": "chg-direct-001"},
+  "catalog": {"change_id": "chg-direct-001", "domain": "ChangeCatalog", "kind": "ChangeRecord"}
+}

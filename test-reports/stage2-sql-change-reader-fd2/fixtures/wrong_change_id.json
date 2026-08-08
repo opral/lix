@@ -1,0 +1,6 @@
+{
+  "case": "wrong_embedded_change_id",
+  "expected": "typed_identity_error",
+  "request": {"change_id": "chg-requested"},
+  "catalog": {"domain": "ChangeCatalog", "kind": "ChangeRecord", "embedded_change_id": "chg-substituted"}
+}

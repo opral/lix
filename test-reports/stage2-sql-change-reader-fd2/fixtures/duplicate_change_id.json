@@ -1,0 +1,6 @@
+{
+  "case": "duplicate_change_id",
+  "expected": "typed_corruption_before_output",
+  "records": ["chg-duplicate", "chg-duplicate"],
+  "rule": "reject duplicate logical ids before sort/output/limit"
+}

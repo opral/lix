@@ -1,0 +1,8 @@
+{
+  "case": "limit_after_merge",
+  "expected": "sort_validate_then_limit",
+  "direct": ["chg-z", "chg-b"],
+  "derived": ["chg-a", "chg-c"],
+  "limit": 2,
+  "rule": "authenticate and deduplicate all records, canonical-sort, then truncate"
+}

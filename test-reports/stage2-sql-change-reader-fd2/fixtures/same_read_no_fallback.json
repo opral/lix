@@ -1,0 +1,5 @@
+{
+  "case": "same_read_no_fallback",
+  "expected": "one_caller_owned_read",
+  "rule": "one retained CoherentView/StorageRead; no begin_read, refresh, raw store, cache, fallback, or second reader"
+}
