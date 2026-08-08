@@ -1,0 +1,48 @@
+{
+  "package": "forktree-duckdb-olap-b59-rebind",
+  "status": "test-report-only-unrun",
+  "production_edits": false,
+  "runtime_claims": false,
+  "current_main_performance": false,
+  "b59_binding": {
+    "head": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+    "parent": "713455a3557907ce705d06f720fcdc4486bddd4a"
+  },
+  "nearest_input": {
+    "ref": "origin/codex/olap-duckdb-comparator-2a0",
+    "head": "cd76d29406ed7e00711a5b5ba9c40da537524dd3",
+    "tree": "585d9906eb9ae931f3dea2fb7d7a0b724d6eccba",
+    "parent": "2a0e8512bb37c9da2050c99c366e5ac05bb01553",
+    "evidence_sha256": "e783ea32afc679b019b20482bbc44edce83a653cb36722c693d2455b43642084",
+    "results_sha256": "20f6b010fa770b3a24e69cf7e13a44cda4977d0b3ee3b705dcc49c95e56b3f99",
+    "raw_sha256sums_sha256": "0e6b229f47f07154599cf75984b6ce1d6843a5c55b4ef90a37f5ca970dc12296",
+    "requested_missing_report_sha256": "0b56c824c7d803f65a356d08d6c4643992decd97f885f7042c4abcea1cf68b07",
+    "requested_report_available": false
+  },
+  "input_source_hashes": {
+    "duckdb_main_rs_sha256": "6f733e7698d806b53420c3172f2ae278b632aa966bfa1437f73cbb34c1bafd6b",
+    "olap_common_rs_sha256": "5fae129c1d9c96e3756fbf3e6947212315b59feeb967351421aef382d89b0411",
+    "olap_datafusion_rs_sha256": "ede8480c99a6a4e50b8f41768d56e9a95eb0ae39df92e6f3af2a1cbe196da753",
+    "duckdb_cargo_toml_sha256": "8f1594d36e4ff434b83ad326ba791448826d1b92d113ae67abd9fd3653b31a19"
+  },
+  "fixture": {
+    "row_counts": [10000, 50000, 500000],
+    "lanes": 32,
+    "wide_columns": 16,
+    "wide_payload_bytes": 256,
+    "query_count": 9,
+    "query_order": ["pk_point", "pk_range", "narrow_scan", "wide_scan", "filtered_scan", "group_by", "order_limit", "simple_join", "column_projection"],
+    "digest": "blake3-row-count-column-count-typed-cell-stream",
+    "warm_cold_model_digest_equality": "required-future-invariant-unmeasured"
+  },
+  "adapter_order": ["model", "duckdb-control", "memory", "rocksdb", "slatedb"],
+  "future_cell_cap_minutes": 20,
+  "thresholds": {
+    "target_improvement_percent_at_least": 10,
+    "critical_guardrail_regression_percent_at_most": 5,
+    "guardrail_domains": ["OLTP", "VC/history/branch/checkpoint", "filesystem/files", "OLAP", "cold_reopen", "digest", "backend_work", "RSS", "disk"]
+  },
+  "inherited_measurements_are_b59": false,
+  "b59_runtime_cells_completed": false
+}
