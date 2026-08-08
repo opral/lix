@@ -3836,7 +3836,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         stage_recovery_ref_rotation(
             &mut writes,
-            &super::CheckpointRecoveryRef {
+            &CheckpointRecoveryRef {
                 branch_id: branch_id.to_owned(),
                 recovered_head_commit_id: recovered.commit_id,
                 checkpoint_commit_id: checkpoint.commit_id,
@@ -6199,6 +6199,263 @@ mod tests {
 
     #[tokio::test]
     async fn repository_gc_marks_binary_roots_from_checkpoint_batches_beyond_retirement_window() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("retireable queue timestamp", "2026-01-01T00:00:00Z");
+        let control_ref = ChangeId::for_test_label("retireable-queue-live-control");
+        let live = replay_commit_record("retireable-queue-live", 0, None, timestamp);
+        let live_control = replay_branch_control(live.commit_id, control_ref, timestamp);
+        let retired = (0..=super::GC_REACHABILITY_BATCH_LIMIT)
+            .map(|index| {
+                replay_commit_record(
+                    &format!("retireable-queue-root-{index}"),
+                    0,
+                    None,
+                    timestamp,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut records = Vec::with_capacity(retired.len() + 1);
+        records.push(live.clone());
+        records.extend(retired.iter().cloned());
+        let manifests = records
+            .iter()
+            .map(|record| {
+                test_commit_state_manifest(record, CommitStateMutationInventory::default())
+            })
+            .collect::<Vec<_>>();
+
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("retireable queue should seed");
+        stage_branch_head_control(&mut writes, "retireable-live", live_control)
+            .expect("retireable queue live control should stage");
+        persist_replay_closure_fixture(&storage, writes, &records, &manifests).await;
+
+        for (index, record) in retired.iter().enumerate() {
+            let old_control = replay_branch_control(record.commit_id, control_ref, timestamp);
+            stage_replay_root_delta(
+                &storage,
+                RootReachabilityDelta {
+                    branch_id: format!("retireable-branch-{index}"),
+                    old_root: Some(record.commit_id),
+                    new_root: None,
+                    old_control: Some(old_control),
+                    new_control: None,
+                    old_control_digest: root_control_digest_for_control(Some(&old_control))
+                        .expect("retireable old control should encode"),
+                    new_control_digest: root_control_digest_for_control(None)
+                        .expect("retireable absent control should encode"),
+                },
+            )
+            .await;
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retireable queue bounds read should open");
+        let (before, _) = load_reachability_queue(&read)
+            .await
+            .expect("retireable queue bounds should load");
+        assert_eq!(
+            before.tail_sequence - before.head_sequence + 1,
+            super::GC_REACHABILITY_BATCH_LIMIT as u64 + 1
+        );
+        drop(read);
+
+        let first = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            first.reachability_queue_advanced,
+            "a retireable bounded prefix must report strict queue-head progress"
+        );
+        assert!(
+            !first.reachability_queue_drained,
+            "one authenticated suffix batch must preserve collection debt"
+        );
+        assert_eq!(
+            first.sweep.tracked_commit_roots.len(),
+            super::GC_REACHABILITY_BATCH_LIMIT
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("advanced queue bounds read should open");
+        let (advanced, _) = load_reachability_queue(&read)
+            .await
+            .expect("advanced queue bounds should load");
+        assert_eq!(
+            advanced.head_sequence,
+            before.head_sequence + super::GC_REACHABILITY_BATCH_LIMIT as u64
+        );
+        assert_eq!(advanced.tail_sequence, before.tail_sequence);
+        drop(read);
+
+        let final_plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            final_plan.reachability_queue_advanced,
+            "the fresh exact-CAS continuation must consume the suffix"
+        );
+        assert!(
+            final_plan.reachability_queue_drained,
+            "the strict-progress continuation must drain the queue"
+        );
+        assert_eq!(final_plan.sweep.tracked_commit_roots.len(), 1);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("drained queue read should open");
+        let (drained, _) = load_reachability_queue(&read)
+            .await
+            .expect("drained queue should load");
+        assert_eq!((drained.head_sequence, drained.tail_sequence), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn repository_gc_blocked_head_preserves_debt_until_release_and_cadence() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("blocked queue timestamp", "2026-01-01T00:00:00Z");
+        let recovered = replay_commit_record("blocked-queue-recovered", 0, None, timestamp);
+        let checkpoint = replay_commit_record("blocked-queue-checkpoint", 0, None, timestamp);
+        let mut source = replay_commit_record(
+            "blocked-queue-source",
+            1,
+            Some(recovered.commit_id),
+            timestamp,
+        );
+        source.parent_commit_ids.push(checkpoint.commit_id);
+        let released = replay_commit_record("blocked-queue-released", 0, None, timestamp);
+        let control_ref = ChangeId::for_test_label("blocked-queue-control");
+        let recovered_control = replay_branch_control(recovered.commit_id, control_ref, timestamp);
+        let mut source_control = replay_branch_control(source.commit_id, control_ref, timestamp);
+        source_control.working_diff_checkpoint_commit_id = Some(checkpoint.commit_id);
+        let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
+        let records = [
+            recovered.clone(),
+            checkpoint.clone(),
+            source.clone(),
+            released.clone(),
+        ];
+        let manifests = records
+            .iter()
+            .map(|record| {
+                test_commit_state_manifest(record, CommitStateMutationInventory::default())
+            })
+            .collect::<Vec<_>>();
+        let branch_id = "blocked-queue-branch";
+
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("blocked queue should seed");
+        stage_branch_head_control(&mut writes, branch_id, source_control)
+            .expect("blocked source control should stage");
+        stage_recovery_ref_rotation(
+            &mut writes,
+            &CheckpointRecoveryRef {
+                branch_id: branch_id.to_owned(),
+                recovered_head_commit_id: recovered.commit_id,
+                checkpoint_commit_id: checkpoint.commit_id,
+                interval_has_commits: true,
+            },
+        )
+        .expect("blocked recovery context should stage");
+        persist_replay_closure_fixture(&storage, writes, &records, &manifests).await;
+        stage_replay_root_delta(
+            &storage,
+            RootReachabilityDelta {
+                branch_id: branch_id.to_owned(),
+                old_root: Some(recovered.commit_id),
+                new_root: Some(source.commit_id),
+                old_control: Some(recovered_control),
+                new_control: Some(source_control),
+                old_control_digest: root_control_digest_for_control(Some(&recovered_control))
+                    .expect("blocked recovered control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&source_control))
+                    .expect("blocked source control should encode"),
+            },
+        )
+        .await;
+
+        let blocked = run_ordinary_repository_gc(&storage).await;
+        assert!(!blocked.reachability_queue_drained);
+        assert!(
+            !blocked.reachability_queue_advanced,
+            "a live recovered dependency must keep the queue head blocked"
+        );
+        assert!(blocked.sweep.tracked_commit_roots.is_empty());
+
+        let mut gc_state = CheckpointGcState {
+            checkpoint_sequence: 64,
+            last_gc_sequence: 0,
+            collectible_interval_count: 1,
+        };
+        gc_state.reschedule_pending_reachability();
+        assert_eq!(gc_state.collectible_interval_count, 1);
+        assert_eq!(gc_state.last_gc_sequence, 63);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("blocked release read should open");
+        let mut release = storage.new_write_set();
+        stage_branch_head_control(&mut release, branch_id, released_control)
+            .expect("released control should stage");
+        stage_delete_recovery_ref(&mut release, branch_id)
+            .expect("released recovery context should delete");
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut release,
+            &[RootReachabilityDelta {
+                branch_id: branch_id.to_owned(),
+                old_root: Some(source.commit_id),
+                new_root: Some(released.commit_id),
+                old_control: Some(source_control),
+                new_control: Some(released_control),
+                old_control_digest: root_control_digest_for_control(Some(&source_control))
+                    .expect("released source control should encode"),
+                new_control_digest: root_control_digest_for_control(Some(&released_control))
+                    .expect("released control should encode"),
+            }],
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("released root delta should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                release,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("released root delta should commit against the exact queue");
+
+        let drained = run_ordinary_repository_gc(&storage).await;
+        assert!(drained.reachability_queue_advanced);
+        assert!(drained.reachability_queue_drained);
+        assert!(
+            drained
+                .sweep
+                .tracked_commit_roots
+                .contains(&recovered.commit_id)
+        );
+        assert!(
+            drained
+                .sweep
+                .tracked_commit_roots
+                .contains(&source.commit_id)
+        );
+        gc_state.mark_collected();
+        assert_eq!(gc_state.collectible_interval_count, 0);
+        assert_eq!(gc_state.last_gc_sequence, gc_state.checkpoint_sequence);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_marks_binary_roots_from_blocked_checkpoint_batches_beyond_window() {
         let backend = Memory::new();
         Engine::initialize(backend.clone())
             .await
@@ -6298,8 +6555,8 @@ mod tests {
             "a bounded sweep must preserve collection debt for authenticated batches beyond its window"
         );
         assert!(
-            plan.reachability_queue_advanced,
-            "the bounded pass must report strict queue-head progress"
+            !plan.reachability_queue_advanced,
+            "the active selected-source dependency must keep this queue head blocked"
         );
         assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
         storage
