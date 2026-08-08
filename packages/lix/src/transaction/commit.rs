@@ -184,10 +184,10 @@ where
     else {
         return Ok(PreparedForkTreePlan::Noop);
     };
-    let prepared_blob_manifests = prepared_blob_manifest_ids(&prepared_writes)?;
     let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
+    let prepared_blob_manifests = prepared_blob_manifest_ids(&mut publication, &prepared_writes)?;
 
     for checkpoint in &prepared_writes.checkpoint_publications {
         crate::gc::stage_checkpoint_publication(&mut publication, checkpoint)?;
@@ -1163,14 +1163,6 @@ fn classify_publication_intent(
     prepared: &PreparedWriteSet,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
 ) -> Result<PublicationIntent, LixError> {
-    for write in &prepared.file_content_writes {
-        if write.prepared_cas_receipt().is_none() {
-            return Err(writer_error(
-                "inline file payloads cannot bypass BlobId-only ForkTree lowering",
-            ));
-        }
-    }
-
     // Commit intent is independent of current-state row count. Inspect every
     // semantic owner before opening a view or constructing a publication, so
     // an unsupported ref/history cohort cannot publish unrelated untracked
@@ -1286,14 +1278,22 @@ fn classify_publication_intent(
 type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), ObjectId>;
 
 fn prepared_blob_manifest_ids(
+    publication: &mut PreparedPublication,
     prepared: &PreparedWriteSet,
 ) -> Result<PreparedBlobManifestMap, LixError> {
     let mut manifests = PreparedBlobManifestMap::new();
     for write in &prepared.file_content_writes {
-        let receipt = write.prepared_cas_receipt().ok_or_else(|| {
-            writer_error("file payload is missing an authenticated ForkTree CAS receipt")
-        })?;
-        let manifest = ObjectId::from_bytes(receipt.manifest_object_id);
+        let manifest = if let Some(receipt) = write.prepared_cas_receipt() {
+            ObjectId::from_bytes(receipt.manifest_object_id)
+        } else if let Some(payload) = write.inline_payload() {
+            publication
+                .stage_inline_blob_payload(payload.bytes())
+                .map_err(LixError::from)?
+        } else {
+            return Err(writer_error(
+                "file payload is missing an authenticated ForkTree blob representation",
+            ));
+        };
         if manifest == ObjectId::ZERO {
             return Err(writer_error(
                 "file payload has a zero ForkTree manifest identity",
@@ -1480,7 +1480,8 @@ mod intent_tests {
     use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
     use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
     use crate::transaction::types::{
-        PreparedStateBatch, StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
+        FileContent, PreparedStateBatch, StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
+        TransactionFileContent,
     };
 
     fn empty_writes() -> PreparedWriteSet {
@@ -1522,6 +1523,24 @@ mod intent_tests {
         assert_eq!(
             deterministic_sequence_snapshot(7).expect("sequence snapshot"),
             r#"{"key":"lix_deterministic_sequence_number","value":7}"#
+        );
+    }
+
+    #[test]
+    fn inline_file_payload_is_not_rejected_before_forktree_lowering() {
+        let mut writes = empty_writes();
+        writes.file_content_writes.push(TransactionFileContent::new(
+            "inline-file".to_owned(),
+            Some("inline.txt".to_owned()),
+            Some("inline.txt".to_owned()),
+            crate::GLOBAL_BRANCH_ID.to_owned(),
+            false,
+            false,
+            FileContent::inline(b"inline payload".to_vec()),
+        ));
+        assert_eq!(
+            classify_publication_intent(&writes, None).expect("inline payload intent"),
+            PublicationIntent::Noop
         );
     }
 

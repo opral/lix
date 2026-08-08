@@ -9,10 +9,10 @@ use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 use super::blob::{CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
-    BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeObjectV1,
-    CommitObjectV1, GlobalSelectorV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1,
-    UploadProgressV1, UploadSelectorV1, branch_selector_key, gc_progress_selector_key,
-    global_selector_key, snapshot_selector_key, upload_selector_key,
+    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
+    ChangeObjectV1, CommitObjectV1, GlobalSelectorV1, SnapshotSelectorV1, SnapshotTargetV1,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, branch_selector_key,
+    gc_progress_selector_key, global_selector_key, snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit, validate_member_catalog_owner};
@@ -398,6 +398,40 @@ impl PreparedPublication {
         let (id, bytes) = value.encode()?;
         self.stage_encoded_object(id, bytes)?;
         Ok(id)
+    }
+
+    /// Lowers an inline file payload into the same authenticated object set as
+    /// every other ForkTree blob publication. The returned manifest identity
+    /// is later attached to the exact `lix_binary_blob_ref` state row; no
+    /// BlobId-only reader or separate CAS commit is involved.
+    pub(crate) fn stage_inline_blob_payload(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<ObjectId, StorageError> {
+        if bytes.is_empty() {
+            return Err(corruption(
+                "empty inline payload has no blob manifest; omit its BlobRef row",
+            ));
+        }
+        let mut ordered_chunks = Vec::with_capacity(bytes.len().div_ceil(1024 * 1024));
+        for chunk_bytes in bytes.chunks(1024 * 1024) {
+            let chunk = BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(chunk_bytes),
+            };
+            let (chunk_object_id, encoded) = chunk.encode()?;
+            self.stage_encoded_object(chunk_object_id, encoded)?;
+            ordered_chunks.push(BlobChunkRefV1 {
+                chunk_object_id,
+                declared_len: chunk_bytes.len() as u64,
+            });
+        }
+        let manifest = BlobManifestV1::from_authenticated_chunks(
+            bytes.len() as u64,
+            ordered_chunks,
+            crate::binary_cas::BlobId::from_content(bytes),
+            *blake3::hash(bytes).as_bytes(),
+        );
+        self.stage_blob_manifest(&manifest)
     }
 
     pub(super) fn stage_upload_part(
