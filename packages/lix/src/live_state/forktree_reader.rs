@@ -6,7 +6,7 @@
 //! lanes that still need a separate owner instead of falling back to a
 //! deleted current-layout reader.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::LixError;
@@ -133,12 +133,12 @@ where
     candidate_request.limit = None;
     let tracked = scan_tracked_view(view, &candidate_request).await?;
     let untracked = scan_untracked_view(view, &candidate_request).await?;
-    Ok(merge_current_overlay(
+    merge_current_overlay(
         tracked,
         untracked,
         request.filter.include_tombstones,
         request.limit,
-    ))
+    )
 }
 
 fn merge_current_overlay(
@@ -146,13 +146,23 @@ fn merge_current_overlay(
     untracked: MaterializedLiveStateBatch,
     include_tombstones: bool,
     limit: Option<usize>,
-) -> MaterializedLiveStateBatch {
+) -> Result<MaterializedLiveStateBatch, LixError> {
     let mut by_key = BTreeMap::new();
+    let mut tracked_keys = BTreeSet::new();
     for row in tracked.into_rows() {
-        by_key.insert(encode_row_key(&row), row);
+        let key = encode_row_key(&row);
+        if !tracked_keys.insert(key.clone()) {
+            return Err(overlay_corruption("tracked"));
+        }
+        by_key.insert(key, row);
     }
+    let mut untracked_keys = BTreeSet::new();
     for row in untracked.into_rows() {
-        by_key.insert(encode_row_key(&row), row);
+        let key = encode_row_key(&row);
+        if !untracked_keys.insert(key.clone()) {
+            return Err(overlay_corruption("untracked"));
+        }
+        by_key.insert(key, row);
     }
 
     let mut output = Vec::with_capacity(limit.unwrap_or(by_key.len()).min(by_key.len()));
@@ -165,7 +175,7 @@ fn merge_current_overlay(
             break;
         }
     }
-    MaterializedLiveStateBatch::from_rows(output)
+    Ok(MaterializedLiveStateBatch::from_rows(output))
 }
 
 fn encode_row_key(row: &MaterializedLiveStateRow) -> Vec<u8> {
@@ -413,6 +423,13 @@ fn unsupported(message: &'static str) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message)
 }
 
+fn overlay_corruption(stream: &'static str) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("current ForkTree overlay contains duplicate logical key in {stream} rows"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,8 +520,9 @@ mod tests {
             row("branch", "d", Some("untracked-d"), false, false, true),
         ]);
 
-        let rows =
-            merge_current_overlay(tracked.clone(), untracked.clone(), false, None).into_rows();
+        let rows = merge_current_overlay(tracked.clone(), untracked.clone(), false, None)
+            .expect("distinct physical overlay rows should merge")
+            .into_rows();
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].entity_pk, EntityPk::single("a"));
         assert_eq!(
@@ -521,7 +539,9 @@ mod tests {
         assert_eq!(rows[2].entity_pk, EntityPk::single("c"));
         assert_eq!(rows[3].entity_pk, EntityPk::single("d"));
 
-        let limited = merge_current_overlay(tracked, untracked, false, Some(3)).into_rows();
+        let limited = merge_current_overlay(tracked, untracked, false, Some(3))
+            .expect("distinct physical overlay rows should preserve limit")
+            .into_rows();
         assert_eq!(
             limited
                 .iter()
@@ -545,19 +565,50 @@ mod tests {
             "branch", "deleted", None, true, false, true,
         )]);
 
-        let visible =
-            merge_current_overlay(tracked.clone(), untracked.clone(), false, None).into_rows();
+        let visible = merge_current_overlay(tracked.clone(), untracked.clone(), false, None)
+            .expect("cross-stream tombstone should mask tracked value")
+            .into_rows();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].entity_pk, EntityPk::single("null"));
         assert_eq!(visible[0].snapshot_content, None);
         assert!(!visible[0].deleted);
 
-        let with_tombstone = merge_current_overlay(tracked, untracked, true, None).into_rows();
+        let with_tombstone = merge_current_overlay(tracked, untracked, true, None)
+            .expect("cross-stream tombstone should remain visible when requested")
+            .into_rows();
         assert_eq!(with_tombstone.len(), 2);
         assert!(
             with_tombstone
                 .iter()
                 .any(|row| row.entity_pk == EntityPk::single("deleted") && row.deleted)
         );
+    }
+
+    #[test]
+    fn combined_overlay_rejects_duplicate_tracked_logical_keys() {
+        let duplicate = row("branch", "duplicate", Some("value"), false, false, false);
+        let error = merge_current_overlay(
+            MaterializedLiveStateBatch::from_rows(vec![duplicate.clone(), duplicate]),
+            MaterializedLiveStateBatch::default(),
+            false,
+            None,
+        )
+        .expect_err("duplicate tracked rows must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("tracked"));
+    }
+
+    #[test]
+    fn combined_overlay_rejects_duplicate_untracked_logical_keys() {
+        let duplicate = row("branch", "duplicate", Some("value"), false, false, true);
+        let error = merge_current_overlay(
+            MaterializedLiveStateBatch::default(),
+            MaterializedLiveStateBatch::from_rows(vec![duplicate.clone(), duplicate]),
+            false,
+            None,
+        )
+        .expect_err("duplicate untracked rows must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("untracked"));
     }
 }
