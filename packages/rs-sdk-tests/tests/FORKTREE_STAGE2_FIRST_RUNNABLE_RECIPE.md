@@ -23,6 +23,17 @@ source report SHA-256 is
 Do not run acceptance artifacts against either frontier: both remain
 compiler-red and have no first-runnable approval.
 
+The next compatibility anchor for the disposable overlay is exact
+`1f742a382c755399b8a49ab536c4f6dc55fffdd8`, tree
+`860a047b98eaa38368a3d889497628e244c2e0ec`, parent
+`7c9b1060bc396dfa54efcc6c888e37894a7cfb04`, parent-to-head full-index
+SHA-256 `18a7df6d37fce9809b2214f5b1530204b1a2dd4cf19760aa876ec7856249dbc7`.
+Use the dormant
+`forktree_stage2_seven_stage_overlay.sh` only as a read-only preflight or to
+create a fresh detached overlay. It rejects candidates that are not descended
+from this exact object. It will not run a cell while the R1 checkpoint/GC
+binding is `awaiting-immutable-ref`.
+
 The historical artifact comparator remains exact a12
 `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
 `9a705d36392e88d8f5f363b2b23d373deec3321d`; all a12-based artifact diffs are
@@ -204,6 +215,15 @@ timeout 20m \
 
 Do not substitute a mutable branch tip, local working tree, or compile-red
 milestone.
+
+The reduced landing order is exactly seven stages: (1) P0 plus residue,
+compile, fmt, and Clippy; (2) production 65-row delete RocksDB then SlateDB;
+(3) SQL transaction/publication RocksDB then SlateDB; (4) branch/diff/merge/
+history/undo-redo RocksDB then SlateDB; (5) parsed files and 64 MiB BlobRef
+identity RocksDB then SlateDB; (6) R1 checkpoint/recovery RocksDB then SlateDB;
+and (7) R1 GC/publication/upload RocksDB then SlateDB. The broad comparator,
+point-read A/B, OLAP, broad VC, multimedia-shape, 512 MiB, and scaling rows are
+post-landing follow-ups only.
 
 ## Disposable artifact application
 
