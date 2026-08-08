@@ -1,0 +1,23 @@
+case	cohort_or_fault	expected_topology_or_result	reads	plans	prepares	commits	selector_epoch_effect	object_catalog_effect	runtime_receipt_effect	reopen_or_failure_proof
+P0-UNNAMEABLE	reference PreparedPublication::commit or any alias	compile/source rejection	0	0	0	0	none	none	none	no callable symbol
+P0-NO-DIRECT-WRITE	invoke any ForkTree reachability/GC/publication direct begin_write/commit	compile/source rejection	0	0	0	0	none	none	none	only transaction plan consumer exists
+W1A-INTERMEDIATE-CHAIN	P -> I1 -> I2 -> F on one branch	catalog contains P,I1,I2,F; selector points F; exact generations and ordered parents	1	1	1	1	one branch+global CAS	all commits/members/ref fact atomic	none	history/diff/undo/redo exact after cold reopen
+W1A-PARENT-OVERRIDE	selected head H; final chronology parent override P	F.parent=P; RefChange.before=H; selector H->F	1	1	1	1	one exact H/global CAS	P and H independently authenticated	none	cold reopen preserves chronology and branch movement
+W1A-SELECTED-ORDER	fresh A,B plus selected C,D from two source commits	target member order equals baseline oracle; source and target memberships both valid	1	1	1	1	one branch+global CAS	one Change object/ID each; all target ordinals authenticated	none	history/diff exact order after reopen
+W1A-DUPLICATE-IDENTITY	fresh A plus selected A or duplicate selected batches	typed duplicate rejection or exact existing dedup result	1	0	0	0	byte-identical	none	none	complete storage snapshot identical
+W1A-DUPLICATE-COMMIT	I1 and F share CommitId	typed corruption/internal rejection	1	0	0	0	byte-identical	none	none	complete storage snapshot identical
+W1A-MEMBER-ORDER	transplant/swap C,D edges or target ordinals	fail closed on order/ordinal/back-edge	1	0	0	0	byte-identical	no partial target objects/catalog	none	cold state unchanged
+W1A-MEMBER-DOMAIN	replace semantic member with ref/blob/tree/commit object	fail closed on ObjectId/domain	1	0	0	0	byte-identical	none	none	cold state unchanged
+W1A-MEMBER-IDENTITY	catalog key, embedded ChangeId, object ID, or source membership mismatch	fail closed before plan	1	0	0	0	byte-identical	none	none	cold state unchanged
+W1A-PARENT-BACKEDGE	missing/wrong CommitCatalog parent edge or substituted parent object	fail closed before plan	1	0	0	0	byte-identical	none	none	cold state unchanged
+W1A-PARENT-ORDER	duplicate/reordered parents, duplicate CommitId, non-decreasing generation	fail closed before plan	1	0	0	0	byte-identical	none	none	cold state unchanged
+W1A-PARENT-CYCLE	I1/I2/F staged cycle or generation overflow	fail closed before plan	1	0	0	0	byte-identical	none	none	cold state unchanged
+W1A-STALE-BRANCH	prepare on branch selector H then competing branch publication	stale exact branch CAS rejects whole plan	1	1	1	0	winner only	candidate objects/catalog absent	candidate runtime/receipt absent	winner exact after reopen
+W1A-STALE-GLOBAL	prepare then competing GC/global epoch rotation	stale exact global CAS rejects whole plan	1	1	1	0	winner only	candidate objects/catalog absent	candidate runtime/receipt absent	winner/progress exact after reopen
+W1A-NOOP	zero rows/history/runtime/metadata/receipt	prior successful no-op	1	0-or-empty	0-or-empty	0-or-empty	byte-identical	none	none	cold digest identical
+W1A-RUNTIME	ordinary history plus advanced deterministic sequence seed40->42	commit/history/runtime all atomic	1	1	1	1	one branch+global CAS	complete history atomic	sequence42 + optional receipt same batch	cold next=43
+W1A-UNTRACKED	one ordinary untracked row only	valid current row; no semantic commit	1	1	1	1	one expected selector/global CAS	no commit/member objects	none	row exact after reopen
+W1A-UNSUPPORTED	file/upload/checkpoint/multi-branch/reachability/GC intent	typed pre-plan rejection	1	0	0	0	byte-identical	none	no runtime row or receipt	complete storage snapshot identical
+W1A-ROLLBACK	stage chain/runtime then explicit rollback	successful rollback	1	0	0	0	byte-identical	none	none	fresh transaction starts durable sequence
+W1A-SAVEPOINT	A succeeds; B consumes sequence then fails/restores; F commits	A/F visible; B absent; consumed sequence gap retained	1	1	1	1	one final CAS	A/F objects only	actual high-water same batch	B absent and next sequence exact after reopen
+W1A-IDEMPOTENCY	first ordered-history execution, exact replay, conflicting fingerprint	first success; replay sealed; conflict fail closed	first-only	first-only	first-only	1 total	first transition only	first objects only	one receipt/sequence advance	replay result/order exact after cold reopen
