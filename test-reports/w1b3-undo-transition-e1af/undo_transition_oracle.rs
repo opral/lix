@@ -125,6 +125,14 @@ fn validate_read(read: &ReadTrace) -> Result<(), Reject> {
                 || call.view_id != read.view_id
                 || call.operation.is_empty()
         })
+        || !read
+            .calls
+            .iter()
+            .any(|call| call.operation == "first_parent/marker/exact_rows")
+        || !read
+            .calls
+            .iter()
+            .any(|call| call.operation == "inverse_or_replay_transition")
     {
         return Err(Reject::ReadView);
     }
@@ -135,7 +143,15 @@ fn validate_commit_graph(history: &History) -> Result<(), Reject> {
     if !history.commits.contains_key(&history.head) {
         return Err(Reject::MissingCommit);
     }
-    for commit in history.commits.values() {
+    for (map_id, commit) in &history.commits {
+        if map_id.is_empty() || commit.id != map_id.as_str() {
+            return Err(Reject::IdentityMismatch);
+        }
+        for (row_id, row) in &commit.rows {
+            if row_id.is_empty() || row.identity != row_id.as_str() {
+                return Err(Reject::IdentityMismatch);
+            }
+        }
         let mut parent_ids = BTreeSet::new();
         let mut maximum_parent_generation: Option<u64> = None;
         for parent_id in &commit.parents {
@@ -153,14 +169,15 @@ fn validate_commit_graph(history: &History) -> Result<(), Reject> {
         }
         match maximum_parent_generation {
             None if commit.generation != 0 => return Err(Reject::Chronology),
-            Some(parent_generation)
-                if commit.parents.len() == 1
-                    && commit.generation != parent_generation.saturating_add(1) =>
-            {
-                return Err(Reject::Chronology);
-            }
             Some(parent_generation) if commit.generation <= parent_generation => {
                 return Err(Reject::Chronology);
+            }
+            Some(parent_generation) if commit.parents.len() == 1 => {
+                if commit.generation
+                    != parent_generation.checked_add(1).ok_or(Reject::Chronology)?
+                {
+                    return Err(Reject::Chronology);
+                }
             }
             _ => {}
         }
@@ -259,6 +276,27 @@ fn first_parent(history: &History, target_id: &str) -> Result<String, Reject> {
     }
 }
 
+fn first_parent_contains(
+    history: &History,
+    descendant_id: &str,
+    ancestor_id: &str,
+) -> Result<bool, Reject> {
+    let mut current_id = descendant_id.to_string();
+    loop {
+        if current_id == ancestor_id {
+            return Ok(true);
+        }
+        let current = history
+            .commits
+            .get(&current_id)
+            .ok_or(Reject::MissingCommit)?;
+        match current.parents.as_slice() {
+            [parent] => current_id = parent.clone(),
+            [] | [_, ..] => return Ok(false),
+        }
+    }
+}
+
 fn undo_plan(history: &History, read: ReadTrace) -> Result<TransitionPlan, Reject> {
     let target_id = history
         .undo_target
@@ -269,12 +307,10 @@ fn undo_plan(history: &History, read: ReadTrace) -> Result<TransitionPlan, Rejec
     }
     let parent_id = first_parent(history, target_id)?;
     if let Some(floor_id) = &history.checkpoint_floor {
-        let floor = history.commits.get(floor_id).ok_or(Reject::MissingCommit)?;
-        let parent = history
-            .commits
-            .get(&parent_id)
-            .ok_or(Reject::MissingCommit)?;
-        if parent.generation < floor.generation {
+        history.commits.get(floor_id).ok_or(Reject::MissingCommit)?;
+        if !first_parent_contains(history, target_id, floor_id)?
+            || !first_parent_contains(history, &parent_id, floor_id)?
+        {
             return Err(Reject::CheckpointFloor);
         }
     }
@@ -360,6 +396,42 @@ impl Repository {
         if self.selector_head != self.history.head {
             return Err(Reject::SelectorMismatch);
         }
+        if let Some(undo_target) = &self.history.undo_target {
+            self.history
+                .commits
+                .get(undo_target)
+                .ok_or(Reject::MissingCommit)?;
+            if undo_target != &self.history.head {
+                return Err(Reject::CursorMismatch);
+            }
+        }
+        if self.history.redo_cursor.is_some() != self.history.redo_target.is_some() {
+            return Err(Reject::CursorMismatch);
+        }
+        if let Some(redo_cursor) = &self.history.redo_cursor {
+            if redo_cursor != &self.history.head {
+                return Err(Reject::CursorMismatch);
+            }
+        }
+        if let Some(redo_target) = &self.history.redo_target {
+            let target = self
+                .history
+                .commits
+                .get(redo_target)
+                .ok_or(Reject::MissingCommit)?;
+            if target.parents.as_slice() != [self.history.head.clone()] {
+                return Err(Reject::CursorMismatch);
+            }
+        }
+        if let Some(floor_id) = &self.history.checkpoint_floor {
+            self.history
+                .commits
+                .get(floor_id)
+                .ok_or(Reject::MissingCommit)?;
+            if !first_parent_contains(&self.history, &self.history.head, floor_id)? {
+                return Err(Reject::CheckpointFloor);
+            }
+        }
         Ok(self.clone())
     }
 }
@@ -431,6 +503,26 @@ fn three_commit_history() -> History {
     history
 }
 
+fn forked_floor_history() -> History {
+    let root = commit("A", 0, &[], &[row("x", 1, Value::Null)]);
+    let active_parent = commit("B", 1, &["A"], &[row("x", 2, Value::Text("b".into()))]);
+    let sibling_floor = commit("F", 1, &["A"], &[row("x", 2, Value::Text("f".into()))]);
+    let active_head = commit("D", 2, &["B"], &[row("x", 3, Value::Text("d".into()))]);
+    History {
+        commits: BTreeMap::from([
+            (root.id.clone(), root),
+            (active_parent.id.clone(), active_parent),
+            (sibling_floor.id.clone(), sibling_floor),
+            (active_head.id.clone(), active_head),
+        ]),
+        head: "D".into(),
+        undo_target: Some("D".into()),
+        redo_cursor: None,
+        redo_target: None,
+        checkpoint_floor: Some("F".into()),
+    }
+}
+
 #[test]
 fn undo_and_redo_preserve_exact_inverse_state_identity() {
     let mut repository = Repository::new(linear_history());
@@ -484,6 +576,25 @@ fn ordered_checkpoint_floor_allows_to_floor_but_not_below() {
     let before = repository.clone();
     assert_eq!(repository.apply_undo(read()), Err(Reject::CheckpointFloor));
     assert_eq!(repository, before);
+}
+
+#[test]
+fn sibling_and_non_ancestor_checkpoint_floors_fail_closed() {
+    let mut sibling = forked_floor_history();
+    assert_eq!(
+        Repository::new(sibling.clone()).apply_undo(read()),
+        Err(Reject::CheckpointFloor)
+    );
+
+    let non_ancestor = commit("G", 2, &["F"], &[row("x", 3, Value::Text("g".into()))]);
+    sibling
+        .commits
+        .insert(non_ancestor.id.clone(), non_ancestor);
+    sibling.checkpoint_floor = Some("G".into());
+    assert_eq!(
+        Repository::new(sibling).apply_undo(read()),
+        Err(Reject::CheckpointFloor)
+    );
 }
 
 #[test]
@@ -562,6 +673,27 @@ fn atomic_failure_leaves_selector_cursor_and_rows_unchanged() {
 }
 
 #[test]
+fn cold_reopen_reauthenticates_cursor_floor_and_commit_identity() {
+    let mut missing_redo = Repository::new(linear_history());
+    missing_redo.apply_undo(read()).expect("undo");
+    missing_redo.history.redo_target = Some("missing".into());
+    assert_eq!(missing_redo.cold_reopen(), Err(Reject::MissingCommit));
+
+    let mut missing_floor = Repository::new(linear_history());
+    missing_floor.history.checkpoint_floor = Some("missing".into());
+    assert_eq!(missing_floor.cold_reopen(), Err(Reject::MissingCommit));
+
+    let mut mismatched_cursor = Repository::new(linear_history());
+    mismatched_cursor.apply_undo(read()).expect("undo");
+    mismatched_cursor.history.redo_cursor = Some("B".into());
+    assert_eq!(mismatched_cursor.cold_reopen(), Err(Reject::CursorMismatch));
+
+    let mut forged_commit = Repository::new(linear_history());
+    forged_commit.history.commits.get_mut("B").expect("B").id = "forged".into();
+    assert_eq!(forged_commit.cold_reopen(), Err(Reject::IdentityMismatch));
+}
+
+#[test]
 fn fresh_alias_raw_store_fallback_and_cache_reads_fail_closed() {
     let history = linear_history();
     let mut alias = read();
@@ -579,6 +711,10 @@ fn fresh_alias_raw_store_fallback_and_cache_reads_fail_closed() {
     let mut cache = read();
     cache.cache_authority_reads = 1;
     assert_eq!(undo_plan(&history, cache), Err(Reject::ReadView));
+
+    let mut fake = read();
+    fake.calls[0].operation = "unrelated_operation".into();
+    assert_eq!(undo_plan(&history, fake), Err(Reject::ReadView));
 }
 
 #[test]

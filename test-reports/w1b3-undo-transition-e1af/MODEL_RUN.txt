@@ -1,15 +1,15 @@
-Standalone corrected model qualification only; no Lix or adapter target was
-built or run.
+Standalone corrected v2 model qualification only; no Lix or adapter target
+was built or run.
 
 Command:
-  timeout 1200s rustc --edition=2024 --test -D warnings undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af
-  timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af --nocapture
+  timeout 1200s rustc --edition=2024 --test -D warnings undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af-correction
+  timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af-correction --nocapture
 
 Binary SHA-256:
-  4684f2749233b1015b7953b4a0c085efd0ee9a32bad226f2b8a7a5e114ff53fa
+  bcb6cebd4064dde71eb7541346e0e52091fa294c4f3393a044f716a67fb6c692
 
 Result:
-  running 9 tests
+  running 11 tests
   test absence_null_and_tombstone_are_distinct_valid_transition_values ... ok
   test fresh_alias_raw_store_fallback_and_cache_reads_fail_closed ... ok
   test duplicate_empty_missing_and_cold_reopen_fail_closed_or_preserve_state ... ok
@@ -20,5 +20,5 @@ Result:
   test undo_and_redo_preserve_exact_inverse_state_identity ... ok
   test redo_cursor_mismatch_fails_closed_without_selector_update ... ok
 
-  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   rustfmt --edition 2024 --check: PASS

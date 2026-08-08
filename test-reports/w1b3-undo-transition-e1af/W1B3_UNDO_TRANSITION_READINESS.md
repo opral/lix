@@ -1,6 +1,6 @@
-# W1b-3 undo/redo and typed-transition readiness package — exact e1af
+# W1b-3 undo/redo and typed-transition readiness package — exact e1af v2
 
-Status: corrected test/report-only successor. No production edit, Lix build,
+Status: corrected test/report-only successor v2. No production edit, Lix build,
 adapter runtime, benchmark, PR, or merge was performed. The standalone model
 is the only artifact compiled/run in this task.
 
@@ -9,7 +9,8 @@ is the only artifact compiled/run in this task.
 - Anchor commit: e1af471b9ab0f598dafa7c2ddec7867667c81740
 - Anchor tree: bfa0d271a723da8250ab76ada16fda90926f1099
 - Anchor parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
-- Source worktree: /tmp/lix-w1b3-undo-transition-e1af
+- Direct correction predecessor: fc01cd1ddb4a2b5e3ca26a55290a511be83f11c8
+- Source worktree: /tmp/lix-w1b3-correction
 - Exact production allowlist: SOURCE_ALLOWLIST.md
 - Package-only path: test-reports/w1b3-undo-transition-e1af/
 
@@ -78,8 +79,11 @@ and every chronology, marker, exact-row, delta, node, and inverse/replay helper
 call must pass `forktree_read` as an argument. `execute_typed_state_transitions`
 must receive `forktree_read: &ForkTreeReadFacade`; fresh graph/read/raw-store
 paths, aliases, fallback, retry, cache, and alternate authorities are
-forbidden. The source verifier balances function/call delimiters and checks
-these arguments, rather than accepting a token in an unrelated comment.
+forbidden. The source verifier masks comments/literals, balances
+function/call delimiters, follows the helper closure, checks exact facade
+arguments and parameters, scans added authority tokens in all allowlisted
+ForkTree paths, and rejects facade aliases or second constructors rather than
+accepting a bare token in an unrelated comment.
 
 ## Required semantic gates
 
@@ -105,11 +109,13 @@ The future candidate must preserve:
   identities.
 
 The standalone model covers inverse/redo identity, generation and first-parent
-validation, ordered floors, root/merge rejection, ordinary-commit redo
+validation, authenticated first-parent floor ancestry including sibling and
+non-ancestor rejection, root/merge rejection, ordinary-commit redo
 invalidation, explicit redo-cursor mismatch rejection, atomic
 selector/cursor rollback, stale/read/alias/raw-store/fallback/cache poisoning,
 explicit absence/NULL/tombstone, missing history, duplicate/empty identities,
-and cold reopen. Its nine tests are a contract oracle, not production
+commit map-key/record identity, malformed/missing cursor and floor state, and
+cold reopen. Its eleven tests are a contract oracle, not production
 qualification.
 
 ## Expected exact-e1af RED calibration
@@ -149,11 +155,11 @@ The standalone model and rustfmt are the only local qualification commands run
 in this task:
 
     timeout 1200s rustfmt --edition 2024 --check test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs
-    timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle
-    timeout 1200s /tmp/w1b3-undo-transition-oracle --nocapture
+    timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af-correction
+    timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af-correction --nocapture
 
-Corrected model evidence: 9/9 passed; executable SHA-256
-`4684f2749233b1015b7953b4a0c085efd0ee9a32bad226f2b8a7a5e114ff53fa`.
+Corrected model evidence: 11/11 passed; executable SHA-256
+`bcb6cebd4064dde71eb7541346e0e52091fa294c4f3393a044f716a67fb6c692`.
 The exact e1af source verifier output SHA-256 is
 `8741d99516d096b41f06813c7afdc2dc1ff74fa3b286f45cbfe81c6e2b2dc652` and
 exits 1 with the preserved four RED predicates.

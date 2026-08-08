@@ -51,9 +51,12 @@ those bodies must pass `forktree_read` in its argument list.
 
 `execute_typed_state_transitions` must receive an explicit
 `forktree_read: &ForkTreeReadFacade` argument and pass that same variable to
-all historical/state helpers. The verifier balances function and call
-parentheses before inspecting arguments; it does not accept a bare token in a
-different comment or function.
+all historical/state helpers. The verifier masks comments and literals,
+balances function and call delimiters, follows every historical helper body,
+checks each facade parameter and exact call argument, rejects facade
+aliases/clones and second constructors, and scans added reader/authority
+tokens in every allowlisted ForkTree path. It does not accept a bare token in
+a different comment or function.
 
 The exact e1af source remains RED on the original four predicates. Structural
 GREEN checks run only after those legacy-reader predicates are absent, so the
