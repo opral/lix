@@ -8,11 +8,9 @@ use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::NullableKeyFilter;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
-use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest};
 
 use super::SqlHistoryQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
@@ -377,9 +375,7 @@ where
             let history = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
                 .await?;
-            let reachable_nodes = if metadata_projection.commit_created_at
-                || query_source.certified_history_reader.is_some()
-            {
+            let reachable_nodes = if metadata_projection.commit_created_at {
                 history.reachable_nodes
             } else {
                 Arc::from([])
@@ -464,43 +460,76 @@ where
                     && request.max_depth.is_none_or(|maximum| *depth <= maximum)
             })
             .map(|(commit_id, _)| *commit_id)
-            .collect();
-        let certified_request = TrackedStateScanRequest {
-            filter: TrackedStateFilter {
-                schema_keys: request.schema_keys.clone(),
-                entity_pks: request.entity_pks.clone(),
-                file_ids: request
-                    .file_ids
-                    .iter()
-                    .cloned()
-                    .map(NullableKeyFilter::Value)
-                    .collect(),
-                include_tombstones: true,
-            },
-            read_columns: TrackedStateReadColumns {
-                columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
-            },
-            limit: None,
+            .collect::<Vec<_>>();
+        let certified_records = if certified_commit_ids.is_empty() {
+            Vec::new()
+        } else {
+            let mut guard = commit_graph.lock().await;
+            guard.load_commit_records(&certified_commit_ids).await?
         };
-        let existing_change_ids = rows
+        let mut accounts_by_commit = BTreeMap::new();
+        for (commit_id, record) in certified_commit_ids.iter().copied().zip(certified_records) {
+            let record = record.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("certified historical row references missing commit '{commit_id}'"),
+                )
+            })?;
+            if record.commit_id != commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("certified historical commit identity mismatch for '{commit_id}'"),
+                ));
+            }
+            accounts_by_commit.insert(commit_id, record.account_id);
+        }
+        let mut existing_change_ids = rows
             .iter()
             .map(|entry| entry.change.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        if let Some(certified_history_reader) = &query_source.certified_history_reader {
-            for certified in certified_history_reader
-                .scan(&certified_commit_ids, &certified_request)
-                .await?
-            {
-                if existing_change_ids.contains(&certified.change.id) {
+        for certified_commit_id in certified_commit_ids {
+            let Some((depth, commit_created_at)) = reachable_by_id.get(&certified_commit_id) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("certified commit '{certified_commit_id}' is not reachable"),
+                ));
+            };
+            let account_id = accounts_by_commit
+                .get(&certified_commit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("certified commit '{certified_commit_id}' has no account"),
+                    )
+                })?;
+            let certified_rows = query_source
+                .forktree_reader
+                .scan_state_rows_at_commit(certified_commit_id)
+                .await?;
+            for row in certified_rows {
+                if row.commit_id != certified_commit_id
+                    || !historical_row_matches_request(&row, &request)
+                {
                     continue;
                 }
-                let Some((depth, commit_created_at)) = reachable_by_id.get(&certified.commit_id)
-                else {
+                let change_id = row.change_id.to_string();
+                if !existing_change_ids.insert(change_id.clone()) {
                     continue;
-                };
+                }
                 rows.push(HistoryEntry {
-                    change: certified.change,
-                    observed_commit_id: certified.commit_id.to_string(),
+                    change: MaterializedChange {
+                        id: change_id,
+                        account_id: account_id.clone(),
+                        entity_pk: row.key.entity_pk,
+                        schema_key: row.key.schema_key,
+                        file_id: row.key.file_id,
+                        snapshot_content: row.snapshot_content,
+                        metadata: row.metadata,
+                        created_at: row.created_at.to_string(),
+                        origin_key: None,
+                    },
+                    observed_commit_id: certified_commit_id.to_string(),
                     commit_created_at: metadata_projection
                         .commit_created_at
                         .then(|| commit_created_at.clone()),
@@ -512,6 +541,21 @@ where
     }
 
     Ok(rows)
+}
+
+fn historical_row_matches_request(
+    row: &crate::forktree::HistoricalStateRow,
+    request: &CommitGraphChangeHistoryRequest,
+) -> bool {
+    (request.schema_keys.is_empty() || request.schema_keys.contains(&row.key.schema_key))
+        && (request.entity_pks.is_empty() || request.entity_pks.contains(&row.key.entity_pk))
+        && (request.file_ids.is_empty()
+            || row
+                .key
+                .file_id
+                .as_ref()
+                .is_some_and(|file_id| request.file_ids.contains(file_id)))
+        && (request.include_tombstones || !row.deleted)
 }
 
 pub(crate) fn invalid_history_anchor_error(
@@ -1191,8 +1235,8 @@ mod tests {
         let read_scope = SharedStorageAdapterRead::new(read_scope);
         HistoryQuerySource {
             store: read_scope.clone(),
-            json_reader: JsonStoreContext::new().reader(read_scope),
-            certified_history_reader: None,
+            json_reader: JsonStoreContext::new().reader(read_scope.clone()),
+            forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
             default_as_of_commit_id: default_as_of_commit_id.to_string(),
         }
     }

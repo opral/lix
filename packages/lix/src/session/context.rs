@@ -35,7 +35,7 @@ use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
+use crate::transaction::{Transaction, open_transaction};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
@@ -731,9 +731,7 @@ where
         HistoryQuerySource {
             store: self.read_store.clone(),
             json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
-            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
-                self.read_store.clone(),
-            ))),
+            forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
             default_as_of_commit_id,
         }
     }

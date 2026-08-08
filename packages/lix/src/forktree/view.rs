@@ -231,6 +231,7 @@ where
 
 /// One operation-scoped ForkTree read facade. Branch views borrow the same
 /// retained read identity; no branch or untracked traversal can refresh it.
+#[derive(Clone)]
 pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
 }

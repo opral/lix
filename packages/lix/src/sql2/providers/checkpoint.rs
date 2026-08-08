@@ -9,8 +9,6 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
-use crate::checkpoint::checkpoint_history_for_branch_forktree;
-use crate::forktree::ForkTreeReadFacade;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{HistoryRoute, parse_history_filter};
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
@@ -88,7 +86,7 @@ where
         &self,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
@@ -109,60 +107,25 @@ where
                     branch_ids,
                     depth_route,
                 ),
-                move |(active_branch_id, branch_ref, store, schema, branch_ids, depth_route)| async move {
-                    if depth_route.is_contradictory()
+                move |(
+                    _active_branch_id,
+                    _branch_ref,
+                    _store,
+                    schema,
+                    branch_ids,
+                    _depth_route,
+                )| async move {
+                    if _depth_route.is_contradictory()
                         || matches!(branch_ids, FileIdConstraint::None)
                     {
                         return CHECKPOINT_COLS
                             .build(schema, &[])
                             .map_err(checkpoint_batch_error);
                     }
-                    let heads = selected_heads(
-                        branch_ref.as_ref(),
-                        active_branch_id.as_deref(),
-                        &branch_ids,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                    let depth_scan_limit = checkpoint_depth_scan_limit(&depth_route);
-                    let provider_limit =
-                        if depth_route.min_depth.is_none() && depth_route.max_depth.is_none() {
-                            limit
-                        } else {
-                            None
-                        };
-                    let historical = ForkTreeReadFacade::new(store);
-                    let mut rows = Vec::new();
-                    for head in heads {
-                        let remaining =
-                            provider_limit.map(|limit| limit.saturating_sub(rows.len()));
-                        if remaining == Some(0) {
-                            break;
-                        }
-                        let head_scan_limit = min_optional(remaining, depth_scan_limit);
-                        for checkpoint in checkpoint_history_for_branch_forktree(
-                            &historical,
-                            &head.commit_id,
-                            &head.branch_id,
-                            head_scan_limit,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?
-                        {
-                            if !checkpoint_depth_matches(&depth_route, checkpoint.depth) {
-                                continue;
-                            }
-                            rows.push(CheckpointSqlRow {
-                                commit_id: checkpoint.commit_id.to_string(),
-                                created_at: checkpoint.created_at,
-                                branch_id: head.branch_id.clone(),
-                                depth: i64::from(checkpoint.depth),
-                            });
-                        }
-                    }
-                    CHECKPOINT_COLS
-                        .build(schema, &rows)
-                        .map_err(checkpoint_batch_error)
+                    return Err(DataFusionError::Execution(
+                        "checkpoint history is deferred until its sole ForkTree chronology owner is wired"
+                            .to_string(),
+                    ));
                 },
             ),
         })

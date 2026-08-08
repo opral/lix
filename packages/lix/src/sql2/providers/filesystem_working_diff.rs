@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::branch::BranchRefReader;
-use crate::checkpoint::checkpoint_history_for_branch_forktree;
 use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
@@ -17,7 +16,7 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde::Deserialize;
 
-use super::checkpoint::{filter_conjuncts, selected_heads};
+use super::checkpoint::filter_conjuncts;
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -103,7 +102,7 @@ where
         &self,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
@@ -121,60 +120,16 @@ where
                     route,
                     self.kind,
                 ),
-                move |(active_branch_id, branch_ref, store, schema, route, kind)| async move {
+                move |(_active_branch_id, _branch_ref, _store, schema, route, _kind)| async move {
                     if route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
                             .map_err(batch_error);
                     }
-                    let heads = selected_heads(
-                        branch_ref.as_ref(),
-                        active_branch_id.as_deref(),
-                        &route.branch_ids,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                    let historical = ForkTreeReadFacade::new(store);
-                    let mut rows = Vec::new();
-                    for head in heads {
-                        let checkpoint_id = checkpoint_history_for_branch_forktree(
-                            &historical,
-                            &head.commit_id,
-                            &head.branch_id,
-                            Some(1),
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?
-                        .into_iter()
-                        .next()
-                        .map(|checkpoint| checkpoint.commit_id)
-                        .ok_or_else(|| {
-                            datafusion::common::DataFusionError::Execution(format!(
-                                "branch '{}' has no checkpoint baseline",
-                                head.branch_id
-                            ))
-                        })?;
-                        let mut branch_rows = load_rows(
-                            &historical,
-                            &checkpoint_id.to_string(),
-                            &head.commit_id.to_string(),
-                            &head.branch_id,
-                            kind,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                        if let FileIdConstraint::Ids(ids) = &route.ids {
-                            branch_rows.retain(|row| ids.contains(&row.id));
-                        }
-                        rows.extend(branch_rows);
-                        if limit.is_some_and(|limit| rows.len() >= limit) {
-                            rows.truncate(limit.unwrap_or(0));
-                            break;
-                        }
-                    }
-                    FILESYSTEM_WORKING_DIFF_COLS
-                        .build(schema, &rows)
-                        .map_err(batch_error)
+                    return Err(datafusion::common::DataFusionError::Execution(
+                        "filesystem working-diff checkpoint baseline is deferred until its sole ForkTree chronology owner is wired"
+                            .to_string(),
+                    ));
                 },
             ),
         })

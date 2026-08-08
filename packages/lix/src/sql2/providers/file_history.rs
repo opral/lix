@@ -624,7 +624,7 @@ where
     .await?;
     let parent_commit_ids_by_commit =
         load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
-    let historical = ForkTreeReadFacade::new(query_source.store.clone());
+    let historical = query_source.forktree_reader.clone();
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -822,7 +822,10 @@ fn prepare_file_history_rows(
             .enumerate()
             .find(|(_, descriptor)| descriptor.id == event.file_id)
         else {
-            continue;
+            return Err(invalid_file_history_state(format!(
+                "file history event for '{}' at commit '{}' has no authenticated descriptor",
+                event.file_id, event.observed_commit_id
+            )));
         };
         let directory_index = directory_indexes
             .get(event.observed_commit_id.as_str())
@@ -1243,31 +1246,36 @@ where
         },
     )
     .await?;
-    let snapshot = rows
-        .iter()
-        .last()
-        .map(|observed| {
-            let row = observed.row();
-            if row.deleted() {
-                Ok(None)
-            } else {
-                row.snapshot_content()
-                    .map(|snapshot| {
-                        serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
-                                ),
-                            )
-                        })
-                    })
-                    .transpose()
-            }
-        })
-        .transpose()?
-        .flatten();
-    PluginRegistry::from_optional_snapshot(snapshot.as_ref())
+    let observed = rows.iter().next().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "lix_file_history plugin registry row is missing at observed commit '{observed_commit_id}'"
+        ))
+    })?;
+    if rows.iter().nth(1).is_some() {
+        return Err(invalid_file_history_state(format!(
+            "lix_file_history plugin registry has duplicate authenticated rows at observed commit '{observed_commit_id}'"
+        )));
+    }
+    let row = observed.row();
+    if row.deleted() {
+        return Err(invalid_file_history_state(format!(
+            "lix_file_history plugin registry row is deleted at observed commit '{observed_commit_id}'"
+        )));
+    }
+    let snapshot = row.snapshot_content().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "lix_file_history plugin registry row is not an authenticated value at observed commit '{observed_commit_id}'"
+        ))
+    })?;
+    let snapshot = serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
+            ),
+        )
+    })?;
+    PluginRegistry::from_optional_snapshot(Some(&snapshot))
 }
 
 async fn load_file_history_filesystem_entries<S>(
@@ -1393,8 +1401,8 @@ where
         })
         .await?;
     Ok((
-        parse_file_history_plugin_state(&event_entries),
-        parse_file_history_plugin_state(&context_entries),
+        parse_file_history_plugin_state(&event_entries)?,
+        parse_file_history_plugin_state(&context_entries)?,
     ))
 }
 
@@ -1799,9 +1807,10 @@ fn parse_file_history_descriptors(
         .iter()
         .filter(|entry| entry.change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDescriptorRecord {
-                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    id: row_id,
                     entry: entry.clone(),
                 });
             };
@@ -1812,8 +1821,14 @@ fn parse_file_history_descriptors(
                         format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "file descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryDescriptorRecord {
-                id: snapshot.id,
+                id: row_id,
                 entry: entry.clone(),
             })
         })
@@ -1827,9 +1842,10 @@ fn parse_file_history_directories(
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDirectoryRecord {
-                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    id: row_id,
                     parent_id: None,
                     name: None,
                     entry: entry.clone(),
@@ -1842,8 +1858,14 @@ fn parse_file_history_directories(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryDirectoryRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 entry: entry.clone(),
@@ -1859,15 +1881,10 @@ fn parse_file_history_blobs(
         .iter()
         .filter(|entry| entry.change.schema_key == BLOB_REF_SCHEMA_KEY)
         .map(|entry| {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryBlobRecord {
-                    file_id: entry.change.file_id.clone().unwrap_or_else(|| {
-                        entry
-                            .change
-                            .entity_pk
-                            .as_single_string_owned()
-                            .expect("canonical change entity primary key should project")
-                    }),
+                    file_id: entry.change.file_id.clone().unwrap_or_else(|| row_id.clone()),
                     entry: entry.clone(),
                 });
             };
@@ -1878,15 +1895,29 @@ fn parse_file_history_blobs(
                         format!("invalid lix_binary_blob_ref history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id
+                || entry
+                    .change
+                    .file_id
+                    .as_deref()
+                    .is_some_and(|file_id| file_id != snapshot.id)
+            {
+                return Err(invalid_file_history_state(format!(
+                    "blob reference payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryBlobRecord {
-                file_id: entry.change.file_id.clone().unwrap_or(snapshot.id),
+                file_id: entry.change.file_id.clone().unwrap_or(row_id),
                 entry: entry.clone(),
             })
         })
         .collect()
 }
 
-fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryPluginStateRecord> {
+fn parse_file_history_plugin_state(
+    entries: &[HistoryEntry],
+) -> Result<Vec<FileHistoryPluginStateRecord>, LixError> {
     entries
         .iter()
         .filter(|entry| {
@@ -1895,9 +1926,15 @@ fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryP
                 FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY
             )
         })
-        .filter_map(|entry| {
-            Some(FileHistoryPluginStateRecord {
-                file_id: entry.change.file_id.clone()?,
+        .map(|entry| {
+            let file_id = entry.change.file_id.clone().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "plugin history row at commit '{}' is missing file_id",
+                    entry.observed_commit_id
+                ))
+            })?;
+            Ok(FileHistoryPluginStateRecord {
+                file_id,
                 entry: entry.clone(),
             })
         })
@@ -1936,9 +1973,10 @@ fn parse_file_history_observed_descriptors(
         .map(|observed| {
             let _ = observed.observed_commit_id();
             let row = observed.row();
+            let row_id = row.entity_pk().as_single_string_owned()?;
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(FileHistoryObservedDescriptorRecord {
-                    id: row.entity_pk().as_single_string_owned()?,
+                    id: row_id,
                     directory_id: None,
                     name: None,
                     row: observed.ordinal(),
@@ -1951,8 +1989,14 @@ fn parse_file_history_observed_descriptors(
                         format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "observed file descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryObservedDescriptorRecord {
-                id: snapshot.id,
+                id: row_id,
                 directory_id: snapshot.directory_id,
                 name: Some(snapshot.name),
                 row: observed.ordinal(),
@@ -1968,9 +2012,10 @@ fn parse_file_history_observed_directories(
         .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|observed| {
             let row = observed.row();
+            let row_id = row.entity_pk().as_single_string_owned()?;
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(FileHistoryObservedDirectoryRecord {
-                    id: row.entity_pk().as_single_string_owned()?,
+                    id: row_id,
                     parent_id: None,
                     name: None,
                     row: observed.ordinal(),
@@ -1983,8 +2028,14 @@ fn parse_file_history_observed_directories(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "observed directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryObservedDirectoryRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 row: observed.ordinal(),
@@ -2000,16 +2051,10 @@ fn parse_file_history_observed_blobs(
         .filter(|observed| observed.row().schema_key() == BLOB_REF_SCHEMA_KEY)
         .map(|observed| {
             let row = observed.row();
-            let fallback_file_id = || {
-                row.file_id().map(str::to_owned).unwrap_or_else(|| {
-                    row.entity_pk()
-                        .as_single_string_owned()
-                        .expect("canonical change entity primary key should project")
-                })
-            };
+            let row_id = row.entity_pk().as_single_string_owned()?;
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(FileHistoryObservedBlobRecord {
-                    file_id: fallback_file_id(),
+                    file_id: row.file_id().map(str::to_owned).unwrap_or(row_id),
                     blob_hash: None,
                     row: observed.ordinal(),
                 });
@@ -2021,8 +2066,15 @@ fn parse_file_history_observed_blobs(
                         format!("invalid lix_binary_blob_ref history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id || row.file_id().is_some_and(|file_id| file_id != snapshot.id)
+            {
+                return Err(invalid_file_history_state(format!(
+                    "observed blob reference payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryObservedBlobRecord {
-                file_id: row.file_id().map(str::to_owned).unwrap_or(snapshot.id),
+                file_id: row.file_id().map(str::to_owned).unwrap_or(row_id),
                 blob_hash: Some(snapshot.blob_hash),
                 row: observed.ordinal(),
             })

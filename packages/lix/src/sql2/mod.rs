@@ -43,12 +43,11 @@ pub(crate) use catalog::{
     EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
     entity_visible_fields,
 };
-pub(crate) use change_materialization::MaterializedChange;
 pub(crate) use context::{
-    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
-    DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader, WriteContextLiveStateReader,
+    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
+    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
+    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
+    WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use entity_columnar_layout::{

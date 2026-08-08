@@ -30,8 +30,8 @@ use crate::catalog::{
     stage_catalog_revision,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId,
-    CommitLoadRequest, load_change_records, materialize_known_change_payloads,
+    ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
+    materialize_known_change_payloads,
 };
 use crate::checkpoint::{
     CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head, checkpoint_marker_stage_row,
@@ -84,10 +84,9 @@ use crate::session::{
     encode_receipt,
 };
 use crate::sql2::{
-    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
-    HistoryQuerySource, MaterializedChange, SessionFileViewKey, SessionFileViewMutation,
-    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource,
+    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SessionFileViewKey,
+    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -100,7 +99,7 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
-    TrackedStateScanRequest, TrackedStateStoreReader,
+    TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -124,90 +123,6 @@ use crate::transaction::types::{
     TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
-pub(crate) struct CertifiedHistoryStoreReader<S> {
-    store: S,
-}
-
-impl<S> CertifiedHistoryStoreReader<S> {
-    pub(crate) const fn new(store: S) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait]
-impl<S> CertifiedHistoryReader for CertifiedHistoryStoreReader<S>
-where
-    S: StorageAdapterRead + Send + Sync,
-{
-    async fn scan(
-        &self,
-        commit_ids: &BTreeSet<CommitId>,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<CertifiedHistoryChange>, LixError> {
-        let rows = crate::live_state::scan_certified_history_rows(&self.store, commit_ids, request)
-            .await?;
-        // Certified rows may use generated IDs that intentionally have no
-        // standalone or packed change record. Their embedded commit is the
-        // immutable authoring authority and survives inherited manifests.
-        let commit_ids = rows
-            .iter()
-            .filter_map(|row| row.commit_id)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let records = ChangelogContext::new()
-            .reader(&self.store)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &commit_ids,
-            })
-            .await?;
-        let accounts_by_commit = records
-            .into_iter()
-            .map(|(commit_id, record)| {
-                record
-                    .map(|record| (*commit_id, record.account_id))
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "certified historical row references missing commit '{commit_id}'"
-                            ),
-                        )
-                    })
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        let mut changes = Vec::with_capacity(rows.len());
-        for row in rows {
-            let (Some(commit_id), Some(change_id)) = (row.commit_id, row.change_id) else {
-                continue;
-            };
-            let account_id = accounts_by_commit
-                .get(&commit_id)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("certified historical row references missing commit '{commit_id}'"),
-                    )
-                })?
-                .clone();
-            changes.push(CertifiedHistoryChange {
-                commit_id,
-                change: MaterializedChange {
-                    id: change_id.to_string(),
-                    account_id,
-                    entity_pk: row.entity_pk,
-                    schema_key: row.schema_key,
-                    file_id: row.file_id,
-                    snapshot_content: row.snapshot_content,
-                    metadata: row.metadata,
-                    created_at: row.created_at.to_string(),
-                    origin_key: None,
-                },
-            });
-        }
-        Ok(changes)
-    }
-}
 use crate::transaction::validation::{
     TransactionValidationInput, fresh_plugin_file_import_certificate,
     prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
@@ -8324,9 +8239,7 @@ where
         HistoryQuerySource {
             store: self.read_store.clone(),
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
-            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
-                self.read_store.clone(),
-            ))),
+            forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
             default_as_of_commit_id,
         }
     }

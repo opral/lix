@@ -3371,8 +3371,8 @@ mod tests {
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             HistoryQuerySource {
                 store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope),
-                certified_history_reader: None,
+                json_reader: JsonStoreContext::new().reader(read_scope.clone()),
+                forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
                 default_as_of_commit_id,
             }
         }

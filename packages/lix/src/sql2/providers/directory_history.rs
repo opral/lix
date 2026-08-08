@@ -276,7 +276,7 @@ where
         })
         .collect::<Vec<_>>();
     observed_commit_ids.extend(direct_parent_commit_ids);
-    let historical = ForkTreeReadFacade::new(query_source.store.clone());
+    let historical = query_source.forktree_reader.clone();
     let observed_states =
         load_directory_history_observed_states(&historical, observed_commit_ids).await?;
     let events = grouped_directory_history_events(
@@ -302,7 +302,13 @@ where
             .enumerate()
             .find(|(_, descriptor)| descriptor.id == event.directory_id)
         else {
-            continue;
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "lix_directory_history event for '{}' at commit '{}' has no authenticated descriptor",
+                    event.directory_id, event.observed_commit_id
+                ),
+            ));
         };
         let path = if visible_descriptor.name.is_some() {
             resolve_observed_directory_path(
@@ -422,9 +428,10 @@ fn parse_directory_history_observed_records(
         .map(|observed| {
             let _ = observed.observed_commit_id();
             let row = observed.row();
+            let row_id = row.entity_pk().as_single_string_owned()?;
             let Some(snapshot_content) = row.snapshot_content() else {
                 return Ok(DirectoryHistoryObservedRecord {
-                    id: row.entity_pk().as_single_string_owned()?,
+                    id: row_id,
                     parent_id: None,
                     name: None,
                     row: observed.ordinal(),
@@ -437,8 +444,17 @@ fn parse_directory_history_observed_records(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "observed directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                        snapshot.id, row_id
+                    ),
+                ));
+            }
             Ok(DirectoryHistoryObservedRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 row: observed.ordinal(),
@@ -454,9 +470,10 @@ fn parse_directory_history_records(
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(DirectoryHistoryRecord {
-                    id: entry.change.entity_pk.as_single_string_owned()?,
+                    id: row_id,
                     parent_id: None,
                     name: None,
                     entry: entry.clone(),
@@ -469,8 +486,17 @@ fn parse_directory_history_records(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                        snapshot.id, row_id
+                    ),
+                ));
+            }
             Ok(DirectoryHistoryRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 entry: entry.clone(),

@@ -182,11 +182,11 @@ where
                     }
                     let mut rows = Vec::with_capacity(by_key.len());
                     for (_key, (before, after)) in by_key {
-                        if before.as_ref().is_some_and(|row| {
-                            row.key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
-                                || row.key.schema_key
-                                    == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-                        }) {
+                        if before
+                            .as_ref()
+                            .or(after.as_ref())
+                            .is_some_and(|row| is_internal_marker_schema(&row.key.schema_key))
+                        {
                             continue;
                         }
                         let kind = match (before.as_ref(), after.as_ref()) {
@@ -277,6 +277,11 @@ fn diff_row_matches(row: &HistoricalStateRow, filter: &TrackedStateFilter) -> bo
             }))
 }
 
+fn is_internal_marker_schema(schema_key: &str) -> bool {
+    schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
+        || schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+}
+
 fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<String>> {
     match exact_string_column_constraint_from_filters(conjuncts, column) {
         Ok(FileIdConstraint::All) | Err(_) => None,
@@ -340,5 +345,19 @@ fn diff_batch_error(error: ColumnTableError) -> DataFusionError {
             DataFusionError::from(error)
         }
         ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_internal_marker_schema;
+    use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
+    use crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY;
+
+    #[test]
+    fn internal_markers_are_suppressed_when_present_only_after() {
+        assert!(is_internal_marker_schema(CHECKPOINT_MARKER_SCHEMA_KEY));
+        assert!(is_internal_marker_schema(UNDO_REDO_MARKER_SCHEMA_KEY));
+        assert!(!is_internal_marker_schema("lix_file_descriptor"));
     }
 }
