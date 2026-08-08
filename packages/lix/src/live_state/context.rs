@@ -5,26 +5,23 @@ use crate::LixError;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
 };
 use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateExactBatch,
-    MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateBatch, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateContext;
 #[cfg(test)]
 use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns};
 use async_trait::async_trait;
-use bytes::Bytes;
 use std::sync::Mutex as StdMutex;
 
-use super::derived::request_may_include_derived;
 const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
 type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
@@ -155,78 +152,6 @@ where
             .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
             .prepare_packed_identity_membership(branch_id, control.tracked_generation, schema_key)
             .await
-    }
-
-    /// Returns raw current-state snapshot bytes for one current SQL entity scan.
-    ///
-    /// `None` means the normal materialized visibility path remains
-    /// authoritative: a global branch projection, multiple result branch
-    /// scopes, or commit-derived state all require its full visibility
-    /// semantics.
-    pub(crate) async fn scan_direct_entity_snapshots(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        let Some(rows) = self.scan_direct_entity_rows(request).await? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            rows.into_iter()
-                .map(|row| match row.value.cell {
-                    crate::forktree::StateCell::Value(value) => Some(value.into_bytes()),
-                    crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
-                        None
-                    }
-                })
-                .collect(),
-        ))
-    }
-
-    /// Returns committed entity identities under the same narrow visibility
-    /// proof as [`Self::scan_direct_entity_snapshots`].  The packed reader
-    /// still resolves the authoritative current rows; callers may avoid JSON
-    /// decoding only when their projected SQL fields are exact key components.
-    pub(crate) async fn scan_direct_entity_primary_keys(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        let Some(rows) = self.scan_direct_entity_rows(request).await? else {
-            return Ok(None);
-        };
-        rows.into_iter()
-            .map(|row| crate::forktree::decode_state_key(&row.encoded_key).map(|key| key.entity_pk))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
-    }
-
-    async fn scan_direct_entity_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Option<Vec<crate::forktree::VisibleStateRow>>, LixError> {
-        if request.filter.untracked.is_some()
-            || request_may_include_derived(request)
-            || request.filter.constraints.len() > 0
-            || request.filter.file_ids.len() > 0
-            || request.filter.include_tombstones
-            || !matches!(request.filter.rows, LiveStateRowFilter::All)
-        {
-            return Ok(None);
-        }
-        let [schema_key] = request.filter.schema_keys.as_slice() else {
-            return Ok(None);
-        };
-        let [branch_id] = request.filter.branch_ids.as_slice() else {
-            return Ok(None);
-        };
-        let rows = crate::forktree::ForkTreeReadFacade::new(&self.store)
-            .scan_entity_rows(
-                branch_id,
-                schema_key,
-                &request.filter.entity_pks,
-                request.limit,
-            )
-            .await?;
-        Ok(Some(rows))
     }
 
     pub(crate) async fn scan_batch(

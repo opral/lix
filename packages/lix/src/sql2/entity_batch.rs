@@ -1,10 +1,8 @@
-//! Direct current-state snapshot serving for current SQL entity scans.
+//! Terminal SQL projections over the canonical live-state scan.
 //!
-//! The generic live-state reader intentionally exposes fully materialized
-//! engine rows. The committed current-state index has a narrower, private capability:
-//! it can serve durable snapshot bytes directly. Arrow providers and native
-//! public-result reads consume those same bytes, keeping visibility proof in
-//! one place and leaving every unsupported shape on the established row path.
+//! The entity capability does not own a storage/index read. It asks the
+//! operation-owned `LiveStateReader::scan_batch` for the visible rows once and
+//! projects that authenticated batch into snapshot bytes or primary keys.
 
 use std::sync::Arc;
 
@@ -13,18 +11,15 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{LiveStateContext, LiveStateRowFilter, LiveStateScanRequest};
+use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateScanRequest};
 use crate::storage_adapter::StorageAdapterRead;
 
-/// Optional private capability supplied only by committed read sessions.
+/// Optional private capability supplied by a SQL execution context.
 ///
-/// Returning `None` is the normal conservative answer: generic contexts,
-/// transaction-local staged state, retention-scoped reads, and unsupported
-/// SQL shapes all retain the existing materialized-row implementation. A
-/// successful result has one entry per live current-state member, ordered by
-/// logical entity primary key ascending. File-backed members sharing a
-/// primary key remain separate adjacent entries; a caller that relies on a
-/// stronger tie order must retain the general SQL path.
+/// The production implementation is only a terminal projection: it performs
+/// one canonical `LiveStateReader::scan_batch` and returns no storage handle,
+/// alternate visibility result, or legacy DTO. `None` remains available for
+/// contexts that do not provide this capability.
 #[async_trait]
 pub(crate) trait EntitySnapshotReader: Send + Sync {
     async fn scan_entity_snapshots(
@@ -64,38 +59,138 @@ where
         &self,
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        if !direct_entity_snapshot_request(&request) {
-            return Ok(None);
-        }
-        self.live_state
-            .reader(self.store.clone())
-            .scan_direct_entity_snapshots(&request)
-            .await
+        let reader = self.live_state.reader(self.store.clone());
+        Ok(Some(
+            canonical_snapshot_projection(&reader, &request).await?,
+        ))
     }
 
     async fn scan_entity_primary_keys(
         &self,
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
-        if !direct_entity_snapshot_request(&request) {
-            return Ok(None);
-        }
-        self.live_state
-            .reader(self.store.clone())
-            .scan_direct_entity_primary_keys(&request)
-            .await
+        let reader = self.live_state.reader(self.store.clone());
+        Ok(Some(
+            canonical_primary_key_projection(&reader, &request).await?,
+        ))
     }
 }
 
-/// The raw snapshot plane is deliberately narrower than the general
-/// live-state reader. It has no identity/filter evaluator beyond exact entity
-/// PKs, so only a no-tombstone request without file or residual constraints
-/// can use it. Both Arrow and public-result consumers add their own
-/// output-shape checks above this shared serving boundary.
-fn direct_entity_snapshot_request(request: &LiveStateScanRequest) -> bool {
-    matches!(request.filter.rows, LiveStateRowFilter::All)
-        && !request.filter.include_tombstones
-        && request.filter.untracked.is_none()
-        && request.filter.file_ids.is_empty()
-        && request.filter.constraints.is_empty()
+async fn canonical_snapshot_projection<R>(
+    reader: &R,
+    request: &LiveStateScanRequest,
+) -> Result<Vec<Option<Bytes>>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    Ok(reader
+        .scan_batch(request)
+        .await?
+        .into_identity_ordered_snapshots())
+}
+
+async fn canonical_primary_key_projection<R>(
+    reader: &R,
+    request: &LiveStateScanRequest,
+) -> Result<Vec<EntityPk>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    Ok(reader
+        .scan_batch(request)
+        .await?
+        .into_identity_ordered_primary_keys())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
+    use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingCanonicalReader {
+        rows: MaterializedLiveStateBatch,
+        scans: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for CountingCanonicalReader {
+        async fn scan_batch(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            Ok(self.rows.clone())
+        }
+
+        async fn load_exact_batch(
+            &self,
+            _request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "test reader does not provide exact rows",
+            ))
+        }
+    }
+
+    fn mixed_retention_rows() -> MaterializedLiveStateBatch {
+        MaterializedLiveStateBatch::from_rows(vec![
+            row("b", "tracked", false),
+            row("a", "untracked", true),
+        ])
+    }
+
+    fn row(entity_pk: &str, value: &str, untracked: bool) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
+            entity_pk: EntityPk::single(entity_pk),
+            schema_key: "entity".to_string(),
+            file_id: None,
+            snapshot_content: Some(format!(r#"{{"value":"{value}"}}"#).into()),
+            metadata: None,
+            deleted: false,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00Z"),
+            global: false,
+            change_id: Some(ChangeId::for_test_label("change")),
+            commit_id: Some(CommitId::for_test_label("commit")),
+            untracked,
+            branch_id: "branch".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_projections_use_one_canonical_scan_for_mixed_retention() {
+        let reader = CountingCanonicalReader {
+            rows: mixed_retention_rows(),
+            scans: AtomicUsize::new(0),
+        };
+        let snapshots = canonical_snapshot_projection(&reader, &LiveStateScanRequest::default())
+            .await
+            .expect("canonical snapshot projection should succeed");
+        assert_eq!(reader.scans.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            snapshots,
+            vec![
+                Some(Bytes::from(r#"{"value":"untracked"}"#)),
+                Some(Bytes::from(r#"{"value":"tracked"}"#)),
+            ]
+        );
+
+        let reader = CountingCanonicalReader {
+            rows: mixed_retention_rows(),
+            scans: AtomicUsize::new(0),
+        };
+        let primary_keys =
+            canonical_primary_key_projection(&reader, &LiveStateScanRequest::default())
+                .await
+                .expect("canonical primary-key projection should succeed");
+        assert_eq!(reader.scans.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary_keys,
+            vec![EntityPk::single("a"), EntityPk::single("b")]
+        );
+    }
 }
