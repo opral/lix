@@ -230,6 +230,22 @@ else
   fail marker-root-oracle
 fi
 
+# Function-scoped proof: token presence is insufficient because two providers
+# can carry identically named fields while binding different read instances,
+# or call a name-only fake chronology seam.  The executable verifier checks
+# the actual provider binding/call body and runs positive plus three negative
+# fixtures (distinct view, fresh acquisition, fake seam).
+structural_proof="$candidate_root/$package_rel/structural_view_proof.py"
+if python3 "$structural_proof" "$candidate_root" \
+    --fixture-root "$candidate_root/$package_rel/fixtures/positive" \
+    --fixture-root "$candidate_root/$package_rel/fixtures/distinct_views" \
+    --fixture-root "$candidate_root/$package_rel/fixtures/independent_acquisition" \
+    --fixture-root "$candidate_root/$package_rel/fixtures/fake_seam"; then
+  pass structural-shared-view-proof
+else
+  fail structural-shared-view-proof
+fi
+
 # Exactly one retained ForkTree-owned chronology seam is required. The name is
 # intentionally contract-level: a successor may use either chronology or
 # checkpoint wording, but it must be a production function under forktree.

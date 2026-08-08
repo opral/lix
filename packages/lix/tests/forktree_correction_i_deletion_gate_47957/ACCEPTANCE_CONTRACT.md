@@ -49,6 +49,12 @@ Correction I passes only when all of the following are true:
     scan closures must consume that field; neither may call `begin_read` or
     construct a local ForkTree reader. This is the structural shared-view
     identity proof.
+11. The executable `structural_view_proof.py` must pass its positive fixture and
+    reject the distinct-view, fresh-acquisition, and fake-seam fixtures. It
+    parses function and struct bodies, records the right-hand side of each
+    provider binding, resolves chronology calls against actual definitions
+    under `forktree/`, and compares both provider call chains. A matching field
+    name or chronology substring alone is not evidence of shared identity.
 
 ## Exact 479 calibration
 
@@ -80,3 +86,13 @@ oracle and static source/diff checks.
 The intended future order is: source ownership/deletion proof; marker/root
 oracle; normalized compiler delta; only after those pass, separate Memory,
 RocksDB, and SlateDB semantic/runtime qualification by the owning lane.
+
+## Structural proof evidence
+
+The verifier is report-only and performs no build or runtime action. It emits a
+function-scoped trace for each provider binding and chronology call. Its
+fixtures are deliberately adversarial: `distinct_views` binds the working
+diff to another view, `independent_acquisition` constructs a fresh reader from
+storage, and `fake_seam` calls an undeclared name that merely resembles a
+checkpoint seam. The 479 calibration is expected to remain RED because its
+providers are still deferred and no production ForkTree chronology seam exists.
