@@ -1027,7 +1027,9 @@ mod tests {
             PublicCatalog::from_visible_schemas(&[schema.clone()]).expect("catalog should build");
         let _spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
         let session = SessionContext::new();
-        entity::register_entity_providers(
+        entity::register_entity_providers::<
+            crate::storage_adapter::SharedStorageAdapterRead<crate::storage::MemoryRead>,
+        >(
             &session,
             "01920000-0000-7000-8000-0000000000a1",
             Arc::new(EmptyLiveStateReader),

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
-    ReadOptions, ScanCursor, SpaceId, Storage, StorageError, StorageRead, WriteOptions,
+    ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix::{ObserveEvent, Value};
 use serde_json::json;
@@ -1168,7 +1168,7 @@ impl StorageRead for CountingRead {
 
 impl CountingRead {
     fn count_user_read(&self, space: lix::storage::StorageSpace) {
-        if space.id == SpaceId(0x0007_0001) {
+        if space.id() == 0x0007_0001 {
             self.mutation_revision_read_count
                 .fetch_add(1, Ordering::SeqCst);
         } else if !self.counted.swap(true, Ordering::SeqCst) {

@@ -597,7 +597,7 @@ mod tests {
     use crate::storage::{
         BeginScanOptions, GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory,
         ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError,
-        StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+        StorageRead, StorageSpace, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
     };
 
     #[tokio::test]

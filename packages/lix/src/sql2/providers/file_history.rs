@@ -3171,7 +3171,7 @@ mod tests {
             ),
         );
         file.change.file_id = Some("01920000-0000-7000-8000-0000000000b2".to_string());
-        assert!(parse_file_history_descriptors(&[file]).is_err());
+        assert!(super::parse_file_history_descriptors(&[file]).is_err());
 
         let directory_id = "01920000-0000-7000-8000-0000000000b2";
         let mut directory = history_entry(
@@ -3188,7 +3188,7 @@ mod tests {
         );
         directory.change.schema_key = super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string();
         directory.change.file_id = Some(file_id.to_string());
-        assert!(parse_file_history_directories(&[directory]).is_err());
+        assert!(super::parse_file_history_directories(&[directory]).is_err());
     }
 
     #[test]

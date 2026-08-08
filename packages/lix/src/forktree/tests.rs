@@ -189,7 +189,7 @@ async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry
     writes.put(
         OBJECT_SPACE,
         remapped_source_object_id.as_bytes().to_vec(),
-        remapped_source_bytes,
+        remapped_source_bytes.to_vec(),
     );
     for (object_id, bytes) in remapped_catalog.objects.iter() {
         writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
@@ -1455,8 +1455,9 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         member_object_reads: Arc::clone(&member_object_reads),
     };
     let mut graph = CommitGraphContext::new().reader(read);
+    let sibling_ids = [public_commit_id(0x52), public_commit_id(0x53)];
     let siblings = graph
-        .load_nodes(&[public_commit_id(0x52), public_commit_id(0x53)])
+        .load_nodes(&sibling_ids)
         .await
         .expect("shared-parent sibling batch");
     assert!(siblings.into_iter().all(|(_, node)| node.is_some()));
