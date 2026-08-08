@@ -8,7 +8,17 @@ use crate::storage::{Precondition, StorageError};
 pub const MAX_SCAN_PAGE_ROWS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SpaceId(pub u32);
+pub struct SpaceId(u32);
+
+impl SpaceId {
+    pub(crate) const fn engine_declared(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
 
 /// Engine-declared mutation semantics for one logical storage space.
 ///
@@ -24,27 +34,42 @@ pub enum ValueSemantics {
 /// A logical ordered-key space and the value semantics Lix guarantees for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageSpace {
-    pub id: SpaceId,
-    pub name: &'static str,
-    pub value_semantics: ValueSemantics,
+    id: SpaceId,
+    name: &'static str,
+    value_semantics: ValueSemantics,
+    _brand: private::EngineDeclared,
 }
 
 impl StorageSpace {
-    pub const fn mutable(id: SpaceId, name: &'static str) -> Self {
+    pub(crate) const fn engine_declared(
+        id: u32,
+        name: &'static str,
+        value_semantics: ValueSemantics,
+    ) -> Self {
         Self {
-            id,
+            id: SpaceId::engine_declared(id),
             name,
-            value_semantics: ValueSemantics::Mutable,
+            value_semantics,
+            _brand: private::EngineDeclared,
         }
     }
 
-    pub const fn immutable(id: SpaceId, name: &'static str) -> Self {
-        Self {
-            id,
-            name,
-            value_semantics: ValueSemantics::Immutable,
-        }
+    pub const fn id(self) -> u32 {
+        self.id.value()
     }
+
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub const fn value_semantics(self) -> ValueSemantics {
+        self.value_semantics
+    }
+}
+
+mod private {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub(super) struct EngineDeclared;
 }
 
 impl fmt::Display for StorageSpace {

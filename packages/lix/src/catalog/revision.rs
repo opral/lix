@@ -3,11 +3,14 @@ use bytes::Bytes;
 use crate::LixError;
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageProjectedValue, StorageSpace, StorageValue, StorageWriteSet,
 };
 
-const CATALOG_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0007_0003), "catalog.schema_revision");
+const CATALOG_REVISION_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0007_0003,
+    "catalog.schema_revision",
+    crate::storage::ValueSemantics::Mutable,
+);
 const CATALOG_REVISION_KEY: &[u8] = b"global";
 
 /// Storage-snapshot identity for the visible registered-schema catalog.

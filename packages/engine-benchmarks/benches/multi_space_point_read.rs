@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lix::storage::{
-    GetManyRequest, GetOptions, Key, PutBatch, PutEntry, ReadOptions, SpaceId, Storage,
-    StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+    GetManyRequest, GetOptions, Key, PutBatch, PutEntry, ReadOptions, Storage, StorageRead,
+    StorageWrite, StoredValue, ValueSemantics, WriteOptions,
 };
+use lix::storage_bench::synthetic_space_for_bench;
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -50,9 +51,9 @@ where
         .iter()
         .enumerate()
         .map(|(space, keys)| GetManyRequest {
-            space: StorageSpace::mutable(
-                SpaceId(u32::try_from(space).expect("space index fits u32") + 1),
-                "bench.multi_space_point_read",
+            space: synthetic_space_for_bench(
+                u16::try_from(space).expect("space index fits u16") + 32,
+                ValueSemantics::Mutable,
             ),
             keys,
             opts: GetOptions::default(),

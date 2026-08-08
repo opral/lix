@@ -1,16 +1,16 @@
 use bytes::Bytes;
-use lix::storage::{Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, SpaceId, Storage};
+use lix::storage::{Key, MAX_SCAN_PAGE_ROWS, ProjectedValue, Storage, ValueSemantics};
 use lix::storage_adapter::{
     PointReadPlan, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions,
     StorageCoreProjection, StorageGetOptions, StoragePrefix, StorageReadOptions, StorageSpace,
     StorageValue, StorageWriteOptions, StorageWriteSetStats,
 };
+use lix::storage_bench::synthetic_space_for_bench;
 
 use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};
 
-const ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0002_0001), "tracked_state.crud.row.v1");
+const ROW_SPACE: StorageSpace = synthetic_space_for_bench(7, ValueSemantics::Mutable);
 
 #[derive(Clone)]
 struct BenchRow {
@@ -463,8 +463,8 @@ where
     }
 
     vec![KvLayoutAccounting {
-        space_id: ROW_SPACE.id.0,
-        space: ROW_SPACE.name,
+        space_id: ROW_SPACE.id(),
+        space: ROW_SPACE.name(),
         rows,
         key_bytes,
         value_bytes,

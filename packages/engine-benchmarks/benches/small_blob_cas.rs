@@ -3,15 +3,16 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lix::storage::ValueSemantics;
 use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, Precondition, ProjectedValue, PutBatch,
-    PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageSpace, StorageWrite,
-    StoredValue, WriteOptions,
+    PutEntry, ReadDurability, ReadOptions, Storage, StorageSpace, StorageWrite, StoredValue,
+    WriteOptions,
 };
 use lix::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix::storage_bench::{
     binary_cas_write_accounting, layout_accounting, read_binary_cas_for_bench,
-    reset_binary_cas_write_accounting, write_binary_cas_for_bench,
+    reset_binary_cas_write_accounting, synthetic_space_for_bench, write_binary_cas_for_bench,
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -30,14 +31,12 @@ const OPERATIONS: &[Operation] = &[
 ];
 const DEFAULT_WARMUPS: usize = 20;
 const DEFAULT_SAMPLES: usize = 200;
-const DIRECT_SINGLETON_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x00ff_0002), "bench.direct_singleton");
-const DIRECT_BATCH_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x00ff_0004), "bench.direct_batch");
+const DIRECT_SINGLETON_SPACE: StorageSpace = synthetic_space_for_bench(2, ValueSemantics::Mutable);
+const DIRECT_BATCH_SPACE: StorageSpace = synthetic_space_for_bench(4, ValueSemantics::Mutable);
 const DIRECT_BATCH_KEYS: usize = 1024;
 const DIRECT_BATCH_KEY_SUFFIX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
 const DIRECT_PRECONDITION_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x00ff_0005), "bench.direct_precondition");
+    synthetic_space_for_bench(5, ValueSemantics::Mutable);
 const DIRECT_PRECONDITION_VALUE: &[u8] = b"precondition-value";
 const DIRECT_IDEMPOTENCY_RECEIPT_KEY: &[u8] = b"idempotency-receipt";
 
