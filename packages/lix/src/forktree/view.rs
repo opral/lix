@@ -380,10 +380,45 @@ where
                     updated_at: value.updated_at,
                     change_id: value.change_id,
                     commit_id: value.commit_id,
+                    blob_manifest_object_ids: value.blob_manifest_object_ids,
                 }
             }));
         }
         Ok(rows)
+    }
+
+    /// Loads historical file payloads from exact state keys through this
+    /// facade's retained read. The state value, manifest edge, and payload
+    /// are authenticated together; no BlobId-only reader is involved.
+    pub(crate) async fn load_historical_blob_bytes_for_rows(
+        &self,
+        requests: &[(String, super::state::StateKey)],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
+        if requests.is_empty() {
+            return Ok(crate::binary_cas::BlobBytesBatch::new(Vec::new()));
+        }
+        let mut values = Vec::with_capacity(requests.len());
+        for (commit_id, key) in requests {
+            let commit_id =
+                crate::changelog::CommitId::parse_lix(commit_id, "historical blob commit")?;
+            let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            let value = self
+                .load_state_value_at_commit(commit_id, &encoded_key, true)
+                .await?
+                .map(|(value, _source)| value)
+                .ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "historical BlobRef state row is absent",
+                    )
+                })?;
+            values.push((key.clone(), value));
+        }
+        super::blob::load_historical_blob_bytes_for_state_values(&self.read, &values).await
     }
 
     /// Loads the state rows authored by one authenticated semantic commit.
@@ -1093,6 +1128,7 @@ mod tests {
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted,
+            blob_manifest_object_ids: Vec::new(),
         }
     }
 

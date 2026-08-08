@@ -1,6 +1,6 @@
 use crate::LixError;
 use crate::common::SharedStr;
-use crate::forktree::HistoricalStateRow;
+use crate::forktree::{HistoricalStateRow, StateKey};
 
 /// Project a single-string history entity pk as the canonical JSON array
 /// text exposed by the `lixcol_entity_pk` column.
@@ -224,5 +224,13 @@ impl<'a> HistoricalStateRowRef<'a> {
 
     pub(super) fn commit_id(self) -> crate::changelog::CommitId {
         self.row.commit_id
+    }
+
+    pub(super) fn key(self) -> &'a StateKey {
+        &self.row.key
+    }
+
+    pub(super) fn blob_manifest_object_ids(self) -> &'a [crate::forktree::ObjectId] {
+        &self.row.blob_manifest_object_ids
     }
 }

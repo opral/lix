@@ -7958,11 +7958,13 @@ where
         Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
     }
 
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(TransactionBlobDataReader {
-            base: Arc::new(self.binary_cas.reader(self.read_store.clone())),
-            staged_writes: Arc::clone(&self.staged_writes),
-        })
+    fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        Ok(Arc::new(crate::forktree::blob_reader_on_read(
+            self.read_store.clone(),
+            &self.active_branch_id,
+        )?))
     }
 
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
@@ -7971,18 +7973,6 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
-    }
-}
-
-struct TransactionBlobDataReader {
-    base: Arc<dyn BlobDataReader>,
-    staged_writes: Arc<TransactionWriteBuffer>,
-}
-
-#[async_trait]
-impl BlobDataReader for TransactionBlobDataReader {
-    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        load_transaction_blob_bytes(self.base.as_ref(), &self.staged_writes, hashes).await
     }
 }
 

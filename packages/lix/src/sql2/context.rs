@@ -101,7 +101,14 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
+    fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "authenticated ForkTree blob reader is unavailable for this SQL read context",
+        ))
+    }
     /// Loads runtime-defined SQL entity metadata when provider selection could
     /// not be satisfied entirely by compile-time system surfaces.
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;

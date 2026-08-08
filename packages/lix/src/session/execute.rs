@@ -2336,8 +2336,6 @@ where
                     > = Arc::new(self.live_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-                    let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                        Arc::new(self.binary_cas.reader(read_store.clone()));
                     let authenticated_blob_reader: Arc<
                         dyn crate::forktree::AuthenticatedBlobReader,
                     > = Arc::new(crate::forktree::blob_reader_on_read(
@@ -2351,7 +2349,7 @@ where
                                 live_state,
                                 filesystem_path_index,
                                 branch_ref,
-                                blob_reader,
+                                Arc::clone(&authenticated_blob_reader),
                                 self.plugin_host.clone(),
                                 file_view_collector.clone(),
                                 &selector,
@@ -2380,7 +2378,7 @@ where
                                 live_state,
                                 filesystem_path_index,
                                 branch_ref,
-                                blob_reader,
+                                authenticated_blob_reader,
                                 self.plugin_host.clone(),
                                 file_view_collector.clone(),
                                 &file_ids,

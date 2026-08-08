@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::binary_cas::{BlobDataReader, BlobId};
+use crate::binary_cas::BlobId;
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
@@ -77,7 +77,6 @@ pub(super) async fn register_lix_file_history_surface<S>(
     commit_graph: super::SharedCommitGraph,
     query_source: SqlChangelogQuerySource<S>,
     default_as_of_commit_id: String,
-    blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
 where
@@ -90,7 +89,6 @@ where
             commit_graph,
             query_source,
             default_as_of_commit_id,
-            blob_reader,
             plugin_host,
         }),
         WriteAccess::read_only(),
@@ -106,7 +104,6 @@ struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlChangelogQuerySource<S>,
     default_as_of_commit_id: String,
-    blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
 }
 
@@ -181,7 +178,6 @@ where
                 (
                     Arc::clone(&self.commit_graph),
                     self.query_source.clone(),
-                    Arc::clone(&self.blob_reader),
                     self.plugin_host.clone(),
                     route,
                     public_predicate,
@@ -192,7 +188,6 @@ where
                 move |(
                     commit_graph,
                     query_source,
-                    blob_reader,
                     plugin_host,
                     route,
                     public_predicate,
@@ -203,7 +198,6 @@ where
                     let mut rows = load_file_history_rows(
                         commit_graph,
                         query_source,
-                        &blob_reader,
                         &plugin_host,
                         &route,
                         &public_predicate,
@@ -611,7 +605,6 @@ struct FileHistoryPluginDiscovery {
 async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlChangelogQuerySource<S>,
-    blob_reader: &Arc<dyn BlobDataReader>,
     _plugin_host: &PluginRuntimeHost,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
@@ -767,7 +760,7 @@ where
             .chain(plugin_registry_events),
     )?;
     let prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
-    let blob_bytes = load_file_history_blob_bytes(blob_reader, &prepared).await?;
+    let blob_bytes = load_file_history_blob_bytes(&historical, &prepared).await?;
 
     let mut output = Vec::with_capacity(prepared.len());
     for prepared_row in prepared {
@@ -907,40 +900,61 @@ fn prepare_file_history_rows(
     Ok(prepared)
 }
 
-async fn load_file_history_blob_bytes(
-    blob_reader: &Arc<dyn BlobDataReader>,
+async fn load_file_history_blob_bytes<S>(
+    historical: &ForkTreeReadFacade<S>,
     rows: &[PreparedFileHistoryRow],
-) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
-    let mut hashes = BTreeMap::<BlobId, BTreeSet<String>>::new();
-    for hash in rows
-        .iter()
-        .filter(|row| row.descriptor().name.is_some())
-        .filter_map(|row| row.blob_hash.as_deref())
-    {
-        hashes
-            .entry(BlobId::from_hex(hash)?)
-            .or_default()
-            .insert(hash.to_string());
+) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut requests = Vec::new();
+    let mut hashes = Vec::new();
+    for row in rows.iter().filter(|row| row.descriptor().name.is_some()) {
+        let reference = validate_exactly_one_blob_ref(&row.observed_state, &row.event, true)?
+            .ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "file '{}' at commit '{}' has no authenticated BlobRef",
+                    row.id, row.event.observed_commit_id
+                ))
+            })?;
+        let observed = row.observed_state.rows.row(reference.row);
+        requests.push((
+            observed.observed_commit_id().to_owned(),
+            observed.row().key().clone(),
+        ));
+        hashes.push(row.blob_hash.clone().ok_or_else(|| {
+            invalid_file_history_state(format!(
+                "file '{}' at commit '{}' has no authenticated BlobId",
+                row.id, row.event.observed_commit_id
+            ))
+        })?);
     }
-    if hashes.is_empty() {
+    if requests.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let request = hashes.keys().copied().collect::<Vec<_>>();
-    let loaded = blob_reader.load_bytes_many(&request).await?.into_vec();
-    if loaded.len() != request.len() {
+    let loaded = historical
+        .load_historical_blob_bytes_for_rows(&requests)
+        .await?
+        .into_vec();
+    if loaded.len() != hashes.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "file history blob batch returned {} values for {} requested hashes",
                 loaded.len(),
-                request.len()
+                hashes.len()
             ),
         ));
     }
     let mut by_encoded_hash = BTreeMap::new();
-    for ((_, encoded_hashes), bytes) in hashes.into_iter().zip(loaded) {
-        for encoded_hash in encoded_hashes {
-            by_encoded_hash.insert(encoded_hash, bytes.clone());
+    for (encoded_hash, bytes) in hashes.into_iter().zip(loaded) {
+        if let Some(previous) = by_encoded_hash.insert(encoded_hash.clone(), bytes.clone())
+            && previous != bytes
+        {
+            return Err(invalid_file_history_state(format!(
+                "file history BlobId '{}' resolves to conflicting authenticated payloads",
+                encoded_hash
+            )));
         }
     }
     Ok(by_encoded_hash)
@@ -2524,16 +2538,14 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
     use crate::LixError;
-    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
+    use crate::binary_cas::BlobId;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::{LixTimestamp, SharedStr};
     use crate::entity_pk::EntityPk;
@@ -2552,7 +2564,7 @@ mod tests {
         FileHistoryObservedState, FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord,
         FileHistoryPublicPredicate, HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
         file_history_descriptor_blob_route, file_history_event_from_entry, file_history_events,
-        file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
+        file_history_plugin_events, load_file_history_entry_sets,
         parse_file_history_observed_blobs, parse_file_history_observed_descriptors,
         parse_file_history_observed_directories, parse_file_history_observed_plugin_owners,
         prepare_file_history_rows, sorted_grouped_file_history_events,
@@ -2611,6 +2623,7 @@ mod tests {
             snapshot_content: None,
             metadata: None,
             deleted,
+            blob_manifest_object_ids: Vec::new(),
             created_at: timestamp,
             updated_at: timestamp,
             change_id: ChangeId::new(uuid::Uuid::from_u128(ordinal)),
@@ -2708,6 +2721,7 @@ mod tests {
                     snapshot_content: change.snapshot_content,
                     metadata: change.metadata,
                     deleted,
+                    blob_manifest_object_ids: Vec::new(),
                     created_at,
                     updated_at,
                     change_id: ChangeId::new(uuid::Uuid::from_u128(index as u128 + 1)),
@@ -2875,34 +2889,6 @@ mod tests {
                 .collect(),
             false,
         ))
-    }
-
-    #[derive(Default)]
-    struct RecordingBlobReader {
-        calls: StdMutex<Vec<Vec<BlobId>>>,
-        values: BTreeMap<BlobId, Option<Vec<u8>>>,
-    }
-
-    #[async_trait]
-    impl BlobDataReader for RecordingBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            self.calls.lock().unwrap().push(hashes.to_vec());
-            Ok(BlobBytesBatch::new(
-                hashes
-                    .iter()
-                    .map(|hash| self.values.get(hash).cloned().flatten())
-                    .collect(),
-            ))
-        }
-    }
-
-    struct FixedBatchBlobReader(Vec<Option<Vec<u8>>>);
-
-    #[async_trait]
-    impl BlobDataReader for FixedBatchBlobReader {
-        async fn load_bytes_many(&self, _hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(self.0.clone()))
-        }
     }
 
     #[test]
@@ -3388,14 +3374,15 @@ mod tests {
         );
         let old_state_tombstone =
             plugin_state_tombstone(file_id, "plugin_a_state", replacement_commit_id);
+        let mut parent_state = plugin_observed_state(parent_owner);
+        parent_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_state"]);
+        let mut replacement_state = plugin_observed_state(replacement_owner.clone());
+        replacement_state.plugin_registry = plugin_registry("plugin-b", &["plugin_b_state"]);
         let observed_states = BTreeMap::from([
-            (
-                parent_commit_id.to_string(),
-                Arc::new(plugin_observed_state(parent_owner)),
-            ),
+            (parent_commit_id.to_string(), Arc::new(parent_state)),
             (
                 replacement_commit_id.to_string(),
-                Arc::new(plugin_observed_state(replacement_owner.clone())),
+                Arc::new(replacement_state),
             ),
         ]);
         let parents = BTreeMap::from([(
@@ -3452,7 +3439,8 @@ mod tests {
         let removed_schema_tombstone =
             plugin_state_tombstone(file_id, "plugin_a_removed", update_commit_id);
         let mut parent_state = plugin_observed_state(parent_owner);
-        parent_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_retained"]);
+        parent_state.plugin_registry =
+            plugin_registry("plugin-a", &["plugin_a_removed", "plugin_a_retained"]);
         let mut updated_state = plugin_observed_state(updated_owner.clone());
         updated_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_retained"]);
         let observed_states = BTreeMap::from([
@@ -3545,141 +3533,6 @@ mod tests {
             .is_none(),
             "mixed public predicates retain the existing complete traversal"
         );
-    }
-
-    #[tokio::test]
-    async fn blob_hydration_batches_deduplicates_and_preserves_missing_values() {
-        let present_hash = BlobId::from_content(b"present");
-        let missing_hash = BlobId::from_content(b"missing");
-        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
-        let event = file_history_event_from_entry(
-            "01920000-0000-7000-8000-0000000000a2".to_string(),
-            &descriptor.entry,
-        );
-        let observed_state = Arc::new(observed_state_from_entries(
-            [descriptor.entry.clone()],
-            PluginRegistry::empty(),
-        ));
-        let row = |id: &str, hash: BlobId| PreparedFileHistoryRow {
-            id: id.to_string(),
-            path: Some(format!("/{id}.md")),
-            observed_state: Arc::clone(&observed_state),
-            descriptor_ordinal: 0,
-            blob_hash: Some(hash.to_hex()),
-            event: event.clone(),
-        };
-        let rows = vec![
-            row("01920000-0000-7000-8000-0000000000a2", present_hash),
-            row("01920000-0000-7000-8000-0000000000b2", present_hash),
-            row("01920000-0000-7000-8000-0000000000c2", missing_hash),
-        ];
-        let reader = Arc::new(RecordingBlobReader {
-            calls: StdMutex::new(Vec::new()),
-            values: BTreeMap::from([(present_hash, Some(b"present".to_vec()))]),
-        });
-        let blob_reader: Arc<dyn BlobDataReader> = reader.clone();
-
-        let loaded = load_file_history_blob_bytes(&blob_reader, &rows)
-            .await
-            .unwrap();
-
-        let calls = reader.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].iter().copied().collect::<BTreeSet<_>>().len(), 2);
-        assert_eq!(
-            loaded.get(&present_hash.to_hex()),
-            Some(&Some(b"present".to_vec()))
-        );
-        assert_eq!(loaded.get(&missing_hash.to_hex()), Some(&None));
-    }
-
-    #[tokio::test]
-    async fn blob_hydration_rejects_malformed_batch_lengths() {
-        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
-        let event = file_history_event_from_entry(
-            "01920000-0000-7000-8000-0000000000a2".to_string(),
-            &descriptor.entry,
-        );
-        let observed_state = Arc::new(observed_state_from_entries(
-            [descriptor.entry.clone()],
-            PluginRegistry::empty(),
-        ));
-        let row = |id: &str, hash: BlobId| PreparedFileHistoryRow {
-            id: id.to_string(),
-            path: Some(format!("/{id}.md")),
-            observed_state: Arc::clone(&observed_state),
-            descriptor_ordinal: 0,
-            blob_hash: Some(hash.to_hex()),
-            event: event.clone(),
-        };
-        let rows = vec![
-            row(
-                "01920000-0000-7000-8000-0000000000a2",
-                BlobId::from_content(b"first"),
-            ),
-            row(
-                "01920000-0000-7000-8000-0000000000b2",
-                BlobId::from_content(b"second"),
-            ),
-        ];
-
-        for malformed in [
-            vec![Some(b"only-one".to_vec())],
-            vec![None, None, Some(b"extra".to_vec())],
-        ] {
-            let reader: Arc<dyn BlobDataReader> = Arc::new(FixedBatchBlobReader(malformed));
-            let error = load_file_history_blob_bytes(&reader, &rows)
-                .await
-                .expect_err("mismatched positional batch must fail");
-            assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
-            assert!(error.message.contains("values for 2 requested hashes"));
-        }
-    }
-
-    #[tokio::test]
-    async fn unfiltered_bulk_history_keeps_all_rows_and_uses_one_blob_batch() {
-        let first_hash = BlobId::from_content(b"first");
-        let second_hash = BlobId::from_content(b"second");
-        let descriptors = vec![
-            descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0),
-            descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0),
-        ];
-        let events = descriptors
-            .iter()
-            .map(|descriptor| {
-                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry)
-            })
-            .collect::<Vec<_>>();
-        let context = filesystem_context(
-            descriptors,
-            vec![
-                blob_record("01920000-0000-7000-8000-0000000000a2", first_hash, 0),
-                blob_record("01920000-0000-7000-8000-0000000000b2", second_hash, 0),
-            ],
-        );
-        let rows = prepare_file_history_rows(
-            &observed_states(&context),
-            events,
-            &HistoryRoute::default(),
-            &FileHistoryPublicPredicate::All,
-        )
-        .unwrap();
-        assert_eq!(rows.len(), 2);
-
-        let reader = Arc::new(RecordingBlobReader {
-            calls: StdMutex::new(Vec::new()),
-            values: BTreeMap::from([
-                (first_hash, Some(b"first".to_vec())),
-                (second_hash, Some(b"second".to_vec())),
-            ]),
-        });
-        let blob_reader: Arc<dyn BlobDataReader> = reader.clone();
-        let loaded = load_file_history_blob_bytes(&blob_reader, &rows)
-            .await
-            .unwrap();
-
-        assert_eq!(reader.calls.lock().unwrap().len(), 1);
-        assert_eq!(loaded.len(), 2);
     }
 
     #[tokio::test]

@@ -95,6 +95,13 @@ struct BlobRefOwnerValue {
     size_bytes: u64,
 }
 
+#[derive(Deserialize)]
+struct HistoricalBlobRefOwnerValue {
+    id: String,
+    blob_hash: String,
+    size_bytes: u64,
+}
+
 impl AuthenticatedBlobRef {
     pub(crate) fn semantic_id(self) -> crate::binary_cas::BlobId {
         self.semantic_id
@@ -405,6 +412,122 @@ where
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
 }
 
+/// Loads historical file payloads from exact ForkTree state keys. The state
+/// value and its manifest edge are authenticated by the same retained read;
+/// the BlobId is only an integrity claim and is never a physical lookup key.
+pub(crate) async fn load_historical_blob_bytes_for_state_values<R>(
+    read: &R,
+    values: &[(StateKey, super::state::StateValue)],
+) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let refs = values
+        .iter()
+        .map(|(key, value)| bind_historical_state_blob_ref(key, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifests = load_historical_manifests(read, &refs).await?;
+    for reference in &refs {
+        let manifest = required_manifest_by_id(&manifests, reference.manifest_object_id)?;
+        validate_manifest_fields(manifest, reference.expected_size, reference.semantic_id)?;
+    }
+    let required_ids = manifests
+        .values()
+        .flat_map(|manifest| {
+            manifest
+                .ordered_chunks
+                .iter()
+                .map(|chunk| chunk.chunk_object_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let chunks = load_required_chunks(read, required_ids).await?;
+    let mut entries = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let manifest = required_manifest_by_id(&manifests, reference.manifest_object_id)?;
+        let capacity = usize::try_from(manifest.logical_bytes)
+            .map_err(|_| corruption("blob payload length cannot be represented by this process"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut digest = blake3::Hasher::new();
+        for chunk_ref in &manifest.ordered_chunks {
+            let chunk = required_chunk(&chunks, chunk_ref.chunk_object_id)?;
+            validate_chunk_len(chunk, chunk_ref)?;
+            digest.update(&chunk.bytes);
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+        if bytes.len() != capacity || digest.finalize().as_bytes() != &manifest.content_digest {
+            return Err(corruption("blob manifest payload length or digest is invalid").into());
+        }
+        if crate::binary_cas::BlobId::from_content(&bytes) != reference.semantic_id {
+            return Err(corruption(
+                "historical state blob identity does not match its manifest payload",
+            )
+            .into());
+        }
+        entries.push(Some(bytes));
+    }
+    Ok(crate::binary_cas::BlobBytesBatch::new(entries))
+}
+
+#[derive(Clone, Copy)]
+struct HistoricalAuthenticatedBlobRef {
+    semantic_id: crate::binary_cas::BlobId,
+    expected_size: u64,
+    manifest_object_id: ObjectId,
+}
+
+fn bind_historical_state_blob_ref(
+    key: &StateKey,
+    value: &super::state::StateValue,
+) -> Result<HistoricalAuthenticatedBlobRef, crate::LixError> {
+    if key.schema_key != "lix_binary_blob_ref" {
+        return Err(corruption("historical state row is not a blob-reference owner").into());
+    }
+    let file_id = key
+        .file_id
+        .as_deref()
+        .ok_or_else(|| corruption("historical blob-reference owner has no file identity"))?;
+    let entity_id = key
+        .entity_pk
+        .as_single_string()
+        .map_err(|_| corruption("historical blob-reference owner has a non-scalar identity"))?;
+    if entity_id != file_id {
+        return Err(corruption("historical blob-reference key identity is inconsistent").into());
+    }
+    let snapshot = match &value.cell {
+        StateCell::Value(snapshot) => snapshot,
+        StateCell::Null | StateCell::Tombstone => {
+            return Err(corruption("historical blob-reference owner is not live").into());
+        }
+    };
+    let owner: HistoricalBlobRefOwnerValue = serde_json::from_str(snapshot).map_err(|error| {
+        corruption(format!(
+            "historical blob-reference owner semantic value is malformed: {error}"
+        ))
+    })?;
+    if owner.id != file_id {
+        return Err(corruption(
+            "historical blob-reference payload identity does not match its state key",
+        )
+        .into());
+    }
+    if value.blob_manifest_object_ids.len() != 1 {
+        return Err(corruption(
+            "historical blob-reference owner must contain exactly one manifest edge",
+        )
+        .into());
+    }
+    let manifest_object_id = value
+        .blob_manifest_object_ids
+        .first()
+        .copied()
+        .ok_or_else(|| corruption("historical blob-reference manifest edge is absent"))?;
+    Ok(HistoricalAuthenticatedBlobRef {
+        semantic_id: crate::binary_cas::BlobId::from_hex(&owner.blob_hash)?,
+        expected_size: owner.size_bytes,
+        manifest_object_id,
+    })
+}
+
 /// Loads only chunks intersecting each requested range while preserving the
 /// same authenticated state/manifest ownership as full reads.
 async fn load_blob_ranges_many_on_read<R>(
@@ -499,10 +622,35 @@ async fn load_manifests<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let ids = refs
-        .iter()
-        .map(|reference| reference.manifest_object_id)
-        .collect::<BTreeSet<_>>();
+    load_manifests_for_ids(
+        read,
+        refs.iter().map(|reference| reference.manifest_object_id),
+    )
+    .await
+}
+
+async fn load_historical_manifests<R>(
+    read: &R,
+    refs: &[HistoricalAuthenticatedBlobRef],
+) -> Result<BTreeMap<ObjectId, BlobManifestV1>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    load_manifests_for_ids(
+        read,
+        refs.iter().map(|reference| reference.manifest_object_id),
+    )
+    .await
+}
+
+async fn load_manifests_for_ids<R>(
+    read: &R,
+    ids: impl IntoIterator<Item = ObjectId>,
+) -> Result<BTreeMap<ObjectId, BlobManifestV1>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let ids = ids.into_iter().collect::<BTreeSet<_>>();
     let objects = load_object_map(read, ids.iter().copied()).await?;
     ids.into_iter()
         .map(|id| {
@@ -539,6 +687,13 @@ fn required_manifest(
     manifests: &BTreeMap<ObjectId, BlobManifestV1>,
     id: ObjectId,
 ) -> Result<&BlobManifestV1, crate::LixError> {
+    required_manifest_by_id(manifests, id)
+}
+
+fn required_manifest_by_id(
+    manifests: &BTreeMap<ObjectId, BlobManifestV1>,
+    id: ObjectId,
+) -> Result<&BlobManifestV1, crate::LixError> {
     manifests
         .get(&id)
         .ok_or_else(|| corruption(format!("blob manifest {id} is absent")).into())
@@ -548,13 +703,21 @@ fn validate_manifest_owner(
     manifest: &BlobManifestV1,
     reference: &AuthenticatedBlobRef,
 ) -> Result<(), crate::LixError> {
-    if manifest.logical_bytes != reference.expected_size {
+    validate_manifest_fields(manifest, reference.expected_size, reference.semantic_id)
+}
+
+fn validate_manifest_fields(
+    manifest: &BlobManifestV1,
+    expected_size: u64,
+    semantic_id: crate::binary_cas::BlobId,
+) -> Result<(), crate::LixError> {
+    if manifest.logical_bytes != expected_size {
         return Err(corruption(
             "blob-reference owner size does not match its authenticated manifest",
         )
         .into());
     }
-    if manifest.canonical_blob_id != reference.semantic_id {
+    if manifest.canonical_blob_id != semantic_id {
         return Err(corruption(
             "blob-reference owner identity does not match its authenticated manifest",
         )
@@ -901,7 +1064,35 @@ where
 
 #[cfg(test)]
 mod canonical_blob_id_tests {
-    use super::CanonicalBlobIdBuilder;
+    use super::{CanonicalBlobIdBuilder, bind_historical_state_blob_ref};
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::ObjectId;
+    use crate::forktree::state::{StateCell, StateKey, StateValue};
+
+    fn key(id: &str) -> StateKey {
+        StateKey {
+            schema_key: "lix_binary_blob_ref".to_owned(),
+            file_id: Some(id.to_owned()),
+            entity_pk: EntityPk::single(id),
+        }
+    }
+
+    fn value(id: &str, cell: StateCell, manifest_count: usize) -> StateValue {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        StateValue {
+            change_id: crate::changelog::ChangeId::for_test_label("change"),
+            commit_id: crate::changelog::CommitId::for_test_label("commit"),
+            created_at: timestamp,
+            updated_at: timestamp,
+            cell,
+            metadata: None,
+            origin_key: None,
+            blob_manifest_object_ids: (0..manifest_count)
+                .map(|index| ObjectId::from_bytes([index as u8 + 1; 32]))
+                .collect(),
+        }
+    }
 
     #[test]
     fn streaming_identity_matches_complete_multi_chunk_content() {
@@ -913,6 +1104,37 @@ mod canonical_blob_id_tests {
         assert_eq!(
             builder.finish(),
             crate::binary_cas::BlobId::from_content(&payload)
+        );
+    }
+
+    #[test]
+    fn historical_blob_binding_rejects_wrong_row_and_non_live_cells() {
+        let id = "01920000-0000-7000-8000-0000000000a1";
+        let hash = crate::binary_cas::BlobId::from_content(b"payload").to_hex();
+        let live = StateCell::Value(
+            serde_json::json!({"id": id, "blob_hash": hash, "size_bytes": 7})
+                .to_string()
+                .into(),
+        );
+        assert!(bind_historical_state_blob_ref(&key(id), &value(id, live, 1)).is_ok());
+
+        let substituted = StateCell::Value(
+            serde_json::json!({
+                "id": "01920000-0000-7000-8000-0000000000b2",
+                "blob_hash": hash,
+                "size_bytes": 7
+            })
+            .to_string()
+            .into(),
+        );
+        assert!(bind_historical_state_blob_ref(&key(id), &value(id, substituted, 1)).is_err());
+        assert!(
+            bind_historical_state_blob_ref(&key(id), &value(id, StateCell::Tombstone, 1)).is_err()
+        );
+        assert!(bind_historical_state_blob_ref(&key(id), &value(id, StateCell::Null, 1)).is_err());
+        assert!(
+            bind_historical_state_blob_ref(&key(id), &value(id, StateCell::Value("{}".into()), 2))
+                .is_err()
         );
     }
 }

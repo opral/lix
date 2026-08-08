@@ -8,7 +8,7 @@ use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::binary_cas::{BinaryCasContext, BlobDataReader};
+use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
 };
@@ -743,9 +743,13 @@ where
         self.functions.clone()
     }
 
-    #[expect(trivial_casts)]
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
+    fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        Ok(Arc::new(crate::forktree::blob_reader_on_read(
+            self.read_store.clone(),
+            self.active_branch_id,
+        )?))
     }
 
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
