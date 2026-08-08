@@ -662,6 +662,62 @@ where
     Ok(Some(records))
 }
 
+/// Loads one visible state value from an authenticated immutable commit root.
+/// The commit envelope, catalog identity, and retained member/back-edge closure
+/// are validated before the state tree is consulted.
+pub(crate) async fn load_state_value_at_commit<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+    key: &[u8],
+    include_tombstone: bool,
+) -> Result<Option<(StateValue, StateSource)>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let commit_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
+    let Some(value) = lookup_on_read(
+        repository.commit_catalog_root,
+        "commit",
+        commit_id.as_bytes(),
+        read,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let entry = CommitCatalogEntry::decode(&value)?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != commit_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    validate_commit_catalog_identity(
+        read,
+        repository.commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_retained_commit(
+        read,
+        repository.commit_catalog_root,
+        repository.change_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    state_point_on_read(
+        commit.global_state_root,
+        commit.local_state_root,
+        key,
+        include_tombstone,
+        read,
+    )
+    .await
+    .map_err(Into::into)
+}
+
 pub(crate) async fn scan_change_records<R>(
     read: &R,
     start_after: Option<crate::changelog::ChangeId>,

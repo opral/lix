@@ -1062,6 +1062,10 @@ impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) fn store(&self) -> &S {
+        &self.store
+    }
+
     pub(crate) async fn scan_batch_at_commit(
         &mut self,
         commit_id: &str,

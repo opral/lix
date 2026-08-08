@@ -637,15 +637,21 @@ where
     let candidate_file_ids = common_owners.keys().cloned().collect::<BTreeSet<_>>();
     let common_descriptors =
         historical_conflict_file_descriptors(reader, analysis, &candidate_file_ids).await?;
-    let base_registry =
-        load_plugin_registry_at_commit(reader, &analysis.commits.base_commit_id.to_string())
-            .await?;
-    let target_registry =
-        load_plugin_registry_at_commit(reader, &analysis.commits.target_commit_id.to_string())
-            .await?;
-    let source_registry =
-        load_plugin_registry_at_commit(reader, &analysis.commits.source_commit_id.to_string())
-            .await?;
+    let base_registry = load_plugin_registry_at_commit(
+        reader.store(),
+        &analysis.commits.base_commit_id.to_string(),
+    )
+    .await?;
+    let target_registry = load_plugin_registry_at_commit(
+        reader.store(),
+        &analysis.commits.target_commit_id.to_string(),
+    )
+    .await?;
+    let source_registry = load_plugin_registry_at_commit(
+        reader.store(),
+        &analysis.commits.source_commit_id.to_string(),
+    )
+    .await?;
 
     let mut derived = BTreeMap::new();
     let mut derived_owners = BTreeMap::new();

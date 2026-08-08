@@ -11,14 +11,16 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
-    CanonicalBranchId, StateCell, StateKeyRef, StateSource, decode_state_key, encode_state_key,
-    open_coherent_view_on_read, state_point, state_range,
+    CanonicalBranchId, StateCell, StateKeyRef, StateSource, UNTRACKED_ROW_SPACE, decode_state_key,
+    decode_untracked_key, decode_untracked_value, encode_state_key, open_coherent_view_on_read,
+    state_point, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
     MaterializedLiveStateRow,
 };
+use crate::storage::{BeginScanOptions, CoreProjection, KeyRange, ProjectedValue, ScanOrder};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::derived::{is_derived_schema, request_may_include_derived};
@@ -34,6 +36,9 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     validate_scan_request(request)?;
+    if request.filter.untracked == Some(true) {
+        return scan_untracked_branch(store, request).await;
+    }
     let [branch_id] = request.filter.branch_ids.as_slice() else {
         return Err(unsupported("current ForkTree reader requires one branch"));
     };
@@ -97,6 +102,111 @@ where
         }
     }
     Ok(MaterializedLiveStateBatch::from_rows(output))
+}
+
+/// Reads current untracked rows through the same authenticated selector view
+/// as tracked rows. The raw untracked space is owned and decoded here; no
+/// caller receives a space, key, or alternate serving authority.
+pub(crate) async fn scan_untracked_branch<S>(
+    store: &S,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    validate_scan_request(request)?;
+    if !request.filter.constraints.is_empty()
+        || !matches!(request.filter.rows, LiveStateRowFilter::All)
+    {
+        return Err(unsupported(
+            "current ForkTree reader does not yet own this untracked scan lane",
+        ));
+    }
+    let [branch_id] = request.filter.branch_ids.as_slice() else {
+        return Err(unsupported(
+            "current ForkTree untracked reader requires one branch",
+        ));
+    };
+    let branch_id = parse_branch_id(branch_id)?;
+    let view = open_coherent_view_on_read(store, branch_id).await?;
+    let mut cursor = view
+        .read()
+        .begin_scan(
+            UNTRACKED_ROW_SPACE,
+            KeyRange {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Unbounded,
+            },
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                order: ScanOrder::Ascending,
+            },
+        )
+        .await?;
+    let mut rows = Vec::new();
+    loop {
+        let page = cursor.next_page(256).await?;
+        for entry in page.entries {
+            let value = match entry.value {
+                ProjectedValue::FullValue(bytes) => bytes,
+                ProjectedValue::KeyOnly => {
+                    return Err(unsupported(
+                        "ForkTree untracked scan returned key-only data",
+                    ));
+                }
+            };
+            let (entry_branch_id, key) = decode_untracked_key(&entry.key.0)
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            if entry_branch_id != branch_id {
+                continue;
+            }
+            if !request.filter.schema_keys.is_empty()
+                && !request
+                    .filter
+                    .schema_keys
+                    .iter()
+                    .any(|schema| schema == &key.schema_key)
+            {
+                continue;
+            }
+            if !request.filter.entity_pks.is_empty()
+                && !request
+                    .filter
+                    .entity_pks
+                    .iter()
+                    .any(|entity| entity == &key.entity_pk)
+            {
+                continue;
+            }
+            if !request
+                .filter
+                .file_ids
+                .iter()
+                .all(|filter| filter.matches(key.file_id.as_ref()))
+            {
+                continue;
+            }
+            let value = decode_untracked_value(&value)
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            if value.cell.deleted() && !request.filter.include_tombstones {
+                continue;
+            }
+            rows.push(materialize_untracked_row(
+                value,
+                key.entity_pk,
+                key.schema_key,
+                key.file_id,
+                branch_id_text(branch_id),
+            ));
+            if request.limit.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+        }
+        if request.limit.is_some_and(|limit| rows.len() >= limit) || !page.has_more {
+            break;
+        }
+    }
+    Ok(MaterializedLiveStateBatch::from_rows(rows))
 }
 
 /// Loads correlated current-state identities from one authenticated
@@ -225,6 +335,35 @@ fn materialize_row(
         change_id: Some(row.value.change_id),
         commit_id: Some(row.value.commit_id),
         untracked: false,
+        branch_id: Arc::from(branch_id),
+    }
+}
+
+fn materialize_untracked_row(
+    value: crate::forktree::UntrackedValue,
+    entity_pk: EntityPk,
+    schema_key: String,
+    file_id: Option<String>,
+    branch_id: String,
+) -> MaterializedLiveStateRow {
+    let deleted = value.cell.deleted();
+    let snapshot_content = match &value.cell {
+        StateCell::Value(value) => Some(value.clone()),
+        StateCell::Null | StateCell::Tombstone => None,
+    };
+    MaterializedLiveStateRow {
+        entity_pk,
+        schema_key,
+        file_id,
+        snapshot_content,
+        metadata: value.metadata,
+        deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        global: false,
+        change_id: None,
+        commit_id: None,
+        untracked: true,
         branch_id: Arc::from(branch_id),
     }
 }

@@ -4,6 +4,10 @@ use serde::Deserialize;
 
 use crate::LixError;
 use crate::common::compose_file_path;
+use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonSlot};
+use crate::live_state::{
+    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, scan_forktree_branch,
+};
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -15,36 +19,32 @@ use super::{DirectoryPathRecord, derive_directory_paths};
 /// controls and retained commit/checkpoint roots. Tracked history is read from
 /// commit state; current-only untracked rows are read from each control's
 /// untracked selector through the live-state owner.
-pub(crate) async fn collect_gc_binary_blob_roots<S>(
+pub(crate) async fn collect_gc_binary_blob_roots<S, C>(
     store: &S,
-    controls: &[(String, crate::branch::BranchHeadControl)],
+    controls: &[(String, C)],
     retained_commits: &BTreeSet<crate::changelog::CommitId>,
 ) -> Result<BTreeSet<crate::binary_cas::BlobId>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
-    let request = crate::tracked_state::TrackedStateScanRequest {
-        filter: crate::tracked_state::TrackedStateFilter {
-            schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_owned()],
-            ..crate::tracked_state::TrackedStateFilter::default()
-        },
-        read_columns: crate::tracked_state::TrackedStateReadColumns {
-            columns: vec!["snapshot_content".to_owned()],
-        },
-        limit: None,
-    };
     let mut roots = BTreeSet::new();
-    let current = crate::live_state::TrackedHeadContext::new()
-        .reader(store)
-        .scan_live_batches_for_controls(controls, &request, Some(true))
-        .await
-        .map_err(|error| {
-            LixError::new(
-                error.code,
-                format!("collect current binary blob roots: {}", error.message),
-            )
-        })?;
-    for (_, rows) in current {
+    for (branch_id, _) in controls {
+        let rows = scan_forktree_branch(
+            store,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_owned()],
+                    branch_ids: vec![branch_id.clone()],
+                    untracked: Some(true),
+                    ..LiveStateFilter::default()
+                },
+                projection: LiveStateProjection {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+        )
+        .await?;
         for row in rows.iter() {
             let snapshot = row.snapshot_content().ok_or_else(|| {
                 LixError::new(
@@ -56,28 +56,57 @@ where
         }
     }
 
-    let retained_schema_keys = [BLOB_REF_SCHEMA_KEY.to_owned()];
     for commit_id in retained_commits {
-        for row in crate::tracked_state::load_retained_commit_snapshots_for_schemas(
-            store,
-            *commit_id,
-            &retained_schema_keys,
-        )
-        .await?
-        {
-            if row.deleted {
+        let records = crate::forktree::load_commit_member_records(store, *commit_id)
+            .await?
+            .unwrap_or_default();
+        for record in records {
+            if record.schema_key != BLOB_REF_SCHEMA_KEY || record.snapshot.is_none() {
                 continue;
             }
-            let snapshot = row.snapshot.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("live binary blob reference in commit '{commit_id}' has no snapshot"),
-                )
-            })?;
+            let Some(snapshot) = load_json_slot(store, &record.snapshot).await? else {
+                continue;
+            };
             roots.insert(blob_id_from_snapshot(&snapshot)?);
         }
     }
     Ok(roots)
+}
+
+async fn load_json_slot<S>(store: &S, slot: &JsonSlot) -> Result<Option<String>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead + ?Sized,
+{
+    match slot {
+        JsonSlot::None => Ok(None),
+        JsonSlot::Inline(value) => Ok(Some(value.to_string())),
+        JsonSlot::Ref(json_ref) => {
+            let refs = [*json_ref];
+            let values = crate::json_store::JsonStoreContext::new()
+                .load_bytes_many(
+                    store,
+                    JsonLoadRequestRef {
+                        refs: &refs,
+                        scope: JsonReadScopeRef::OutOfBand,
+                    },
+                )
+                .await?
+                .into_values();
+            let Some(Some(bytes)) = values.into_iter().next() else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "authenticated change snapshot payload is missing",
+                ));
+            };
+            let value = String::from_utf8(bytes.to_vec()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated change snapshot payload is not UTF-8: {error}"),
+                )
+            })?;
+            Ok(Some(value))
+        }
+    }
 }
 
 fn blob_id_from_snapshot(snapshot: &str) -> Result<crate::binary_cas::BlobId, LixError> {
