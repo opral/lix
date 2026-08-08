@@ -34,17 +34,42 @@ binary diff SHA-256 values are:
 | Version control | `origin/agent/forktree-stage2-version-control-oracle` / `3cb6aa56804642efbe703f5e36bdc1788b51a4e7` / `911e0d6138b760a1c63e0e2c16b00e8f4b95c7dd` | `a12..3cb6`: `9348633179a5991dacf6bba85510e4f0cb1d391eeaae0042ab1956a0b08348b4` |
 | Checkpoint | `origin/codex/checkpoint-stage2-acceptance-oracle` / `9bace2186664fc77877aa24abae6e516855313a1` / `e006aa4a5a3c6443e13d2c746fe81d9f97c30761` | `c3a58..9bace`: `7525ac6d2dd2b11e7b69709c341fe14a8bfc1b6bbfb525abe995a398e3ef8841`; complete `a12..9bace`: `34724dac23108ad3e65d2245ee926e702a88e778efc0459b98254bb09518d159` |
 | 65-row delete | `origin/agent/forktree-bc823-oltp-delete-repro` / `9713361663df727af88dcf88aa05bd4b998c4149` / `a1b1ef1bed7f2a48b9f11a1a6288f325b3f64590` | `bc823..971336`: `6d633a6d61b33700f12b05b5f38486a16941eb556c40bba7a5e3c42004ebf065` |
+| 1K point read | `origin/agent/stage2-point-read-oracle-a12` / `33117e1c128b038a5bbe486db126b3cb303c0f20` / `098afc641a8219390dd16e17b99598c928af0760` | `a12..33117`: `255127d4faf169f0127c7c254dc6df33c5be20959f4bfc17655d9bfe6a432b55`; patch ID `008ae479bb7d4a73bc125f18d1d5406340de5059`; source `8e9f6aa4e1e3d085c7b1bf6315ff0d8aa94912d5266133594a97961ee2d3e756`; source gate `af8897916e9d3dacbd54f3e48245766d163804b6a9004afa9905b8bb01eb5033`; frozen binary `ead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a`; external report `b86db402ec0bf9b25ca619564edb82a420fcdb34f68de2f972f6c774e863dbf5`; external manifest `cacbcee8f7b80a627f96dd8b7d6d55beef0fe2a2f7228f0290b488ae7717a888` (author-reported 3/3 verification; files are not mounted on this reviewer host) |
 | Deletion/residue | `origin/codex/forktree-stage2-deletion-oracle-v2` / `1dbbf3d206540d36f5912eab8372a42819778b47` / `7fe3b3c83133344dff4025b558dbdd63bb1be21f` | `d00584e..1dbbf`: `0a6edac94dd03cd287e134bd873962bc841c0d2d5aebb9f92b1de45d5e359da5` |
 | No-lease reference | `origin/codex/stage2-no-lease-read-view-boundary-ee402` / `89c73a24b97ce8dedee5e6c9a85e67c481b29090` / `6b90abcc440a3c13a6e95c641426629593536012` | complete `138b..89c`: `e93a1d78d01f3c7d29d4038627c691047fa8953c55bd61e77c6351e714114796` |
 | GC/publication | `origin/codex/stage2-gc-publication-acceptance-oracle` / `0b4e5042b6a79b8be80dbfe4e4cdbff3b28d9a9c` / `0ac1ab8e74b85a92a8044cb4280adf8cf66ba387` | `cbe488..0b4e`: `bb6a70454484b9bba9e29929656a205a0706d1a0a2e60e495ea52fc19e567224` |
 | Multimedia | `origin/codex/forktree-stage2-multimedia-oracle-a12` / `61fc367988190b3438672743331a81d83d450fae` / `1600e8ce54d9f52f6ee3546068362ae298d4d243` | `a12..61fc`: `65cda6ee906b6986bf70b636dfaadda5f8f89a2f8f4af407852687c474472660`; patch ID `30b6a50ac8730e382d2034b704082bab4fe41b7b`; final report `0dd241e1d6bd8fa32d84751972bd96fed666f2dafe742b447ca496f06aadc5bb`; package sums `ccc755a1cc70a28bc08145aeb61bec940f3db9b01b49c7e89931c9bd9218d0e8`; pre-normalization local report `6691dc30ce4f6eb0bd0a413aa060eb80614d4447bd05fd30c268a3e878044274`; predecessor `10bb5f41...` and object `66912a3d...` are excluded |
 
-The no-lease package and 65-row delete reproduction are causal/reference
-discriminators. They do not become candidate acceptance merely because their
-detached model code passes. The first runnable candidate must execute the
-delete sequence against its production owner, and must expose the sealed
+The no-lease package, 65-row delete reproduction, and point-read reference are
+causal/reference discriminators. They do not become candidate acceptance merely
+because their detached model code passes. The point-read reference uses its own
+test-only authenticated encoding, so its frozen latency and resource medians are
+not candidate A/B acceptance evidence. The first runnable candidate must execute
+the delete and point-read sequences against its production owner, source-map the
+actual public point/BlobRef transitive closure, and expose the sealed
 candidate-facing GC/publication facade. This prevents a copied model from
 qualifying unwired production.
+
+The exact point-read build invocation is:
+
+```sh
+cd /root/repos/lix-stage2-point-read-oracle-a12 && env CARGO_TARGET_DIR=/root/repos/lix-stage2-point-read-oracle-a12/target RUST_TEST_THREADS=1 timeout 1200 cargo bench --profile bench -p lix_benchmarks --bench stage2_point_read_oracle --features 'storage-benches slatedb' --no-run
+```
+
+It produced
+`target/release/deps/stage2_point_read_oracle-025c3b394ec8760c` with SHA-256
+`ead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a`.
+The frozen RocksDB and SlateDB invocations are the matrix commands with,
+respectively,
+`/tmp/stage2-point-read-oracle-rocks-a12-1k` and
+`/tmp/stage2-point-read-oracle-slate-a12-1k` substituted for the path
+placeholder. Those paths are consumed evidence and must not be reused or
+deleted; candidate runs substitute only fresh nonexistent paths. The optional
+source gate is:
+
+```sh
+cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/tests/stage2_point_read_source_gate.sh packages/engine-benchmarks/tests/stage2_point_read_source_gate_fixture/entry.rs packages/engine-benchmarks/tests/stage2_point_read_source_gate_fixture/helper.rs
+```
 
 ## Minimal first-runnable sequence
 
@@ -56,16 +81,26 @@ qualifying unwired production.
 2. Run the production-owner 65-row, batch-1 delete on RocksDB. Only after it
    cold-reopens empty, run SlateDB. Retain 64-row/batch-1 and
    65-row/batch-100 controls. A detached benchmark-model pass is insufficient.
-3. Run the 18-statement SQL RocksDB smoke, then SlateDB. Both public-result and
+3. Bind the actual public point plus BlobRef seam and enumerate every transitive
+   helper. Run the 1K point-read gate on RocksDB and then SlateDB with at least
+   five samples and setup excluded. Each sample must perform exactly 1,000
+   `begin_read` calls, 6,000 authenticated gets, and 3,922,880 logical read
+   bytes; perform zero scans, writes, or commits; leave disk unchanged; return
+   digest `0f28fc4645fef236d6332733a943b5b43ab35034c2b1d365d928bda0718295a1`
+   hot and cold; and fail closed for malformed selector/catalog and kind/ID
+   substitution. Require a meaningful paired improvement greater than 10% on
+   both adapters and no critical regression greater than 5%. Any failure stops
+   before SQL and before 10K/50K scaling.
+4. Run the 18-statement SQL RocksDB smoke, then SlateDB. Both public-result and
    cold-state digests must equal the frozen current-layout values.
-4. Run the three-row checkpoint/merge RocksDB test, then SlateDB. This single
+5. Run the three-row checkpoint/merge RocksDB test, then SlateDB. This single
    focused gate includes 64 rotations, true conflict, missing-parent,
    undo/redo, cold reopen, and final release.
-5. Run the no-lease discriminator and then the sealed GC/publication RocksDB
+6. Run the no-lease discriminator and then the sealed GC/publication RocksDB
    gate. Only after both are green, run their SlateDB counterparts. Exact
    one-view transport, progress rotation, persisted bounded packs, upload and
    final-reference checks are mandatory.
-6. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
+7. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
    multimedia transport bound, run 64 MiB/1% image RocksDB first, then SlateDB, then
    the remaining 64 MiB shape and only then 512 MiB/10% archive/video. No
    broader workspace or performance matrix precedes these focused gates.
@@ -75,6 +110,9 @@ qualifying unwired production.
 - Source residue, alternate authority, dual writer, compatibility reader, or
   missing facade delegation: stop and return to R5's compiler-deletion wave.
 - `finish_root`/path-copy 65-row failure: R5's tree owner; do not enter SQL.
+- Point-read source-map/SPI absence, count/digest/cold/corruption mismatch:
+  R5's read owner. A paired improvement of 10% or less, or a critical
+  regression above 5%, freezes a no-scale verdict and stops before SQL.
 - SQL-only mismatch: SQL transaction/binder owner plus R5. Never add a second
   layout selector or provider hook.
 - Checkpoint ancestry/base/reclamation mismatch: checkpoint graph owner; queue
