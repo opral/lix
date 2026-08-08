@@ -22,7 +22,8 @@ test "$(git -C "$root" rev-parse "$frontier^1" 2>/dev/null || true)" = "39b12568
 for object in "$frontier" "$oracle"; do git -C "$root" cat-file -e "$object^{commit}" 2>/dev/null && pass "object=$object" || fail "missing-object=$object"; done
 
 changed="$(git -C "$root" diff --name-only "$frontier" "$actual_head" 2>/dev/null || true)"
-test -z "$changed" || fail "unexpected-diff=$changed"
+bad_changed="$(printf '%s\n' "$changed" | rg -v -x -e "$report" -e "$script" || true)"
+test -z "$bad_changed" && pass report-only-diff || fail "unexpected-diff=$bad_changed"
 test -s "$root/$report" && pass "artifact=$report" || fail "missing-artifact=$report"
 test -s "$root/$script" && pass "artifact=$script" || fail "missing-artifact=$script"
 
