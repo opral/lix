@@ -1,0 +1,51 @@
+{
+  "kind": "test-report-only-branch-ref-production-readiness",
+  "status": "dormant-until-source-and-compile-green",
+  "production_anchor": {
+    "commit": "e1af471b9ab0f598dafa7c2ddec7867667c81740",
+    "tree": "bfa0d271a723da8250ab76ada16fda90926f1099",
+    "parent": "b484e20d845aee3f8137bfa3496f9b3cd0e8cd35"
+  },
+  "transport_anchor": {
+    "ref": "origin/codex/forktree-w3-e1af-selector-rebind-e1af",
+    "head": "396f4a4b213ff1207a248599b356cf8accc09523",
+    "tree": "29e9a0c3ece3b64edbf6f081a24bf153c96d862b"
+  },
+  "approved_semantic_v4": {
+    "head": "32200a21f4cb7a77276ff619179b2c05687ffd2a",
+    "tree": "5eef6528fcde96417c0303d3c1df78c48e257ffb",
+    "report_sha256": "3cca3a49a4578720dfac22b59e2412916fa90a73cecdf5c9aa5daaa4d4aedec4"
+  },
+  "h4_production_map_report_sha256": "31f40c3d11db4baaac09f36263de2c55cdc356a912debcfe5d3e6aa2613fad66",
+  "source_calibration": {
+    "expected": "RED",
+    "legacy_control_generation": 58,
+    "checkpoint_history": 1139,
+    "snapshot_pin": 16,
+    "selector_epoch": 770,
+    "mutation_revision": 24,
+    "log_sha256": "ef6077659dca998b3a4030f19d61434fb4bb97c0f491c738851f4bdfad553c9e",
+    "wrapper_log_sha256": "29e2b611cd9f5584920dc74575a881b6e77c19d713b0594e8f30f41517c6c429"
+  },
+  "authority": {
+    "selector_space": "one authenticated GlobalSelectorV1 and one BranchSelectorV1 per branch",
+    "read": "one caller-owned CoherentView over one StorageRead",
+    "write": "one PreparedPublication, one selector/epoch CAS plane, one backend commit",
+    "forbidden": [
+      "BranchRefReader",
+      "BranchHeadControl",
+      "BranchHeadControlCache",
+      "flat-row writer/projection",
+      "compatibility reader",
+      "fallback",
+      "second selector authority"
+    ]
+  },
+  "model": {
+    "source_sha256": "af303849c8c79b2ca07818051a8d3b4c71475eca34f5c2ac9799b354f0eff5ec",
+    "test_count": 7,
+    "runtime_claimed": false
+  },
+  "runtime_claimed": false,
+  "production_changes": false
+}
