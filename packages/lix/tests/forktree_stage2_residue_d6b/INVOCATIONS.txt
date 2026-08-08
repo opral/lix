@@ -1,0 +1,10 @@
+rustc --edition 2024 -D warnings verifier/main.rs -o /tmp/forktree_stage2_residue_d6b
+forktree_stage2_residue_d6b self-test                                      PASS
+forktree_stage2_residue_d6b baseline /path/to/1f742                         9df187fde36f820166ba6209b6746e1764f6ac3ec8e421977762745233dc2c2b
+forktree_stage2_residue_d6b baseline /path/to/d6b                           9df187fde36f820166ba6209b6746e1764f6ac3ec8e421977762745233dc2c2b
+forktree_stage2_residue_d6b cursor-baseline /path/to/1f742                 0c634e2710df6b438cc2b7e84132f9a97e9f491fe70df9b4ade67176d1a2ebb0
+forktree_stage2_residue_d6b cursor-baseline /path/to/d6b                   0c634e2710df6b438cc2b7e84132f9a97e9f491fe70df9b4ade67176d1a2ebb0
+forktree_stage2_residue_d6b budget /path/to/1f742                         52aac2590eec4355180e6394a1f6b6793ec0c26dbe77ad8cb7fb8be41f2077c5
+forktree_stage2_residue_d6b budget /path/to/d6b                           d36dac769e6d24cbaadc09eea2d2b011d4f7b2edf838e6e3fcf7e4c691ca50a6
+forktree_stage2_residue_d6b definitions /path/to/1f742                    02e6d6cbea543e9d3a387f4e1aa8763f20c38b27a38fb0c99bdee2021627555b
+forktree_stage2_residue_d6b definitions /path/to/d6b                      02e6d6cbea543e9d3a387f4e1aa8763f20c38b27a38fb0c99bdee2021627555b
