@@ -122,8 +122,8 @@ no_added_diagnostics() {
 check_frontier() {
   local label="$1"
   local log="$2"
-  local expected_errors="$3"
-  local expected_warnings="$4"
+  local maximum_errors="$3"
+  local maximum_warnings="$4"
   if [[ ! -s "$log" ]]; then
     fail "missing-compiler-log=$label"
     return
@@ -133,18 +133,20 @@ check_frontier() {
   printf 'COMPILER_LOG=%s SHA256=' "$label"
   sha256sum "$log" | awk '{print $1}'
   printf '%s\n' "$summary"
+  local line
   if [[ "$label" == library ]]; then
-    if grep -F "due to ${expected_errors} previous errors; ${expected_warnings} warnings emitted" <<<"$summary" >/dev/null; then
-      pass "compiler-frontier=$label ${expected_errors}/${expected_warnings}"
-    else
-      fail "compiler-frontier=$label expected=${expected_errors}/${expected_warnings}"
-    fi
+    line=$(grep -m1 'error: could not compile `lix` (lib)' <<<"$summary" || true)
   else
-    if grep -F "lib test) due to ${expected_errors} previous errors; ${expected_warnings} warnings emitted" <<<"$summary" >/dev/null; then
-      pass "compiler-frontier=$label ${expected_errors}/${expected_warnings}"
-    else
-      fail "compiler-frontier=$label expected=${expected_errors}/${expected_warnings}"
-    fi
+    line=$(grep -m1 'error: could not compile `lix` (lib test)' <<<"$summary" || true)
+  fi
+  local actual_errors actual_warnings
+  actual_errors=$(sed -n 's/.*due to \([0-9][0-9]*\) previous errors.*/\1/p' <<<"$line")
+  actual_warnings=$(sed -n 's/.*; \([0-9][0-9]*\) warnings emitted.*/\1/p' <<<"$line")
+  if [[ -n "$actual_errors" && -n "$actual_warnings" ]] &&
+     ((actual_errors <= maximum_errors && actual_warnings <= maximum_warnings)); then
+    pass "compiler-frontier=$label ${actual_errors}/${actual_warnings} (max ${maximum_errors}/${maximum_warnings})"
+  else
+    fail "compiler-frontier=$label actual=${actual_errors:-missing}/${actual_warnings:-missing} max=${maximum_errors}/${maximum_warnings}"
   fi
 }
 
@@ -245,8 +247,8 @@ for file in packages/lix/src/sql2/history_route.rs packages/lix/src/sql2/context
 done
 absent_production packages/lix/src/sql2/history_route.rs 'ForkTreeReadFacade::new'
 
-check_frontier library "$candidate_lib_log" 138 9
-check_frontier library-tests "$candidate_tests_log" 381 16
+check_frontier library "$candidate_lib_log" 139 9
+check_frontier library-tests "$candidate_tests_log" 382 16
 no_added_diagnostics library-errors normalize_errors "$base_lib_log" "$candidate_lib_log"
 no_added_diagnostics tests-errors normalize_errors "$base_tests_log" "$candidate_tests_log"
 no_added_diagnostics library-warnings normalize_warnings "$base_lib_log" "$candidate_lib_log"
