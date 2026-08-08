@@ -283,6 +283,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "stage2_point_read_oracle"
+path = "benches/stage2_point_read_oracle.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "uuid_v7_physical_keys"
 path = "benches/uuid_v7_physical_keys.rs"
 harness = false
