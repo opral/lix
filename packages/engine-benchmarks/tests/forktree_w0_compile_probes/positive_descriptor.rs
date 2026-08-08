@@ -1,9 +1,12 @@
-// Acceptance-only sketch. Compile this against the candidate's public/internal
-// boundary harness, not against the pre-cut baseline.
-use lix::forktree::{CoherentView, ObjectId};
+// Compile-pass probe for the actual public descriptor surface. Constructors
+// remain engine-owned; consumers may receive and inspect a descriptor without
+// being able to forge a space.
+use lix::storage::{StorageSpace, ValueSemantics};
 
-fn accepts_opaque_forktree_domain(_view: Option<CoherentView<()>>, _id: ObjectId) {}
+fn accepts_engine_descriptor(space: StorageSpace) -> ValueSemantics {
+    space.value_semantics()
+}
 
 fn main() {
-    accepts_opaque_forktree_domain(None, ObjectId::from_bytes([0; 32]));
+    let _ = accepts_engine_descriptor;
 }

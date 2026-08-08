@@ -1,138 +1,160 @@
-# ForkTree W0 StorageSpace/type-boundary oracle
+# ForkTree W0 storage-boundary correction oracle
 
-Status: test/report-only acceptance package. It makes no production, SQL,
-Stage-2, adapter, or PR change. Its purpose is to freeze the compiler/source
-contract that must be satisfied before the W0 production hard cut is attempted.
+Status: TEST/REPORT-ONLY. This direct successor is based on the immutable
+blocked W0 head `465786fccbf55decd92e169d646670e3351d077a` (tree
+`0f553a521c91983e6d0ea1db98bc7397793aa449`, parent/base
+`e92ea2e505ee3d96abbb529dbaedb23d4908ff42`). It changes only benchmark tests,
+probes, reports, and verifier scripts. It does not change production source,
+start an adapter, add a compatibility path, or open a PR.
 
-## Immutable anchor
+## Contract being frozen
 
-The oracle is based on Cut B `e92ea2e505ee3d96abbb529dbaedb23d4908ff42`, whose
-parent is corrected d6 `d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768`. The d6 tree is
-`641654079f60fcd1c9ff9ccbbd06d3edcabe4096`; Cut B tree is
-`0d0797c024706beb1510cb2f0f88f8414a9a0c96`. The accepted W2 predecessor is
-`0a1955269c0d1fd5d23bac24f0a35f4e9a51d687`; this package does not alter it.
+The accepted physical boundary remains one engine-owned descriptor/object
+plane:
 
-The package freezes the following retained boundary, not an implementation:
+* `StorageSpace` has private fields and a private `SpaceId` field. Only the
+  crate-visible `engine_declared` constructor exists; no public `new`,
+  `mutable`, or `immutable` forge path is accepted.
+* ForkTree owns authenticated `ObjectId` and non-public `ObjectDomain` values.
+  `CoherentView<R>` is crate-visible, has a private `read: R`, and does not
+  expose a public read/object-domain constructor or getter.
+* `OBJECT_SPACE` is immutable object storage, while `SELECTOR_SPACE` and
+  `UNTRACKED_ROW_SPACE` are the retained mutable control/data spaces. No raw
+  adapter registry, alternate object index, second writer, or fallback reader
+  is introduced.
+* A view authenticates the root object ID and domain before point/range work.
+  Cursors bind both view instance and root identity. Reopen authenticates the
+  exact encoded root bytes and domain. Missing roots, wrong domains, identity
+  substitution, tampered bytes, foreign cursors, and expired cursors fail
+  closed; an authenticated missing row remains `Ok(None)` and is distinct from
+  a tombstone or explicit NULL cell.
 
-* `StorageSpace` is a sealed engine-declared descriptor containing a private
-  `SpaceId`, name, and `ValueSemantics`. Only Lix engine declarations may call
-  `engine_declared`; adapters cannot forge IDs or construct mutable/immutable
-  spaces.
-* The ForkTree object domain is the only physical object authority:
-  `ObjectId`, `ObjectDomain`, `CoherentView`, and the engine descriptors
-  `OBJECT_SPACE` (immutable objects), `SELECTOR_SPACE` (mutable selector), and
-  `UNTRACKED_ROW_SPACE` (mutable untracked rows). RocksDB and SlateDB receive
-  opaque descriptors through the existing Storage APIs; they do not own a
-  registry, raw space, alternate index, or second authority.
-* Existing public `StorageRead` streaming semantics remain: one coherent view,
-  ordered point/range reads, cursor continuation bound to that view, reopen and
-  corruption errors, and no writes during reads. The model oracle exercises the
-  same contract for Memory, RocksDB, and SlateDB labels; durable adapter runs
-  are not claimed until the anchored production crate is compile-green.
+## What the predecessor missed
 
-## Hard-cut deletion map
+The blocked verifier searched only `packages/lix/src`, accepted required names
+by token presence, and did not execute its probes. Its TypeScript negative
+probe declared the removed methods itself, so it could type-check even when
+those methods existed. Its Rust model compared locally manufactured identical
+errors and did not authenticate a root/object domain or bind reopen identity.
 
-The production successor must remove, rather than alias or deprecate:
+This successor corrects those gaps:
 
-| Area | Exact residue to delete | Replacement/authority |
-|---|---|---|
-| `packages/lix/src/storage/types.rs` | `StorageSpace::mutable`, `StorageSpace::immutable`, `StorageSpace::new`, raw `SpaceId(...)`/`StorageSpaceId(...)` construction and public exports | sealed `engine_declared` descriptors |
-| columnar owners | `columnar_row_group.rs`; `live_state/entity_columnar.rs`, `entity_columnar_cache.rs`, `entity_decoded_column_cache.rs`; `sql2/entity_batch.rs`, `sql2/entity_columnar_layout.rs`; imports such as `EntityColumnar*`, `ColumnarBaseCoordinate`, row-group spaces | ForkTree `ObjectDomain`/`ObjectId` state objects |
-| tracked physical owners | `tracked_state/codec.rs`, `storage.rs`, `tree.rs`; `TrackedStateStoreReader`, scan/filter/column readers | ForkTree state objects and one `CoherentView` |
-| changelog physical owners | `COMMIT_SPACE`, `CHANGE_SPACE`, `COMMIT_CHANGE_ID_SPACE`, legacy change-record loaders and physical scans | ForkTree commit/change catalog objects; commit graph remains chronology authority |
-| binary-CAS legacy owners | `binary_cas/kv.rs`, old manifest/chunk/presence modules and their raw owner symbols | W2 `BlobRef`/`ObjectId` domain only |
+* The verifier obtains the complete tracked source list with `git ls-files` and
+  scans Lix, JS SDK, native bindings, engine examples/benches/tests, RocksDB,
+  and SlateDB. Generic storage-adapter test/implementation constructors are
+  printed as an explicit allowlist, never silently omitted. Binary-CAS
+  `context.rs` and all predecessor binary-CAS owner files are explicit residue
+  candidates. The W0 probe/report files are excluded only to avoid the oracle
+  auditing its own fixture strings.
+* Structural checks inspect declarations, not token presence: private
+  `SpaceId`/`StorageSpace` fields and engine brand, crate-visible constructor,
+  crate-visible `ObjectId`, `super`-visible `ObjectDomain` and authenticator,
+  crate-visible `CoherentView<R>`, private read field, and absence of public
+  forge/read accessors.
+* `negative_native_exports.ts` imports `LocalFilesystem` and `LixBinding` from
+  the actual `packages/js-sdk/src` sources. It does not declare the removed
+  properties or methods. The runner separately scans the actual N-API Rust
+  registration for the old exports.
+* `forktree_w0_compile_probes.sh` runs an actual package compile-pass gate,
+  an actual positive descriptor crate, four external Rust compile-fail probes,
+  the real TypeScript negative probe, and the native-export absence check. A
+  future candidate must make the positive gates pass and the forbidden API
+  gates fail. The runner is bounded by `W0_TIMEOUT_SECONDS` (default 1200s)
+  per command and never runs a storage adapter.
 
-No scalar SQL implementation is in scope. Parser, binder, DML, transaction,
-RETURNING, and public cursor semantics are inputs to this boundary, not new
-owners here.
+## Model oracle
 
-## Source/error contract
+`forktree_w0_storage_boundary_oracle.rs` is a standalone deterministic model,
+not a claim about an adapter. It now has six executable tests:
 
-The residue verifier scans all production source under `packages/lix/src` and
-rejects the legacy files/symbols above. It also requires the retained boundary
-tokens. The negative probes in
-`forktree_w0_compile_probes/` make the intended compiler failures explicit:
-raw space forging, columnar-owner imports, tracked/changelog imports, and the
-removed native filesystem export names must be unnameable. The positive probe
-uses only the opaque object-domain/read-view boundary.
+1. descriptor identity plus attempted raw-space, raw-domain, and deleted
+   columnar-owner operations;
+2. authenticated root, point/range order, cursor continuation, reopen, and
+   zero read-side writes under Memory/RocksDB/SlateDB labels;
+3. missing root, wrong domain, same-size root substitution, malformed bytes,
+   and tampered object identity rejection;
+4. foreign-view and expired-cursor rejection without writes;
+5. authenticated absent, NULL, and tombstone distinction; and
+6. retained descriptor parity across all three adapter labels.
 
-Missing/malformed descriptors, wrong value semantics, forged/raw spaces,
-missing selected roots, malformed object bytes, invalid range/cursor state,
-wrong view, stale cursor, and deleted columnar-owner access must fail closed.
-There is no compatibility registry, fallback reader, dual writer, or raw-space
-authority. The pure model also checks NULL/tombstone-style absence as an
-ordinary value outcome rather than a physical-space escape hatch.
+The model intentionally uses a deterministic identity stand-in and makes no
+cryptographic claim. Future production qualification must use the real
+authenticated objects and separate Memory, RocksDB, and SlateDB lifecycle
+oracles only after the production crate compiles.
 
-## Exact controls and order
+## Exact gates
 
-Run from an isolated checkout of the exact candidate, with one target directory
-per candidate and `CARGO_BUILD_JOBS=2`:
+From an isolated checkout of the candidate:
 
 ```sh
 node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root "$PWD"
 cargo fmt --all -- --check
 git diff --check
+W0_TIMEOUT_SECONDS=1200 scripts/forktree_w0_compile_probes.sh "$PWD" "${CARGO_TARGET_DIR:-/tmp/forktree-w0-probes}"
 cargo clippy -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- -D warnings
 cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle --no-run
-cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-W0_BACKEND=memory  cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-W0_BACKEND=rocksdb cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-W0_BACKEND=slatedb cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
 ```
 
-The model test is storage-independent and must pass for all three labels. A
-candidate's real adapter controls must add flush/drop/reopen for RocksDB and
-SlateDB, repeat point/range/cursor reads, assert exact ordering and bytes,
-assert zero writes during reads, and run malformed descriptor/root/object
-controls. The first production compiler/no-run gate precedes all durable
-runtime cells; every cell is capped at 20 minutes. Do not broaden the matrix
-from Memory until the static and compile gates are green.
+The standalone calibration command, which does not build or run production,
+is:
 
-## Expected compiler reduction
+```sh
+rustc --edition=2024 --test \
+  packages/engine-benchmarks/tests/forktree_w0_storage_boundary_oracle.rs \
+  -o /tmp/forktree-w0-model
+/tmp/forktree-w0-model --nocapture --test-threads=1
+```
 
-This package does not invent a numeric reduction. Baseline d6/Cut B is
-deliberately calibrated red: it still contains legacy raw constructors and
-columnar/tracked/changelog owners. The verifier records the exact path/line
-residue count and hash. A W0 candidate must rerun `cargo check -p lix --lib
---all-features`, warnings-denied Clippy, and the verifier; the acceptance claim
-is removal of those diagnostics/owners, not a source-only count substituted for
-compiler evidence. Any remaining old constructor/type/import diagnostic is a
-blocker. Record compiler wall time and peak RSS only as supporting evidence.
+No Memory/RocksDB/SlateDB runtime cell is claimed by this package. A future
+compile-green candidate must add those adapter commands, flush/drop/cold
+reopen, exact root/object corruption, point/range ordering, cursor binding,
+and zero-read-write controls. Every future cell is capped at 20 minutes.
 
-The model is intentionally limited to public semantics: descriptor identity and
-value semantics, opaque object-domain reads, point/range streaming and cursor
-binding, reopen, missing/corrupt roots, and no write amplification. It is not a
-performance claim and does not authorize a scalar SQL path.
+## Immutable baseline calibration
 
-## Exact Cut B calibration
-
-The static verifier was run against the exact Cut B worktree with:
+The predecessor verifier, run unchanged against the exact blocked head, exited
+1 with 565 residues and no missing boundary tokens:
 
 ```text
-node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root "$PWD"
+node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root <465-review-worktree>
+571 lines, 69865 bytes
+SHA-256 4cecc96ae9569e5a8c3db0c6860e903b6d114aaa94ef3436fb35be94211fa271
 ```
 
-It found no missing retained-boundary token and 565 forbidden residues. The
-complete 571-line output is captured as
-`/tmp/w0-e92-residue.log`, SHA-256
-`57ea9499e868c2611e892774e04175388a8aa6b8eba5ba99b41bfad10dc58e9c`.
-This red result is the expected pre-cut comparator: the source still contains
-raw constructors, columnar owners, tracked/changelog readers, and old binary
-CAS owners. It is not evidence against the W0 oracle itself.
+The corrected verifier against this successor worktree is intentionally still
+red on the blocked production source because it scans the full tracked
+workspace and finds the existing binary-CAS/columnar/tracked/changelog/raw
+owner residues and old JS/native filesystem exports:
 
-The pure model was compiled with warnings denied and ran 5/5 tests green. The
-test executable SHA-256 is
-`7d6d5f8cc646e21e3521b150950514ff1d1759f98f5d3d90c2cf2d9524b133e7`.
+```text
+598 scanned source files / 605 tracked source files
+996 lines, 130133 bytes
+SHA-256 3e6be4f97c79487e2a6359dfab05088db7306689b1a21b88752bf639c1100d40
+exit 1; missing retained boundary none; structural findings 0; residues 956
+```
 
-The exact package no-run gate was then attempted once in an isolated target
-with `CARGO_BUILD_JOBS=2`. It terminated at 8:44.60 with exit 101 before
-linking the oracle: `lix` emitted 190 errors and 7 warnings, including
-unresolved legacy tracked/changelog/columnar imports and private/raw `SpaceId`
-field/constructor accesses. `/root/repos/lix-w0-storage-boundary-oracle/evidence/cut-b-package-no-run.log`
-is 94,600 bytes, SHA-256
-`4539f7b4672df47c08f939a18d86732364749b214f2a271ff6eb3e41308e5232`;
-`/usr/bin/time -v` recorded 1,620,648 KiB maximum RSS, 943.61 seconds user
-CPU, 40.97 seconds system CPU, and 4,385 seconds wall time. This is an
-inherited Cut B compile blocker and prevents any honest Memory/RocksDB/SlateDB
-runtime claim. No adapter runtime cell was started, and no production source
-was changed.
+The explicit generic-storage allowlist is printed separately and is not
+counted as residue. This is a diagnostic blocker for a future production W0
+cut, not a claim that this test-only successor should delete production code.
+
+The corrected model compiles and passes 6/6 with no warnings:
+
+```text
+binary SHA-256 e33005d7653e17a1d8acbf13c323ba195ebbe7fad7b66cd8afec800cd0b9985e
+run log SHA-256 d63dc63486f4cef75e6bb0625ce70adb7bf3ab366e9dfca9f7ed51e9333e603f
+```
+
+The executable probe runner was calibrated against the exact blocked source
+with `W0_TIMEOUT_SECONDS=30`. It correctly rejected the legacy Rust probes,
+but the positive Rust gates could not compile through the inherited source
+frontier; `tsc` was unavailable on the review host; and native Rust export
+residue was found. It therefore exits nonzero and is not candidate acceptance:
+
+```text
+22 lines, 1765 bytes
+SHA-256 82b3e5ab4ae8e5943225aecdd2885fc0861db64f0577a4055d08df4fe7254b00
+```
+
+No adapter runtime, production build matrix, or performance result was
+started. The accepted next step is a compile-green production candidate that
+must rerun this unchanged verifier and runner before any adapter qualification.

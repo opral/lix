@@ -1,34 +1,39 @@
-W0 ForkTree StorageSpace/type-boundary oracle manifest
+W0 ForkTree storage-boundary correction oracle
 status=TEST_REPORT_ONLY
-base=e92ea2e505ee3d96abbb529dbaedb23d4908ff42
-base_tree=0d0797c024706beb1510cb2f0f88f8414a9a0c96
-parent=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
-parent_tree=641654079f60fcd1c9ff9ccbbd06d3edcabe4096
-accepted_w2_head=0a1955269c0d1fd5d23bac24f0a35f4e9a51d687
+direct_successor_of=465786fccbf55decd92e169d646670e3351d077a
+base=465786fccbf55decd92e169d646670e3351d077a
+base_tree=0f553a521c91983e6d0ea1db98bc7397793aa449
+base_parent=e92ea2e505ee3d96abbb529dbaedb23d4908ff42
+production_edits=none
+adapter_runtime=none
 
 retained_boundary=StorageSpace(engine_declared)+ObjectId+ObjectDomain+CoherentView
 retained_spaces=OBJECT_SPACE,SELECTOR_SPACE,UNTRACKED_ROW_SPACE
-public_semantics=StorageRead coherent point/range/cursor/reopen; zero writes during read
-forbidden=raw_space_forge,columnar_owner,tracked_physical_owner,changelog_physical_space,binary_cas_legacy_owner,compatibility_registry
+public_semantics=authenticated point/range/cursor/reopen; zero read-side writes
+forbidden=raw_space_forge,columnar_owner,tracked_physical_owner,changelog_physical_space,binary_cas_owner,legacy_js_native_exports,compatibility_registry
 sql_scope=none
 
 static_gate=node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root <repo>
+compile_probe_runner=W0_TIMEOUT_SECONDS=1200 scripts/forktree_w0_compile_probes.sh <repo> <target>
 format_gate=cargo fmt --all -- --check
 diff_gate=git diff --check
 clippy_gate=cargo clippy -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- -D warnings
 compile_gate=cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle --no-run
-model_gate=cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-memory_gate=W0_BACKEND=memory cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-rocks_gate=W0_BACKEND=rocksdb cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-slate_gate=W0_BACKEND=slatedb cargo test -p lix_benchmarks --test forktree_w0_storage_boundary_oracle -- --nocapture --test-threads=1
-negative_probes=tests/forktree_w0_compile_probes/negative_*.rs,negative_native_exports.ts
-positive_probes=tests/forktree_w0_compile_probes/positive_descriptor.rs
+model_gate=rustc --edition=2024 --test tests/forktree_w0_storage_boundary_oracle.rs; binary --nocapture --test-threads=1
+rust_positive=positive_descriptor.rs plus actual benchmark test no-run
+rust_negative=negative_raw_space.rs,negative_columnar_owner.rs,negative_tracked_changelog.rs,negative_binary_cas_owner.rs
+typescript_negative=negative_native_exports.ts imports actual js-sdk LocalFilesystem/LixBinding
+native_negative=actual packages/js-sdk/native/napi.rs export absence scan
 cell_cap_minutes=20
-production_edits=none
-static_calibration=RED;565 residues;0 missing boundary tokens
-static_log_sha256=57ea9499e868c2611e892774e04175388a8aa6b8eba5ba99b41bfad10dc58e9c
-model_tests=5/5 GREEN
-model_binary_sha256=7d6d5f8cc646e21e3521b150950514ff1d1759f98f5d3d90c2cf2d9524b133e7
-package_no_run=RED inherited Cut B;190 errors;no test binary
-package_no_run_log_sha256=4539f7b4672df47c08f939a18d86732364749b214f2a271ff6eb3e41308e5232
-adapter_runtime=UNCLAIMED;compile gate failed before runtime
+
+baseline_old_verifier=565 residues;0 missing boundary tokens;exit 1
+baseline_old_verifier_log_sha256=4cecc96ae9569e5a8c3db0c6860e903b6d114aaa94ef3436fb35be94211fa271
+corrected_scanned_source_files=598
+corrected_tracked_source_files=605
+corrected_static=RED;956 residues;0 structural findings;0 missing boundary;exit 1
+corrected_static_log_sha256=3e6be4f97c79487e2a6359dfab05088db7306689b1a21b88752bf639c1100d40
+corrected_model_tests=6/6 GREEN
+corrected_model_binary_sha256=e33005d7653e17a1d8acbf13c323ba195ebbe7fad7b66cd8afec800cd0b9985e
+corrected_model_log_sha256=d63dc63486f4cef75e6bb0625ce70adb7bf3ab366e9dfca9f7ed51e9333e603f
+corrected_probe_calibration=RED;positive compile frontier;tsc unavailable;native residue;exit nonzero
+corrected_probe_log_sha256=82b3e5ab4ae8e5943225aecdd2885fc0861db64f0577a4055d08df4fe7254b00
