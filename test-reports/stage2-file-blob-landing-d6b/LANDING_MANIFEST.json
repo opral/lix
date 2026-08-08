@@ -1,0 +1,30 @@
+{
+  "package": "minimum-parsed-file-64mib-blob-landing",
+  "kind": "test-report-only",
+  "anchor": {
+    "ref": "origin/codex/forktree-stage2-commit-catalog-failclosed-1f742",
+    "head": "d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768",
+    "tree": "641654079f60fcd1c9ff9ccbbd06d3edcabe4096"
+  },
+  "prerequisites": {
+    "current_state_reader": "8b0cf91387ffc86851b99029bdd8942938ba2be6",
+    "w4_acceptance_package": "b1dd25ebc90e95304709fbbafcc662c144b0449c",
+    "cut_b_reader_acceptance_package": "e92ea2e505ee3d96abbb529dbaedb23d4908ff42"
+  },
+  "runtime_status": "not-run-anchor-is-compiler-red",
+  "production_changes": false,
+  "w5_implementation": false,
+  "excluded": ["512MiB", "scaling", "comparator", "alternate-layout"],
+  "adapters": ["Memory", "RocksDB", "SlateDB"],
+  "source_gate": "bash test-reports/stage2-file-blob-landing-d6b/verify_landing_contract.sh",
+  "required_gates": [
+    "plugin_parsed_rows",
+    "file_mutation_branch_diff_merge_history_reopen",
+    "BlobId_and_bounded_partial_reads",
+    "64x1MiB_unchanged_chunk_reuse",
+    "same_size_manifest_substitution_rejected",
+    "manifest_chunk_plugin_corruption_fail_closed",
+    "shared_and_final_reference_gc_handoff",
+    "RocksDB_then_SlateDB_exact_commands"
+  ]
+}
