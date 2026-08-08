@@ -73,7 +73,10 @@ boundary; retained historical roots are never allowed to use it.
   registry loader for base/target/source.
 - `packages/lix/src/live_state/forktree_reader.rs:31-45` — raw
   `scan_branch<S>(&S, ...)` calls `open_coherent_view_on_read(store, ...)`;
-  `scan_view` exists beside it but does not delete the raw entry.
+  `scan_view` exists beside it but does not delete the raw entry. The same
+  file's `load_exact_batch` at approximately lines 241-252 also calls
+  `open_coherent_view_on_read(store, ...)` directly; the verifier rejects both
+  raw-store acquisition sites.
 - `packages/lix/src/forktree/view.rs:133-210` — `ForkTreeReadFacade<'a, R>`
   stores arbitrary `read: &'a R`; `from_retained_read` accepts raw `&R`, and
   `branch()` constructs another `CoherentView<&R>` from that field.
