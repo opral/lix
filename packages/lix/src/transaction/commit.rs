@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::LixError;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
+use crate::common::LixTimestamp;
 use crate::json_store::JsonSlot;
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::transaction::staging::{PreparedWriteSet, StagedIntermediateCommit};
 
 use crate::forktree::{
@@ -53,6 +54,40 @@ pub(crate) fn take_rootless_replacement_generation_publications() -> usize {
 #[cfg(test)]
 pub(crate) fn take_direct_journal_replacement_publications(_schema_key: &str) -> usize {
     0
+}
+
+pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
+
+/// Complete result of classifying one transaction's currently supported
+/// ForkTree publication intent.
+///
+/// `Noop` is deliberately distinct from an empty `PreparedPublication`: a
+/// genuine empty transaction must not rotate the global selector or discard
+/// an in-progress GC page. Runtime/idempotency metadata can still be appended
+/// by the transaction owner to this empty plan before its sole commit.
+pub(crate) enum PreparedForkTreePlan {
+    Noop,
+    Publication(PreparedPublication),
+}
+
+impl PreparedForkTreePlan {
+    pub(crate) fn into_storage_plan(
+        self,
+    ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+        match self {
+            Self::Noop => Ok((StorageWriteSet::new(), Vec::new())),
+            Self::Publication(publication) => Ok(publication.into_storage_plan()?),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationIntent {
+    Noop,
+    Ordinary {
+        branch_id: CanonicalBranchId,
+        semantic_commit: bool,
+    },
 }
 
 /// Resolves every branch head from the caller's coherent commit snapshot.
@@ -132,24 +167,45 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
 pub(crate) async fn prepare_forktree_publication_with_parent_heads<R>(
     active_account_id: &str,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
+    runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
     read: R,
     prepared_writes: PreparedWriteSet,
-) -> Result<PreparedPublication, LixError>
+) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
 {
-    reject_not_yet_lowered_cohorts(&prepared_writes)?;
-
-    let branch_id = sole_publication_branch(&prepared_writes)?;
-    let canonical_branch_id = canonical_branch_id(&branch_id)?;
-    let view = open_coherent_view_on_read(read, canonical_branch_id).await?;
+    let intent = classify_publication_intent(&prepared_writes, runtime_checkpoint)?;
+    let PublicationIntent::Ordinary {
+        branch_id: publication_branch_id,
+        semantic_commit,
+    } = intent
+    else {
+        return Ok(PreparedForkTreePlan::Noop);
+    };
+    let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
+    let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
+
+    let runtime_entity_pk = runtime_checkpoint
+        .map(|_| crate::entity_pk::EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY));
 
     for row in prepared_writes
         .state_rows
         .iter()
         .filter(|row| row.untracked)
     {
+        if runtime_entity_pk.as_ref().is_some_and(|entity_pk| {
+            row.branch_id.as_str() == crate::GLOBAL_BRANCH_ID
+                && row.schema_key.as_str() == "lix_key_value"
+                && row.file_id.is_none()
+                && row.entity_pk == entity_pk
+        }) {
+            // The engine-owned sequence checkpoint is derived after statement
+            // rollback/savepoint handling. It therefore supersedes a staged
+            // user row at the same protected identity, matching the previous
+            // materializer without creating two values for one untracked key.
+            continue;
+        }
         let key = StateKeyRef {
             schema_key: row.schema_key.as_str(),
             file_id: row.file_id.map(|value| value.as_str()),
@@ -157,7 +213,7 @@ where
         };
         if let Some(snapshot) = row.snapshot {
             publication.put_untracked_row(
-                canonical_branch_id,
+                publication_branch_id,
                 key,
                 UntrackedValueRef {
                     created_at: row.created_at,
@@ -169,18 +225,42 @@ where
                 },
             )?;
         } else {
-            publication.delete_untracked_row(canonical_branch_id, key)?;
+            publication.delete_untracked_row(publication_branch_id, key)?;
         }
     }
 
+    if let Some((highest_seen, timestamp, _change_id)) = runtime_checkpoint {
+        let entity_pk = runtime_entity_pk
+            .as_ref()
+            .expect("runtime checkpoint necessarily has an entity identity");
+        let snapshot = deterministic_sequence_snapshot(highest_seen)?;
+        publication.put_untracked_row(
+            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?,
+            StateKeyRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk,
+            },
+            UntrackedValueRef {
+                created_at: timestamp,
+                updated_at: timestamp,
+                cell: StateCellRef::Value(&snapshot),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )?;
+    }
+
+    if !semantic_commit {
+        return Ok(PreparedForkTreePlan::Publication(publication));
+    }
     let tracked_rows = prepared_writes
         .state_rows
         .iter()
         .filter(|row| !row.untracked)
         .collect::<Vec<_>>();
-    if tracked_rows.is_empty() {
-        return Ok(publication);
-    }
+    debug_assert!(!tracked_rows.is_empty());
 
     let change_refs = prepared_writes
         .commit_change_refs_by_branch
@@ -376,7 +456,7 @@ where
     })?;
     let ref_change = ChangeObjectV1::BranchRef {
         change_id: forktree_change_id(change_refs.branch_ref_change_id),
-        branch_id: canonical_branch_id,
+        branch_id: publication_branch_id,
         before_semantic_head_commit_object_id: Some(selected_parent_object_id),
         after_semantic_head_commit_object_id: Some(commit_object_id),
         previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
@@ -417,7 +497,7 @@ where
             change_object_id: ref_object_id,
             owner: ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: ref_object_id,
-                branch_id: canonical_branch_id,
+                branch_id: publication_branch_id,
             },
         },
     ));
@@ -441,7 +521,7 @@ where
         semantic_commit,
         changes,
         branch_snapshot: BranchSnapshotV1 {
-            branch_id: canonical_branch_id,
+            branch_id: publication_branch_id,
             local_state_root,
             semantic_head_commit_object_id: commit_object_id,
             latest_ref_change_object_id: Some(ref_object_id),
@@ -452,7 +532,85 @@ where
     publication
         .publish_state_transition(&view, transition)
         .await?;
-    Ok(publication)
+    Ok(PreparedForkTreePlan::Publication(publication))
+}
+
+fn classify_publication_intent(
+    prepared: &PreparedWriteSet,
+    runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
+) -> Result<PublicationIntent, LixError> {
+    reject_not_yet_lowered_cohorts(prepared)?;
+
+    // Commit intent is independent of current-state row count. Inspect every
+    // semantic owner before opening a view or constructing a publication, so
+    // an unsupported ref/history cohort cannot publish unrelated untracked
+    // state or rotate the global epoch while silently dropping its commit.
+    for refs in prepared.commit_change_refs_by_branch.values() {
+        if refs.has_selected_changes() {
+            return Err(writer_error(
+                "selected historical members require the ForkTree merge-member lowering slice",
+            ));
+        }
+        if refs.ordered_mutation_journal().is_some() {
+            return Err(writer_error(
+                "immutable mutation journals require the ForkTree bulk lowering slice",
+            ));
+        }
+    }
+
+    let mut tracked_rows_by_branch = BTreeMap::<&str, usize>::new();
+    for row in prepared.state_rows.iter().filter(|row| !row.untracked) {
+        *tracked_rows_by_branch
+            .entry(row.branch_id.as_str())
+            .or_default() += 1;
+    }
+    for (branch_id, refs) in &prepared.commit_change_refs_by_branch {
+        let tracked_rows = tracked_rows_by_branch
+            .get(branch_id.as_str())
+            .copied()
+            .unwrap_or_default();
+        if tracked_rows == 0 {
+            return Err(writer_error(
+                "ref-only commit intent requires the ForkTree history lowering slice",
+            ));
+        }
+        if refs.tracked_change_count != tracked_rows {
+            return Err(writer_error(
+                "tracked row count differs from its semantic commit membership",
+            ));
+        }
+    }
+    if tracked_rows_by_branch.len() != prepared.commit_change_refs_by_branch.len() {
+        return Err(writer_error(
+            "tracked rows are missing their semantic commit owner",
+        ));
+    }
+    if !prepared.extra_commit_parents_by_branch.is_empty()
+        && prepared.commit_change_refs_by_branch.is_empty()
+    {
+        return Err(writer_error(
+            "extra parent intent is missing its semantic commit owner",
+        ));
+    }
+
+    let has_state_rows = !prepared.state_rows.is_empty();
+    let has_commit_intent = !prepared.commit_change_refs_by_branch.is_empty()
+        || !prepared.extra_commit_parents_by_branch.is_empty();
+    if !has_state_rows && !has_commit_intent {
+        return match runtime_checkpoint {
+            None => Ok(PublicationIntent::Noop),
+            Some(_) => Ok(PublicationIntent::Ordinary {
+                branch_id: canonical_branch_id(crate::GLOBAL_BRANCH_ID)?,
+                semantic_commit: false,
+            }),
+        };
+    }
+
+    let branch_id = sole_publication_branch(prepared, runtime_checkpoint.is_some())?;
+    Ok(PublicationIntent::Ordinary {
+        branch_id: canonical_branch_id(&branch_id)?,
+        semantic_commit: has_commit_intent,
+    })
 }
 
 fn reject_not_yet_lowered_cohorts(prepared: &PreparedWriteSet) -> Result<(), LixError> {
@@ -479,7 +637,10 @@ fn reject_not_yet_lowered_cohorts(prepared: &PreparedWriteSet) -> Result<(), Lix
     Ok(())
 }
 
-fn sole_publication_branch(prepared: &PreparedWriteSet) -> Result<String, LixError> {
+fn sole_publication_branch(
+    prepared: &PreparedWriteSet,
+    runtime_checkpoint_present: bool,
+) -> Result<String, LixError> {
     let mut branches = prepared
         .state_rows
         .iter()
@@ -490,7 +651,16 @@ fn sole_publication_branch(prepared: &PreparedWriteSet) -> Result<String, LixErr
                 .keys()
                 .map(String::as_str),
         )
+        .chain(
+            prepared
+                .extra_commit_parents_by_branch
+                .keys()
+                .map(String::as_str),
+        )
         .collect::<BTreeSet<_>>();
+    if branches.is_empty() && runtime_checkpoint_present {
+        branches.insert(crate::GLOBAL_BRANCH_ID);
+    }
     let branch = branches
         .pop_first()
         .ok_or_else(|| writer_error("prepared publication has no branch owner"))?;
@@ -500,6 +670,18 @@ fn sole_publication_branch(prepared: &PreparedWriteSet) -> Result<String, LixErr
         ));
     }
     Ok(branch.to_string())
+}
+
+fn deterministic_sequence_snapshot(highest_seen: i64) -> Result<String, LixError> {
+    serde_json::to_string(&serde_json::json!({
+        "key": crate::functions::DETERMINISTIC_SEQUENCE_KEY,
+        "value": highest_seen,
+    }))
+    .map_err(|error| {
+        writer_error(format!(
+            "failed to serialize deterministic sequence checkpoint: {error}"
+        ))
+    })
 }
 
 fn canonical_branch_id(value: &str) -> Result<CanonicalBranchId, LixError> {
@@ -527,3 +709,92 @@ fn writer_error(message: impl Into<String>) -> LixError {
 // Keep the compiler honest that the drained intermediate owner remains part
 // of the next history-lowering slice rather than being silently discarded.
 const _: Option<StagedIntermediateCommit> = None;
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
+    use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
+    use crate::transaction::types::{
+        PreparedStateBatch, StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
+    };
+
+    fn empty_writes() -> PreparedWriteSet {
+        PreparedWriteSet {
+            state_rows: PreparedStateBatch::new(),
+            insert_selection: PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn genuine_empty_and_unadvanced_runtime_are_noop_intent() {
+        assert_eq!(
+            classify_publication_intent(&empty_writes(), None).expect("empty intent"),
+            PublicationIntent::Noop
+        );
+    }
+
+    #[test]
+    fn advanced_runtime_is_global_publication_intent() {
+        let checkpoint = Some((
+            7,
+            LixTimestamp::from_unix_millis_utc_lossy(7),
+            crate::changelog::ChangeId::for_test_label("runtime-7"),
+        ));
+        assert_eq!(
+            classify_publication_intent(&empty_writes(), checkpoint).expect("runtime intent"),
+            PublicationIntent::Ordinary {
+                branch_id: canonical_branch_id(crate::GLOBAL_BRANCH_ID)
+                    .expect("canonical global branch"),
+                semantic_commit: false,
+            }
+        );
+        assert_eq!(
+            deterministic_sequence_snapshot(7).expect("sequence snapshot"),
+            r#"{"key":"lix_deterministic_sequence_number","value":7}"#
+        );
+    }
+
+    #[test]
+    fn ref_only_and_selected_history_fail_before_publication() {
+        let mut ref_only = empty_writes();
+        ref_only.commit_change_refs_by_branch.insert(
+            crate::GLOBAL_BRANCH_ID.to_string(),
+            StagedCommitChangeRefs::default(),
+        );
+        let error = classify_publication_intent(&ref_only, None)
+            .expect_err("ref-only intent must not be dropped");
+        assert!(error.message.contains("ref-only commit intent"));
+
+        let mut selected = empty_writes();
+        let mut refs = StagedCommitChangeRefs::default();
+        let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
+        batch.push(
+            TrackedStateDiffIdentity::from_key(TrackedStateKey {
+                schema_key: "app.row".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single("selected"),
+            }),
+            CommitId::for_test_label("selected-source"),
+            crate::changelog::ChangeId::for_test_label("selected-change"),
+            false,
+            LixTimestamp::from_unix_millis_utc_lossy(1),
+            LixTimestamp::from_unix_millis_utc_lossy(2),
+        );
+        refs.add_selected_change_batch(batch.finish());
+        selected
+            .commit_change_refs_by_branch
+            .insert(crate::GLOBAL_BRANCH_ID.to_string(), refs);
+        let error = classify_publication_intent(&selected, None)
+            .expect_err("selected history must not be dropped");
+        assert!(error.message.contains("selected historical members"));
+    }
+}

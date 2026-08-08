@@ -1553,7 +1553,7 @@ where
 
     async fn commit_prepared(
         mut self,
-        _runtime_functions: &FunctionContext,
+        runtime_functions: &FunctionContext,
         mut prepared_writes: PreparedWriteSet,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let transaction = &mut self;
@@ -1658,9 +1658,10 @@ where
         } else {
             load_path_index_revision(&read).await.ok().flatten()
         };
-        let prepared_publication = match commit::prepare_forktree_publication_with_parent_heads(
+        let prepared_forktree_plan = match commit::prepare_forktree_publication_with_parent_heads(
             &transaction.active_account_id,
             &commit_parent_heads,
+            runtime_functions.deterministic_sequence_checkpoint(),
             read.clone(),
             prepared_writes,
         )
@@ -1684,7 +1685,7 @@ where
         // idempotency receipt are appended below before the sole backend
         // prepare/commit boundary.
         let (mut writes, materialization_preconditions) =
-            prepared_publication.into_storage_plan()?;
+            prepared_forktree_plan.into_storage_plan()?;
         if catalog_revision_changed {
             stage_catalog_revision(&mut writes);
         }
