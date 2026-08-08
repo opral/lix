@@ -1,0 +1,18 @@
+# Exact e1af calibration
+
+Target: e1af471b9ab0f598dafa7c2ddec7867667c81740
+
+The legacy source verifier must report exactly these five RED predicates on the
+anchor. Structural capability self-tests must pass independently, while the
+candidate contract remains RED because the anchor has no operation-owned
+ForkTree merge-analysis argument:
+
+1. merge analysis still accepts TrackedStateStoreReader
+2. merge analysis still routes through legacy diff_commits
+3. merge branch still enters with_opening_tracked_reader
+4. transaction context still exposes merge callback plumbing
+5. legacy tracked-state diff owner remains reachable
+
+The five labels are the calibration count. Structural diagnostics are reported
+separately and do not change this five-predicate calibration.
+
