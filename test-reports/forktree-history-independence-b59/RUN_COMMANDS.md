@@ -1,7 +1,7 @@
-# Future execution recipe (all cells UNRUN)
+# Future adapter execution recipe (adapter cells UNRUN)
 
-This package is report-only. The following commands are the exact future
-order, not results. No command below was run while freezing this package.
+This package is report-only. The adapter commands below are the exact future
+order, not results, and remain UNRUN while freezing this package.
 
 ## Common rules
 
@@ -16,7 +16,7 @@ order, not results. No command below was run while freezing this package.
   50K/500K before the focused 10K pair and corruption cells pass.
 * No current-main performance comparison is part of this oracle.
 
-## Pure model (UNRUN)
+## Pure model (standalone correction gate: PASS 6/6)
 
 ```bash
 rustc --edition=2021 --test \
@@ -25,6 +25,10 @@ rustc --edition=2021 --test \
 timeout 20m /root/repos/lix-evidence/forktree-history-independence-b59/model-test \
   --nocapture
 ```
+
+This standalone model command was run for the correction only; it does not
+open Lix storage or assert adapter behavior. The observed executable SHA-256
+was `f6db5617abd2109d3601e10229b996ac09e6083de504644fa54c39ffe1229310`.
 
 ## Adapter order (UNRUN)
 

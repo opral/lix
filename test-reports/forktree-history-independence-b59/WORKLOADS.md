@@ -9,8 +9,11 @@ cell, 50K is conditional, and 500K is last/optional.
 ## Pair definitions
 
 For every `N`, construct final keys `row/000000` through `row/{N-1:06}`.
-Blob IDs and bytes are deterministic functions of the key (`blob/shared` is
-used by every eighth row; all other IDs are unique and content-addressed).
+Blob bytes are deterministic functions of the row index, with shared content
+used by every fourth row. The modeled BlobId/ObjectId is derived from the
+domain and complete content bytes, never from the row key; identical content
+therefore produces one shared object even when referenced by different rows.
+All other content is unique and content-addressed.
 The following pairs must finish with exactly the same final row key, value,
 tombstone, file identity, and blob identity sets:
 
@@ -26,6 +29,13 @@ The branch/checkpoint pair must also compare branch-visible rows and the
 selected historical member before the final merge. The intermediate pair
 must compare history and diff outputs before convergence. These are not
 allowed to be reduced to final-state-only comparisons.
+
+The executable model first asserts, for every pair, equality of final rows,
+BlobIds/content-object IDs, logical digest, and cold-reopen digest. It then
+records construction/history-root differences as diagnostics and measures
+publication/synchronization bytes, diff/history reads, allocations, settled
+disk, and final-reference-GC reclamation. A pair that does not satisfy the
+equality assertions is a semantic failure, not a canonicalization result.
 
 ## Required result fields
 
@@ -49,6 +59,12 @@ gc_reclaimed_bytes, corruption_case, outcome, failure_digest
 `roots_equal_to_pair` is informational. `outcome` must distinguish `pass`,
 `valid_absence`, and `fail_closed`; it must never turn a missing required
 object into `valid_absence`.
+
+The model-only fields additionally include content-object ID sets,
+history-only object bytes, publication bytes, and the explicit
+`perfect_elimination_ceiling` numerator/denominator/ratio. The adapter result
+must replace estimates with measured counters and retain the same field
+meaning.
 
 ## Corruption and GC controls
 

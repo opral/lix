@@ -18,9 +18,11 @@ Package purpose:
   history-dependent identity to be mistaken for a semantic result;
 * preserve fail-closed corruption and atomic-publication requirements.
 
-The pure model in `history_independence_model.rs` is deliberately a small
-oracle model, not a ForkTree codec or a substitute authority. It must not be
-used to claim runtime results.
+The pure model in `history_independence_model.rs` is an executable semantic
+and accounting oracle, not a ForkTree codec or a substitute authority. Its
+row-key-independent content ObjectIds, pair equality assertions,
+authenticated-fingerprint publication, GC, and ceiling values must not be
+used to claim adapter runtime results.
 
 ## Frozen identity
 
@@ -29,7 +31,8 @@ used to claim runtime results.
 | production base | `b59e1f11a51153e0a787a81f0f25bf104d150aaf` |
 | production tree | `700fd04d21bc40c05425c9fc9e10d65c9e1eda24` |
 | package scope | `test-reports/forktree-history-independence-b59/*` only |
-| runtime status | **UNRUN** |
+| adapter runtime status | **UNRUN** |
+| standalone pure-model status | **PASS — 6/6** |
 | adapters | Memory, RocksDB, SlateDB, in that order |
 | production edits | none |
 
