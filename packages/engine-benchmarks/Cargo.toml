@@ -8,6 +8,9 @@ license.workspace = true
 rust-version.workspace = true
 autobenches = false
 autotests = false
+[[test]]
+name = "forktree_public_sql_acceptance_oracle"
+path = "tests/forktree_public_sql_acceptance_oracle.rs"
 
 [lints]
 workspace = true

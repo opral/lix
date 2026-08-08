@@ -1,0 +1,31 @@
+ForkTree public-SQL acceptance oracle manifest
+status=TEST_REPORT_SOURCE_ONLY
+base=e1666edd0b4d814a88d985086ecc5a477b5d32e6
+base_tree=c680bd7e7f7b70cd784676515839af2dcbbc7917
+scope=direct_entity_snapshot_primary_key_vs_deleted_row_group_planner
+authority=live_state::forktree_reader + live_state::visibility + sql2::providers::entity
+required=exact_entity_pk,branch_global_overlay,ordering,projection,limit,NULL,tombstone,schema_filter,typed_pk_filter
+fail_closed=missing_schema,missing_branch,malformed_pk,wrong_kind,invalid_projection,conflicting_duplicate
+deleted=plan_direct_entity_columnar_scan,row_group_manifest,entity_columnar_overlay,obsolete_hot_helpers
+compatibility=none
+production_edits=none
+current_main_performance=excluded
+runtime_on_frontier=unclaimed_compiler_red
+
+source_gate=node scripts/forktree_public_sql_residue_verify.mjs --root <repo>
+format_gate=cargo fmt --all -- --check
+diff_gate=git diff --check
+model_compile_gate=rustc --edition=2021 --test -D warnings packages/engine-benchmarks/tests/forktree_public_sql_acceptance_oracle.rs -o <oracle>
+model_gate=<oracle> --nocapture --test-threads=1
+clippy_gate=cargo clippy -p lix_benchmarks --test forktree_public_sql_acceptance_oracle -- -D warnings
+package_no_run=cargo test -p lix_benchmarks --test forktree_public_sql_acceptance_oracle --no-run
+memory_gate=W0_BACKEND=memory cargo test -p lix_benchmarks --test forktree_public_sql_acceptance_oracle -- --nocapture --test-threads=1
+rocks_gate=W0_BACKEND=rocksdb cargo test -p lix_benchmarks --test forktree_public_sql_acceptance_oracle -- --nocapture --test-threads=1
+slate_gate=W0_BACKEND=slatedb cargo test -p lix_benchmarks --test forktree_public_sql_acceptance_oracle -- --nocapture --test-threads=1
+cell_cap_minutes=20
+source_calibration=RED;187 obsolete residues;0 missing direct-boundary tokens
+source_log_sha256=bc3b8db204e80707c3b890228fa07165b9cfb6098d426b0c452d5b2e465d4f97
+model_tests=8/8 GREEN
+model_binary_sha256=40cd9f6e2603947af1807348a5031e7fedcb4348ceb65f21d7f4d8c8f73d3732
+package_no_run=NOT_CLAIMED;frontier compiler-red
+adapter_runtime=UNCLAIMED;R5 replay on compile-green successor
