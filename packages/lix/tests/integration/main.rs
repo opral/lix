@@ -23,3 +23,4 @@ mod physical_plan_cache;
 mod sql;
 mod storage_accounting;
 mod transaction;
+mod w3_checkpoint_publication_oracle;
