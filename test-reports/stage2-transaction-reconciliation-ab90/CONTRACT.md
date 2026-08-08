@@ -42,6 +42,39 @@ allowed.
    malformed, wrong-kind, substituted, duplicate, reordered, or undecodable
    selected authority fails closed before output or writes.
 
+## Required successor corrections
+
+The next TEST/REPORT-ONLY successor must close these source and semantic gaps
+without changing production code in this package:
+
+- Scan the complete tracked workspace source set. Report legacy names by path
+  and classify deferred owners separately from the exact migrated function
+  scope. Do not use a global absence rule that produces unrelated positives.
+- Prove one retained read across every alternate opening helper. The helper
+  may borrow a branch descriptor or transaction object, but it must not call
+  `begin_read`, refresh, extract a read, or pair a detached cache. The captured
+  selector/root/epoch bytes must be the same bytes used by reconciliation and
+  planning.
+- Bind both `owner_epoch` and `view_id` into the publication plan and the
+  final transaction commit precondition. Checking either value only in a
+  reader/view wrapper is insufficient.
+- Make publication enforce `reconcile_owner`; the lowerer cannot accept an
+  unclassified stale or mixed-owner plan merely because a caller reached it
+  through a different helper.
+- Make historical state an immutable captured view with one consistent
+  tombstone policy across opening, transition, undo/redo, and cold reopen.
+  Missing selected roots/records must not become empty or zero digests.
+- Carry desired local state explicitly in the transition. Never reconstruct it
+  from a mutable reader, cache, fallback row, or default digest.
+- Authenticate root identity from complete content/authority bytes. A
+  same-prefix or same-length transplant must fail before plan creation while
+  the valid root remains accepted.
+
+The eight D-cases in `CASES.md` are the discriminators for these requirements.
+They are not satisfied by rejecting a supported operation as an unsupported
+capability, and they do not authorize a second selector, cache, format, or
+writer.
+
 ## Exact future source paths
 
 Allowed production ownership is narrow and compiler-driven:
@@ -59,6 +92,10 @@ Allowed production ownership is narrow and compiler-driven:
   points, statement checkpoints, and one-view threading;
 - existing ForkTree serving/model/view code for authenticated facts and
   in-memory publication plans.
+
+The exact negative source policy, including the full-workspace inventory and
+function-scoped compatibility rules, is frozen in `SOURCE_POLICY.md` and is
+executed by `verify_transaction_reconciliation.sh`.
 
 Forbidden in this lane: tracked-state writer/reader replacement, SQL
 binder/executor changes, CAS/blob layout, selector/format changes, GC

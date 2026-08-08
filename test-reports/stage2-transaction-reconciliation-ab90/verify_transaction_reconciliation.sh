@@ -185,6 +185,115 @@ else
   emit PASS historical_tombstone_prerequisite "tombstone-inclusive terminal behavior is represented by the canonical reader"
 fi
 
+# Full-workspace inventory.  This is deliberately broader than the old
+# hand-maintained source list: legacy names are classified, not globally
+# forbidden, because deferred checkpoint/GC owners may legitimately remain.
+source_file_count=0
+while IFS= read -r -d '' path; do
+  case "$path" in
+    *.rs|*.ts|*.tsx|*.js|*.jsx|*.py|*.go|*.sql|*.sh|*.bash|*.toml|*.yaml|*.yml)
+      source_file_count=$((source_file_count + 1)) ;;
+  esac
+done < <(git -C "$ROOT" ls-files -z)
+
+workspace_legacy_inventory=$(git -C "$ROOT" grep --no-color -n -I -E \
+  'TrackedStateStoreReader|TrackedStateContext|TrackedHeadContext|TrackedStateScanRequest|CertifiedHistoryStoreReader|PreparedPublication::commit|StorageAdapterRead|begin_read|compatibility|fallback|cache' \
+  -- '*.rs' '*.ts' '*.tsx' '*.js' '*.jsx' '*.py' '*.go' '*.sql' '*.sh' '*.bash' '*.toml' '*.yaml' '*.yml' 2>/dev/null || true)
+workspace_legacy_lines=0
+if [[ -n "$workspace_legacy_inventory" ]]; then
+  workspace_legacy_lines=$(printf '%s\n' "$workspace_legacy_inventory" | wc -l | tr -d ' ')
+fi
+emit PASS full_workspace_source_scan "scanned $source_file_count tracked source files; classified $workspace_legacy_lines legacy/read/compatibility lines by path"
+
+# Extract a Rust function body for the function-scoped negative policy.  The
+# scan is intentionally limited to the exact lowerer functions; it does not
+# turn an inherited owner elsewhere in the workspace into a false positive.
+function_body() {
+  local path=$1
+  local needle=$2
+  git -C "$ROOT" show "HEAD:$path" 2>/dev/null | awk -v needle="$needle" '
+    function brace_count(line, token) {
+      token = line
+      return gsub(/\{/, "", token) - gsub(/\}/, "", token)
+    }
+    !found && index($0, needle) { found = 1 }
+    found && !done {
+      print
+      delta = brace_count($0)
+      if (delta != 0) { started = 1; depth += delta }
+      if (started && depth == 0) { done = 1 }
+    }
+  '
+}
+
+publication_lowerer_body=$(function_body packages/lix/src/transaction/commit.rs 'prepare_forktree_publication_with_parent_heads')
+publication_plan_body=$(function_body packages/lix/src/forktree/publication.rs 'into_storage_plan')
+stale_lowerer_body=$(function_body packages/lix/src/transaction/stale_commit.rs 'classify_stale_commit')
+context_lowerer_body=$(function_body packages/lix/src/transaction/context.rs 'prepare_write_set')
+migrated_function_bodies="$publication_lowerer_body\n$publication_plan_body\n$stale_lowerer_body\n$context_lowerer_body"
+
+if [[ -n "$publication_lowerer_body" && -n "$publication_plan_body" && -n "$stale_lowerer_body" && -n "$context_lowerer_body" ]] \
+  && ! printf '%s\n' "$migrated_function_bodies" | rg -n \
+    'begin_read|StorageAdapterRead|TrackedState(Store|Head)?(Reader|Context)|TrackedStateScanRequest|CertifiedHistoryStoreReader|PreparedPublication::commit|compatibility|fallback|cache|retry' >/dev/null; then
+  emit PASS function_scoped_no_compat "migrated lowerer bodies have no raw-read, legacy-reader, fallback, cache, retry, or direct-commit token"
+else
+  emit RED function_scoped_no_compat "mapped lowerer bodies are not yet compiler-proven free of raw-read/legacy/fallback/cache/direct-commit seams"
+fi
+
+# Alternate opening helpers must share one retained operation read.  The
+# source gate requires both canonical view entry points plus explicit proof
+# markers; a mere token or a second helper that reacquires storage is not
+# enough.
+opening_helpers=$(git -C "$ROOT" grep --no-color -n -I -E \
+  'open_coherent_view(_on_read)?|open.*(transaction|reconcil|historical).*view' \
+  -- packages/lix/src 2>/dev/null || true)
+opening_count=0
+if [[ -n "$opening_helpers" ]]; then
+  opening_count=$(printf '%s\n' "$opening_helpers" | wc -l | tr -d ' ')
+fi
+transaction_begin_reads=$(git -C "$ROOT" grep --no-color -n -I -E 'begin_read|StorageAdapterRead' \
+  -- packages/lix/src/transaction packages/lix/src/session packages/lix/src/live_state 2>/dev/null || true)
+if [[ -n "$opening_helpers" && -z "$transaction_begin_reads" ]] \
+  && has_all "$publication_lowerer_body$context_lowerer_body$stale_lowerer_body" \
+    'open_coherent_view_on_read' 'operation-owned' 'captured' 'same read'; then
+  emit PASS one_retained_read_alternate_helpers "$opening_count alternate opening/helper references share the captured operation read; no transaction/session/live_state acquisition"
+else
+  emit RED one_retained_read_alternate_helpers "alternate opening helpers lack a source-proven single retained read across all paths"
+fi
+
+if has_all "$publication$commit" 'owner_epoch' 'view_id' 'into_storage_plan' && \
+   has_all "$context" 'owner_epoch' 'view_id' 'prepare_write_set' 'prepared_commit.commit'; then
+  emit PASS owner_epoch_view_id_binding "owner_epoch and view_id are bound in both publication planning and final commit preconditions"
+else
+  emit RED owner_epoch_view_id_binding "owner_epoch/view_id are not both authenticated at plan and commit boundaries"
+fi
+
+if has_all "$publication$commit" 'reconcile_owner' 'owner' 'precondition' 'return Err'; then
+  emit PASS reconcile_owner_publication "publication enforces reconcile_owner before producing writes"
+else
+  emit RED reconcile_owner_publication "publication can still be reached without source-proven reconcile_owner enforcement"
+fi
+
+captured_sources="$publication$commit$context$undo_redo$execute$forktree_reader$live_context"
+if has_all "$captured_sources" 'captured_historical_view' 'tombstone_policy' 'immutable' 'selector' 'root' 'epoch'; then
+  emit PASS immutable_captured_history_view "historical selector/root/epoch capture and tombstone policy are explicit in the shared transition surface"
+else
+  emit RED immutable_captured_history_view "shared immutable historical capture with consistent tombstone semantics is not source-proven"
+fi
+
+if has_all "$commit$context$execute" 'desired_local_state' 'transition' 'source' 'target' 'missing' 'return Err'; then
+  emit PASS desired_local_state_transition "transition carries desired local state and rejects missing source/target authority"
+else
+  emit RED desired_local_state_transition "desired local state is not explicit or may be reconstructed from mutable/default state"
+fi
+
+root_identity_sources="$publication$commit$context$serving$model"
+if has_all "$root_identity_sources" 'content' 'authenticated' 'root' 'identity' 'same-prefix' 'transplant' 'return Err'; then
+  emit PASS content_authenticated_root_identity "complete content-authenticated root identity rejects same-prefix transplant before planning"
+else
+  emit RED content_authenticated_root_identity "root identity/transplant rejection is not source-proven beyond prefix/length claims"
+fi
+
 emit NOT_RUN runtime_matrix "TEST/REPORT-ONLY package: no Memory/RocksDB/SlateDB build or runtime was run"
 
 printf 'SUMMARY\tmode=%s\tpass=%d\tred=%d\tfail=%d\tnot_run=%d\thead=%s\ttree=%s\n' \

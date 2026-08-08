@@ -13,6 +13,14 @@ ab90: the historical duplicate-invariant/fail-closed prerequisite is not yet
 accepted, and ab90 still contains inherited reader/cache/transaction seams.
 That RED is a safety hold, not a request to weaken the prerequisite.
 
+This successor preserves the original 16-case baseline (R01-R15 plus the
+historical prerequisite P0) and adds D01-D08 discriminators for the H2 gaps:
+full-workspace source classification, one retained read across alternate
+opening helpers, owner_epoch/view_id plan-and-commit binding, publication-side
+reconcile_owner enforcement, immutable captured history/tombstones, explicit
+desired local state, content-authenticated root identity, and precise
+function-scoped compatibility rules.
+
 Run the static discriminator from this directory:
 
 ```sh
@@ -32,3 +40,8 @@ HISTORICAL_FAIL_CLOSED_ORACLE=accepted:<immutable-oracle-sha> \
 No command in this package is a production acceptance claim.  Runtime replay
 is deliberately staged Memory → RocksDB → SlateDB in `CONTRACT.md` and is to
 be run only on a future compiler-runnable immutable successor.
+
+The full source policy and its false-positive boundaries are frozen in
+`SOURCE_POLICY.md`. The verifier scans all tracked source artifacts and only
+applies negative compatibility rules inside the explicitly mapped lowerer
+function bodies.
