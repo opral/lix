@@ -80,6 +80,33 @@ The pure W5/R7 model and future adapter gate must preserve:
 No second root authority, compatibility reader, fallback, cache, raw
 `StorageSpace` forge, or independent writer is accepted.
 
+## Standalone model and candidate-parametric source gate
+
+`w5_r7_e1af_readiness_model.rs` is the executable model for the selector,
+authenticated object graph, owner-bound fence, queue, pin, root-owner, and
+cold-reopen controls. It is independent of Lix production and must compile
+with warnings denied before any adapter gate.
+
+```sh
+timeout 1200 rustc --edition=2021 --test -D warnings \
+  test-report/forktree-w5-r7-e1af-rebind/w5_r7_e1af_readiness_model.rs \
+  -o /tmp/w5-r7-e1af-readiness-model
+timeout 1200 /tmp/w5-r7-e1af-readiness-model --nocapture --test-threads=1
+```
+
+The verifier is cwd-independent and takes a candidate target and exact e1af
+anchor. Exact e1af is intentionally RED; a future candidate can reach GREEN
+only when its whole `packages/lix/src` scope has no forbidden legacy/fallback/
+second-authority residues and retains the required ForkTree owner symbols:
+
+```sh
+timeout 1200 bash test-report/forktree-w5-r7-e1af-rebind/verify_e1af_rebind.sh \
+  <repo-root> <candidate-or-e1af> e1af471b9ab0f598dafa7c2ddec7867667c81740
+```
+
+The baseline `SOURCE_RED.log` remains bound to the exact e1af residue count;
+it is not used to mask candidate results.
+
 ## Dormant first-runnable order
 
 Every cell is independently capped at 1200 seconds and stops on the first
@@ -109,4 +136,6 @@ FORKTREE_W5_R7_BACKEND=slatedb \
   forktree_stage2_gc_publication_acceptance -- --exact --nocapture
 ```
 
-No command in this package was run beyond the source-only residue calibration.
+No production Cargo, adapter, or benchmark command is claimed here. The
+standalone model and source gate are the only readiness controls executed for
+this correction.
