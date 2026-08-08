@@ -463,3 +463,60 @@ fn not_initialized_error() -> LixError {
         "engine storage is not initialized; call Engine::initialize(...) before Engine::new(...)",
     )
 }
+
+#[cfg(test)]
+mod predecessor_protocol_tests {
+    use super::*;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageWriteOptions};
+
+    #[tokio::test]
+    async fn predecessor_protocol_markers_fail_before_forktree_open() {
+        // These values are historical protocol markers, not current storage
+        // spaces. The public engine boundary must reject them before any old
+        // row/codec owner can be consulted.
+        let markers = [
+            b"live-state.hot.v15".as_slice(),
+            b"clustered-packed-history.v20".as_slice(),
+            b"file-descriptor-ownership.v21".as_slice(),
+            b"file-first-hot-state.v22".as_slice(),
+            b"schema-file-membership.v23".as_slice(),
+            b"commit-delta-sidecar-zstd.v24".as_slice(),
+            b"hot-inline-fingerprint.v25".as_slice(),
+            b"selected-payload-reference.v26".as_slice(),
+            b"packed-current-base.v27".as_slice(),
+            b"checkpoint-owned-hot-baseline.v27".as_slice(),
+            b"checkpoint-source-delta.v33".as_slice(),
+        ];
+
+        for marker in markers {
+            let storage = Memory::new();
+            let adapter = StorageAdapter::new(storage.clone());
+            let mut writes = adapter.new_write_set();
+            writes.put(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+                marker,
+            );
+            adapter
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("historical protocol marker should be writable as corruption input");
+
+            let result = Engine::new(storage).await;
+            let Err(error) = result else {
+                panic!("historical protocol marker must fail closed");
+            };
+            assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_current_protocol_fails_before_any_legacy_state_decode() {
+        let storage = Memory::new();
+        let result = Engine::new(storage).await;
+        let Err(error) = result else {
+            panic!("missing protocol must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_NOT_INITIALIZED");
+    }
+}

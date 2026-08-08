@@ -880,3 +880,133 @@ fn upload_manifest_leaf_range(upload_id: &str) -> Result<StorageKeyRange, LixErr
 fn invalid_upload(message: &'static str) -> LixError {
     LixError::new(LixError::CODE_INVALID_PARAM, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+    use crate::storage::Memory;
+
+    #[tokio::test]
+    #[ignore = "repository initialization is deferred until transaction-owned ForkTree publication is lowered"]
+    async fn public_upload_race_preserves_one_authenticated_winner_and_reopens() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("test repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("test repository should open");
+        let left = engine
+            .open_workspace_session()
+            .await
+            .expect("left upload session should open");
+        let right = engine
+            .open_workspace_session()
+            .await
+            .expect("right upload session should open");
+        let total_size = FILE_UPLOAD_PART_BYTES as u64;
+        let left_bytes = vec![0x31; FILE_UPLOAD_PART_BYTES];
+        let right_bytes = vec![0x72; FILE_UPLOAD_PART_BYTES];
+
+        let (left_result, right_result) = tokio::join!(
+            left.upsert_file_content_part(
+                "receipt-race".to_owned(),
+                "/media/receipt-race.bin".to_owned(),
+                0,
+                total_size,
+                left_bytes.clone().into(),
+            ),
+            right.upsert_file_content_part(
+                "receipt-race".to_owned(),
+                "/media/receipt-race.bin".to_owned(),
+                0,
+                total_size,
+                right_bytes.clone().into(),
+            ),
+        );
+        assert!(
+            left_result.is_ok() ^ right_result.is_ok(),
+            "one receipt publication must win and the conflicting stale publication must fail"
+        );
+        let expected = if left_result.is_ok() {
+            left_bytes
+        } else {
+            right_bytes
+        };
+
+        let reopened = Engine::new(storage)
+            .await
+            .expect("published upload should cold reopen");
+        let session = reopened
+            .open_workspace_session()
+            .await
+            .expect("reopened upload session should open");
+        let read = session
+            .read_file_content("/media/receipt-race.bin".to_owned(), None)
+            .await
+            .expect("published upload should read");
+        assert_eq!(
+            read.expect("winner file should exist")
+                .into_content()
+                .as_ref(),
+            expected.as_slice()
+        );
+
+        let replay = session
+            .upsert_file_content_part(
+                "receipt-race".to_owned(),
+                "/media/receipt-race.bin".to_owned(),
+                0,
+                total_size,
+                expected.clone().into(),
+            )
+            .await
+            .expect("identical completed-part replay should be idempotent");
+        assert!(replay.finalized);
+
+        let mismatch = session
+            .upsert_file_content_part(
+                "receipt-race".to_owned(),
+                "/media/receipt-race.bin".to_owned(),
+                0,
+                total_size,
+                vec![0xa5; FILE_UPLOAD_PART_BYTES].into(),
+            )
+            .await
+            .expect_err("conflicting completed-part replay must fail closed");
+        assert_eq!(mismatch.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[test]
+    fn upload_validation_keeps_receipt_window_and_identity_guards() {
+        assert!(
+            validate_upload_request(
+                "upload",
+                0,
+                FILE_UPLOAD_PART_BYTES as u64,
+                FILE_UPLOAD_PART_BYTES
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_upload_request(
+                "upload",
+                1,
+                FILE_UPLOAD_PART_BYTES as u64,
+                FILE_UPLOAD_PART_BYTES
+            )
+            .is_err()
+        );
+        assert!(validate_upload_binding("/a", 4, "/a", 4).is_ok());
+        assert!(validate_upload_binding("/a", 4, "/b", 4).is_err());
+        assert_eq!(
+            upload_part_count(FILE_UPLOAD_PART_BYTES as u64 * 2).unwrap(),
+            2
+        );
+        assert_eq!(
+            upload_part_size(FILE_UPLOAD_PART_BYTES as u64 + 7, 1).unwrap(),
+            7
+        );
+    }
+}

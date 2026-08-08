@@ -121,3 +121,17 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     ChangeId::from(uuid::Uuid::from_bytes(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_sequence_change_identity_is_stable_for_one_value() {
+        let first = deterministic_sequence_change_id(7);
+        let second = deterministic_sequence_change_id(7);
+        let different = deterministic_sequence_change_id(8);
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+    }
+}

@@ -266,3 +266,127 @@ fn materialized_json_string(
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changelog::ChangeLoadBatch;
+    use crate::changelog::test_support::test_change_record;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
+
+    #[test]
+    fn decoded_change_records_preserve_unique_id_order_and_missing_slots() {
+        let change_ids = [
+            ChangeId::for_test_label("ordered-a"),
+            ChangeId::for_test_label("ordered-missing"),
+            ChangeId::for_test_label("ordered-c"),
+        ];
+        let mut alpha = test_change_record();
+        alpha.change_id = change_ids[0];
+        alpha.schema_key = "alpha".to_owned();
+        let mut charlie = test_change_record();
+        charlie.change_id = change_ids[2];
+        charlie.schema_key = "charlie".to_owned();
+        let records = ChangeLoadBatch::try_new(
+            "ForkTree ChangeCatalog",
+            &change_ids,
+            vec![Some(alpha), None, Some(charlie)],
+        )
+        .expect("ordered change records should decode")
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
+
+        assert_eq!(records.len(), change_ids.len());
+        let first = records[0].as_ref().expect("first record");
+        assert_eq!(first.change_id, change_ids[0]);
+        assert_eq!(first.schema_key, "alpha");
+        assert!(records[1].is_none());
+        let third = records[2].as_ref().expect("third record");
+        assert_eq!(third.change_id, change_ids[2]);
+        assert_eq!(third.schema_key, "charlie");
+    }
+
+    #[test]
+    fn decoded_change_records_reject_storage_cardinality_mismatch() {
+        let change_ids = [
+            ChangeId::for_test_label("cardinality-a"),
+            ChangeId::for_test_label("cardinality-b"),
+        ];
+        let error = ChangeLoadBatch::try_new("ForkTree ChangeCatalog", &change_ids, vec![None])
+            .expect_err("short storage response must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("returned 1 values for 2 requested keys")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_materialization_preserves_repeated_change_ids() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let first = test_change_record();
+        let mut second = first.clone();
+        second.schema_key = "derived-row".to_owned();
+        second.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
+
+        let payloads = materialize_known_change_payloads_in_order(
+            &read,
+            [first.clone(), second.clone()].into_iter(),
+            ChangeRecordProjection::full(),
+        )
+        .await
+        .expect("repeated source ids should materialize");
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].0, first.change_id);
+        assert_eq!(payloads[1].0, first.change_id);
+        assert_eq!(
+            payloads[0]
+                .1
+                .identity
+                .as_ref()
+                .expect("first identity")
+                .schema_key,
+            first.schema_key
+        );
+        assert_eq!(
+            payloads[1]
+                .1
+                .identity
+                .as_ref()
+                .expect("second identity")
+                .schema_key,
+            second.schema_key
+        );
+    }
+
+    #[test]
+    fn materialized_json_string_consumes_owned_payload_bytes() {
+        let json = Bytes::from_static(br#"{"value":1}"#);
+        let json_ref = JsonRef::for_content(&json);
+        let source_ptr = json.as_ptr();
+        let mut json_values = vec![Some(json)];
+
+        let materialized = materialized_json_string(
+            MaterializedJsonSlot::Loaded(0),
+            &[json_ref],
+            &mut json_values,
+        )
+        .expect("json should materialize");
+
+        let materialized = materialized.expect("materialized JSON");
+        assert_eq!(materialized, r#"{"value":1}"#);
+        assert_eq!(
+            materialized.as_bytes().as_ptr(),
+            source_ptr,
+            "materialization must retain the JSON-store buffer"
+        );
+        assert!(json_values[0].is_none());
+    }
+}
