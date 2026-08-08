@@ -1,10 +1,52 @@
+SELF_TEST
 PASS negative_second_read
 PASS negative_second_publication
 PASS negative_second_commit
-legacy_control_generation	58
-checkpoint_history	1139
-snapshot_pin	16
-selector_epoch	770
-mutation_revision	24
-PASS embedded_map_and_diagnostics
-RED e1af legacy W3 source frontier
+PASS positive_one_operation
+cluster_W3-01	LOWERED
+cluster_W3-02	LOWERED
+cluster_W3-03	LOWERED
+cluster_W3-04	LOWERED
+cluster_W3-05	LOWERED
+cluster_W3-06	LOWERED
+cluster_W3-07	LOWERED
+cluster_W3-08	LOWERED
+cluster_W3-09	LOWERED
+cluster_W3-10	LOWERED
+cluster_W3-11	LOWERED
+cluster_W3-12	LOWERED
+cluster_W3-13	LOWERED
+cluster_W3-14	LOWERED
+PASS candidate_green_self_test
+W3_GATE=GREEN
+
+E1AF_BASE_AS_CANDIDATE_CONTROL
+PASS negative_second_read
+PASS negative_second_publication
+PASS negative_second_commit
+PASS positive_one_operation
+baseline_legacy_control_generation	58
+baseline_checkpoint_history	1139
+baseline_snapshot_pin	16
+baseline_selector_epoch	770
+baseline_mutation_revision	24
+candidate_legacy_control_generation	base=58	candidate=58
+candidate_checkpoint_history	base=1139	candidate=1139
+candidate_snapshot_pin	base=16	candidate=16
+candidate_selector_epoch	base=770	candidate=770
+candidate_mutation_revision	base=24	candidate=24
+W3_GATE=RED
+RED: W3-01 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,BranchRefReader
+RED: W3-02 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,TrackedHeadContext,CurrentStateDeltaRef
+RED: W3-03 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,branch_head_control_precondition,TrackedHeadContext,CurrentStateDeltaRef
+RED: W3-04 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,branch_head_control_precondition,TrackedHeadContext,CurrentStateDeltaRef
+RED: W3-05 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,TrackedHeadContext,CurrentStateDeltaRef,load_mutation_revision,BranchRefReader
+RED: W3-06 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,BranchRefReader
+RED: W3-07 retains legacy authority without fail-closed-before-plan: BranchHeadControl,TrackedHeadContext,TrackedStateStoreReader,tracked_state_reader,BranchRefReader
+RED: W3-08 retains legacy authority without fail-closed-before-plan: BranchHeadControl,TrackedHeadContext,TrackedStateStoreReader,tracked_state_reader,BranchRefReader
+RED: W3-09 retains legacy authority without fail-closed-before-plan: BranchHeadControl,TrackedHeadContext,TrackedStateStoreReader,tracked_state_reader,BranchRefReader
+RED: W3-10 retains legacy authority without fail-closed-before-plan: BranchHeadControl,TrackedHeadContext,TrackedStateStoreReader,tracked_state_reader,BranchRefReader
+RED: W3-11 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,branch_head_control_precondition,TrackedHeadContext,CurrentStateDeltaRef,CHECKPOINT_RECOVERY_REF_SPACE,stage_recovery_ref_rotation,TrackedStateStoreReader
+RED: W3-12 retains legacy authority without fail-closed-before-plan: MUTATION_REVISION_SPACE,TRACKED_MUTATION_REVISION_SPACE,load_mutation_revision,stage_mutation_revision
+RED: W3-13 retains legacy authority without fail-closed-before-plan: BranchHeadControl,TrackedStateStoreReader
+RED: W3-14 retains legacy authority without fail-closed-before-plan: BranchHeadControl,stage_branch_head_control,BRANCH_HEAD_CONTROL_SPACE,TrackedHeadContext,CurrentStateDeltaRef

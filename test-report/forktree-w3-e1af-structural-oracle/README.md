@@ -1,9 +1,9 @@
 # W3 e1af structural and GC contract oracle
 
-Status: **TEST/REPORT-ONLY CORRECTION FROZEN**. This package directly embeds
-the complete W3 map and diagnostics and adds executable source-structure and
-pure GC model gates. It makes no production change and has no compiler,
-adapter, or production-runtime result.
+Status: **TEST/REPORT-ONLY CORRECTION SUCCESSOR**. This package directly embeds
+the complete W3 map and diagnostics and adds a candidate-parametric source
+scope/ownership gate plus the pure GC model gate. It makes no production
+change and has no compiler, adapter, or production-runtime result.
 
 ## Immutable anchor
 
@@ -20,23 +20,61 @@ The package embeds the complete 14-cluster map in
 are `d9a6653f5f5f62e476d7dac10a7bcb5377d0642d9365cbd330c13e778841e471` and
 `1d6cb84157c64eed06d5e4a3cc6925b645fd2ddab2c28a901a774aaf55d49126`.
 
-## Structural one-operation contract
+## Candidate-parametric structural contract
 
-`w3_structural_gate.py` checks an operation shape containing exactly:
+`w3_structural_gate.py` requires exact base and candidate roots/commits. It
+verifies that the frozen e1af commit remains the calibration baseline, that the
+candidate is descended from the supplied base, and that the whole
+base-to-candidate path set is limited to this report package and the 14 paths
+named by `DIAGNOSTICS.tsv`.
+
+The frozen e1af source counts are immutable:
 
 ```text
-one caller-owned begin_read
-  -> one CoherentView / one PreparedPublication
-  -> one prepare_write_set
-  -> one prepared_commit.commit
+legacy_control_generation 58
+checkpoint_history         1139
+snapshot_pin               16
+selector_epoch             770
+mutation_revision          24
 ```
 
-It runs three negative fixtures and requires each to be rejected: a second
-read acquisition, a second publication object, and a second commit. It also
-checks the embedded 14-row diagnostics, exact e1af identity, required owner
-tokens, and the expected e1af legacy-residue calibration. The current e1af
-source is intentionally RED; the gate's successful exit means the RED control
-and negative fixtures behaved as expected, not that production is runnable.
+Every candidate count must be no greater than both the exact supplied base and
+the frozen e1af value. Legacy authority counts and narrow compatibility,
+fallback, alternate, or secondary authority patterns fail on any increase or
+new appearance.
+
+The operation source gate checks an actual Rust function graph containing:
+
+```text
+one caller-owned `read` argument -> one open_coherent_view_on_read(read)
+  -> one CoherentView / one PreparedPublication
+one PreparedForkTreePlan::into_storage_plan lowering with no I/O
+one transaction commit_write_set -> one prepare_write_set -> one commit
+```
+
+The selected publication function must pass its owned read to the coherent
+view, derive one publication from that view, contain no independent read,
+write, publication, or commit, and return the prepared plan. The lowering and
+transaction checks are separate graph nodes, so a second publication or commit
+cannot be hidden in the operation fixture. All 14 diagnostic clusters must be
+either free of legacy authority or contain an explicit typed error before the
+first plan/I/O token. Otherwise the gate is RED. GREEN is emitted only after
+all identity, path, baseline, authority-delta, graph, cluster, fixture, map,
+and diagnostics checks pass.
+
+The positive and three negative operation fixtures are consumed by the same
+executable gate functions. Run the parser/fixture GREEN proof independently:
+
+```sh
+PYTHONWARNINGS=error python3 -W error \
+  test-report/forktree-w3-e1af-structural-oracle/w3_structural_gate.py \
+  --self-test
+```
+
+The self-test runs all 14 cluster checks as `LOWERED`. The current e1af source
+is expected to be RED because its 14 clusters retain legacy authorities; that
+RED is now candidate-parametric and distinct from the accepted synthetic GREEN
+self-test.
 
 ## Pure 65-entry GC model
 
@@ -72,8 +110,11 @@ Every cell is fresh and capped at 1200 seconds; stop at the first blocker.
 These commands were not run here:
 
 ```sh
-# static source/deletion gate, then formatting
-python3 test-report/forktree-w3-e1af-structural-oracle/w3_structural_gate.py <candidate-root>
+# static source/deletion gate, then formatting; roots and commits are exact
+PYTHONWARNINGS=error python3 -W error \
+  test-report/forktree-w3-e1af-structural-oracle/w3_structural_gate.py \
+  --base-root <exact-base-root> --base-commit <exact-base-commit> \
+  --candidate-root <exact-candidate-root> --candidate-commit <exact-candidate-commit>
 cargo fmt --all -- --check
 git diff --check <exact-base>..<exact-head>
 
