@@ -86,11 +86,21 @@ The first ordinary atomic-writer slice is pinned and blocked:
 
 Its ordinary single-branch cohort lowers once into the existing sole backend
 commit, but discards deterministic `runtime_functions`, so runtime sequence
-writes and preconditions never enter that batch. Upload/checkpoint/history/
-multi-branch/reachability publication families also remain. It is compile-red
-and has not cleared R2 atomicity or H2 deletion/residue review. Do not apply
-artifacts or treat it as a readiness base. A successor must preserve runtime
-writes/preconditions in the sole transaction batch and receive a new R2 review.
+writes and preconditions never enter that batch. Its `tracked_rows.is_empty()`
+branch can silently discard ref-only or selected-history intent while still
+publishing untracked/global-epoch work, and true empty commits error instead of
+preserving no-op behavior. Upload/checkpoint/history/multi-branch/reachability
+publication families also remain. It is compile-red and has not cleared R2
+atomicity or H2 deletion/residue review. Do not apply artifacts or treat it as a
+readiness base. A successor must classify complete intent before lowering,
+preserve runtime writes/preconditions in the sole transaction batch, reject
+unsupported cohorts with zero plan/writes/epoch rotation, preserve true empty
+no-op semantics, and receive a new R2 review.
+
+Do not use 5A's residue count as a readiness datum. The author-reported
+170/`ae4250...` and R2-reported 166/`3891a486...` were produced with
+non-identical or unbound scanner provenance. A successor must pin one exact
+scanner source/binary hash and replay both baseline and candidate identically.
 
 ## Eligibility fence
 

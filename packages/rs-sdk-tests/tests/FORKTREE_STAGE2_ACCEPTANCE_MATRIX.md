@@ -67,12 +67,21 @@ Its focused full-index SHA-256 is
 its `a12..head` SHA-256 is
 `ad49aa816f4cece010f361f6fadf7f7b59f2003d6e905bd8f44341d613d08f56`,
 and its stable patch ID is `2b57e2e9e23bd79343068a3b237ce20581c56526`.
-It remains non-runnable at 201 errors/8 warnings and 170 residue findings and is
+It remains non-runnable at 201 errors/8 warnings and is
 **BLOCKED**: the ordinary lowerer discards deterministic `runtime_functions`,
 so runtime sequence writes and preconditions do not enter the sole transaction
-batch. Upload, checkpoint, history, multi-branch, and reachability publication
-families also remain independent. This is blocked identity evidence, not
-readiness promotion. The latest approved readiness base remains `54e90dbf...`.
+batch. Its `tracked_rows.is_empty()` branch can also discard ref-only or
+selected-history intent while still publishing untracked/global-epoch work, and
+true empty commits error instead of retaining no-op behavior. Upload,
+checkpoint, history, multi-branch, and reachability publication families also
+remain independent. This is blocked identity evidence, not readiness promotion.
+The latest approved readiness base remains `54e90dbf...`.
+
+Its residue count is intentionally non-canonical: the author handoff reports
+170 findings with log SHA prefix `ae4250` but does not bind the scanner identity,
+while R2's independent frozen oracle reports 166 with log SHA prefix `3891a486`.
+These values are non-comparable until a successor pins the exact scanner source
+and hash and replays baseline plus candidate with that same binary.
 
 The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at
