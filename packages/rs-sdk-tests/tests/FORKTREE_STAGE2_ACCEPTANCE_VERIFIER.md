@@ -4,8 +4,8 @@ Status: frozen test/report-only preparation for the first immutable runnable
 Stage 2 head. No candidate artifact has been applied and no build has run.
 
 The verifier worktree carries ten-row acceptance-matrix readiness successor
-`8eb742cf795c8841211c3e6f1291c92c3f154528`, tree
-`f4eba4a5b34fc786b8bbf020da165173cd0c16fb`. At creation the workspace
+`c7674c6d0dd5b995f10a016e281e5106b703de50`, tree
+`62329238fb6a7b35c9d4bda61ee93e464ecda16d`. At creation the workspace
 filesystem had 49 GiB available. Cargo targets and databases will remain under
 this workspace filesystem and every future cell is capped at 20 minutes.
 
@@ -29,34 +29,41 @@ the committed binary attributes govern the 42,863-byte canonical stream. The
 same-object worktree text rendering is documented in the matrix but is not the
 verifier identity.
 
-The verifier separately checks one approved non-runnable readiness milestone without
-counting it as an acceptance row: topology owner head
+The verifier separately checks the approved non-runnable readiness lineage
+without counting it as an acceptance row. The topology owner head is
 `af7899f41c489fe763ce1a64c5468083570979e2`, tree
 `da097bd739b50629ea39b155d4fa9efc870654e0`, parent
 `2e0cea1b91558179e6ed90847bc8b04b23de246f`. It verifies focused and
 `a12` lineage diffs. Approval of this object does not authorize a build or
 artifact application.
 
-It also pins the later blocked BlobRef frontier
+It retains the later blocked BlobRef predecessor
 `08f8dd5cf20842f79996fae9eb7b0924f074a084`, tree
 `19c8706d6bc3d1dbe9217b4f8386b19c66f027a8`, whose exact parent is the
 approved topology head. The verifier reproduces the focused and `a12` lineage
-diffs and all five changed source blob IDs. This frontier is identity evidence,
-not readiness approval: same-size manifest identity substitution is not rejected
-by range reads, and the milestone remains deliberately non-runnable.
+diffs and all five changed source blob IDs. This object remains immutable blocker
+evidence: same-size manifest identity substitution is not rejected by its range
+path.
 
-Result: PASS for 10/10 acceptance refs, 1/1 approved readiness milestone,
-1/1 identity-pinned blocked frontier with 5/5 changed source blobs, and 27/27
-embedded acceptance files. The frozen
+The latest approved readiness base is the two-reviewer source-approved successor
+`54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`, tree
+`5a8da9f8b11d83bf8216e266beaf4042cee84068`, parent `08f8dd5c...`.
+The verifier reproduces its focused and `a12` lineage diffs and all three changed
+source blob IDs. It remains non-runnable and does not authorize a build or
+artifact application.
+
+Result: PASS for 10/10 acceptance refs, latest approved readiness
+`54e90dbf...`, one retained superseded blocker, 8/8 readiness source blobs, and
+27/27 embedded acceptance files. The frozen
 machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 
 ## Runnable-head boundary
 
 Ryzen-V has not advertised a first runnable immutable SPI head. The latest
-observed BlobRef milestone is non-runnable and source-blocked, so the last
-approved readiness base remains `af7899f41c489fe763ce1a64c5468083570979e2`.
-Until a later immutable successor is explicitly compile-green and independently
-approved, this worktree remains provenance-only.
+approved BlobRef milestone remains non-runnable, so the next candidate must be
+an explicitly compile-green writer/SPI descendant of
+`54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`. Until then this worktree remains
+provenance-only.
 
 On the first runnable immutable head:
 

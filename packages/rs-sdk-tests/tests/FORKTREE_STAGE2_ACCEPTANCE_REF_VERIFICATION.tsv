@@ -19,6 +19,11 @@ blob	blobref	PASS	packages/lix/src/forktree/mod.rs	445e9ba1a13c48fab34fed1f16ff2
 blob	blobref	PASS	packages/lix/src/forktree/serving.rs	8ec1d5a19c2a265fc0d1a790426016081fc661ef	-
 blob	blobref	PASS	packages/lix/src/forktree/tests.rs	0c21a4e54bf070be1717af9e08d9cba66bea9926	-
 blob	blobref	PASS	packages/lix/src/forktree/view.rs	0102fd6c0229dab2b19a032ff724d6f6161e9bfe	-
+readiness	blobref_identity	PASS	54e90dbf2bcf55c74de0be6ea4b217dc02cec89c	5a8da9f8b11d83bf8216e266beaf4042cee84068	c507282c79b8de8b9cdec3960157276efef2769e2866a895b4c0d015b77fa8f1
+lineage	blobref_identity	PASS	08f8dd5cf20842f79996fae9eb7b0924f074a084	a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3	d5adb4a322dbf98a590d765c9ee2179a3a1e583211cb6a41c3fe2bf2cd786bae
+blob	blobref_identity	PASS	packages/lix/src/forktree/blob.rs	a9ab0f78cace48a036966fd8f53b0b3941ba2ef3	-
+blob	blobref_identity	PASS	packages/lix/src/forktree/model.rs	62209166b0168e094653dceacdd69ea6783d80ca	-
+blob	blobref_identity	PASS	packages/lix/src/forktree/tests.rs	483ea45dfad532ef4d744d6719a4b0bd1d5db878	-
 file	sql	PASS	packages/rs-sdk-tests/tests/forktree_stage2_sql_dml.rs	b410b717f45d68e928e93dcf1332de2895db0246202e9ba9a6e5bc10b416c6bb	-
 file	sql	PASS	packages/rs-sdk-tests/tests/FORKTREE_STAGE2_SQL_DML_ORACLE.md	1867643051628903232c3cbe8f4ae2c1e2655b7cbb0b044ec1046acf35947e22	-
 file	vc	PASS	packages/rs-sdk-tests/tests/forktree_stage2_version_control.rs	c120b5ca3ab20acb67dd472791e281af03bffb39e280a5b4d28212337e42a6f9	-
@@ -51,4 +56,4 @@ external	pointread	NOTE	REPORT.md	b86db402ec0bf9b25ca619564edb82a420fcdb34f68de2
 external	pointread	NOTE	SHA256SUMS	cacbcee8f7b80a627f96dd8b7d6d55beef0fe2a2f7228f0290b488ae7717a888	not embedded in ref; author reports 3/3 verify
 external	pointread	NOTE	stage2_point_read_oracle-025c3b394ec8760c	ead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a	bench binary; rebuild on candidate
 external	olap	NOTE	provenance-report	e78821631888e8a8810df78e9bdffbe31c8a8124227c5ad0c3b549a6e60795a4	not embedded in ref
-summary	all	PASS	10 acceptance refs; 1 approved readiness; 1 blocked frontier	27 embedded files; 5 blocked-source blobs	no artifacts applied
+summary	all	PASS	10 acceptance refs; latest approved readiness=54e90dbf; 1 superseded blocker	27 embedded files; 8 readiness-source blobs	no artifacts applied
