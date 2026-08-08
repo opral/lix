@@ -1,0 +1,11 @@
+TARGET head=705440f55eccba9e2d55c0951d6a684737005d76 tree=2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d
+CONTRACT_SHA256=ff784043429f563fb01a29c42eecc90a939f7ce8ac7926d9db07a0f13313da24
+PASS-01 authenticated GlobalSelectorV1/BranchSelectorV1 codecs exist
+PASS-02 one retained read authenticates both selectors and branch identity
+PASS-03 publication has global epoch and branch raw-byte CAS in one plan
+PASS-04 chronology roots and checkpoint floor are separately validated
+RED-01 create_branch still writes legacy branch-ref rows instead of BranchSelectorV1 publication
+RED-02 switch_branch still reads/writes legacy BranchRef/workspace rows
+RED-03 branch deletion/retirement still exposes a legacy branch-ref tombstone writer
+RED-04 undo/redo still persists a marker authority not proven equivalent to snapshot selectors
+SOURCE_STATUS=RED
