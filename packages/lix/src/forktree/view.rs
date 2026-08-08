@@ -263,6 +263,41 @@ where
         Ok(view)
     }
 
+    /// Reads the authenticated current entity rows for one branch/global
+    /// overlay.  The operation owns the view acquisition and returns only
+    /// ForkTree serving rows; callers do not receive a storage handle or a
+    /// legacy live-state/tracked-state DTO.
+    pub(crate) async fn scan_entity_rows(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+        entity_pks: &[crate::entity_pk::EntityPk],
+        limit: Option<usize>,
+    ) -> Result<Vec<super::serving::VisibleStateRow>, crate::LixError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let view = self.branch(branch_id).await?;
+        let rows = super::serving::state_range(&view, None, None, None, false).await?;
+        let mut output = Vec::new();
+        for row in rows {
+            let key = super::state::decode_state_key(&row.encoded_key)?;
+            if key.schema_key != schema_key
+                || (!entity_pks.is_empty()
+                    && !entity_pks
+                        .iter()
+                        .any(|entity_pk| entity_pk == &key.entity_pk))
+            {
+                continue;
+            }
+            output.push(row);
+            if limit.is_some_and(|limit| output.len() >= limit) {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
     pub(crate) async fn load_commit_member_records(
         &self,
         commit_id: crate::changelog::CommitId,

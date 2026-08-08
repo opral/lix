@@ -4583,30 +4583,6 @@ mod tests {
         assert_eq!(rows.rows()[1_023].get::<String>("value").unwrap(), sample);
     }
 
-    async fn assert_columnar_layout_selected(
-        session: &SessionContext<Memory>,
-        schema_key: &str,
-        expected_overlay_rows: usize,
-    ) {
-        let branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch should resolve");
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("columnar route read should open");
-        let overlay_rows = session
-            .live_state
-            .reader(&read)
-            .entity_columnar_overlay_len_for_test(&branch_id, schema_key)
-            .await
-            .expect("columnar route should plan")
-            .expect("fixture must retain the authenticated columnar path");
-        assert_eq!(overlay_rows, expected_overlay_rows);
-    }
-
     async fn assert_current_head_uses_packed_delta_without_columnar_sidecar(
         session: &SessionContext<Memory>,
         schema_key: &str,
@@ -6317,7 +6293,6 @@ mod tests {
         )
         .await
         .expect("sparse typed update should commit");
-        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 1).await;
 
         let limited = main
             .execute(

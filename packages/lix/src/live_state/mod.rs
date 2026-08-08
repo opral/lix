@@ -1,8 +1,6 @@
 mod context;
 mod derived;
 mod entity_columnar;
-mod entity_columnar_cache;
-mod entity_decoded_column_cache;
 mod forktree_reader;
 mod reader;
 mod types;
@@ -14,10 +12,6 @@ pub(crate) use entity_columnar::{
     ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
     EntityColumnarWriteSets, entity_identity_column_index, entity_row_group_set_id,
 };
-pub(crate) use entity_columnar_cache::{
-    EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
-};
-pub(crate) use entity_decoded_column_cache::EntityDecodedColumnCache;
 pub(crate) use forktree_reader::{
     load_exact_batch as load_forktree_exact_batch, scan_view as scan_forktree_view,
 };
