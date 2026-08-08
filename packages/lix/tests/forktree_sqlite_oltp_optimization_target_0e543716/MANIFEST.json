@@ -1,0 +1,123 @@
+{
+  "package": "forktree-sqlite-oltp-optimization-target-0e543716",
+  "status": "test-report-only-unrun-blocked-model-mismatch",
+  "binding": {
+    "forktree_head": "0e543716b0a89d377015ce8cdb1579cad70408ff",
+    "forktree_tree": "b0589d9037a8b3a530d252150360ce9f5648577c",
+    "forktree_parent": "cd76d29406ed7e00711a5b5ba9c40da537524dd3",
+    "parent_head_full_index_sha256": "b6f7046c017196beff03aa79016ec686df7070621a1025e292e3e604e0ceee65",
+    "stable_patch_id": "d587a183973eb31ce01593d3919f925dcdd29f45",
+    "semantic_seams": [
+      "ForkTree::read_projected_range",
+      "ForkTree::read_range",
+      "ForkTreeTableProvider"
+    ],
+    "oltp_semantic_seams": [],
+    "oltp_blocker": "0e is an OLAP read benchmark and exposes no SQLite CRUD, transaction, stale-writer, file-row, or one-publication target seam",
+    "historical_b59_package": {
+      "head": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+      "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+      "parent": "713455a3557907ce705d06f720fcdc4486bddd4a"
+    }
+  },
+  "model_scope": {
+    "kind": "forktree-duckdb-datafusion-olap-benchmark",
+    "production_path": false,
+    "source_paths": [
+      "packages/engine-benchmarks/benches/forktree_replacement/olap_datafusion.rs",
+      "benchmarks/forktree_duckdb_comparator/src/main.rs"
+    ],
+    "model_changed_paths": [
+      "benchmarks/forktree_duckdb_comparator/BATCHING_EXPERIMENT.md",
+      "benchmarks/forktree_duckdb_comparator/BATCHING_RAW_SHA256SUMS",
+      "benchmarks/forktree_duckdb_comparator/BATCHING_RESULTS.csv",
+      "packages/engine-benchmarks/benches/forktree_replacement/olap_datafusion.rs"
+    ],
+    "model_parent_head_full_index_sha256": "b6f7046c017196beff03aa79016ec686df7070621a1025e292e3e604e0ceee65",
+    "available_controls": ["read-only point/range/scan/aggregate/order/join/projection", "branch snapshot", "cold reopen", "corruption fail-closed"],
+    "missing_controls": ["SQLite CRUD", "DML RETURNING", "UPSERT", "savepoint/rollback", "stale-writer conflict", "file-row mutation", "transaction-owned publication"],
+    "runs_claimed": false
+  },
+  "standalone_sqlite": {
+    "crate": "libsqlite3-sys",
+    "crate_version": "0.30.1",
+    "crate_archive_sha256": "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149",
+    "bundled_sqlite_version": "3.46.0",
+    "source_id": "2024-05-23 13:25:27 96c92aba00c8375bc32fafcdf12429c58bd8aabfcadab6683e35bbb9cdebf19e",
+    "sqlite3_c_sha256": "c01235302fe80da901fb70c7622c39147e29d9f29b7f6eb746b23517f320c90d",
+    "sqlite3_h_sha256": "d088aa96aa70db50f02acc5c86eca61a5d17556e4c363b9c06079239bf7f87b1",
+    "static_archive_sha256": "e2532979ce9bde50b950ffb7c63c4f2fc2da72f7499c75afc4275948faa674ca",
+    "static_archive_provenance": "/root/projects/lix-forktree-olap-target-2a0e/release/build/libsqlite3-sys-ad9cc24acc6a0c2b/out/libsqlite3.a",
+    "binary_kind": "bundled SQLite static core archive",
+    "binary_sha256": "e2532979ce9bde50b950ffb7c63c4f2fc2da72f7499c75afc4275948faa674ca",
+    "harness_executable_sha256": "recorded-by-compile-gate-before-runtime",
+    "build": "cargo build --locked --release --features bundled; hash executable and linked archive",
+    "runtime_pragmas": ["journal_mode=DELETE", "synchronous=FULL", "foreign_keys=ON", "recursive_triggers=OFF", "temp_store=MEMORY", "locking_mode=NORMAL", "busy_timeout=0"]
+  },
+  "fixture": {
+    "schema_key": "app.sqlite_oltp",
+    "file_id": "sqlite-oltp-target-v1",
+    "seed_rows": 1000,
+    "primary_key": "typed-text-r-plus-six-decimal-digits",
+    "overlay_controls": {
+      "r000007": "local-value",
+      "r000011": "local-tombstone",
+      "r000013": "local-null"
+    },
+    "digest": {
+      "algorithm": "sha256",
+      "domain": "lix.sqlite-oltp.target.0e543716.v1\\0",
+      "golden_status": "unmeasured-until-authorized-future-run",
+      "warm_equals_cold": true,
+      "warm_equals_model": true
+    }
+  },
+  "cells": [
+    {"id": "point-1000", "logical_ops": 1000, "returned_rows": 1000, "writes": 0, "commits": 0},
+    {"id": "range-128x32", "ranges": 128, "returned_rows": 4096, "writes": 0, "commits": 0},
+    {"id": "insert-256-returning", "inputs": 256, "returning_rows": 256, "plans": 1, "commits": 1},
+    {"id": "update-256-returning", "inputs": 256, "returning_rows": 256, "plans": 1, "commits": 1},
+    {"id": "delete-128-returning", "inputs": 128, "returning_rows": 128, "plans": 1, "commits": 1},
+    {"id": "upsert-256-returning", "inputs": 256, "updates": 128, "inserts": 128, "returning_rows": 256, "plans": 1, "commits": 1},
+    {"id": "mixed-savepoint", "rolled_back_mutations": 8, "committed_mutations": 192, "returning_rows": 192, "plans": 1, "commits": 1},
+    {"id": "overlay-precedence", "controls": 3, "writes": 0, "commits": 0},
+    {"id": "historical-fail-closed", "corruption_classes": 4, "writes": 0, "commits": 0}
+  ],
+  "required_zero_counters": [
+    "legacy_reads",
+    "legacy_writes",
+    "fallback_reads",
+    "retries",
+    "cache_refreshes"
+  ],
+  "required_write_shape": {
+    "prepared_publications": 1,
+    "storage_plans": 1,
+    "prepared_write_sets": 1,
+    "backend_commits": 1,
+    "selector_cas": 1,
+    "epoch_cas": 1
+  },
+  "ceilings": {
+    "point_snapshot_call_elimination": "99.9% if baseline is one view per point operation",
+    "mixed_commit_call_elimination": "99.479% if baseline is one commit per mutation",
+    "fallback_retry_legacy_cache_elimination": "100% because target counters are zero",
+    "range_scan_work": "1 - target_authenticated_scan_work / baseline_scan_work"
+  },
+  "thresholds": {
+    "target_improvement_percent_at_least": 10,
+    "primary_regression_percent_at_most": 5,
+    "primary_guardrails": ["point", "range", "digest", "cold_reopen", "backend_work", "writes", "settled_disk"]
+  },
+  "future_order": [
+    "static-binding",
+    "memory-model-and-vector",
+    "sqlite-shaped-control",
+    "forktree-target",
+    "rocksdb",
+    "slatedb"
+  ],
+  "runs_claimed": false,
+  "production_edits": false,
+  "current_main_comparison": false
+}
