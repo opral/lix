@@ -568,6 +568,7 @@ struct OrderedCommitContent {
     mutations: Vec<StateTreeMutation>,
     fresh_changes: Vec<ChangeObjectV1>,
     members: Vec<CommitMemberV1>,
+    max_selected_source_generation: Option<u64>,
 }
 
 async fn prepare_ordered_single_branch_history<R>(
@@ -677,6 +678,7 @@ where
         let mut mutations = Vec::new();
         let mut fresh_changes = Vec::new();
         let mut members = Vec::new();
+        let mut max_selected_source_generation: Option<u64> = None;
         let fresh_rows = prepared
             .state_rows
             .iter()
@@ -794,6 +796,11 @@ where
                     forktree_change_id(selected.change_id),
                 )
                 .await?;
+                max_selected_source_generation = Some(
+                    max_selected_source_generation.map_or(source_commit.generation, |generation| {
+                        generation.max(source_commit.generation)
+                    }),
+                );
                 let ChangeObjectV1::Semantic { payload, .. } = source_change else {
                     return Err(writer_error(
                         "selected history source member has the wrong Change domain",
@@ -880,6 +887,7 @@ where
             mutations,
             fresh_changes,
             members,
+            max_selected_source_generation,
         });
     }
 
@@ -922,12 +930,8 @@ where
             generation =
                 Some(generation.map_or(parent.generation, |value| value.max(parent.generation)));
         }
-        let generation = match generation {
-            None => 0,
-            Some(value) => value
-                .checked_add(1)
-                .ok_or_else(|| writer_error("ordered history generation overflows u64"))?,
-        };
+        let generation =
+            next_ordered_commit_generation(generation, content.max_selected_source_generation)?;
         let global_state_root = if global {
             state_edit.root
         } else {
@@ -1268,6 +1272,21 @@ fn writer_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
 
+fn next_ordered_commit_generation(
+    parent_generation: Option<u64>,
+    selected_source_generation: Option<u64>,
+) -> Result<u64, LixError> {
+    parent_generation
+        .into_iter()
+        .chain(selected_source_generation)
+        .max()
+        .map_or(Ok(0), |generation| {
+            generation
+                .checked_add(1)
+                .ok_or_else(|| writer_error("ordered history generation overflows u64"))
+        })
+}
+
 #[cfg(test)]
 mod intent_tests {
     use super::*;
@@ -1354,5 +1373,18 @@ mod intent_tests {
         let error = classify_publication_intent(&selected, None)
             .expect_err("selected history must not be dropped");
         assert!(error.message.contains("selected historical members"));
+    }
+
+    #[test]
+    fn ordered_history_generation_advances_past_selected_source() {
+        assert_eq!(
+            next_ordered_commit_generation(Some(1), Some(2)).expect("generation"),
+            3
+        );
+        assert_eq!(
+            next_ordered_commit_generation(Some(2), None).expect("generation"),
+            3
+        );
+        assert!(next_ordered_commit_generation(Some(u64::MAX), None).is_err());
     }
 }
