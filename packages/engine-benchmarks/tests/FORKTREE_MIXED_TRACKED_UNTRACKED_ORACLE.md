@@ -68,7 +68,7 @@ the gate is scoped so it does not reject unrelated engine readers.
 
 ## Frozen red/green calibration
 
-On exact rejected `11442c1e`:
+On exact rejected `11442c1e`, the initial frozen gate (v1) reported:
 
 - source gate output SHA: `de6436835246fffd8d2c69a22d3867691b17c141ab79ee39b476cafcb8aafbf1`
 - required canonical tokens missing: none
@@ -82,3 +82,28 @@ On exact rejected `11442c1e`:
 The red source result is intentional calibration: the rejected head still
 contains the alternate direct entity reader. The first corrected successor
 must invert this gate to GREEN while retaining the same 4/4 model result.
+
+The scoped v2 gate used for the successor retains only the canonical projection
+requirements. Its exact rejected-control output was RED with two missing
+projection tokens and nine direct-path residues; output SHA
+`c1f72e6a239919505e183188b11a8bccb69aa71223dd152dc2f2dfcba278b872`.
+
+## Successor qualification update
+
+The corrected immutable successor `413e08a75ad3bbcbd749bfa7ec97a82b9f1f098d`
+removes the direct ForkTree entity-range seam. Its entity capability remains
+only a terminal wrapper: each snapshot/PK operation calls the canonical
+`LiveStateReader::scan_batch` once and maps the returned batch. The scoped
+successor source gate is GREEN:
+
+- output SHA: `8c68664b212ef941d941296b699110df11b898c2b7444aebde67947525cc5de7`
+- required canonical tokens missing: none
+- forbidden alternate-read residues: `0`
+
+The older frozen public-SQL residue script also ran on the successor and was
+RED because it requires the now-deleted `scan_direct_entity_*` and
+`direct_entity_snapshot_scope` names and still scans writer/GC columnar
+owners outside this read cut (3 missing tokens, 27 residues; output SHA
+`9b65a658eb2789bee0b8be9658f7a047ab1885397ad39e15996f74740621a459`). This
+is a stale comparator gate, not evidence of a surviving alternate SQL read
+owner; the scoped mixed-domain gate above is the applicable correction gate.
