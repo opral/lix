@@ -4,6 +4,7 @@
 //! acceptance-only physical-layout selector. It uses no current-layout space,
 //! queue, codec, object ID, storage adapter, or maintenance implementation.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
@@ -24,7 +25,10 @@ const CONFLICT_BRANCH_ID: &str = "01920000-0000-7000-8000-00000000c202";
 const RELEASE_BRANCH_ID: &str = "01920000-0000-7000-8000-00000000c203";
 const MISSING_PARENT_BRANCH_ID: &str = "01920000-0000-7000-8000-00000000c204";
 const MISSING_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000dead";
-const GC_ROTATIONS: usize = 64;
+// The first 64 deltas exercise the retirement window; the 65th is the
+// suffix-drain discriminator. The public trace cannot inspect the queue, but
+// it must still survive the same rotation count and final-reference release.
+const GC_ROTATIONS: usize = 65;
 
 #[async_trait]
 trait AcceptanceBackend {
@@ -185,7 +189,7 @@ async fn run_trace<B: AcceptanceBackend>(layout: AcceptancePhysicalLayout) -> Or
     let target_head = active_head(&lix).await;
 
     let preview = lix
-        .preview_merge_branch(MergeBranchPreviewOptions {
+        .merge_branch_preview(MergeBranchPreviewOptions {
             source_branch_id: SOURCE_BRANCH_ID.to_owned(),
         })
         .await
@@ -238,7 +242,7 @@ async fn run_trace<B: AcceptanceBackend>(layout: AcceptancePhysicalLayout) -> Or
     .expect("switch to true-conflict target");
     update_value(&lix, "source", "conflict-target").await;
     let conflict_preview = lix
-        .preview_merge_branch(MergeBranchPreviewOptions {
+        .merge_branch_preview(MergeBranchPreviewOptions {
             source_branch_id: CONFLICT_BRANCH_ID.to_owned(),
         })
         .await
@@ -512,6 +516,228 @@ async fn qualify_backend<B: AcceptanceBackend>() {
     assert_eq!(
         forktree, current,
         "physical owner changed checkpoint semantics"
+    );
+}
+
+// This is a test-only contract model for the owner-local queue assertions
+// that cannot be reached through the public acceptance SPI. It deliberately
+// contains no storage, object, selector, recovery-ref, or production GC type.
+// The public RocksDB/SlateDB tests above remain the semantic gate; this model
+// freezes the exact 64+suffix and blocked-debt discriminators that a Stage2
+// owner must satisfy internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateRepresentation {
+    Base,
+    TrackedStateRebuild,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootDebt {
+    old_root: String,
+    rows: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrainResult {
+    advanced: bool,
+    drained: bool,
+    reclaimed: Vec<String>,
+    debt_tokens: usize,
+    attempts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueModel {
+    pending: Vec<RootDebt>,
+    cursor: usize,
+    blocked: bool,
+    attempts: usize,
+    debt_tokens: usize,
+    last_debt_sequence: Option<u64>,
+    reclaimed: BTreeSet<String>,
+}
+
+impl QueueModel {
+    fn retireable_65() -> Self {
+        Self {
+            pending: (1..=65)
+                .map(|index| RootDebt {
+                    old_root: format!("retireable-root-{index:02}"),
+                    rows: 1,
+                    bytes: 1,
+                })
+                .collect(),
+            cursor: 0,
+            blocked: false,
+            attempts: 0,
+            debt_tokens: 0,
+            last_debt_sequence: None,
+            reclaimed: BTreeSet::new(),
+        }
+    }
+
+    fn blocked_recovered_branch() -> Self {
+        // H and C are depth-one replay debt; S is the recovered source with a
+        // depth-two first-parent debt. The serving C is never made chronology.
+        Self {
+            pending: vec![
+                RootDebt {
+                    old_root: "H".to_owned(),
+                    rows: 1,
+                    bytes: 1,
+                },
+                RootDebt {
+                    old_root: "S".to_owned(),
+                    rows: 2,
+                    bytes: 2,
+                },
+            ],
+            cursor: 0,
+            blocked: true,
+            attempts: 0,
+            debt_tokens: 0,
+            last_debt_sequence: None,
+            reclaimed: BTreeSet::new(),
+        }
+    }
+
+    fn drain_once(&mut self, capacity: usize, sequence: u64) -> DrainResult {
+        self.attempts += 1;
+        if self.blocked {
+            if self.debt_tokens == 0 {
+                self.debt_tokens = 1;
+                self.last_debt_sequence = Some(sequence);
+            }
+            return DrainResult {
+                advanced: false,
+                drained: false,
+                reclaimed: Vec::new(),
+                debt_tokens: self.debt_tokens,
+                attempts: self.attempts,
+            };
+        }
+
+        let start = self.cursor;
+        let end = (start + capacity).min(self.pending.len());
+        let mut reclaimed = Vec::new();
+        for debt in &self.pending[start..end] {
+            // The depth/size fields are part of the authenticated contract;
+            // a model must not silently turn malformed zero debt into a root.
+            assert!(debt.rows > 0 && debt.bytes > 0);
+            self.reclaimed.insert(debt.old_root.clone());
+            reclaimed.push(debt.old_root.clone());
+        }
+        self.cursor = end;
+        let drained = self.cursor == self.pending.len();
+        if drained {
+            self.debt_tokens = 0;
+        }
+        DrainResult {
+            advanced: end > start,
+            drained,
+            reclaimed,
+            debt_tokens: self.debt_tokens,
+            attempts: self.attempts,
+        }
+    }
+
+    fn release_blocked_head(&mut self) {
+        self.blocked = false;
+    }
+
+    fn snapshot(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.cursor,
+            self.blocked as u8,
+            self.debt_tokens,
+            self.last_debt_sequence.unwrap_or_default(),
+            self.reclaimed.iter().cloned().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LandingArtifact {
+    representation: StateRepresentation,
+    branch_first_parent: String,
+    serving_checkpoint: String,
+    suffix_reclaimed: bool,
+    blocked_reclaimed: bool,
+    reopened_snapshot: String,
+}
+
+fn run_landing_model(representation: StateRepresentation) -> LandingArtifact {
+    // The graph's sole chronology authority is [S first-parent H, serving C].
+    // T is a later ordinary commit and is never a bridge target.
+    let graph_parents = ["H".to_owned(), "C".to_owned()];
+    let later_commit = "T".to_owned();
+    assert_eq!(graph_parents[0], "H");
+    assert_eq!(graph_parents[1], "C");
+    assert_ne!(graph_parents[0], graph_parents[1]);
+    assert_ne!(graph_parents[1], later_commit);
+
+    let mut retireable = QueueModel::retireable_65();
+    let prefix = retireable.drain_once(64, 64);
+    assert!(prefix.advanced);
+    assert!(!prefix.drained);
+    assert_eq!(prefix.reclaimed.len(), 64);
+    assert_eq!(prefix.debt_tokens, 0);
+    let suffix = retireable.drain_once(64, 65);
+    assert!(suffix.advanced);
+    assert!(suffix.drained);
+    assert_eq!(suffix.reclaimed.len(), 1);
+    assert_eq!(retireable.reclaimed.len(), 65);
+
+    let mut blocked = QueueModel::blocked_recovered_branch();
+    let blocked_first = blocked.drain_once(64, 64);
+    assert!(!blocked_first.advanced);
+    assert!(!blocked_first.drained);
+    assert!(blocked_first.reclaimed.is_empty());
+    assert_eq!(blocked_first.debt_tokens, 1);
+    assert_eq!(blocked_first.attempts, 1);
+    assert_eq!(blocked.last_debt_sequence, Some(64));
+    // No immediate retry/spin: the owner records one debt token and returns.
+    let blocked_snapshot = blocked.snapshot();
+    blocked.release_blocked_head();
+    let released = blocked.drain_once(64, 65);
+    assert!(released.advanced);
+    assert!(released.drained);
+    assert_eq!(released.reclaimed, vec!["H", "S"]);
+    assert!(blocked.reclaimed.contains("H"));
+    assert!(blocked.reclaimed.contains("S"));
+
+    // The reopen boundary carries only the authenticated queue progress. The
+    // delayed token is not a second authority and does not change semantics.
+    let reopened_snapshot = blocked.snapshot();
+    assert_ne!(blocked_snapshot, reopened_snapshot);
+
+    LandingArtifact {
+        representation,
+        branch_first_parent: graph_parents[0].clone(),
+        serving_checkpoint: graph_parents[1].clone(),
+        suffix_reclaimed: retireable.reclaimed.len() == 65,
+        blocked_reclaimed: blocked.reclaimed == BTreeSet::from(["H".to_owned(), "S".to_owned()]),
+        reopened_snapshot,
+    }
+}
+
+#[test]
+fn forktree_stage2_checkpoint_gc_landing_contract() {
+    let base = run_landing_model(StateRepresentation::Base);
+    let tracked = run_landing_model(StateRepresentation::TrackedStateRebuild);
+    assert_eq!(base.branch_first_parent, "H");
+    assert_eq!(base.serving_checkpoint, "C");
+    assert!(base.suffix_reclaimed);
+    assert!(base.blocked_reclaimed);
+    assert_eq!(base.reopened_snapshot, tracked.reopened_snapshot);
+    assert_eq!(
+        LandingArtifact {
+            representation: StateRepresentation::TrackedStateRebuild,
+            ..base
+        },
+        tracked
     );
 }
 
