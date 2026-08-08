@@ -260,6 +260,34 @@ where
                 blob_manifest_object_ids: &[],
             },
         )?;
+        let initialized_entity_pk = crate::entity_pk::EntityPk::single(
+            crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY,
+        );
+        let initialized_snapshot = serde_json::to_string(&serde_json::json!({
+            "key": crate::functions::DETERMINISTIC_SEQUENCE_INITIALIZED_KEY,
+            "value": true,
+        }))
+        .map_err(|error| {
+            writer_error(format!(
+                "failed to serialize deterministic sequence initialization marker: {error}"
+            ))
+        })?;
+        publication.put_untracked_row(
+            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?,
+            StateKeyRef {
+                schema_key: "lix_key_value",
+                file_id: None,
+                entity_pk: &initialized_entity_pk,
+            },
+            UntrackedValueRef {
+                created_at: timestamp,
+                updated_at: timestamp,
+                cell: StateCellRef::Value(&initialized_snapshot),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: &[],
+            },
+        )?;
     }
 
     if !semantic_commit {
