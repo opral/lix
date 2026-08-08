@@ -228,6 +228,28 @@ where
     pub(crate) async fn load_object_bytes(&self, id: ObjectId) -> Result<Bytes, StorageError> {
         load_object_bytes(&self.read, id).await
     }
+
+    pub(crate) async fn load_change_records(
+        &self,
+        ids: &[crate::changelog::ChangeId],
+    ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
+        super::serving::load_change_records(&self.read, ids).await
+    }
+
+    pub(crate) async fn scan_state_rows_at_commit(
+        &self,
+        commit_id: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
+        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
+    }
+
+    pub(crate) async fn diff_state_rows_between_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
+        diff_state_rows_between_commits_on_read(&self.read, before, after).await
+    }
 }
 
 /// One operation-scoped ForkTree read facade. Branch views borrow the same
@@ -384,34 +406,7 @@ where
         before: crate::changelog::CommitId,
         after: crate::changelog::CommitId,
     ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
-        let before_rows = self.scan_state_rows_at_commit(before).await?;
-        let after_rows = self.scan_state_rows_at_commit(after).await?;
-        let mut by_key = BTreeMap::new();
-        for row in before_rows {
-            by_key.entry(row.key.clone()).or_insert((Some(row), None));
-        }
-        for row in after_rows {
-            by_key
-                .entry(row.key.clone())
-                .and_modify(|entry| entry.1 = Some(row.clone()))
-                .or_insert((None, Some(row)));
-        }
-        Ok(by_key
-            .into_values()
-            .filter_map(|(before, after)| {
-                let changed = match (&before, &after) {
-                    (Some(left), Some(right)) => {
-                        left.deleted != right.deleted
-                            || left.snapshot_content != right.snapshot_content
-                            || left.metadata != right.metadata
-                            || left.key != right.key
-                    }
-                    (Some(_), None) | (None, Some(_)) => true,
-                    (None, None) => false,
-                };
-                changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
-            })
-            .collect())
+        diff_state_rows_between_commits_on_read(&self.read, before, after).await
     }
 
     /// Resolves one required semantic commit record from the authenticated
@@ -573,6 +568,44 @@ where
             }
         }
     }
+}
+
+async fn diff_state_rows_between_commits_on_read<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
+    let after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
+    let mut by_key = BTreeMap::new();
+    for row in before_rows {
+        by_key.entry(row.key.clone()).or_insert((Some(row), None));
+    }
+    for row in after_rows {
+        by_key
+            .entry(row.key.clone())
+            .and_modify(|entry| entry.1 = Some(row.clone()))
+            .or_insert((None, Some(row)));
+    }
+    Ok(by_key
+        .into_values()
+        .filter_map(|(before, after)| {
+            let changed = match (&before, &after) {
+                (Some(left), Some(right)) => {
+                    left.deleted != right.deleted
+                        || left.snapshot_content != right.snapshot_content
+                        || left.metadata != right.metadata
+                        || left.key != right.key
+                }
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
+        })
+        .collect())
 }
 
 pub(crate) async fn open_coherent_view<S>(

@@ -171,21 +171,15 @@ where
                 .await?;
 
                 let facade = transaction.forktree_read_facade();
-                let analysis = async {
-                    transaction
-                        .with_opening_tracked_reader(|reader| Box::pin(async move {
-                            super::analysis::analyze(
-                                reader,
-                                MergeCommits {
-                                    base_commit_id: merge_base,
-                                    target_commit_id: target_head,
-                                    source_commit_id: source_head,
-                                },
-                            )
-                            .await
-                        }))
-                        .await
-                }
+                let analysis = super::analysis::analyze(
+                    &facade,
+                    &active_branch_id,
+                    MergeCommits {
+                        base_commit_id: merge_base,
+                        target_commit_id: target_head,
+                        source_commit_id: source_head,
+                    },
+                )
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
                 .await?;
                 let derived_blob_files = async {
@@ -291,25 +285,16 @@ where
                 "lix.perf.merge_base"
             ))
             .await?;
-            let base_commit_id = merge_base;
             let facade = transaction.forktree_read_facade();
-            let analysis = async {
-                transaction
-                    .with_opening_tracked_reader(|reader| {
-                        Box::pin(async move {
-                            super::analysis::analyze(
-                                reader,
-                                MergeCommits {
-                                    base_commit_id,
-                                    target_commit_id: target_head,
-                                    source_commit_id: source_head,
-                                },
-                            )
-                            .await
-                        })
-                    })
-                    .await
-            }
+            let analysis = super::analysis::analyze(
+                &facade,
+                &active_branch_id,
+                MergeCommits {
+                    base_commit_id: merge_base,
+                    target_commit_id: target_head,
+                    source_commit_id: source_head,
+                },
+            )
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.merge_analysis"

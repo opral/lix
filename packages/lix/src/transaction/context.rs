@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7304,21 +7303,6 @@ where
             .expect("open transaction read scope");
         self.tracked_state
             .reader(SharedStorageAdapterRead::new(read))
-    }
-
-    /// Runs the still-unique merge diff/plan algorithm over the transaction's
-    /// retained opening read. The closure is deliberately private to the
-    /// transaction owner: mapped merge metadata readers use ForkTree's typed
-    /// facade, while this callback preserves only the remaining diff owner
-    /// without opening or exposing another storage snapshot.
-    pub(crate) async fn with_opening_tracked_reader<T, F>(&self, f: F) -> Result<T, LixError>
-    where
-        F: for<'a> FnOnce(
-            &'a mut TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'static>>>,
-        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>,
-    {
-        let mut reader = self.tracked_state.reader(self.opening_read());
-        f(&mut reader).await
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
