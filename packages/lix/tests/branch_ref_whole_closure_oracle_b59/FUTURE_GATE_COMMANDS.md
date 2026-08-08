@@ -38,8 +38,8 @@ Cargo target on compiler-red b59.
 Error taxonomy is part of that contract: absent or non-live global roots,
 branch snapshots, and selector-catalog closure return `MissingRoot`; malformed
 selector authentication or an embedded branch identity mismatch returns
-`CorruptSelector` (subject to the model's earlier `InvalidFingerprint`/
-`InvalidBranchIdentity` validation boundary).
+`CorruptSelector` (subject to the separate malformed branch-identity input
+being rejected as `InvalidBranchIdentity`).
 
 After compile/no-run green, run one backend cell at a time, in this order:
 

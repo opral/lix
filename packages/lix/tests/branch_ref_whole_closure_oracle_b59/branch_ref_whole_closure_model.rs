@@ -251,7 +251,6 @@ enum Failure {
     Cycle,
     DualAuthority,
     InvalidGlobalSequence,
-    InvalidFingerprint,
     RetiredBranch,
 }
 
@@ -364,7 +363,7 @@ impl Repository {
         if global.is_authenticated() {
             Ok(())
         } else {
-            Err(Failure::InvalidFingerprint)
+            Err(Failure::CorruptSelector)
         }
     }
 
@@ -379,7 +378,7 @@ impl Repository {
         if branch.is_authenticated() {
             Ok(())
         } else {
-            Err(Failure::InvalidFingerprint)
+            Err(Failure::CorruptSelector)
         }
     }
 
@@ -888,7 +887,7 @@ fn selector_bytes_bind_exact_root_catalog_generation_and_owner() {
     repository.branches.insert(BRANCH_A.into(), forged);
     assert_eq!(
         repository.open_view(BRANCH_A),
-        Err(Failure::InvalidFingerprint)
+        Err(Failure::CorruptSelector)
     );
 
     repository
@@ -899,7 +898,34 @@ fn selector_bytes_bind_exact_root_catalog_generation_and_owner() {
     repository.branches.insert(BRANCH_A.into(), wrong_catalog);
     assert_eq!(
         repository.open_view(BRANCH_A),
-        Err(Failure::InvalidFingerprint)
+        Err(Failure::CorruptSelector)
+    );
+}
+
+#[test]
+fn malformed_selector_authentication_is_corrupt_selector() {
+    let mut malformed_global = repository_with_branch();
+    malformed_global
+        .global
+        .as_mut()
+        .unwrap()
+        .auth_fingerprint
+        .push('x');
+    assert_eq!(
+        malformed_global.open_view(BRANCH_A),
+        Err(Failure::CorruptSelector)
+    );
+
+    let mut malformed_branch = repository_with_branch();
+    malformed_branch
+        .branches
+        .get_mut(BRANCH_A)
+        .unwrap()
+        .auth_fingerprint
+        .push('x');
+    assert_eq!(
+        malformed_branch.open_view(BRANCH_A),
+        Err(Failure::CorruptSelector)
     );
 }
 

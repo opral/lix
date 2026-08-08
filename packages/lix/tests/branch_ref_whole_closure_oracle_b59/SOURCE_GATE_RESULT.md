@@ -1,4 +1,4 @@
-# b59 source-gate calibration and BranchRef v4 correction
+# b59 source-gate calibration and BranchRef v5 correction
 
 This is a static calibration result on the immutable b59 anchor. It is not a
 candidate acceptance result and does not claim production compilation or
@@ -112,9 +112,10 @@ This immutable test/report-only child of v3 commit
 `3a3c687f30c5190ac5eb9dc397745aec5d3a18d2` changes only the model's failure
 classification. `open_view` and `reopen` share a branch-snapshot validator:
 an absent or non-live global root, branch snapshot, or selector-catalog
-closure is `MissingRoot`; malformed selector authentication and an embedded
-branch identity mismatch remain `CorruptSelector` (or the earlier explicit
-authentication/identity error). No production source, adapter, format,
+closure is `MissingRoot`; malformed selector authentication retained v4's
+prior `InvalidFingerprint` outcome, while an embedded branch identity mismatch
+remained `CorruptSelector`.
+No production source, adapter, format,
 compatibility path, or authority changed. The exact standalone v4 model
 compile and 19-test runtime are recorded below; production and adapter
 runtime remain unclaimed.
@@ -127,3 +128,21 @@ runtime remain unclaimed.
 * direct v4 source-verifier capture: expected RED, log SHA-256
   `c1c39f02df2f99116cf4aa9ef5a30e8719774a54d7d9ffb9e943483c046e522d`
 * `rustfmt --edition 2021 --check`, `bash -n`, and `git diff --check`: PASS
+
+## Direct v5 selector-authentication correction
+
+This immutable child of v4 commit
+`3a553f5cf59745651cf7df026a7a10de6f8639aa` removes the stale
+`InvalidFingerprint` model outcome. Both malformed global and malformed branch
+selector authentication now fail closed as `CorruptSelector`, with an
+explicit two-selector regression. `MissingRoot` and stale/unrelated CAS
+classification are unchanged.
+
+* direct v5 `rustc --edition=2021 --test -D warnings`: PASS
+* direct v5 model runtime: 20/20 PASS, binary SHA-256
+  `8b60cbc43e3e070e30de68c1dff308b72574ddbeef00c5a252d8aefe18cbc11a`,
+  log SHA-256
+  `3e54bef653af9ce56e7f08eface6036f80b25b7908e9e696d209cc716bb7b8d9`
+* direct v5 source-verifier capture: expected RED, log SHA-256
+  `c1c39f02df2f99116cf4aa9ef5a30e8719774a54d7d9ffb9e943483c046e522d`
+* direct v5 rustfmt, shell syntax, diff, and package checksum gates: PASS

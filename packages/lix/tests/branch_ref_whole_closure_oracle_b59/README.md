@@ -51,12 +51,24 @@ This is a new immutable test/report-only child of v3 commit
 `3a3c687f30c5190ac5eb9dc397745aec5d3a18d2`; v3 remains unchanged. The model
 now classifies an absent or non-live global root, branch snapshot, or
 selector-catalog closure as `MissingRoot`. A malformed or unauthenticated
-selector, including an embedded branch identity that does not match the
-requested branch, remains `CorruptSelector` (or the existing authentication
-failure where validation stops earlier). The correction uses one shared
+selector retained v4's existing authentication failure classification, while
+an embedded branch identity that does not match the requested branch remained
+`CorruptSelector`.
+The correction uses one shared
 branch-snapshot validation rule in `open_view` and `reopen`; it adds no
 production path, authority, fallback, or adapter behavior. All 19 standalone
 model tests are rerun for this successor.
+
+## Direct v5 selector-authentication correction
+
+This new immutable child of v4 commit
+`3a553f5cf59745651cf7df026a7a10de6f8639aa` normalizes malformed or
+unauthenticated global and branch selectors to `CorruptSelector`. It adds an
+explicit regression that tampers each selector authentication fingerprint and
+requires the same fail-closed result. `MissingRoot` remains reserved for
+absent or non-live roots/closure, and stale same-owner versus unrelated-owner
+CAS outcomes are unchanged. The package remains test/report-only; no
+production, adapter, compatibility, or PR behavior is changed.
 
 ## Immutable anchor
 
