@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 mod model;
+mod oltp;
 mod relational;
 mod vertical;
 mod workload;
@@ -405,6 +406,10 @@ struct Sample {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("oltp") {
+        oltp::run().await;
+        return;
+    }
     let parameters = Parameters::parse();
     if parameters.scenario == Scenario::Relational {
         relational::run(parameters).await;
