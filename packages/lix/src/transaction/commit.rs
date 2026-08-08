@@ -16,6 +16,7 @@ use crate::common::LixTimestamp;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::transaction::staging::PreparedWriteSet;
+use crate::transaction::types::PreparedStateRowRef;
 
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
@@ -183,6 +184,7 @@ where
     else {
         return Ok(PreparedForkTreePlan::Noop);
     };
+    let prepared_blob_manifests = prepared_blob_manifest_ids(&prepared_writes)?;
     let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
@@ -226,7 +228,10 @@ where
                     cell: StateCellRef::Value(snapshot.normalized()),
                     metadata: row.metadata.map(|value| value.normalized()),
                     origin_key: row.origin_key.map(|value| value.as_str()),
-                    blob_manifest_object_ids: &[],
+                    blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
+                        row,
+                        &prepared_blob_manifests,
+                    )?,
                 },
             )?;
         } else {
@@ -275,6 +280,7 @@ where
             &view,
             publication,
             prepared_writes,
+            prepared_blob_manifests,
         )
         .await;
     }
@@ -356,7 +362,10 @@ where
                 cell,
                 metadata: row.metadata.map(|value| value.normalized()),
                 origin_key: row.origin_key.map(|value| value.as_str()),
-                blob_manifest_object_ids: &[],
+                blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
+                    row,
+                    &prepared_blob_manifests,
+                )?,
             })?;
             let exists_at_target_root = previous
                 .as_ref()
@@ -577,6 +586,7 @@ async fn prepare_ordered_single_branch_history<R>(
     view: &crate::forktree::CoherentView<R>,
     mut publication: PreparedPublication,
     prepared: PreparedWriteSet,
+    prepared_blob_manifests: BTreeMap<(String, String, bool, bool), ObjectId>,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -761,7 +771,10 @@ where
                     }),
                     metadata: row.metadata.map(|value| value.normalized()),
                     origin_key: row.origin_key.map(|value| value.as_str()),
-                    blob_manifest_object_ids: &[],
+                    blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
+                        row,
+                        &prepared_blob_manifests,
+                    )?,
                 })?;
                 touched_presence.insert(key.clone(), true);
                 if existed {
@@ -1073,10 +1086,12 @@ fn classify_publication_intent(
     prepared: &PreparedWriteSet,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
 ) -> Result<PublicationIntent, LixError> {
-    if !prepared.file_content_writes.is_empty() {
-        return Err(writer_error(
-            "file payload publication requires the ForkTree receipt/manifest lowering slice",
-        ));
+    for write in &prepared.file_content_writes {
+        if write.prepared_cas_receipt().is_none() {
+            return Err(writer_error(
+                "inline file payloads cannot bypass BlobId-only ForkTree lowering",
+            ));
+        }
     }
 
     // Commit intent is independent of current-state row count. Inspect every
@@ -1189,6 +1204,61 @@ fn classify_publication_intent(
         branch_id: canonical_branch_id(&branch_id)?,
         semantic_commit: has_commit_intent,
     })
+}
+
+type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), ObjectId>;
+
+fn prepared_blob_manifest_ids(
+    prepared: &PreparedWriteSet,
+) -> Result<PreparedBlobManifestMap, LixError> {
+    let mut manifests = PreparedBlobManifestMap::new();
+    for write in &prepared.file_content_writes {
+        let receipt = write.prepared_cas_receipt().ok_or_else(|| {
+            writer_error("file payload is missing an authenticated ForkTree CAS receipt")
+        })?;
+        let manifest = ObjectId::from_bytes(receipt.manifest_object_id);
+        if manifest == ObjectId::ZERO {
+            return Err(writer_error(
+                "file payload has a zero ForkTree manifest identity",
+            ));
+        }
+        let key = (
+            write.branch_id.clone(),
+            write.file_id.clone(),
+            write.global,
+            write.untracked,
+        );
+        if let Some(previous) = manifests.insert(key.clone(), manifest)
+            && previous != manifest
+        {
+            return Err(writer_error(
+                "one file scope has conflicting ForkTree manifest identities",
+            ));
+        }
+    }
+    Ok(manifests)
+}
+
+fn blob_manifest_object_ids_for_row(
+    row: PreparedStateRowRef<'_>,
+    manifests: &PreparedBlobManifestMap,
+) -> Result<Vec<ObjectId>, LixError> {
+    if row.schema_key.as_str() != "lix_binary_blob_ref" {
+        return Ok(Vec::new());
+    }
+    let file_id = row
+        .file_id
+        .ok_or_else(|| writer_error("blob-ref state row has no file identity"))?;
+    let key = (
+        row.branch_id.to_string(),
+        file_id.to_string(),
+        row.global,
+        row.untracked,
+    );
+    let manifest = manifests.get(&key).copied().ok_or_else(|| {
+        writer_error("blob-ref state row has no matching prepared ForkTree manifest")
+    })?;
+    Ok(vec![manifest])
 }
 
 fn sole_publication_branch(

@@ -28,7 +28,7 @@ const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = StorageSpace::engine_declared(
 pub const FILE_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const UPLOAD_PART_WINDOW: u32 = 4;
-const UPLOAD_MANIFEST_LEAF_MAGIC: &[u8; 8] = b"LIXUML2\0";
+const UPLOAD_MANIFEST_LEAF_MAGIC: &[u8; 8] = b"LIXUML3\0";
 
 /// Collects active resumable-upload receipt chunks and stages receipt cleanup.
 /// Upload leaves contain hashes and sizes only; they are never a second payload
@@ -409,14 +409,14 @@ where
         let receipt = self
             .binary_cas
             .writer_skipping_existing_chunks(&read, &mut finalization_writes)
-            .stage_fixed_manifest(&receipts)?;
+            .stage_fixed_manifest(&receipts)
+            .await?;
         let complete = UploadState::Complete(UploadComplete {
             path: state.path.clone(),
             total_size: state.total_size,
             blob_id: receipt.hash.into_bytes(),
             part_identities,
         });
-        let publication_blob_id = receipt.hash;
         let expected_blob_id = receipt.hash.into_bytes();
         stage_upload_state(&mut finalization_writes, state_key.clone(), &complete)?;
         let expected_open = encode_upload_state(&UploadState::Open(state.clone()))?;
@@ -435,7 +435,7 @@ where
                     transaction.stage_atomic_cas_publication(
                         finalization_writes,
                         finalization_preconditions,
-                        publication_blob_id,
+                        receipt.clone(),
                     )?;
                     crate::sql2::execute_fast_lix_file_prepared_path_write(
                         transaction,
@@ -624,7 +624,7 @@ fn encode_upload_manifest_leaf(leaf: &UploadManifestLeaf) -> Result<Vec<u8>, Lix
     let chunk_count = u32::try_from(leaf.chunks.len())
         .map_err(|_| invalid_upload("upload manifest leaf has too many chunks"))?;
     let mut value = Vec::with_capacity(
-        UPLOAD_MANIFEST_LEAF_MAGIC.len() + 8 + 4 + leaf.chunks.len().saturating_mul(40),
+        UPLOAD_MANIFEST_LEAF_MAGIC.len() + 8 + 4 + leaf.chunks.len().saturating_mul(72),
     );
     value.extend_from_slice(UPLOAD_MANIFEST_LEAF_MAGIC);
     value.extend_from_slice(&leaf.part_size.to_be_bytes());
@@ -632,6 +632,7 @@ fn encode_upload_manifest_leaf(leaf: &UploadManifestLeaf) -> Result<Vec<u8>, Lix
     for chunk in &leaf.chunks {
         value.extend_from_slice(chunk.hash.as_bytes());
         value.extend_from_slice(&chunk.size_bytes.to_be_bytes());
+        value.extend_from_slice(&chunk.object_id);
     }
     Ok(value)
 }
@@ -642,6 +643,7 @@ fn upload_manifest_leaf_identity(leaf: &UploadManifestLeaf) -> [u8; 32] {
     for chunk in &leaf.chunks {
         identity.update(chunk.hash.as_bytes());
         identity.update(&chunk.size_bytes.to_le_bytes());
+        identity.update(&chunk.object_id);
     }
     *identity.finalize().as_bytes()
 }
@@ -665,7 +667,7 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
             .expect("fixed upload manifest leaf chunk count"),
     ) as usize;
     let expected_len = HEADER_BYTES
-        .checked_add(chunk_count.saturating_mul(40))
+        .checked_add(chunk_count.saturating_mul(72))
         .ok_or_else(|| invalid_upload("upload manifest leaf size overflows usize"))?;
     if value.len() != expected_len {
         return Err(LixError::new(
@@ -674,7 +676,7 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
         ));
     }
     let mut chunks = Vec::with_capacity(chunk_count);
-    for encoded in value[HEADER_BYTES..].chunks_exact(40) {
+    for encoded in value[HEADER_BYTES..].chunks_exact(72) {
         let mut hash = [0; 32];
         hash.copy_from_slice(&encoded[..32]);
         let size_bytes = u64::from_be_bytes(
@@ -682,9 +684,18 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
                 .try_into()
                 .expect("fixed upload manifest leaf chunk size"),
         );
+        let mut object_id = [0; 32];
+        object_id.copy_from_slice(&encoded[40..]);
+        if object_id == [0; 32] {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "upload manifest leaf chunk object identity is absent",
+            ));
+        }
         chunks.push(BlobChunkReceipt {
             hash: ChunkHash::from_bytes(hash),
             size_bytes,
+            object_id,
         });
     }
     let encoded_part_size = chunks
@@ -1252,6 +1263,7 @@ mod tests {
                 chunks: vec![BlobChunkReceipt {
                     hash: chunk_hash,
                     size_bytes: payload.len() as u64 + 1,
+                    object_id: [1; 32],
                 }],
             },
         )
@@ -1305,7 +1317,11 @@ mod tests {
                 upload_manifest_leaf_key(upload_id, 0).unwrap(),
                 &UploadManifestLeaf {
                     part_size: size_bytes,
-                    chunks: vec![BlobChunkReceipt { hash, size_bytes }],
+                    chunks: vec![BlobChunkReceipt {
+                        hash,
+                        size_bytes,
+                        object_id: [1; 32],
+                    }],
                 },
             )
             .expect("active upload receipt should stage");

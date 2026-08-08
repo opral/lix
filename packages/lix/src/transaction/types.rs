@@ -2075,6 +2075,13 @@ impl TransactionFileContent {
         self.content.blob_id()
     }
 
+    pub(crate) fn prepared_cas_receipt(&self) -> Option<&BlobWriteReceipt> {
+        match &self.content {
+            FileContent::PreparedCas(receipt) => Some(receipt),
+            FileContent::Inline(_) => None,
+        }
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.content.len()
     }

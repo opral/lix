@@ -737,6 +737,21 @@ impl StorageWriteSet {
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
     }
 
+    /// Checks whether this transaction-owned plan contains the exact final
+    /// point put. Content-addressed owners use this to bind a semantic receipt
+    /// to its authenticated immutable object before the plan is committed.
+    pub(crate) fn has_put(&self, space: StorageSpace, key: &[u8]) -> bool {
+        self.group_index
+            .get(&space.id())
+            .and_then(|index| self.groups.get(*index))
+            .is_some_and(|group| {
+                group
+                    .puts
+                    .iter()
+                    .any(|put| &group.key_bytes(put.key)[..] == key)
+            })
+    }
+
     pub(crate) fn changelog_gc_is_sealed(&self) -> bool {
         self.changelog_gc_sealed
     }

@@ -7,7 +7,7 @@ use super::codec::{Decoder, Encoder, corruption, keyed_hash};
 const OBJECT_MAGIC: &[u8; 8] = b"LIXFTO\0\x01";
 const OBJECT_HASH_DOMAIN: &str = "lix forktree immutable object id v1";
 
-pub(super) const OBJECT_SPACE: StorageSpace = StorageSpace::engine_declared(
+pub(crate) const OBJECT_SPACE: StorageSpace = StorageSpace::engine_declared(
     0x0009_0001,
     "forktree.object.v1",
     crate::storage::ValueSemantics::Immutable,

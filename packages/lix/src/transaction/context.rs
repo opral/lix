@@ -21,7 +21,9 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
+use crate::binary_cas::{
+    BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId, BlobWriteReceipt,
+};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
     BranchReferenceRole, branch_ref_stage_row,
@@ -773,7 +775,7 @@ where
         &mut self,
         writes: StorageWriteSet,
         preconditions: Vec<StoragePrecondition>,
-        blob_id: BlobId,
+        receipt: BlobWriteReceipt,
     ) -> Result<(), LixError> {
         if self.atomic_metadata_writes.is_some() {
             return Err(LixError::new(
@@ -781,10 +783,7 @@ where
                 "atomic transaction metadata was staged more than once",
             ));
         }
-        if !self
-            .binary_cas
-            .prepared_manifest_is_staged(&writes, blob_id)
-        {
+        if !writes.has_put(crate::forktree::OBJECT_SPACE, &receipt.manifest_object_id) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "atomic CAS publication is missing its prepared manifest",

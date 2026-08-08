@@ -26,7 +26,7 @@ pub(crate) use model::{
     RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
     UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
-pub(crate) use object::ObjectId;
+pub(crate) use object::{OBJECT_SPACE, ObjectId};
 pub(crate) use publication::{
     BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication, SelectorExpectation,
 };
