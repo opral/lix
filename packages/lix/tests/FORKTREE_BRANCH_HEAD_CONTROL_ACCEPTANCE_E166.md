@@ -82,8 +82,8 @@ references in live-state, transaction, functions, init, GC, tests/fixtures,
 and storage-bench support. This is the intended compiler/deletion frontier,
 not a runtime verdict.
 
-- captured log: `/root/repos/evidence/forktree-branch-head-control-acceptance-e166/source-gate.log`
-- source-gate log SHA-256: `fe512179d2116449e2654ac479b462910d3d9edc674cd1fd15a91c97bc6d8368`
+- captured log: `/root/repos/evidence/forktree-branch-head-control-acceptance-e166/source-gate-final.log`
+- source-gate log SHA-256: `5d00358c9d8826fe8c2e9cc4d10ff27f9074262b28d163a76e324e5aa3097052`
 
 The first accepted runnable candidate must make this gate green after
 reader-first/writer-last migration and physical deletion. Public
