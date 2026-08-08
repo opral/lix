@@ -1490,7 +1490,6 @@ where
     }
 
     async fn attach_checkpoint_branch_parents<S>(
-        &self,
         read: &S,
         prepared_writes: &mut PreparedWriteSet,
         commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
@@ -1809,9 +1808,12 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = transaction
-            .attach_checkpoint_branch_parents(&read, &mut prepared_writes, &commit_parent_heads)
-            .await
+        if let Err(error) = Self::attach_checkpoint_branch_parents(
+            &read,
+            &mut prepared_writes,
+            &commit_parent_heads,
+        )
+        .await
         {
             transaction
                 .discard_pending_plugin_actor_publications()
