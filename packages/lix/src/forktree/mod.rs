@@ -18,8 +18,8 @@ mod tree;
 mod view;
 
 pub(crate) use blob::{
-    AuthenticatedBlobReader, AuthenticatedBlobRef, UploadBindingRef, blob_reader_on_read,
-    prepare_upload_completion,
+    AuthenticatedBlobReader, AuthenticatedBlobRef, PreparedUploadPart, UploadBindingRef,
+    blob_reader_on_read, prepare_upload_completion, prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use model::{

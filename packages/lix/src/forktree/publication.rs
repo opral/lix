@@ -6,7 +6,7 @@ use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 
-use super::blob::CompletedUpload;
+use super::blob::{CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeObjectV1,
@@ -178,6 +178,125 @@ impl PreparedPublication {
                 expected.ok_or_else(|| corruption("GC selector retirement is not present"))?,
             ),
         }
+    }
+
+    /// Merges two plans derived from the same coherent global selector. This
+    /// is an in-memory composition step only: the caller still performs one
+    /// `into_storage_plan`, one prepare, and one backend commit. Independent
+    /// selector expectations or incompatible repository-root rotations are
+    /// rejected rather than silently choosing one authority.
+    pub(crate) fn merge_from(&mut self, other: Self) -> Result<(), StorageError> {
+        if self.expected_global != other.expected_global
+            || self.next_global.epoch != other.next_global.epoch
+            || self.next_global.selector_generation != other.next_global.selector_generation
+        {
+            return Err(corruption(
+                "publications were prepared from different global epochs",
+            ));
+        }
+        if self.next_global.repository_root != other.next_global.repository_root {
+            let original_root = GlobalSelectorV1::decode(&self.expected_global)?.repository_root;
+            let self_changed = self.next_global.repository_root != original_root;
+            let other_changed = other.next_global.repository_root != original_root;
+            if self_changed && other_changed {
+                return Err(corruption(
+                    "publications assign conflicting repository roots",
+                ));
+            }
+            if !self_changed {
+                self.next_global.repository_root = other.next_global.repository_root;
+            }
+        }
+        for (key, expected) in &other.selector_expectations {
+            self.expect_selector(key.clone(), expected.clone())?;
+        }
+        for (key, value) in other.selector_puts {
+            let expected = self
+                .selector_expectations
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| corruption("upload publication lost selector expectation"))?;
+            self.put_selector(key, value, expected)?;
+        }
+        for key in other.selector_deletes {
+            let expected = match other.selector_expectations.get(&key) {
+                Some(SelectorExpectation::Equals(bytes)) => bytes.clone(),
+                _ => {
+                    return Err(corruption(
+                        "publication deletes a selector without an exact expectation",
+                    ));
+                }
+            };
+            self.delete_selector(key, expected)?;
+        }
+        self.object_puts.extend(other.object_puts)?;
+        for (key, value) in other.untracked_puts {
+            if self.untracked_deletes.contains(&key) {
+                return Err(corruption(
+                    "publication both puts and deletes one untracked row",
+                ));
+            }
+            match self.untracked_puts.get(&key) {
+                Some(existing) if existing != &value => {
+                    return Err(corruption("publications assign conflicting untracked rows"));
+                }
+                Some(_) => {}
+                None => {
+                    self.untracked_puts.insert(key, value);
+                }
+            }
+        }
+        for key in other.untracked_deletes {
+            if self.untracked_puts.contains_key(&key) {
+                return Err(corruption(
+                    "publication both puts and deletes one untracked row",
+                ));
+            }
+            self.untracked_deletes.insert(key);
+        }
+        Ok(())
+    }
+
+    /// Stages one authenticated upload part in this publication. Open parts
+    /// retain typed ReceiptTree state; a completed part stages the manifest
+    /// and lets the ordinary file-row lowerer publish the visible BlobRef in
+    /// the same transaction. No BinaryCasContext writer or second commit is
+    /// reachable from this operation.
+    pub(crate) fn publish_upload_part(
+        &mut self,
+        prepared: PreparedUploadPart,
+    ) -> Result<(), StorageError> {
+        if prepared.already_present {
+            return Ok(());
+        }
+        for chunk in &prepared.chunks {
+            self.stage_blob_chunk(chunk)?;
+        }
+        if let Some(manifest) = &prepared.complete_manifest {
+            self.stage_blob_manifest(manifest)?;
+            if let Some(raw_selector) = prepared.raw_selector {
+                let selector = UploadSelectorV1::decode(&raw_selector)?;
+                self.delete_upload_selector(&selector, raw_selector)?;
+            }
+            return Ok(());
+        }
+
+        self.stage_upload_part(&prepared.part)?;
+        self.stage_receipt_tree_edit(prepared.receipt)?;
+        let (progress_id, _) = prepared.progress.encode()?;
+        if progress_id != prepared.selector.progress_object_id {
+            return Err(corruption(
+                "upload selector does not name the staged progress object",
+            ));
+        }
+        self.stage_upload_progress(&prepared.progress)?;
+        self.put_upload_selector(
+            &prepared.selector,
+            match prepared.raw_selector {
+                Some(raw) => SelectorExpectation::Equals(raw),
+                None => SelectorExpectation::Absent,
+            },
+        )
     }
 
     pub(super) fn stage_repository_root(

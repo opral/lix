@@ -2405,6 +2405,58 @@ async fn state_and_catalog_publication_inputs_are_bound_to_the_selected_view() {
 }
 
 #[tokio::test]
+async fn state_edit_rejects_unsorted_and_duplicate_encoded_keys() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view");
+
+    let (a_key, a_value) = state_entry("a", StateCellRef::Value("a"), 0x90, &[]);
+    let (z_key, z_value) = state_entry("z", StateCellRef::Value("z"), 0x91, &[]);
+    let unsorted = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![
+            StateTreeMutation::insert(z_key, z_value),
+            StateTreeMutation::insert(a_key.clone(), a_value.clone()),
+        ],
+        view.storage_read(),
+    )
+    .await
+    .expect_err("unsorted encoded mutations must fail closed");
+    assert!(matches!(
+        unsorted,
+        StorageError::Corruption(message)
+            if message.contains("ordered-tree mutations are not strictly ordered and distinct")
+    ));
+
+    let (_, duplicate_value) = state_entry("a", StateCellRef::Value("replacement"), 0x92, &[]);
+    let duplicate = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        vec![
+            StateTreeMutation::insert(a_key, a_value),
+            StateTreeMutation::insert(
+                encode_state_key(StateKeyRef {
+                    schema_key: "app.row",
+                    file_id: Some("file"),
+                    entity_pk: &EntityPk::single("a"),
+                }),
+                duplicate_value,
+            ),
+        ],
+        view.storage_read(),
+    )
+    .await
+    .expect_err("duplicate encoded mutations must fail closed");
+    assert!(matches!(
+        duplicate,
+        StorageError::Corruption(message)
+            if message.contains("ordered-tree mutations are not strictly ordered and distinct")
+    ));
+}
+
+#[tokio::test]
 async fn upload_abort_releases_receipt_closure_after_final_selector_move() {
     let seed = build_seed();
     let upload = make_upload();
@@ -2564,8 +2616,8 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![
-            StateTreeMutation::insert(key.clone(), value),
             StateTreeMutation::insert(wrong_owner_key.clone(), wrong_owner),
+            StateTreeMutation::insert(key.clone(), value),
             StateTreeMutation::insert(mismatched_owner_key.clone(), mismatched_owner),
             StateTreeMutation::insert(transplanted_owner_key.clone(), transplanted_owner),
             StateTreeMutation::insert(valid_multichunk_key.clone(), valid_multichunk_owner),
