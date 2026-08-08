@@ -162,8 +162,13 @@ where
         &self,
         refs: &[AuthenticatedBlobRef],
     ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
-        load_blob_bytes_many_on_read(self.read(), self.view_id(), self.view_instance_id(), refs)
-            .await
+        load_blob_bytes_many_on_read(
+            self.storage_read(),
+            self.view_id(),
+            self.view_instance_id(),
+            refs,
+        )
+        .await
     }
 
     /// Loads payload ranges on the same StorageRead that authenticated their
@@ -173,7 +178,7 @@ where
         requests: &[(AuthenticatedBlobRef, Range<u64>)],
     ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
         load_blob_ranges_many_on_read(
-            self.read(),
+            self.storage_read(),
             self.view_id(),
             self.view_instance_id(),
             requests,
@@ -462,7 +467,7 @@ where
 {
     let selector_key = [Key(upload_selector_key(upload_id)?)];
     let loaded = view
-        .read()
+        .storage_read()
         .get_many(&[GetManyRequest {
             space: SELECTOR_SPACE,
             keys: &selector_key,
@@ -499,7 +504,8 @@ where
             "upload completion binding does not match its receipt",
         ));
     }
-    let progress_bytes = load_object_bytes(view.read(), selector.progress_object_id).await?;
+    let progress_bytes =
+        load_object_bytes(view.storage_read(), selector.progress_object_id).await?;
     let progress = UploadProgressV1::decode(selector.progress_object_id, &progress_bytes)?;
     if progress.upload_id != selector.upload_id
         || progress.binding_digest != selector.binding_digest
@@ -522,7 +528,7 @@ where
         received_bytes: progress.received_bytes,
         contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
     };
-    validate_receipt_root_on_read(receipt_root, view.read()).await?;
+    validate_receipt_root_on_read(receipt_root, view.storage_read()).await?;
     let mut ordered_chunks = Vec::new();
     let mut final_hasher = blake3::Hasher::new();
     let mut semantic_id_builder = CanonicalBlobIdBuilder::default();
@@ -535,7 +541,7 @@ where
             "receipt",
             start_after.as_deref(),
             super::tree::RECEIPT_TREE_LEAF_ENTRIES,
-            view.read(),
+            view.storage_read(),
         )
         .await?;
         if page.is_empty() {
@@ -553,7 +559,7 @@ where
                     .try_into()
                     .map_err(|_| corruption("receipt value is not an object ID"))?,
             );
-            let part_bytes = load_object_bytes(view.read(), part_id).await?;
+            let part_bytes = load_object_bytes(view.storage_read(), part_id).await?;
             let part = UploadPartV1::decode(part_id, &part_bytes)?;
             if part.upload_id != selector.upload_id
                 || part.part_number != part_number
@@ -566,7 +572,7 @@ where
             let mut part_hasher = blake3::Hasher::new();
             for chunk_ref in &part.ordered_chunks {
                 authenticate_chunk(
-                    view.read(),
+                    view.storage_read(),
                     chunk_ref,
                     &mut part_hasher,
                     &mut final_hasher,

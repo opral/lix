@@ -1158,13 +1158,13 @@ where
             view.repository_root().change_catalog_root,
             "change",
             change_id.as_bytes(),
-            view.read(),
+            view.storage_read(),
         )
         .await?
         .ok_or_else(|| corruption("selected Change has no ChangeCatalog introduction owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner(
-            view.read(),
+            view.storage_read(),
             view.repository_root().commit_catalog_root,
             source_commit_object_id,
             source.generation,
@@ -1215,7 +1215,7 @@ where
         view.branch_snapshot().local_state_root,
         key,
         include_tombstone,
-        view.read(),
+        view.storage_read(),
     )
     .await?
     else {
@@ -1290,7 +1290,7 @@ where
                 upper,
                 global_cursor.as_deref(),
                 page_size,
-                view.read(),
+                view.storage_read(),
             )
             .await?;
             global_done = page.len() < page_size;
@@ -1305,7 +1305,7 @@ where
                 upper,
                 local_cursor.as_deref(),
                 page_size,
-                view.read(),
+                view.storage_read(),
             )
             .await?;
             local_done = page.len() < page_size;
@@ -1589,7 +1589,7 @@ where
         view.repository_root().commit_catalog_root,
         "commit",
         id.as_bytes(),
-        view.read(),
+        view.storage_read(),
     )
     .await?
     else {
@@ -1604,7 +1604,7 @@ where
         ));
     }
     validate_retained_commit(
-        view.read(),
+        view.storage_read(),
         view.repository_root().commit_catalog_root,
         view.repository_root().change_catalog_root,
         entry.commit_object_id,
@@ -1625,7 +1625,7 @@ where
         view.repository_root().change_catalog_root,
         "change",
         id.as_bytes(),
-        view.read(),
+        view.storage_read(),
     )
     .await?
     else {
@@ -1652,7 +1652,7 @@ where
         "commit",
         start_after.as_deref(),
         page_size,
-        view.read(),
+        view.storage_read(),
     )
     .await?;
     let mut entries = Vec::with_capacity(rows.len());
@@ -1671,7 +1671,7 @@ where
             ));
         }
         validate_retained_commit(
-            view.read(),
+            view.storage_read(),
             view.repository_root().commit_catalog_root,
             view.repository_root().change_catalog_root,
             entry.commit_object_id,
@@ -1704,7 +1704,7 @@ where
         "change",
         start_after.as_deref(),
         page_size,
-        view.read(),
+        view.storage_read(),
     )
     .await?;
     let mut entries = Vec::with_capacity(rows.len());
@@ -1790,7 +1790,7 @@ where
             },
         ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
             validate_retained_ref_change(
-                view.read(),
+                view.storage_read(),
                 view.repository_root().change_catalog_root,
                 entry.change_object_id,
                 &change,

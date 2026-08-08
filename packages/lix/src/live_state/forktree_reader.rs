@@ -11,16 +11,14 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
-    CanonicalBranchId, StateCell, StateKeyRef, StateSource, UNTRACKED_ROW_SPACE, decode_state_key,
-    decode_untracked_key, decode_untracked_value, encode_state_key, open_coherent_view_on_read,
-    state_point, state_range,
+    CanonicalBranchId, StateCell, StateKeyRef, StateSource, decode_state_key, encode_state_key,
+    open_coherent_view_on_read, state_point, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
     MaterializedLiveStateRow,
 };
-use crate::storage::{BeginScanOptions, CoreProjection, KeyRange, ProjectedValue, ScanOrder};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::derived::{is_derived_schema, request_may_include_derived};
@@ -134,80 +132,45 @@ where
             "current ForkTree untracked view does not match requested branch",
         ));
     }
-    let mut cursor = view
-        .read()
-        .begin_scan(
-            UNTRACKED_ROW_SPACE,
-            KeyRange {
-                lower: std::ops::Bound::Unbounded,
-                upper: std::ops::Bound::Unbounded,
-            },
-            BeginScanOptions {
-                projection: CoreProjection::FullValue,
-                order: ScanOrder::Ascending,
-            },
-        )
-        .await?;
     let mut rows = Vec::new();
-    loop {
-        let page = cursor.next_page(256).await?;
-        for entry in page.entries {
-            let value = match entry.value {
-                ProjectedValue::FullValue(bytes) => bytes,
-                ProjectedValue::KeyOnly => {
-                    return Err(unsupported(
-                        "ForkTree untracked scan returned key-only data",
-                    ));
-                }
-            };
-            let (entry_branch_id, key) = decode_untracked_key(&entry.key.0)
-                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
-            if entry_branch_id != branch_id {
-                continue;
-            }
-            if !request.filter.schema_keys.is_empty()
-                && !request
-                    .filter
-                    .schema_keys
-                    .iter()
-                    .any(|schema| schema == &key.schema_key)
-            {
-                continue;
-            }
-            if !request.filter.entity_pks.is_empty()
-                && !request
-                    .filter
-                    .entity_pks
-                    .iter()
-                    .any(|entity| entity == &key.entity_pk)
-            {
-                continue;
-            }
-            if !request
+    for (key, value) in view.scan_untracked_rows().await? {
+        if !request.filter.schema_keys.is_empty()
+            && !request
                 .filter
-                .file_ids
+                .schema_keys
                 .iter()
-                .all(|filter| filter.matches(key.file_id.as_ref()))
-            {
-                continue;
-            }
-            let value = decode_untracked_value(&value)
-                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
-            if value.cell.deleted() && !request.filter.include_tombstones {
-                continue;
-            }
-            rows.push(materialize_untracked_row(
-                value,
-                key.entity_pk,
-                key.schema_key,
-                key.file_id,
-                branch_id_text(branch_id),
-            ));
-            if request.limit.is_some_and(|limit| rows.len() >= limit) {
-                break;
-            }
+                .any(|schema| schema == &key.schema_key)
+        {
+            continue;
         }
-        if request.limit.is_some_and(|limit| rows.len() >= limit) || !page.has_more {
+        if !request.filter.entity_pks.is_empty()
+            && !request
+                .filter
+                .entity_pks
+                .iter()
+                .any(|entity| entity == &key.entity_pk)
+        {
+            continue;
+        }
+        if !request
+            .filter
+            .file_ids
+            .iter()
+            .all(|filter| filter.matches(key.file_id.as_ref()))
+        {
+            continue;
+        }
+        if value.cell.deleted() && !request.filter.include_tombstones {
+            continue;
+        }
+        rows.push(materialize_untracked_row(
+            value,
+            key.entity_pk,
+            key.schema_key,
+            key.file_id,
+            branch_id_text(branch_id),
+        ));
+        if request.limit.is_some_and(|limit| rows.len() >= limit) {
             break;
         }
     }

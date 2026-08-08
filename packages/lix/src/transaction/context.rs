@@ -7379,6 +7379,13 @@ where
             .ref_reader(SharedStorageAdapterRead::new(read))
     }
 
+    /// Creates a branch-ref reader over this transaction's retained opening
+    /// read. Merge planning must not acquire a second snapshot just to resolve
+    /// branch selectors.
+    pub(crate) fn branch_ref_reader_on_opening_read(&self) -> impl BranchRefReader + '_ {
+        self.branch_ctx.ref_reader(&self.opening_read)
+    }
+
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) async fn tracked_state_reader(
         &mut self,
@@ -7443,6 +7450,15 @@ where
             .await
             .expect("open transaction read scope");
         CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
+    }
+
+    /// Creates a commit-graph reader over the same immutable read that opened
+    /// this transaction. The graph reader owns its positive topology cache and
+    /// cannot refresh the transaction's view.
+    pub(crate) fn commit_graph_reader_on_opening_read(
+        &self,
+    ) -> CommitGraphStoreReader<&SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
+        CommitGraphContext::new().reader(&self.opening_read)
     }
 
     /// Applies a tracked-state transition resolved from two immutable commits.

@@ -22,10 +22,9 @@ use crate::forktree::{
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
     CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
-    StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, edit_state_tree,
-    edit_state_tree_sequence, encode_state_key, encode_state_value, load_commit,
-    open_coherent_view_on_read, put_change_catalog_entries, put_commit_catalog_entries,
-    select_historical_commit_member, state_point, state_point_on_read,
+    StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
+    encode_state_key, encode_state_value, load_commit, open_coherent_view_on_read,
+    select_historical_commit_member, state_point,
 };
 
 #[cfg(test)]
@@ -372,7 +371,7 @@ where
     } else {
         view.branch_snapshot().local_state_root
     };
-    let state_edit = edit_state_tree(state_base, state_mutations, view.read()).await?;
+    let state_edit = view.edit_state_tree(state_base, state_mutations).await?;
 
     let expected_parent = commit_parent_heads
         .get(&branch_id)
@@ -483,15 +482,15 @@ where
     let (ref_object_id, _) = ref_change.encode()?;
     changes.push(ref_change);
 
-    let commit_catalog_edit = put_commit_catalog_entries(
-        view.repository_root().commit_catalog_root,
-        &[(
-            (forktree_commit_id(commit_id)),
-            CommitCatalogEntry { commit_object_id },
-        )],
-        view.read(),
-    )
-    .await?;
+    let commit_catalog_edit = view
+        .put_commit_catalog_entries(
+            view.repository_root().commit_catalog_root,
+            &[(
+                (forktree_commit_id(commit_id)),
+                CommitCatalogEntry { commit_object_id },
+            )],
+        )
+        .await?;
     let mut change_entries = encoded_semantic_changes
         .into_iter()
         .enumerate()
@@ -520,12 +519,9 @@ where
         },
     ));
     change_entries.sort_unstable_by_key(|(change_id, _)| *change_id);
-    let change_catalog_edit = put_change_catalog_entries(
-        view.repository_root().change_catalog_root,
-        &change_entries,
-        view.read(),
-    )
-    .await?;
+    let change_catalog_edit = view
+        .put_change_catalog_entries(view.repository_root().change_catalog_root, &change_entries)
+        .await?;
     let repository_root = RepositoryRootV1 {
         global_state_root,
         commit_catalog_root: commit_catalog_edit.root,
@@ -811,15 +807,15 @@ where
                         "selected history identity or lifecycle differs from its Change payload",
                     ));
                 }
-                let (source_value, source_domain) = state_point_on_read(
-                    source_commit.global_state_root,
-                    source_commit.local_state_root,
-                    &identity,
-                    true,
-                    view.read(),
-                )
-                .await?
-                .ok_or_else(|| writer_error("selected history source state row is absent"))?;
+                let (source_value, source_domain) = view
+                    .state_point_at_roots(
+                        source_commit.global_state_root,
+                        source_commit.local_state_root,
+                        &identity,
+                        true,
+                    )
+                    .await?
+                    .ok_or_else(|| writer_error("selected history source state row is absent"))?;
                 let selected_global = source_domain == StateSource::Global;
                 if state_domain
                     .replace(selected_global)
@@ -889,15 +885,15 @@ where
     } else {
         view.branch_snapshot().local_state_root
     };
-    let state_edits = edit_state_tree_sequence(
-        state_base,
-        contents
-            .iter_mut()
-            .map(|content| std::mem::take(&mut content.mutations))
-            .collect(),
-        view.read(),
-    )
-    .await?;
+    let state_edits = view
+        .edit_state_tree_sequence(
+            state_base,
+            contents
+                .iter_mut()
+                .map(|content| std::mem::take(&mut content.mutations))
+                .collect(),
+        )
+        .await?;
 
     let mut staged_commits = BTreeMap::<CommitId, (ObjectId, CommitObjectV1)>::new();
     let mut semantic_commits = Vec::with_capacity(contents.len());
@@ -977,12 +973,9 @@ where
         semantic_commits.push(commit);
     }
     commit_entries.sort_unstable_by_key(|(commit_id, _)| *commit_id);
-    let commit_catalog_edit = put_commit_catalog_entries(
-        view.repository_root().commit_catalog_root,
-        &commit_entries,
-        view.read(),
-    )
-    .await?;
+    let commit_catalog_edit = view
+        .put_commit_catalog_entries(view.repository_root().commit_catalog_root, &commit_entries)
+        .await?;
 
     let final_content = contents.last().expect("ordered history is nonempty");
     debug_assert!(final_content.draft.publish_head);
@@ -1034,12 +1027,12 @@ where
         },
     ));
     fresh_owner_rows.sort_unstable_by_key(|(change_id, _)| *change_id);
-    let change_catalog_edit = put_change_catalog_entries(
-        view.repository_root().change_catalog_root,
-        &fresh_owner_rows,
-        view.read(),
-    )
-    .await?;
+    let change_catalog_edit = view
+        .put_change_catalog_entries(
+            view.repository_root().change_catalog_root,
+            &fresh_owner_rows,
+        )
+        .await?;
     let repository_root = RepositoryRootV1 {
         global_state_root: final_global_state_root,
         commit_catalog_root: commit_catalog_edit.root,

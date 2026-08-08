@@ -781,14 +781,14 @@ impl PreparedPublication {
                             view.repository_root().change_catalog_root,
                             "change",
                             change.change_id().as_bytes(),
-                            view.read(),
+                            view.storage_read(),
                         )
                         .await?
                         .ok_or_else(|| {
                             corruption("selected history member has no ChangeCatalog owner")
                         })?;
                         validate_member_catalog_owner(
-                            view.read(),
+                            view.storage_read(),
                             view.repository_root().commit_catalog_root,
                             commit_object_id,
                             commit.generation,

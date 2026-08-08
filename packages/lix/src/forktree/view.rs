@@ -4,15 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::storage::{
-    CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, ReadOptions, Storage,
-    StorageError,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
+    ReadOptions, ScanOrder, Storage, StorageError,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
 use super::codec::{Encoder, corruption, keyed_hash};
 use super::model::{
-    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeObjectV1, CommitObjectV1,
-    GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
+    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeId,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 
@@ -82,8 +83,108 @@ where
         self.branch_snapshot
     }
 
-    pub(crate) fn read(&self) -> &R {
+    pub(super) fn storage_read(&self) -> &R {
         &self.read
+    }
+
+    /// Applies an authenticated state-tree edit using this view's retained
+    /// read. The storage handle never leaves the ForkTree owner.
+    pub(crate) async fn edit_state_tree(
+        &self,
+        root: ObjectId,
+        mutations: Vec<super::serving::StateTreeMutation>,
+    ) -> Result<super::serving::StateTreeEdit, StorageError> {
+        super::serving::edit_state_tree(root, mutations, &self.read).await
+    }
+
+    /// Applies ordered intermediate state edits while retaining the same
+    /// authenticated operation read for every path-copy lookup.
+    pub(crate) async fn edit_state_tree_sequence(
+        &self,
+        root: ObjectId,
+        mutation_batches: Vec<Vec<super::serving::StateTreeMutation>>,
+    ) -> Result<Vec<super::serving::StateTreeEdit>, StorageError> {
+        super::serving::edit_state_tree_sequence(root, mutation_batches, &self.read).await
+    }
+
+    pub(crate) async fn put_commit_catalog_entries(
+        &self,
+        root: ObjectId,
+        entries: &[(CommitId, CommitCatalogEntry)],
+    ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
+        super::serving::put_commit_catalog_entries(root, entries, &self.read).await
+    }
+
+    pub(crate) async fn put_change_catalog_entries(
+        &self,
+        root: ObjectId,
+        entries: &[(ChangeId, ChangeCatalogEntry)],
+    ) -> Result<super::serving::CatalogTreeEdit, StorageError> {
+        super::serving::put_change_catalog_entries(root, entries, &self.read).await
+    }
+
+    pub(crate) async fn state_point_at_roots(
+        &self,
+        global_root: ObjectId,
+        local_root: ObjectId,
+        key: &[u8],
+        include_tombstone: bool,
+    ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, StorageError> {
+        super::serving::state_point_on_read(
+            global_root,
+            local_root,
+            key,
+            include_tombstone,
+            &self.read,
+        )
+        .await
+    }
+
+    /// Scans authenticated untracked rows for this branch without exposing
+    /// the underlying storage read to callers outside ForkTree.
+    pub(crate) async fn scan_untracked_rows(
+        &self,
+    ) -> Result<Vec<(super::state::StateKey, super::state::UntrackedValue)>, crate::LixError> {
+        let mut cursor = self
+            .read
+            .begin_scan(
+                super::state::UNTRACKED_ROW_SPACE,
+                KeyRange {
+                    lower: std::ops::Bound::Unbounded,
+                    upper: std::ops::Bound::Unbounded,
+                },
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    order: ScanOrder::Ascending,
+                },
+            )
+            .await?;
+        let mut rows = Vec::new();
+        loop {
+            let page = cursor.next_page(256).await?;
+            for entry in page.entries {
+                let (branch_id, key) = super::state::decode_untracked_key(&entry.key.0)?;
+                if branch_id != self.branch_id {
+                    continue;
+                }
+                let value = match entry.value {
+                    ProjectedValue::FullValue(bytes) => {
+                        super::state::decode_untracked_value(&bytes)?
+                    }
+                    ProjectedValue::KeyOnly => {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_STORAGE_ERROR,
+                            "ForkTree untracked scan returned key-only data",
+                        ));
+                    }
+                };
+                rows.push((key, value));
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(rows)
     }
 
     pub(crate) fn bind_resume_key(&self, catalog_root: ObjectId, last_key: &[u8]) -> Vec<u8> {

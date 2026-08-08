@@ -142,7 +142,7 @@ where
                 }
 
                 let (target_head, source_head) = async {
-                    let reader = transaction.branch_ref_reader().await;
+                    let reader = transaction.branch_ref_reader_on_opening_read();
                     let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
                         .require_existing_commit_id(
@@ -164,7 +164,7 @@ where
                 .await?;
 
                 let merge_base = async {
-                    let mut reader = transaction.commit_graph_reader().await;
+                    let mut reader = transaction.commit_graph_reader_on_opening_read();
                     reader.merge_base(&target_head, &source_head).await
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_base"))
@@ -258,7 +258,7 @@ where
             }
 
             let (target_head, source_head) = async {
-                let reader = transaction.branch_ref_reader().await;
+                let reader = transaction.branch_ref_reader_on_opening_read();
                 let lifecycle = BranchLifecycle::new(&reader);
                 let target_head = lifecycle
                     .require_existing_commit_id(
@@ -283,7 +283,7 @@ where
             .await?;
 
             let merge_base = async {
-                let mut reader = transaction.commit_graph_reader().await;
+                let mut reader = transaction.commit_graph_reader_on_opening_read();
                 reader.merge_base(&target_head, &source_head).await
             }
             .instrument(tracing::debug_span!(

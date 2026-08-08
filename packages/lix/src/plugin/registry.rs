@@ -372,6 +372,28 @@ impl PluginRegistry {
         Self::from_optional_snapshot(Some(&snapshot))
     }
 
+    /// Decode the selected registry row for GC. A missing, deleted, null, or
+    /// malformed selected cell is corruption; only an authenticated Value
+    /// payload may represent the registry, including an explicitly empty one.
+    pub(crate) fn from_required_live_state_row(
+        row: &MaterializedLiveStateRow,
+        branch_id: &str,
+    ) -> Result<Self, LixError> {
+        validate_live_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
+        if row.deleted {
+            return Err(invalid_registry(
+                "selected plugin registry row is a tombstone",
+            ));
+        }
+        if row.snapshot_content.is_none() {
+            return Err(invalid_registry(
+                "selected plugin registry row is not an authenticated Value",
+            ));
+        }
+        let snapshot = parse_snapshot_content(row, "plugin registry")?;
+        Self::from_optional_snapshot(Some(&snapshot))
+    }
+
     pub(crate) fn to_value(&self) -> Result<JsonValue, LixError> {
         self.validate()?;
         serde_json::to_value(PluginRegistryWire {
@@ -540,7 +562,7 @@ where
             ));
         }
         for row in rows {
-            let registry = PluginRegistry::from_optional_live_state_row(Some(&row), branch_id)?;
+            let registry = PluginRegistry::from_required_live_state_row(&row, branch_id)?;
             extend_registry_wasm_roots(&registry, &mut roots)?;
         }
     }
