@@ -1,0 +1,75 @@
+{
+  "package": "cut-b-filesystem-plugin-reader-acceptance",
+  "kind": "test-report-only",
+  "anchor": {
+    "ref": "origin/codex/forktree-stage2-current-state-reader-correction-9f3",
+    "head": "705440f55eccba9e2d55c0951d6a684737005d76",
+    "parent": "9f3c703e953440cde1d60b1511467c4337648c8f",
+    "tree": "2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d"
+  },
+  "reader_prerequisite": {
+    "ref": "origin/codex/forktree-stage2-current-state-reader-correction-9f3",
+    "head": "705440f55eccba9e2d55c0951d6a684737005d76",
+    "tree": "2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d",
+    "anchor_to_head_diff_sha256": "c68b9338562aee6c9d08de60c447a5e8bd4520696aa275ad9be7599e10b6f6df",
+    "stable_patch_id": "7504d3c10c1f38cc6bb6c124de5af5a4d9ea4e4e"
+  },
+  "runtime_status": "not-run-anchor-is-compiler-red",
+  "production_changes": false,
+  "w5_implementation": false,
+  "source_gate": "bash test-reports/stage2-filesystem-plugin-reader-705/verify_source_contract.sh",
+  "source_gate_observed": {
+    "anchor_exit": 1,
+    "log_sha256": "34c097bcb54c01cf7d9cad26c974cebd1480c71e8db7efa0e6537832ce0e66d4",
+    "meaning": "expected pre-Cut-B legacy reader residue on exact 705; no compiler or adapter invoked"
+  },
+  "path_policy": {
+    "base": "705440f55eccba9e2d55c0951d6a684737005d76",
+    "allowed_production_paths": [
+      "packages/lix/src/filesystem/read.rs",
+      "packages/lix/src/filesystem/mod.rs",
+      "packages/lix/src/plugin/registry.rs",
+      "packages/lix/src/plugin/mod.rs",
+      "packages/lix/src/sql2/providers/file.rs",
+      "packages/lix/src/session/merge/branch.rs"
+    ],
+    "allowed_artifact_prefix": "test-reports/stage2-filesystem-plugin-reader-705/",
+    "forbidden_widenings": [
+      "scalar/entity/W2",
+      "transaction/publication/writer",
+      "GC orchestration",
+      "CAS/storage",
+      "selector/ForkTree owner",
+      "compatibility/fallback/second authority"
+    ]
+  },
+  "calibration_report": {
+    "path": "test-reports/stage2-filesystem-plugin-reader-705/RED_CALIBRATION.md",
+    "sha256": "f4169c48a1e87f20294f3dae357f296bf9810e3fd8ebc0dfd3379cece034659c"
+  },
+  "artifacts": [
+    {
+      "path": "test-reports/stage2-filesystem-plugin-reader-705/CUT_B_FILESYSTEM_PLUGIN_READER_ACCEPTANCE.md",
+      "sha256": "36a8e453b2107c2a159070e0d20d05cc59d50f9e408e4a28c88511476de8399b"
+    },
+    {
+      "path": "test-reports/stage2-filesystem-plugin-reader-705/RED_CALIBRATION.md",
+      "sha256": "f4169c48a1e87f20294f3dae357f296bf9810e3fd8ebc0dfd3379cece034659c"
+    },
+    {
+      "path": "test-reports/stage2-filesystem-plugin-reader-705/verify_source_contract.sh",
+      "sha256": "8401c71768a5e69efa7f25fbb7acc19b9490a7a058e727c2b3f04ec973c0c76e"
+    }
+  ],
+  "required_adapters": ["Memory", "RocksDB", "SlateDB"],
+  "required_semantics": [
+    "one_coherent_view",
+    "filesystem_parsed_file_and_history_semantics",
+    "plugin_registry_and_owner_semantics",
+    "gc_blobid_root_dedupe_without_byte_reads",
+    "merge_registry_historical_view",
+    "malformed_missing_wrong_kind_fail_closed",
+    "cold_reopen",
+    "legacy_tracked_head_tracked_state_cas_reader_residue_zero"
+  ]
+}
