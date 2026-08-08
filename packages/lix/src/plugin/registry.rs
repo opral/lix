@@ -535,7 +535,9 @@ where
             if rows.is_empty() {
                 return Err(LixError::new(
                     LixError::CODE_STORAGE_ERROR,
-                    format!("selected plugin registry is missing for branch '{branch_id}'"),
+                    format!(
+                        "selected plugin registry is missing for branch '{branch_id}'; only an authenticated explicit bootstrap-empty row may be empty"
+                    ),
                 ));
             }
             for row in rows {
