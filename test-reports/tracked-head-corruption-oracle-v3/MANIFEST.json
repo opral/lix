@@ -1,0 +1,51 @@
+{
+  "kind": "test-report-only",
+  "status": "focused-v3-discriminator",
+  "base": {
+    "commit": "1d9c47728377c6ec7d2646704d51f3aadb11c773",
+    "tree": "df2a373a1c0e7917f4abbd167c7659efd1c3e6a1",
+    "parent": "422319cca0dad82525ab840d157aba5be49b09f0"
+  },
+  "independent_r4": {
+    "head": "7ff277c297e93eba83da09bf12f83d6485a8458b",
+    "tree": "a0e6be2c9029144497b75e4f9dcd6b001d71fec9",
+    "parent": "1d9c47728377c6ec7d2646704d51f3aadb11c773",
+    "full_index_binary_diff": "55d018ea5389898414dbf7844053c5339b316bf36652574b86983c1c8cb43b4b",
+    "stable_patch_id": "1ad9a7cc93f5386920032d3d1b1cebc8febaa43d",
+    "scope": "independent five-slot corruption discriminator"
+  },
+  "scope": [
+    "per-domain authenticated selector/root corruption",
+    "one retained read and one retained view on failures",
+    "zero plan/prepared-write/commit/selector-rotation on failures",
+    "stale pinned view rejection for every domain",
+    "no production source change"
+  ],
+  "domains": [
+    "GlobalSelector",
+    "BranchSelector",
+    "StateRoot",
+    "CommitCatalog",
+    "ChangeCatalog",
+    "CheckpointRoot"
+  ],
+  "corruptions": [
+    "Malformed",
+    "Missing",
+    "WrongKind",
+    "IdentitySubstitution"
+  ],
+  "expected_cases": 24,
+  "expected_stale_view_cases": 6,
+  "runtime_claimed": false,
+  "adapter_claimed": false,
+  "production_edits": false,
+  "artifacts": [
+    "selector_domain_contract_model.rs",
+    "verify_v3_source.sh",
+    "REPORT.md",
+    "INDEPENDENT_R4.md",
+    "RESULTS.md",
+    "SHA256SUMS"
+  ]
+}
