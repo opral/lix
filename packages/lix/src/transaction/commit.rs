@@ -334,6 +334,19 @@ where
         ));
     }
 
+    // The catalog identity set is authenticated before any ChangeObject is
+    // encoded. Keep this canonical order separate from the caller's member
+    // and result-slot order below.
+    let mut catalog_change_ids = Vec::with_capacity(tracked_rows.len() + 1);
+    for row in &tracked_rows {
+        let change_id = row
+            .change_id
+            .ok_or_else(|| writer_error("tracked row has no change identity"))?;
+        catalog_change_ids.push(forktree_change_id(change_id));
+    }
+    catalog_change_ids.push(forktree_change_id(change_refs.branch_ref_change_id));
+    let catalog_order = canonical_change_order(&catalog_change_ids)?;
+
     let mut changes = Vec::with_capacity(tracked_rows.len().saturating_add(1));
     let mut state_mutations = Vec::with_capacity(tracked_rows.len());
     for row in tracked_rows {
@@ -533,34 +546,34 @@ where
             )],
         )
         .await?;
-    let mut change_entries = encoded_semantic_changes
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, (change_id, change_object_id))| {
-            Ok((
-                change_id,
+    let mut change_entries = Vec::with_capacity(catalog_order.len());
+    for index in catalog_order {
+        if let Some((change_id, change_object_id)) = encoded_semantic_changes.get(index) {
+            change_entries.push((
+                *change_id,
                 ChangeCatalogEntry {
-                    change_object_id,
+                    change_object_id: *change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
-                        ordinal: u32::try_from(ordinal)
+                        ordinal: u32::try_from(index)
                             .map_err(|_| writer_error("commit member ordinal exceeds u32"))?,
                     },
                 },
-            ))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    change_entries.push((
-        forktree_change_id(change_refs.branch_ref_change_id),
-        ChangeCatalogEntry {
-            change_object_id: ref_object_id,
-            owner: ChangeCatalogOwner::BranchRef {
-                ref_change_object_id: ref_object_id,
-                branch_id: publication_branch_id,
-            },
-        },
-    ));
-    change_entries.sort_unstable_by_key(|(change_id, _)| *change_id);
+            ));
+        } else {
+            debug_assert_eq!(index, encoded_semantic_changes.len());
+            change_entries.push((
+                forktree_change_id(change_refs.branch_ref_change_id),
+                ChangeCatalogEntry {
+                    change_object_id: ref_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: ref_object_id,
+                        branch_id: publication_branch_id,
+                    },
+                },
+            ));
+        }
+    }
     let change_catalog_edit = view
         .put_change_catalog_entries(view.repository_root().change_catalog_root, &change_entries)
         .await?;
@@ -711,6 +724,30 @@ where
     }
 
     let mut touched_presence = BTreeMap::<Vec<u8>, bool>::new();
+    // Fresh identities are the only new catalog members in ordered history;
+    // selected historical members already own catalog entries. Build the
+    // unique authenticated key set before any fresh object is encoded.
+    let mut catalog_change_ids = Vec::new();
+    for draft in &drafts {
+        for row in prepared
+            .state_rows
+            .iter()
+            .filter(|row| !row.untracked && row.commit_id == Some(draft.commit_id))
+        {
+            let change_id = row
+                .change_id
+                .ok_or_else(|| writer_error("ordered history row has no ChangeId"))?;
+            catalog_change_ids.push(forktree_change_id(change_id));
+        }
+    }
+    catalog_change_ids.push(forktree_change_id(
+        drafts
+            .last()
+            .expect("ordered history is nonempty")
+            .branch_ref_change_id,
+    ));
+    let catalog_order = canonical_change_order(&catalog_change_ids)?;
+
     let mut contents = Vec::with_capacity(drafts.len());
     for draft in drafts {
         let mut seen_identities = BTreeSet::<Vec<u8>>::new();
@@ -1079,7 +1116,10 @@ where
             },
         },
     ));
-    fresh_owner_rows.sort_unstable_by_key(|(change_id, _)| *change_id);
+    let fresh_owner_rows = catalog_order
+        .into_iter()
+        .map(|index| fresh_owner_rows[index])
+        .collect::<Vec<_>>();
     let change_catalog_edit = view
         .put_change_catalog_entries(
             view.repository_root().change_catalog_root,
@@ -1399,6 +1439,19 @@ fn sort_state_mutations(mutations: &mut Vec<StateTreeMutation>) -> Result<(), Li
     Ok(())
 }
 
+fn canonical_change_order(ids: &[ForkTreeChangeId]) -> Result<Vec<usize>, LixError> {
+    let mut ordered = BTreeMap::new();
+    for (index, id) in ids.iter().copied().enumerate() {
+        if ordered.insert(id, index).is_some() {
+            let duplicate = uuid::Uuid::from_bytes(*id.as_bytes());
+            return Err(writer_error(format!(
+                "publication contains duplicate semantic ChangeId {duplicate}"
+            )));
+        }
+    }
+    Ok(ordered.into_values().collect())
+}
+
 fn next_ordered_commit_generation(
     parent_generation: Option<u64>,
     selected_source_generation: Option<u64>,
@@ -1567,5 +1620,29 @@ mod intent_tests {
         let error = sort_state_mutations(&mut batches[0])
             .expect_err("ordered edit input duplicates must fail closed");
         assert!(error.message.contains("duplicate encoded keys"));
+    }
+
+    #[test]
+    fn canonical_catalog_order_preserves_slots_and_rejects_duplicate_ids() {
+        let ids = [
+            ForkTreeChangeId::from_bytes([3; 16]),
+            ForkTreeChangeId::from_bytes([1; 16]),
+            ForkTreeChangeId::from_bytes([2; 16]),
+        ];
+        assert_eq!(
+            canonical_change_order(&ids).expect("canonical order"),
+            [1, 2, 0]
+        );
+
+        let duplicate = [
+            ForkTreeChangeId::from_bytes([1; 16]),
+            ForkTreeChangeId::from_bytes([1; 16]),
+        ];
+        let error = canonical_change_order(&duplicate).expect_err("duplicate ids must fail closed");
+        assert!(
+            error
+                .message
+                .contains("01010101-0101-0101-0101-010101010101")
+        );
     }
 }
