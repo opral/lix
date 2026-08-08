@@ -5,7 +5,7 @@ set -u -o pipefail
 candidate_root="${1:?candidate worktree}"
 expected_head="${2:?expected candidate head}"
 expected_tree="${3:?expected candidate tree}"
-base="b59e1f11a51153e0a787a81f0f25bf104d150aaf"
+base="ac8a7bb1823954939662ad4a5255df9a4db2417f"
 script_dir="$(cd -- "$(dirname "$0")" && pwd)"
 src="$candidate_root/packages/lix/src"
 model="$script_dir/forktree_tracked_state_merge_analysis_workspace_model_b59.rs"
@@ -13,13 +13,37 @@ red=0
 pass() { printf 'PASS %s\n' "$*"; }
 fail() { printf 'FAIL %s\n' "$*"; red=1; }
 
-printf 'TrackedState merge-analysis workspace oracle; exact b59 anchor\n'
+printf 'TrackedState merge-analysis workspace oracle; direct ac8 successor\n'
 actual_head="$(git -C "$candidate_root" rev-parse HEAD 2>/dev/null || true)"
 actual_tree="$(git -C "$candidate_root" rev-parse HEAD^{tree} 2>/dev/null || true)"
 printf 'BASE=%s\nCANDIDATE_HEAD=%s\nCANDIDATE_TREE=%s\n' "$base" "$actual_head" "$actual_tree"
 test "$actual_head" = "$expected_head" || fail "head-mismatch expected=$expected_head actual=$actual_head"
 test "$actual_tree" = "$expected_tree" || fail "tree-mismatch expected=$expected_tree actual=$actual_tree"
 test -d "$src" || { fail "missing-production-root=$src"; exit 1; }
+
+allowed_changed_paths=(
+  packages/lix/tests/FORKTREE_TRACKED_STATE_MERGE_ANALYSIS_WORKSPACE_ORACLE_B59.md
+  packages/lix/tests/forktree_tracked_state_merge_analysis_workspace_model_b59.rs
+  packages/lix/tests/forktree_tracked_state_merge_analysis_workspace_oracle_b59.sh
+)
+changed_paths="$(git -C "$candidate_root" diff --name-only "$base" "$actual_head" 2>/dev/null || true)"
+changed_count=0
+while IFS= read -r changed_path; do
+  test -n "$changed_path" || continue
+  changed_count=$((changed_count + 1))
+  case " ${allowed_changed_paths[*]} " in
+    *" $changed_path "*) pass "changed-path=$changed_path" ;;
+    *) fail "changed-path-outside-test-report-scope=$changed_path" ;;
+  esac
+done <<< "$changed_paths"
+for required_path in "${allowed_changed_paths[@]}"; do
+  printf '%s\n' "$changed_paths" | rg -n -x -F "$required_path" >/dev/null 2>&1 \
+    && pass "changed-path-present=$required_path" \
+    || fail "changed-path-missing=$required_path"
+done
+test "$changed_count" -eq "${#allowed_changed_paths[@]}" \
+  && pass "changed-path-count=${changed_count}" \
+  || fail "changed-path-count-expected=${#allowed_changed_paths[@]} actual=${changed_count}"
 
 for path in \
   "$script_dir/FORKTREE_TRACKED_STATE_MERGE_ANALYSIS_WORKSPACE_ORACLE_B59.md" \
@@ -35,8 +59,14 @@ for token in \
   'ObjectKind::CommitCatalog' 'ObjectKind::Root' 'ObjectKind::Member' 'ObjectKind::Payload' \
   'ObjectKind::PluginRegistry' 'ObjectKind::FileOwner' 'ReadError::Missing' 'ReadError::WrongKind' \
   'ReadError::Malformed' 'IdentityMismatch' 'GenerationMismatch' 'ReadError::GenerationMismatch' 'RetainedStorageRead' \
-  'ReadEvent' 'assert_one_owner' 'MergeOperation' 'source_plugin' 'wrong_root' 'wrong_catalog' \
-  'wrong_registry' 'wrong_member' 'wrong_payload' 'substituted_payload' 'bad_generation'; do
+  'ReadEvent' 'ReadIdentity' 'reader_instance' 'view_id' 'assert_one_owner' 'MergeOperation' \
+  'read_identity' 'foreign' 'source_plugin' 'disjoint merge succeeds' \
+  'missing_root' 'malformed_root' 'wrong_root' 'substituted_root' \
+  'missing_member' 'malformed_member' 'wrong_member' 'substituted_member' \
+  'missing_catalog' 'malformed_catalog' 'wrong_catalog' 'substituted_catalog' \
+  'malformed_payload' 'wrong_payload' 'substituted_payload' \
+  'missing_file_owner' 'malformed_file_owner' 'wrong_file_owner' 'substituted_file_owner' \
+  'wrong_registry' 'bad_generation'; do
   rg -n --no-heading -F "$token" "$model" >/dev/null 2>&1 \
     && pass "model-contract=$token" || fail "model-contract-missing=$token"
 done
@@ -56,14 +86,56 @@ for token in MergeCommits base_commit_id source_commit_id target_commit_id merge
     && pass "semantic-source=$token" || fail "semantic-source-missing=$token"
 done
 
-# This named fallback helper is an alternate merge authority wherever it is
-# found, including tracked_state/context.rs. It is therefore forbidden across
-# the entire production workspace, not only in the merge directory.
+# These named fallback helpers are alternate merge authorities wherever found,
+# including tracked_state/context.rs. They are forbidden across the entire
+# production workspace, not only in the merge directory.
 for token in 'merge_payload_fallback_ids' 'sorted_merge_payload_fallback_ids'; do
   count="$(rg -n --no-heading -F "$token" "$src" 2>/dev/null | wc -l | tr -d ' ')"
   printf 'WORKSPACE_ALTERNATE_AUTHORITY token=%s count=%s\n' "$token" "$count"
   test "$count" = 0 && pass "workspace-alternate-authority-free=$token" || fail "workspace-alternate-authority-residue=$token count=$count"
 done
+
+# Full-workspace named-authority scan. Generic prose words such as "cache" or
+# "retry" are not authority names; this scan targets identifiers that can be
+# renamed without changing the surrounding API. Any identifier containing
+# merge/tracked_state plus reader, cache, fallback, compatibility, retry,
+# factory, wrapper, or store is forbidden, regardless of word order or prefix.
+# The tracked-state service and checkpoint/undo cohorts remain governed by the
+# explicit path allowlist below.
+named_authority_pattern='\b(?:[A-Za-z_][A-Za-z0-9_]*_)?(?:merge|tracked_state)[A-Za-z0-9_]*(?:reader|cache|fallback|compat|retry|factory|wrapper|store)[A-Za-z0-9_]*\b|\b(?:reader|cache|fallback|compat|retry|factory|wrapper|store)[A-Za-z0-9_]*(?:merge|tracked_state)[A-Za-z0-9_]*\b'
+allow_named_unrelated() {
+  local path="$1" line="$2"
+  case "$path" in
+    packages/lix/src/checkpoint.rs|packages/lix/src/session/checkpoint.rs|packages/lix/src/session/undo_redo.rs|packages/lix/src/gc.rs|packages/lix/src/init.rs|packages/lix/src/sql2/providers/file_history.rs|packages/lix/src/sql2/providers/filesystem_working_diff.rs|packages/lix/src/tracked_state/diff.rs|packages/lix/src/transaction/context/cohort.rs)
+      return 0
+      ;;
+    packages/lix/src/tracked_state/context.rs)
+      test "$line" -eq 3756 && return 1
+      return 0
+      ;;
+    packages/lix/src/tracked_state/mod.rs)
+      test "$line" -eq 22 && return 1
+      return 0
+      ;;
+    packages/lix/src/transaction/context.rs)
+      test "$line" -ge 7390 && test "$line" -le 7413 && return 1
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+while IFS=: read -r absolute_path line source_line; do
+  test -n "$absolute_path" || continue
+  rel="${absolute_path#"$candidate_root/"}"
+  if allow_named_unrelated "$rel" "$line"; then
+    printf 'WORKSPACE_NAMED_AUTHORITY path=%s line=%s class=ALLOWLISTED_UNRELATED\n' "$rel" "$line"
+  else
+    printf 'WORKSPACE_NAMED_AUTHORITY path=%s line=%s class=FORBIDDEN_MERGE\n' "$rel" "$line"
+    red=1
+  fi
+done < <(rg -n --no-heading -i -P "$named_authority_pattern" "$src" 2>/dev/null || true)
 
 # Workspace-wide legacy residue scan. Every hit is printed and classified.
 # Only the following unrelated retained cohorts are allowlisted. Any hit in

@@ -1,12 +1,6 @@
-# ForkTree tracked-state merge-analysis workspace oracle (b59)
+# ForkTree tracked-state merge-analysis workspace oracle (ac8 successor)
 
-This is a TEST/REPORT-ONLY acceptance package. It contains no Lix production
-change, does not build or execute production, and is bound to exact base
-`b59e1f11a51153e0a787a81f0f25bf104d150aaf` (tree
-`700fd04d21bc40c05425c9fc9e10d65c9e1eda24`). The source verifier is expected
-to return RED on b59: the purpose of this second corrected package is to make
-the remaining H1 blocker explicit and reproducible before a future production
-successor is reviewed.
+This is a TEST/REPORT-ONLY direct successor to exact `ac8a7bb1823954939662ad4a5255df9a4db2417f`. It contains no Lix production change, does not build or execute production, and keeps the production source line anchored to b59. The verifier binds the candidate HEAD and tree, requires exactly these three test/report paths in the base-to-candidate diff, scans the full `packages/lix/src` production workspace, and rejects any production diff.
 
 ## Future GREEN contract
 
@@ -44,8 +38,11 @@ they do not authorize an implementation cache or retry.
 `merge_payload_fallback_ids` and its sorting helper are stricter than the
 general allowlist: the verifier scans the entire `packages/lix/src` tree and
 rejects them wherever found, including the retained-looking
-`tracked_state/context.rs` call. This prevents a renamed or relocated payload
-fallback from surviving outside `session/merge`.
+`tracked_state/context.rs` call. It also scans any identifier containing
+`merge`/`tracked_state` plus reader/cache/fallback/compat/retry/factory/
+wrapper/store in either word order, classifying only the explicitly unrelated
+checkpoint/undo/GC/service cohorts as allowlisted, so a renamed merge authority
+cannot evade the exact-symbol checks.
 
 ## Executable model obligations
 
@@ -60,10 +57,14 @@ and has a `main` with assertions for:
   conflict (semantic equality uses authenticated payload digest and row
   metadata, not payload identity alone);
 - plugin registry and file-owner handoff;
-- missing/malformed/wrong-kind/identity-substituted CommitCatalog, Root,
-  Member, Payload, and FileOwner authority;
-- one caller-owned `RetainedStorageRead`, one `MergeOperation` borrow, and
-  `assert_one_owner` over every topology/state/plugin event.
+- a genuinely disjoint merge-success fixture (source adds `c`, target adds
+  `d`) with no conflicts;
+- explicit missing, malformed, wrong-kind, and identity-substituted Root,
+  Member, CommitCatalog, and FileOwner cases, plus malformed/missing/
+  wrong-kind/identity-substituted Payload cases;
+- one caller-owned `RetainedStorageRead` with an actual numeric
+  `(reader_instance, view_id)` identity. Foreign events from a separate
+  reader/view are rejected; self-labelled event strings are not trusted.
 
 Missing objects never become an empty state and no unauthenticated absent row
 is interpreted as a deletion. The model's future Memory/RocksDB/SlateDB
@@ -76,8 +77,7 @@ From this exact detached worktree:
 
 ```sh
 bash packages/lix/tests/forktree_tracked_state_merge_analysis_workspace_oracle_b59.sh \
-  "$PWD" b59e1f11a51153e0a787a81f0f25bf104d150aaf \
-  700fd04d21bc40c05425c9fc9e10d65c9e1eda24
+  "$PWD" <successor-head> <successor-tree>
 ```
 
 The command performs only Git identity checks, static token checks, and a
