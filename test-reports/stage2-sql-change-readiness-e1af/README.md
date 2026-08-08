@@ -164,3 +164,110 @@ duplicate logical ID, canonical merged order, limit after merge, exact-ID
 routing, cold reopen, and identical result digests on Memory/RocksDB/SlateDB.
 Stop before widening on any corruption, identity, second-view, or scope
 mismatch.
+
+## Consumer-closure audit folded into this binding
+
+The exact e1af tree was audited read-only. The complete production SQL
+consumer closure is:
+
+```text
+sql2/session.rs::{build_read_session_with_active_head,build_transaction_read_session}
+  -> SqlExecutionContext::{changelog_query_source,history_query_source,commit_graph}
+  -> sql2/providers/mod.rs::register_read_from_catalog
+       -> providers/change.rs::register_lix_change_read_provider
+       -> providers/diff.rs::register_diff_function
+       -> providers/{checkpoint,working_diff,filesystem_working_diff,
+                     file_history,directory_history,entity_history,entity}.rs
+            -> history_route.rs::load_history_entries
+                 -> CommitGraphReader::{change_history_from_commit,
+                                        load_commit_records}
+                 -> HistoryQuerySource::forktree_reader
+```
+
+Concrete constructor/caller sites are `session/context.rs:727-748`,
+`transaction/context.rs:8215-8235`, and the test-only DataFusion dummy at
+`sql2/exec/datafusion.rs:3366-3391`. The read source type is declared in
+`sql2/context.rs:50-67`; e1af's `ChangelogQuerySource` still contains only
+`store` and `json_reader`, while `HistoryQuerySource` separately contains a
+`ForkTreeReadFacade`.
+
+The direct changelog-row authority is
+`sql2/providers/change.rs:151-367`: it currently reaches tracked-state
+delta scans, `ChangelogContext`/`ChangelogReader`, the raw
+`COMMIT_CHANGE_ID_SPACE`, and a fresh `CommitGraphContext` for both scan and
+exact lookup. The direct diff authority is
+`sql2/providers/diff.rs:28-223`: it extracts `query_source.store` and builds
+`ForkTreeReadFacade::new(store)` inside the scan closure. Those are the
+first-slice blockers.
+
+History is a separate, real consumer and must not be silently omitted from
+the closure. `history_route.rs:339-535` consumes a caller-passed
+`CommitGraphReader` for chronology and commit records, then consumes
+`query_source.forktree_reader` for certified state rows. The session/provider
+fan-out is at `sql2/providers/mod.rs:247-370` and `:402-469`; concrete
+providers are checkpoint (`checkpoint.rs:21-48`), working diff
+(`working_diff.rs:27-55`), filesystem working diff
+(`filesystem_working_diff.rs:29-65`), file history, directory history,
+entity history, and entity history registration. This is the next chronology
+authority boundary, not an excuse to add a second reader to the changelog
+slice.
+
+Other production `ChangeRecord`/changelog consumers remain legitimate owners
+outside the first SQL cut: changelog context/materialization/types, commit
+graph context/types, ForkTree serving/view, filesystem read, functions/state,
+GC, init, live-state context, session execute/undo-redo, SQL change
+materialization, tracked-state context/row materialization, and transaction
+commit/context/cohort. Writer, publication, GC, and non-SQL history owners
+must remain until their own authorized cuts.
+
+Direct facade sites were classified rather than globally forbidden:
+
+* SQL production duplicate: `sql2/providers/diff.rs:151`.
+* SQL history retained-view wrappers: session and transaction history source
+  constructors; provider clones of that facade do not call `begin_read`.
+* Same-read, non-SQL serving wrappers: `filesystem/read.rs:29`,
+  `live_state/context.rs:209`, `plugin/registry.rs:533`, and
+  `live_state/forktree_reader.rs:279` consume caller-retained reads or an
+  explicitly retained read for GC/serving roles; they are not SQL changelog
+  acquisitions.
+* Canonical acquisition/serving APIs: `forktree/view.rs:555-575`,
+  `forktree/serving.rs:297-305`, and `transaction/commit.rs:187` use the
+  caller-owned read protocol. Their existence is not a pass for a SQL
+  provider to call `begin_read`.
+* `sql2/history_route.rs:1244-1258`, `sql2/providers/mod.rs:1107-1121`,
+  and the DataFusion dummy are test-only source constructors.
+
+The smallest source acceptance delta for the forthcoming production child is
+therefore: add one `ForkTreeReadFacade` field to `ChangelogQuerySource`, bind
+it from the session/transaction retained read (using the existing transaction
+`forktree_read_facade()` helper), update the test-only dummy, migrate
+`change.rs` scan/exact lookup to the typed authenticated facade, and carry the
+same field through `diff.rs` without a closure-local constructor. No history
+chronology rewrite, writer/GC change, storage change, cache, fallback,
+compatibility reader, or second authority is in this delta. The v4 ten-case
+semantic oracle remains the required next gate, unchanged.
+
+## Corrected package gate
+
+The v2 successor to the blocked predecessor adds three executable package
+guards. `verify_source_binding.py` now compares
+`e1af471b9ab0f598dafa7c2ddec7867667c81740..HEAD` with rename/copy awareness
+and rejects every changed path outside this file's exact `ALLOWED` set. It
+also extracts the concrete diff registration, `call`, and `plan_scan` bodies
+with balanced-brace parsing, proving this identity chain:
+
+```text
+query_source.forktree_reader
+  -> DiffFunction.forktree_reader
+  -> self.forktree_reader.clone()
+  -> first scan closure tuple element
+  -> first closure parameter
+  -> every authenticated chronology receiver
+```
+
+The mismatched-argument fixture passes the correct reader as the first tuple
+element but calls `other_reader`; the verifier rejects it. The path fixture
+contains one allowed and one unauthorized path; the verifier rejects it.
+Both fixtures execute on every verifier invocation and are not production
+code. The e1af source worktree remains expected `SOURCE_BINDING=RED`; the
+new checks do not convert calibration RED into acceptance.

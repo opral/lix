@@ -41,7 +41,7 @@ The new binding gate was run read-only against the exact e1af worktree:
 
 ```text
 python3 test-reports/stage2-sql-change-readiness-e1af/verify_source_binding.py \
-  /root/repos/lix-e1af-sql-change-binding
+  /root/repos/lix-e1af-consumer-closure-audit
 ```
 
 Observed result: exit `1`, expected `SOURCE_BINDING=RED`.
@@ -51,6 +51,13 @@ RED: change provider does not bind both routes to query_source.forktree_reader
 RED: change provider still consumes query_source.store
 RED: diff provider still consumes query_source.store
 RED: diff provider constructs a second facade from store
+RED: diff identity: diff registration does not bind DiffFunction to query_source.forktree_reader
+RED: diff identity: diff registration retains a raw store field
+RED: diff identity: DiffFunction::call does not propagate its reader into DiffSpec
+RED: diff identity: diff plan body acquires a second reader/facade
+RED: diff identity: diff scan tuple reader is not the exact self.forktree_reader identity
+RED: diff identity: diff chronology call receiver is not the reader-first closure identity: historical != store
+RED: diff identity: diff chronology call receiver is not the reader-first closure identity: historical != store
 RED: change retains forbidden legacy token: tracked_state::scan_change_records_from_commit_deltas
 RED: change retains forbidden legacy token: tracked_state::load_change_record_by_id
 RED: change retains forbidden legacy token: COMMIT_CHANGE_ID_SPACE
@@ -89,3 +96,60 @@ reader, cache, fallback, second authority, or new persisted index is allowed.
 
 This report freezes readiness evidence only. It neither approves nor rejects
 the unimplemented e1af successor.
+
+## Correction-I successor to the package blocker
+
+R1's independent review blocked the predecessor package for three test-gate
+defects: the declared production allowlist was documentation-only, the diff
+reader check did not prove call-argument identity, and there were no
+discriminating negatives. This immutable successor closes only those package
+defects; it does not alter e1af or claim a production result.
+
+The verifier now compares
+`e1af471b9ab0f598dafa7c2ddec7867667c81740..HEAD` using
+`git diff --name-status --find-renames`. Every path, including both sides of
+a rename/copy, must be in the exact `ALLOWED` set. The exact e1af calibration
+worktree has an empty e1af..HEAD delta and is therefore scope-clean; its
+source checks remain RED as expected.
+
+For `diff.rs`, the verifier is function-scoped and requires this identity
+chain:
+
+```text
+query_source.forktree_reader
+  -> DiffFunction.forktree_reader
+  -> self.forktree_reader.clone()
+  -> first scan closure tuple element
+  -> first closure parameter
+  -> every authenticated chronology receiver
+```
+
+The mismatched fixture intentionally passes the correct reader as the first
+tuple element but calls `other_reader` for both chronology lookups; it is
+rejected. The path fixture contains one allowed and one unauthorized path and
+is rejected. These are executable checks, not token-presence assertions.
+
+The consumer-closure audit found the same two direct SQL blockers and one
+separate history boundary. `providers/change.rs:151-367` still has the
+tracked-state/changelog/raw-space/commit-graph scan and exact-lookup routes;
+`providers/diff.rs:28-223` still owns a raw store and closure-local facade.
+`history_route.rs:339-535` independently consumes a passed CommitGraphReader
+for chronology and the HistoryQuerySource ForkTree reader for certified
+state, fanned out by `providers/mod.rs:247-469`. Session and transaction
+constructors are at `session/context.rs:727-748` and
+`transaction/context.rs:8215-8235`; the test-only dummy is at
+`sql2/exec/datafusion.rs:3366-3391`. The forthcoming changelog child must
+close only the authorized SQL change/diff/source-constructor slice; the
+history chronology boundary remains separately visible and may not be hidden
+by a second read or fallback.
+
+The direct-facade classification is recorded in README: the SQL diff
+constructor is a blocker; retained-read filesystem/live-state/plugin/serving
+wrappers and canonical `open_coherent_view_on_read` callers are legitimate
+non-SQL owners; test-only SQL constructors are fixtures. No new broad caller
+or authority is introduced by this package.
+
+The ten v4 semantic cases, exact fd2 RED calibration, and all identity,
+ordering, deduplication, limit-after-merge, malformed/missing/wrong-kind,
+substitution, and cold-reopen requirements remain unchanged. This successor
+did not build, run adapters, or execute SQL.
