@@ -58,6 +58,20 @@ across transaction, upload, and GC families. The disposable
 preflight/application procedure is frozen in
 `FORKTREE_STAGE2_FIRST_RUNNABLE_RECIPE.md`.
 
+Immutable writer Milestone 5A
+`origin/codex/forktree-stage2-milestone5a-ordinary-atomic-writer` is held at
+`5c4cae810324a34c0adbbb5a1a0be5fba5348054`, tree
+`16741cdf6efce6bccdcf469406be1e1bce9b5f37`, parent `54e90dbf...`.
+Its focused full-index SHA-256 is
+`80f48db60e9205b2d3f242ee966f8d61d539a9dff65030d002a71c7f82bfaf2d`,
+its `a12..head` SHA-256 is
+`ad49aa816f4cece010f361f6fadf7f7b59f2003d6e905bd8f44341d613d08f56`,
+and its stable patch ID is `2b57e2e9e23bd79343068a3b237ce20581c56526`.
+It remains non-runnable at 201 errors/8 warnings and 170 residue findings.
+Upload, checkpoint, history, multi-branch, and reachability publication families
+remain independent, so this is a held identity frontier, not readiness
+promotion. The latest approved readiness base remains `54e90dbf...`.
+
 The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at
 `08f8dd5cf20842f79996fae9eb7b0924f074a084`, tree

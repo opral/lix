@@ -70,6 +70,25 @@ negative coverage and a valid control without an index, cache, fallback, or
 second serving owner. This approval is source-only: `54e90dbf...` remains
 non-runnable and is not an acceptance-matrix result.
 
+### Held writer milestone
+
+The first ordinary atomic-writer slice is pinned but not approved for readiness:
+
+- ref `origin/codex/forktree-stage2-milestone5a-ordinary-atomic-writer`;
+- head `5c4cae810324a34c0adbbb5a1a0be5fba5348054`;
+- tree `16741cdf6efce6bccdcf469406be1e1bce9b5f37`;
+- parent `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`;
+- parent-to-head full-index SHA-256
+  `80f48db60e9205b2d3f242ee966f8d61d539a9dff65030d002a71c7f82bfaf2d`;
+- `a12..head` full-index SHA-256
+  `ad49aa816f4cece010f361f6fadf7f7b59f2003d6e905bd8f44341d613d08f56`;
+- stable patch ID `2b57e2e9e23bd79343068a3b237ce20581c56526`.
+
+Its ordinary single-branch cohort lowers once into the existing sole backend
+commit, but upload/checkpoint/history/multi-branch/reachability publication
+families remain. It is compile-red and has not cleared R2 atomicity or H2
+deletion/residue review. Do not apply artifacts or treat it as a readiness base.
+
 ## Eligibility fence
 
 The integrator may start only after the coordinator advertises an immutable
