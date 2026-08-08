@@ -1392,12 +1392,13 @@ where
     async fn resolve_pending_branch_checkpoint_replacements<S>(
         &mut self,
         read: &S,
-        prepared_writes: &mut PreparedWriteSet,
-    ) -> Result<(), LixError>
+        prepared_writes: &PreparedWriteSet,
+    ) -> Result<BTreeMap<String, CheckpointRecoveryRef>, LixError>
     where
         S: StorageAdapterRead + Clone + Send + Sync,
     {
         let requests = std::mem::take(&mut self.pending_branch_checkpoint_replacements);
+        let mut branch_checkpoint_bridges = BTreeMap::new();
         for (branch_id, source_commit_id) in requests {
             let Some(replacement) =
                 crate::gc::resolve_pending_checkpoint_replacement(read, source_commit_id).await?
@@ -1475,19 +1476,17 @@ where
                     format!("branch '{branch_id}' already staged checkpoint serving context"),
                 ));
             }
-            prepared_writes
-                .checkpoint_publications
-                .push(CheckpointPublication {
-                    recovery_ref: CheckpointRecoveryRef {
-                        branch_id,
-                        recovered_head_commit_id: source_commit_id,
-                        checkpoint_commit_id,
-                        interval_has_commits: true,
-                    },
-                    gc_state: load_checkpoint_gc_state(read).await?,
-                });
+            branch_checkpoint_bridges.insert(
+                branch_id.clone(),
+                CheckpointRecoveryRef {
+                    branch_id,
+                    recovered_head_commit_id: source_commit_id,
+                    checkpoint_commit_id,
+                    interval_has_commits: true,
+                },
+            );
         }
-        Ok(())
+        Ok(branch_checkpoint_bridges)
     }
 
     async fn attach_checkpoint_branch_parents<S>(
@@ -1782,15 +1781,18 @@ where
                 .await;
             return Err(error);
         }
-        if let Err(error) = transaction
-            .resolve_pending_branch_checkpoint_replacements(&read, &mut prepared_writes)
+        let branch_checkpoint_bridges = match transaction
+            .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
             .await
         {
-            transaction
-                .discard_pending_plugin_actor_publications()
-                .await;
-            return Err(error);
-        }
+            Ok(branch_checkpoint_bridges) => branch_checkpoint_bridges,
+            Err(error) => {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        };
         let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
             transaction.branch_ctx.as_ref(),
             &read,
@@ -1861,6 +1863,7 @@ where
                 &transaction.active_account_id,
                 &commit_parent_heads,
                 &mut read,
+                &branch_checkpoint_bridges,
                 prepared_writes,
             )
             .instrument(tracing::debug_span!(
