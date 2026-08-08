@@ -140,6 +140,18 @@ def matching_brace(masked: str, opening: int) -> int | None:
     return None
 
 
+def matching_pair(masked: str, opening: int, left: str, right: str) -> int | None:
+    depth = 0
+    for i in range(opening, len(masked)):
+        if masked[i] == left:
+            depth += 1
+        elif masked[i] == right:
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def spans(source: str, kind: str) -> list[Span]:
     masked = mask_rust(source)
     if kind == "fn":
@@ -165,6 +177,51 @@ def calls(body: str) -> set[str]:
         for name in re.findall(rf"\b({IDENT})\s*\(", mask_rust(body))
         if name not in CALL_WORDS
     }
+
+
+def call_arguments(body: str, name: str) -> list[str]:
+    """Return the raw argument text for each call to `name` in one body."""
+
+    masked = mask_rust(body)
+    arguments: list[str] = []
+    for match in re.finditer(rf"\b{re.escape(name)}\s*\(", masked):
+        opening = masked.find("(", match.start(), match.end())
+        closing = matching_pair(masked, opening, "(", ")")
+        if closing is not None:
+            arguments.append(body[opening + 1 : closing])
+    return arguments
+
+
+def chronology_argument_binds_provider(body: str, argument: str) -> bool:
+    """Prove the first seam argument is the provider's retained reader.
+
+    Direct field expressions (`&provider.forktree_reader`) and local aliases
+    (`let reader = &provider.forktree_reader; seam(reader)`) are accepted.
+    A mere field mention elsewhere in the function is deliberately ignored.
+    """
+
+    masked_body = mask_rust(body)
+    masked_argument = mask_rust(argument)
+    field_bases = set(re.findall(rf"\b({IDENT})\.forktree_reader\b", masked_body))
+    field_bases.discard("query_source")
+    if not field_bases:
+        return False
+    if any(
+        re.search(rf"\b{re.escape(base)}\.forktree_reader\b", masked_argument)
+        for base in field_bases
+    ):
+        return True
+    aliases: dict[str, str] = {}
+    for alias, base in re.findall(
+        rf"\b(?:let\s+)?({IDENT})\s*=\s*&?\s*({IDENT})\.forktree_reader(?:\.clone\(\))?",
+        masked_body,
+    ):
+        if base in field_bases:
+            aliases[alias] = base
+    return any(
+        re.search(rf"\b{re.escape(alias)}\b", masked_argument)
+        for alias in aliases
+    )
 
 
 def production(source: str) -> str:
@@ -243,9 +300,9 @@ def check_tree(root: Path, label: str) -> tuple[bool, list[str]]:
         funcs = spans(prod, "fn")
         bindings: set[str] = set()
         chronology_calls: list[str] = []
+        chronology_argument_failures: list[str] = []
         for fn in funcs:
             body_masked = mask_rust(fn.body)
-            compact_body = re.sub(r"\s+", "", body_masked)
             # Capture the actual right-hand side of every provider field
             # binding.  Comparing only for the expected token would miss a
             # second view whose field happened to keep the same name.
@@ -254,11 +311,20 @@ def check_tree(root: Path, label: str) -> tuple[bool, list[str]]:
             ):
                 bindings.add(re.sub(r"\s+", "", binding))
             for seam in sorted(seam_names):
-                if re.search(rf"\b{re.escape(seam)}\s*\(", body_masked) and "forktree_reader" in body_masked:
-                    chronology_calls.append(f"{fn.name}->{seam}")
+                for argument in call_arguments(fn.body, seam):
+                    compact_argument = re.sub(r"\s+", "", argument)
+                    if chronology_argument_binds_provider(fn.body, argument):
+                        chronology_calls.append(f"{fn.name}->{seam}(arg={compact_argument})")
+                    else:
+                        chronology_argument_failures.append(f"{fn.name}->{seam}(arg={compact_argument})")
         binding_sources[label] = bindings
         require(bool(bindings), f"{label}: binding function clones query_source.forktree_reader")
         require(bool(chronology_calls), f"{label}: chronology call receives provider reader ({chronology_calls})")
+        if chronology_argument_failures:
+            require(
+                False,
+                f"{label}: chronology call argument is not the bound provider reader ({chronology_argument_failures})",
+            )
 
     all_sources = set().union(*binding_sources.values()) if binding_sources else set()
     require(all_sources == {"query_source.forktree_reader.clone()"}, f"shared caller-owned identity={sorted(all_sources)}")
