@@ -78,6 +78,31 @@ The existing checkpoint publication path in `session/checkpoint.rs`, and the
 writer/GC portion of `transaction/context.rs`, are acceptance consumers only.
 They are explicitly excluded from W1b-4 source changes.
 
+## Structural source gate
+
+The package's verifier is candidate-parametric:
+
+```sh
+verify_source_contract.sh WORKTREE BASE_COMMIT TARGET_COMMIT
+```
+
+It rejects any changed path outside the five-path production allowlist before
+source inspection. It lexically masks Rust comments and literals, extracts the
+complete `execute_checkpoint_selection` body using balanced braces, and binds
+the receiver identity rather than counting token occurrences. A future GREEN
+candidate must contain exactly one local opening-read facade binding, and the
+same binding must receive both chronology and state-diff calls. The operation
+body cannot construct a fresh read/facade/graph, use a raw store, or route
+through a legacy reader/fallback/cache. `view.rs` and the checkpoint provider
+are checked for the authenticated marker/root and ForkTree-only authority
+contracts. The `--self-test` suite proves GREEN acceptance for the shared-view
+fixture and rejection for distinct views, mismatched receiver, fresh read,
+parallel graph authority, and partial chronology/diff scope.
+
+The verifier does not claim that the current anchor is GREEN. The exact e1af
+source RED remains the frozen two-condition calibration, while a future child
+is evaluated against its real base and complete diff.
+
 ## Discriminating fixtures
 
 The standalone model supplies five deterministic tests:

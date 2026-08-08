@@ -18,7 +18,10 @@ Files:
   future gates.
 - `SOURCE_ALLOWLIST.md`: exact future production slice and forbidden paths.
 - `checkpoint_history_oracle.rs`: standalone model and five tests.
-- `verify_source_contract.sh`: source-only RED/positive calibration.
+- `verify_source_contract.sh` plus `verify_source_contract.py`: a
+  candidate-parametric, whole-diff-scope, argument-aware source gate.
+- `fixtures/`: one GREEN shared-view fixture and five discriminating negative
+  fixtures for duplicate/mismatched/fresh/parallel/partial authorities.
 - `EXPECTED_RED.txt`: captured verifier output for the immutable anchor.
 - `MODEL_RUN.txt`: standalone `rustc -D warnings` run and digest.
 - `SHA256SUMS`: package artifact hashes.
@@ -28,3 +31,10 @@ commit currently being walked. A root with no parent is an implicit
 checkpoint; it is not inferred from an unrelated marker. A configured
 checkpoint floor is a retention boundary, not a truncation boundary: all
 walked commits remain available for history/undo replay.
+
+The verifier accepts `WORKTREE BASE_COMMIT TARGET_COMMIT`. It rejects every
+base..target path outside the future production allowlist, extracts the full
+checkpoint-selection function with a comment/string-aware brace scanner, and
+requires one local facade binding to be the receiver of both chronology and
+state-diff calls. It rejects additional reads, graph readers, raw stores,
+legacy readers, fallback/cache tokens, and provider-local authority.

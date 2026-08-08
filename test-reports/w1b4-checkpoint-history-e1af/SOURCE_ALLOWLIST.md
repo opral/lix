@@ -33,3 +33,28 @@ The existing `CheckpointSpec` may hold a lightweight facade clone only when
 that type remains an operation-owned view over the exact retained read; a
 clone must not expose or replace the read, refresh it, or become a durable
 cache/authority. Future source review must prove this structurally.
+
+The frozen verifier command is:
+
+```sh
+test-reports/w1b4-checkpoint-history-e1af/verify_source_contract.sh \
+  WORKTREE BASE_COMMIT TARGET_COMMIT
+```
+
+`BASE_COMMIT..TARGET_COMMIT` must change only the five production paths above;
+the verifier checks the complete diff rather than merely checking that files
+exist. It then parses the target's `execute_checkpoint_selection` body and
+requires exactly one `let <view> = self.forktree_read_facade()` binding, with
+both `checkpoint_history_from_head` and
+`diff_state_rows_between_commits` called on that exact `<view>`. It rejects a
+second facade, fresh `begin_read`, `ForkTreeReadFacade::new`, graph reader,
+raw store, fallback/cache, or legacy reader in the operation. The positive and
+five negative fixtures are run by:
+
+```sh
+python3 test-reports/w1b4-checkpoint-history-e1af/verify_source_contract.py \
+  --self-test
+```
+
+The exact anchor invocation remains byte-compatible with the original RED
+calibration by passing the same e1af commit as both base and target.

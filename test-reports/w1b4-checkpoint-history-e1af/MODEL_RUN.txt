@@ -4,6 +4,10 @@ Anchor:
   e1af471b9ab0f598dafa7c2ddec7867667c81740
   tree bfa0d271a723da8250ab76ada16fda90926f1099
 
+Format command (completed, exit 0):
+  rustfmt --edition 2024 --check \
+    test-reports/w1b4-checkpoint-history-e1af/checkpoint_history_oracle.rs
+
 Build command (completed, exit 0):
   timeout 1200s rustc --edition=2024 --test -D warnings \
     test-reports/w1b4-checkpoint-history-e1af/checkpoint_history_oracle.rs \
@@ -18,7 +22,14 @@ Result:
   finished in 0.00s
 
 Binary SHA-256:
-  7212d1239929bb9fb4dd7d9dda3bbcb122847befba5df0eb087da9e868b4f823
+  35836e31b23bd12838d0e4bf5748b154db00942e9a4a32f456d0033bde0110ba
+
+Structural fixture command (completed, exit 0):
+  python3 test-reports/w1b4-checkpoint-history-e1af/verify_source_contract.py \
+    --self-test
+
+Result:
+  shared fixture accepted; five negative fixtures rejected.
 
 The model covers 65 rotations, implicit root/marker identity, checkpoint
 floor separation, retained history/undo IDs, missing/malformed/wrong-kind/

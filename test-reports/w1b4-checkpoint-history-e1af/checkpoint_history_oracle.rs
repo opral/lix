@@ -79,12 +79,7 @@ enum Reject {
     Depth,
 }
 
-fn valid_commit(
-    id: &str,
-    generation: u64,
-    parents: Vec<String>,
-    marker: Marker,
-) -> Commit {
+fn valid_commit(id: &str, generation: u64, parents: Vec<String>, marker: Marker) -> Commit {
     Commit {
         id: id.to_owned(),
         generation,
@@ -190,7 +185,10 @@ fn reconstruct(graph: &Graph, lease: &ReadLease) -> Result<Reconstruction, Rejec
     })
 }
 
-fn operation_graph<'a>(graph: &'a Graph, lease: &'a ReadLease) -> Result<OperationGraph<'a>, Reject> {
+fn operation_graph<'a>(
+    graph: &'a Graph,
+    lease: &'a ReadLease,
+) -> Result<OperationGraph<'a>, Reject> {
     validate_read(lease)?;
     Ok(OperationGraph { graph, lease })
 }
@@ -337,9 +335,15 @@ fn missing_parent_generation_gap_and_cycle_fail_closed() {
 #[test]
 fn cold_reopen_is_identical_and_second_reader_or_provider_read_is_rejected() {
     let graph = rotations(65);
-    let first = operation_graph(&graph, &lease(14)).unwrap().history().unwrap();
+    let first = operation_graph(&graph, &lease(14))
+        .unwrap()
+        .history()
+        .unwrap();
     let reopened = graph.clone();
-    let second = operation_graph(&reopened, &lease(14)).unwrap().history().unwrap();
+    let second = operation_graph(&reopened, &lease(14))
+        .unwrap()
+        .history()
+        .unwrap();
     assert_eq!(first, second);
 
     let duplicate_reader = ReadLease {
