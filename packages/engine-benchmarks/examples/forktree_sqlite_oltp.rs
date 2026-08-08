@@ -157,7 +157,7 @@ async fn run(
 async fn run_lix(fixture: &sql_session::SqlFixture, operation: Operation) -> ExecuteResult {
     match operation {
         Operation::Insert => {
-            fixture.insert_all().await;
+            fixture.insert_json_pointer_all().await;
             fixture.read_all_result().await
         }
         Operation::Point => fixture.read_one_by_pk_result().await,

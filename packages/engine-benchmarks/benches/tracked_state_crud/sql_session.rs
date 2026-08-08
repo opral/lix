@@ -384,6 +384,25 @@ impl SqlFixture {
         }
     }
 
+    /// Inserts the CRUD fixture rows into the same `json_pointer` relation
+    /// used by the comparator's reads. The ordinary benchmark insert path
+    /// intentionally targets `tracked_crud_insert`, which is a separate
+    /// benchmark schema and therefore cannot be paired with the comparator's
+    /// `json_pointer` digest.
+    pub(crate) async fn insert_json_pointer_all(&self) -> usize {
+        match self {
+            Self::RocksDB(fixture) => {
+                fixture.seed_rows().await;
+                fixture.row_count
+            }
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => {
+                fixture.seed_rows().await;
+                fixture.row_count
+            }
+        }
+    }
+
     pub(crate) async fn active_commit_id(&self) -> String {
         match self {
             Self::RocksDB(fixture) => fixture.active_commit_id().await,
