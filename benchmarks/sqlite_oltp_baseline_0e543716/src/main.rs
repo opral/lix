@@ -199,6 +199,9 @@ fn returning_one(
 
 fn crud(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
     let mut digest = DigestState::new();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    counters.sql_statements += 1;
+    counters.transactions += 1;
     for index in 1000..1064 {
         let id = format!("r{index:06}");
         let value = format!("inserted:{id}");
@@ -236,9 +239,6 @@ fn crud(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
             &[&id],
         )?;
     }
-    counters.transactions += 1;
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    counters.sql_statements += 1;
     conn.execute_batch("COMMIT")?;
     counters.sql_statements += 1;
     counters.commits += 1;
@@ -286,6 +286,9 @@ fn savepoint_transaction(conn: &Connection, counters: &mut Counters) -> AnyResul
 
 fn conflicts(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
     let mut digest = DigestState::new();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    counters.sql_statements += 1;
+    counters.transactions += 1;
     let id = "r000000";
     let value = "conflict-update";
     let version = 70000_i64;
@@ -327,6 +330,9 @@ fn conflicts(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
         return Err("ON CONFLICT DO NOTHING unexpectedly returned a row".into());
     }
     digest.event("do-nothing", &[ignored_id, "no-row"]);
+    conn.execute_batch("COMMIT")?;
+    counters.sql_statements += 1;
+    counters.commits += 1;
     Ok(digest.finish())
 }
 
@@ -378,6 +384,9 @@ fn validate_file_row(conn: &Connection, file_id: &str, snapshot_id: &str) -> Res
 
 fn file_rows(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
     let mut digest = DigestState::new();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    counters.sql_statements += 1;
+    counters.transactions += 1;
     insert_file_row(
         conn,
         counters,
@@ -432,11 +441,17 @@ fn file_rows(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
     validate_file_row(conn, "directory-001", "snap-001")
         .map_err(|error| -> Box<dyn Error> { error.into() })?;
     digest.event("directory", &["directory-001", "no-payload"]);
+    conn.execute_batch("COMMIT")?;
+    counters.sql_statements += 1;
+    counters.commits += 1;
     Ok(digest.finish())
 }
 
 fn corruption(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
     let mut digest = DigestState::new();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    counters.sql_statements += 1;
+    counters.transactions += 1;
     insert_file_row(
         conn,
         counters,
@@ -528,6 +543,9 @@ fn corruption(conn: &Connection, counters: &mut Counters) -> AnyResult<String> {
     if !(valid_empty && missing_ref_rejected && payload_tombstone_rejected && identity_rejected) {
         return Err("SQLite file-row corruption controls did not discriminate".into());
     }
+    conn.execute_batch("COMMIT")?;
+    counters.sql_statements += 1;
+    counters.commits += 1;
     Ok(digest.finish())
 }
 

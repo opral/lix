@@ -93,10 +93,10 @@ operation_ns, verified
 ```
 
 Process wall/CPU/RSS and filesystem I/O are captured with `/usr/bin/time -v`.
-The direct release smoke run passed all seven cells in 0.05 seconds after
-build, with maximum RSS 4,296 KiB. The release compile was separately bounded
-and completed in 21.28 seconds; no compile time is included in cell
-`operation_ns`.
+The final direct release smoke run passed all seven cells in 0.01 seconds,
+with maximum RSS 4,540 KiB. The initial release compile was separately
+bounded and completed in 21.28 seconds; the corrected cached rebuild completed
+in 0.35 seconds. No compile time is included in cell `operation_ns`.
 
 The exact per-cell digests and counters are frozen in `EVIDENCE_SMOKE.txt`.
 All seven cells reported `verified=true`; `reopen` reported identical warm

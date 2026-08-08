@@ -29,8 +29,8 @@
   "baseline_source": {
     "cargo_toml_sha256": "3f231cef147ab28d0eb3c16784d1a1c95b122735771969a6587066c2a10f61da",
     "cargo_lock_sha256": "96ee6d6d52a9cdc5651554f2f710c8a4364c1d280a3a5f47eff8926508c2beba",
-    "main_rs_sha256": "16b856a6ef138f15df8c15f9e1ff8d56b046b25bc62dee4ce0386b1e04778211",
-    "release_binary_sha256": "137133bfe3d8de7181475560b79f95e5ae3873a196b4dab656da29ad1da4fbfb"
+    "main_rs_sha256": "6b55fd8d398de3587d9ea75858721f93c86ad2e3ed3f5d9b9739565276195480",
+    "release_binary_sha256": "b84e8bd79c7a3da0a15de928cb1fcd0f0fdb371e4d820b120b0508407ac75d25"
   },
   "fixture": {
     "seed_rows": 1000,
@@ -50,10 +50,10 @@
   ],
   "evidence": {
     "command": "timeout 1200 /usr/bin/time -v target/release/sqlite_oltp_baseline_0e543716 /tmp/sqlite-oltp-baseline-0e543716-direct smoke 1000",
-    "evidence_sha256": "45c3db5a8c4205e8db36a56744d950dd66583520378421b9dd83956a7b93ecfd",
-    "wall_seconds": 0.05,
-    "max_rss_kib": 4296,
-    "filesystem_outputs": 9600,
+    "evidence_sha256": "25ff07d81985f38a8f35ad2805869fe584af1f2e0ba6fd208d127c8995e233e3",
+    "wall_seconds": 0.01,
+    "max_rss_kib": 4540,
+    "filesystem_outputs": 1568,
     "exit_status": 0
   },
   "integration_gap": {
