@@ -59,6 +59,7 @@ where
         &self,
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        validate_terminal_projection_request(&request)?;
         let reader = self.live_state.reader(self.store.clone());
         Ok(Some(
             canonical_snapshot_projection(&reader, &request).await?,
@@ -69,11 +70,22 @@ where
         &self,
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        validate_terminal_projection_request(&request)?;
         let reader = self.live_state.reader(self.store.clone());
         Ok(Some(
             canonical_primary_key_projection(&reader, &request).await?,
         ))
     }
+}
+
+fn validate_terminal_projection_request(request: &LiveStateScanRequest) -> Result<(), LixError> {
+    if request.filter.include_tombstones {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "entity terminal projection does not preserve tombstone rows",
+        ));
+    }
+    Ok(())
 }
 
 async fn canonical_snapshot_projection<R>(
@@ -192,5 +204,17 @@ mod tests {
             primary_keys,
             vec![EntityPk::single("a"), EntityPk::single("b")]
         );
+    }
+
+    #[test]
+    fn terminal_projection_rejects_tombstones_before_acquisition() {
+        let request = LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(validate_terminal_projection_request(&request).is_err());
     }
 }

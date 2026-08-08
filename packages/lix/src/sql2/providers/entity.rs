@@ -1942,6 +1942,7 @@ fn direct_entity_batch_eligible(
 ) -> bool {
     !schema.fields().is_empty()
         && matches!(request.filter.rows, LiveStateRowFilter::All)
+        && !request.filter.include_tombstones
         && row_filters.is_empty()
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()

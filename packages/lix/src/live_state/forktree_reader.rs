@@ -6,6 +6,7 @@
 //! lanes that still need a separate owner instead of falling back to a
 //! deleted current-layout reader.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::LixError;
@@ -31,14 +32,24 @@ where
     R: StorageAdapterRead,
 {
     validate_scan_request(request)?;
-    if request.filter.untracked == Some(true) {
-        return scan_untracked_view(view, request).await;
+    match request.filter.untracked {
+        Some(true) => scan_untracked_view(view, request).await,
+        Some(false) => scan_tracked_view(view, request).await,
+        None => scan_combined_view(view, request).await,
     }
+}
+
+async fn scan_tracked_view<R>(
+    view: &crate::forktree::CoherentView<R>,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    R: StorageAdapterRead,
+{
     let [branch_id] = request.filter.branch_ids.as_slice() else {
         return Err(unsupported("current ForkTree reader requires one branch"));
     };
-    if request.filter.untracked == Some(true)
-        || !request.filter.constraints.is_empty()
+    if !request.filter.constraints.is_empty()
         || !matches!(request.filter.rows, LiveStateRowFilter::All)
     {
         return Err(unsupported(
@@ -101,6 +112,68 @@ where
         }
     }
     Ok(MaterializedLiveStateBatch::from_rows(output))
+}
+
+/// Resolves the complete current logical overlay while borrowing the one view
+/// opened by the caller. The two physical candidate streams are transient
+/// inputs to one identity-ordered result; untracked values replace tracked
+/// values, including with a tombstone, before the public limit is applied.
+async fn scan_combined_view<R>(
+    view: &crate::forktree::CoherentView<R>,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    R: StorageAdapterRead,
+{
+    if request.limit == Some(0) {
+        return Ok(MaterializedLiveStateBatch::default());
+    }
+    let mut candidate_request = request.clone();
+    candidate_request.filter.include_tombstones = true;
+    candidate_request.limit = None;
+    let tracked = scan_tracked_view(view, &candidate_request).await?;
+    let untracked = scan_untracked_view(view, &candidate_request).await?;
+    Ok(merge_current_overlay(
+        tracked,
+        untracked,
+        request.filter.include_tombstones,
+        request.limit,
+    ))
+}
+
+fn merge_current_overlay(
+    tracked: MaterializedLiveStateBatch,
+    untracked: MaterializedLiveStateBatch,
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> MaterializedLiveStateBatch {
+    let mut by_key = BTreeMap::new();
+    for row in tracked.into_rows() {
+        by_key.insert(encode_row_key(&row), row);
+    }
+    for row in untracked.into_rows() {
+        by_key.insert(encode_row_key(&row), row);
+    }
+
+    let mut output = Vec::with_capacity(limit.unwrap_or(by_key.len()).min(by_key.len()));
+    for row in by_key.into_values() {
+        if row.deleted && !include_tombstones {
+            continue;
+        }
+        output.push(row);
+        if limit.is_some_and(|limit| output.len() >= limit) {
+            break;
+        }
+    }
+    MaterializedLiveStateBatch::from_rows(output)
+}
+
+fn encode_row_key(row: &MaterializedLiveStateRow) -> Vec<u8> {
+    encode_state_key(StateKeyRef {
+        schema_key: &row.schema_key,
+        file_id: row.file_id.as_deref(),
+        entity_pk: &row.entity_pk,
+    })
 }
 
 /// Reads current untracked rows through the same authenticated selector view
@@ -343,8 +416,10 @@ fn unsupported(message: &'static str) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::live_state::LiveStateExactRowRequest;
+    use crate::live_state::{LiveStateExactRowRequest, MaterializedLiveStateRow};
 
     fn exact(schema_key: &str) -> LiveStateExactBatchRequest {
         LiveStateExactBatchRequest {
@@ -388,5 +463,101 @@ mod tests {
             ..request.rows[0].clone()
         });
         assert!(validate_exact_request(&request).is_err());
+    }
+
+    fn row(
+        branch_id: &str,
+        entity_pk: &str,
+        value: Option<&str>,
+        deleted: bool,
+        global: bool,
+        untracked: bool,
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
+            entity_pk: EntityPk::single(entity_pk),
+            schema_key: "entity".to_string(),
+            file_id: None,
+            snapshot_content: value.map(|value| format!(r#"{{"value":"{value}"}}"#).into()),
+            metadata: None,
+            deleted,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00Z"),
+            global,
+            change_id: Some(ChangeId::for_test_label("change")),
+            commit_id: Some(CommitId::for_test_label("commit")),
+            untracked,
+            branch_id: branch_id.into(),
+        }
+    }
+
+    #[test]
+    fn combined_overlay_replaces_tracked_and_preserves_order_and_limit() {
+        let tracked = MaterializedLiveStateBatch::from_rows(vec![
+            row("global", "a", Some("global-a"), false, true, false),
+            row("branch", "b", Some("tracked-b"), false, false, false),
+            row("branch", "c", Some("tracked-c"), false, false, false),
+        ]);
+        let untracked = MaterializedLiveStateBatch::from_rows(vec![
+            row("branch", "a", Some("untracked-a"), false, false, true),
+            row("branch", "b", Some("untracked-b"), false, false, true),
+            row("branch", "d", Some("untracked-d"), false, false, true),
+        ]);
+
+        let rows =
+            merge_current_overlay(tracked.clone(), untracked.clone(), false, None).into_rows();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].entity_pk, EntityPk::single("a"));
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"untracked-a"}"#)
+        );
+        assert!(rows[0].untracked);
+        assert_eq!(rows[1].entity_pk, EntityPk::single("b"));
+        assert_eq!(
+            rows[1].snapshot_content.as_deref(),
+            Some(r#"{"value":"untracked-b"}"#)
+        );
+        assert!(rows[1].untracked);
+        assert_eq!(rows[2].entity_pk, EntityPk::single("c"));
+        assert_eq!(rows[3].entity_pk, EntityPk::single("d"));
+
+        let limited = merge_current_overlay(tracked, untracked, false, Some(3)).into_rows();
+        assert_eq!(
+            limited
+                .iter()
+                .map(|row| row.entity_pk.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                EntityPk::single("a"),
+                EntityPk::single("b"),
+                EntityPk::single("c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn combined_overlay_tombstone_masks_value_but_null_remains_visible() {
+        let tracked = MaterializedLiveStateBatch::from_rows(vec![
+            row("branch", "null", None, false, false, false),
+            row("branch", "deleted", Some("old"), false, false, false),
+        ]);
+        let untracked = MaterializedLiveStateBatch::from_rows(vec![row(
+            "branch", "deleted", None, true, false, true,
+        )]);
+
+        let visible =
+            merge_current_overlay(tracked.clone(), untracked.clone(), false, None).into_rows();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].entity_pk, EntityPk::single("null"));
+        assert_eq!(visible[0].snapshot_content, None);
+        assert!(!visible[0].deleted);
+
+        let with_tombstone = merge_current_overlay(tracked, untracked, true, None).into_rows();
+        assert_eq!(with_tombstone.len(), 2);
+        assert!(
+            with_tombstone
+                .iter()
+                .any(|row| row.entity_pk == EntityPk::single("deleted") && row.deleted)
+        );
     }
 }
