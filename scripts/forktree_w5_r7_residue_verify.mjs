@@ -95,4 +95,3 @@ console.log(
     : "GREEN no forbidden production residues",
 );
 process.exitCode = findings.length ? 1 : 0;
-

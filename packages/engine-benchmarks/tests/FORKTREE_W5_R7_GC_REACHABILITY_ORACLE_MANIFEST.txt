@@ -8,4 +8,3 @@ control=1f742a382c755399b8a49ab536c4f6dc55fffdd8
 test=packages/engine-benchmarks/tests/forktree_w5_r7_gc_reachability_oracle.rs
 verifier=scripts/forktree_w5_r7_residue_verify.mjs
 report=packages/engine-benchmarks/tests/FORKTREE_W5_R7_GC_REACHABILITY_ORACLE.md
-
