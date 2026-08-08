@@ -195,6 +195,16 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Bound;
+
+    use bytes::Bytes;
+
+    use crate::engine::Engine;
+    use crate::storage::Memory;
+    use crate::storage_adapter::{
+        MAX_SCAN_PAGE_ROWS, StorageAdapter, StorageBeginScanOptions, StorageCoreProjection,
+        StorageKey, StorageProjectedValue, StorageReadOptions, StorageValue, StorageWriteOptions,
+    };
 
     #[test]
     fn missing_mode_payload_defaults_to_disabled_without_a_legacy_state_owner() {
@@ -230,5 +240,148 @@ mod tests {
             assert_eq!(error.code, LixError::CODE_UNKNOWN);
             assert!(error.message.contains("must be an object"));
         }
+    }
+
+    #[tokio::test]
+    async fn public_deterministic_function_rejects_same_count_member_substitution_after_reopen() {
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("test repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("test repository should open");
+        let session = engine
+            .open_session(receipt.main_branch_id.clone())
+            .await
+            .expect("workspace session should open");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+                &[],
+            )
+            .await
+            .expect("deterministic mode should publish");
+        session
+            .execute("SELECT lix_uuid_v7()", &[])
+            .await
+            .expect("the initial deterministic function call should publish its member");
+        drop(session);
+        drop(engine);
+
+        let published = storage
+            .export_snapshot()
+            .expect("published deterministic state should snapshot");
+        let reopened = Memory::from_snapshot(&published).expect("state should cold reopen");
+        let reopened_engine = Engine::new(reopened.clone())
+            .await
+            .expect("reopened state should open");
+        let reopened_session = reopened_engine
+            .open_session(crate::GLOBAL_BRANCH_ID.to_owned())
+            .await
+            .expect("reopened workspace should open");
+        reopened_session
+            .execute("SELECT lix_uuid_v7()", &[])
+            .await
+            .expect("an authenticated selected member should remain usable after reopen");
+        drop(reopened_session);
+        drop(reopened_engine);
+
+        let corrupt = Memory::from_snapshot(&published).expect("corruption fixture should reopen");
+        let storage = StorageAdapter::new(corrupt.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("current untracked state should be readable");
+        let range = crate::storage_adapter::StorageKeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let mut cursor = read
+            .begin_scan(
+                crate::forktree::UNTRACKED_ROW_SPACE,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await
+            .expect("untracked state scan should begin");
+        let mut selected = Vec::new();
+        loop {
+            let page = cursor
+                .next_page(MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("untracked state page should read");
+            selected.extend(page.entries.into_iter().filter(|entry| {
+                entry
+                    .key
+                    .0
+                    .windows(DETERMINISTIC_SEQUENCE_KEY.len())
+                    .any(|window| window == DETERMINISTIC_SEQUENCE_KEY.as_bytes())
+            }));
+            if !page.has_more {
+                break;
+            }
+        }
+        drop(cursor);
+        drop(read);
+        assert_eq!(selected.len(), 1, "fixture must select one sequence member");
+        let selected = selected.pop().expect("selected member");
+        let StorageProjectedValue::FullValue(value) = selected.value else {
+            panic!("selected deterministic member must include its value");
+        };
+        let replacement = b"lix_unrelated_sequence_substitute";
+        assert_eq!(replacement.len(), DETERMINISTIC_SEQUENCE_KEY.len());
+        let replacement_key = StorageKey(Bytes::from(replace_subslice(
+            selected.key.0.as_ref(),
+            DETERMINISTIC_SEQUENCE_KEY.as_bytes(),
+            replacement,
+        )));
+        let mut writes = storage.new_write_set();
+        writes.delete(crate::forktree::UNTRACKED_ROW_SPACE, selected.key);
+        writes.put(
+            crate::forktree::UNTRACKED_ROW_SPACE,
+            replacement_key,
+            StorageValue { bytes: value },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("same-count current-owner substitution should commit");
+
+        let corrupted_snapshot = corrupt
+            .export_snapshot()
+            .expect("corrupted current-owner state should snapshot");
+        let corrupted = Memory::from_snapshot(&corrupted_snapshot)
+            .expect("corrupted current-owner state should cold reopen");
+        let corrupted_engine = Engine::new(corrupted)
+            .await
+            .expect("structurally corrupt state should open before selected read");
+        let corrupted_session = corrupted_engine
+            .open_workspace_session()
+            .await
+            .expect("corrupted workspace should open before selected read");
+        let error = corrupted_session
+            .execute("SELECT lix_uuid_v7()", &[])
+            .await
+            .expect_err("missing selected member must fail closed through the public function");
+        assert!(
+            error.message.contains("identity") || error.message.contains("sequence"),
+            "unexpected selected-member closure error: {error:?}"
+        );
+    }
+
+    fn replace_subslice(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+        assert_eq!(needle.len(), replacement.len());
+        let position = haystack
+            .windows(needle.len())
+            .position(|candidate| candidate == needle)
+            .expect("selected key must contain its canonical identity");
+        let mut replaced = haystack.to_vec();
+        replaced[position..position + needle.len()].copy_from_slice(replacement);
+        replaced
     }
 }
