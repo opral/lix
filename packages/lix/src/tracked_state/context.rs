@@ -2397,17 +2397,6 @@ where
             entries.swap_sides();
             return Ok(entries);
         }
-        if self
-            .exact_current_state_scope_has_equal_live_state(
-                left_commit_id,
-                right_commit_id,
-                request,
-            )
-            .await?
-            == Some(true)
-        {
-            return Ok(TrackedStateTreeDiffBatch::default());
-        }
         if left_commit_id == right_commit_id {
             return Ok(TrackedStateTreeDiffBatch::default());
         }
@@ -2472,58 +2461,6 @@ where
             }
         }
         entries.finish()
-    }
-
-    /// Proves equal live endpoint state from authenticated serving partitions.
-    ///
-    /// This proof belongs to semantic diff, which normalizes tombstones to
-    /// absence. Raw tree-entry diff must retain tombstone rows for merge and
-    /// history consumers and therefore never calls this helper.
-    pub(crate) async fn exact_current_state_scope_has_equal_live_state(
-        &self,
-        left_commit_id: &str,
-        right_commit_id: &str,
-        request: &TrackedStateTreeScanRequest,
-    ) -> Result<Option<bool>, LixError> {
-        let Some(scope) = exact_current_state_scope(request) else {
-            return Ok(None);
-        };
-        let left_commit_id = CommitId::parse_lix(
-            left_commit_id,
-            "tracked-state current-state diff left commit_id",
-        )?;
-        let right_commit_id = CommitId::parse_lix(
-            right_commit_id,
-            "tracked-state current-state diff right commit_id",
-        )?;
-        let Some(left_state) =
-            storage::load_published_commit_state_topology(&self.store, left_commit_id).await?
-        else {
-            return Ok(None);
-        };
-        let Some(right_state) =
-            storage::load_published_commit_state_topology(&self.store, right_commit_id).await?
-        else {
-            return Ok(None);
-        };
-        let Some(left_root) = left_state.current_state_scoped_ranges() else {
-            return Ok(None);
-        };
-        let Some(right_root) = right_state.current_state_scoped_ranges() else {
-            return Ok(None);
-        };
-        let prefix = super::current_state_envelope::current_state_scope_prefix(&scope)?;
-        match super::scoped_range::prove_scoped_range_scope_equal(
-            &self.store,
-            &left_root.tree,
-            &right_root.tree,
-            &prefix,
-        )
-        .await?
-        {
-            super::scoped_range::ScopedRangeScopeEqualityProof::Equal => Ok(Some(true)),
-            super::scoped_range::ScopedRangeScopeEqualityProof::NotProven => Ok(None),
-        }
     }
 
     /// Returns the compact write-set union for an ancestor/descendant
