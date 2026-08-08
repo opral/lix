@@ -148,7 +148,7 @@ Delete only after the last reader/writer moves:
 The `lix_binary_blob_ref` schema and visible BlobId row remain; only the old
 physical CAS/upload authorities and bridges are deleted.
 
-## Static RED command and future adapter order
+## Static RED command and V2 execution contract
 
 Static calibration, expected exit 1:
 
@@ -157,19 +157,57 @@ bash test-reports/forktree-w4-fileblob-upload-readiness-e1af/source_gate_red.sh 
   "$PWD" e1af471b9ab0f598dafa7c2ddec7867667c81740
 ```
 
-Future compile gates are not run here and must use an isolated target:
+The following execution policy is mandatory for every future compile,
+Memory, RocksDB, and SlateDB cell. It is intentionally recorded here because
+this package has no runnable W4 target. Every cell is isolated, serialized,
+bounded by `timeout 1200s` (20 minutes), and fail-fast. A nonzero result or a
+timeout prints `STOP_FIRST_BLOCKER` and terminates the sequence; no later cell
+may run and no wider matrix may be started.
 
 ```bash
-CARGO_TARGET_DIR=/root/repos/target-w4-e1af-memory cargo fmt --all -- --check
-CARGO_TARGET_DIR=/root/repos/target-w4-e1af-memory cargo check -p lix --lib --all-targets
-CARGO_TARGET_DIR=/root/repos/target-w4-e1af-memory cargo clippy -p lix --lib --all-targets -- -D warnings
+set -Eeuo pipefail
+run_cell() {
+  local label="$1"
+  shift
+  if timeout --foreground --kill-after=5s 1200s "$@"; then
+    return 0
+  else
+    local status=$?
+    printf 'STOP_FIRST_BLOCKER cell=%s status=%s\n' "$label" "$status" >&2
+    exit "$status"
+  fi
+}
 ```
 
-After compile-green, run the identical focused correctness package in order:
+The compile cells are separate cells and stop at the first failure:
 
-```text
-Memory -> RocksDB -> SlateDB
+```bash
+run_cell compile-fmt env CARGO_TARGET_DIR=/root/repos/target-w4-e1af-v2 \
+  cargo fmt --all -- --check
+run_cell compile-check env CARGO_TARGET_DIR=/root/repos/target-w4-e1af-v2 \
+  cargo check -p lix --lib --all-targets
+run_cell compile-clippy env CARGO_TARGET_DIR=/root/repos/target-w4-e1af-v2 \
+  cargo clippy -p lix --lib --all-targets -- -D warnings
 ```
+
+Only after all compile cells are green, run the identical focused correctness
+package in exactly this order, `Memory -> RocksDB -> SlateDB`, with no
+parallelism and no scale widening:
+
+```bash
+W4_ORACLE=/absolute/path/to/the/frozen-w4-oracle
+run_cell Memory "$W4_ORACLE" --backend memory --focused
+run_cell RocksDB "$W4_ORACLE" --backend rocksdb --focused
+run_cell SlateDB "$W4_ORACLE" --backend slatedb --focused
+```
+
+`W4_ORACLE` is an explicit placeholder because the accepted e1af object has no
+runnable W4 harness; it must be replaced only by the immutable future oracle
+binary and never by a moving ref. The three commands above are the complete
+admitted adapter sequence. Any failed or expired Memory cell prevents RocksDB
+and SlateDB execution. Any failed or expired RocksDB cell prevents SlateDB
+execution. No 50/500 MiB, concurrency, or other wider matrix is admitted by
+this package.
 
 RocksDB and SlateDB must record exact result digests, malformed/substituted
 object failures, rollback/stale behavior, cold reopen, one-view/one-plan/one
