@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array, Int64Builder, StringArray,
+    StringBuilder, UInt64Array,
 };
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -25,7 +26,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     displayable,
 };
-use futures_util::stream;
+use futures_util::{TryStreamExt, stream};
 use lix::storage::{Memory, Storage};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
@@ -41,6 +42,17 @@ use super::olap_common as common;
 use common::{Cell, Query};
 
 const NULLABLE_PREFIX: u8 = b'x';
+const BATCH_ROWS_ENV: &str = "FORKTREE_OLAP_BATCH_ROWS";
+
+fn batch_rows() -> Option<usize> {
+    std::env::var(BATCH_ROWS_ENV).ok().map(|value| {
+        let rows = value
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("invalid {BATCH_ROWS_ENV}={value:?}: {error}"));
+        assert!(rows > 0, "{BATCH_ROWS_ENV} must be positive");
+        rows
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TableKind {
@@ -97,6 +109,7 @@ where
     branch: Arc<str>,
     kind: TableKind,
     schema: SchemaRef,
+    batch_rows: Option<usize>,
 }
 
 impl<S> Debug for ForkTreeTableProvider<S>
@@ -163,6 +176,7 @@ where
             projection,
             filters.to_vec(),
             limit,
+            self.batch_rows,
         )?))
     }
 }
@@ -181,6 +195,7 @@ where
     limit: Option<usize>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    batch_rows: Option<usize>,
 }
 
 impl<S> ForkTreeScanExec<S>
@@ -195,6 +210,7 @@ where
         projection: Vec<usize>,
         filters: Vec<Expr>,
         limit: Option<usize>,
+        batch_rows: Option<usize>,
     ) -> Result<Self> {
         let schema = Arc::new(source_schema.project(&projection)?);
         let equivalence = schema.index_of(kind.primary_key()).ok().map_or_else(
@@ -228,6 +244,7 @@ where
             limit,
             schema,
             properties,
+            batch_rows,
         })
     }
 
@@ -272,6 +289,57 @@ where
             &self.schema,
         )
     }
+
+    async fn load_batched(&self, batch_rows: usize) -> Result<Vec<RecordBatch>> {
+        let mut needed = self.projection.iter().copied().collect::<BTreeSet<_>>();
+        for filter in self.filters.iter() {
+            collect_filter_columns(filter, &self.source_schema, &mut needed)?;
+        }
+        let (start, end) = range_bounds(self.kind, &self.filters)?;
+        let raw_rows = self
+            .tree
+            .read_range(&self.branch, &start, &end)
+            .await
+            .map_err(DataFusionError::Execution)?;
+        let mut batches = Vec::new();
+        let mut remaining_limit = self.limit;
+        for chunk in raw_rows.chunks(batch_rows) {
+            let mut builders = BatchBuilders::new(&self.source_schema, &self.projection);
+            for (key, encoded) in chunk {
+                let mut row = decode_row(self.kind, &self.source_schema, &needed, encoded)?;
+                set_primary_key(self.kind, &self.source_schema, &mut row, key)?;
+                let mut keep = Some(true);
+                for filter in self.filters.iter() {
+                    keep = sql_and(
+                        keep,
+                        evaluate_filter(filter, &self.source_schema, &row)?.sql_bool()?,
+                    );
+                }
+                if keep != Some(true) {
+                    continue;
+                }
+                builders.append(&row, &self.projection)?;
+                if let Some(limit) = remaining_limit.as_mut() {
+                    *limit = limit.saturating_sub(1);
+                    if *limit == 0 {
+                        break;
+                    }
+                }
+            }
+            if builders.len() != 0 {
+                batches.push(builders.finish(&self.schema)?);
+            }
+            if remaining_limit == Some(0) {
+                break;
+            }
+        }
+        if batches.is_empty() {
+            batches.push(
+                BatchBuilders::new(&self.source_schema, &self.projection).finish(&self.schema)?,
+            );
+        }
+        Ok(batches)
+    }
 }
 
 impl<S> Debug for ForkTreeScanExec<S>
@@ -285,6 +353,7 @@ where
             .field("projection", &self.projection)
             .field("filters", &self.filters)
             .field("limit", &self.limit)
+            .field("batch_rows", &self.batch_rows)
             .finish_non_exhaustive()
     }
 }
@@ -354,7 +423,15 @@ where
         }
         let scan = self.clone();
         let schema = Arc::clone(&self.schema);
-        let batches = stream::once(async move { scan.load_batch().await });
+        let batches = stream::once(async move {
+            let batches = match scan.batch_rows {
+                Some(batch_rows) => scan.load_batched(batch_rows).await?,
+                None => vec![scan.load_batch().await?],
+            };
+            Ok::<_, DataFusionError>(batches)
+        })
+        .map_ok(|batches| stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)))
+        .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
     }
 }
@@ -362,7 +439,8 @@ where
 pub(super) async fn run(parameters: Parameters) {
     assert_eq!(parameters.layout, Layout::ForkTree);
     println!(
-        "forktree_datafusion_boundary,sql_wiring=true,provider=ForkTreeTableProvider,authority=one_storage_read_authenticated_iterator,request_big_o=O(height),projection_allocation=O(rows*selected_width)"
+        "forktree_datafusion_boundary,sql_wiring=true,provider=ForkTreeTableProvider,authority=one_storage_read_authenticated_iterator,request_big_o=O(height),projection_allocation=O(batch*selected_width),batch_rows={:?}",
+        batch_rows()
     );
     if parameters.rows == 1_000 {
         run_memory_provider_oracle().await;
@@ -570,6 +648,7 @@ where
                     branch: Arc::from(branch),
                     kind,
                     schema,
+                    batch_rows: batch_rows(),
                 }),
             )
             .expect("register ForkTree DataFusion provider");
@@ -970,6 +1049,84 @@ fn set_primary_key(
         _ => Datum::Text(raw),
     };
     Ok(())
+}
+
+enum BatchBuilder {
+    Utf8(StringBuilder),
+    Int64(Int64Builder),
+    Boolean(BooleanBuilder),
+}
+
+struct BatchBuilders {
+    columns: Vec<BatchBuilder>,
+    rows: usize,
+}
+
+impl BatchBuilders {
+    fn new(source_schema: &SchemaRef, projection: &[usize]) -> Self {
+        let columns = projection
+            .iter()
+            .map(|&index| match source_schema.field(index).data_type() {
+                DataType::Utf8 => BatchBuilder::Utf8(StringBuilder::new()),
+                DataType::Int64 => BatchBuilder::Int64(Int64Builder::new()),
+                DataType::Boolean => BatchBuilder::Boolean(BooleanBuilder::new()),
+                data_type => panic!("unsupported ForkTree batching type {data_type:?}"),
+            })
+            .collect();
+        Self { columns, rows: 0 }
+    }
+
+    fn append(&mut self, row: &[Datum], projection: &[usize]) -> Result<()> {
+        for (builder, &index) in self.columns.iter_mut().zip(projection) {
+            let value = &row[index];
+            match (builder, value) {
+                (BatchBuilder::Utf8(builder), Datum::Null) => builder.append_null(),
+                (BatchBuilder::Utf8(builder), Datum::Text(value)) => builder.append_value(value),
+                (BatchBuilder::Int64(builder), Datum::Null) => builder.append_null(),
+                (BatchBuilder::Int64(builder), Datum::Integer(value)) => {
+                    builder.append_value(*value)
+                }
+                (BatchBuilder::Boolean(builder), Datum::Null) => builder.append_null(),
+                (BatchBuilder::Boolean(builder), Datum::Boolean(value)) => {
+                    builder.append_value(*value)
+                }
+                (builder, value) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "ForkTree batching datum/type mismatch: {builder:?} and {value:?}"
+                    )));
+                }
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(self, schema: &SchemaRef) -> Result<RecordBatch> {
+        let arrays = self
+            .columns
+            .into_iter()
+            .map(|builder| {
+                let array: ArrayRef = match builder {
+                    BatchBuilder::Utf8(mut builder) => Arc::new(builder.finish()),
+                    BatchBuilder::Int64(mut builder) => Arc::new(builder.finish()),
+                    BatchBuilder::Boolean(mut builder) => Arc::new(builder.finish()),
+                };
+                array
+            })
+            .collect();
+        RecordBatch::try_new(Arc::clone(schema), arrays)
+            .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))
+    }
+}
+
+impl Debug for BatchBuilder {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BatchBuilder")
+    }
 }
 
 fn rows_to_batch(
