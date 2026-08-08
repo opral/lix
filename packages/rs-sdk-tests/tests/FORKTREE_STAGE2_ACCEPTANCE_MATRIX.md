@@ -38,6 +38,7 @@ binary diff SHA-256 values are:
 | Deletion/residue | `origin/codex/forktree-stage2-deletion-oracle-v2` / `1dbbf3d206540d36f5912eab8372a42819778b47` / `7fe3b3c83133344dff4025b558dbdd63bb1be21f` | `d00584e..1dbbf`: `0a6edac94dd03cd287e134bd873962bc841c0d2d5aebb9f92b1de45d5e359da5` |
 | No-lease reference | `origin/codex/stage2-no-lease-read-view-boundary-ee402` / `89c73a24b97ce8dedee5e6c9a85e67c481b29090` / `6b90abcc440a3c13a6e95c641426629593536012` | complete `138b..89c`: `e93a1d78d01f3c7d29d4038627c691047fa8953c55bd61e77c6351e714114796` |
 | GC/publication | `origin/codex/stage2-gc-publication-acceptance-oracle` / `0b4e5042b6a79b8be80dbfe4e4cdbff3b28d9a9c` / `0ac1ab8e74b85a92a8044cb4280adf8cf66ba387` | `cbe488..0b4e`: `bb6a70454484b9bba9e29929656a205a0706d1a0a2e60e495ea52fc19e567224` |
+| Ordered OLAP | `origin/codex/forktree-stage2-olap-acceptance-oracle-a12` / `b9055810dff42c9eb2a096a83ab2207024dce1c6` / `231939d8a8d0f2a46803264184eea8171fa05f90` | `a12..b905` canonical committed-attribute stream: `545ff4e7c74b6bc19223d4977fd4dbba11914d46e3e5efadcae8407741e44b42` (42,863 bytes), patch ID `f88e0ea04bef0e93b0280c19f7c89d59c678223e`; alternate same-object text rendering: `0490631c2cc76da541e84c10c0e208c02d7a6626fa52a34b2c8aabaa1c9aaad9`, patch ID `d6bb816da4117a4b1781cda19450d6a32e2e0099`; report `005646c33cda54a363ab3c81f0b7ed0a5891e24de20639f05d8ca00a0f66009f`; SPI `c54c50ee301338ef3c04a3364eaff06e075a3f0212099cbc9a4290e8c5197193`; manifest `8e8b616f39bd37fc7eb3dda7aa19da7ce2011c16561c1687caa2cb6942d1a7c2`; external provenance report `e78821631888e8a8810df78e9bdffbe31c8a8124227c5ad0c3b549a6e60795a4` |
 | Multimedia | `origin/codex/forktree-stage2-multimedia-oracle-a12` / `61fc367988190b3438672743331a81d83d450fae` / `1600e8ce54d9f52f6ee3546068362ae298d4d243` | `a12..61fc`: `65cda6ee906b6986bf70b636dfaadda5f8f89a2f8f4af407852687c474472660`; patch ID `30b6a50ac8730e382d2034b704082bab4fe41b7b`; final report `0dd241e1d6bd8fa32d84751972bd96fed666f2dafe742b447ca496f06aadc5bb`; package sums `ccc755a1cc70a28bc08145aeb61bec940f3db9b01b49c7e89931c9bd9218d0e8`; pre-normalization local report `6691dc30ce4f6eb0bd0a413aa060eb80614d4447bd05fd30c268a3e878044274`; predecessor `10bb5f41...` and object `66912a3d...` are excluded |
 
 The no-lease package, 65-row delete reproduction, and point-read reference are
@@ -100,7 +101,17 @@ cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/te
    gate. Only after both are green, run their SlateDB counterparts. Exact
    one-view transport, progress rotation, persisted bounded packs, upload and
    final-reference checks are mandatory.
-7. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
+7. Build the sealed OLAP oracle once, then run its ordered gate into a new empty
+   evidence directory: 10K RocksDB plus both corruption cells, 10K SlateDB plus
+   both corruption cells, 50K RocksDB then SlateDB, and finally 500K RocksDB
+   then SlateDB. Every process cell is capped at 20 minutes. Query digests and
+   row counts must match hot and cold; query writes remain zero; range and
+   projection improve by more than 10%; all critical regressions remain within
+   5%. SlateDB's six-versus-five range reads or twelve-versus-ten join reads
+   hard-block broad closeout unless a checked-in manager waiver binds the exact
+   candidate, scale, query, values, report hash, and at least 20% aggregate
+   improvement. No waiver can cover any other metric.
+8. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
    multimedia transport bound, run 64 MiB/1% image RocksDB first, then SlateDB, then
    the remaining 64 MiB shape and only then 512 MiB/10% archive/video. No
    broader workspace or performance matrix precedes these focused gates.
@@ -119,6 +130,10 @@ cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/te
   internals remain unreadable to public tests.
 - One-view, cursor poison, epoch/progress CAS, mark/queue, upload, or final
   release mismatch: GC/publication owner; no lease or raw-space escape.
+- OLAP SPI/owner identity, digest/reopen/corruption, coherent read, batching,
+  projection order, writes, latency, resource, or physical-read mismatch: R5's
+  OLAP reader owner. Stop at the first failing scale. The SlateDB object-count
+  residual requires the exact narrow manager waiver or remains a hard blocker.
 - Multimedia transport/provenance mismatch: H4. Runtime/accounting facade
   absence routes to R5; a 64 MiB failure stops 512 MiB qualification.
 - Version-control-only mismatch: branch/history/merge owner, after isolating
