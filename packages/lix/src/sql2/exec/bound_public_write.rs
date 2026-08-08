@@ -5629,7 +5629,8 @@ fn append_entity_replace_row_from_live<'a>(
     };
 
     let snapshot = snapshot
-        .map(|snapshot| {
+        .map(|mut snapshot| {
+            complete_untracked_primary_key_fields(&mut snapshot, row, spec)?;
             TransactionJson::from_value(
                 snapshot,
                 &format!("{} update snapshot_content", spec.schema_key),
@@ -5658,6 +5659,73 @@ fn append_entity_replace_row_from_live<'a>(
     Ok(())
 }
 
+fn complete_untracked_primary_key_fields(
+    snapshot: &mut JsonValue,
+    row: EntityLiveRowRef<'_>,
+    spec: &EntitySurfaceSpec,
+) -> Result<(), LixError> {
+    if !row.untracked() || spec.primary_key_paths.is_empty() {
+        return Ok(());
+    }
+    let entity_pk = row.entity_pk().as_json_array_value()?;
+    let Some(values) = entity_pk.as_array() else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "untracked entity '{}' has a non-array primary-key identity",
+                spec.schema_key
+            ),
+        ));
+    };
+    for (index, path) in spec.primary_key_paths.iter().enumerate() {
+        let Some(value) = values.get(index).cloned() else {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "untracked entity '{}' is missing primary-key component {index}",
+                    spec.schema_key
+                ),
+            ));
+        };
+        insert_missing_json_path(snapshot, path, value, &spec.schema_key)?;
+    }
+    Ok(())
+}
+
+fn insert_missing_json_path(
+    target: &mut JsonValue,
+    path: &[String],
+    value: JsonValue,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    if path.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("entity '{schema_key}' has an empty primary-key path"),
+        ));
+    }
+    let Some(object) = target.as_object_mut() else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("entity '{schema_key}' snapshot must be a JSON object"),
+        ));
+    };
+    let mut object = object;
+    for segment in &path[..path.len() - 1] {
+        let child = object
+            .entry(segment.clone())
+            .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+        object = child.as_object_mut().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("entity '{schema_key}' primary-key path has a non-object parent"),
+            )
+        })?;
+    }
+    object.entry(path[path.len() - 1].clone()).or_insert(value);
+    Ok(())
+}
+
 fn inherited_metadata<'a>(
     row: impl Into<EntityLiveRowRef<'a>>,
     spec: &EntitySurfaceSpec,
@@ -5677,6 +5745,7 @@ struct EntityEvalContext<'a> {
     excluded_snapshot: Option<&'a JsonValue>,
     excluded_row: Option<RawWriteRowRef<'a>>,
     visible_columns: &'a [EntitySurfaceColumn],
+    primary_key_paths: Option<&'a [Vec<String>]>,
 }
 
 #[derive(Clone, Copy)]
@@ -5778,6 +5847,7 @@ impl<'a> EntityEvalContext<'a> {
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns,
+            primary_key_paths: None,
         }
     }
 
@@ -5792,6 +5862,7 @@ impl<'a> EntityEvalContext<'a> {
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns: &spec.columns,
+            primary_key_paths: Some(&spec.primary_key_paths),
         }
     }
 
@@ -5806,6 +5877,7 @@ impl<'a> EntityEvalContext<'a> {
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns: &spec.columns,
+            primary_key_paths: Some(&spec.primary_key_paths),
         }
     }
 
@@ -5822,6 +5894,7 @@ impl<'a> EntityEvalContext<'a> {
             excluded_snapshot: Some(excluded_snapshot),
             excluded_row: Some(excluded_row),
             visible_columns: &spec.columns,
+            primary_key_paths: Some(&spec.primary_key_paths),
         }
     }
 }
@@ -6942,6 +7015,24 @@ fn column_eval_value(
     let Some(row) = context.row else {
         return Ok(EntityEvalValue::SqlNull);
     };
+    if let Some(primary_key_paths) = context.primary_key_paths {
+        if let Some((index, _)) = primary_key_paths.iter().enumerate().find(|(_, path)| {
+            path.len() == 1 && path.first().is_some_and(|path| path == column_name)
+        }) {
+            if let Some(entity_pk) = row.entity_pk() {
+                let values = entity_pk.as_json_array_value()?;
+                if let Some(value) = values.as_array().and_then(|values| values.get(index)) {
+                    return Ok(visible_column_eval_value(
+                        context
+                            .visible_columns
+                            .iter()
+                            .find(|column| column.name == column_name),
+                        value,
+                    ));
+                }
+            }
+        }
+    }
     match column_name {
         "lixcol_entity_pk" => row
             .entity_pk()
