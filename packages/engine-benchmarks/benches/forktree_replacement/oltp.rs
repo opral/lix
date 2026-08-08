@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 use super::model::{ForkTree, Mutation, RelationalValue};
 use super::{
@@ -40,8 +41,12 @@ enum Operation {
     UpdateTenPercent,
     Delete,
     Atomic18,
-    Upsert,
+    UpsertConflict,
+    UpsertNothing,
     Returning,
+    StaleSameOwner,
+    StaleUnrelatedOwner,
+    UnrelatedOwnerSequential,
 }
 
 impl Operation {
@@ -54,8 +59,12 @@ impl Operation {
             "update_10pct" => Self::UpdateTenPercent,
             "delete" => Self::Delete,
             "atomic_18" => Self::Atomic18,
-            "upsert" => Self::Upsert,
+            "upsert_conflict" => Self::UpsertConflict,
+            "upsert_nothing" => Self::UpsertNothing,
             "returning" => Self::Returning,
+            "stale_same_owner" => Self::StaleSameOwner,
+            "stale_unrelated_owner" => Self::StaleUnrelatedOwner,
+            "unrelated_owner_sequential" => Self::UnrelatedOwnerSequential,
             other => panic!("unknown OLTP operation '{other}'"),
         }
     }
@@ -69,13 +78,54 @@ impl Operation {
             Self::UpdateTenPercent => "update_10pct",
             Self::Delete => "delete",
             Self::Atomic18 => "atomic_18",
-            Self::Upsert => "upsert",
+            Self::UpsertConflict => "upsert_conflict",
+            Self::UpsertNothing => "upsert_nothing",
             Self::Returning => "returning",
+            Self::StaleSameOwner => "stale_same_owner",
+            Self::StaleUnrelatedOwner => "stale_unrelated_owner",
+            Self::UnrelatedOwnerSequential => "unrelated_owner_sequential",
         }
     }
 
     const fn starts_empty(self) -> bool {
         matches!(self, Self::Insert)
+    }
+}
+
+const UNRELATED_BRANCH_A: &str = "oltp-unrelated-a";
+const UNRELATED_BRANCH_B: &str = "oltp-unrelated-b";
+
+trait OltpStorage: lix::storage::Storage + Clone + Send + Sync + 'static {
+    const LABEL: &'static str;
+
+    fn open_path(path: &Path) -> Self;
+
+    async fn flush_for_bench(&self);
+}
+
+impl OltpStorage for RocksDB {
+    const LABEL: &'static str = "rocksdb";
+
+    fn open_path(path: &Path) -> Self {
+        Self::open(path).expect("open ForkTree RocksDB")
+    }
+
+    async fn flush_for_bench(&self) {
+        self.flush().expect("flush ForkTree RocksDB");
+    }
+}
+
+impl OltpStorage for SlateDB {
+    const LABEL: &'static str = "slatedb";
+
+    fn open_path(path: &Path) -> Self {
+        Self::open(path).expect("open ForkTree SlateDB")
+    }
+
+    async fn flush_for_bench(&self) {
+        self.flush_memtable_for_diagnostics()
+            .await
+            .expect("flush ForkTree SlateDB");
     }
 }
 
@@ -113,19 +163,23 @@ pub async fn run() {
         .parse::<usize>()
         .expect("batch size must be an integer");
     assert!(rows >= 18 && batch_size > 0);
+    let backend = std::env::var("FORKTREE_OLTP_BACKEND").unwrap_or_else(|_| "rocksdb".to_string());
     println!(
-        "oltp_comparator_contract,path=forktree_bc823_direct_typed_owner,mode={mode:?},rows={rows},operation={},batch_size={batch_size},sql_integrated=false,branch_history_enabled=true,setup_excluded=true,backend=rocksdb",
-        operation.label()
+        "oltp_comparator_contract,path=forktree_bc823_direct_typed_owner,mode={mode:?},rows={rows},operation={},batch_size={batch_size},sql_integrated=false,branch_history_enabled=true,setup_excluded=true,backend={backend}",
+        operation.label(),
     );
-    match mode {
-        Mode::Setup => setup(&path, rows, operation).await,
-        Mode::Run => measure(&path, rows, operation, batch_size).await,
+    match (mode, backend.as_str()) {
+        (Mode::Setup, "rocksdb") => setup::<RocksDB>(&path, rows, operation).await,
+        (Mode::Run, "rocksdb") => measure::<RocksDB>(&path, rows, operation, batch_size).await,
+        (Mode::Setup, "slatedb") => setup::<SlateDB>(&path, rows, operation).await,
+        (Mode::Run, "slatedb") => measure::<SlateDB>(&path, rows, operation, batch_size).await,
+        (_, other) => panic!("unknown FORKTREE_OLTP_BACKEND '{other}'"),
     }
 }
 
-async fn setup(path: &Path, rows: usize, operation: Operation) {
+async fn setup<S: OltpStorage>(path: &Path, rows: usize, operation: Operation) {
     std::fs::create_dir_all(path).expect("create ForkTree comparator directory");
-    let database = RocksDB::open(path).expect("open ForkTree setup RocksDB");
+    let database = S::open_path(path);
     let tree = ForkTree::new(database.clone());
     let initial = setup_rows(rows, operation);
     if initial.is_empty() {
@@ -150,21 +204,40 @@ async fn setup(path: &Path, rows: usize, operation: Operation) {
             .await
             .expect("initialize ForkTree fixture");
     }
+    if matches!(
+        operation,
+        Operation::StaleUnrelatedOwner | Operation::UnrelatedOwnerSequential
+    ) {
+        let main = tree.branch_head("main").await.expect("read main head");
+        tree.create_branch(UNRELATED_BRANCH_A, Some(main))
+            .await
+            .expect("create unrelated-owner branch A");
+        tree.create_branch(UNRELATED_BRANCH_B, Some(main))
+            .await
+            .expect("create unrelated-owner branch B");
+    }
     assert_eq!(tree_rows(&tree).await, initial);
     drop(tree);
-    database.flush().expect("flush ForkTree setup");
+    database.flush_for_bench().await;
     drop(database);
     println!(
-        "oltp_comparator_setup,path=forktree_bc823_direct_typed_owner,rows={rows},operation={},digest={},disk_bytes={}",
+        "oltp_comparator_setup,path=forktree_bc823_direct_typed_owner,backend={},rows={rows},operation={},digest={},disk_bytes={}",
+        S::LABEL,
         operation.label(),
         map_digest(&initial),
         directory_bytes(path)
     );
 }
 
-async fn measure(path: &Path, rows: usize, operation: Operation, batch_size: usize) {
-    let database = RocksDB::open(path).expect("open measured ForkTree RocksDB");
+async fn measure<S: OltpStorage>(
+    path: &Path,
+    rows: usize,
+    operation: Operation,
+    batch_size: usize,
+) {
+    let database = S::open_path(path);
     let (storage, stats) = CountingStorage::new(database.clone());
+    let race_control = storage.clone();
     let tree = ForkTree::new(storage);
     let _ = tree
         .read_relational_point("main", row_key(0).as_bytes())
@@ -179,7 +252,8 @@ async fn measure(path: &Path, rows: usize, operation: Operation, batch_size: usi
     let cpu_before = process_cpu_nanos();
     begin_allocation_profile();
     let started = Instant::now();
-    let (result_digest, commits) = operation_run(&tree, rows, operation, batch_size).await;
+    let (result_digest, commits) =
+        operation_run(&tree, &race_control, rows, operation, batch_size).await;
     let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
     let (alloc_bytes, alloc_calls) = end_allocation_profile();
     let cpu_us = process_cpu_nanos().saturating_sub(cpu_before) as f64 / 1_000.0;
@@ -195,20 +269,34 @@ async fn measure(path: &Path, rows: usize, operation: Operation, batch_size: usi
     let state_digest = map_digest(&actual);
     drop(tree);
     let flush_started = Instant::now();
-    database.flush().expect("flush measured ForkTree operation");
+    database.flush_for_bench().await;
     let flush_us = flush_started.elapsed().as_secs_f64() * 1_000_000.0;
     drop(database);
     let settled_disk = directory_bytes(path);
 
-    let reopened = RocksDB::open(path).expect("cold reopen ForkTree RocksDB");
+    let reopened = S::open_path(path);
     let reopened_tree = ForkTree::new(reopened.clone());
     let cold = tree_rows(&reopened_tree).await;
     assert_eq!(cold, expected, "ForkTree cold-reopen rows");
     let cold_digest = map_digest(&cold);
     assert_eq!(cold_digest, state_digest);
+    if matches!(
+        operation,
+        Operation::StaleUnrelatedOwner | Operation::UnrelatedOwnerSequential
+    ) {
+        assert_eq!(
+            forktree_point_value(&reopened_tree, UNRELATED_BRANCH_A, 0).await,
+            row_value(0, "unrelated-a")
+        );
+        assert_eq!(
+            forktree_point_value(&reopened_tree, UNRELATED_BRANCH_B, 0).await,
+            row_value(0, "unrelated-b")
+        );
+    }
 
     println!(
-        "oltp_comparator_result,path=forktree_bc823_direct_typed_owner,rows={rows},operation={},batch_size={batch_size},wall_us={wall_us:.3},cpu_us={cpu_us:.3},alloc_bytes={alloc_bytes},alloc_calls={alloc_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},peak_before_bytes={peak_before},peak_after_bytes={peak_after},process_read_calls={},process_write_calls={},process_read_bytes={},process_write_bytes={},backend_begin_reads={},backend_begin_writes={},backend_get_calls={},backend_get_keys={},backend_get_values={},backend_get_value_bytes={},backend_scan_calls={},backend_scan_entries={},backend_scan_value_bytes={},backend_write_batches={},backend_write_puts={},backend_write_deletes={},backend_write_ranges={},backend_write_bytes={},backend_commits={},logical_commits={commits},disk_before_bytes={disk_before},disk_after_bytes={disk_after},flush_us={flush_us:.3},settled_disk_bytes={settled_disk},result_digest={result_digest},state_digest={state_digest},cold_digest={cold_digest},verified=true,returning_equivalent=direct_owner_postimage",
+        "oltp_comparator_result,path=forktree_bc823_direct_typed_owner,backend={},rows={rows},operation={},batch_size={batch_size},wall_us={wall_us:.3},cpu_us={cpu_us:.3},alloc_bytes={alloc_bytes},alloc_calls={alloc_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},peak_before_bytes={peak_before},peak_after_bytes={peak_after},process_read_calls={},process_write_calls={},process_read_bytes={},process_write_bytes={},backend_begin_reads={},backend_begin_writes={},backend_get_calls={},backend_get_keys={},backend_get_values={},backend_get_value_bytes={},backend_scan_calls={},backend_scan_entries={},backend_scan_value_bytes={},backend_write_batches={},backend_write_puts={},backend_write_deletes={},backend_write_ranges={},backend_write_bytes={},backend_commits={},logical_commits={commits},disk_before_bytes={disk_before},disk_after_bytes={disk_after},flush_us={flush_us:.3},settled_disk_bytes={settled_disk},result_digest={result_digest},state_digest={state_digest},cold_digest={cold_digest},verified=true,returning_equivalent=direct_owner_postimage",
+        S::LABEL,
         operation.label(),
         io.read_calls,
         io.write_calls,
@@ -234,6 +322,7 @@ async fn measure(path: &Path, rows: usize, operation: Operation, batch_size: usi
 
 async fn operation_run<S>(
     tree: &ForkTree<CountingStorage<S>>,
+    race_control: &CountingStorage<S>,
     rows: usize,
     operation: Operation,
     batch_size: usize,
@@ -340,30 +429,27 @@ where
                 .expect("apply ForkTree atomic18");
             ("affected:18".to_string(), 1)
         }
-        Operation::Upsert => {
+        Operation::UpsertConflict => {
             let mutations = (0..rows)
-                .map(|index| {
-                    if index % 2 == 0 {
-                        Mutation::Update {
-                            key: row_key(index).into_bytes(),
-                            value: RelationalValue::Bytes(
-                                row_value(index, "upsert-update").into_bytes(),
-                            ),
-                        }
-                    } else {
-                        Mutation::Insert {
-                            key: new_key(index).into_bytes(),
-                            value: RelationalValue::Bytes(
-                                row_value(index, "upsert-insert").into_bytes(),
-                            ),
-                        }
-                    }
+                .map(|index| Mutation::Update {
+                    key: row_key(index).into_bytes(),
+                    value: RelationalValue::Bytes(row_value(index, "upsert-conflict").into_bytes()),
                 })
                 .collect::<Vec<_>>();
             let mut sorted = mutations;
             sorted.sort_by(|left, right| left.key().cmp(right.key()));
             let commits = apply_chunks(tree, &sorted, batch_size).await;
             (format!("affected:{rows}"), commits)
+        }
+        Operation::UpsertNothing => {
+            for index in 0..rows {
+                let key = row_key(index);
+                tree.read_relational_point("main", key.as_bytes())
+                    .await
+                    .expect("read ForkTree upsert-nothing owner")
+                    .expect("ForkTree upsert-nothing row exists");
+            }
+            ("affected:0".to_string(), 0)
         }
         Operation::Returning => {
             let targets = target_keys(rows, update_count(rows, 10));
@@ -394,7 +480,102 @@ where
             assert_eq!(returned, returned_expected(rows));
             (map_digest(&returned), commits)
         }
+        Operation::StaleSameOwner => {
+            let left = [Mutation::Update {
+                key: row_key(0).into_bytes(),
+                value: RelationalValue::Bytes(row_value(0, "same-owner-winner").into_bytes()),
+            }];
+            let right = left.clone();
+            race_control.arm_publication_barrier(2);
+            let (left_result, right_result) = tokio::join!(
+                tree.apply_sorted_mutations(&left),
+                tree.apply_sorted_mutations(&right)
+            );
+            race_control.clear_publication_barrier();
+            assert_ne!(left_result.is_ok(), right_result.is_ok());
+            assert_eq!(
+                forktree_point_value(tree, "main", 0).await,
+                row_value(0, "same-owner-winner")
+            );
+            ("same_owner:winner_committed_stale_rejected".to_string(), 1)
+        }
+        Operation::StaleUnrelatedOwner => {
+            let left = [Mutation::Update {
+                key: row_key(0).into_bytes(),
+                value: RelationalValue::Bytes(row_value(0, "unrelated-a").into_bytes()),
+            }];
+            let right = [Mutation::Update {
+                key: row_key(0).into_bytes(),
+                value: RelationalValue::Bytes(row_value(0, "unrelated-b").into_bytes()),
+            }];
+            race_control.arm_publication_barrier(2);
+            let (left_result, right_result) = tokio::join!(
+                tree.apply_sorted_mutations_on(UNRELATED_BRANCH_A, &left),
+                tree.apply_sorted_mutations_on(UNRELATED_BRANCH_B, &right)
+            );
+            race_control.clear_publication_barrier();
+            assert_ne!(left_result.is_ok(), right_result.is_ok());
+            if left_result.is_err() {
+                tree.apply_sorted_mutations_on(UNRELATED_BRANCH_A, &left)
+                    .await
+                    .expect("retry unrelated-owner branch A after global conflict");
+            }
+            if right_result.is_err() {
+                tree.apply_sorted_mutations_on(UNRELATED_BRANCH_B, &right)
+                    .await
+                    .expect("retry unrelated-owner branch B after global conflict");
+            }
+            assert_eq!(
+                forktree_point_value(tree, UNRELATED_BRANCH_A, 0).await,
+                row_value(0, "unrelated-a")
+            );
+            assert_eq!(
+                forktree_point_value(tree, UNRELATED_BRANCH_B, 0).await,
+                row_value(0, "unrelated-b")
+            );
+            (
+                "unrelated_owner:one_global_retry_both_committed".to_string(),
+                2,
+            )
+        }
+        Operation::UnrelatedOwnerSequential => {
+            let left = [Mutation::Update {
+                key: row_key(0).into_bytes(),
+                value: RelationalValue::Bytes(row_value(0, "unrelated-a").into_bytes()),
+            }];
+            let right = [Mutation::Update {
+                key: row_key(0).into_bytes(),
+                value: RelationalValue::Bytes(row_value(0, "unrelated-b").into_bytes()),
+            }];
+            tree.apply_sorted_mutations_on(UNRELATED_BRANCH_A, &left)
+                .await
+                .expect("commit sequential unrelated-owner branch A");
+            tree.apply_sorted_mutations_on(UNRELATED_BRANCH_B, &right)
+                .await
+                .expect("commit sequential unrelated-owner branch B");
+            assert_eq!(
+                forktree_point_value(tree, UNRELATED_BRANCH_A, 0).await,
+                row_value(0, "unrelated-a")
+            );
+            assert_eq!(
+                forktree_point_value(tree, UNRELATED_BRANCH_B, 0).await,
+                row_value(0, "unrelated-b")
+            );
+            ("unrelated_owner:no_retry_both_committed".to_string(), 2)
+        }
     }
+}
+
+async fn forktree_point_value<S>(tree: &ForkTree<S>, branch: &str, index: usize) -> String
+where
+    S: lix::storage::Storage + Clone + Send + Sync + 'static,
+{
+    relational_text(
+        tree.read_relational_point(branch, row_key(index).as_bytes())
+            .await
+            .expect("read ForkTree owner-control point")
+            .expect("ForkTree owner-control row exists"),
+    )
 }
 
 async fn apply_chunks<S>(
@@ -480,15 +661,17 @@ fn expected_after(rows: usize, operation: Operation) -> BTreeMap<String, String>
                 expected.insert(new_key(index), row_value(index, "atomic-insert"));
             }
         }
-        Operation::Upsert => {
+        Operation::UpsertConflict => {
             for index in 0..rows {
-                if index % 2 == 0 {
-                    expected.insert(row_key(index), row_value(index, "upsert-update"));
-                } else {
-                    expected.insert(new_key(index), row_value(index, "upsert-insert"));
-                }
+                expected.insert(row_key(index), row_value(index, "upsert-conflict"));
             }
         }
+        Operation::UpsertNothing => {}
+        Operation::StaleSameOwner => {
+            expected.insert(row_key(0), row_value(0, "same-owner-winner"));
+        }
+        Operation::StaleUnrelatedOwner => {}
+        Operation::UnrelatedOwnerSequential => {}
     }
     expected
 }

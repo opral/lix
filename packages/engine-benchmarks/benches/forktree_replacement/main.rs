@@ -102,6 +102,7 @@ struct IoStats {
 struct CountingStorage<S> {
     inner: S,
     stats: Arc<Mutex<IoStats>>,
+    publication_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 struct CountingRead<R> {
@@ -121,9 +122,25 @@ impl<S> CountingStorage<S> {
             Self {
                 inner,
                 stats: Arc::clone(&stats),
+                publication_barrier: Arc::new(Mutex::new(None)),
             },
             stats,
         )
+    }
+
+    fn arm_publication_barrier(&self, participants: usize) {
+        *self
+            .publication_barrier
+            .lock()
+            .expect("publication barrier mutex") =
+            Some(Arc::new(tokio::sync::Barrier::new(participants)));
+    }
+
+    fn clear_publication_barrier(&self) {
+        *self
+            .publication_barrier
+            .lock()
+            .expect("publication barrier mutex") = None;
     }
 }
 
@@ -150,6 +167,14 @@ where
 
     async fn begin_write(&self, options: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
         self.stats.lock().expect("I/O stats mutex").begin_writes += 1;
+        let barrier = self
+            .publication_barrier
+            .lock()
+            .expect("publication barrier mutex")
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
         Ok(CountingWrite {
             inner: self.inner.begin_write(options).await?,
             stats: Arc::clone(&self.stats),
