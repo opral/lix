@@ -12,7 +12,6 @@ from __future__ import annotations
 import csv
 import json
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,6 +175,15 @@ class Token:
     end: int
 
 
+@dataclass(frozen=True)
+class FunctionDefinition:
+    path: Path
+    name: str
+    tokens: list[Token]
+    opening: int
+    closing: int
+
+
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -278,6 +286,135 @@ def function_bodies(tokens: list[Token], name: str) -> list[tuple[int, int]]:
     return result
 
 
+def function_definitions(path: Path) -> list[FunctionDefinition]:
+    tokens = tokenize(path.read_text(encoding="utf-8"))
+    result: list[FunctionDefinition] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token.text != "fn" or not IDENT.fullmatch(tokens[index + 1].text):
+            continue
+        brace = index + 2
+        while brace < len(tokens) and tokens[brace].text not in {"{", ";"}:
+            brace += 1
+        need(brace < len(tokens) and tokens[brace].text == "{",
+             f"{path}: function {tokens[index + 1].text} has no body")
+        result.append(FunctionDefinition(
+            path=path,
+            name=tokens[index + 1].text,
+            tokens=tokens,
+            opening=brace,
+            closing=matching(tokens, brace),
+        ))
+    return result
+
+
+def generic_call_end(tokens: list[Token], opening: int) -> int | None:
+    depth = 0
+    for index in range(opening, len(tokens)):
+        text = tokens[index].text
+        if text == "<":
+            depth += 1
+        elif text == ">":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def called_function_names(tokens: list[Token]) -> set[str]:
+    names: set[str] = set()
+    for index, token in enumerate(tokens):
+        if not IDENT.fullmatch(token.text):
+            continue
+        if index + 1 < len(tokens) and tokens[index + 1].text == "(":
+            names.add(token.text)
+            continue
+        if index + 1 < len(tokens) and tokens[index + 1].text == "<":
+            end = generic_call_end(tokens, index + 1)
+            if end is not None and end + 1 < len(tokens) and tokens[end + 1].text == "(":
+                names.add(token.text)
+    return names
+
+
+def acquisition_calls(tokens: list[Token]) -> list[str]:
+    acquisitions: list[str] = []
+    for index, token in enumerate(tokens):
+        if token.text in {"begin_read", "open_coherent_view"}:
+            if index + 1 < len(tokens) and tokens[index + 1].text == "(":
+                acquisitions.append(token.text)
+        elif token.text == "new" and index >= 3 and index + 1 < len(tokens):
+            if tokens[index - 1].text == ":" and tokens[index - 2].text == ":" \
+                    and tokens[index - 3].text == "ForkTreeReadFacade" \
+                    and tokens[index + 1].text == "(":
+                acquisitions.append("ForkTreeReadFacade::new")
+    return acquisitions
+
+
+SOURCE_CLOSURE_PATHS = (
+    "sql2/providers/change.rs",
+    "sql2/context.rs",
+    "session/context.rs",
+    "transaction/context.rs",
+    "forktree/view.rs",
+    "forktree/serving.rs",
+    "forktree/mod.rs",
+)
+
+
+def source_closure(candidate: Path) -> list[FunctionDefinition]:
+    root = candidate / "packages/lix/src"
+    definitions: list[FunctionDefinition] = []
+    for relative in SOURCE_CLOSURE_PATHS:
+        path = root / relative
+        if path.exists():
+            definitions.extend(function_definitions(path))
+
+    by_name: dict[str, list[FunctionDefinition]] = {}
+    for definition in definitions:
+        by_name.setdefault(definition.name, []).append(definition)
+
+    root_specs = (
+        (root / "sql2/providers/change.rs", "scan_changelog_changes"),
+        (root / "sql2/providers/change.rs", "load_exact_change"),
+        (root / "session/context.rs", "changelog_query_source"),
+        (root / "transaction/context.rs", "changelog_query_source"),
+    )
+    roots: list[FunctionDefinition] = []
+    for path, name in root_specs:
+        matching_definitions = [definition for definition in definitions
+                                if definition.path == path and definition.name == name]
+        need(len(matching_definitions) == 1,
+             f"{path}: expected exactly one {name} definition")
+        roots.extend(matching_definitions)
+
+    # Include every same-file caller of the two provider seams. This makes the
+    # closure cover the actual call sites, not only the callee definitions.
+    provider_names = {"scan_changelog_changes", "load_exact_change"}
+    for definition in definitions:
+        body = definition.tokens[definition.opening + 1:definition.closing]
+        if definition.path.name == "change.rs" and called_function_names(body) & provider_names:
+            roots.append(definition)
+
+    ignored_calls = {
+        "begin_read", "open_coherent_view", "new", "clone", "as_ref", "as_mut",
+        "len", "is_empty", "iter", "into_iter", "collect", "map", "filter",
+        "ok", "err", "unwrap", "expect", "Some", "None", "Ok", "Err",
+    }
+    closure: list[FunctionDefinition] = []
+    pending = list(roots)
+    seen: set[tuple[Path, int]] = set()
+    while pending:
+        definition = pending.pop()
+        identity = (definition.path, definition.opening)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        closure.append(definition)
+        body = definition.tokens[definition.opening + 1:definition.closing]
+        for called_name in sorted(called_function_names(body) - ignored_calls):
+            pending.extend(by_name.get(called_name, []))
+    return closure
+
+
 def call_arguments(tokens: list[Token], name: str) -> list[list[Token]]:
     calls: list[list[Token]] = []
     for index, token in enumerate(tokens[:-1]):
@@ -356,6 +493,30 @@ def constructor_proof(path: Path, label: str) -> None:
          f"{label}: changelog source constructor contains a second read acquisition")
 
 
+def source_closure_proof(candidate: Path) -> None:
+    closure = source_closure(candidate)
+    need(closure, "source closure is empty")
+    constructor_paths = {
+        candidate / "packages/lix/src/session/context.rs",
+        candidate / "packages/lix/src/transaction/context.rs",
+    }
+    constructor_names = {"changelog_query_source"}
+    for definition in closure:
+        body = definition.tokens[definition.opening + 1:definition.closing]
+        acquisitions = acquisition_calls(body)
+        is_constructor = definition.path in constructor_paths and definition.name in constructor_names
+        if is_constructor:
+            need(acquisitions == ["ForkTreeReadFacade::new"],
+                 f"{definition.path}: expected exactly one ForkTreeReadFacade::new acquisition, "
+                 f"found {acquisitions}")
+        else:
+            need(not acquisitions,
+                 f"{definition.path}:{definition.name}: unexpected reader acquisition(s) "
+                 f"in transitive source closure: {acquisitions}")
+    names = ", ".join(f"{definition.path.name}::{definition.name}" for definition in closure)
+    print(f"FUNCTION-CLOSURE-PASS {len(closure)} definitions: {names}")
+
+
 def structural_proof(candidate: Path) -> None:
     root = candidate / "packages/lix/src"
     provider_path = root / "sql2/providers/change.rs"
@@ -381,7 +542,18 @@ def structural_proof(candidate: Path) -> None:
 
     constructor_proof(root / "session/context.rs", "session/context.rs")
     constructor_proof(root / "transaction/context.rs", "transaction/context.rs")
-    print("STRUCTURAL-PASS one facade field, balanced call arguments, and two retained-read constructors")
+    source_closure_proof(candidate)
+    print("STRUCTURAL-PASS one facade field, balanced call arguments, and one retained acquisition")
+
+
+def negative_source_fixture_proof(package: Path) -> None:
+    fixture = package / "source-fixtures" / "extra-reader"
+    try:
+        source_closure_proof(fixture)
+    except (OSError, ContractError, KeyError, IndexError) as error:
+        print(f"NEGATIVE-PASS extra reader rejected: {error}")
+        return
+    raise ContractError("extra-reader source fixture unexpectedly passed")
 
 
 def main(argv: list[str]) -> int:
@@ -394,6 +566,7 @@ def main(argv: list[str]) -> int:
     package = Path(__file__).resolve().parent
     model_ok = run_fixture_model(package)
     try:
+        negative_source_fixture_proof(package)
         structural_proof(candidate)
     except (OSError, ContractError, KeyError, IndexError) as error:
         print(f"STRUCTURAL-RED {error}")
