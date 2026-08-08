@@ -163,6 +163,7 @@ pub(crate) async fn commit_prepared_writes(
         crate::ANONYMOUS_ACCOUNT_ID,
         &commit_parent_heads,
         read,
+        &BTreeMap::new(),
         prepared_writes,
     )
     .await
@@ -178,6 +179,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     active_account_id: &str,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
+    branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -770,6 +772,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &explicit_branch_targets,
         &insert_selection,
         &prepared_writes.checkpoint_publications,
+        branch_checkpoint_bridges,
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
@@ -4902,6 +4905,40 @@ fn insert_direct_branch_control(
     Ok(())
 }
 
+fn bind_branch_checkpoint_bridge(
+    branch_id: &str,
+    target: &ExplicitBranchHeadTarget,
+    existing: Option<BranchHeadControl>,
+    control: &mut BranchHeadControl,
+    bridge: &crate::gc::CheckpointRecoveryRef,
+) -> Result<TrackedWorkingDiffEpoch, LixError> {
+    let Some(target_head) = target.head_commit_id else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("checkpoint ancestry bridge cannot delete branch '{branch_id}'"),
+        ));
+    };
+    if bridge.branch_id != branch_id
+        || existing.is_some()
+        || bridge.recovered_head_commit_id != target_head
+        || control.head_commit_id != target_head
+        || bridge.checkpoint_commit_id == target_head
+        || !bridge.interval_has_commits
+        || control.working_diff_checkpoint_commit_id.is_some()
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' has an invalid checkpoint ancestry bridge"),
+        ));
+    }
+    control.working_diff_checkpoint_commit_id = Some(bridge.checkpoint_commit_id);
+    Ok(TrackedWorkingDiffEpoch {
+        checkpoint_commit_id: bridge.checkpoint_commit_id,
+        generation: control.tracked_generation,
+        coverage: WorkingDiffIndexCoverage::default(),
+    })
+}
+
 /// Publishes every current-state branch control under an exact-byte CAS token.
 ///
 /// Normal tracked commits arrive as `normal_controls`, built from the same
@@ -4993,17 +5030,30 @@ async fn stage_branch_head_control_publications(
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     insert_selection: &PreparedInsertSelection,
     checkpoint_publications: &[crate::gc::CheckpointPublication],
+    branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
     root_reachability_deltas: &mut Vec<crate::gc::RootReachabilityDelta>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
+    if let Some(branch_id) = branch_checkpoint_bridges
+        .keys()
+        .find(|branch_id| checkpoint_epochs.contains_key(*branch_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' cannot publish a checkpoint and an ancestry bridge together"
+            ),
+        ));
+    }
     let mut publications = normal_controls
         .iter()
         .map(|(branch_id, control)| (branch_id.clone(), Some(*control)))
         .collect::<BTreeMap<String, Option<BranchHeadControl>>>();
     let tracked_head = TrackedHeadContext::new();
+    let mut consumed_checkpoint_bridges = BTreeSet::new();
     for (branch_id, target) in explicit_branch_targets {
         if publications.contains_key(branch_id) {
             return Err(LixError::new(
@@ -5024,7 +5074,7 @@ async fn stage_branch_head_control_publications(
                 )
             })?
             .control;
-        let desired = match target.head_commit_id {
+        let mut desired = match target.head_commit_id {
             None => None,
             Some(head_commit_id) => {
                 if existing.is_none() {
@@ -5158,7 +5208,34 @@ async fn stage_branch_head_control_publications(
                 }
             }
         };
+        if let Some(bridge) = branch_checkpoint_bridges.get(branch_id) {
+            let control = desired.as_mut().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "checkpoint ancestry bridge has no branch publication for '{branch_id}'"
+                    ),
+                )
+            })?;
+            let epoch =
+                bind_branch_checkpoint_bridge(branch_id, target, existing, control, bridge)?;
+            stage_tracked_working_diff_epoch(writes, branch_id, epoch)?;
+            crate::gc::stage_recovery_ref_rotation(writes, bridge)?;
+            consumed_checkpoint_bridges.insert(branch_id.clone());
+        }
         publications.insert(branch_id.clone(), desired);
+    }
+    if consumed_checkpoint_bridges.len() != branch_checkpoint_bridges.len() {
+        let branch_id = branch_checkpoint_bridges
+            .keys()
+            .find(|branch_id| !consumed_checkpoint_bridges.contains(*branch_id))
+            .expect("bridge count differs only when one branch was not consumed");
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "checkpoint ancestry bridge has no explicit branch publication for '{branch_id}'"
+            ),
+        ));
     }
 
     if publications.is_empty() {
@@ -5216,7 +5293,10 @@ async fn stage_branch_head_control_publications(
         }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
-            None => stage_delete_branch_head_control(writes, branch_id)?,
+            None => {
+                stage_delete_branch_head_control(writes, branch_id)?;
+                crate::gc::stage_delete_recovery_ref(writes, branch_id)?;
+            }
         }
     }
     Ok(publications
@@ -6516,7 +6596,7 @@ fn account_has_changes_error(account_id: &str) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -6551,6 +6631,158 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[tokio::test]
+    async fn branch_creation_owner_publishes_checkpoint_serving_context() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut seed = storage.new_write_set();
+        crate::gc::stage_reachability_queue_seed(&mut seed)
+            .expect("reachability queue should seed");
+        storage
+            .commit_write_set(seed, StorageWriteOptions::default())
+            .await
+            .expect("reachability queue seed should commit");
+
+        let branch_id = "01960000-0000-7000-8000-0000000000b1";
+        let recovered_head = commit_id("branch-bridge-recovered-head");
+        let checkpoint = commit_id("branch-bridge-checkpoint");
+        let target = ExplicitBranchHeadTarget {
+            head_commit_id: Some(recovered_head),
+            ref_change_id: change_id("branch-bridge-ref-change"),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+        };
+        let bridge = crate::gc::CheckpointRecoveryRef {
+            branch_id: branch_id.to_owned(),
+            recovered_head_commit_id: recovered_head,
+            checkpoint_commit_id: checkpoint,
+            interval_has_commits: true,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch publication read should open");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let mut root_backed = BTreeSet::new();
+        let mut reachability_deltas = Vec::new();
+        let controls = stage_branch_head_control_publications(
+            &read,
+            &mut writes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &PreparedStateBatch::new(),
+            &[],
+            &BTreeMap::from([(branch_id.to_owned(), target)]),
+            &PreparedInsertSelection::new(),
+            &[],
+            &BTreeMap::from([(branch_id.to_owned(), bridge.clone())]),
+            &mut preconditions,
+            &BTreeMap::from([(
+                branch_id.to_owned(),
+                BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &mut root_backed,
+            &mut reachability_deltas,
+        )
+        .await
+        .expect("branch owner should stage checkpoint serving context");
+        let control = controls
+            .get(branch_id)
+            .copied()
+            .expect("created branch should have a complete control");
+        assert_eq!(control.head_commit_id, recovered_head);
+        assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
+        assert!(root_backed.contains(branch_id));
+        assert_eq!(reachability_deltas.len(), 1);
+        assert_eq!(reachability_deltas[0].old_root, None);
+        assert_eq!(reachability_deltas[0].new_root, Some(recovered_head));
+        assert_eq!(reachability_deltas[0].new_control, Some(control));
+        crate::gc::stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            &reachability_deltas,
+            &[],
+            &mut preconditions,
+        )
+        .await
+        .expect("branch publication should stage the exact queue fence");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("branch serving context should publish atomically");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch serving verification read should open");
+        let persisted = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .expect("created branch control should load")
+            .expect("created branch control should exist");
+        assert_eq!(persisted, control);
+        let epoch = TrackedHeadContext::new()
+            .reader(&read)
+            .working_diff_epoch(branch_id)
+            .await
+            .expect("branch working-diff epoch should load")
+            .expect("branch working-diff epoch should exist");
+        assert_eq!(epoch.checkpoint_commit_id, checkpoint);
+        assert_eq!(epoch.generation, control.tracked_generation);
+        assert_eq!(
+            crate::gc::resolve_checkpoint_branch_parent(
+                &read,
+                branch_id,
+                recovered_head,
+                control.working_diff_checkpoint_commit_id,
+            )
+            .await
+            .expect("branch serving context should validate"),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_checkpoint_without_complete_hot_control_still_fails() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("checkpoint validation read should open");
+        let mut writes = storage.new_write_set();
+        let checkpoint = commit_id("missing-hot-checkpoint");
+        let error = stage_checkpoint_working_diff_epochs(
+            &read,
+            &mut writes,
+            &[crate::gc::CheckpointPublication {
+                recovery_ref: crate::gc::CheckpointRecoveryRef {
+                    branch_id: "01960000-0000-7000-8000-0000000000b2".to_owned(),
+                    recovered_head_commit_id: commit_id("missing-hot-recovered-head"),
+                    checkpoint_commit_id: checkpoint,
+                    interval_has_commits: true,
+                },
+                gc_state: crate::gc::CheckpointGcState::default(),
+            }],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("real checkpoint publication without complete HOT control must fail");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("has no complete hot control"));
     }
 
     #[test]

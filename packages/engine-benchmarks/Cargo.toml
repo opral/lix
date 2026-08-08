@@ -115,6 +115,11 @@ path = "tests/checkpoint_gc_replay_reopen.rs"
 required-features = ["rocksdb", "slatedb"]
 
 [[test]]
+name = "checkpoint_branch_merge_reopen"
+path = "tests/checkpoint_branch_merge_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[test]]
 name = "cas_gc_history_retention"
 path = "tests/cas_gc_history_retention.rs"
 required-features = ["storage-benches", "slatedb"]

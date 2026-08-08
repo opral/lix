@@ -347,6 +347,20 @@ pub(crate) struct RootReachabilityDelta {
     pub(crate) new_control_digest: [u8; 32],
 }
 
+/// One authenticated checkpoint replacement that is still pending physical
+/// retirement.
+///
+/// Callers receive only the typed canonical replacement. The queue remains
+/// GC-owned maintenance state and never becomes a merge-time chronology
+/// reader. A caller may use this proof only while publishing from the same
+/// coherent read: the ordinary reachability-batch writer then CASes the exact
+/// queue row observed by this resolver.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PendingCheckpointReplacement {
+    pub(crate) checkpoint_commit_id: CommitId,
+    pub(crate) checkpoint_branch_id: String,
+}
+
 /// Stages one branch's recovery-root rotation.
 ///
 /// The caller owns the surrounding transaction. Replacing the key drops the
@@ -379,6 +393,20 @@ pub(crate) fn stage_recovery_ref_rotation(
         StorageValue {
             bytes: Bytes::from(value),
         },
+    );
+    Ok(())
+}
+
+/// Retires branch-local checkpoint serving context with its canonical branch
+/// control. A deleted branch must not keep recovered history or compacted
+/// checkpoints live through an orphan recovery row.
+pub(crate) fn stage_delete_recovery_ref(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+) -> Result<(), LixError> {
+    writes.delete(
+        CHECKPOINT_RECOVERY_REF_SPACE,
+        StorageKey(Bytes::from(recovery_ref_key(branch_id)?)),
     );
     Ok(())
 }
@@ -774,6 +802,106 @@ where
         },
     )
     .await
+}
+
+/// Resolves a still-pending checkpoint replacement for an explicit branch
+/// source, or proves that the source remains reachable through ordinary
+/// canonical chronology.
+///
+/// A checkpoint replacement is accepted only when one authenticated pending
+/// batch binds `source_commit_id -> checkpoint_commit_id` through matching
+/// branch controls and includes that checkpoint in the same batch's root set.
+/// Branch publication must retain this read through the ordinary reachability
+/// batch writer, whose queue CAS prevents GC consumption and branch creation
+/// from both committing from the same observation.
+pub(crate) async fn resolve_pending_checkpoint_replacement<S>(
+    store: &S,
+    source_commit_id: CommitId,
+) -> Result<Option<PendingCheckpointReplacement>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let (queue, _) = load_reachability_queue(store).await?;
+    let candidates =
+        fold_reachability_batches(store, &queue, None, Vec::new(), |candidates, _, batch| {
+            let checkpoint_roots = batch
+                .checkpoint_roots
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            for delta in &batch.deltas {
+                validate_stored_root_reachability_delta(delta)?;
+                if delta.old_root != Some(source_commit_id) {
+                    continue;
+                }
+                let Some(checkpoint_commit_id) = delta.new_root else {
+                    continue;
+                };
+                let Some(new_control) = delta.new_control else {
+                    continue;
+                };
+                if new_control.working_diff_checkpoint_commit_id == Some(checkpoint_commit_id)
+                    && checkpoint_roots.contains(&checkpoint_commit_id)
+                {
+                    candidates.push((checkpoint_commit_id, delta.branch_id.clone()));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    match candidates.len() {
+        0 => {}
+        1 => {
+            let (checkpoint_commit_id, checkpoint_branch_id) = candidates
+                .into_iter()
+                .next()
+                .expect("single checkpoint replacement candidate");
+            return Ok(Some(PendingCheckpointReplacement {
+                checkpoint_commit_id,
+                checkpoint_branch_id,
+            }));
+        }
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{source_commit_id}' has ambiguous pending checkpoint replacements"
+                ),
+            ));
+        }
+    }
+
+    let controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .scan()
+        .await?;
+    let roots = controls
+        .into_iter()
+        .flat_map(|(_, control)| control.tracked_reachability().chronology_roots)
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    if roots.contains(&source_commit_id) {
+        return Ok(None);
+    }
+    let mut graph = CommitGraphContext::new().reader(store.clone());
+    for root in roots {
+        if graph
+            .reachable_nodes(&root)
+            .await?
+            .iter()
+            .any(|reachable| reachable.commit.commit_id == source_commit_id)
+        {
+            return Ok(None);
+        }
+    }
+    Err(LixError::commit_not_found(
+        source_commit_id.to_string(),
+        "create_branch",
+        "commit_source",
+    )
+    .with_hint(
+        "The commit is no longer an authenticated branchable root after checkpoint compaction.",
+    ))
 }
 
 #[allow(dead_code)]
@@ -1554,6 +1682,36 @@ pub(crate) async fn load_recovery_ref(
         checkpoint_commit_id: stored.checkpoint_commit_id,
         interval_has_commits: stored.interval_has_commits,
     }))
+}
+
+/// Returns the bounded checkpoint parent consumed by the first ordinary
+/// commit on a branch created from a recovered historical head.
+///
+/// The recovery row and branch control are serving context only. Once this
+/// returns, commit publication records the checkpoint as an ordinary graph
+/// parent; merge/history readers never consult either serving record.
+pub(crate) async fn resolve_checkpoint_branch_parent(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    head_commit_id: CommitId,
+    working_diff_checkpoint_commit_id: Option<CommitId>,
+) -> Result<Option<CommitId>, LixError> {
+    let Some(recovery) = load_recovery_ref(store, branch_id).await? else {
+        return Ok(None);
+    };
+    if recovery.recovered_head_commit_id != head_commit_id {
+        return Ok(None);
+    }
+    if !recovery.interval_has_commits
+        || recovery.checkpoint_commit_id == head_commit_id
+        || working_diff_checkpoint_commit_id != Some(recovery.checkpoint_commit_id)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' has an invalid pending checkpoint ancestry bridge"),
+        ));
+    }
+    Ok(Some(recovery.checkpoint_commit_id))
 }
 
 pub(crate) async fn load_checkpoint_gc_state(
@@ -3469,7 +3627,7 @@ mod tests {
         stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
         stage_ordered_addressable_replacement_parts,
     };
-    use crate::{GLOBAL_BRANCH_ID, Value, engine::Engine};
+    use crate::{GLOBAL_BRANCH_ID, LixError, Value, engine::Engine};
     use bytes::Bytes;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -3481,9 +3639,11 @@ mod tests {
         RootReachabilityDelta, StoredTreeSweepMark, authenticated_control_commit_reachability,
         begin_tree_sweep_epoch, collect_all_reachability_checkpoint_roots,
         load_checkpoint_gc_state, load_reachability_batches, load_reachability_queue,
-        load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch, retirement_is_proven,
-        root_control_digest_for_control, stage_checkpoint_gc_state, stage_reachability_delta_batch,
-        stage_reachability_queue_seed, stage_recovery_ref_rotation, stage_tree_sweep_epoch_page,
+        load_recovery_ref, load_recovery_refs, open_tree_sweep_epoch,
+        resolve_pending_checkpoint_replacement, retirement_is_proven,
+        root_control_digest_for_control, stage_checkpoint_gc_state, stage_delete_recovery_ref,
+        stage_reachability_delta_batch, stage_reachability_queue_seed, stage_recovery_ref_rotation,
+        stage_tree_sweep_epoch_page,
     };
 
     async fn append_checkpoint_batch(
@@ -5303,6 +5463,32 @@ mod tests {
                 .expect("main recovery ref should load"),
             Some(second_main)
         );
+        drop(read);
+
+        let mut writes = storage.new_write_set();
+        stage_delete_recovery_ref(&mut writes, "main")
+            .expect("deleted branch recovery ref should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("deleted branch recovery ref should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retired recovery read should open");
+        assert_eq!(
+            load_recovery_ref(&read, "main")
+                .await
+                .expect("retired main recovery ref should load"),
+            None
+        );
+        assert!(
+            load_recovery_ref(&read, "other")
+                .await
+                .expect("other recovery ref should load")
+                .is_some(),
+            "retiring one branch must not remove another branch's serving context"
+        );
     }
 
     #[tokio::test]
@@ -5391,6 +5577,225 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].1.checkpoint_roots, vec![new_root]);
         assert_eq!(batches[0].1.deltas[0].old_root, Some(old_root));
+    }
+
+    fn checkpoint_replacement_delta(
+        label: &str,
+        old_root: CommitId,
+        new_root: CommitId,
+    ) -> RootReachabilityDelta {
+        let timestamp = LixTimestamp::expect_parse(
+            "checkpoint replacement test timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        let old_control = BranchHeadControl {
+            head_commit_id: old_root,
+            tracked_generation: old_root,
+            untracked_generation: old_root,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label(&format!("{label}-old-control")),
+            schema_presence_bloom: [0; 4],
+        };
+        let new_control = BranchHeadControl {
+            head_commit_id: new_root,
+            tracked_generation: new_root,
+            untracked_generation: new_root,
+            current_state_revision: 1,
+            working_diff_checkpoint_commit_id: Some(new_root),
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label(&format!("{label}-new-control")),
+            schema_presence_bloom: [0; 4],
+        };
+        RootReachabilityDelta {
+            branch_id: label.to_owned(),
+            old_root: Some(old_root),
+            new_root: Some(new_root),
+            old_control: Some(old_control),
+            new_control: Some(new_control),
+            old_control_digest: root_control_digest_for_control(Some(&old_control))
+                .expect("old replacement control should encode"),
+            new_control_digest: root_control_digest_for_control(Some(&new_control))
+                .expect("new replacement control should encode"),
+        }
+    }
+
+    async fn append_replacement_delta(
+        storage: &StorageAdapter<Memory>,
+        delta: RootReachabilityDelta,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replacement publication read should open");
+        let checkpoint = delta.new_root.expect("replacement has a new root");
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &read,
+            &mut writes,
+            std::slice::from_ref(&delta),
+            &[checkpoint],
+            &mut preconditions,
+        )
+        .await
+        .expect("replacement delta should stage");
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("replacement delta should commit");
+    }
+
+    #[tokio::test]
+    async fn pending_checkpoint_replacement_is_unique_and_queue_cas_fenced() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut seed = storage.new_write_set();
+        stage_reachability_queue_seed(&mut seed).expect("queue seed should stage");
+        storage
+            .commit_write_set(seed, StorageWriteOptions::default())
+            .await
+            .expect("queue seed should commit");
+
+        let recovered = CommitId::for_test_label("pending-replacement-recovered");
+        let checkpoint = CommitId::for_test_label("pending-replacement-checkpoint");
+        append_replacement_delta(
+            &storage,
+            checkpoint_replacement_delta("main", recovered, checkpoint),
+        )
+        .await;
+
+        let stale_read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("branch publication read should open"),
+        );
+        let proof = resolve_pending_checkpoint_replacement(&stale_read, recovered)
+            .await
+            .expect("unique pending replacement should authenticate")
+            .expect("pending replacement should exist");
+        assert_eq!(proof.checkpoint_commit_id, checkpoint);
+        assert_eq!(proof.checkpoint_branch_id, "main");
+
+        let mut stale_writes = storage.new_write_set();
+        let mut stale_preconditions = Vec::new();
+        stage_reachability_delta_batch(
+            &stale_read,
+            &mut stale_writes,
+            &[],
+            &[checkpoint],
+            &mut stale_preconditions,
+        )
+        .await
+        .expect("branch-side queue fence should stage");
+
+        let second_checkpoint = CommitId::for_test_label("pending-replacement-checkpoint-2");
+        append_replacement_delta(
+            &storage,
+            checkpoint_replacement_delta("main", recovered, second_checkpoint),
+        )
+        .await;
+        let stale_error = storage
+            .commit_write_set(
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: stale_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale branch publication must lose the queue CAS");
+        assert!(stale_error.to_string().contains("precondition"));
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("ambiguous replacement read should open"),
+        );
+        let ambiguous = resolve_pending_checkpoint_replacement(&read, recovered)
+            .await
+            .expect_err("two pending direct replacements must fail closed");
+        assert!(ambiguous.message.contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn recovery_ref_without_pending_replacement_is_not_branchable_authority() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
+        let recovered = CommitId::for_test_label("consumed-replacement-recovered");
+        let checkpoint = CommitId::for_test_label("consumed-replacement-checkpoint");
+        stage_recovery_ref_rotation(
+            &mut writes,
+            &CheckpointRecoveryRef {
+                branch_id: "main".to_owned(),
+                recovered_head_commit_id: recovered,
+                checkpoint_commit_id: checkpoint,
+                interval_has_commits: true,
+            },
+        )
+        .expect("recovery ref should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("recovery-only fixture should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("recovery-only read should open"),
+        );
+        let error = resolve_pending_checkpoint_replacement(&read, recovered)
+            .await
+            .expect_err("a mutable recovery ref must not replace a consumed queue proof");
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn malformed_pending_checkpoint_replacement_fails_closed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut seed = storage.new_write_set();
+        stage_reachability_queue_seed(&mut seed).expect("queue seed should stage");
+        storage
+            .commit_write_set(seed, StorageWriteOptions::default())
+            .await
+            .expect("queue seed should commit");
+
+        let recovered = CommitId::for_test_label("malformed-replacement-recovered");
+        let checkpoint = CommitId::for_test_label("malformed-replacement-checkpoint");
+        let mut malformed = checkpoint_replacement_delta("main", recovered, checkpoint);
+        malformed
+            .new_control
+            .as_mut()
+            .expect("replacement has new control")
+            .working_diff_checkpoint_commit_id = None;
+        malformed.new_control_digest =
+            root_control_digest_for_control(malformed.new_control.as_ref())
+                .expect("malformed control should still encode");
+        append_replacement_delta(&storage, malformed).await;
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("malformed replacement read should open"),
+        );
+        let error = resolve_pending_checkpoint_replacement(&read, recovered)
+            .await
+            .expect_err("mapping without an exact checkpoint baseline must fail closed");
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
     }
 
     #[tokio::test]
