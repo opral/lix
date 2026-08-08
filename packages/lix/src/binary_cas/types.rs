@@ -1,8 +1,39 @@
 use crate::LixError;
-use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
-use crate::binary_cas::codec::BinaryChunkCodec;
-use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
+
+const MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn hash_bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String is infallible");
+    }
+    encoded
+}
+
+fn hash_hex_to_bytes(value: &str, context: &str) -> Result<[u8; 32], LixError> {
+    if value.len() != 64 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("{context} hash must contain 64 hexadecimal characters"),
+        ));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("{context} hash contains non-hexadecimal characters"),
+            )
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn binary_blob_hash_bytes(content: &[u8]) -> [u8; 32] {
+    *blake3::hash(content).as_bytes()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobId([u8; 32]);
@@ -259,13 +290,4 @@ pub(crate) struct BlobWriteReceipt {
 pub(crate) struct BlobChunkReceipt {
     pub(crate) hash: ChunkHash,
     pub(crate) size_bytes: u64,
-}
-
-#[derive(musli::Decode)]
-#[musli(packed)]
-pub(crate) struct BinaryCasChunkView<'a> {
-    pub(crate) codec: BinaryChunkCodec,
-    pub(crate) uncompressed_len: u64,
-    #[musli(bytes)]
-    pub(crate) payload: &'a [u8],
 }

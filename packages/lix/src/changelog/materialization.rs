@@ -3,17 +3,13 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 
 use crate::LixError;
-use crate::common::{ExactBatch, SharedStr};
+use crate::common::SharedStr;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
 };
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageProjectedValue,
-};
+use crate::storage_adapter::StorageAdapterRead;
 
-use super::{CHANGE_SPACE, ChangeId, ChangeRecord, decode_change_record};
-
-const CHANGE_STORAGE_KEY_BYTES: usize = 16;
+use super::{ChangeId, ChangeRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChangeRecordProjection {
@@ -84,88 +80,14 @@ where
     if unique.is_empty() {
         return Ok(HashMap::new());
     }
-    let records = load_unique_change_records_in_order(store, &unique).await?;
+    let records = crate::forktree::load_change_records(store, &unique).await?;
     let mut by_id = HashMap::with_capacity(unique.len());
-    for (change_id, record) in records {
+    for (change_id, record) in unique.into_iter().zip(records) {
         if let Some(record) = record {
-            by_id.insert(*change_id, record);
+            by_id.insert(change_id, record);
         }
     }
     Ok(by_id)
-}
-
-/// Loads a caller-deduplicated change-id batch.
-///
-/// All changelog keys are fixed-width UUID bytes, so one immutable arena can
-/// back every point-read key. The plan also receives the keys as already
-/// unique, avoiding a second hash table, key vector, caller-order remap, and
-/// materialized value vector for the common identity mapping. Decoded records
-/// retain that same order so batch materialization does not need an
-/// intermediate `HashMap`.
-async fn load_unique_change_records_in_order<'a, S>(
-    store: &S,
-    unique: &'a [ChangeId],
-) -> Result<ExactBatch<'a, ChangeId, ChangeRecord>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if unique.is_empty() {
-        return ExactBatch::try_new("change materialization", unique, Vec::new());
-    }
-    let keys = change_storage_keys(unique)?;
-    let plan = PointReadPlan::from_unique_keys(CHANGE_SPACE, keys);
-    let result = plan.collect(store, StorageGetOptions::default()).await?;
-    decode_change_records_in_order(unique, result.value.unique_values)
-}
-
-fn decode_change_records_in_order(
-    unique: &[ChangeId],
-    values: Vec<Option<StorageProjectedValue>>,
-) -> Result<ExactBatch<'_, ChangeId, ChangeRecord>, LixError> {
-    let records = unique
-        .iter()
-        .copied()
-        .zip(values)
-        .map(|(change_id, value)| match value {
-            None => Ok(None),
-            Some(StorageProjectedValue::FullValue(bytes)) => {
-                decode_change_record(&bytes, change_id).map(Some)
-            }
-            Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "change point read returned a key-only projection for ChangeRecord '{change_id}'"
-                ),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ExactBatch::try_new("change materialization", unique, records)
-}
-
-fn change_storage_keys(
-    unique: &[ChangeId],
-) -> Result<Vec<crate::storage_adapter::StorageKey>, LixError> {
-    let arena_len = unique
-        .len()
-        .checked_mul(CHANGE_STORAGE_KEY_BYTES)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "change point-read key arena size overflowed",
-            )
-        })?;
-    let mut arena = Vec::with_capacity(arena_len);
-    for change_id in unique {
-        arena.extend_from_slice(change_id.as_uuid().as_bytes());
-    }
-    debug_assert_eq!(arena.len(), arena_len);
-    let arena = Bytes::from(arena);
-    Ok((0..unique.len())
-        .map(|index| {
-            let start = index * CHANGE_STORAGE_KEY_BYTES;
-            crate::storage_adapter::StorageKey(arena.slice(start..start + CHANGE_STORAGE_KEY_BYTES))
-        })
-        .collect())
 }
 
 /// Hydrates records that a caller already retained from their authoritative

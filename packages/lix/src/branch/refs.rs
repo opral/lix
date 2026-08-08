@@ -1,5 +1,5 @@
 use crate::LixError;
-use crate::branch::{BranchHead, BranchHeadControlContext, BranchRefReader};
+use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -20,9 +20,7 @@ impl BranchRefContext {
     where
         S: StorageAdapterRead,
     {
-        BranchRefStoreReader {
-            controls: BranchHeadControlContext::new().reader(store),
-        }
+        BranchRefStoreReader { store }
     }
 }
 
@@ -31,7 +29,7 @@ pub(super) struct BranchRefStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    controls: crate::branch::BranchHeadControlReader<S>,
+    store: S,
 }
 
 impl<S> BranchRefStoreReader<S>
@@ -39,13 +37,11 @@ where
     S: StorageAdapterRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        Ok(self
-            .controls
-            .load(branch_id)
+        Ok(crate::forktree::load_branch_head(&self.store, branch_id)
             .await?
-            .map(|control| BranchHead {
+            .map(|commit_id| BranchHead {
                 branch_id: branch_id.to_string(),
-                commit_id: control.head_commit_id,
+                commit_id,
             }))
     }
 
@@ -57,14 +53,12 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        Ok(self
-            .controls
-            .scan()
+        Ok(crate::forktree::scan_branch_heads(&self.store)
             .await?
             .into_iter()
-            .map(|(branch_id, control)| BranchHead {
+            .map(|(branch_id, commit_id)| BranchHead {
                 branch_id,
-                commit_id: control.head_commit_id,
+                commit_id,
             })
             .collect())
     }

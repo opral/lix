@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::storage::StorageError;
+use crate::storage::{
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, Prefix, ProjectedValue,
+    ScanOrder, StorageError,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::corruption;
 use super::model::{
-    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId,
-    CommitObjectV1,
+    BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
+    RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
 use super::state::{StateCell, StateValue, decode_state_key, decode_state_value};
@@ -14,7 +18,11 @@ use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations, lookup_on_read,
     scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
 };
-use super::view::CoherentView;
+use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
+
+const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
+const BRANCH_SCAN_PAGE_ROWS: usize = 256;
+const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateSource {
@@ -105,6 +113,469 @@ impl CatalogTreeEdit {
 pub(crate) struct CatalogPage<T> {
     pub(crate) entries: Vec<T>,
     pub(crate) resume_token: Option<Vec<u8>>,
+}
+
+/// Loads one authenticated moving branch head through the ForkTree selector
+/// owner. Missing selectors are ordinary branch absence; malformed selectors,
+/// snapshots, and selected commit edges fail closed.
+pub(crate) async fn load_branch_head<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<Option<crate::changelog::CommitId>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let branch_id = canonical_branch_id(branch_id)?;
+    let selector_key = branch_selector_key(branch_id);
+    let keys = [Key(selector_key.clone())];
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    let Some(value) = loaded.values.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let bytes = match value {
+        ProjectedValue::FullValue(bytes) => bytes,
+        ProjectedValue::KeyOnly => {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "ForkTree branch selector point read returned key-only data",
+            ));
+        }
+    };
+    let selector = BranchSelectorV1::decode(&bytes)?;
+    if selector.branch_id != branch_id || branch_selector_key(selector.branch_id) != selector_key {
+        return Err(
+            corruption("ForkTree branch selector key and embedded branch ID differ").into(),
+        );
+    }
+    selected_head_commit_id(read, branch_id).await.map(Some)
+}
+
+/// Scans every authenticated branch selector in one coherent read view.
+/// Selector enumeration is storage-streaming and retains only one page plus
+/// the output branch-head list.
+pub(crate) async fn scan_branch_heads<R>(
+    read: &R,
+) -> Result<Vec<(String, crate::changelog::CommitId)>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let range = Prefix {
+        bytes: bytes::Bytes::from_static(BRANCH_SELECTOR_PREFIX),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            SELECTOR_SPACE,
+            range,
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                order: ScanOrder::Ascending,
+            },
+        )
+        .await?;
+    let mut heads = Vec::new();
+    loop {
+        let page = cursor.next_page(BRANCH_SCAN_PAGE_ROWS).await?;
+        for entry in page.entries {
+            let bytes = match entry.value {
+                ProjectedValue::FullValue(bytes) => bytes,
+                ProjectedValue::KeyOnly => {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "ForkTree branch selector scan returned key-only data",
+                    ));
+                }
+            };
+            let selector = BranchSelectorV1::decode(&bytes)?;
+            if entry.key.0 != branch_selector_key(selector.branch_id) {
+                return Err(corruption(
+                    "ForkTree branch selector scan key and embedded branch ID differ",
+                )
+                .into());
+            }
+            let branch_text = uuid::Uuid::from_bytes(*selector.branch_id.as_bytes()).to_string();
+            let commit_id = selected_head_commit_id(read, selector.branch_id).await?;
+            heads.push((branch_text, commit_id));
+        }
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(heads)
+}
+
+fn canonical_branch_id(branch_id: &str) -> Result<CanonicalBranchId, crate::LixError> {
+    let id = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        crate::LixError::new(
+            crate::LixError::CODE_INVALID_PARAM,
+            format!("branch ID must be a UUID: {error}"),
+        )
+    })?;
+    Ok(CanonicalBranchId::from_bytes(*id.as_bytes()))
+}
+
+async fn selected_head_commit_id<R>(
+    read: &R,
+    branch_id: CanonicalBranchId,
+) -> Result<crate::changelog::CommitId, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let view = open_coherent_view_on_read(read, branch_id).await?;
+    let selected_id = view.branch_snapshot().semantic_head_commit_object_id;
+    let bytes = view.load_object_bytes(selected_id).await?;
+    let commit = CommitObjectV1::decode(selected_id, &bytes)?;
+    Ok(crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+        *commit.commit_id.as_bytes(),
+    )))
+}
+
+/// Loads exact public commit facts from the single authenticated
+/// CommitCatalog through the caller's coherent StorageRead.
+pub(crate) async fn load_commit_records<R>(
+    read: &R,
+    ids: &[crate::changelog::CommitId],
+) -> Result<Vec<Option<crate::changelog::CommitRecord>>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = CommitId::from_bytes(*id.as_uuid().as_bytes());
+        let Some(value) = lookup_on_read(
+            repository.commit_catalog_root,
+            "commit",
+            id.as_bytes(),
+            read,
+        )
+        .await?
+        else {
+            records.push(None);
+            continue;
+        };
+        let entry = CommitCatalogEntry::decode(&value)?;
+        let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+        records.push(Some(
+            semantic_commit_record(
+                read,
+                repository.change_catalog_root,
+                entry.commit_object_id,
+                commit,
+            )
+            .await?,
+        ));
+    }
+    Ok(records)
+}
+
+/// Reads one bounded ordered CommitCatalog page. `start_after` is exclusive
+/// and interpreted inside the caller's retained read view.
+pub(crate) async fn scan_commit_records<R>(
+    read: &R,
+    start_after: Option<crate::changelog::CommitId>,
+    limit: usize,
+) -> Result<Vec<crate::changelog::CommitRecord>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let repository = load_repository_root(read).await?;
+    let start_after = start_after.map(|id| id.as_uuid().as_bytes().to_vec());
+    let rows = scan_page_on_read(
+        repository.commit_catalog_root,
+        "commit",
+        start_after.as_deref(),
+        limit.min(CATALOG_SCAN_PAGE_ROWS),
+        read,
+    )
+    .await?;
+    let mut records = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        let id = CommitId::from_bytes(
+            key.as_slice()
+                .try_into()
+                .map_err(|_| corruption("CommitCatalog key is not a raw UUID"))?,
+        );
+        let entry = CommitCatalogEntry::decode(&value)?;
+        let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+        if commit.commit_id != id {
+            return Err(corruption("CommitCatalog key does not match Commit object").into());
+        }
+        records.push(
+            semantic_commit_record(
+                read,
+                repository.change_catalog_root,
+                entry.commit_object_id,
+                commit,
+            )
+            .await?,
+        );
+    }
+    Ok(records)
+}
+
+pub(crate) async fn load_change_records<R>(
+    read: &R,
+    ids: &[crate::changelog::ChangeId],
+) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = ChangeId::from_bytes(*id.as_uuid().as_bytes());
+        let Some(value) = lookup_on_read(
+            repository.change_catalog_root,
+            "change",
+            id.as_bytes(),
+            read,
+        )
+        .await?
+        else {
+            records.push(None);
+            continue;
+        };
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        records.push(Some(
+            semantic_change_record(read, repository.change_catalog_root, id, entry).await?,
+        ));
+    }
+    Ok(records)
+}
+
+/// Loads the authenticated semantic Change members owned by one commit. The
+/// Commit object supplies ordered membership; the unified ChangeCatalog must
+/// supply the exact reverse owner/ordinal edge for every returned payload.
+pub(crate) async fn load_commit_member_records<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+) -> Result<Option<Vec<crate::changelog::ChangeRecord>>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let commit_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
+    let Some(value) = lookup_on_read(
+        repository.commit_catalog_root,
+        "commit",
+        commit_id.as_bytes(),
+        read,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let entry = CommitCatalogEntry::decode(&value)?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != commit_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    validate_retained_commit(
+        read,
+        repository.change_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    let mut records = Vec::with_capacity(commit.member_change_object_ids.len());
+    for change_object_id in commit.member_change_object_ids {
+        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
+        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+        let change_id = change.change_id();
+        let value = lookup_on_read(
+            repository.change_catalog_root,
+            "change",
+            change_id.as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("Commit member has no ChangeCatalog owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        records.push(
+            semantic_change_record(read, repository.change_catalog_root, change_id, entry).await?,
+        );
+    }
+    Ok(Some(records))
+}
+
+pub(crate) async fn scan_change_records<R>(
+    read: &R,
+    start_after: Option<crate::changelog::ChangeId>,
+    limit: usize,
+) -> Result<Vec<crate::changelog::ChangeRecord>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let repository = load_repository_root(read).await?;
+    let start_after = start_after.map(|id| id.as_uuid().as_bytes().to_vec());
+    let rows = scan_page_on_read(
+        repository.change_catalog_root,
+        "change",
+        start_after.as_deref(),
+        limit.min(CATALOG_SCAN_PAGE_ROWS),
+        read,
+    )
+    .await?;
+    let mut records = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        let id = ChangeId::from_bytes(
+            key.as_slice()
+                .try_into()
+                .map_err(|_| corruption("ChangeCatalog key is not a raw UUID"))?,
+        );
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        records
+            .push(semantic_change_record(read, repository.change_catalog_root, id, entry).await?);
+    }
+    Ok(records)
+}
+
+async fn load_repository_root<R>(read: &R) -> Result<RepositoryRootV1, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let keys = [Key(global_selector_key())];
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    let raw = required_full_value(
+        loaded.values.into_iter().next().flatten(),
+        "ForkTree global selector is absent",
+    )?;
+    let selector = GlobalSelectorV1::decode(&raw)?;
+    let bytes = super::view::load_object_bytes(read, selector.repository_root).await?;
+    Ok(RepositoryRootV1::decode(selector.repository_root, &bytes)?)
+}
+
+async fn semantic_commit_record<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    object_id: ObjectId,
+    commit: CommitObjectV1,
+) -> Result<crate::changelog::CommitRecord, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    validate_retained_commit(read, change_catalog_root, object_id, &commit).await?;
+    let record = crate::changelog::decode_forktree_commit_payload(&commit.metadata)?;
+    let commit_id =
+        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit.commit_id.as_bytes()));
+    if record.commit_id != commit_id || record.generation != commit.generation {
+        return Err(corruption("Commit semantic payload disagrees with its envelope").into());
+    }
+    if record.parent_commit_ids.len() != commit.parent_commit_object_ids.len() {
+        return Err(corruption("Commit semantic parent count disagrees with its edges").into());
+    }
+    for (expected, object_id) in record
+        .parent_commit_ids
+        .iter()
+        .zip(&commit.parent_commit_object_ids)
+    {
+        let bytes = super::view::load_object_bytes(read, *object_id).await?;
+        let parent = CommitObjectV1::decode(*object_id, &bytes)?;
+        if parent.commit_id.as_bytes() != expected.as_uuid().as_bytes() {
+            return Err(corruption("Commit semantic parent ID disagrees with its edge").into());
+        }
+    }
+    Ok(record)
+}
+
+async fn semantic_change_record<R>(
+    read: &R,
+    change_catalog_root: ObjectId,
+    id: ChangeId,
+    entry: ChangeCatalogEntry,
+) -> Result<crate::changelog::ChangeRecord, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let bytes = super::view::load_object_bytes(read, entry.change_object_id).await?;
+    let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
+    if change.change_id() != id {
+        return Err(corruption("ChangeCatalog key does not match Change object").into());
+    }
+    match (entry.owner, &change) {
+        (
+            ChangeCatalogOwner::CommitMember {
+                commit_object_id,
+                ordinal,
+            },
+            ChangeObjectV1::Semantic { .. },
+        ) => {
+            let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+            let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+            if commit.member_change_object_ids.get(ordinal as usize)
+                != Some(&entry.change_object_id)
+            {
+                return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
+            }
+        }
+        (
+            ChangeCatalogOwner::BranchRef {
+                ref_change_object_id,
+                branch_id,
+            },
+            ChangeObjectV1::BranchRef {
+                branch_id: object_branch,
+                ..
+            },
+        ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
+            validate_retained_ref_change(
+                read,
+                change_catalog_root,
+                entry.change_object_id,
+                &change,
+            )
+            .await?;
+        }
+        _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid").into()),
+    }
+    let payload = match change {
+        ChangeObjectV1::Semantic { payload, .. } | ChangeObjectV1::BranchRef { payload, .. } => {
+            payload
+        }
+    };
+    Ok(crate::changelog::decode_forktree_change_payload(
+        &payload,
+        crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*id.as_bytes())),
+    )?)
+}
+
+fn required_full_value(
+    value: Option<ProjectedValue>,
+    missing: &'static str,
+) -> Result<bytes::Bytes, crate::LixError> {
+    match value {
+        Some(ProjectedValue::FullValue(bytes)) => Ok(bytes),
+        Some(ProjectedValue::KeyOnly) => {
+            Err(corruption("ForkTree full-value read returned key-only data").into())
+        }
+        None => Err(corruption(missing).into()),
+    }
 }
 
 pub(crate) async fn state_point<R>(

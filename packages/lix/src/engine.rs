@@ -4,7 +4,6 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
-use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
@@ -18,10 +17,7 @@ use crate::plugin::{
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StoragePrefix,
-    StorageReadOptions, StorageWriteOptions,
-};
+use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
@@ -451,36 +447,8 @@ where
         crate::init::RepositoryProtocolStatus::Unsupported => {
             Err(crate::init::unsupported_repository_protocol_error())
         }
-        crate::init::RepositoryProtocolStatus::Missing => {
-            // A raw changelog key is the initialization sentinel. Unlike a
-            // live-state lookup it cannot parse an old tracked-head layout.
-            if repository_has_changelog_commit(&read).await? {
-                Err(crate::init::unsupported_repository_protocol_error())
-            } else {
-                Err(not_initialized_error())
-            }
-        }
+        crate::init::RepositoryProtocolStatus::Missing => Err(not_initialized_error()),
     }
-}
-
-async fn repository_has_changelog_commit(
-    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-) -> Result<bool, LixError> {
-    let range = StoragePrefix {
-        bytes: bytes::Bytes::new(),
-    }
-    .to_range()?;
-    let mut cursor = read
-        .begin_scan(
-            COMMIT_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    Ok(!cursor.next_page(1).await?.entries.is_empty())
 }
 
 fn not_initialized_error() -> LixError {

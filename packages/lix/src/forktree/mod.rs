@@ -28,9 +28,11 @@ pub(crate) use object::ObjectId;
 pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
-    CatalogPage, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree, load_change,
-    load_commit, page_changes, page_commits, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_range,
+    CatalogPage, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree,
+    load_branch_head, load_change, load_change_records, load_commit, load_commit_member_records,
+    load_commit_records, page_changes, page_commits, put_change_catalog_entries,
+    put_commit_catalog_entries, scan_branch_heads, scan_change_records, scan_commit_records,
+    state_point, state_range,
 };
 pub(crate) use state::{
     StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef, UntrackedValueRef,
@@ -106,13 +108,20 @@ const _: () = {
         let _: Option<GcStepStatus> = None;
         let _ = edit_state_tree::<R>;
         let _ = load_change::<R>;
+        let _ = load_branch_head::<R>;
         let _ = load_commit::<R>;
+        let _ = load_commit_records::<R>;
+        let _ = load_commit_member_records::<R>;
+        let _ = load_change_records::<R>;
+        let _ = scan_commit_records::<R>;
+        let _ = scan_change_records::<R>;
         let _ = page_changes::<R>;
         let _ = page_commits::<R>;
         let _ = put_change_catalog_entries::<R>;
         let _ = put_commit_catalog_entries::<R>;
         let _ = state_point::<R>;
         let _ = state_range::<R>;
+        let _ = scan_branch_heads::<R>;
         let _ = decode_state_key;
         let _ = decode_state_value;
         let _ = encode_state_key;
@@ -136,6 +145,7 @@ const _: () = {
         let _ = PreparedPublication::delete_untracked_row;
         let _ = PreparedPublication::publish_branch_retirement::<R>;
         let _ = PreparedPublication::commit::<S>;
+        let _ = PreparedPublication::into_storage_plan;
         let _ = StateTreeMutation::insert;
         let _ = StateTreeMutation::update;
         let _ = StateTreeMutation::remove;

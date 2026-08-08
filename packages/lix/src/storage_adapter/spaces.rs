@@ -4,30 +4,36 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 #[cfg(test)]
 use crate::storage::StorageError;
-use crate::storage::{Key, KeyRange, SpaceId, StorageSpace};
+use crate::storage::{Key, KeyRange, StorageSpace, ValueSemantics};
 
-pub(crate) const MUTATION_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0007_0001), "observe.mutation_revision");
-pub(crate) const TRACKED_MUTATION_REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0007_0004), "transaction.tracked_revision");
+pub(crate) const MUTATION_REVISION_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0007_0001,
+    "observe.mutation_revision",
+    ValueSemantics::Mutable,
+);
+pub(crate) const TRACKED_MUTATION_REVISION_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0007_0004,
+    "transaction.tracked_revision",
+    ValueSemantics::Mutable,
+);
 
 impl StorageSpace {
     pub const fn physical_prefix(&self) -> [u8; 4] {
-        self.id.0.to_be_bytes()
+        self.id().to_be_bytes()
     }
 
     pub fn encode_key(&self, key: &Key) -> Key {
-        encode_physical_key(self.id, key)
+        encode_physical_key(self.id(), key)
     }
 
     pub fn encode_range(&self, range: KeyRange) -> KeyRange {
-        encode_physical_range(self.id, range)
+        encode_physical_range(self.id(), range)
     }
 }
 
-pub(crate) fn encode_physical_key(space: SpaceId, key: &Key) -> Key {
+pub(crate) fn encode_physical_key(space: u32, key: &Key) -> Key {
     let mut bytes = BytesMut::with_capacity(4 + key.0.len());
-    bytes.put_u32(space.0);
+    bytes.put_u32(space);
     bytes.extend_from_slice(key.0.as_ref());
     Key(bytes.freeze())
 }
@@ -42,7 +48,7 @@ pub(crate) fn decode_logical_key(key: &Key) -> Result<Key, StorageError> {
     Ok(Key(key.0.slice(4..)))
 }
 
-pub(crate) fn encode_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+pub(crate) fn encode_physical_range(space: u32, range: KeyRange) -> KeyRange {
     let lower = match range.lower {
         Bound::Included(key) => Bound::Included(encode_physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(encode_physical_key(space, &key)),
@@ -58,35 +64,35 @@ pub(crate) fn encode_physical_range(space: SpaceId, range: KeyRange) -> KeyRange
     KeyRange { lower, upper }
 }
 
-fn space_lower_bound(space: SpaceId) -> Key {
-    Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))
+fn space_lower_bound(space: u32) -> Key {
+    Key(Bytes::copy_from_slice(&space.to_be_bytes()))
 }
 
-fn space_upper_bound(space: SpaceId) -> Bound<Key> {
-    if space.0 == u32::MAX {
+fn space_upper_bound(space: u32) -> Bound<Key> {
+    if space == u32::MAX {
         Bound::Unbounded
     } else {
-        Bound::Excluded(Key(Bytes::copy_from_slice(&(space.0 + 1).to_be_bytes())))
+        Bound::Excluded(Key(Bytes::copy_from_slice(&(space + 1).to_be_bytes())))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{Key, SpaceId};
+    use crate::storage::{Key, ValueSemantics};
     use crate::storage_adapter::StorageSpace;
 
     #[test]
     fn storage_space_preserves_id_and_name() {
-        let space = StorageSpace::mutable(SpaceId(7), "test.space");
+        let space = StorageSpace::engine_declared(7, "test.space", ValueSemantics::Mutable);
 
-        assert_eq!(space.id, SpaceId(7));
-        assert_eq!(space.name, "test.space");
+        assert_eq!(space.id(), 7);
+        assert_eq!(space.name(), "test.space");
         assert_eq!(space.to_string(), "test.space(SpaceId(7), Mutable)");
     }
 
     #[test]
     fn physical_keys_are_prefixed_by_space_id() {
-        let space = StorageSpace::mutable(SpaceId(7), "test.space");
+        let space = StorageSpace::engine_declared(7, "test.space", ValueSemantics::Mutable);
         let physical = space.encode_key(&Key(bytes::Bytes::from_static(b"abc")));
 
         assert_eq!(physical.0.as_ref(), b"\0\0\0\x07abc");
@@ -104,12 +110,12 @@ mod tests {
             lower: Bound::Included(Key(bytes::Bytes::from_static(b"m"))),
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(SpaceId(7), range);
+        let encoded = super::encode_physical_range(7, range);
 
         assert_eq!(
             encoded.lower,
             Bound::Included(super::encode_physical_key(
-                SpaceId(7),
+                7,
                 &Key(bytes::Bytes::from_static(b"m"))
             ))
         );
@@ -123,12 +129,12 @@ mod tests {
             lower: Bound::Excluded(Key(bytes::Bytes::from_static(b"r"))),
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(SpaceId(7), range);
+        let encoded = super::encode_physical_range(7, range);
 
         assert_eq!(
             encoded.lower,
             Bound::Excluded(super::encode_physical_key(
-                SpaceId(7),
+                7,
                 &Key(bytes::Bytes::from_static(b"r"))
             ))
         );
@@ -142,7 +148,7 @@ mod tests {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(SpaceId(u32::MAX), range);
+        let encoded = super::encode_physical_range(u32::MAX, range);
 
         assert_eq!(encoded.upper, Bound::Unbounded);
     }
@@ -155,7 +161,7 @@ mod tests {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         };
-        let encoded = super::encode_physical_range(SpaceId(7), range);
+        let encoded = super::encode_physical_range(7, range);
 
         assert_eq!(
             encoded.upper,

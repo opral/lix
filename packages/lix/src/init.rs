@@ -26,7 +26,7 @@ use crate::storage_adapter::Storage;
 use crate::storage_adapter::{PointReadPlan, SharedStorageAdapterRead, StorageAdapterRead};
 use crate::storage_adapter::{
     StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
-    StorageSpaceId, StorageWriteSet,
+    StorageWriteSet,
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
@@ -46,8 +46,11 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 /// records. Semantic commit facts remain owned exclusively by `changelog.commit`;
 /// canonical snapshot metadata stays inside the immutable physical authority
 /// while its content-addressed tree chunks remain rebuildable.
-pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
+pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::engine_declared(
+    0x0004_0011,
+    "repository.protocol.v1",
+    crate::storage::ValueSemantics::Mutable,
+);
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v61";
 

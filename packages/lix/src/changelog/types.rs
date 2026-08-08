@@ -452,6 +452,59 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) origin_key: Option<String>,
 }
 
+/// Canonical semantic payload stored inside a ForkTree Commit object.
+///
+/// The immutable object envelope owns identity, graph, generation, and state
+/// edges. This payload preserves the remaining public `lix_commit` fields;
+/// readers validate every duplicated semantic fact against the envelope.
+pub(crate) fn encode_forktree_commit_payload(record: &CommitRecord) -> Result<Vec<u8>, LixError> {
+    crate::storage_codec::encode("ForkTree commit semantic payload", record)
+}
+
+pub(crate) fn decode_forktree_commit_payload(bytes: &[u8]) -> Result<CommitRecord, LixError> {
+    crate::storage_codec::decode("ForkTree commit semantic payload", bytes)
+}
+
+/// Canonical semantic payload stored inside either semantic Change object or
+/// standalone RefChange object. ChangeId remains in the authenticated object
+/// envelope and is reconstructed only after the envelope has authenticated.
+pub(crate) fn encode_forktree_change_payload(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
+    crate::storage_codec::encode(
+        "ForkTree change semantic payload",
+        &ChangeRecordRef {
+            format_version: record.format_version,
+            account_id: &record.account_id,
+            schema_key: &record.schema_key,
+            entity_pk: &record.entity_pk,
+            file_id: record.file_id.as_deref(),
+            snapshot: record.snapshot.as_ref_slot(),
+            metadata: record.metadata.as_ref_slot(),
+            created_at: record.created_at,
+            origin_key: record.origin_key.as_deref(),
+        },
+    )
+}
+
+pub(crate) fn decode_forktree_change_payload(
+    bytes: &[u8],
+    change_id: ChangeId,
+) -> Result<ChangeRecord, LixError> {
+    let view: ChangeRecordView<'_> =
+        crate::storage_codec::decode("ForkTree change semantic payload", bytes)?;
+    Ok(ChangeRecord {
+        format_version: view.format_version,
+        change_id,
+        account_id: view.account_id.to_string(),
+        schema_key: view.schema_key.to_string(),
+        entity_pk: view.entity_pk,
+        file_id: view.file_id,
+        snapshot: view.snapshot,
+        metadata: view.metadata,
+        created_at: view.created_at,
+        origin_key: view.origin_key,
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ChangeLoadRequest<'a> {
     pub(crate) change_ids: &'a [ChangeId],

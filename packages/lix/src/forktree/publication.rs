@@ -2,11 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
-use crate::storage::{
-    Key, Precondition, PutBatch, PutEntry, Storage, StorageError, StorageWrite, StoredValue,
-    WriteOptions,
-};
+use crate::storage::{Key, Precondition, Storage, StorageError, WriteOptions};
 use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 
 use super::blob::CompletedUpload;
 use super::codec::corruption;
@@ -782,6 +780,30 @@ impl PreparedPublication {
     where
         S: Storage,
     {
+        let (writes, preconditions) = self.into_storage_plan()?;
+        writes
+            .commit(
+                storage,
+                WriteOptions {
+                    preconditions,
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Lowers one authenticated publication into the engine's canonical
+    /// in-memory write/precondition plan.
+    ///
+    /// Transaction commit extends this plan with runtime, idempotency, and
+    /// orthogonal metadata before issuing the existing single backend commit.
+    /// This function performs no I/O and cannot publish a partial ForkTree
+    /// transition independently.
+    pub(crate) fn into_storage_plan(
+        self,
+    ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), StorageError> {
         let mut preconditions = Vec::with_capacity(1 + self.selector_expectations.len());
         preconditions.push(Precondition::KeyValueEquals {
             space: SELECTOR_SPACE,
@@ -807,97 +829,38 @@ impl PreparedPublication {
             });
         }
         let next_global = self.next_global.encode()?;
-        let capacity = self
-            .object_puts
-            .iter()
-            .map(|(_, bytes)| bytes.len())
-            .sum::<usize>()
-            .saturating_add(
-                self.selector_puts
-                    .iter()
-                    .map(|(key, value)| key.len() + value.len())
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                self.untracked_puts
-                    .iter()
-                    .map(|(key, value)| key.len() + value.len())
-                    .sum::<usize>(),
-            )
-            .saturating_add(next_global.len());
-        let mut write = storage
-            .begin_write(WriteOptions {
-                preconditions,
-                batch_capacity_hint_bytes: capacity,
-                ..WriteOptions::default()
-            })
-            .await?;
-        if !self.object_puts.is_empty() {
-            write
-                .put_many(
-                    OBJECT_SPACE,
-                    PutBatch {
-                        entries: self
-                            .object_puts
-                            .iter()
-                            .map(|(id, bytes)| PutEntry {
-                                key: Key(Bytes::copy_from_slice(id.as_bytes())),
-                                value: StoredValue {
-                                    bytes: bytes.clone(),
-                                },
-                            })
-                            .collect(),
-                    },
-                )
-                .await?;
+        let mut writes = StorageWriteSet::with_capacity(
+            self.object_puts
+                .iter()
+                .count()
+                .saturating_add(self.selector_puts.len())
+                .saturating_add(self.selector_deletes.len())
+                .saturating_add(self.untracked_puts.len())
+                .saturating_add(self.untracked_deletes.len())
+                .saturating_add(2),
+            3,
+        );
+        for (id, bytes) in self.object_puts.iter() {
+            writes.put(
+                OBJECT_SPACE,
+                Bytes::copy_from_slice(id.as_bytes()),
+                bytes.clone(),
+            );
         }
-        let mut selector_entries = Vec::with_capacity(self.selector_puts.len() + 1);
-        selector_entries.push(PutEntry {
-            key: Key(global_selector_key()),
-            value: StoredValue { bytes: next_global },
-        });
-        selector_entries.extend(self.selector_puts.into_iter().map(|(key, value)| PutEntry {
-            key: Key(key),
-            value: StoredValue { bytes: value },
-        }));
-        write
-            .put_many(
-                SELECTOR_SPACE,
-                PutBatch {
-                    entries: selector_entries,
-                },
-            )
-            .await?;
-        let mut selector_deletes = Vec::with_capacity(self.selector_deletes.len() + 1);
-        selector_deletes.push(Key(gc_progress_selector_key()));
-        selector_deletes.extend(self.selector_deletes.into_iter().map(Key));
-        write.delete_many(SELECTOR_SPACE, &selector_deletes).await?;
-        if !self.untracked_puts.is_empty() {
-            write
-                .put_many(
-                    UNTRACKED_ROW_SPACE,
-                    PutBatch {
-                        entries: self
-                            .untracked_puts
-                            .into_iter()
-                            .map(|(key, value)| PutEntry {
-                                key: Key(key),
-                                value: StoredValue { bytes: value },
-                            })
-                            .collect(),
-                    },
-                )
-                .await?;
+        writes.put(SELECTOR_SPACE, global_selector_key(), next_global);
+        for (key, value) in self.selector_puts {
+            writes.put(SELECTOR_SPACE, key, value);
         }
-        if !self.untracked_deletes.is_empty() {
-            let keys = self
-                .untracked_deletes
-                .into_iter()
-                .map(Key)
-                .collect::<Vec<_>>();
-            write.delete_many(UNTRACKED_ROW_SPACE, &keys).await?;
+        writes.delete(SELECTOR_SPACE, gc_progress_selector_key());
+        for key in self.selector_deletes {
+            writes.delete(SELECTOR_SPACE, key);
         }
-        write.commit().await?;
-        Ok(())
+        for (key, value) in self.untracked_puts {
+            writes.put(UNTRACKED_ROW_SPACE, key, value);
+        }
+        for key in self.untracked_deletes {
+            writes.delete(UNTRACKED_ROW_SPACE, key);
+        }
+        Ok((writes, preconditions))
     }
 }
