@@ -378,6 +378,7 @@ where
         };
         state_mutations.push(mutation);
     }
+    sort_state_mutations(&mut state_mutations)?;
 
     let state_base = if global {
         view.repository_root().global_state_root
@@ -1342,6 +1343,28 @@ fn writer_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
 
+fn state_mutation_key(mutation: &StateTreeMutation) -> &[u8] {
+    match mutation {
+        StateTreeMutation::Insert { key, .. }
+        | StateTreeMutation::Update { key, .. }
+        | StateTreeMutation::Remove { key } => key.as_slice(),
+    }
+}
+
+fn sort_state_mutations(mutations: &mut Vec<StateTreeMutation>) -> Result<(), LixError> {
+    mutations
+        .sort_unstable_by(|left, right| state_mutation_key(left).cmp(state_mutation_key(right)));
+    if mutations
+        .windows(2)
+        .any(|pair| state_mutation_key(&pair[0]) == state_mutation_key(&pair[1]))
+    {
+        return Err(writer_error(
+            "authenticated state mutations contain duplicate encoded keys",
+        ));
+    }
+    Ok(())
+}
+
 fn next_ordered_commit_generation(
     parent_generation: Option<u64>,
     selected_source_generation: Option<u64>,
@@ -1456,5 +1479,27 @@ mod intent_tests {
             3
         );
         assert!(next_ordered_commit_generation(Some(u64::MAX), None).is_err());
+    }
+
+    #[test]
+    fn state_mutations_are_sorted_by_encoded_key_before_forktree_edit() {
+        let mut mutations = vec![
+            StateTreeMutation::remove(b"state/z".to_vec()),
+            StateTreeMutation::remove(b"state/a".to_vec()),
+        ];
+        sort_state_mutations(&mut mutations).expect("out-of-order mutations should be sorted");
+        assert_eq!(state_mutation_key(&mutations[0]), b"state/a");
+        assert_eq!(state_mutation_key(&mutations[1]), b"state/z");
+    }
+
+    #[test]
+    fn state_mutations_reject_duplicate_encoded_keys() {
+        let mut mutations = vec![
+            StateTreeMutation::remove(b"state/a".to_vec()),
+            StateTreeMutation::update(b"state/a".to_vec(), b"replacement".to_vec()),
+        ];
+        let error = sort_state_mutations(&mut mutations)
+            .expect_err("duplicate authenticated state keys must fail closed");
+        assert!(error.message.contains("duplicate encoded keys"));
     }
 }
