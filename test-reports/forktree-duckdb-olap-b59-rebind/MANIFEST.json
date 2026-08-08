@@ -36,6 +36,17 @@
     "digest": "blake3-row-count-column-count-typed-cell-stream",
     "warm_cold_model_digest_equality": "required-future-invariant-unmeasured"
   },
+  "corruption_contract": {
+    "matrix_file": "CORRUPTION_MATRIX.md",
+    "model_file": "corruption_matrix_model.rs",
+    "target_classes": ["global_selector", "branch_selector", "state_root", "catalog_root", "checkpoint_root"],
+    "adapter_domains": ["global_selector", "branch_selector", "state_root", "catalog_root", "checkpoint_root"],
+    "corruption_classes": ["malformed", "missing", "wrong_kind", "identity_substitution"],
+    "valid_absence_distinct": true,
+    "typed_failures": true,
+    "unchanged_authority_fingerprint": true,
+    "zero_durable_work": true
+  },
   "adapter_order": ["model", "duckdb-control", "memory", "rocksdb", "slatedb"],
   "future_cell_cap_minutes": 20,
   "thresholds": {

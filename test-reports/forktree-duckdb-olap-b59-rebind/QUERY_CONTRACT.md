@@ -68,6 +68,31 @@ The available comparator report says this equality passed in its own 2a0
 run, but its raw logs are not present here and the result digests are not
 replayed or relabeled as b59 evidence.
 
+## Result-row provenance and setup boundary
+
+`RESULTS.csv` is intentionally a historical timing ledger. Its 27 rows are
+the nine query labels at 10K, 50K, and 500K from the nearest cd76 comparator;
+they are not b59 measurements. Every row must contain these fields:
+
+```text
+source_kind,source_ref,source_sha256,b59_cell_status,setup_excluded,
+rows,query,historical_forktree_rocks_us,historical_forktree_slate_us,
+historical_duckdb_us,historical_rocks_over_duck,historical_slate_over_duck,
+result_digest,reopen_digest,verified,
+setup_wall_ns,query_wall_ns,query_cpu_ns,alloc_bytes,rss_peak_bytes,
+backend_reads,backend_read_keys,backend_read_bytes,backend_writes,
+backend_write_bytes,physical_read_objects,physical_read_bytes,
+physical_write_objects,physical_write_bytes,publication_count,selector_cas,
+epoch_cas,vc_reads,vc_writes,oltp_calls,filesystem_calls,cold_reopen
+```
+
+Historical rows must use `source_kind=historical-cd76-timing-only`, the exact
+cd76 ref and source-file SHA, `b59_cell_status=UNRUN`,
+`setup_excluded=TRUE`, and `UNRUN` for every b59 digest/counter/verification
+field. A future b59 row replaces only the UNRUN fields with exact measured
+values and keeps its own candidate/source hash. No inherited timing or digest
+may be relabeled as b59.
+
 ## Required counters
 
 Every query sample must publish:
@@ -87,3 +112,16 @@ selector/epoch CAS, OLTP mutation calls, and filesystem mutation calls. One
 coherent authenticated read is required for each logical query. DuckDB's
 `logical_reads=unavailable` and Rust-only allocation scope must remain labeled
 as such rather than compared as ForkTree authority counters.
+
+## Corruption and reopen controls
+
+Before any timed b59 query, run the named matrix in `CORRUPTION_MATRIX.md` on
+fresh selector/root/object fixtures. For each of global selector, branch
+selector, state root, catalog root, and checkpoint root, inject malformed,
+missing, wrong-kind, and identity-substitution bytes. Require the exact typed
+failure, one retained coherent read, unchanged before/after authority
+fingerprint, zero writes/publication/selector-CAS/epoch-CAS, and no fallback.
+An optional authenticated object that is absent must return `ValidAbsence`, not
+the typed missing-required-object failure. Flush, drop, reopen, and repeat the
+healthy digest and corruption controls; any surviving root or digest mismatch
+is a blocker.

@@ -11,13 +11,20 @@ ROOT=/path/to/exact-b59-candidate
 ORACLE="$ROOT/test-reports/forktree-duckdb-olap-b59-rebind"
 test "$(git -C "$ROOT" rev-parse HEAD)" = b59e1f11a51153e0a787a81f0f25bf104d150aaf
 test "$(git -C "$ROOT" rev-parse HEAD^{tree})" = 700fd04d21bc40c05425c9fc9e10d65c9e1eda24
-sha256sum "$ORACLE"/{README.md,MANIFEST.json,QUERY_CONTRACT.md,RESULTS.csv,RAW_SHA256SUMS}
+sha256sum "$ORACLE"/{README.md,MANIFEST.json,QUERY_CONTRACT.md,RESULTS.csv,RAW_SHA256SUMS,CORRUPTION_MATRIX.md,corruption_matrix_model.rs,CORRECTION_REPORT.md,FUTURE_GATE_COMMANDS.md,source_verifier.sh}
+rustc --edition=2021 --test "$ORACLE/corruption_matrix_model.rs" \
+  -o /tmp/forktree-duckdb-corruption-model
+timeout 20m /tmp/forktree-duckdb-corruption-model --nocapture --test-threads=1
 ```
 
 The future harness must verify one authenticated coherent ForkTree read per
 query, provider planning/materialization attribution, zero OLTP/VC/filesystem
 mutation counters, exact result digest, and cold-reopen equality before any
 timed optimization claim.
+
+It must run the named selector/root/object corruption matrix and the catalog
+and checkpoint extensions before timing. Save typed failure, before/after
+authority fingerprint, zero-work counters, and valid-absence results.
 
 ## Ordered adapter cells
 

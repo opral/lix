@@ -86,6 +86,21 @@ The exact warm/cold/model digests must be emitted by the future b59 harness.
 No digest is claimed by this package; inherited raw log hashes are preserved in
 `RAW_SHA256SUMS` only as provenance.
 
+`RESULTS.csv` is a 27-row historical timing ledger, not b59 output. Every row
+now carries `source_kind=historical-cd76-timing-only`, the exact historical
+source ref/hash, `b59_cell_status=UNRUN`, `setup_excluded=TRUE`, and `UNRUN`
+sentinels for b59 digests, reopen, verification, and resource counters. The
+historical timing columns are explicitly prefixed `historical_` and must never
+be used as b59 measurements.
+
+The named corruption contract is in
+`CORRUPTION_MATRIX.md`; the standalone model covers the same five authenticated
+domains—selectors, state/root, catalog root, and checkpoint root—with malformed,
+missing, wrong-kind, and identity-substitution cases. The future adapter
+harness repeats that matrix, distinguishes valid optional absence from missing
+required objects, and requires unchanged authority fingerprints plus zero
+durable work.
+
 ## Quantitative gate
 
 The first b59 report must compare the exact target and baseline for every
