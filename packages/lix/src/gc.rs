@@ -6344,6 +6344,36 @@ mod tests {
                 test_commit_state_manifest(record, CommitStateMutationInventory::default())
             })
             .collect::<Vec<_>>();
+        let mut recovered_manifest = manifests[0].clone();
+        recovered_manifest.replay_debt = CommitStateReplayDebt {
+            depth: 1,
+            rows: 1,
+            bytes: 1,
+        };
+        let mut checkpoint_manifest = manifests[1].clone();
+        checkpoint_manifest.replay_debt = CommitStateReplayDebt {
+            depth: 1,
+            rows: 1,
+            bytes: 1,
+        };
+        let mut source_manifest = manifests[2].clone();
+        source_manifest.replay_debt = CommitStateReplayDebt {
+            depth: 2,
+            rows: 2,
+            bytes: 2,
+        };
+        let mut released_manifest = manifests[3].clone();
+        released_manifest.replay_debt = CommitStateReplayDebt {
+            depth: 1,
+            rows: 1,
+            bytes: 1,
+        };
+        let manifests = vec![
+            recovered_manifest,
+            checkpoint_manifest,
+            source_manifest,
+            released_manifest,
+        ];
         let branch_id = "blocked-queue-branch";
 
         let mut writes = storage.new_write_set();
