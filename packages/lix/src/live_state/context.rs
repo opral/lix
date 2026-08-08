@@ -15,22 +15,11 @@ use crate::live_state::{
     MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateContext;
 #[cfg(test)]
 use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns};
 use async_trait::async_trait;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
-
-/// Transaction-local branch publication controls.
-///
-/// A transaction is fenced by the tracked mutation revision observed when it
-/// opens, so repeatedly loading the same immutable generation selector only
-/// adds storage round trips. Missing controls are cached as well: branch
-/// creation rotates that revision and therefore conflicts with the pinned
-/// transaction before commit.
-#[derive(Default)]
-pub(crate) struct BranchHeadControlCache;
 
 /// Serving facade for visible live-state reads.
 ///
@@ -43,10 +32,7 @@ pub(crate) struct LiveStateContext {
 }
 
 impl LiveStateContext {
-    pub(crate) fn new(
-        _tracked_state: TrackedStateContext,
-        commit_graph: CommitGraphContext,
-    ) -> Self {
+    pub(crate) fn new(commit_graph: CommitGraphContext) -> Self {
         Self {
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
@@ -65,13 +51,8 @@ impl LiveStateContext {
         }
     }
 
-    /// Creates a reader whose branch generation selectors are pinned to one
-    /// transaction-local cache.
-    pub(crate) fn transaction_reader<S>(
-        &self,
-        store: S,
-        _branch_head_control_cache: std::sync::Arc<BranchHeadControlCache>,
-    ) -> LiveStateStoreReader<S>
+    /// Creates a reader for one transaction-retained storage view.
+    pub(crate) fn transaction_reader<S>(&self, store: S) -> LiveStateStoreReader<S>
     where
         S: StorageAdapterRead,
     {

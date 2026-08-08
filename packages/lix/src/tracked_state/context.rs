@@ -6,19 +6,9 @@
 use std::collections::BTreeSet;
 
 use crate::LixError;
-use crate::entity_pk::EntityPk;
 use crate::tracked_state::{TrackedStateIndexValue, TrackedStateKey};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TrackedStateContext;
-
-impl TrackedStateContext {
-    pub(crate) const fn new() -> Self {
-        Self
-    }
-}
 
 /// Returns file identities whose descriptor tombstone requires dependent
 /// payload rows to be retired. This is semantic transaction planning logic;
@@ -41,6 +31,3 @@ pub(crate) fn descriptor_dependency_cascade_file_ids(
     }
     Ok(file_ids.into_iter().collect())
 }
-
-#[allow(dead_code)]
-fn _entity_pk_marker(_: &EntityPk) {}
