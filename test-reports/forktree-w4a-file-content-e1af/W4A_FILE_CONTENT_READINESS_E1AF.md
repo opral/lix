@@ -1,10 +1,13 @@
-# W4a v3 file-content publication correction package
+# W4a v4 file-content publication correction package
 
 Status: TEST/REPORT-ONLY. This is a direct immutable successor of
 `f2f4c41bd3a64187f8288ca0396fd364a1f2f8fe` and changes no production source,
 adapter, PR, or merge state. It closes the prior package-model blockers for
 shared chunks, exact final-reference release, persisted cold reopen, and
 discriminating source-negative fixtures.
+
+The only v4 change from `82f4ac5c202ae54ee90b56c45739656891ce442c` is
+resolving the verifier's own canonical path before recursive self-tests.
 
 ## Frozen anchor
 
@@ -83,6 +86,11 @@ bash verify_w4a_source.sh --self-test
 
 Expected output includes `CANDIDATE-GREEN-RESULT=GREEN` and ten
 `NEGATIVE-PASS` fixtures.
+
+The path correction is exercised from both the package directory and an
+external working directory using `bash verify_w4a_source.sh`, `bash
+./verify_w4a_source.sh`, and the absolute script path. All three invocations
+must pass; the exact transcript is `INVOCATION_MATRIX.log`.
 
 Warnings-denied model:
 

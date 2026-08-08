@@ -1,0 +1,23 @@
+W4A v4 verifier self-test invocation matrix; all commands exit 0.
+
+[package cwd] bash verify_w4a_source.sh --self-test
+[package cwd] bash ./verify_w4a_source.sh --self-test
+[external cwd=/tmp] bash /root/repos/lix-w4a-file-content-correction-v4/test-reports/forktree-w4a-file-content-e1af/verify_w4a_source.sh --self-test
+
+All three invocations produced the same result:
+CANDIDATE-SCOPE paths=packages/lix/src/transaction/commit.rs packages/lix/src/transaction/context.rs
+CANDIDATE-PASS-01 whole allowlisted closure has no second writer/cache/authority
+CANDIDATE-PASS-02 one read -> one publication -> one plan -> one prepare -> one commit
+CANDIDATE-PASS-03 private BlobId derives from authenticated ordered closure before payload bytes
+CANDIDATE-PASS-04 non-copy read/lease identity is argument-bound
+CANDIDATE-GREEN-RESULT=GREEN
+NEGATIVE-PASS caller-supplied-BlobId
+NEGATIVE-PASS swapped-row-read-identity
+NEGATIVE-PASS validation-after-byte-request
+NEGATIVE-PASS copied-or-full-payload-range
+NEGATIVE-PASS alternate-writer-cache-index-authority
+NEGATIVE-PASS second-read-view
+NEGATIVE-PASS second-plan-commit
+NEGATIVE-PASS mismatched-read-argument
+NEGATIVE-PASS fallback-compatibility-route
+NEGATIVE-PASS production-path-scope-escape

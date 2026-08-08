@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Resolve once so recursive self-tests work for `bash script`, `bash ./script`,
+# absolute invocation, and a symlink from any current working directory.
+readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+
 readonly BASE_SHA="e1af471b9ab0f598dafa7c2ddec7867667c81740"
 readonly BASE_TREE="bfa0d271a723da8250ab76ada16fda90926f1099"
 readonly BASE_PARENT="b484e20d845aee3f8137bfa3496f9b3cd0e8cd35"
@@ -422,7 +426,7 @@ EOF
   git -C "$temp" add .
   git -C "$temp" commit -qm candidate
   candidate=$(git -C "$temp" rev-parse HEAD)
-  W4A_SELF_TEST=1 "$0" "$temp" "$base" "$temp" "$candidate"
+  W4A_SELF_TEST=1 "$SCRIPT_PATH" "$temp" "$base" "$temp" "$candidate"
 
   make_fixture() {
     fixture=$(mktemp -d "${TMPDIR:-/tmp}/w4a-source-negative.XXXXXX")
@@ -433,7 +437,7 @@ EOF
 
   expect_blocker() {
     local label=$1
-    if output=$(W4A_SELF_TEST=1 "$0" "$fixture" "$base" "$fixture" "$fixture_candidate" 2>&1); then
+    if output=$(W4A_SELF_TEST=1 "$SCRIPT_PATH" "$fixture" "$base" "$fixture" "$fixture_candidate" 2>&1); then
       printf 'NEGATIVE-BLOCKER %s unexpectedly accepted\n%s\n' "$label" "$output"
       return 1
     fi
