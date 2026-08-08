@@ -14,6 +14,30 @@ fail() {
   exit 1
 }
 
+verify_anchor() {
+  local id=$1
+  local remote_branch=$2
+  local expected_head=$3
+  local expected_tree=$4
+  local expected_parent=${5:--}
+  local local_ref="refs/stage2-acceptance-verifier/anchor-$id"
+
+  timeout 20m "${git_cmd[@]}" fetch --no-tags origin "+refs/heads/$remote_branch:$local_ref" >/dev/null
+  local head tree parent
+  head=$("${git_cmd[@]}" rev-parse "$local_ref^{commit}")
+  [[ "$head" == "$expected_head" ]] ||
+    fail "$id anchor head expected=$expected_head actual=$head"
+  tree=$("${git_cmd[@]}" rev-parse "$head^{tree}")
+  [[ "$tree" == "$expected_tree" ]] ||
+    fail "$id anchor tree expected=$expected_tree actual=$tree"
+  if [[ "$expected_parent" != "-" ]]; then
+    parent=$("${git_cmd[@]}" rev-parse "$head^")
+    [[ "$parent" == "$expected_parent" ]] ||
+      fail "$id anchor parent expected=$expected_parent actual=$parent"
+  fi
+  printf 'anchor\t%s\tPASS\t%s\t%s\t%s\n' "$id" "$head" "$tree" "-"
+}
+
 sha_stdin() {
   sha256sum | awk '{print $1}'
 }
@@ -127,6 +151,12 @@ verify_blob_oid() {
 
 printf 'kind\tid\tstatus\tidentity_or_path\ttree_or_sha\tdiff_sha256\n'
 
+# The candidate is always qualified against the exact current main and the
+# immutable non-runnable ForkTree frontier. These are anchors, not acceptance
+# rows and are never merged into a candidate.
+verify_anchor current_main main 822c204ce0670969ca71045bc74f9ca25fde8093 fac3f2b713683be17c34515062dd72edc8feed95
+verify_anchor forktree_frontier codex/forktree-stage2-milestone5b-catalog-boundary 7c9b1060bc396dfa54efcc6c888e37894a7cfb04 ee96c5b64912b8fa8bb15fb7c31916244a255523 34f2dacad4a0126a58d015f27ed75c2142547dd5
+
 verify_ref sql agent/forktree-stage2-sql-dml-oracle cb834007768205d5e9fb83919ca2915c77acca2d 8826a0a404a39bf4f932ad5140e0dfd1657f48fb a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 be976527a15ec049be6465c3cf91020b3f58d0788792d7a5f0b1e00165a8b8ff
 verify_ref vc agent/forktree-stage2-version-control-oracle 3cb6aa56804642efbe703f5e36bdc1788b51a4e7 911e0d6138b760a1c63e0e2c16b00e8f4b95c7dd a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 9348633179a5991dacf6bba85510e4f0cb1d391eeaae0042ab1956a0b08348b4
 verify_ref checkpoint codex/checkpoint-stage2-acceptance-oracle 9bace2186664fc77877aa24abae6e516855313a1 e006aa4a5a3c6443e13d2c746fe81d9f97c30761 c3a58cc293c8a2df052bc590886ea040f98aa3fb 7525ac6d2dd2b11e7b69709c341fe14a8bfc1b6bbfb525abe995a398e3ef8841
@@ -137,6 +167,18 @@ verify_ref nolease codex/stage2-no-lease-read-view-boundary-ee402 89c73a24b97ce8
 verify_ref gc codex/stage2-gc-publication-acceptance-oracle 0b4e5042b6a79b8be80dbfe4e4cdbff3b28d9a9c 0ac1ab8e74b85a92a8044cb4280adf8cf66ba387 cbe48835f6f07a21e0babf1ba16652a0c6b8a214 bb6a70454484b9bba9e29929656a205a0706d1a0a2e60e495ea52fc19e567224
 verify_ref olap codex/forktree-stage2-olap-acceptance-oracle-a12 b9055810dff42c9eb2a096a83ab2207024dce1c6 231939d8a8d0f2a46803264184eea8171fa05f90 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 545ff4e7c74b6bc19223d4977fd4dbba11914d46e3e5efadcae8407741e44b42 head f88e0ea04bef0e93b0280c19f7c89d59c678223e 42863
 verify_ref multimedia codex/forktree-stage2-multimedia-oracle-a12 61fc367988190b3438672743331a81d83d450fae 1600e8ce54d9f52f6ee3546068362ae298d4d243 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 65cda6ee906b6986bf70b636dfaadda5f8f89a2f8f4af407852687c474472660
+
+verify_ref p0w1a_transport codex/forktree-stage2-p0-w1a-acceptance-a1cf d03d03a4925b51c7d43801bf256b9c9b37f53f67 d5016a33f069c5151944eff1f11eca650d8fd872 a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737 e568ad37ff4531958780b6530124c91dccb9df4f572c0c41d4e75918605447d9
+verify_file p0w1a_transport evidence/forktree-stage2/p0-w1a-acceptance-a1cf/FREEZE_REPORT.md 77a0762582364b3c77ca78720e8feca9c2b44c3cbdf40b4a91037ca704064e8e
+verify_file p0w1a_transport evidence/forktree-stage2/p0-w1a-acceptance-a1cf/P0_W1A_ACCEPTANCE.md cfd25a6064aa1c5fd3ad06558c43f79c2169ac88f7b80bd9dab05a90f739d249
+verify_file p0w1a_transport evidence/forktree-stage2/p0-w1a-acceptance-a1cf/P0_W1A_CASES.tsv 77af0924a86cf023a2924075507545b52035739e8c5bfc33accc080e8f4a9b17
+verify_file p0w1a_transport evidence/forktree-stage2/p0-w1a-acceptance-a1cf/TRANSPORT_REPORT.md db5a29e0bac9f09da6defa6af4be0b3c3a79d06890f386392e124169d1fb1a8e
+verify_file p0w1a_transport evidence/forktree-stage2/p0-w1a-acceptance-a1cf/verify_p0_w1a_successor.sh 35dfbedc0373f5292d96d9e0ab2feafbc11b3f35618adcaa2d5c921514304550
+
+verify_ref target_discovery codex/forktree-post-stage2-acceptance-manifest 1ad4c879b1d8339bca7fdc414fdee36305ce9a69 bc9728cfa0b761d98c0639479c80c65cbad5e4a9 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 1bf97fb4037add7d5ecf3d046359e6ab92188f3740532c155e5bd885a0fa841d
+verify_file target_discovery packages/lix/tests/FORKTREE_POST_STAGE2_ACCEPTANCE_MANIFEST.md 456dd164a7a1742c917ad69acc806c3eebf1205125c44dccb5561c9def778a06
+verify_file target_discovery packages/lix/tests/forktree_post_stage2_acceptance/SOURCE_REFS.tsv 349ca7019d7e4db03c57ee0f2e8123f7e1f85666a945221ad5a8997b33c9b39d
+verify_file target_discovery packages/lix/tests/forktree_post_stage2_acceptance/run.sh 8b1a6ef66e32ba795c415b02486ead7a030fe5aa1ecbe33f65246661348de8ac
 
 verify_readiness_ref topology codex/forktree-stage2-milestone3e-topology-owned-reader af7899f41c489fe763ce1a64c5468083570979e2 da097bd739b50629ea39b155d4fa9efc870654e0 2e0cea1b91558179e6ed90847bc8b04b23de246f 942d05f6c92f89e6c32c3b706c82c4e506e498263b5798c92eb2af607a219587 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 734d02bfe332e4f8384301de243d85248b639aec0edeffac48b3f56a4ec271e5
 verify_readiness_ref blobref codex/forktree-stage2-milestone4-blobref-owned-view 08f8dd5cf20842f79996fae9eb7b0924f074a084 19c8706d6bc3d1dbe9217b4f8386b19c66f027a8 af7899f41c489fe763ce1a64c5468083570979e2 d7217fafa02e3c50a6c10b7e3a7a0985697b4ba82beb1ba896d2cf636f34d71f a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 2a06b554cea5f28a24117dfb52c3e24be9ddc408bbb59405ea66b051b73ddb47 blocked-readiness
@@ -193,6 +235,6 @@ printf 'external\tolap\tNOTE\tprovenance-report\te78821631888e8a8810df78e9bdffbe
 printf 'scanner\tresidue\tPASS\tnormalized-166-record-set\t86010e7dad821c8cc89858dcbf1a55cb9a234ea2eeab6d43ef08247e4ede61aa\tsource=f71e91fcbccbb7d6df676a95e9d747725856b77f7e3177ec42f12ca8b28736cc; frozen-binary=40d02e20dd2cbd1334a8c0eddccce9c16e012200707d8488e136415a89483066\n'
 printf 'presentation\tresidue\tNOTE\tbaseline-stdout\t6f4013daca11867c9e07fab14b741c1650515eed473f87c12377e3421db8c42b\t166 records + footer + LF\n'
 printf 'presentation\tresidue\tNOTE\taudit-stdout-plus-stderr\t3891a48613e5d6ebd3d0ab2780aed13c6dd0236f1c2ff343320dd73fb2158a0d\tsame stdout + expected terminal audit stderr; reconciliation-report=1f90f530b02743ffda50b56646499759119e69590a11f0b3eabe4a71b9b3a251\n'
-printf 'external\tp0-w1a\tNOTE\tmanifest\t73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6\tnot mounted; contract=cfd25a6064aa1c5fd3ad06558c43f79c2169ac88f7b80bd9dab05a90f739d249; cases=77af0924a86cf023a2924075507545b52035739e8c5bfc33accc080e8f4a9b17\n'
-printf 'external\tp0-w1a\tNOTE\tverifier\t35dfbedc0373f5292d96d9e0ab2feafbc11b3f35618adcaa2d5c921514304550\tfreeze-report=77a0762582364b3c77ca78720e8feca9c2b44c3cbdf40b4a91037ca704064e8e\n'
-printf 'summary\tall\tPASS\t10 acceptance refs; latest source/static readiness=a1cf8f7f; 2 blocked frontiers\t27 embedded files; 13 readiness-source blobs\tno artifacts applied; non-runnable\n'
+printf 'external\tp0-w1a\tPASS\ttransport-ref\td03d03a4925b51c7d43801bf256b9c9b37f53f67\tmanifest=73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6; transport-report=db5a29e0bac9f09da6defa6af4be0b3c3a79d06890f386392e124169d1fb1a8e\n'
+printf 'external\ttarget-discovery\tPASS\tmanifest-ref\t1ad4c879b1d8339bca7fdc414fdee36305ce9a69\tdiff=1bf97fb4037add7d5ecf3d046359e6ab92188f3740532c155e5bd885a0fa841d; patch=7389880b6907b20c3d97971883b352105e15a816\n'
+printf 'summary\tall\tPASS\t10 core acceptance refs; current-main=822c204c; held frontier=7c9b1060; readiness=a1cf8f7f\tP0 transport + 3 discovery files + readiness source blobs\tno artifacts applied; non-runnable\n'

@@ -3,7 +3,19 @@
 Status: frozen test/report-only preparation for the first immutable runnable
 Stage 2 head. No candidate artifact has been applied and no build has run.
 
-The verifier worktree carries ten-row acceptance-matrix readiness successor
+The verifier worktree carries ten core acceptance rows plus immutable preflight
+transport/discovery records, and its readiness metadata is anchored to exact
+current main
+`822c204ce0670969ca71045bc74f9ca25fde8093` (tree
+`fac3f2b713683be17c34515062dd72edc8feed95`) and the latest held
+catalog-boundary frontier
+`7c9b1060bc396dfa54efcc6c888e37894a7cfb04` (tree
+`ee96c5b64912b8fa8bb15fb7c31916244a255523`, parent
+`34f2dacad4a0126a58d015f27ed75c2142547dd5`). The prior 34f2 frontier remains
+preserved as its immediate parent; the held frontier report SHA is
+`8fe40b5fe63895a132293151e126394161552bf95a4106e02c01bb068c2b17ff` and its
+stable patch ID is `1e9b50c12a8db7a3db9024e28ff2d06b5a0dbb0d`. This is a ten-row acceptance-matrix
+readiness successor
 `7678fb1cd4bad261c5a667c5916645bfb731b944`, tree
 `98390511cdc0b2591a1813b16b681928807a6232`. At creation the workspace
 filesystem had 49 GiB available. Cargo targets and databases will remain under
@@ -13,8 +25,9 @@ this workspace filesystem and every future cell is capped at 20 minutes.
 
 forktree_stage2_acceptance_verify.sh fetches the ten immutable artifact
 branches into refs/stage2-acceptance-verifier/*, without checking them out or
-applying them. It reproduces every expected commit, tree, canonical full-index
-binary diff, and 27 embedded source/report hashes. The external delete report
+applying them. It reproduces exact current-main/frontier anchors, every
+expected commit, tree, canonical full-index binary diff, and the immutable P0
+transport plus external target-discovery file hashes. The external delete report
 and point-read report/manifest/binary hashes are recorded as provenance but
 correctly marked non-embedded. The point-read report and manifest are not
 mounted on this reviewer host; their supplied hashes and author-reported 3/3
@@ -23,6 +36,11 @@ manifest verification are not presented as a local file check.
 Invocation:
 
     timeout 20m packages/rs-sdk-tests/tests/forktree_stage2_acceptance_verify.sh .
+
+The latest read-only run completed successfully. Captured stdout SHA-256 is
+`96e6e33bd8b550ad0c0a1bb758e3281cd0455b468ec78d4868e5e27c24712e5e` and
+stderr is empty (SHA-256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
 
 The OLAP diff is reproduced with `GIT_ATTR_SOURCE` bound to its exact head so
 the committed binary attributes govern the 42,863-byte canonical stream. The
@@ -81,16 +99,30 @@ The scanner acceptance identity is the source/binary plus normalized semantic
 set, not the redirection-dependent presentation. Independent reconciliation
 report SHA is `1f90f530b02743ffda50b56646499759119e69590a11f0b3eabe4a71b9b3a251`.
 
-The externally frozen P0+W1a package is also provenance-bound: manifest
-`73cd9f5d...`, contract `cfd25a60...`, cases `77af0924...`, verifier
-`35dfbedc...`, and freeze report `77a07625...`. It is the first source gate for
+The immutable P0+W1a transport is provenance-bound: ref
+`origin/codex/forktree-stage2-p0-w1a-acceptance-a1cf`, head
+`d03d03a4925b51c7d43801bf256b9c9b37f53f67`, tree
+`d5016a33f069c5151944eff1f11eca650d8fd872`, parent a1cf, parent diff
+`e568ad37ff4531958780b6530124c91dccb9df4f572c0c41d4e75918605447d9`, and
+manifest `73cd9f5d...`; contract `cfd25a60...`, cases `77af0924...`, verifier
+`35dfbedc...`, freeze report `77a07625...`, and transport report
+`db5a29e0...` are checked from the five transport files. It is the first source gate for
 the next runnable candidate. It must remove direct publication commit entry
 points and prove ordered single-branch history/selected members use exactly one
 read, plan, prepare, and commit before any residue or runtime artifact is run.
 
-Result: PASS for 10/10 acceptance refs, latest source/static readiness
-`a1cf8f7f...`, two retained blocked frontiers, 13/13 readiness source blobs, and
-27/27 embedded acceptance files. The frozen
+The immutable external target-discovery package is also checked: ref
+`origin/codex/forktree-post-stage2-acceptance-manifest`, head
+`1ad4c879b1d8339bca7fdc414fdee36305ce9a69`, tree
+`bc9728cfa0b761d98c0639479c80c65cbad5e4a9`, a12 parent, diff
+`1bf97fb4037add7d5ecf3d046359e6ab92188f3740532c155e5bd885a0fa841d`, patch
+`7389880b6907b20c3d97971883b352105e15a816`, and its three file hashes. It is
+discovery-only and does not qualify a candidate result.
+
+Result: PASS for 10/10 core acceptance refs, exact current-main/frontier
+anchors, immutable P0 transport and external target-discovery identities,
+latest source/static readiness `a1cf8f7f...`, two retained blocked frontiers,
+13/13 readiness source blobs, and the embedded acceptance files. The frozen
 machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 
 ## Runnable-head boundary
