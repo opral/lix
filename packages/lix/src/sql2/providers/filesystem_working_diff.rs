@@ -1,26 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
-use crate::LixError;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::file::{exact_string_column_constraint_from_filters, FileIdConstraint};
-use super::spec::{projected_schema, register_spec_table, scan_row_source, PlannedScan, TableSpec};
+use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -320,10 +320,7 @@ where
 }
 
 fn single_entity_pk_value(entity_pk: &EntityPk) -> Option<String> {
-    serde_json::from_str::<Vec<String>>(&entity_pk.as_json_array_text().ok()?)
-        .ok()?
-        .into_iter()
-        .next()
+    entity_pk.as_single_string_owned().ok()
 }
 
 async fn load_logical_snapshot<S>(
@@ -665,5 +662,25 @@ fn batch_error(error: ColumnTableError) -> datafusion::common::DataFusionError {
             datafusion::common::DataFusionError::from(error)
         }
         ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_entity_pk_value;
+    use crate::entity_pk::EntityPk;
+
+    #[test]
+    fn composite_entity_pk_is_not_reduced_to_its_first_component() {
+        let composite = EntityPk::from_json_array_text(r#"["file-like","other"]"#)
+            .expect("composite entity key should decode");
+        assert_eq!(single_entity_pk_value(&composite), None);
+
+        let single = EntityPk::from_json_array_text(r#"["file-like"]"#)
+            .expect("single entity key should decode");
+        assert_eq!(
+            single_entity_pk_value(&single).as_deref(),
+            Some("file-like")
+        );
     }
 }
