@@ -49,7 +49,7 @@ insufficient. No compatibility or fallback path is permitted.
 `08f8dd5cf20842f79996fae9eb7b0924f074a084` remains identity-pinned blocker
 evidence only; it is superseded, not erased.
 
-### Latest approved BlobRef readiness base
+### Approved reader base and latest source/static readiness
 
 Two independent source reviews approved the narrow immutable successor:
 
@@ -63,12 +63,29 @@ Two independent source reviews approved the narrow immutable successor:
   `d5adb4a322dbf98a590d765c9ee2179a3a1e583211cb6a41c3fe2bf2cd786bae`;
 - stable patch ID `242302af3d9db6ecb81f258570b1ed0ec99cde3c`.
 
-The successor authenticates an owner-private canonical BlobId inside the
+The BlobRef successor authenticates an owner-private canonical BlobId inside the
 manifest and compares it to the selected state-row identity before any payload
 chunk load on full and range reads. It adds same-size multi-chunk substitution
 negative coverage and a valid control without an index, cache, fallback, or
 second serving owner. This approval is source-only: `54e90dbf...` remains
 non-runnable and is not an acceptance-matrix result.
+
+The latest source/static-approved readiness base is the narrow 5A2 successor:
+
+- ref `origin/codex/forktree-stage2-milestone5a2-runtime-intent`;
+- head `a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737`;
+- tree `d8326da2b1d38bd51b8ac7229d00684a6865bce2`;
+- parent `5c4cae810324a34c0adbbb5a1a0be5fba5348054`;
+- focused full-index SHA-256
+  `a81dd0af7154b86f663ca786bcd0470c6cd4af01a1fada0eea3ac6696a709e8c`;
+- `a12..head` SHA-256
+  `8192c4f2409f11fedbab14e3553f98fa7f09887afd7745ad351aa72e5c87b87c`;
+- patch ID `f903241b622507aa637e09fa2362b976def580e2`.
+
+Its static approval covers intent-before-view/plan, unsupported ref/selected
+zero-write rejection, true empty no-op, and advanced runtime state in the sole
+ForkTree plan. It remains explicitly non-runnable and authorizes no build or
+artifact application.
 
 ### Blocked writer milestone
 
@@ -97,10 +114,17 @@ preserve runtime writes/preconditions in the sole transaction batch, reject
 unsupported cohorts with zero plan/writes/epoch rotation, preserve true empty
 no-op semantics, and receive a new R2 review.
 
-Do not use 5A's residue count as a readiness datum. The author-reported
-170/`ae4250...` and R2-reported 166/`3891a486...` were produced with
-non-identical or unbound scanner provenance. A successor must pin one exact
-scanner source/binary hash and replay both baseline and candidate identically.
+5A2 pins scanner ref `1dbbf3d...`, source SHA `f71e91fc...`, and frozen binary
+SHA `40d02e20...`. Baseline and candidate both normalize to 166 records with
+SHA `86010e7dad821c8cc89858dcbf1a55cb9a234ea2eeab6d43ef08247e4ede61aa`.
+Raw stdout SHA `6f4013da...` and combined audit stdout+stderr SHA `3891a486...`
+differ only by the expected terminal audit error line; they are presentation
+hashes, not competing semantic results.
+
+The first source gate is the externally frozen P0+W1a package manifest
+`73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6`
+(contract `cfd25a60...`, cases `77af0924...`, verifier `35dfbedc...`, freeze
+report `77a07625...`). It must pass before artifact application or runtime.
 
 ## Eligibility fence
 
@@ -109,7 +133,7 @@ ref, exact head and tree as compile-green. Before creating a worktree:
 
 1. fetch that exact ref into a private verification ref;
 2. require its commit and tree to equal the advertised values;
-3. require `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c` to be an ancestor, unless the
+3. require `a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737` to be an ancestor, unless the
    coordinator explicitly names a replacement accepted lineage;
 4. require the BlobRef same-size manifest-substitution correction above to
    remain byte-identical in the candidate lineage;
@@ -129,7 +153,7 @@ git fetch --no-tags origin \
 test "$(git rev-parse refs/stage2-candidate/next^{commit})" = "<advertised-head>"
 test "$(git rev-parse refs/stage2-candidate/next^{tree})" = "<advertised-tree>"
 git merge-base --is-ancestor \
-  54e90dbf2bcf55c74de0be6ea4b217dc02cec89c \
+  a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737 \
   refs/stage2-candidate/next
 timeout 20m \
   packages/rs-sdk-tests/tests/forktree_stage2_acceptance_verify.sh .
@@ -154,15 +178,18 @@ database/evidence path and the row's isolated target. Stop at the first failure.
 
 The fixed execution order is:
 
-1. fmt/diff, residue/delegation/CLI/cursor source gates;
-2. production-owner 65-row batch-1 delete, RocksDB then SlateDB;
-3. 1K point read, RocksDB then SlateDB; stop unless both show a meaningful
+1. frozen P0+W1a source gate: no direct publication commit, ordered
+   single-branch history through one read/plan/prepare/commit, exact selected
+   member authentication, and unsupported families rejected before a plan;
+2. fmt/diff, residue/delegation/CLI/cursor source gates;
+3. production-owner 65-row batch-1 delete, RocksDB then SlateDB;
+4. 1K point read, RocksDB then SlateDB; stop unless both show a meaningful
    improvement greater than 10% and no critical regression greater than 5%;
-4. SQL RocksDB/SlateDB;
-5. three-row checkpoint RocksDB/SlateDB;
-6. no-lease and sealed GC/publication RocksDB/SlateDB;
-7. OLAP 10K RocksDB/SlateDB plus corruption, then 50K, then 500K;
-8. multimedia and broader version-control closeout.
+5. SQL RocksDB/SlateDB;
+6. three-row checkpoint RocksDB/SlateDB;
+7. no-lease and sealed GC/publication RocksDB/SlateDB;
+8. OLAP 10K RocksDB/SlateDB plus corruption, then 50K, then 500K;
+9. multimedia and broader version-control closeout.
 
 Every build and process cell is capped at 20 minutes. A compile timeout is a
 host boundary, not a pass. No broad gate runs after a focused blocker.

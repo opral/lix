@@ -37,7 +37,7 @@ full-index SHA-256
 and patch ID `6ed511438fe08387ea40a5b6861f7db9f3544764`. This is an approved
 topology-ownership frontier remains valid in the approved lineage.
 
-The latest approved readiness base is the source-only BlobRef identity
+The latest reader-only readiness base remains the source-only BlobRef identity
 successor `origin/codex/forktree-stage2-milestone4b-blob-manifest-identity`,
 head `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`, tree
 `5a8da9f8b11d83bf8216e266beaf4042cee84068`, parent `08f8dd5c...`.
@@ -49,8 +49,25 @@ and its stable patch ID is `242302af3d9db6ecb81f258570b1ed0ec99cde3c`.
 Two independent source reviews approved this exact immutable object. It remains
 non-runnable and receives no artifact application or build.
 
+The latest source/static-approved readiness base is the non-runnable 5A2
+successor `origin/codex/forktree-stage2-milestone5a2-runtime-intent`, head
+`a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737`, tree
+`d8326da2b1d38bd51b8ac7229d00684a6865bce2`, parent `5c4cae81...`.
+Its focused full-index SHA-256 is
+`a81dd0af7154b86f663ca786bcd0470c6cd4af01a1fada0eea3ac6696a709e8c`,
+its `a12..head` SHA-256 is
+`8192c4f2409f11fedbab14e3553f98fa7f09887afd7745ad351aa72e5c87b87c`,
+and its patch ID is `f903241b622507aa637e09fa2362b976def580e2`.
+The exact two changed production blobs are transaction `commit.rs`
+`cfc40fa496ddcdc9ea920b3b6c17d19978e1ea0c` and `context.rs`
+`3a7c27fa922cda832d2bf89f5942b0981e444126`. Static review approved complete
+intent classification before view/plan creation, unsupported-cohort zero-write
+rejection, true empty no-op behavior, and the advanced runtime row in the sole
+ForkTree plan/prepare/commit. This is source/static readiness only: it remains
+compile-red/non-runnable and has no runtime, broad, 5B, merge, or artifact result.
+
 The next eligible candidate must be an explicitly compile-green immutable
-writer/SPI head descending from `54e90dbf...`, unless the coordinator names a
+writer/SPI head descending from `a1cf8f7f...`, unless the coordinator names a
 replacement lineage. Compile-green ordinary commit lowering is not sufficient:
 the same immutable head must have independent R2 atomicity approval, H2
 deletion/residue approval, and zero independent ForkTree publication points
@@ -75,19 +92,49 @@ selected-history intent while still publishing untracked/global-epoch work, and
 true empty commits error instead of retaining no-op behavior. Upload,
 checkpoint, history, multi-branch, and reachability publication families also
 remain independent. This is blocked identity evidence, not readiness promotion.
-The latest approved readiness base remains `54e90dbf...`.
+This rejected object remains blocker evidence; it is superseded for readiness
+by the narrowly corrected `a1cf8f7f...` source/static milestone.
 
-Its residue count is intentionally non-canonical: the author handoff reports
-170 findings with log SHA prefix `ae4250` but does not bind the scanner identity,
-while R2's independent frozen oracle reports 166 with log SHA prefix `3891a486`.
-These values are non-comparable until a successor pins the exact scanner source
-and hash and replays baseline plus candidate with that same binary.
+The 5A2 scanner replay is bound to exact residue ref
+`1dbbf3d206540d36f5912eab8372a42819778b47`, source SHA-256
+`f71e91fcbccbb7d6df676a95e9d747725856b77f7e3177ec42f12ca8b28736cc`,
+and owner-frozen binary SHA-256
+`40d02e20dd2cbd1334a8c0eddccce9c16e012200707d8488e136415a89483066`.
+Baseline and candidate each contain 166 identical semantic finding records.
+Their sorted unique normalized record set hashes to
+`86010e7dad821c8cc89858dcbf1a55cb9a234ea2eeab6d43ef08247e4ede61aa`.
+The previously conflicting raw hashes are presentation variants: baseline
+stdout, including `finding_count=166` and its final newline, hashes to
+`6f4013daca11867c9e07fab14b741c1650515eed473f87c12377e3421db8c42b`;
+audit mode writes that same stdout plus `first runnable candidate retains
+forbidden residue` to stderr, and combining streams with `2>&1` hashes to
+`3891a48613e5d6ebd3d0ab2780aed13c6dd0236f1c2ff343320dd73fb2158a0d`.
+Removing that terminal stderr line makes the streams byte-identical. The
+independent reconciliation report SHA-256 is
+`1f90f530b02743ffda50b56646499759119e69590a11f0b3eabe4a71b9b3a251`.
+Acceptance
+binds scanner source/binary identity and the normalized semantic set, not a
+cwd/path/redirection-dependent raw presentation.
+
+The externally frozen P0+W1a source-gate package is bound by manifest SHA-256
+`73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6`.
+Its contract, case table, verifier, and freeze report respectively hash to
+`cfd25a6064aa1c5fd3ad06558c43f79c2169ac88f7b80bd9dab05a90f739d249`,
+`77af0924a86cf023a2924075507545b52035739e8c5bfc33accc080e8f4a9b17`,
+`35dfbedc0373f5292d96d9e0ab2feafbc11b3f35618adcaa2d5c921514304550`,
+and `77a0762582364b3c77ca78720e8feca9c2b44c3cbdf40b4a91037ca704064e8e`.
+It is external evidence, not mounted or rehashed here. Every first-runnable
+candidate must pass it before residue or runtime artifact application: P0
+removes direct `PreparedPublication::commit`/independent write entry points;
+W1a lowers ordered single-branch history and selected members through exactly
+one read, plan, prepare, and commit, with unsupported families failing before
+any plan or epoch rotation.
 
 The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at
 `08f8dd5cf20842f79996fae9eb7b0924f074a084`, tree
-`19c8706d6bc3d1dbe9217b4f8386b19c66f027a8`, parent `af7899f...`, but is
-was **BLOCKED**. Its range path authenticates a manifest and intersecting chunks
+`19c8706d6bc3d1dbe9217b4f8386b19c66f027a8`, parent `af7899f...`, and is
+**BLOCKED**. Its range path authenticates a manifest and intersecting chunks
 while checking only owner size, so a same-size valid manifest can be
 substituted under a different row `BlobId`. This object remains immutable
 blocker evidence, not an executable candidate. The approved `54e90dbf...`
@@ -144,15 +191,19 @@ cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/te
 
 ## Minimal first-runnable sequence
 
-1. Verify the candidate SHA/tree and apply only exact test/report artifacts in
-   a disposable prospective tree. Run `cargo fmt --all -- --check`,
+1. Verify the candidate SHA/tree and run the frozen P0+W1a source package
+   against it. Require direct publication commit to be unnameable, ordered
+   single-branch history to use one read/plan/prepare/commit, exact selected
+   member authentication, and unsupported families to fail before a plan.
+2. Apply only exact test/report artifacts in a disposable prospective tree.
+   Run `cargo fmt --all -- --check`,
    `git diff --check`, the residue scanner, semantic delegation audit, CLI
    routing audit, cursor compile probes, and the 21-path/39-symbol #1258 map.
    Any nonzero legacy authority stops all runtime work.
-2. Run the production-owner 65-row, batch-1 delete on RocksDB. Only after it
+3. Run the production-owner 65-row, batch-1 delete on RocksDB. Only after it
    cold-reopens empty, run SlateDB. Retain 64-row/batch-1 and
    65-row/batch-100 controls. A detached benchmark-model pass is insufficient.
-3. Bind the actual public point plus BlobRef seam and enumerate every transitive
+4. Bind the actual public point plus BlobRef seam and enumerate every transitive
    helper. Run the 1K point-read gate on RocksDB and then SlateDB with at least
    five samples and setup excluded. Each sample must perform exactly 1,000
    `begin_read` calls, 6,000 authenticated gets, and 3,922,880 logical read
@@ -162,16 +213,16 @@ cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/te
    substitution. Require a meaningful paired improvement greater than 10% on
    both adapters and no critical regression greater than 5%. Any failure stops
    before SQL and before 10K/50K scaling.
-4. Run the 18-statement SQL RocksDB smoke, then SlateDB. Both public-result and
+5. Run the 18-statement SQL RocksDB smoke, then SlateDB. Both public-result and
    cold-state digests must equal the frozen current-layout values.
-5. Run the three-row checkpoint/merge RocksDB test, then SlateDB. This single
+6. Run the three-row checkpoint/merge RocksDB test, then SlateDB. This single
    focused gate includes 64 rotations, true conflict, missing-parent,
    undo/redo, cold reopen, and final release.
-6. Run the no-lease discriminator and then the sealed GC/publication RocksDB
+7. Run the no-lease discriminator and then the sealed GC/publication RocksDB
    gate. Only after both are green, run their SlateDB counterparts. Exact
    one-view transport, progress rotation, persisted bounded packs, upload and
    final-reference checks are mandatory.
-7. Build the sealed OLAP oracle once, then run its ordered gate into a new empty
+8. Build the sealed OLAP oracle once, then run its ordered gate into a new empty
    evidence directory: 10K RocksDB plus both corruption cells, 10K SlateDB plus
    both corruption cells, 50K RocksDB then SlateDB, and finally 500K RocksDB
    then SlateDB. Every process cell is capped at 20 minutes. Query digests and
@@ -181,7 +232,7 @@ cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/te
    hard-block broad closeout unless a checked-in manager waiver binds the exact
    candidate, scale, query, values, report hash, and at least 20% aggregate
    improvement. No waiver can cover any other metric.
-8. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
+9. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
    multimedia transport bound, run 64 MiB/1% image RocksDB first, then SlateDB, then
    the remaining 64 MiB shape and only then 512 MiB/10% archive/video. No
    broader workspace or performance matrix precedes these focused gates.
