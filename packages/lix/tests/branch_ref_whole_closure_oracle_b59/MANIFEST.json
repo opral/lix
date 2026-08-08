@@ -2,6 +2,12 @@
   "kind": "test-report-only-branch-ref-whole-closure-oracle",
   "status": "dormant-until-compile-green",
   "correction": "6eba H1 global selector identity correction oracle",
+  "prior_blocker_evidence": {
+    "source_log_sha256": "a1fe150858a8f85af1e24e04f1bbc367182b1b5652bd904187b21dec1411d830",
+    "model_log_sha256": "c481827a36dacf8168d35791f9ac44ec4992b86604eb2af117165d6713d75044",
+    "model_binary_sha256": "36f96fbac86acfaf6a783ac608c528f5467814304d8d184cbb15c62caf3987b0",
+    "classification": "R1 v5 BLOCKER control evidence"
+  },
   "corrected_from": {
     "commit": "6eba1b6f853337985c17cf2ef83fcb3abbccf02c",
     "tree": "677b645d8e29c2d6ebe07a3494f5a8c2601155ce",
@@ -18,7 +24,7 @@
     "branch_ref_occurrence_files": 15,
     "non_derived_branch_ref_files": 4,
     "authority_use_lines": 343,
-    "normalized_log_sha256": "18f9ac8be382be047445a6c52448d9d4f77785f23b8383dc4846a4d23defecd4",
+    "normalized_log_sha256": "c6fe18db31225530c85f07374be2b93fbd2e343e2959c9a94f7e8521f34712d8",
     "result": "RED"
   },
   "anchor": {

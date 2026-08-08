@@ -15,12 +15,22 @@ bash packages/lix/tests/branch_ref_whole_closure_oracle_b59/verify_branch_ref_wh
 
 Result: exit status `1`, expected `RED`.
 
+The R1 v5 blocker control evidence bound by this correction is identified by
+source log SHA-256
+`a1fe150858a8f85af1e24e04f1bbc367182b1b5652bd904187b21dec1411d830`, model
+log SHA-256
+`c481827a36dacf8168d35791f9ac44ec4992b86604eb2af117165d6713d75044`, and
+model binary SHA-256
+`36f96fbac86acfaf6a783ac608c528f5467814304d8d184cbb15c62caf3987b0`.
+These are prior-control evidence identities, not claims that this package
+reused a production binary or performed adapter/runtime qualification.
+
 The corrected successor replayed the same source verifier from its immutable
 482e descendant. The exact candidate run reports `required-missing=0` and the
 compiler-red closure (`legacy-residue=481`, `old-closure-paths=4`); no
 production file changed in the correction. The path-normalized source-gate
 capture is `/root/repos/lix-evidence/branch-ref-selector-correction-oracle-6eba/source-successor-normalized.log`,
-SHA-256 `18f9ac8be382be047445a6c52448d9d4f77785f23b8383dc4846a4d23defecd4`.
+SHA-256 `c6fe18db31225530c85f07374be2b93fbd2e343e2959c9a94f7e8521f34712d8`.
 
 Summary:
 
@@ -37,7 +47,7 @@ RED BranchHead/BranchRef whole-closure deletion boundary
 The complete path-normalized stdout/stderr capture is identified by:
 
 ```text
-18f9ac8be382be047445a6c52448d9d4f77785f23b8383dc4846a4d23defecd4
+c6fe18db31225530c85f07374be2b93fbd2e343e2959c9a94f7e8521f34712d8
 ```
 
 The four non-derived projection files are intentionally reported rather than
@@ -77,6 +87,9 @@ switch, advance, delete, retire, retained-view release/GC, and cold reopen,
 including malformed/same-size substitutions, missing roots, cycles, and epoch
 gaps. Future adapter commands require the same fingerprints, one retained view,
 and zero backend writes for read/CAS rejection. The correction's positive
-control accepts the canonical selector; its negative control requires
-same-size forged key/root rejection as `InvalidFingerprint` before view,
-write, commit, or rotation.
+control `canonical_global_selector_is_accepted` accepts the canonical
+selector. Its executable negative control
+`same_size_forged_global_key_and_root_fail_before_view_or_write` rewrites the
+canonical key and root to equal-length values, recomputes the model
+authentication tag, and requires typed `InvalidFingerprint` rejection before
+view, write, commit, or rotation, with unchanged read/write/commit counters.
