@@ -685,7 +685,11 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_batch_with_schema_presence(request, false).await
+        // Current tracked rows are now served by the authenticated
+        // ForkTree selector/state facade. Unsupported lanes fail closed in
+        // that adapter; they must not fall back to the deleted hot-state
+        // reader.
+        crate::live_state::scan_forktree_branch(&self.store, request).await
     }
 
     async fn scan_batch_with_schema_presence(
@@ -1103,8 +1107,7 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_tracked_batch_with_schema_presence(request, false)
-            .await
+        crate::live_state::scan_forktree_branch(&self.store, request).await
     }
 
     async fn scan_tracked_batch_with_schema_presence(
@@ -1229,16 +1232,8 @@ where
         request: &LiveStateScanRequest,
         tracked_only: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        if tracked_only {
-            self.scan_tracked_batch_with_schema_presence(request, true)
-                .await
-        } else {
-            // A combined constraint read is also the explicit cross-domain
-            // identity/collision probe. Its tracked bloom cannot prove that
-            // the current-only selector is empty, so never short-circuit it.
-            self.scan_batch_with_schema_presence(request, request.filter.untracked.is_some())
-                .await
-        }
+        let _ = tracked_only;
+        crate::live_state::scan_forktree_branch(&self.store, request).await
     }
 
     async fn scan_batch(

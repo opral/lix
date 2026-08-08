@@ -8,10 +8,11 @@
 use async_trait::async_trait;
 use tracing::Instrument;
 
-use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
+use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::changelog::{ChangeId, CommitId, CommitRecord};
 use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
+use crate::forktree::{CanonicalBranchId, ChangeObjectV1};
 use crate::live_state::{LiveStateRowFilter, LiveStateScanRequest, MaterializedLiveStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
@@ -342,13 +343,14 @@ where
         {
             return Ok(Vec::new());
         }
-        BranchHeadControlContext::new()
-            .reader(reads.store)
-            .scan()
-            .await?
-            .into_iter()
-            .map(|(branch_id, control)| branch_ref_row(&branch_id, control))
-            .collect()
+        let heads = crate::forktree::scan_branch_heads(reads.store).await?;
+        let mut rows = Vec::with_capacity(heads.len());
+        for (branch_id, head_commit_id) in heads {
+            if let Some(row) = load_branch_ref_row(reads.store, &branch_id, head_commit_id).await? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -379,16 +381,18 @@ where
         if branch_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let controls = BranchHeadControlContext::new()
-            .reader(reads.store)
-            .load_many(&branch_ids)
-            .await?;
-        branch_ids
-            .into_iter()
-            .zip(controls)
-            .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
-            .map(|(branch_id, control)| branch_ref_row(&branch_id, control))
-            .collect()
+        let mut rows = Vec::with_capacity(branch_ids.len());
+        for branch_id in branch_ids {
+            let Some(head_commit_id) =
+                crate::forktree::load_branch_head(reads.store, &branch_id).await?
+            else {
+                continue;
+            };
+            if let Some(row) = load_branch_ref_row(reads.store, &branch_id, head_commit_id).await? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -659,13 +663,69 @@ fn commit_edge_row(
     })
 }
 
+async fn load_branch_ref_row<S>(
+    store: &S,
+    branch_id: &str,
+    head_commit_id: CommitId,
+) -> Result<Option<MaterializedLiveStateRow>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let branch_id_value = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("branch ID must be a UUID: {error}"),
+        )
+    })?;
+    let branch_id_value = CanonicalBranchId::from_bytes(*branch_id_value.as_bytes());
+    let view = crate::forktree::open_coherent_view_on_read(store, branch_id_value).await?;
+    let Some(ref_object_id) = view.branch_snapshot().latest_ref_change_object_id else {
+        return Ok(None);
+    };
+    let bytes = view.load_object_bytes(ref_object_id).await?;
+    let envelope = ChangeObjectV1::decode(ref_object_id, &bytes)?;
+    let Some(change) = crate::forktree::load_change(&view, envelope.change_id()).await? else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' ref change is absent from ChangeCatalog"),
+        ));
+    };
+    let ChangeObjectV1::BranchRef {
+        branch_id: object_branch_id,
+        payload,
+        ..
+    } = change
+    else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' ref edge names a semantic Change"),
+        ));
+    };
+    if object_branch_id != branch_id_value {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("branch '{branch_id}' ref edge has a mismatched branch identity"),
+        ));
+    }
+    let change_id = ChangeId::new(uuid::Uuid::from_bytes(*envelope.change_id().as_bytes()));
+    let record = crate::changelog::decode_forktree_change_payload(&payload, change_id)?;
+    Ok(Some(branch_ref_row(
+        branch_id,
+        head_commit_id,
+        record.change_id,
+        record.created_at,
+    )?))
+}
+
 fn branch_ref_row(
     branch_id: &str,
-    control: BranchHeadControl,
+    head_commit_id: CommitId,
+    ref_change_id: ChangeId,
+    created_at: crate::common::LixTimestamp,
 ) -> Result<MaterializedLiveStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": branch_id,
-        "commit_id": control.head_commit_id.to_string(),
+        "commit_id": head_commit_id.to_string(),
     }))
     .map_err(|error| {
         LixError::new(
@@ -685,11 +745,11 @@ fn branch_ref_row(
         snapshot_content: Some(snapshot_content.into()),
         metadata: None,
         deleted: false,
-        created_at: control.created_at,
-        updated_at: control.updated_at,
+        created_at,
+        updated_at: created_at,
         global: true,
-        change_id: Some(control.ref_change_id),
-        commit_id: None,
+        change_id: Some(ref_change_id),
+        commit_id: Some(head_commit_id),
         untracked: true,
         branch_id: GLOBAL_BRANCH_ID.into(),
     })

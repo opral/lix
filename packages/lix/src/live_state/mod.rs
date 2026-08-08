@@ -3,6 +3,7 @@ mod derived;
 mod entity_columnar;
 mod entity_columnar_cache;
 mod entity_decoded_column_cache;
+mod forktree_reader;
 mod reader;
 mod types;
 pub(crate) mod visibility;
@@ -17,6 +18,7 @@ pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
 };
 pub(crate) use entity_decoded_column_cache::EntityDecodedColumnCache;
+pub(crate) use forktree_reader::scan_branch as scan_forktree_branch;
 #[cfg(test)]
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[allow(unused_imports)]
