@@ -176,6 +176,52 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_owner_does_not_enter_stale_plan() {
+        let prepared = PreparedWriteSet {
+            state_rows: {
+                let mut rows = super::super::staging::PreparedStateBatch::with_capacity(1);
+                rows.push_parts_with_change_addressability(
+                    super::super::staging::SchemaPlanId::for_test(0),
+                    super::super::staging::PreparedRowFacts::default(),
+                    EntityPk::single("row-a"),
+                    "plugin_entity".to_owned(),
+                    Some("file-a".to_owned()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                    crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    "main".to_owned(),
+                );
+                rows
+            },
+            insert_selection: super::super::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: Default::default(),
+            first_commit_parent_override_by_branch: Default::default(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: Default::default(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+        let unrelated = TrackedStateKey {
+            schema_key: "plugin_entity".to_owned(),
+            file_id: Some("file-b".to_owned()),
+            entity_pk: EntityPk::single("row-a"),
+        };
+
+        assert_eq!(
+            classify_stale_commit(&prepared, std::iter::once(test_key_ref(&unrelated))),
+            StaleCommitPlan::Direct
+        );
+    }
+
+    #[test]
     #[ignore = "release-only stale overlap discovery benchmark probe"]
     fn stale_overlap_discovery_benchmark_probe() {
         let rows = std::env::var("LIX_STALE_OVERLAP_BENCH_ROWS")

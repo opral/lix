@@ -593,19 +593,33 @@ where
     Ok(by_key
         .into_values()
         .filter_map(|(before, after)| {
-            let changed = match (&before, &after) {
-                (Some(left), Some(right)) => {
-                    left.deleted != right.deleted
-                        || left.snapshot_content != right.snapshot_content
-                        || left.metadata != right.metadata
-                        || left.key != right.key
-                }
-                (Some(_), None) | (None, Some(_)) => true,
-                (None, None) => false,
-            };
+            let changed = historical_state_rows_differ(before.as_ref(), after.as_ref());
             changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
         })
         .collect())
+}
+
+/// A stale-write diff must retain both payload changes and the authenticated
+/// write identity. Equal visible bytes do not make two writes equivalent:
+/// same-key rows with a different change or commit identity still represent a
+/// concurrent write and must reach the stale classifier. The caller maps any
+/// returned entry to its logical key only after this complete comparison.
+fn historical_state_rows_differ(
+    before: Option<&super::state::HistoricalStateRow>,
+    after: Option<&super::state::HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (Some(left), Some(right)) => {
+            left.key != right.key
+                || left.deleted != right.deleted
+                || left.snapshot_content != right.snapshot_content
+                || left.metadata != right.metadata
+                || left.change_id != right.change_id
+                || left.commit_id != right.commit_id
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
 }
 
 pub(crate) async fn open_coherent_view<S>(
@@ -907,8 +921,33 @@ fn projected_required(
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_marker_matches_commit;
-    use crate::changelog::CommitId;
+    use super::{checkpoint_marker_matches_commit, historical_state_rows_differ};
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::state::{HistoricalStateRow, StateKey};
+
+    fn historical_row(
+        change_id: ChangeId,
+        commit_id: CommitId,
+        deleted: bool,
+        snapshot_content: Option<&str>,
+    ) -> HistoricalStateRow {
+        HistoricalStateRow {
+            key: StateKey {
+                schema_key: "plugin_entity".to_owned(),
+                file_id: Some("file-a".to_owned()),
+                entity_pk: EntityPk::single("row-a"),
+            },
+            change_id,
+            commit_id,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            snapshot_content: snapshot_content.map(Into::into),
+            metadata: None,
+            deleted,
+        }
+    }
 
     #[test]
     fn inherited_marker_does_not_classify_descendant_commit() {
@@ -916,5 +955,39 @@ mod tests {
         let ordinary = CommitId::for_test_label("ordinary");
         assert!(checkpoint_marker_matches_commit(checkpoint, checkpoint));
         assert!(!checkpoint_marker_matches_commit(checkpoint, ordinary));
+    }
+
+    #[test]
+    fn same_payload_with_new_authenticated_change_identity_is_a_diff() {
+        let before = historical_row(
+            ChangeId::for_test_label("change-before"),
+            CommitId::for_test_label("commit-before"),
+            false,
+            Some(r#"{"id":"row-a","value":"same"}"#),
+        );
+        let same_payload_new_change = historical_row(
+            ChangeId::for_test_label("change-after"),
+            CommitId::for_test_label("commit-after"),
+            false,
+            Some(r#"{"id":"row-a","value":"same"}"#),
+        );
+
+        assert!(historical_state_rows_differ(
+            Some(&before),
+            Some(&same_payload_new_change),
+        ));
+        assert!(!historical_state_rows_differ(Some(&before), Some(&before)));
+    }
+
+    #[test]
+    fn null_tombstone_and_absence_remain_distinct_diff_states() {
+        let change = ChangeId::for_test_label("change");
+        let commit = CommitId::for_test_label("commit");
+        let null = historical_row(change, commit, false, None);
+        let tombstone = historical_row(change, commit, true, None);
+
+        assert!(historical_state_rows_differ(Some(&null), Some(&tombstone)));
+        assert!(historical_state_rows_differ(Some(&tombstone), None));
+        assert!(historical_state_rows_differ(None, Some(&null)));
     }
 }
