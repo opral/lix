@@ -1,0 +1,37 @@
+{
+  "package": "cut-b-filesystem-plugin-reader-acceptance",
+  "kind": "test-report-only",
+  "anchor": {
+    "ref": "origin/codex/forktree-stage2-commit-catalog-failclosed-1f742",
+    "head": "d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768",
+    "parent": "1f742a382c755399b8a49ab536c4f6dc55fffdd8",
+    "tree": "641654079f60fcd1c9ff9ccbbd06d3edcabe4096"
+  },
+  "reader_prerequisite": {
+    "ref": "origin/codex/forktree-stage2-reader-acceptance-d6",
+    "head": "8b0cf91387ffc86851b99029bdd8942938ba2be6",
+    "tree": "5bfc6d63011789c85b70fd0675ffb8a2216210c0",
+    "anchor_to_head_diff_sha256": "b75fed7dace12928a800eb1f92cb5abc025f3e13d6fa36f19013d8c96114aee3",
+    "stable_patch_id": "912561f9e9f11d3341225354c9df119d681180ac"
+  },
+  "runtime_status": "not-run-anchor-is-compiler-red",
+  "production_changes": false,
+  "w5_implementation": false,
+  "source_gate": "bash test-reports/stage2-filesystem-plugin-reader-d6b/verify_source_contract.sh",
+  "source_gate_observed": {
+    "anchor_exit": 1,
+    "log_sha256": "e2b11cee996a8b29b724ac5f3efa45c212ad985deb481d7c7053a830c9f2227b",
+    "meaning": "expected pre-Cut-B legacy reader residue; no compiler or adapter invoked"
+  },
+  "required_adapters": ["Memory", "RocksDB", "SlateDB"],
+  "required_semantics": [
+    "one_coherent_view",
+    "filesystem_parsed_file_and_history_semantics",
+    "plugin_registry_and_owner_semantics",
+    "gc_blobid_root_dedupe_without_byte_reads",
+    "merge_registry_historical_view",
+    "malformed_missing_wrong_kind_fail_closed",
+    "cold_reopen",
+    "legacy_tracked_head_tracked_state_cas_reader_residue_zero"
+  ]
+}
