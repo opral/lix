@@ -287,6 +287,10 @@ pub(crate) struct BlobWriteReceipt {
     /// The authenticated ForkTree manifest object staged for this receipt.
     /// A semantic BlobId alone cannot authorize a physical object edge.
     pub(crate) manifest_object_id: [u8; 32],
+    /// True only when the writer authenticated the exact immutable manifest
+    /// already present in the retained read; this is an in-memory proof bit,
+    /// not a second persisted authority.
+    pub(crate) manifest_was_existing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -783,7 +783,9 @@ where
                 "atomic transaction metadata was staged more than once",
             ));
         }
-        if !writes.has_put(crate::forktree::OBJECT_SPACE, &receipt.manifest_object_id) {
+        if !writes.has_put(crate::forktree::OBJECT_SPACE, &receipt.manifest_object_id)
+            && !receipt.manifest_was_existing
+        {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "atomic CAS publication is missing its prepared manifest",

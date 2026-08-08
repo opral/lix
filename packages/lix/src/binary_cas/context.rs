@@ -224,10 +224,20 @@ where
             *content_digest.finalize().as_bytes(),
         );
         let (manifest_object_id, encoded) = manifest.encode().map_err(LixError::from)?;
-        if !self.object_exists(manifest_object_id).await?
-            && !self
-                .writes
-                .has_put(OBJECT_SPACE, manifest_object_id.as_bytes())
+        let manifest_was_existing = self.object_exists(manifest_object_id).await?;
+        if manifest_was_existing {
+            let existing = self.load_object(manifest_object_id).await?;
+            let decoded =
+                BlobManifestV1::decode(manifest_object_id, &existing).map_err(LixError::from)?;
+            if decoded != manifest || existing.as_slice() != encoded.as_ref() {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "ForkTree upload manifest identity resolves to different authenticated bytes",
+                ));
+            }
+        } else if !self
+            .writes
+            .has_put(OBJECT_SPACE, manifest_object_id.as_bytes())
         {
             self.writes.put(
                 OBJECT_SPACE,
@@ -259,6 +269,7 @@ where
             size_bytes: total_size,
             layout,
             manifest_object_id: *manifest_object_id.as_bytes(),
+            manifest_was_existing,
         })
     }
 

@@ -11702,6 +11702,7 @@ mod tests {
             size_bytes,
             layout: BlobLayout::Chunked { chunk_count },
             manifest_object_id: [0; 32],
+            manifest_was_existing: false,
         };
 
         let outcome = super::execute_fast_lix_file_prepared_path_write(

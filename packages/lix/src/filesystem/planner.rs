@@ -372,17 +372,19 @@ pub(crate) struct BlobRefPluginCheckpoint {
 
 impl BlobRefRowInput {
     pub(crate) fn append_to(self, rows: &mut RawWriteBatch) -> Result<(), LixError> {
-        let snapshot = json!({
+        let mut snapshot = json!({
             "id": self.file_id,
             "blob_hash": self.blob_hash.to_hex(),
             "size_bytes": self.size_bytes,
-            "plugin_checkpoint": self.plugin_checkpoint.map(|checkpoint| json!({
+        });
+        if let Some(checkpoint) = self.plugin_checkpoint {
+            snapshot["plugin_checkpoint"] = json!({
                 "generation": checkpoint.generation,
                 "semantic_root": checkpoint.semantic_root,
                 "runtime": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(checkpoint.runtime),
                 "authority": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(checkpoint.authority),
-            })),
-        });
+            });
+        }
         let file_id = self.file_id;
         append_state_row(
             rows,
@@ -1940,6 +1942,25 @@ mod tests {
         assert_eq!(
             snapshot["blob_hash"].as_str(),
             Some(BlobId::from_content(b"Hello").to_hex().as_str())
+        );
+        assert_eq!(
+            snapshot
+                .as_object()
+                .expect("blob ref snapshot should be an object")
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "blob_hash".to_owned(),
+                "id".to_owned(),
+                "size_bytes".to_owned(),
+            ])
+        );
+        assert!(
+            !snapshot
+                .as_object()
+                .expect("blob ref snapshot should be an object")
+                .contains_key("plugin_checkpoint")
         );
     }
 

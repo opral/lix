@@ -1247,6 +1247,9 @@ fn blob_manifest_object_ids_for_row(
     if row.schema_key.as_str() != "lix_binary_blob_ref" {
         return Ok(Vec::new());
     }
+    if row.snapshot.is_none() {
+        return Ok(Vec::new());
+    }
     let file_id = row
         .file_id
         .ok_or_else(|| writer_error("blob-ref state row has no file identity"))?;
