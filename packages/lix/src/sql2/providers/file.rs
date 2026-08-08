@@ -787,7 +787,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     live_state: Arc<dyn LiveStateReader>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
     plugin_cache_snapshot: Option<u128>,
@@ -844,7 +844,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     // blobs into the result instead of packing them into Arrow only for
     // DataFusion to copy them back into row values.
     let rows = exact_path_data_rows_from_prepared(
-        &blob_reader,
+        authenticated_blob_reader.as_ref(),
         plugin_render,
         prepared,
         data_range.as_ref(),
@@ -2397,6 +2397,7 @@ struct BlobRefRecord {
     blob_hash: String,
     inline_data: Option<Vec<u8>>,
     live: LiveStateRowHandle,
+    state_key: crate::forktree::StateKey,
 }
 
 #[derive(Debug, Clone)]
@@ -2467,6 +2468,11 @@ fn blob_ref_record_from_live_row(
             blob_hash: snapshot.blob_hash,
             inline_data: None,
             live: handle,
+            state_key: crate::forktree::StateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                entity_pk: row.entity_pk().clone(),
+            },
         },
     )))
 }
@@ -4910,7 +4916,6 @@ async fn lix_file_record_batch_from_prepared(
         Some(plugin_render) if needs_data => {
             render_plugin_files_for_sql(
                 plugin_render,
-                blob_reader,
                 &live_rows,
                 &file_keys,
                 &file_rows,
@@ -4977,7 +4982,7 @@ async fn lix_file_record_batch_from_prepared(
 }
 
 async fn exact_path_data_rows_from_prepared(
-    blob_reader: &Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
     plugin_render: Option<PluginRenderContext>,
     prepared: PreparedLixFileRows,
     data_range: Option<&Range<u64>>,
@@ -4990,14 +4995,20 @@ async fn exact_path_data_rows_from_prepared(
         path_ordered_file_keys,
     } = prepared;
     let mut blob_bytes = if data_range.is_none() {
-        load_blob_bytes_for_files(blob_reader, &live_rows, &file_rows, &blob_rows).await?
+        load_authenticated_blob_bytes_for_files(
+            authenticated_blob_reader,
+            &live_rows,
+            &file_rows,
+            &blob_rows,
+        )
+        .await?
     } else {
         LoadedBlobBytes::default()
     };
     let mut blob_ranges = match data_range {
         Some(range) => {
-            load_blob_ranges_for_files(
-                blob_reader,
+            load_authenticated_blob_ranges_for_files(
+                authenticated_blob_reader,
                 &live_rows,
                 &file_rows,
                 &blob_rows,
@@ -5014,7 +5025,6 @@ async fn exact_path_data_rows_from_prepared(
         Some(plugin_render) => {
             render_plugin_files_for_sql(
                 plugin_render,
-                blob_reader,
                 &live_rows,
                 &file_keys,
                 &file_rows,
@@ -5169,8 +5179,8 @@ impl LoadedBlobRanges {
     }
 }
 
-async fn load_blob_ranges_for_files(
-    blob_reader: &Arc<dyn BlobDataReader>,
+async fn load_authenticated_blob_ranges_for_files(
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
     live_rows: &LiveStateBatchOwners,
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
@@ -5195,14 +5205,17 @@ async fn load_blob_ranges_for_files(
                     );
                 } else {
                     keys.push(key);
-                    requests.push((BlobId::from_hex(&row.blob_hash)?, range.clone()));
+                    requests.push((row.state_key.clone(), range.clone()));
                 }
             }
             *remaining += 1;
         }
     }
     if !keys.is_empty() {
-        let values = blob_reader.load_ranges_many(&requests).await?.into_vec();
+        let values = authenticated_blob_reader
+            .load_ranges_for_rows(&requests)
+            .await?
+            .into_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -5216,6 +5229,57 @@ async fn load_blob_ranges_for_files(
         bytes_by_key.extend(keys.into_iter().zip(values));
     }
     Ok(LoadedBlobRanges {
+        bytes_by_key,
+        remaining_by_key,
+    })
+}
+
+async fn load_authenticated_blob_bytes_for_files(
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    live_rows: &LiveStateBatchOwners,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+) -> Result<LoadedBlobBytes, LixError> {
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let mut keys = Vec::new();
+    let mut rows = Vec::new();
+    let mut bytes_by_key = BTreeMap::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key(live_rows);
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                if let Some(data) = &row.inline_data {
+                    bytes_by_key.insert(key.clone(), Some(data.clone()));
+                } else {
+                    keys.push(key);
+                    rows.push(row.state_key.clone());
+                }
+            }
+            *remaining += 1;
+        }
+    }
+    if !keys.is_empty() {
+        let values = authenticated_blob_reader
+            .load_bytes_for_rows(&rows)
+            .await?
+            .into_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "authenticated blob reader returned {} values for {} requested rows",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
+    }
+    Ok(LoadedBlobBytes {
         bytes_by_key,
         remaining_by_key,
     })
@@ -5271,7 +5335,6 @@ async fn load_blob_bytes_for_files(
 
 async fn render_plugin_files_for_sql(
     plugin_render: &PluginRenderContext,
-    blob_reader: &Arc<dyn BlobDataReader>,
     live_rows: &LiveStateBatchOwners,
     file_keys: &[FilesystemDescriptorKey],
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
@@ -5318,7 +5381,6 @@ async fn render_plugin_files_for_sql(
     for file_key in materialized_file_keys {
         acknowledge_materialized_file(
             plugin_render,
-            blob_reader,
             live_rows,
             &file_key,
             file_rows,
@@ -5332,7 +5394,6 @@ async fn render_plugin_files_for_sql(
 
 async fn acknowledge_materialized_file(
     plugin_render: &PluginRenderContext,
-    _blob_reader: &Arc<dyn BlobDataReader>,
     live_rows: &LiveStateBatchOwners,
     file_key: &FilesystemDescriptorKey,
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
