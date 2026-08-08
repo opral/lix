@@ -54,7 +54,21 @@ Exact sites at 479:
 | `tracked_state/mod.rs:21-22` | merge reexports | delete only merge reexports after the move |
 | `tracked_state/context.rs:3743-3759` | test-only reader-backed `plan_merge` helper | move its tests/model to ForkTree and delete the helper with the old planner |
 | `tracked_state/diff.rs:349-464` | generic diff and shared payload batch | retain for checkpoint, working-diff, SQL and other cohorts |
+| `tracked_state/diff.rs:1481-1485` (`cfg(test)`, `ten_thousand_merge_picks_retain_the_source_identity_batch`) | direct `crate::tracked_state::merge::plan_merge` caller; source-identity/contiguous-pick regression | retarget the regression to the ForkTree merge owner, then delete this direct call with the old planner; the verifier must enumerate it even under `cfg(test)` |
 | `session/merge/stats.rs`, `conflicts.rs` | session stats and borrowed conflict views | preserve behavior; retarget imports to the ForkTree-owned plan |
+
+### Direct merge-planner caller completeness
+
+The 479 frontier has two production merge callbacks in
+`session/merge/branch.rs` (preview and committed merge), plus one direct
+test-only qualified planner call at
+`tracked_state/diff.rs:1481-1485`:
+`crate::tracked_state::merge::plan_merge`. The production callbacks are
+retained and retargeted to the one ForkTree operation; the test-only caller
+is not an unrelated reader and must move with the merge planner. The source
+verifier scans every Rust file under `packages/lix/src`, `packages/lix/tests`,
+and `packages/engine-benchmarks`, without excluding `cfg(test)`, and requires
+zero direct `tracked_state::merge::plan_merge` calls in an accepted successor.
 
 `TrackedStateContext::reader` and `tracked_state_reader()` are not merge-only:
 they still serve checkpoint, undo/redo, stale-transaction validation, SQL,

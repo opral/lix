@@ -39,6 +39,21 @@ for token in with_opening_tracked_reader merge_payload_fallback_ids plan_merge C
 merge_calls="$(rg -n --no-heading -F with_opening_tracked_reader "$branch" | wc -l | tr -d ' ')"
 test "$merge_calls" = 2 && pass merge-callback-callers-2 || fail "merge-callback-callers=$merge_calls"
 
+# Enumerate the fully-qualified legacy planner call across production,
+# integration, benchmark, and cfg(test) Rust sources. The frontier is
+# expected to report this as RED; an accepted successor must retarget every
+# listed caller to the ForkTree merge owner, including the test-only caller.
+direct_plan_merge_calls="$(rg -n --no-heading --glob '*.rs' -F \
+  'tracked_state::merge::plan_merge' \
+  "$src" "$root/packages/lix/tests" "$root/packages/engine-benchmarks" \
+  2>/dev/null || true)"
+if test -n "$direct_plan_merge_calls"; then
+  fail "direct-tracked-state-merge-plan-merge-calls-must-be-zero"
+  printf '%s\n' "$direct_plan_merge_calls"
+else
+  pass direct-tracked-state-merge-plan-merge-calls-zero
+fi
+
 # Retained cohorts are evidence for the deletion boundary, not merge-owned
 # paths that the future slice may remove.
 for path in "$src/checkpoint.rs" "$src/session/checkpoint.rs" "$src/session/undo_redo.rs" "$src/sql2/providers/file_history.rs" "$src/sql2/providers/filesystem_working_diff.rs" "$src/tracked_state/diff.rs"; do test -f "$path" && pass "retained-cohort=$path" || fail "missing-retained-cohort=$path"; done
