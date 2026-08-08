@@ -342,9 +342,10 @@ where
     for (id, bytes) in objects.iter() {
         writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
     }
+    let global_selector_storage_key = global_selector_key().to_vec();
     writes.put(
         SELECTOR_SPACE,
-        global_selector_key().to_vec(),
+        global_selector_storage_key.clone(),
         GlobalSelectorV1 {
             repository_root: repository_id,
             epoch: 1,
@@ -354,13 +355,19 @@ where
         .map_err(LixError::from)?
         .to_vec(),
     );
+    let global_branch_selector_storage_key = branch_selector_key(global_branch).to_vec();
+    let main_branch_selector_storage_key = branch_selector_key(main_branch_id).to_vec();
     for (branch_id, snapshot_id) in [
         (global_branch, global_snapshot_id),
         (main_branch_id, main_snapshot_id),
     ] {
         writes.put(
             SELECTOR_SPACE,
-            branch_selector_key(branch_id).to_vec(),
+            if branch_id == global_branch {
+                global_branch_selector_storage_key.clone()
+            } else {
+                main_branch_selector_storage_key.clone()
+            },
             BranchSelectorV1 {
                 branch_id,
                 branch_snapshot_object_id: snapshot_id,
@@ -390,16 +397,43 @@ where
     })?;
     writes.put(UNTRACKED_ROW_SPACE, workspace_key, workspace_value);
     crate::init::stage_repository_protocol(&mut writes);
+    #[cfg(test)]
+    tests::inject_selector_before_bootstrap_commit(
+        &storage,
+        global_selector_storage_key.clone(),
+        main_branch_selector_storage_key.clone(),
+    )
+    .await?;
     storage
         .commit_write_set(
             writes,
             StorageWriteOptions {
-                preconditions: vec![crate::storage_adapter::StoragePrecondition::KeyAbsent {
-                    space: crate::init::REPOSITORY_PROTOCOL_SPACE,
-                    key: crate::storage_adapter::StorageKey(Bytes::from_static(
-                        crate::init::REPOSITORY_PROTOCOL_KEY,
-                    )),
-                }],
+                preconditions: vec![
+                    crate::storage_adapter::StoragePrecondition::KeyAbsent {
+                        space: crate::init::REPOSITORY_PROTOCOL_SPACE,
+                        key: crate::storage_adapter::StorageKey(Bytes::from_static(
+                            crate::init::REPOSITORY_PROTOCOL_KEY,
+                        )),
+                    },
+                    crate::storage_adapter::StoragePrecondition::KeyAbsent {
+                        space: SELECTOR_SPACE,
+                        key: crate::storage_adapter::StorageKey(Bytes::from(
+                            global_selector_storage_key,
+                        )),
+                    },
+                    crate::storage_adapter::StoragePrecondition::KeyAbsent {
+                        space: SELECTOR_SPACE,
+                        key: crate::storage_adapter::StorageKey(Bytes::from(
+                            global_branch_selector_storage_key,
+                        )),
+                    },
+                    crate::storage_adapter::StoragePrecondition::KeyAbsent {
+                        space: SELECTOR_SPACE,
+                        key: crate::storage_adapter::StorageKey(Bytes::from(
+                            main_branch_selector_storage_key,
+                        )),
+                    },
+                ],
                 ..StorageWriteOptions::default()
             },
         )
@@ -430,4 +464,135 @@ fn branch_ref_change(
     };
     let (object_id, bytes) = change.encode().map_err(LixError::from)?;
     Ok((change_id, object_id, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::engine::Engine;
+    use crate::storage_adapter::{
+        Memory, PointReadPlan, StorageGetOptions, StorageKey, StorageWriteOptions,
+    };
+
+    const NO_SELECTOR_RACE: u8 = 0;
+    const GLOBAL_SELECTOR_RACE: u8 = 1;
+    const BRANCH_SELECTOR_RACE: u8 = 2;
+
+    static SELECTOR_RACE: AtomicU8 = AtomicU8::new(NO_SELECTOR_RACE);
+    static LAST_INJECTED_SELECTOR_KEY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    static RACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn race_test_lock() -> MutexGuard<'static, ()> {
+        RACE_TEST_LOCK.lock().unwrap()
+    }
+
+    fn arm_selector_race(kind: u8) {
+        SELECTOR_RACE.store(kind, Ordering::SeqCst);
+    }
+
+    pub(super) async fn inject_selector_before_bootstrap_commit<S>(
+        storage: &StorageAdapter<S>,
+        global_selector_key: Vec<u8>,
+        main_branch_selector_key: Vec<u8>,
+    ) -> Result<(), LixError>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        let kind = SELECTOR_RACE.swap(NO_SELECTOR_RACE, Ordering::SeqCst);
+        let key = match kind {
+            GLOBAL_SELECTOR_RACE => global_selector_key,
+            BRANCH_SELECTOR_RACE => main_branch_selector_key,
+            _ => return Ok(()),
+        };
+        *LAST_INJECTED_SELECTOR_KEY.lock().unwrap() = Some(key.clone());
+
+        let mut writes = storage.new_write_set();
+        writes.put(SELECTOR_SPACE, key, &b"concurrent-selector"[..]);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .map_err(LixError::from)?;
+        Ok(())
+    }
+
+    async fn selector_value(storage: &Memory, key: Vec<u8>) -> Option<Bytes> {
+        let adapter = StorageAdapter::new(storage.clone());
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let value = PointReadPlan::new(SELECTOR_SPACE, &[StorageKey(Bytes::from(key))])
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .unwrap()
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+        match value {
+            Some(crate::storage_adapter::StorageProjectedValue::FullValue(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_accepts_first_repository_and_rejects_second() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("first initialization should succeed");
+
+        let error = Engine::initialize(storage)
+            .await
+            .expect_err("second initialization should be rejected");
+        assert_eq!(error.code, "LIX_ERROR_ALREADY_INITIALIZED");
+    }
+
+    #[tokio::test]
+    async fn selector_insertion_race_is_atomic_for_global_and_branch_keys() {
+        let _race_test_lock = race_test_lock();
+        for (kind, expected_key_is_global) in
+            [(GLOBAL_SELECTOR_RACE, true), (BRANCH_SELECTOR_RACE, false)]
+        {
+            let storage = Memory::new();
+            arm_selector_race(kind);
+
+            // The test-only hook inserts the exact key that bootstrap is about
+            // to write. Selector KeyAbsent preconditions must reject the whole
+            // write set, leaving the racing value intact.
+            let error = Engine::initialize(storage.clone())
+                .await
+                .expect_err("concurrent selector insertion must fail bootstrap");
+            assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+            let selector_key = LAST_INJECTED_SELECTOR_KEY
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("race hook must record the inserted key");
+            assert_eq!(
+                selector_key == global_selector_key().to_vec(),
+                expected_key_is_global
+            );
+            assert_eq!(
+                selector_value(&storage, selector_key).await,
+                Some(Bytes::from_static(b"concurrent-selector"))
+            );
+
+            let adapter = StorageAdapter::new(storage);
+            let read = adapter
+                .begin_read(Default::default())
+                .await
+                .expect("storage must remain readable after rejection");
+            assert_eq!(
+                crate::init::repository_protocol_status(&read)
+                    .await
+                    .unwrap(),
+                crate::init::RepositoryProtocolStatus::Missing,
+                "a rejected bootstrap must not publish the protocol marker"
+            );
+        }
+    }
 }
