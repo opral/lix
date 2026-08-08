@@ -1,0 +1,46 @@
+TAP version 13
+# Subtest: frozen comparator tables and production-only bridge retain exact identity
+ok 1 - frozen comparator tables and production-only bridge retain exact identity
+  ---
+  duration_ms: 2.002987
+  type: 'test'
+  ...
+# Subtest: ordered plan never reaches 50K before both 10K adapters and corruption
+ok 2 - ordered plan never reaches 50K before both 10K adapters and corruption
+  ---
+  duration_ms: 1.236198
+  type: 'test'
+  ...
+# Subtest: known Slate six-versus-five residual is a hard failure
+ok 3 - known Slate six-versus-five residual is a hard failure
+  ---
+  duration_ms: 4.809693
+  type: 'test'
+  ...
+# Subtest: exact manager artifact can waive only overwhelming Slate object tradeoff
+ok 4 - exact manager artifact can waive only overwhelming Slate object tradeoff
+  ---
+  duration_ms: 4.105992
+  type: 'test'
+  ...
+# Subtest: manager artifact cannot waive non-object regressions
+ok 5 - manager artifact cannot waive non-object regressions
+  ---
+  duration_ms: 1.527848
+  type: 'test'
+  ...
+# Subtest: digest mismatch and corruption partial publication fail closed
+ok 6 - digest mismatch and corruption partial publication fail closed
+  ---
+  duration_ms: 1.911477
+  type: 'test'
+  ...
+1..6
+# tests 6
+# suites 0
+# pass 6
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 180.389255

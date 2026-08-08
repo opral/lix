@@ -1,0 +1,16 @@
+log,rows,engine,backend,elapsed,max_rss_kib,exit_status,reopen_exact_results,reopen_disk_bytes
+duckdb-1.10505-10k.log,10000,duckdb,embedded,0:00.39,104148,0,true,3158016
+model-2a0e-10k-rocks.log,10000,forktree-model,rocksdb,0:00.53,122460,0,true,931679
+model-2a0e-10k-slate.log,10000,forktree-model,slatedb,0:00.69,159932,0,true,892207
+lix-a12-10k-rocks.log,10000,lix,rocksdb,0:02.21,428680,0,true,1598909
+lix-a12-10k-slate.log,10000,lix,slatedb,0:02.28,434924,0,true,1553627
+duckdb-1.10505-50k.log,50000,duckdb,embedded,0:01.47,216656,0,true,10498048
+model-2a0e-50k-rocks.log,50000,forktree-model,rocksdb,0:02.51,242316,0,true,4393852
+model-2a0e-50k-slate.log,50000,forktree-model,slatedb,0:03.48,252956,0,true,4475851
+lix-a12-50k-rocks.log,50000,lix,rocksdb,0:10.87,1280948,0,true,7613556
+lix-a12-50k-slate.log,50000,lix,slatedb,0:11.41,1253828,0,true,7535186
+duckdb-1.10505-500k.log,500000,duckdb,embedded,0:13.86,1595204,0,true,99102720
+model-2a0e-500k-rocks.log,500000,forktree-model,rocksdb,0:26.93,1392668,0,true,41693591
+model-2a0e-500k-slate.log,500000,forktree-model,slatedb,0:34.77,1334284,0,true,43181844
+lix-a12-500k-rocks.log,500000,lix,rocksdb,1:58.93,5505324,0,true,80229742
+lix-a12-500k-slate.log,500000,lix,slatedb,1:59.77,5416492,0,true,84773814

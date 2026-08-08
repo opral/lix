@@ -24,6 +24,9 @@ tpch = ["dep:duckdb", "dep:tpchgen"]
 # remains comparable with the existing benchmark. This feature removes that
 # allocator entirely so heap profilers and RSS controls use libc directly.
 system-allocation-profiler = []
+# Test-only compile boundary supplied by the Stage 2 production owner. This
+# feature is intentionally absent from default/workspace builds.
+forktree-stage2-olap-acceptance = []
 
 [dependencies]
 lix = { workspace = true }
@@ -128,6 +131,12 @@ name = "storage_v2"
 path = "benches/storage_v2.rs"
 harness = false
 required-features = ["storage-benches"]
+
+[[bench]]
+name = "forktree_stage2_olap_acceptance"
+path = "benches/forktree_stage2_olap_acceptance.rs"
+harness = false
+required-features = ["storage-benches", "slatedb", "forktree-stage2-olap-acceptance"]
 
 [[bench]]
 name = "changelog_scorecard"
