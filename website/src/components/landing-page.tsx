@@ -105,6 +105,47 @@ function CopyInstallButton({
   );
 }
 
+const lixStackLayers = [
+  { title: "FILESYSTEM", subtitle: "tools and agents" },
+  { title: "SQL DATABASE", subtitle: "queries, transactions" },
+  { title: "VERSION CONTROL", subtitle: "review/merge, rollback" },
+];
+
+/**
+ * Vertical "LIX = filesystem × database × version control" diagram in the hero.
+ *
+ * @example
+ * <LixStackDiagram />
+ */
+function LixStackDiagram() {
+  return (
+    <div className="relative w-[250px] shrink-0 self-center rounded-xl border-[1.5px] border-cyan-bright bg-[rgba(7,182,213,0.05)] px-4 pb-4 pt-6">
+      <span className="absolute -top-2 left-1/2 -translate-x-1/2 whitespace-nowrap bg-paper px-2.5 font-mono text-[10.5px] font-bold tracking-[0.09em] text-cyan-deep">
+        LIX
+      </span>
+      <div className="flex flex-col items-center gap-2">
+        {lixStackLayers.map(({ title, subtitle }, index) => (
+          <div key={title} className="contents">
+            {index > 0 && (
+              <div className="font-mono text-xs leading-none text-ink-faint">
+                ×
+              </div>
+            )}
+            <div className="w-full rounded-lg border border-line bg-white px-4 py-3 text-center shadow-[0_1px_2px_rgba(20,23,26,0.03)]">
+              <div className="font-mono text-[11px] font-bold tracking-[0.07em] text-ink">
+                {title}
+              </div>
+              <div className="mt-1 font-mono text-[10px] leading-[1.5] text-ink-faint">
+                {subtitle}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 const whatYouGet = [
   {
     title: "Works with any file format",
@@ -178,95 +219,59 @@ const whatYouGet = [
       "A spreadsheet diff is a cell, not a byte blob. Review the clause, cell, or row that changed.",
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="16"
-          y="10"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
+        <line
+          x1="16"
+          y1="14"
+          x2="64"
+          y2="14"
           stroke="#C9C7BF"
-          strokeWidth="1.5"
+          strokeWidth="2"
+          strokeLinecap="round"
         />
-        <rect
-          x="33"
-          y="10"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
+        <line
+          x1="16"
+          y1="24"
+          x2="52"
+          y2="24"
           stroke="#C9C7BF"
-          strokeWidth="1.5"
+          strokeWidth="2"
+          strokeLinecap="round"
         />
-        <rect
-          x="50"
-          y="10"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
+        <line
+          x1="16"
+          y1="34"
+          x2="30"
+          y2="34"
           stroke="#C9C7BF"
-          strokeWidth="1.5"
+          strokeWidth="2"
+          strokeLinecap="round"
         />
-        <rect
-          x="16"
-          y="23"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="33"
-          y="23"
-          width="14"
-          height="10"
-          rx="2"
-          fill="rgba(7,182,213,0.14)"
+        <line
+          x1="35"
+          y1="34"
+          x2="52"
+          y2="34"
           stroke="#07B6D5"
-          strokeWidth="1.5"
+          strokeWidth="2"
+          strokeLinecap="round"
         />
-        <rect
-          x="50"
-          y="23"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
+        <line
+          x1="57"
+          y1="34"
+          x2="64"
+          y2="34"
           stroke="#C9C7BF"
-          strokeWidth="1.5"
+          strokeWidth="2"
+          strokeLinecap="round"
         />
-        <rect
-          x="16"
-          y="36"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
+        <line
+          x1="16"
+          y1="44"
+          x2="58"
+          y2="44"
           stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="33"
-          y="36"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="50"
-          y="36"
-          width="14"
-          height="10"
-          rx="2"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
+          strokeWidth="2"
+          strokeLinecap="round"
         />
       </svg>
     ),
@@ -356,51 +361,48 @@ const whatYouGet = [
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <rect
-          x="32"
+          x="33"
           y="8"
-          width="16"
-          height="14"
-          rx="3"
+          width="14"
+          height="11"
+          rx="2"
           fill="#FFFFFF"
           stroke="#8A8F96"
           strokeWidth="1.5"
         />
-        <line
-          x1="40"
-          y1="22"
-          x2="40"
-          y2="32"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeDasharray="3 3"
-        />
-        <rect
-          x="14"
-          y="34"
-          width="16"
-          height="14"
-          rx="3"
+        <path
+          d="M40 19 V26 M24 34 V26 H56 V34 M40 26 V34"
           fill="none"
           stroke="#C9C7BF"
           strokeWidth="1.5"
         />
         <rect
-          x="32"
+          x="17"
           y="34"
-          width="16"
-          height="14"
-          rx="3"
+          width="14"
+          height="11"
+          rx="2"
+          fill="#FFFFFF"
+          stroke="#C9C7BF"
+          strokeWidth="1.5"
+        />
+        <rect
+          x="33"
+          y="34"
+          width="14"
+          height="11"
+          rx="2"
           fill="rgba(7,182,213,0.14)"
           stroke="#07B6D5"
           strokeWidth="1.5"
         />
         <rect
-          x="50"
+          x="49"
           y="34"
-          width="16"
-          height="14"
-          rx="3"
-          fill="none"
+          width="14"
+          height="11"
+          rx="2"
+          fill="#FFFFFF"
           stroke="#C9C7BF"
           strokeWidth="1.5"
         />
@@ -415,27 +417,27 @@ const whatYouGet = [
     icon: (
       <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
         <path
-          d="M31 26 v-6 a9 9 0 0 1 18 0 v6"
+          d="M32 25 V18 a8 8 0 0 1 16 0 V25"
           fill="none"
-          stroke="#8A8F96"
+          stroke="#C9C7BF"
           strokeWidth="1.5"
         />
         <rect
-          x="26"
-          y="26"
-          width="28"
-          height="22"
-          rx="4"
+          x="27"
+          y="25"
+          width="26"
+          height="21"
+          rx="3"
           fill="#FFFFFF"
           stroke="#8A8F96"
           strokeWidth="1.5"
         />
-        <circle cx="40" cy="35" r="3" fill="#07B6D5" />
+        <circle cx="40" cy="33.5" r="2.6" fill="#07B6D5" />
         <line
           x1="40"
-          y1="37"
+          y1="36"
           x2="40"
-          y2="42"
+          y2="40.5"
           stroke="#07B6D5"
           strokeWidth="1.5"
           strokeLinecap="round"
@@ -459,46 +461,50 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
       <Header width="narrow" />
       <main className="mx-auto w-full max-w-[1100px] px-8">
         {/* Hero */}
-        <section className="max-w-[720px] pt-16">
-          <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
-            Open source · MIT
-          </p>
-          <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-            A version control system for files and data beyond code
-          </h1>
-          <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-            Agents and tools work with files. Applications need a database.
-            Teams need version control. Lix combines all three: normal files
-            for tools, SQL rows for apps, and version control for every change.
-          </p>
-          <div className="mt-6 flex flex-wrap items-center gap-5">
-            <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
-              <JsLogo className="h-3.5 w-3.5" />
-              JavaScript
-            </span>
-            {sdkLanguages.map(({ label, href, Logo }) => (
+        <section className="flex flex-wrap items-center justify-between gap-12 pt-16">
+          <div className="min-w-[300px] max-w-[620px] flex-1">
+            <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
+              Open source · MIT
+            </p>
+            <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
+              Version control system and SQL database in one
+            </h1>
+            <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
+              AI applications span files, a SQL database, and version control.
+              Lix combines those three requirements in one system, avoiding
+              three separate layers of infrastructure that need to be kept in
+              sync.
+            </p>
+            <div className="mt-6 flex flex-wrap items-center gap-5">
+              <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
+                <JsLogo className="h-3.5 w-3.5" />
+                JavaScript
+              </span>
+              {sdkLanguages.map(({ label, href, Logo }) => (
+                <a
+                  key={label}
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`The ${label} SDK is planned. Upvote the issue on GitHub.`}
+                  className="flex items-center gap-1.5 border-b-2 border-transparent pb-0.5 text-[13px] text-ink-muted transition-colors hover:text-cyan-deep"
+                >
+                  <Logo className="h-3.5 w-3.5" />
+                  {label}
+                </a>
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <CopyInstallButton background="white" />
               <a
-                key={label}
-                href={href}
-                target="_blank"
-                rel="noopener noreferrer"
-                title={`The ${label} SDK is planned. Upvote the issue on GitHub.`}
-                className="flex items-center gap-1.5 border-b-2 border-transparent pb-0.5 text-[13px] text-ink-muted transition-colors hover:text-cyan-deep"
+                href="/docs/what-is-lix"
+                className="flex h-10 items-center rounded-lg bg-ink px-4 text-[13.5px] font-semibold text-paper transition-colors hover:text-paper"
               >
-                <Logo className="h-3.5 w-3.5" />
-                {label}
+                Read the docs
               </a>
-            ))}
+            </div>
           </div>
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            <CopyInstallButton background="white" />
-            <a
-              href="/docs/what-is-lix"
-              className="flex h-10 items-center rounded-lg bg-ink px-4 text-[13.5px] font-semibold text-paper transition-colors hover:text-paper"
-            >
-              Read the docs
-            </a>
-          </div>
+          <LixStackDiagram />
         </section>
 
         {/* Stats */}

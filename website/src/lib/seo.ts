@@ -1,6 +1,7 @@
 const SITE_URL = "https://lix.dev";
-const DEFAULT_OG_IMAGE_PATH = "/lix-features.svg";
-const DEFAULT_OG_IMAGE_ALT = "Lix";
+const DEFAULT_OG_IMAGE_PATH = "/og.png";
+const DEFAULT_OG_IMAGE_ALT =
+  "Lix - version control system and SQL database in one";
 const DESCRIPTION_MAX_LENGTH = 160;
 const DESCRIPTION_SENTENCE_MIN_LENGTH = 120;
 
