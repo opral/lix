@@ -1,0 +1,47 @@
+{
+  "kind": "test-report-only-w1a-historical-reader-readiness",
+  "status": "dormant-until-compile-green",
+  "anchor": {
+    "commit": "e1af471b9ab0f598dafa7c2ddec7867667c81740",
+    "tree": "bfa0d271a723da8250ab76ada16fda90926f1099",
+    "parent": "b484e20d845aee3f8137bfa3496f9b3cd0e8cd35"
+  },
+  "source_scope": [
+    "packages/lix/src/sql2/context.rs",
+    "packages/lix/src/session/context.rs",
+    "packages/lix/src/transaction/context.rs",
+    "packages/lix/src/sql2/history_route.rs",
+    "packages/lix/src/sql2/providers/entity_history.rs",
+    "packages/lix/src/sql2/providers/directory_history.rs",
+    "packages/lix/src/sql2/providers/file_history.rs"
+  ],
+  "forbidden_widening": [
+    "merge-analysis",
+    "undo-redo",
+    "typed-transition",
+    "changelog/change-provider",
+    "writer/publication",
+    "selector/BranchRef",
+    "GC",
+    "CAS/blob layout",
+    "W3-W5"
+  ],
+  "production_changes_in_this_package": false,
+  "transport_provenance": "The enclosing immutable commit/ref/tree identifies this package; no post-commit external handoff digest is self-bound here.",
+  "future_contract": {
+    "owner": "one operation-owned ForkTree historical reader over one retained StorageRead",
+    "legacy_common_helper": "deleted",
+    "raw_history_source_store": "deleted",
+    "raw_history_source_json_reader": "deleted",
+    "extra_commit_graph_reader": "deleted",
+    "fallback_or_dual_authority": "forbidden",
+    "projection": "terminal only",
+    "failure": "typed fail-closed authority error before rows or LIMIT"
+  },
+  "negative_fixtures": "NEGATIVE_FIXTURES.tsv",
+  "expected_red": "EXPECTED_RED.tsv",
+  "expected_red_output": "EXPECTED_RED_OUTPUT.txt",
+  "source_gate_result": "SOURCE_GATE_RESULT.md",
+  "future_commands": "FUTURE_GATE_COMMANDS.md",
+  "sha256sums": "SHA256SUMS"
+}

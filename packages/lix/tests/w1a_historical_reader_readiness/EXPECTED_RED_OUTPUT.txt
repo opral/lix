@@ -1,0 +1,21 @@
+RED-01 legacy raw HistoryQuerySource.store: /tmp/lix-w1-e1af/packages/lix/src/sql2/context.rs contains 'pub(crate) store:'
+RED-02 legacy raw HistoryQuerySource.json_reader: /tmp/lix-w1-e1af/packages/lix/src/sql2/context.rs contains 'pub(crate) json_reader:'
+RED-03 legacy storage-bearing common helper: /tmp/lix-w1-e1af/packages/lix/src/sql2/history_route.rs contains 'pub(crate) async fn load_history_entries'
+RED-04 legacy CommitGraphReader common route: /tmp/lix-w1-e1af/packages/lix/src/sql2/history_route.rs contains 'CommitGraphReader'
+RED-05 provider CommitGraphReader: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/entity_history.rs contains 'CommitGraphReader'
+RED-06 provider load_history_entries: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/entity_history.rs contains 'load_history_entries'
+RED-07 provider CommitGraphReader: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/directory_history.rs contains 'CommitGraphReader'
+RED-08 provider load_history_entries: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/directory_history.rs contains 'load_history_entries'
+RED-09 provider CommitGraphReader: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/file_history.rs contains 'CommitGraphReader'
+RED-10 provider load_history_entries: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/file_history.rs contains 'load_history_entries'
+RED-11 file history parent graph helper: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/file_history.rs contains 'load_history_commit_parents'
+RED-12 directory history parent graph helper: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/directory_history.rs contains 'load_history_commit_parents'
+PASS raw file history source store absent: query_source.store
+PASS raw file history JSON reader absent: query_source.json_reader
+PASS ForkTree owner reference: /tmp/lix-w1-e1af/packages/lix/src/sql2/context.rs
+PASS ForkTree owner reference: /tmp/lix-w1-e1af/packages/lix/src/sql2/history_route.rs
+RED-13 missing ForkTree owner reference: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/entity_history.rs
+PASS ForkTree owner reference: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/directory_history.rs
+PASS ForkTree owner reference: /tmp/lix-w1-e1af/packages/lix/src/sql2/providers/file_history.rs
+PASS existing typed ForkTree observed-state path present
+SUMMARY expected-red-findings=13

@@ -1,0 +1,15 @@
+id	construction	must_fail_or_pass	boundary
+missing_commit_record	authenticated reachable CommitCatalog entry names a missing CommitRecord	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	commit topology/catalog
+malformed_commit_record	reachable commit object has malformed envelope or generation	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	commit topology/authentication
+commit_identity_substitution	requested commit id resolves to a different authenticated record	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	commit identity
+missing_member_record	valid CommitRecord has absent member/change object	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	semantic member closure
+state_root_wrong_kind	state root key resolves to a commit/change object	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	state root
+state_row_identity_substitution	state value key or commit_id differs from requested identity	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	state row authentication
+registry_missing_or_deleted	selected observed commit has no authenticated plugin registry value	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	plugin registry
+file_owner_mismatch	file owner payload names a different file_id or plugin generation	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	file owner
+authenticated_absent_key	all required authority is valid and requested state key is absent	PASS_ABSENT_NOT_CORRUPTION	state point
+null_vs_tombstone	valid state row is NULL versus authenticated tombstone	PASS_DISTINCT_TERMINAL_VALUES	state cell semantics
+projection_order_limit	valid rows are filtered and ordered only after identity/authentication	PASS_FILTER_ORDER_LIMIT	SQL terminal projection
+duplicate_source_change	one source-change id has conflicting authenticated payloads	FAIL_TYPED_CORRUPTION_BEFORE_ROWS	file history grouping
+second_view_attempt	provider attempts another begin_read or detached history reader	FAIL_SOURCE_GATE	one operation owner
+raw_history_source_escape	provider accesses HistoryQuerySource.store or json_reader	FAIL_SOURCE_GATE	sealed source facade

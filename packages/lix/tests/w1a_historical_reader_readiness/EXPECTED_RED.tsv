@@ -1,0 +1,7 @@
+id	anchor	observed_e1af_result	future_success_condition
+legacy_history_source_fields	/sql2/context.rs:44-59	RED	HistoryQuerySource exposes only one opaque ForkTree historical owner
+legacy_common_history_helper	/sql2/history_route.rs:339-530	RED	storage-bearing load_history_entries is deleted/reduced to owner operation
+parallel_graph_provider	entity_history.rs,directory_history.rs,file_history.rs	RED	provider structs no longer retain CommitGraphReader
+parallel_json_provider	file_history.rs,HistoryQuerySource	RED	providers cannot access raw JsonStoreReader or query_source.json_reader
+parallel_history_calls	file_history.rs,directory_history.rs,entity_history.rs	RED	all reachability-aware event reads use the same ForkTree owner
+unmigrated_later_cohorts	transaction/merge/undo/transition	EXPECTED_NOT_W1A	remain separate waves and are not widened by W1a
