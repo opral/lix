@@ -14,7 +14,8 @@ REJECT deleted changelog space: forbidden 'COMMIT_CHANGE_ID_SPACE' in /tmp/lix-s
 REJECT deleted changelog loader: forbidden 'crate::tracked_state::' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/sql2/providers/change.rs
 REJECT exact apply caller: missing caller-owned ForkTree facade
 REJECT exact apply caller: raw/second read
+REJECT exact apply caller: legacy fallback loader
 REJECT replay helper: no typed ForkTree view argument
 REJECT replay helper: raw/legacy read path
 REJECT production second authority: COMMIT_CHANGE_ID_SPACE
-SUCCESSOR SOURCE GATE: BLOCKED (14 findings)
+SUCCESSOR SOURCE GATE: BLOCKED (15 findings)

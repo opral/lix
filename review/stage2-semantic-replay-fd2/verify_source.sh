@@ -115,6 +115,12 @@ if grep -Eq 'begin_read|StorageReadOptions|SharedStorageAdapterRead|StorageAdapt
 else
   echo "PASS exact apply caller: no raw/second read"
 fi
+if grep -Fq "load_change_records" <<<"$apply_body"; then
+  echo "REJECT exact apply caller: legacy fallback loader"
+  failures=$((failures + 1))
+else
+  echo "PASS exact apply caller: no legacy fallback loader"
+fi
 
 # The replay helper must not take a raw adapter or create a read. This check
 # intentionally binds the exact helper signature, not merely a symbol count.
