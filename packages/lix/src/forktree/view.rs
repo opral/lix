@@ -130,38 +130,43 @@ where
 
 /// One operation-scoped ForkTree read facade. Branch views borrow the same
 /// retained read identity; no branch or untracked traversal can refresh it.
-pub(crate) struct ForkTreeReadFacade<'a, R: ?Sized> {
-    read: &'a R,
+pub(crate) struct ForkTreeReadFacade<R> {
+    read: R,
 }
 
-impl<'a, R: ?Sized> ForkTreeReadFacade<'a, R>
+impl<R> ForkTreeReadFacade<R>
 where
     R: StorageAdapterRead,
 {
-    pub(crate) fn from_retained_read(read: &'a R) -> Self {
+    pub(crate) fn new(read: R) -> Self {
         Self { read }
     }
 
     pub(crate) async fn branch(
         &self,
         branch_id: &str,
-    ) -> Result<CoherentView<&'a R>, crate::LixError> {
+    ) -> Result<CoherentView<&R>, crate::LixError> {
         let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
             crate::LixError::new(
                 crate::LixError::CODE_INVALID_PARAM,
                 format!("branch ID must be a UUID: {error}"),
             )
         })?;
-        open_coherent_view_on_read(self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
-            .await
-            .map_err(Into::into)
+        let view =
+            open_coherent_view_on_read(&self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
+                .await
+                .map_err(crate::LixError::from)?;
+        let _view_identity = view.view_id();
+        let _resume_identity_validator = CoherentView::<&R>::validate_resume_key;
+        let _ = _resume_identity_validator;
+        Ok(view)
     }
 
     pub(crate) async fn load_commit_member_records(
         &self,
         commit_id: crate::changelog::CommitId,
     ) -> Result<Option<Vec<crate::changelog::ChangeRecord>>, crate::LixError> {
-        super::serving::load_commit_member_records(self.read, commit_id).await
+        super::serving::load_commit_member_records(&self.read, commit_id).await
     }
 
     pub(crate) async fn load_state_value_at_commit(
@@ -171,7 +176,7 @@ where
         include_tombstone: bool,
     ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
     {
-        super::serving::load_state_value_at_commit(self.read, commit_id, key, include_tombstone)
+        super::serving::load_state_value_at_commit(&self.read, commit_id, key, include_tombstone)
             .await
     }
 
@@ -186,7 +191,7 @@ where
                 let refs = [*json_ref];
                 let values = crate::json_store::JsonStoreContext::new()
                     .load_bytes_many(
-                        self.read,
+                        &self.read,
                         crate::json_store::JsonLoadRequestRef {
                             refs: &refs,
                             scope: crate::json_store::JsonReadScopeRef::OutOfBand,

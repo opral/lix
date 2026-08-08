@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
-use crate::changelog::ChangeRecordProjection;
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
@@ -24,7 +23,7 @@ use crate::live_state::{
     scan_forktree_view,
 };
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::{MaterializedTrackedStateRowRef, TrackedStateStoreReader};
+use crate::tracked_state::MaterializedTrackedStateRowRef;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
@@ -457,47 +456,43 @@ impl PluginRegistry {
 }
 
 /// Loads one retained registry through the plugin-owned durable decoder.
-pub(crate) async fn load_plugin_registry_at_commit<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+pub(crate) async fn load_plugin_registry_at_commit<R>(
+    facade: &crate::forktree::ForkTreeReadFacade<R>,
     commit_id: &str,
 ) -> Result<PluginRegistry, LixError>
 where
-    S: StorageAdapterRead,
+    R: StorageAdapterRead,
 {
-    let registry_key = crate::tracked_state::TrackedStateKey {
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+    let commit_id = CommitId::parse_lix(commit_id, "historical plugin registry commit")?;
+    let registry_key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+        schema_key: KEY_VALUE_SCHEMA_KEY,
+        entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
         file_id: None,
-    };
-    let rows = reader
-        .load_projected_batch_at_commit(
-            commit_id,
-            std::slice::from_ref(&registry_key),
-            &ChangeRecordProjection::full(),
-        )
+    });
+    let value = facade
+        .load_state_value_at_commit(commit_id, &registry_key, true)
         .await?
-        .into_rows();
-    let row = rows.into_iter().next().flatten().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            format!("historical plugin registry is missing at commit '{commit_id}'"),
-        )
-    })?;
-    let snapshot = if row.deleted {
-        None
-    } else {
-        let content = row.snapshot_content.as_deref().ok_or_else(|| {
+        .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_STORAGE_ERROR,
-                format!("historical plugin registry has no snapshot at commit '{commit_id}'"),
+                format!("historical plugin registry is missing at commit '{commit_id}'"),
             )
         })?;
-        Some(serde_json::from_str(content).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!("historical plugin registry snapshot is invalid JSON: {error}"),
-            )
-        })?)
+    let snapshot = match value.0.cell {
+        crate::forktree::StateCell::Value(value) => {
+            Some(serde_json::from_str(value.as_str()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("historical plugin registry snapshot is invalid JSON: {error}"),
+                )
+            })?)
+        }
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("historical plugin registry is deleted at commit '{commit_id}'"),
+            ));
+        }
     };
     PluginRegistry::from_optional_snapshot(snapshot.as_ref())
 }
@@ -506,14 +501,14 @@ where
 /// registry generations. Registry snapshots remain the sole serving authority;
 /// this returns only their authenticated content hashes for binary-CAS marking.
 pub(crate) async fn collect_gc_wasm_blob_roots<O, C>(
-    owner: &O,
+    retained: &O,
     controls: &[(String, C)],
     retained_commits: &BTreeSet<CommitId>,
 ) -> Result<BTreeSet<BlobId>, LixError>
 where
-    O: StorageAdapterRead + ?Sized,
+    O: StorageAdapterRead + Clone,
 {
-    let facade = crate::forktree::ForkTreeReadFacade::from_retained_read(owner);
+    let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
     let mut roots = BTreeSet::new();
     for (branch_id, _) in controls {
         for untracked in [None, Some(true)] {
@@ -536,7 +531,14 @@ where
                 },
             )
             .await?;
-            for row in rows.into_rows() {
+            let rows = rows.into_rows();
+            if rows.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("selected plugin registry is missing for branch '{branch_id}'"),
+                ));
+            }
+            for row in rows {
                 let registry = PluginRegistry::from_optional_live_state_row(Some(&row), branch_id)?;
                 extend_registry_wasm_roots(&registry, &mut roots)?;
             }

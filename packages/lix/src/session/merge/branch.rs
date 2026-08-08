@@ -9,6 +9,7 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::entity_pk::EntityPk;
+use crate::forktree::ForkTreeReadFacade;
 use crate::plugin::{
     ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     load_plugin_registry_at_commit,
@@ -188,8 +189,9 @@ where
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
                 .await?;
                 let derived_blob_files = async {
+                    let facade = transaction.forktree_read_facade();
                     let mut reader = transaction.tracked_state_reader().await;
-                    derived_plugin_blob_conflicts(&mut reader, &analysis).await
+                    derived_plugin_blob_conflicts(&mut reader, &facade, &analysis).await
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
                 .await?;
@@ -312,8 +314,9 @@ where
             ))
             .await?;
             let derived_blob_files = async {
+                let facade = transaction.forktree_read_facade();
                 let mut reader = transaction.tracked_state_reader().await;
-                derived_plugin_blob_conflicts(&mut reader, &analysis).await
+                derived_plugin_blob_conflicts(&mut reader, &facade, &analysis).await
             }
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
@@ -543,12 +546,14 @@ impl DerivedPluginConflictIndex {
     }
 }
 
-async fn derived_plugin_blob_conflicts<S>(
+async fn derived_plugin_blob_conflicts<S, R>(
     reader: &mut TrackedStateStoreReader<S>,
+    facade: &ForkTreeReadFacade<R>,
     analysis: &super::analysis::MergeAnalysis,
 ) -> Result<DerivedPluginConflictIndex, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
+    R: crate::storage_adapter::StorageAdapterRead,
 {
     // A derived blob conflict is the common signal, but it is not the
     // authority for plugin ownership. Start from every conflicted file and
@@ -638,13 +643,13 @@ where
     let common_descriptors =
         historical_conflict_file_descriptors(reader, analysis, &candidate_file_ids).await?;
     let base_registry =
-        load_plugin_registry_at_commit(reader, &analysis.commits.base_commit_id.to_string())
+        load_plugin_registry_at_commit(facade, &analysis.commits.base_commit_id.to_string())
             .await?;
     let target_registry =
-        load_plugin_registry_at_commit(reader, &analysis.commits.target_commit_id.to_string())
+        load_plugin_registry_at_commit(facade, &analysis.commits.target_commit_id.to_string())
             .await?;
     let source_registry =
-        load_plugin_registry_at_commit(reader, &analysis.commits.source_commit_id.to_string())
+        load_plugin_registry_at_commit(facade, &analysis.commits.source_commit_id.to_string())
             .await?;
 
     let mut derived = BTreeMap::new();

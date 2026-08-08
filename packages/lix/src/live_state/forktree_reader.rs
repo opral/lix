@@ -25,25 +25,6 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::derived::{is_derived_schema, request_may_include_derived};
 
-/// Reads one selected branch through a caller-owned authenticated
-/// global/local state pair. Unsupported lanes return a typed error so
-/// callers cannot silently revive an old reader or acquire a second view.
-pub(crate) async fn scan_branch<S>(
-    store: &S,
-    request: &LiveStateScanRequest,
-) -> Result<MaterializedLiveStateBatch, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    validate_scan_request(request)?;
-    let [branch_id] = request.filter.branch_ids.as_slice() else {
-        return Err(unsupported("current ForkTree reader requires one branch"));
-    };
-    let branch_id = parse_branch_id(branch_id)?;
-    let view = open_coherent_view_on_read(store, branch_id).await?;
-    scan_view(&view, request).await
-}
-
 pub(crate) async fn scan_view<R>(
     view: &crate::forktree::CoherentView<R>,
     request: &LiveStateScanRequest,
@@ -238,7 +219,7 @@ where
 /// tracked-head fallback: unsupported derived, untracked, and multi-branch
 /// requests fail before a view is opened.
 pub(crate) async fn load_exact_batch<S>(
-    store: &S,
+    read: &S,
     request: &LiveStateExactBatchRequest,
 ) -> Result<MaterializedLiveStateExactBatch, LixError>
 where
@@ -249,7 +230,7 @@ where
         return Ok(MaterializedLiveStateExactBatch::default());
     }
     let branch_id = parse_branch_id(&request.rows[0].branch_id)?;
-    let view = open_coherent_view_on_read(store, branch_id).await?;
+    let view = open_coherent_view_on_read(read, branch_id).await?;
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
     let mut slots = Vec::with_capacity(request.rows.len());
     for requested in &request.rows {

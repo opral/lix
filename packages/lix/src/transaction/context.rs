@@ -825,6 +825,16 @@ where
         self.opening_read.clone()
     }
 
+    /// Creates the opaque ForkTree operation owner from this transaction's
+    /// already-retained opening read. This does not acquire or refresh a
+    /// storage read and does not expose the underlying handle.
+    pub(crate) fn forktree_read_facade(
+        &self,
+    ) -> crate::forktree::ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
+    {
+        crate::forktree::ForkTreeReadFacade::new(self.opening_read())
+    }
+
     async fn reconcile_stale_disjoint_writes<S>(
         &mut self,
         read: &S,
