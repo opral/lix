@@ -8,10 +8,10 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
     BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
-    KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanCursor,
-    Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage,
+    StorageError, StorageRead, StorageWrite, WriteOptions,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
+use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope, StorageWriteSet};
 
 use super::model::{
     GcProgressSelectorV2, GcProgressV2, branch_selector_key, gc_progress_selector_key,
@@ -31,20 +31,50 @@ use super::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
-    CommitObjectV1, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication,
-    RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
-    RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
-    SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource, StateTreeMutation,
-    StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree,
-    encode_state_key, encode_state_value, load_change, load_commit, load_commit_member_records,
-    load_commit_topologies, open_coherent_view, page_changes, page_commits,
-    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
-    state_range,
+    CommitMemberV1, CommitObjectV1, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId,
+    PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
+    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
+    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource,
+    StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1,
+    UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc,
+    edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
+    load_commit_member_records, load_commit_topologies, open_coherent_view, page_changes,
+    page_commits, prepare_upload_completion, put_change_catalog_entries,
+    put_commit_catalog_entries, state_point, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
     [byte; 16]
+}
+
+async fn commit_publication_for_test<S>(
+    publication: PreparedPublication,
+    storage: &S,
+) -> Result<(), StorageError>
+where
+    S: Storage,
+{
+    let (writes, preconditions) = publication.into_storage_plan()?;
+    StorageWriteSet::commit(
+        writes,
+        storage,
+        WriteOptions {
+            preconditions,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .map_err(|error| StorageError::Io(error.to_string()))?;
+    Ok(())
+}
+
+async fn commit_write_set_for_test<S>(writes: StorageWriteSet, storage: &S)
+where
+    S: Storage,
+{
+    StorageWriteSet::commit(writes, storage, WriteOptions::default())
+        .await
+        .expect("commit test write set");
 }
 
 #[test]
@@ -73,6 +103,59 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     assert!(blob.contains("manifest.canonical_blob_id != reference.semantic_id"));
     assert!(!blob.contains("BTreeMap<crate::binary_cas::BlobId"));
     assert!(!blob.contains("fn canonical_blob_id"));
+}
+
+#[tokio::test]
+async fn selected_commit_member_authenticates_canonical_owner_source_and_generation() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open selected history view");
+    let (member, source_commit, source_change) = super::serving::select_historical_commit_member(
+        &view,
+        seed.commit_id,
+        seed.semantic_change_id,
+    )
+    .await
+    .expect("select authenticated historical member");
+    assert_eq!(source_commit.commit_id, seed.commit_id);
+    assert_eq!(source_change.change_id(), seed.semantic_change_id);
+    assert_eq!(
+        member,
+        CommitMemberV1::selected(seed.semantic_change_object_id, seed.commit_object_id, 0)
+    );
+    let entry = ChangeCatalogEntry {
+        change_object_id: seed.semantic_change_object_id,
+        owner: ChangeCatalogOwner::CommitMember {
+            commit_object_id: seed.commit_object_id,
+            ordinal: 0,
+        },
+    };
+    super::serving::validate_member_catalog_owner(
+        view.read(),
+        content_id(0xa1),
+        2,
+        0,
+        member,
+        entry,
+    )
+    .await
+    .expect("older selected source is valid");
+    assert!(
+        super::serving::validate_member_catalog_owner(
+            view.read(),
+            content_id(0xa1),
+            1,
+            0,
+            member,
+            entry,
+        )
+        .await
+        .is_err(),
+        "same-generation selected history must fail closed"
+    );
 }
 
 fn content_id(byte: u8) -> ObjectId {
@@ -215,7 +298,7 @@ fn build_seed() -> SeedData {
         commit_id,
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        member_change_object_ids: vec![semantic_change_object_id],
+        members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
         global_state_root,
         local_state_root,
         metadata: b"commit".to_vec(),
@@ -391,51 +474,27 @@ async fn seed_storage<S>(storage: &S, seed: &SeedData)
 where
     S: Storage,
 {
-    let mut write = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .expect("open seed write");
-    write
-        .put_many(
-            OBJECT_SPACE,
-            PutBatch {
-                entries: seed
-                    .objects
-                    .iter()
-                    .map(|(id, bytes)| PutEntry {
-                        key: Key(Bytes::copy_from_slice(id.as_bytes())),
-                        value: StoredValue {
-                            bytes: bytes.clone(),
-                        },
-                    })
-                    .collect(),
-            },
-        )
-        .await
-        .expect("seed objects");
-    write
-        .put_many(
-            SELECTOR_SPACE,
-            PutBatch {
-                entries: vec![
-                    PutEntry {
-                        key: Key(global_selector_key()),
-                        value: StoredValue {
-                            bytes: seed.global_selector.encode().expect("global selector"),
-                        },
-                    },
-                    PutEntry {
-                        key: Key(branch_selector_key(seed.branch_id)),
-                        value: StoredValue {
-                            bytes: seed.branch_selector.encode().expect("branch selector"),
-                        },
-                    },
-                ],
-            },
-        )
-        .await
-        .expect("seed selectors");
-    write.commit().await.expect("commit seed");
+    let mut writes = StorageWriteSet::new();
+    for (id, bytes) in seed.objects.iter() {
+        writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    writes.put(
+        SELECTOR_SPACE,
+        global_selector_key().to_vec(),
+        seed.global_selector
+            .encode()
+            .expect("global selector")
+            .to_vec(),
+    );
+    writes.put(
+        SELECTOR_SPACE,
+        branch_selector_key(seed.branch_id).to_vec(),
+        seed.branch_selector
+            .encode()
+            .expect("branch selector")
+            .to_vec(),
+    );
+    commit_write_set_for_test(writes, storage).await;
 }
 
 fn load_from(
@@ -513,7 +572,7 @@ async fn branch_transition<R: StorageAdapterRead>(
         commit_id: CommitId::from_bytes(raw_id(identity)),
         generation: identity as u64,
         parent_commit_object_ids: vec![view.branch_snapshot().semantic_head_commit_object_id],
-        member_change_object_ids: Vec::new(),
+        members: Vec::new(),
         global_state_root: view.repository_root().global_state_root,
         local_state_root: state_edit.root,
         metadata: vec![identity],
@@ -741,8 +800,7 @@ async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
         .await
         .expect("typed transition");
     drop(view);
-    publication
-        .commit(&storage)
+    commit_publication_for_test(publication, &storage)
         .await
         .expect("commit transition");
     let reopened = open_coherent_view(&storage, seed.branch_id)
@@ -1021,20 +1079,12 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
     assert_eq!(manual.branch_id(), seed.branch_id);
     drop(manual);
 
-    let mut write = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .expect("corruption write");
-    write
-        .delete_many(
-            OBJECT_SPACE,
-            &[Key(Bytes::copy_from_slice(
-                seed.semantic_change_object_id.as_bytes(),
-            ))],
-        )
-        .await
-        .expect("delete selected member");
-    write.commit().await.expect("commit corruption");
+    let mut writes = StorageWriteSet::new();
+    writes.delete(
+        OBJECT_SPACE,
+        seed.semantic_change_object_id.as_bytes().to_vec(),
+    );
+    commit_write_set_for_test(writes, &storage).await;
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
         .expect("bounded open does not traverse an unrelated catalog member");
@@ -1048,7 +1098,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         commit_id: CommitId::from_bytes(raw_id(0x50)),
         generation: 1,
         parent_commit_object_ids: Vec::new(),
-        member_change_object_ids: Vec::new(),
+        members: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"grandparent".to_vec(),
@@ -1061,7 +1111,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         commit_id: CommitId::from_bytes(raw_id(0x51)),
         generation: 2,
         parent_commit_object_ids: vec![grandparent_object_id],
-        member_change_object_ids: vec![seed.semantic_change_object_id],
+        members: vec![CommitMemberV1::introduced(seed.semantic_change_object_id)],
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"shared-parent".to_vec(),
@@ -1074,7 +1124,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         commit_id: CommitId::from_bytes(raw_id(0x52)),
         generation: 3,
         parent_commit_object_ids: vec![parent_object_id],
-        member_change_object_ids: Vec::new(),
+        members: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"child-a".to_vec(),
@@ -1087,7 +1137,7 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
         commit_id: CommitId::from_bytes(raw_id(0x53)),
         generation: 3,
         parent_commit_object_ids: vec![parent_object_id],
-        member_change_object_ids: Vec::new(),
+        members: Vec::new(),
         global_state_root: seed.global_state_root,
         local_state_root: seed.local_state_root,
         metadata: b"child-b".to_vec(),
@@ -1210,20 +1260,12 @@ async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk
     assert_eq!(member_object_reads.load(Ordering::Relaxed), 0);
     drop(graph);
 
-    let mut corrupt = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .expect("member corruption write");
-    corrupt
-        .delete_many(
-            OBJECT_SPACE,
-            &[Key(Bytes::copy_from_slice(
-                seed.semantic_change_object_id.as_bytes(),
-            ))],
-        )
-        .await
-        .expect("delete member");
-    corrupt.commit().await.expect("commit member corruption");
+    let mut writes = StorageWriteSet::new();
+    writes.delete(
+        OBJECT_SPACE,
+        seed.semantic_change_object_id.as_bytes().to_vec(),
+    );
+    commit_write_set_for_test(writes, &storage).await;
 
     let read = StorageAdapterReadScope::new(
         storage
@@ -1453,7 +1495,7 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         commit_id: CommitId::from_bytes(raw_id(0x41)),
         generation: 2,
         parent_commit_object_ids: Vec::new(),
-        member_change_object_ids: Vec::new(),
+        members: Vec::new(),
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         metadata: b"parent".to_vec(),
@@ -1467,7 +1509,9 @@ async fn retained_history_gc_rejects_generation_owner_and_ref_chronology_corrupt
         commit_id: CommitId::from_bytes(raw_id(0x42)),
         generation: 2,
         parent_commit_object_ids: vec![parent_id],
-        member_change_object_ids: vec![bad_generation.semantic_change_object_id],
+        members: vec![CommitMemberV1::introduced(
+            bad_generation.semantic_change_object_id,
+        )],
         global_state_root: bad_generation.global_state_root,
         local_state_root: bad_generation.local_state_root,
         metadata: b"child".to_vec(),
@@ -1722,7 +1766,9 @@ async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     let mut publish = PreparedPublication::from_global_epoch(&publish_view).expect("publish");
     stage_upload(&mut publish, &upload);
     drop(publish_view);
-    publish.commit(&storage).await.expect("receipt first");
+    commit_publication_for_test(publish, &storage)
+        .await
+        .expect("receipt first");
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, upload.progress_id).await);
 
@@ -1736,7 +1782,7 @@ async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     drop(publish_view);
     sweep(&storage, seed.branch_id).await;
     assert!(matches!(
-        stale_publish.commit(&storage).await,
+        commit_publication_for_test(stale_publish, &storage).await,
         Err(StorageError::PreconditionFailed(_))
     ));
     let retry_view = open_coherent_view(&storage, seed.branch_id)
@@ -1745,7 +1791,9 @@ async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     let mut retry = PreparedPublication::from_global_epoch(&retry_view).expect("retry");
     stage_upload(&mut retry, &upload);
     drop(retry_view);
-    retry.commit(&storage).await.expect("retry publication");
+    commit_publication_for_test(retry, &storage)
+        .await
+        .expect("retry publication");
     assert!(object_present(&storage, upload.chunk_id).await);
 }
 
@@ -1770,8 +1818,7 @@ async fn publication_cancels_active_gc_without_becoming_a_global_writer_lock() {
         .expect("publication view during GC");
     let publication = PreparedPublication::from_global_epoch(&view).expect("publication");
     drop(view);
-    publication
-        .commit(&storage)
+    commit_publication_for_test(publication, &storage)
         .await
         .expect("publication must atomically invalidate active GC");
     assert!(
@@ -1807,8 +1854,7 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
         )
         .expect("checkpoint target");
     drop(view);
-    checkpoint
-        .commit(&storage)
+    commit_publication_for_test(checkpoint, &storage)
         .await
         .expect("checkpoint commit");
 
@@ -1871,7 +1917,9 @@ async fn deterministic_reader_pin_safe_point_and_cursor_oracle() {
         )
         .expect("release checkpoint");
     drop(current);
-    release.commit(&storage).await.expect("release commit");
+    commit_publication_for_test(release, &storage)
+        .await
+        .expect("release commit");
     sweep(&storage, seed.branch_id).await;
 
     assert!(!object_present(&storage, target_id).await);
@@ -1921,7 +1969,11 @@ async fn deterministic_crash_recovery_publication_and_gc_oracle() {
             .expect("recovery pin");
         drop(view);
         storage.inject(crash);
-        assert!(publication.commit(&storage).await.is_err());
+        assert!(
+            commit_publication_for_test(publication, &storage)
+                .await
+                .is_err()
+        );
 
         let reopened = storage.reopen();
         assert_eq!(
@@ -1954,7 +2006,9 @@ async fn deterministic_crash_recovery_publication_and_gc_oracle() {
         };
         let orphan_id = orphan.stage_snapshot_target(target).expect("orphan target");
         drop(view);
-        orphan.commit(&storage).await.expect("stage orphan");
+        commit_publication_for_test(orphan, &storage)
+            .await
+            .expect("stage orphan");
 
         storage.inject(crash);
         assert!(advance_gc(&storage, GcBudget::default()).await.is_err());
@@ -2027,18 +2081,9 @@ async fn corrupted_persisted_gc_index_aborts_without_authorizing_deletion() {
         .expect("selector roots produced marks");
     drop(read);
 
-    let mut corrupt = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .expect("corruption write");
-    corrupt
-        .delete_many(
-            OBJECT_SPACE,
-            &[Key(Bytes::copy_from_slice(mark_root.as_bytes()))],
-        )
-        .await
-        .expect("remove mark root");
-    corrupt.commit().await.expect("commit corruption");
+    let mut writes = StorageWriteSet::new();
+    writes.delete(OBJECT_SPACE, mark_root.as_bytes().to_vec());
+    commit_write_set_for_test(writes, &storage).await;
 
     assert!(advance_gc(&storage, GcBudget::default()).await.is_err());
     assert!(object_present(&storage, seed.repository_root_id).await);
@@ -2144,7 +2189,9 @@ async fn upload_abort_releases_receipt_closure_after_final_selector_move() {
     let mut publication = PreparedPublication::from_global_epoch(&view).expect("upload");
     stage_upload(&mut publication, &upload);
     drop(view);
-    publication.commit(&storage).await.expect("publish upload");
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("publish upload");
 
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -2172,7 +2219,9 @@ async fn upload_abort_releases_receipt_closure_after_final_selector_move() {
         .abort_upload(&upload.selector, raw)
         .expect("typed abort");
     drop(view);
-    abort.commit(&storage).await.expect("abort commit");
+    commit_publication_for_test(abort, &storage)
+        .await
+        .expect("abort commit");
     sweep(&storage, seed.branch_id).await;
     assert!(!object_present(&storage, upload.progress_id).await);
     assert!(!object_present(&storage, upload.chunk_id).await);
@@ -2190,7 +2239,9 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     let mut publication = PreparedPublication::from_global_epoch(&view).expect("upload");
     stage_upload(&mut publication, &upload);
     drop(view);
-    publication.commit(&storage).await.expect("publish receipt");
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("publish receipt");
 
     let view = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -2314,7 +2365,9 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         manifest_id
     );
     drop(view);
-    publish.commit(&storage).await.expect("complete upload");
+    commit_publication_for_test(publish, &storage)
+        .await
+        .expect("complete upload");
 
     let reopened = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -2489,7 +2542,9 @@ async fn publish_untracked_manifest(
         )
         .expect("untracked row");
     drop(view);
-    publication.commit(storage).await.expect("untracked commit");
+    commit_publication_for_test(publication, storage)
+        .await
+        .expect("untracked commit");
     manifest_id
 }
 
@@ -2510,7 +2565,9 @@ async fn delete_untracked(storage: &Memory, seed: &SeedData, primary_key: &str) 
         )
         .expect("delete untracked");
     drop(view);
-    publication.commit(storage).await.expect("delete commit");
+    commit_publication_for_test(publication, storage)
+        .await
+        .expect("delete commit");
 }
 
 async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBranchId, ChangeId) {
@@ -2602,25 +2659,13 @@ async fn seed_with_disposable_branch(storage: &Memory) -> (SeedData, CanonicalBr
         branch_snapshot_object_id: snapshot_id,
         selector_generation: 1,
     };
-    let mut write = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .expect("disposable selector write");
-    write
-        .put_many(
-            SELECTOR_SPACE,
-            PutBatch {
-                entries: vec![PutEntry {
-                    key: Key(branch_selector_key(disposable)),
-                    value: StoredValue {
-                        bytes: selector.encode().expect("disposable selector"),
-                    },
-                }],
-            },
-        )
-        .await
-        .expect("put disposable selector");
-    write.commit().await.expect("commit disposable selector");
+    let mut writes = StorageWriteSet::new();
+    writes.put(
+        SELECTOR_SPACE,
+        branch_selector_key(disposable).to_vec(),
+        selector.encode().expect("disposable selector").to_vec(),
+    );
+    commit_write_set_for_test(writes, storage).await;
     (seed, disposable, disposable_ref_id)
 }
 
@@ -2635,8 +2680,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let mut upload_publication = PreparedPublication::from_global_epoch(&view).expect("upload");
     stage_upload(&mut upload_publication, &upload);
     drop(view);
-    upload_publication
-        .commit(&storage)
+    commit_publication_for_test(upload_publication, &storage)
         .await
         .expect("publish upload");
 
@@ -2683,7 +2727,9 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         .await
         .expect("handoff");
     drop(view);
-    complete.commit(&storage).await.expect("complete upload");
+    commit_publication_for_test(complete, &storage)
+        .await
+        .expect("complete upload");
 
     let checkpoint_id = SnapshotSelectorId::from_bytes(raw_id(0x90));
     let view = open_coherent_view(&storage, disposable)
@@ -2699,8 +2745,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         )
         .expect("checkpoint pin");
     drop(view);
-    checkpoint
-        .commit(&storage)
+    commit_publication_for_test(checkpoint, &storage)
         .await
         .expect("checkpoint commit");
 
@@ -2725,7 +2770,9 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         .publish_branch_retirement(&view, commit_catalog_edit, change_catalog_edit, repository)
         .expect("branch retirement");
     drop(view);
-    retire.commit(&storage).await.expect("retire commit");
+    commit_publication_for_test(retire, &storage)
+        .await
+        .expect("retire commit");
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, manifest_id).await);
     assert!(object_present(&storage, upload.chunk_id).await);
@@ -2782,7 +2829,9 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
         )
         .expect("release checkpoint");
     drop(view);
-    release.commit(&storage).await.expect("release commit");
+    commit_publication_for_test(release, &storage)
+        .await
+        .expect("release commit");
     sweep(&storage, seed.branch_id).await;
     assert!(!object_present(&storage, manifest_id).await);
     assert!(!object_present(&storage, upload.chunk_id).await);
@@ -2886,8 +2935,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         .stage_snapshot_target(target)
         .expect("orphan target");
     drop(view);
-    orphan_stage
-        .commit(&storage)
+    commit_publication_for_test(orphan_stage, &storage)
         .await
         .expect("stage orphan target");
     let publish_view = open_coherent_view(&storage, seed.branch_id)
@@ -2906,7 +2954,9 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         target_id
     );
     drop(publish_view);
-    root_only.commit(&storage).await.expect("root first");
+    commit_publication_for_test(root_only, &storage)
+        .await
+        .expect("root first");
     sweep(&storage, seed.branch_id).await;
 
     let inverse = Memory::new();
@@ -2919,8 +2969,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         .stage_snapshot_target(target)
         .expect("orphan target");
     drop(view);
-    orphan_stage
-        .commit(&inverse)
+    commit_publication_for_test(orphan_stage, &inverse)
         .await
         .expect("stage orphan target");
     let publish_view = open_coherent_view(&inverse, seed.branch_id)
@@ -2938,7 +2987,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
     drop(publish_view);
     sweep(&inverse, seed.branch_id).await;
     assert!(matches!(
-        stale_root.commit(&inverse).await,
+        commit_publication_for_test(stale_root, &inverse).await,
         Err(StorageError::PreconditionFailed(_))
     ));
     let retry_view = open_coherent_view(&inverse, seed.branch_id)
@@ -2954,8 +3003,7 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
         )
         .expect("retry selector");
     drop(retry_view);
-    retry
-        .commit(&inverse)
+    commit_publication_for_test(retry, &inverse)
         .await
         .expect("retry root publication");
     assert!(object_present(&inverse, target_id).await);
@@ -2979,7 +3027,9 @@ async fn root_only_publication_and_gc_are_epoch_fenced_and_all_roles_are_roots()
             .expect("role selector");
     }
     drop(view);
-    roles.commit(&storage).await.expect("all roles");
+    commit_publication_for_test(roles, &storage)
+        .await
+        .expect("all roles");
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, target_id).await);
 }
@@ -3008,7 +3058,9 @@ async fn full_selector_scan_crosses_storage_page_and_corruption_fails_closed() {
             .expect("selector");
     }
     drop(view);
-    publication.commit(&storage).await.expect("selector pages");
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("selector pages");
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, last_target).await);
 
@@ -3039,8 +3091,7 @@ async fn full_selector_scan_crosses_storage_page_and_corruption_fails_closed() {
         )
         .expect("wrong selector");
     drop(view);
-    corrupt
-        .commit(&storage)
+    commit_publication_for_test(corrupt, &storage)
         .await
         .expect("publish authenticated corruption");
     assert!(sweep_result(&storage).await.is_err());

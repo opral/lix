@@ -20,20 +20,23 @@ pub(crate) use blob::{AuthenticatedBlobRef, UploadBindingRef, prepare_upload_com
 pub(crate) use model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
     RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
     UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
 pub(crate) use object::ObjectId;
-pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
+pub(crate) use publication::{
+    BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication, SelectorExpectation,
+};
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
     CatalogPage, CommitTopology, CommitTopologyReader, StateSource, StateTreeMutation,
-    VisibleStateRow, edit_state_tree, load_branch_head, load_change, load_change_records,
-    load_commit, load_commit_member_records, load_commit_records, load_commit_topologies,
-    page_changes, page_commits, put_change_catalog_entries, put_commit_catalog_entries,
-    scan_branch_heads, scan_change_records, scan_commit_records, scan_commit_topologies,
-    state_point, state_range,
+    VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_head, load_change,
+    load_change_records, load_commit, load_commit_member_records, load_commit_records,
+    load_commit_topologies, page_changes, page_commits, put_change_catalog_entries,
+    put_commit_catalog_entries, scan_branch_heads, scan_change_records, scan_commit_records,
+    scan_commit_topologies, select_historical_commit_member, state_point, state_point_on_read,
+    state_range,
 };
 pub(crate) use state::{
     StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef, UntrackedValueRef,
@@ -68,6 +71,7 @@ const _: () = {
             ChangeObjectV1,
             CommitCatalogEntry,
             CommitId,
+            CommitMemberV1,
             CommitObjectV1,
             GlobalSelectorV1,
             RepositoryRootV1,
@@ -83,6 +87,7 @@ const _: () = {
             ObjectId,
             AuthenticatedBlobRef,
             BranchStateTransition,
+            OrderedBranchHistoryTransition,
             PreparedPublication,
             SelectorExpectation,
             CatalogPage<(CommitId, CommitObjectV1)>,
@@ -111,6 +116,7 @@ const _: () = {
         let _ = GcBudget::default;
         let _: Option<GcStepStatus> = None;
         let _ = edit_state_tree::<R>;
+        let _ = edit_state_tree_sequence::<R>;
         let _ = load_change::<R>;
         let _ = load_branch_head::<R>;
         let _ = load_commit::<R>;
@@ -128,6 +134,8 @@ const _: () = {
         let _ = state_point::<R>;
         let _ = state_range::<R>;
         let _ = scan_branch_heads::<R>;
+        let _ = select_historical_commit_member::<R>;
+        let _ = state_point_on_read::<R>;
         let _ = decode_state_key;
         let _ = decode_state_value;
         let _ = encode_state_key;
@@ -146,11 +154,11 @@ const _: () = {
         let _ = PreparedPublication::publish_current_snapshot_pin::<R>;
         let _ = PreparedPublication::release_snapshot_pin_with_catalog_retirement::<R>;
         let _ = PreparedPublication::publish_state_transition::<R>;
+        let _ = PreparedPublication::publish_ordered_branch_history::<R>;
         let _ = PreparedPublication::publish_completed_upload::<R>;
         let _ = PreparedPublication::put_untracked_row;
         let _ = PreparedPublication::delete_untracked_row;
         let _ = PreparedPublication::publish_branch_retirement::<R>;
-        let _ = PreparedPublication::commit::<S>;
         let _ = PreparedPublication::into_storage_plan;
         let _ = StateTreeMutation::insert;
         let _ = StateTreeMutation::update;

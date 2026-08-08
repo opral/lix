@@ -4,9 +4,8 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::storage::{
-    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, Precondition,
-    ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOrder, Storage, StorageError,
-    StorageWrite, StoredValue, WriteOptions,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
+    ReadOptions, ScanOrder, Storage, StorageError,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
@@ -122,90 +121,30 @@ impl SweepBatch {
 /// orphan set survives the call in memory. The persisted maintenance graph is
 /// rebuildable and is never consulted by serving reads.
 pub(crate) async fn advance_gc<S>(
-    storage: &S,
-    budget: GcBudget,
+    _storage: &S,
+    _budget: GcBudget,
 ) -> Result<GcStepStatus, StorageError>
 where
     S: Storage,
 {
-    let snapshot = load_gc_snapshot(storage).await?;
-    let Some(mut progress) = snapshot.progress.clone() else {
-        return start_cycle(storage, snapshot).await;
-    };
-    match progress.phase {
-        GcPhaseV2::RootSelectors => advance_selector_roots(storage, snapshot, &mut progress).await,
-        GcPhaseV2::RootUntracked => advance_untracked_roots(storage, snapshot, &mut progress).await,
-        GcPhaseV2::Traverse => advance_traversal(storage, snapshot, &mut progress, budget).await,
-        GcPhaseV2::Sweep => advance_sweep(storage, snapshot, &mut progress, budget).await,
-        GcPhaseV2::Cleanup => advance_cleanup(storage, snapshot, &mut progress, budget).await,
-    }
+    Err(StorageError::Io(
+        "ForkTree GC publication is deferred until its transaction-owned plan lowering wave"
+            .to_string(),
+    ))
 }
 
 /// Removes only a malformed GC selector/progress edge under the exact current
 /// global epoch. It never accepts semantic object IDs and cannot stage a
 /// semantic deletion. Orphaned maintenance objects are reclaimed by a later
 /// complete cycle.
-pub(crate) async fn abort_corrupt_gc<S>(storage: &S) -> Result<GcStepStatus, StorageError>
+pub(crate) async fn abort_corrupt_gc<S>(_storage: &S) -> Result<GcStepStatus, StorageError>
 where
     S: Storage,
 {
-    let read = StorageAdapterReadScope::new(storage.begin_read(ReadOptions::default()).await?);
-    let keys = [Key(global_selector_key()), Key(gc_progress_selector_key())];
-    let loaded = read
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await?;
-    let raw_global = required_full(
-        loaded.values.first().cloned().flatten(),
-        "global selector is absent",
-    )?;
-    let raw_progress = match loaded.values.get(1).cloned().flatten() {
-        None => return Ok(GcStepStatus::AbortedCorruptProgress),
-        Some(ProjectedValue::FullValue(bytes)) => bytes,
-        Some(ProjectedValue::KeyOnly) => {
-            return Err(corruption("GC selector read returned key-only data"));
-        }
-    };
-    let global = GlobalSelectorV1::decode(&raw_global)?;
-    let next_global = global.rotated()?.encode()?;
-    let mut write = storage
-        .begin_write(WriteOptions {
-            preconditions: vec![
-                Precondition::KeyValueEquals {
-                    space: SELECTOR_SPACE,
-                    key: Key(global_selector_key()),
-                    expected: raw_global,
-                },
-                Precondition::KeyValueEquals {
-                    space: SELECTOR_SPACE,
-                    key: Key(gc_progress_selector_key()),
-                    expected: raw_progress,
-                },
-            ],
-            ..WriteOptions::default()
-        })
-        .await?;
-    write
-        .put_many(
-            SELECTOR_SPACE,
-            PutBatch {
-                entries: vec![PutEntry {
-                    key: Key(global_selector_key()),
-                    value: StoredValue { bytes: next_global },
-                }],
-            },
-        )
-        .await?;
-    write
-        .delete_many(SELECTOR_SPACE, &[Key(gc_progress_selector_key())])
-        .await?;
-    write.commit().await?;
-    Ok(GcStepStatus::AbortedCorruptProgress)
+    Err(StorageError::Io(
+        "ForkTree corrupt-GC retirement is deferred until its transaction-owned plan lowering wave"
+            .to_string(),
+    ))
 }
 
 async fn load_gc_snapshot<S>(
@@ -1012,12 +951,15 @@ where
                     .into_iter()
                     .map(|id| typed(id, ObjectDomain::Commit)),
             );
-            edges.extend(
-                value
-                    .member_change_object_ids
-                    .into_iter()
-                    .map(|id| typed(id, ObjectDomain::SemanticChange)),
-            );
+            for member in value.members {
+                edges.push(typed(
+                    member.change_object_id(),
+                    ObjectDomain::SemanticChange,
+                ));
+                if let Some((source_commit_object_id, _)) = member.source() {
+                    edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
+                }
+            }
             edges.extend([
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
                 typed(value.local_state_root, ObjectDomain::OrderedTreeNode),
@@ -1218,8 +1160,10 @@ where
             ) => {
                 let bytes = load_object_bytes(read, commit_object_id).await?;
                 let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-                if commit.member_change_object_ids.get(ordinal as usize)
-                    != Some(&entry.change_object_id)
+                if commit.members.get(ordinal as usize)
+                    != Some(&super::model::CommitMemberV1::introduced(
+                        entry.change_object_id,
+                    ))
                 {
                     return Err(corruption(
                         "ChangeCatalog commit ordinal back-edge mismatch",
@@ -1280,119 +1224,21 @@ where
 }
 
 async fn commit_progress<S, R>(
-    storage: &S,
-    snapshot: GcSnapshot<R>,
-    mut progress: GcProgressV2,
-    mut edit: MaintenanceEdit,
-    sweep: SweepBatch,
-    finish: bool,
+    _storage: &S,
+    _snapshot: GcSnapshot<R>,
+    _progress: GcProgressV2,
+    _edit: MaintenanceEdit,
+    _sweep: SweepBatch,
+    _finish: bool,
 ) -> Result<(), StorageError>
 where
     S: Storage,
     R: StorageAdapterRead,
 {
-    let next_global = snapshot.global.rotated()?;
-    let raw_next_global = next_global.encode()?;
-    progress.expected_global_digest = global_digest(&raw_next_global);
-    progress.expected_global_epoch = next_global.epoch;
-    let old_selector = snapshot.progress_selector;
-    let old_progress_id = old_selector.map(|selector| selector.progress_object_id);
-    let next_generation = old_selector.map_or(Ok(1), |selector| {
-        selector
-            .selector_generation
-            .checked_add(1)
-            .ok_or_else(|| corruption("GC progress selector generation overflowed"))
-    })?;
-    let (progress_id, raw_progress) = progress.encode()?;
-    if !finish {
-        edit.stage(progress_id, raw_progress)?;
-    }
-    if let Some(old) = old_progress_id {
-        edit.supersede(old, (!finish).then_some(progress_id));
-    }
-    let mut preconditions = vec![Precondition::KeyValueEquals {
-        space: SELECTOR_SPACE,
-        key: Key(global_selector_key()),
-        expected: snapshot.raw_global,
-    }];
-    preconditions.push(match snapshot.raw_progress_selector {
-        Some(expected) => Precondition::KeyValueEquals {
-            space: SELECTOR_SPACE,
-            key: Key(gc_progress_selector_key()),
-            expected,
-        },
-        None => Precondition::KeyAbsent {
-            space: SELECTOR_SPACE,
-            key: Key(gc_progress_selector_key()),
-        },
-    });
-    let mut write = storage
-        .begin_write(WriteOptions {
-            preconditions,
-            ..WriteOptions::default()
-        })
-        .await?;
-    let object_entries = edit
-        .puts()
-        .map(|(id, bytes)| PutEntry {
-            key: object_key(id),
-            value: StoredValue {
-                bytes: bytes.clone(),
-            },
-        })
-        .collect::<Vec<_>>();
-    if !object_entries.is_empty() {
-        write
-            .put_many(
-                OBJECT_SPACE,
-                PutBatch {
-                    entries: object_entries,
-                },
-            )
-            .await?;
-    }
-    let mut selector_entries = vec![PutEntry {
-        key: Key(global_selector_key()),
-        value: StoredValue {
-            bytes: raw_next_global,
-        },
-    }];
-    if !finish {
-        selector_entries.push(PutEntry {
-            key: Key(gc_progress_selector_key()),
-            value: StoredValue {
-                bytes: GcProgressSelectorV2 {
-                    cycle_id: progress.cycle_id,
-                    progress_object_id: progress_id,
-                    selector_generation: next_generation,
-                }
-                .encode()?,
-            },
-        });
-    }
-    write
-        .put_many(
-            SELECTOR_SPACE,
-            PutBatch {
-                entries: selector_entries,
-            },
-        )
-        .await?;
-    if finish {
-        write
-            .delete_many(SELECTOR_SPACE, &[Key(gc_progress_selector_key())])
-            .await?;
-    }
-    let object_deletes = edit
-        .deletes()
-        .map(object_key)
-        .chain(sweep.keys())
-        .collect::<Vec<_>>();
-    if !object_deletes.is_empty() {
-        write.delete_many(OBJECT_SPACE, &object_deletes).await?;
-    }
-    write.commit().await?;
-    Ok(())
+    Err(StorageError::Io(
+        "ForkTree reachability publication is deferred until its transaction-owned plan lowering wave"
+            .to_string(),
+    ))
 }
 
 fn maintenance_cycle(

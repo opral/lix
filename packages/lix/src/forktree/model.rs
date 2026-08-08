@@ -176,12 +176,110 @@ impl BranchSnapshotV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitMemberV1 {
+    Introduced {
+        change_object_id: ObjectId,
+    },
+    Selected {
+        change_object_id: ObjectId,
+        source_commit_object_id: ObjectId,
+        source_ordinal: u32,
+    },
+}
+
+impl CommitMemberV1 {
+    pub(crate) fn introduced(change_object_id: ObjectId) -> Self {
+        Self::Introduced { change_object_id }
+    }
+
+    pub(crate) fn selected(
+        change_object_id: ObjectId,
+        source_commit_object_id: ObjectId,
+        source_ordinal: u32,
+    ) -> Self {
+        Self::Selected {
+            change_object_id,
+            source_commit_object_id,
+            source_ordinal,
+        }
+    }
+
+    pub(crate) fn change_object_id(self) -> ObjectId {
+        match self {
+            Self::Introduced { change_object_id }
+            | Self::Selected {
+                change_object_id, ..
+            } => change_object_id,
+        }
+    }
+
+    pub(crate) fn source(self) -> Option<(ObjectId, u32)> {
+        match self {
+            Self::Introduced { .. } => None,
+            Self::Selected {
+                source_commit_object_id,
+                source_ordinal,
+                ..
+            } => Some((source_commit_object_id, source_ordinal)),
+        }
+    }
+
+    fn encode(self, encoder: &mut Encoder) {
+        match self {
+            Self::Introduced { change_object_id } => {
+                encoder.u8(0);
+                encode_id(encoder, change_object_id);
+            }
+            Self::Selected {
+                change_object_id,
+                source_commit_object_id,
+                source_ordinal,
+            } => {
+                encoder.u8(1);
+                encode_id(encoder, change_object_id);
+                encode_id(encoder, source_commit_object_id);
+                encoder.u32(source_ordinal);
+            }
+        }
+    }
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, StorageError> {
+        let value = match decoder.u8()? {
+            0 => Self::introduced(decode_id(decoder)?),
+            1 => Self::selected(decode_id(decoder)?, decode_id(decoder)?, decoder.u32()?),
+            tag => {
+                return Err(corruption(format!(
+                    "commit member has invalid membership tag {tag}"
+                )));
+            }
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(self) -> Result<(), StorageError> {
+        if self.change_object_id() == ObjectId::ZERO
+            || self
+                .source()
+                .is_some_and(|(commit_object_id, _)| commit_object_id == ObjectId::ZERO)
+        {
+            return Err(corruption("commit member contains a zero object edge"));
+        }
+        Ok(())
+    }
+
+    fn authenticated_edge_count(self) -> usize {
+        1 + usize::from(self.source().is_some())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitObjectV1 {
     pub(crate) commit_id: CommitId,
     pub(crate) generation: u64,
     pub(crate) parent_commit_object_ids: Vec<ObjectId>,
-    pub(crate) member_change_object_ids: Vec<ObjectId>,
+    pub(crate) members: Vec<CommitMemberV1>,
     pub(crate) global_state_root: ObjectId,
     pub(crate) local_state_root: ObjectId,
     pub(crate) metadata: Vec<u8>,
@@ -191,14 +289,16 @@ impl CommitObjectV1 {
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate_edge_bound()?;
         validate_nonzero_ids("commit parent", &self.parent_commit_object_ids)?;
-        validate_nonzero_ids("commit member", &self.member_change_object_ids)?;
+        for member in &self.members {
+            member.validate()?;
+        }
         validate_nonzero_ids(
             "commit state",
             &[self.global_state_root, self.local_state_root],
         )?;
         let parent_count = u32::try_from(self.parent_commit_object_ids.len())
             .map_err(|_| corruption("commit has too many parents"))?;
-        let member_count = u32::try_from(self.member_change_object_ids.len())
+        let member_count = u32::try_from(self.members.len())
             .map_err(|_| corruption("commit has too many member changes"))?;
         encode_object(ObjectDomain::Commit, |encoder| {
             encoder.fixed(self.commit_id.as_bytes());
@@ -208,8 +308,8 @@ impl CommitObjectV1 {
                 encode_id(encoder, *parent);
             }
             encoder.u32(member_count);
-            for change in &self.member_change_object_ids {
-                encode_id(encoder, *change);
+            for member in &self.members {
+                member.encode(encoder);
             }
             encode_id(encoder, self.global_state_root);
             encode_id(encoder, self.local_state_root);
@@ -229,22 +329,24 @@ impl CommitObjectV1 {
         }
         let member_count = decoder.usize("commit member count")?;
         validate_count(member_count, decoder.remaining(), 32, "commit member count")?;
-        let mut member_change_object_ids = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
-            member_change_object_ids.push(decode_id(&mut decoder)?);
+            members.push(CommitMemberV1::decode(&mut decoder)?);
         }
         let value = Self {
             commit_id,
             generation,
             parent_commit_object_ids,
-            member_change_object_ids,
+            members,
             global_state_root: decode_id(&mut decoder)?,
             local_state_root: decode_id(&mut decoder)?,
             metadata: decoder.bytes("commit metadata")?,
         };
         decoder.finish()?;
         validate_nonzero_ids("commit parent", &value.parent_commit_object_ids)?;
-        validate_nonzero_ids("commit member", &value.member_change_object_ids)?;
+        for member in &value.members {
+            member.validate()?;
+        }
         validate_nonzero_ids(
             "commit state",
             &[value.global_state_root, value.local_state_root],
@@ -257,7 +359,13 @@ impl CommitObjectV1 {
         if self
             .parent_commit_object_ids
             .len()
-            .checked_add(self.member_change_object_ids.len())
+            .checked_add(
+                self.members
+                    .iter()
+                    .copied()
+                    .map(CommitMemberV1::authenticated_edge_count)
+                    .sum(),
+            )
             .and_then(|count| count.checked_add(2))
             .is_none_or(|count| count > AUTHENTICATED_EDGE_PAGE_ENTRIES)
         {

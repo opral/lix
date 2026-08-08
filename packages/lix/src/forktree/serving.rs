@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::{
-    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, Prefix, ProjectedValue,
-    ScanOrder, StorageError,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
+    Prefix, ProjectedValue, ScanCursor, ScanOrder, StorageError, StorageSpace,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::corruption;
 use super::model::{
     BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, GlobalSelectorV1,
+    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
     RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
@@ -616,20 +616,22 @@ where
         return Ok(None);
     };
     let entry = CommitCatalogEntry::decode(&value)?;
-    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
-    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    let commit_object_id = entry.commit_object_id;
+    let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+    let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
     if commit.commit_id != commit_id {
         return Err(corruption("CommitCatalog key does not match Commit object").into());
     }
     validate_retained_commit(
         read,
         repository.change_catalog_root,
-        entry.commit_object_id,
+        commit_object_id,
         &commit,
     )
     .await?;
-    let mut records = Vec::with_capacity(commit.member_change_object_ids.len());
-    for change_object_id in commit.member_change_object_ids {
+    let mut records = Vec::with_capacity(commit.members.len());
+    for (ordinal, member) in commit.members.iter().copied().enumerate() {
+        let change_object_id = member.change_object_id();
         let bytes = super::view::load_object_bytes(read, change_object_id).await?;
         let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
         let change_id = change.change_id();
@@ -642,6 +644,15 @@ where
         .await?
         .ok_or_else(|| corruption("Commit member has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
+        validate_member_catalog_owner(
+            read,
+            commit_object_id,
+            commit.generation,
+            ordinal,
+            member,
+            entry,
+        )
+        .await?;
         records.push(
             semantic_change_record(read, repository.change_catalog_root, change_id, entry).await?,
         );
@@ -917,8 +928,8 @@ where
         ) => {
             let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            if commit.member_change_object_ids.get(ordinal as usize)
-                != Some(&entry.change_object_id)
+            if commit.members.get(ordinal as usize)
+                != Some(&CommitMemberV1::introduced(entry.change_object_id))
             {
                 return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
             }
@@ -954,6 +965,130 @@ where
     )?)
 }
 
+pub(super) async fn validate_member_catalog_owner<R>(
+    read: &R,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    member: CommitMemberV1,
+    entry: ChangeCatalogEntry,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if entry.change_object_id != member.change_object_id() {
+        return Err(corruption(
+            "commit membership edge disagrees with ChangeCatalog object identity",
+        ));
+    }
+    let canonical_owner = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
+            let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
+            if introduction.members.get(ordinal as usize)
+                != Some(&CommitMemberV1::introduced(member.change_object_id()))
+            {
+                return Err(corruption(
+                    "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                ));
+            }
+            (commit_object_id, ordinal)
+        }
+        ChangeCatalogOwner::BranchRef { .. } => {
+            return Err(corruption(
+                "semantic commit member resolves to a branch-ref catalog owner",
+            ));
+        }
+    };
+    match member.source() {
+        None => {
+            let target_ordinal = u32::try_from(target_ordinal)
+                .map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+            if canonical_owner != (target_commit_object_id, target_ordinal) {
+                return Err(corruption(
+                    "introduced membership is not the canonical ChangeCatalog owner",
+                ));
+            }
+        }
+        Some((source_commit_object_id, source_ordinal)) => {
+            let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
+            let source_commit = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
+            if source_commit.generation >= target_generation {
+                return Err(corruption(
+                    "selected membership source generation is not earlier than its target",
+                ));
+            }
+            if source_commit
+                .members
+                .get(source_ordinal as usize)
+                .map(|source| source.change_object_id())
+                != Some(member.change_object_id())
+            {
+                return Err(corruption(
+                    "selected membership source commit/ordinal back-edge is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn select_historical_commit_member<R>(
+    view: &CoherentView<R>,
+    source_commit_id: CommitId,
+    change_id: ChangeId,
+) -> Result<(CommitMemberV1, CommitObjectV1, ChangeObjectV1), StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let source = load_commit(view, source_commit_id)
+        .await?
+        .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
+    let (source_commit_object_id, _) = source.encode()?;
+    for (source_ordinal, source_member) in source.members.iter().copied().enumerate() {
+        let change_object_id = source_member.change_object_id();
+        let bytes = view.load_object_bytes(change_object_id).await?;
+        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+        if change.change_id() != change_id {
+            continue;
+        }
+        let value = lookup_on_read(
+            view.repository_root().change_catalog_root,
+            "change",
+            change_id.as_bytes(),
+            view.read(),
+        )
+        .await?
+        .ok_or_else(|| corruption("selected Change has no ChangeCatalog introduction owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        validate_member_catalog_owner(
+            view.read(),
+            source_commit_object_id,
+            source.generation,
+            source_ordinal,
+            source_member,
+            entry,
+        )
+        .await?;
+        return Ok((
+            CommitMemberV1::selected(
+                change_object_id,
+                source_commit_object_id,
+                u32::try_from(source_ordinal)
+                    .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
+            ),
+            source,
+            change,
+        ));
+    }
+    Err(corruption(
+        "selected ChangeId is absent from its authenticated source commit membership",
+    ))
+}
+
 fn required_full_value(
     value: Option<ProjectedValue>,
     missing: &'static str,
@@ -975,46 +1110,54 @@ pub(crate) async fn state_point<R>(
 where
     R: StorageAdapterRead,
 {
-    if let Some(encoded) = lookup_on_read(
-        view.branch_snapshot().local_state_root,
-        "state",
-        key,
-        view.read(),
-    )
-    .await?
-    {
-        let value = decode_state_value_storage(&encoded)?;
-        return if value.cell.deleted() && !include_tombstone {
-            Ok(None)
-        } else {
-            Ok(Some(VisibleStateRow {
-                encoded_key: key.to_vec(),
-                value,
-                source: StateSource::Branch,
-                view_instance_id: view.view_instance_id(),
-            }))
-        };
-    }
-    let Some(encoded) = lookup_on_read(
+    let Some((value, source)) = state_point_on_read(
         view.repository_root().global_state_root,
-        "state",
+        view.branch_snapshot().local_state_root,
         key,
+        include_tombstone,
         view.read(),
     )
     .await?
     else {
         return Ok(None);
     };
+    Ok(Some(VisibleStateRow {
+        encoded_key: key.to_vec(),
+        value,
+        source,
+        view_instance_id: view.view_instance_id(),
+    }))
+}
+
+/// Resolves one state identity against explicitly authenticated commit roots
+/// on the caller's retained read. This is the ordered-history source-state
+/// seam; it never opens or refreshes a storage snapshot.
+pub(crate) async fn state_point_on_read<R>(
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+    key: &[u8],
+    include_tombstone: bool,
+    read: &R,
+) -> Result<Option<(StateValue, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(encoded) = lookup_on_read(local_state_root, "state", key, read).await? {
+        let value = decode_state_value_storage(&encoded)?;
+        return if value.cell.deleted() && !include_tombstone {
+            Ok(None)
+        } else {
+            Ok(Some((value, StateSource::Branch)))
+        };
+    }
+    let Some(encoded) = lookup_on_read(global_state_root, "state", key, read).await? else {
+        return Ok(None);
+    };
     let value = decode_state_value_storage(&encoded)?;
     if matches!(value.cell, StateCell::Tombstone) {
         return Err(corruption("global state tree contains a tombstone"));
     }
-    Ok(Some(VisibleStateRow {
-        encoded_key: key.to_vec(),
-        value,
-        source: StateSource::Global,
-        view_instance_id: view.view_instance_id(),
-    }))
+    Ok(Some((value, StateSource::Global)))
 }
 
 pub(crate) async fn state_range<R>(
@@ -1155,6 +1298,84 @@ where
         written_commit_ids,
         objects: edit.objects,
     })
+}
+
+/// Applies an ordered sequence of commit-local state mutations while keeping
+/// every newly authenticated root available through the caller's one retained
+/// read. Intermediate roots remain immutable commit authority, so their
+/// operation-local nodes are accumulated rather than pruned as transient
+/// publication scratch.
+pub(crate) async fn edit_state_tree_sequence<R>(
+    mut root: ObjectId,
+    mutation_batches: Vec<Vec<StateTreeMutation>>,
+    read: &R,
+) -> Result<Vec<StateTreeEdit>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut accumulated = ImmutableObjectSet::default();
+    let mut edits = Vec::with_capacity(mutation_batches.len());
+    for mutations in mutation_batches {
+        let overlay = ObjectOverlayRead {
+            read,
+            objects: &accumulated,
+        };
+        let edit = edit_state_tree(root, mutations, &overlay).await?;
+        root = edit.root;
+        accumulated.extend(edit.objects.clone())?;
+        edits.push(edit);
+    }
+    Ok(edits)
+}
+
+struct ObjectOverlayRead<'a, R: ?Sized> {
+    read: &'a R,
+    objects: &'a ImmutableObjectSet,
+}
+
+impl<R> StorageAdapterRead for ObjectOverlayRead<'_, R>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.read.snapshot_cache_key()
+    }
+
+    async fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> Result<GetManyResult, StorageError> {
+        let mut loaded = self.read.get_many(requests).await?;
+        let mut value_index = 0usize;
+        for request in requests {
+            for key in request.keys {
+                if request.space == super::object::OBJECT_SPACE {
+                    if let Ok(raw_id) = <[u8; 32]>::try_from(key.0.as_ref()) {
+                        let id = ObjectId::from_bytes(raw_id);
+                        if let Some(bytes) = self.objects.get(id) {
+                            loaded.values[value_index] = Some(match request.opts.projection {
+                                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                                CoreProjection::FullValue => {
+                                    ProjectedValue::FullValue(bytes.clone())
+                                }
+                            });
+                        }
+                    }
+                }
+                value_index += 1;
+            }
+        }
+        Ok(loaded)
+    }
+
+    fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.read.begin_scan(space, range, opts)
+    }
 }
 
 pub(crate) async fn put_commit_catalog_entries<R>(
@@ -1448,8 +1669,8 @@ where
         ) => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            if commit.member_change_object_ids.get(ordinal as usize)
-                != Some(&entry.change_object_id)
+            if commit.members.get(ordinal as usize)
+                != Some(&CommitMemberV1::introduced(entry.change_object_id))
             {
                 return Err(corruption(
                     "ChangeCatalog commit owner does not point back at its ordinal member",
@@ -1500,9 +1721,10 @@ where
             ));
         }
     }
-    for (ordinal, change_object_id) in commit.member_change_object_ids.iter().enumerate() {
-        let bytes = super::view::load_object_bytes(read, *change_object_id).await?;
-        let change = ChangeObjectV1::decode(*change_object_id, &bytes)?;
+    for (ordinal, member) in commit.members.iter().copied().enumerate() {
+        let change_object_id = member.change_object_id();
+        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
+        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
         if !matches!(change, ChangeObjectV1::Semantic { .. }) {
             return Err(corruption("commit member edge names a RefChange object"));
         }
@@ -1515,19 +1737,15 @@ where
         .await?
         .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        let ordinal =
-            u32::try_from(ordinal).map_err(|_| corruption("commit member ordinal exceeds u32"))?;
-        if entry.change_object_id != *change_object_id
-            || entry.owner
-                != (ChangeCatalogOwner::CommitMember {
-                    commit_object_id,
-                    ordinal,
-                })
-        {
-            return Err(corruption(
-                "retained Change object disagrees with its ChangeCatalog owner/back-edge",
-            ));
-        }
+        validate_member_catalog_owner(
+            read,
+            commit_object_id,
+            commit.generation,
+            ordinal,
+            member,
+            entry,
+        )
+        .await?;
     }
     Ok(())
 }

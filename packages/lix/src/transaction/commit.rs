@@ -15,15 +15,17 @@ use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::transaction::staging::{PreparedWriteSet, StagedIntermediateCommit};
+use crate::transaction::staging::PreparedWriteSet;
 
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitId as ForkTreeCommitId, CommitObjectV1, PreparedPublication, RepositoryRootV1,
-    StateCellRef, StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
-    edit_state_tree, encode_state_key, encode_state_value, load_commit, open_coherent_view_on_read,
-    put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
+    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
+    StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, edit_state_tree,
+    edit_state_tree_sequence, encode_state_key, encode_state_value, load_commit,
+    open_coherent_view_on_read, put_change_catalog_entries, put_commit_catalog_entries,
+    select_historical_commit_member, state_point, state_point_on_read,
 };
 
 #[cfg(test)]
@@ -255,6 +257,24 @@ where
     if !semantic_commit {
         return Ok(PreparedForkTreePlan::Publication(publication));
     }
+    let ordered_history = !prepared_writes.intermediate_commits.is_empty()
+        || !prepared_writes
+            .first_commit_parent_override_by_branch
+            .is_empty()
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .any(crate::transaction::types::StagedCommitChangeRefs::has_selected_changes);
+    if ordered_history {
+        return prepare_ordered_single_branch_history(
+            active_account_id,
+            commit_parent_heads,
+            &view,
+            publication,
+            prepared_writes,
+        )
+        .await;
+    }
     let tracked_rows = prepared_writes
         .state_rows
         .iter()
@@ -266,11 +286,6 @@ where
         .commit_change_refs_by_branch
         .get(&branch_id)
         .ok_or_else(|| writer_error("tracked rows have no branch commit owner"))?;
-    if change_refs.has_selected_changes() {
-        return Err(writer_error(
-            "selected historical members require the ForkTree merge-member lowering slice",
-        ));
-    }
     let commit_id = change_refs.commit_id;
     let global = tracked_rows[0].global;
     if tracked_rows
@@ -427,7 +442,10 @@ where
         commit_id: forktree_commit_id(commit_id),
         generation,
         parent_commit_object_ids: parent_object_ids,
-        member_change_object_ids: member_object_ids,
+        members: member_object_ids
+            .into_iter()
+            .map(CommitMemberV1::introduced)
+            .collect(),
         global_state_root,
         local_state_root,
         metadata: crate::changelog::encode_forktree_commit_payload(&commit_record)?,
@@ -535,6 +553,521 @@ where
     Ok(PreparedForkTreePlan::Publication(publication))
 }
 
+struct OrderedCommitDraft {
+    commit_id: CommitId,
+    commit_change_id: crate::changelog::ChangeId,
+    branch_ref_change_id: crate::changelog::ChangeId,
+    created_at: LixTimestamp,
+    parent_commit_ids: Vec<CommitId>,
+    selected_change_batches: Vec<crate::transaction::types::StagedCommitChangeBatch>,
+    publish_head: bool,
+}
+
+struct OrderedCommitContent {
+    draft: OrderedCommitDraft,
+    mutations: Vec<StateTreeMutation>,
+    fresh_changes: Vec<ChangeObjectV1>,
+    members: Vec<CommitMemberV1>,
+}
+
+async fn prepare_ordered_single_branch_history<R>(
+    active_account_id: &str,
+    commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
+    view: &crate::forktree::CoherentView<R>,
+    mut publication: PreparedPublication,
+    prepared: PreparedWriteSet,
+) -> Result<PreparedForkTreePlan, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    let branch_id = prepared
+        .commit_change_refs_by_branch
+        .keys()
+        .next()
+        .cloned()
+        .ok_or_else(|| writer_error("ordered history has no final branch commit owner"))?;
+    if prepared.commit_change_refs_by_branch.len() != 1
+        || prepared
+            .intermediate_commits
+            .iter()
+            .any(|commit| commit.branch_id != branch_id)
+    {
+        return Err(writer_error(
+            "ordered history must target exactly one branch",
+        ));
+    }
+
+    let mut drafts = Vec::with_capacity(prepared.intermediate_commits.len() + 1);
+    for intermediate in prepared.intermediate_commits.iter().cloned() {
+        let refs = intermediate.change_refs;
+        drafts.push(OrderedCommitDraft {
+            commit_id: refs.commit_id,
+            commit_change_id: refs.commit_change_id,
+            branch_ref_change_id: refs.branch_ref_change_id,
+            created_at: refs.created_at,
+            parent_commit_ids: vec![intermediate.parent_commit_id],
+            selected_change_batches: refs.into_selected_change_batches(),
+            publish_head: false,
+        });
+    }
+    let final_refs = prepared
+        .commit_change_refs_by_branch
+        .get(&branch_id)
+        .cloned()
+        .ok_or_else(|| writer_error("ordered history final commit owner is absent"))?;
+    let observed_parent = commit_parent_heads
+        .get(&branch_id)
+        .copied()
+        .flatten()
+        .ok_or_else(|| writer_error("ordered history branch has no observed parent head"))?;
+    let first_parent = prepared
+        .first_commit_parent_override_by_branch
+        .get(&branch_id)
+        .copied()
+        .unwrap_or(observed_parent);
+    let mut final_parents = vec![first_parent];
+    for parent in prepared
+        .extra_commit_parents_by_branch
+        .get(&branch_id)
+        .into_iter()
+        .flatten()
+    {
+        if !final_parents.contains(parent) {
+            final_parents.push(*parent);
+        }
+    }
+    drafts.push(OrderedCommitDraft {
+        commit_id: final_refs.commit_id,
+        commit_change_id: final_refs.commit_change_id,
+        branch_ref_change_id: final_refs.branch_ref_change_id,
+        created_at: final_refs.created_at,
+        parent_commit_ids: final_parents,
+        selected_change_batches: final_refs.into_selected_change_batches(),
+        publish_head: true,
+    });
+
+    let staged_ids = drafts
+        .iter()
+        .map(|draft| draft.commit_id)
+        .collect::<BTreeSet<_>>();
+    if staged_ids.len() != drafts.len() {
+        return Err(writer_error("ordered history repeats one staged CommitId"));
+    }
+
+    let mut state_domain = prepared
+        .state_rows
+        .iter()
+        .find(|row| !row.untracked)
+        .map(|row| row.global);
+    if prepared
+        .state_rows
+        .iter()
+        .filter(|row| !row.untracked)
+        .any(|row| row.branch_id.as_str() != branch_id || state_domain != Some(row.global))
+    {
+        return Err(writer_error(
+            "ordered history mixes branch or global state-root domains",
+        ));
+    }
+
+    let mut touched_presence = BTreeMap::<Vec<u8>, bool>::new();
+    let mut contents = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let mut seen_identities = BTreeSet::<Vec<u8>>::new();
+        let mut mutations = Vec::new();
+        let mut fresh_changes = Vec::new();
+        let mut members = Vec::new();
+        let fresh_rows = prepared
+            .state_rows
+            .iter()
+            .filter(|row| !row.untracked && row.commit_id == Some(draft.commit_id))
+            .collect::<Vec<_>>();
+        if fresh_rows.len()
+            != if draft.publish_head {
+                prepared
+                    .commit_change_refs_by_branch
+                    .get(&branch_id)
+                    .map_or(0, |refs| refs.tracked_change_count)
+            } else {
+                prepared
+                    .intermediate_commits
+                    .iter()
+                    .find(|commit| commit.change_refs.commit_id == draft.commit_id)
+                    .map_or(0, |commit| commit.change_refs.tracked_change_count)
+            }
+        {
+            return Err(writer_error(
+                "ordered history fresh row count differs from commit membership",
+            ));
+        }
+        for row in fresh_rows {
+            let change_id = row
+                .change_id
+                .ok_or_else(|| writer_error("ordered history row has no ChangeId"))?;
+            let key = encode_state_key(StateKeyRef {
+                schema_key: row.schema_key.as_str(),
+                file_id: row.file_id.map(|value| value.as_str()),
+                entity_pk: row.entity_pk,
+            });
+            if !seen_identities.insert(key.clone()) {
+                return Err(writer_error(
+                    "ordered history repeats one logical state identity",
+                ));
+            }
+            let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+                format_version: 2,
+                change_id,
+                account_id: active_account_id.to_string(),
+                schema_key: row.schema_key.to_string(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.map(ToString::to_string),
+                snapshot: row.snapshot.map_or(JsonSlot::None, |value| {
+                    JsonSlot::from_json(value.normalized())
+                }),
+                metadata: row.metadata.map_or(JsonSlot::None, |value| {
+                    JsonSlot::from_json(value.normalized())
+                }),
+                created_at: row.created_at,
+                origin_key: row.origin_key.map(ToString::to_string),
+            })?;
+            let change = ChangeObjectV1::Semantic {
+                change_id: forktree_change_id(change_id),
+                payload,
+            };
+            let (change_object_id, _) = change.encode()?;
+            members.push(CommitMemberV1::introduced(change_object_id));
+            fresh_changes.push(change);
+
+            let existed = match touched_presence.get(&key) {
+                Some(existed) => *existed,
+                None => state_point(view, &key, true)
+                    .await?
+                    .as_ref()
+                    .is_some_and(|value| row.global || value.source == StateSource::Branch),
+            };
+            let mutation = if row.global && row.snapshot.is_none() {
+                touched_presence.insert(key.clone(), false);
+                StateTreeMutation::remove(key)
+            } else {
+                let encoded = encode_state_value(StateValueRef {
+                    change_id,
+                    commit_id: draft.commit_id,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    cell: row.snapshot.map_or(StateCellRef::Tombstone, |value| {
+                        StateCellRef::Value(value.normalized())
+                    }),
+                    metadata: row.metadata.map(|value| value.normalized()),
+                    origin_key: row.origin_key.map(|value| value.as_str()),
+                    blob_manifest_object_ids: &[],
+                })?;
+                touched_presence.insert(key.clone(), true);
+                if existed {
+                    StateTreeMutation::update(key, encoded)
+                } else {
+                    StateTreeMutation::insert(key, encoded)
+                }
+            };
+            mutations.push(mutation);
+        }
+
+        for batch in &draft.selected_change_batches {
+            for selected in batch.iter() {
+                let identity = encode_state_key(StateKeyRef {
+                    schema_key: selected.schema_key(),
+                    file_id: selected.file_id(),
+                    entity_pk: selected.entity_pk(),
+                });
+                if !seen_identities.insert(identity.clone()) {
+                    return Err(writer_error(
+                        "ordered history repeats one fresh/selected logical identity",
+                    ));
+                }
+                if staged_ids.contains(&selected.source_commit_id) {
+                    return Err(writer_error(
+                        "selected history cannot source an uncommitted commit from the same batch",
+                    ));
+                }
+                let (member, source_commit, source_change) = select_historical_commit_member(
+                    view,
+                    forktree_commit_id(selected.source_commit_id),
+                    forktree_change_id(selected.change_id),
+                )
+                .await?;
+                let ChangeObjectV1::Semantic { payload, .. } = source_change else {
+                    return Err(writer_error(
+                        "selected history source member has the wrong Change domain",
+                    ));
+                };
+                let record =
+                    crate::changelog::decode_forktree_change_payload(&payload, selected.change_id)?;
+                if record.schema_key != selected.schema_key()
+                    || record.file_id.as_deref() != selected.file_id()
+                    || record.entity_pk != *selected.entity_pk()
+                    || record.created_at != selected.created_at
+                    || record.snapshot.is_none() != selected.deleted
+                {
+                    return Err(writer_error(
+                        "selected history identity or lifecycle differs from its Change payload",
+                    ));
+                }
+                let (source_value, source_domain) = state_point_on_read(
+                    source_commit.global_state_root,
+                    source_commit.local_state_root,
+                    &identity,
+                    true,
+                    view.read(),
+                )
+                .await?
+                .ok_or_else(|| writer_error("selected history source state row is absent"))?;
+                let selected_global = source_domain == StateSource::Global;
+                if state_domain
+                    .replace(selected_global)
+                    .is_some_and(|domain| domain != selected_global)
+                    || source_value.change_id != selected.change_id
+                    || source_value.commit_id != selected.source_commit_id
+                    || source_value.cell.deleted() != selected.deleted
+                    || source_value.created_at != selected.created_at
+                    || source_value.updated_at != selected.updated_at
+                {
+                    return Err(writer_error(
+                        "selected history source state authority is inconsistent",
+                    ));
+                }
+                let existed = match touched_presence.get(&identity) {
+                    Some(existed) => *existed,
+                    None => state_point(view, &identity, true)
+                        .await?
+                        .as_ref()
+                        .is_some_and(|value| {
+                            selected_global || value.source == StateSource::Branch
+                        }),
+                };
+                let mutation = if selected_global && selected.deleted {
+                    touched_presence.insert(identity.clone(), false);
+                    StateTreeMutation::remove(identity)
+                } else {
+                    let cell = match &source_value.cell {
+                        crate::forktree::StateCell::Value(value) => {
+                            StateCellRef::Value(value.as_ref())
+                        }
+                        crate::forktree::StateCell::Null => StateCellRef::Null,
+                        crate::forktree::StateCell::Tombstone => StateCellRef::Tombstone,
+                    };
+                    let encoded = encode_state_value(StateValueRef {
+                        change_id: selected.change_id,
+                        commit_id: draft.commit_id,
+                        created_at: source_value.created_at,
+                        updated_at: source_value.updated_at,
+                        cell,
+                        metadata: source_value.metadata.as_deref(),
+                        origin_key: source_value.origin_key.as_deref(),
+                        blob_manifest_object_ids: &source_value.blob_manifest_object_ids,
+                    })?;
+                    touched_presence.insert(identity.clone(), true);
+                    if existed {
+                        StateTreeMutation::update(identity, encoded)
+                    } else {
+                        StateTreeMutation::insert(identity, encoded)
+                    }
+                };
+                mutations.push(mutation);
+                members.push(member);
+            }
+        }
+        contents.push(OrderedCommitContent {
+            draft,
+            mutations,
+            fresh_changes,
+            members,
+        });
+    }
+
+    let global = state_domain.unwrap_or(false);
+    let state_base = if global {
+        view.repository_root().global_state_root
+    } else {
+        view.branch_snapshot().local_state_root
+    };
+    let state_edits = edit_state_tree_sequence(
+        state_base,
+        contents
+            .iter_mut()
+            .map(|content| std::mem::take(&mut content.mutations))
+            .collect(),
+        view.read(),
+    )
+    .await?;
+
+    let mut staged_commits = BTreeMap::<CommitId, (ObjectId, CommitObjectV1)>::new();
+    let mut semantic_commits = Vec::with_capacity(contents.len());
+    let mut commit_entries = Vec::with_capacity(contents.len());
+    let mut fresh_changes = Vec::new();
+    let mut fresh_owner_rows = Vec::new();
+    for (content, state_edit) in contents.iter().zip(&state_edits) {
+        let mut generation = None::<u64>;
+        let mut parent_object_ids = Vec::with_capacity(content.draft.parent_commit_ids.len());
+        for parent_id in &content.draft.parent_commit_ids {
+            let (parent_object_id, parent) =
+                if let Some((object_id, commit)) = staged_commits.get(parent_id) {
+                    (*object_id, commit.clone())
+                } else {
+                    let commit = load_commit(view, forktree_commit_id(*parent_id))
+                        .await?
+                        .ok_or_else(|| writer_error("ordered history parent is absent"))?;
+                    let (object_id, _) = commit.encode()?;
+                    (object_id, commit)
+                };
+            parent_object_ids.push(parent_object_id);
+            generation =
+                Some(generation.map_or(parent.generation, |value| value.max(parent.generation)));
+        }
+        let generation = match generation {
+            None => 0,
+            Some(value) => value
+                .checked_add(1)
+                .ok_or_else(|| writer_error("ordered history generation overflows u64"))?,
+        };
+        let global_state_root = if global {
+            state_edit.root
+        } else {
+            view.repository_root().global_state_root
+        };
+        let local_state_root = if global {
+            view.branch_snapshot().local_state_root
+        } else {
+            state_edit.root
+        };
+        let record = CommitRecord {
+            format_version: 2,
+            commit_id: content.draft.commit_id,
+            generation,
+            parent_commit_ids: content.draft.parent_commit_ids.clone(),
+            change_id: content.draft.commit_change_id,
+            account_id: active_account_id.to_string(),
+            created_at: content.draft.created_at,
+        };
+        let commit = CommitObjectV1 {
+            commit_id: forktree_commit_id(content.draft.commit_id),
+            generation,
+            parent_commit_object_ids: parent_object_ids,
+            members: content.members.clone(),
+            global_state_root,
+            local_state_root,
+            metadata: crate::changelog::encode_forktree_commit_payload(&record)?,
+        };
+        let (commit_object_id, _) = commit.encode()?;
+        staged_commits.insert(content.draft.commit_id, (commit_object_id, commit.clone()));
+        commit_entries.push((commit.commit_id, CommitCatalogEntry { commit_object_id }));
+        for (ordinal, change) in content.fresh_changes.iter().enumerate() {
+            let (change_object_id, _) = change.encode()?;
+            fresh_owner_rows.push((
+                change.change_id(),
+                ChangeCatalogEntry {
+                    change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id,
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| writer_error("ordered member ordinal exceeds u32"))?,
+                    },
+                },
+            ));
+            fresh_changes.push(change.clone());
+        }
+        semantic_commits.push(commit);
+    }
+    commit_entries.sort_unstable_by_key(|(commit_id, _)| *commit_id);
+    let commit_catalog_edit = put_commit_catalog_entries(
+        view.repository_root().commit_catalog_root,
+        &commit_entries,
+        view.read(),
+    )
+    .await?;
+
+    let final_content = contents.last().expect("ordered history is nonempty");
+    debug_assert!(final_content.draft.publish_head);
+    let final_commit = semantic_commits
+        .last()
+        .expect("ordered history is nonempty");
+    let (final_commit_object_id, _) = final_commit.encode()?;
+    let final_global_state_root = final_commit.global_state_root;
+    let final_local_state_root = final_commit.local_state_root;
+    let ref_payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+        format_version: 2,
+        change_id: final_content.draft.branch_ref_change_id,
+        account_id: active_account_id.to_string(),
+        schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
+        entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(&branch_id).map_err(
+            |error| writer_error(format!("transaction branch identity is invalid: {error}")),
+        )?,
+        file_id: None,
+        snapshot: JsonSlot::from_json(
+            &serde_json::json!({
+                "branch_id": branch_id,
+                "commit_id": final_content.draft.commit_id.to_string(),
+            })
+            .to_string(),
+        ),
+        metadata: JsonSlot::None,
+        created_at: final_content.draft.created_at,
+        origin_key: None,
+    })?;
+    let branch_ref_change = ChangeObjectV1::BranchRef {
+        change_id: forktree_change_id(final_content.draft.branch_ref_change_id),
+        branch_id: view.branch_id(),
+        before_semantic_head_commit_object_id: Some(
+            view.branch_snapshot().semantic_head_commit_object_id,
+        ),
+        after_semantic_head_commit_object_id: Some(final_commit_object_id),
+        previous_ref_change_object_id: view.branch_snapshot().latest_ref_change_object_id,
+        payload: ref_payload,
+    };
+    let (ref_object_id, _) = branch_ref_change.encode()?;
+    fresh_owner_rows.push((
+        branch_ref_change.change_id(),
+        ChangeCatalogEntry {
+            change_object_id: ref_object_id,
+            owner: ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: view.branch_id(),
+            },
+        },
+    ));
+    fresh_owner_rows.sort_unstable_by_key(|(change_id, _)| *change_id);
+    let change_catalog_edit = put_change_catalog_entries(
+        view.repository_root().change_catalog_root,
+        &fresh_owner_rows,
+        view.read(),
+    )
+    .await?;
+    let repository_root = RepositoryRootV1 {
+        global_state_root: final_global_state_root,
+        commit_catalog_root: commit_catalog_edit.root,
+        change_catalog_root: change_catalog_edit.root,
+        retention_policy_root: view.repository_root().retention_policy_root,
+    };
+    let transition = OrderedBranchHistoryTransition {
+        state_edits,
+        commit_catalog_edit,
+        change_catalog_edit,
+        semantic_commits,
+        fresh_changes,
+        branch_ref_change,
+        branch_snapshot: BranchSnapshotV1 {
+            branch_id: view.branch_id(),
+            local_state_root: final_local_state_root,
+            semantic_head_commit_object_id: final_commit_object_id,
+            latest_ref_change_object_id: Some(ref_object_id),
+            historical_global_state_root: final_global_state_root,
+        },
+        repository_root,
+    };
+    publication
+        .publish_ordered_branch_history(view, transition)
+        .await?;
+    Ok(PreparedForkTreePlan::Publication(publication))
+}
+
 fn classify_publication_intent(
     prepared: &PreparedWriteSet,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
@@ -545,12 +1078,12 @@ fn classify_publication_intent(
     // semantic owner before opening a view or constructing a publication, so
     // an unsupported ref/history cohort cannot publish unrelated untracked
     // state or rotate the global epoch while silently dropping its commit.
-    for refs in prepared.commit_change_refs_by_branch.values() {
-        if refs.has_selected_changes() {
-            return Err(writer_error(
-                "selected historical members require the ForkTree merge-member lowering slice",
-            ));
-        }
+    for refs in prepared.commit_change_refs_by_branch.values().chain(
+        prepared
+            .intermediate_commits
+            .iter()
+            .map(|commit| &commit.change_refs),
+    ) {
         if refs.ordered_mutation_journal().is_some() {
             return Err(writer_error(
                 "immutable mutation journals require the ForkTree bulk lowering slice",
@@ -558,32 +1091,70 @@ fn classify_publication_intent(
         }
     }
 
-    let mut tracked_rows_by_branch = BTreeMap::<&str, usize>::new();
-    for row in prepared.state_rows.iter().filter(|row| !row.untracked) {
-        *tracked_rows_by_branch
-            .entry(row.branch_id.as_str())
-            .or_default() += 1;
-    }
+    let mut expected_commits = BTreeMap::<CommitId, (&str, usize, bool)>::new();
     for (branch_id, refs) in &prepared.commit_change_refs_by_branch {
-        let tracked_rows = tracked_rows_by_branch
-            .get(branch_id.as_str())
+        if expected_commits
+            .insert(
+                refs.commit_id,
+                (
+                    branch_id.as_str(),
+                    refs.tracked_change_count,
+                    refs.has_selected_changes(),
+                ),
+            )
+            .is_some()
+        {
+            return Err(writer_error("semantic commit intent repeats one CommitId"));
+        }
+    }
+    for intermediate in &prepared.intermediate_commits {
+        let refs = &intermediate.change_refs;
+        if expected_commits
+            .insert(
+                refs.commit_id,
+                (
+                    intermediate.branch_id.as_str(),
+                    refs.tracked_change_count,
+                    refs.has_selected_changes(),
+                ),
+            )
+            .is_some()
+        {
+            return Err(writer_error("semantic commit intent repeats one CommitId"));
+        }
+    }
+    let mut tracked_rows_by_commit = BTreeMap::<CommitId, usize>::new();
+    for row in prepared.state_rows.iter().filter(|row| !row.untracked) {
+        let commit_id = row
+            .commit_id
+            .ok_or_else(|| writer_error("tracked row has no semantic CommitId"))?;
+        let Some((branch_id, _, _)) = expected_commits.get(&commit_id) else {
+            return Err(writer_error(
+                "tracked row is missing its semantic commit owner",
+            ));
+        };
+        if row.branch_id.as_str() != *branch_id {
+            return Err(writer_error(
+                "tracked row branch differs from its semantic commit owner",
+            ));
+        }
+        *tracked_rows_by_commit.entry(commit_id).or_default() += 1;
+    }
+    for (commit_id, (_, expected_rows, has_selected)) in &expected_commits {
+        let tracked_rows = tracked_rows_by_commit
+            .get(commit_id)
             .copied()
             .unwrap_or_default();
-        if tracked_rows == 0 {
+        if tracked_rows == 0 && !has_selected {
             return Err(writer_error(
                 "ref-only commit intent requires the ForkTree history lowering slice",
             ));
         }
-        if refs.tracked_change_count != tracked_rows {
+        if *expected_rows != tracked_rows {
             return Err(writer_error(
                 "tracked row count differs from its semantic commit membership",
             ));
         }
-    }
-    if tracked_rows_by_branch.len() != prepared.commit_change_refs_by_branch.len() {
-        return Err(writer_error(
-            "tracked rows are missing their semantic commit owner",
-        ));
     }
     if !prepared.extra_commit_parents_by_branch.is_empty()
         && prepared.commit_change_refs_by_branch.is_empty()
@@ -595,7 +1166,9 @@ fn classify_publication_intent(
 
     let has_state_rows = !prepared.state_rows.is_empty();
     let has_commit_intent = !prepared.commit_change_refs_by_branch.is_empty()
-        || !prepared.extra_commit_parents_by_branch.is_empty();
+        || !prepared.extra_commit_parents_by_branch.is_empty()
+        || !prepared.intermediate_commits.is_empty()
+        || !prepared.first_commit_parent_override_by_branch.is_empty();
     if !has_state_rows && !has_commit_intent {
         return match runtime_checkpoint {
             None => Ok(PublicationIntent::Noop),
@@ -624,16 +1197,6 @@ fn reject_not_yet_lowered_cohorts(prepared: &PreparedWriteSet) -> Result<(), Lix
             "checkpoint publication requires the ForkTree snapshot-root lowering slice",
         ));
     }
-    if !prepared.intermediate_commits.is_empty() {
-        return Err(writer_error(
-            "intermediate commits require the ordered ForkTree history lowering slice",
-        ));
-    }
-    if !prepared.first_commit_parent_override_by_branch.is_empty() {
-        return Err(writer_error(
-            "commit-parent override requires the ForkTree undo/redo lowering slice",
-        ));
-    }
     Ok(())
 }
 
@@ -656,6 +1219,18 @@ fn sole_publication_branch(
                 .extra_commit_parents_by_branch
                 .keys()
                 .map(String::as_str),
+        )
+        .chain(
+            prepared
+                .first_commit_parent_override_by_branch
+                .keys()
+                .map(String::as_str),
+        )
+        .chain(
+            prepared
+                .intermediate_commits
+                .iter()
+                .map(|commit| commit.branch_id.as_str()),
         )
         .collect::<BTreeSet<_>>();
     if branches.is_empty() && runtime_checkpoint_present {
@@ -705,10 +1280,6 @@ fn forktree_change_id(value: crate::changelog::ChangeId) -> ForkTreeChangeId {
 fn writer_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
-
-// Keep the compiler honest that the drained intermediate owner remains part
-// of the next history-lowering slice rather than being silently discarded.
-const _: Option<StagedIntermediateCommit> = None;
 
 #[cfg(test)]
 mod intent_tests {

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
-use crate::storage::{Key, Precondition, Storage, StorageError, WriteOptions};
+use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 
@@ -15,7 +15,7 @@ use super::model::{
     global_selector_key, snapshot_selector_key, upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
-use super::serving::{CatalogTreeEdit, StateTreeEdit};
+use super::serving::{CatalogTreeEdit, StateTreeEdit, validate_member_catalog_owner};
 use super::state::{
     StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
@@ -39,6 +39,21 @@ pub(crate) struct BranchStateTransition {
     pub(crate) change_catalog_edit: CatalogTreeEdit,
     pub(crate) semantic_commit: CommitObjectV1,
     pub(crate) changes: Vec<ChangeObjectV1>,
+    pub(crate) branch_snapshot: BranchSnapshotV1,
+    pub(crate) repository_root: super::model::RepositoryRootV1,
+}
+
+/// One ordered single-branch history publication. Intermediate commits and
+/// their immutable state roots are cataloged together; only the final commit
+/// advances the branch selector/ref fact.
+#[derive(Debug)]
+pub(crate) struct OrderedBranchHistoryTransition {
+    pub(crate) state_edits: Vec<StateTreeEdit>,
+    pub(crate) commit_catalog_edit: CatalogTreeEdit,
+    pub(crate) change_catalog_edit: CatalogTreeEdit,
+    pub(crate) semantic_commits: Vec<CommitObjectV1>,
+    pub(crate) fresh_changes: Vec<ChangeObjectV1>,
+    pub(crate) branch_ref_change: ChangeObjectV1,
     pub(crate) branch_snapshot: BranchSnapshotV1,
     pub(crate) repository_root: super::model::RepositoryRootV1,
 }
@@ -502,19 +517,25 @@ impl PreparedPublication {
             }
         }
         let mut expected_changes = BTreeSet::new();
-        for (ordinal, member_id) in semantic_commit.member_change_object_ids.iter().enumerate() {
-            if !expected_changes.insert(*member_id) {
+        for (ordinal, member) in semantic_commit.members.iter().copied().enumerate() {
+            let member_id = member.change_object_id();
+            if member.source().is_some() {
+                return Err(corruption(
+                    "single-transition publication cannot introduce selected history",
+                ));
+            }
+            if !expected_changes.insert(member_id) {
                 return Err(corruption("semantic commit repeats one member Change"));
             }
             let Some((ChangeObjectV1::Semantic { change_id, .. }, _)) =
-                encoded_changes.get(member_id)
+                encoded_changes.get(&member_id)
             else {
                 return Err(corruption(
                     "semantic commit member is absent or is a branch RefChange",
                 ));
             };
             let expected = super::model::ChangeCatalogEntry {
-                change_object_id: *member_id,
+                change_object_id: member_id,
                 owner: super::model::ChangeCatalogOwner::CommitMember {
                     commit_object_id: commit_id,
                     ordinal: u32::try_from(ordinal)
@@ -578,6 +599,265 @@ impl PreparedPublication {
         for (id, (_, bytes)) in encoded_changes {
             self.stage_encoded_object(id, bytes)?;
         }
+        let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        self.stage_repository_root(repository_root)?;
+        self.install_branch_selector(view, snapshot_id)
+    }
+
+    pub(crate) async fn publish_ordered_branch_history<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        transition: OrderedBranchHistoryTransition,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        if self.expected_global.as_ref() != view.raw_global_selector().as_ref() {
+            return Err(corruption(
+                "ordered history was derived from another coherent global view",
+            ));
+        }
+        let OrderedBranchHistoryTransition {
+            state_edits,
+            commit_catalog_edit,
+            change_catalog_edit,
+            semantic_commits,
+            fresh_changes,
+            branch_ref_change,
+            branch_snapshot,
+            repository_root,
+        } = transition;
+        if semantic_commits.is_empty() || semantic_commits.len() != state_edits.len() {
+            return Err(corruption(
+                "ordered history has mismatched commit/state-root cardinality",
+            ));
+        }
+        if branch_snapshot.branch_id != view.branch_id()
+            || commit_catalog_edit.base_root != view.repository_root().commit_catalog_root
+            || change_catalog_edit.base_root != view.repository_root().change_catalog_root
+            || repository_root.commit_catalog_root != commit_catalog_edit.root
+            || repository_root.change_catalog_root != change_catalog_edit.root
+            || repository_root.retention_policy_root != view.repository_root().retention_policy_root
+        {
+            return Err(corruption(
+                "ordered history roots/catalogs do not derive from the selected view",
+            ));
+        }
+
+        let mut encoded_commits = BTreeMap::new();
+        for commit in &semantic_commits {
+            let (object_id, bytes) = commit.encode()?;
+            if encoded_commits.insert(object_id, (commit, bytes)).is_some()
+                || commit_catalog_edit
+                    .commit_entries
+                    .get(&commit.commit_id)
+                    .map(|entry| entry.commit_object_id)
+                    != Some(object_id)
+            {
+                return Err(corruption(
+                    "ordered history repeats or miscatalogs one Commit object",
+                ));
+            }
+        }
+        if encoded_commits.len() != commit_catalog_edit.commit_entries.len() {
+            return Err(corruption(
+                "ordered history CommitCatalog edit is not exactly the staged commits",
+            ));
+        }
+
+        let mut encoded_fresh_changes = BTreeMap::new();
+        for change in &fresh_changes {
+            let (object_id, bytes) = change.encode()?;
+            if !matches!(change, ChangeObjectV1::Semantic { .. })
+                || encoded_fresh_changes
+                    .insert(object_id, (change, bytes))
+                    .is_some()
+            {
+                return Err(corruption(
+                    "ordered history repeats or misclassifies one fresh Change object",
+                ));
+            }
+        }
+
+        let is_global = semantic_commits
+            .iter()
+            .all(|commit| commit.local_state_root == view.branch_snapshot().local_state_root);
+        let mut expected_state_base = if is_global {
+            view.repository_root().global_state_root
+        } else {
+            view.branch_snapshot().local_state_root
+        };
+        let mut seen_commit_ids = BTreeSet::new();
+        for (commit, state_edit) in semantic_commits.iter().zip(state_edits.iter()) {
+            let (commit_object_id, _) = commit.encode()?;
+            if !seen_commit_ids.insert(commit.commit_id)
+                || state_edit.base_root != expected_state_base
+                || state_edit
+                    .written_commit_ids
+                    .iter()
+                    .any(|id| id != commit.commit_id.as_bytes())
+                || (is_global && state_edit.wrote_tombstone)
+            {
+                return Err(corruption(
+                    "ordered history state edit/commit chronology is inconsistent",
+                ));
+            }
+            let expected_global_root = if is_global {
+                state_edit.root
+            } else {
+                view.repository_root().global_state_root
+            };
+            let expected_local_root = if is_global {
+                view.branch_snapshot().local_state_root
+            } else {
+                state_edit.root
+            };
+            if commit.global_state_root != expected_global_root
+                || commit.local_state_root != expected_local_root
+            {
+                return Err(corruption(
+                    "ordered Commit object does not authenticate its state edit root",
+                ));
+            }
+            expected_state_base = state_edit.root;
+
+            let mut parent_objects = BTreeSet::new();
+            for parent_id in &commit.parent_commit_object_ids {
+                if !parent_objects.insert(*parent_id) {
+                    return Err(corruption("ordered Commit repeats one parent edge"));
+                }
+                let parent = if let Some((parent, _)) = encoded_commits.get(parent_id) {
+                    (*parent).clone()
+                } else {
+                    let bytes = view.load_object_bytes(*parent_id).await?;
+                    CommitObjectV1::decode(*parent_id, &bytes)?
+                };
+                if parent.generation >= commit.generation {
+                    return Err(corruption(
+                        "ordered Commit generation does not strictly follow every parent",
+                    ));
+                }
+            }
+
+            let mut member_ids = BTreeSet::new();
+            for (ordinal, member) in commit.members.iter().copied().enumerate() {
+                let change_object_id = member.change_object_id();
+                if !member_ids.insert(change_object_id) {
+                    return Err(corruption("ordered Commit repeats one Change member"));
+                }
+                match member.source() {
+                    None => {
+                        let Some((ChangeObjectV1::Semantic { change_id, .. }, _)) =
+                            encoded_fresh_changes.get(&change_object_id)
+                        else {
+                            return Err(corruption(
+                                "introduced member is absent from fresh semantic Changes",
+                            ));
+                        };
+                        let expected = super::model::ChangeCatalogEntry {
+                            change_object_id,
+                            owner: super::model::ChangeCatalogOwner::CommitMember {
+                                commit_object_id,
+                                ordinal: u32::try_from(ordinal).map_err(|_| {
+                                    corruption("ordered Commit member ordinal exceeds u32")
+                                })?,
+                            },
+                        };
+                        if change_catalog_edit.change_entries.get(change_id) != Some(&expected) {
+                            return Err(corruption(
+                                "fresh ChangeCatalog introduction owner is inconsistent",
+                            ));
+                        }
+                    }
+                    Some(_) => {
+                        let bytes = view.load_object_bytes(change_object_id).await?;
+                        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
+                        if !matches!(change, ChangeObjectV1::Semantic { .. }) {
+                            return Err(corruption(
+                                "selected history member names a non-semantic Change",
+                            ));
+                        }
+                        let raw_entry = super::tree::lookup_on_read(
+                            view.repository_root().change_catalog_root,
+                            "change",
+                            change.change_id().as_bytes(),
+                            view.read(),
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            corruption("selected history member has no ChangeCatalog owner")
+                        })?;
+                        validate_member_catalog_owner(
+                            view.read(),
+                            commit_object_id,
+                            commit.generation,
+                            ordinal,
+                            member,
+                            super::model::ChangeCatalogEntry::decode(&raw_entry)?,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        let final_commit = semantic_commits.last().expect("nonempty checked");
+        let (final_commit_object_id, _) = final_commit.encode()?;
+        if branch_snapshot.semantic_head_commit_object_id != final_commit_object_id
+            || branch_snapshot.local_state_root != final_commit.local_state_root
+            || branch_snapshot.historical_global_state_root != final_commit.global_state_root
+            || repository_root.global_state_root != final_commit.global_state_root
+        {
+            return Err(corruption(
+                "final ordered Commit does not authenticate selected branch/repository roots",
+            ));
+        }
+        let (ref_object_id, ref_bytes) = branch_ref_change.encode()?;
+        let ChangeObjectV1::BranchRef {
+            change_id,
+            branch_id,
+            before_semantic_head_commit_object_id,
+            after_semantic_head_commit_object_id,
+            previous_ref_change_object_id,
+            ..
+        } = &branch_ref_change
+        else {
+            return Err(corruption(
+                "ordered history final ref fact has wrong domain",
+            ));
+        };
+        let expected_ref_entry = super::model::ChangeCatalogEntry {
+            change_object_id: ref_object_id,
+            owner: super::model::ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: ref_object_id,
+                branch_id: *branch_id,
+            },
+        };
+        if *branch_id != view.branch_id()
+            || *before_semantic_head_commit_object_id
+                != Some(view.branch_snapshot().semantic_head_commit_object_id)
+            || *after_semantic_head_commit_object_id != Some(final_commit_object_id)
+            || *previous_ref_change_object_id != view.branch_snapshot().latest_ref_change_object_id
+            || branch_snapshot.latest_ref_change_object_id != Some(ref_object_id)
+            || change_catalog_edit.change_entries.get(change_id) != Some(&expected_ref_entry)
+        {
+            return Err(corruption(
+                "ordered history final branch ref/catalog/selector edge is inconsistent",
+            ));
+        }
+
+        for edit in state_edits {
+            self.stage_state_edit(edit)?;
+        }
+        self.stage_catalog_edit(commit_catalog_edit)?;
+        self.stage_catalog_edit(change_catalog_edit)?;
+        for (object_id, (_, bytes)) in encoded_commits {
+            self.stage_encoded_object(object_id, bytes)?;
+        }
+        for (object_id, (_, bytes)) in encoded_fresh_changes {
+            self.stage_encoded_object(object_id, bytes)?;
+        }
+        self.stage_encoded_object(ref_object_id, ref_bytes)?;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
         self.stage_repository_root(repository_root)?;
         self.install_branch_selector(view, snapshot_id)
@@ -774,24 +1054,6 @@ impl PreparedPublication {
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_repository_root(repository_root)?;
         self.delete_branch_selector(view.branch_selector(), view.raw_branch_selector().clone())
-    }
-
-    pub(crate) async fn commit<S>(self, storage: &S) -> Result<(), StorageError>
-    where
-        S: Storage,
-    {
-        let (writes, preconditions) = self.into_storage_plan()?;
-        writes
-            .commit(
-                storage,
-                WriteOptions {
-                    preconditions,
-                    ..WriteOptions::default()
-                },
-            )
-            .await
-            .map_err(|error| StorageError::Io(error.to_string()))?;
-        Ok(())
     }
 
     /// Lowers one authenticated publication into the engine's canonical

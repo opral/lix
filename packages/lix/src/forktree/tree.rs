@@ -820,10 +820,10 @@ pub(super) fn validate_change_catalog_back_edge(
         ) => {
             let commit = CommitObjectV1::decode(commit_object_id, &load(commit_object_id)?)?;
             let member = commit
-                .member_change_object_ids
+                .members
                 .get(ordinal as usize)
                 .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
-            if *member != entry.change_object_id {
+            if *member != super::model::CommitMemberV1::introduced(entry.change_object_id) {
                 return Err(corruption(
                     "ChangeCatalog commit ordinal does not point back to its Change object",
                 ));
