@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
+use crate::commit_graph::CommitGraphContext;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
@@ -731,13 +732,20 @@ struct CountingRead {
     inner: MemoryRead,
 }
 
-struct TopologyCountingRead {
-    inner: StorageAdapterReadScope<MemoryRead>,
-    forbidden_member: ObjectId,
+struct SharedParentCountingRead<R> {
+    inner: R,
+    parent_object: ObjectId,
+    grandparent_object: ObjectId,
+    member_object: ObjectId,
+    parent_object_reads: Arc<AtomicUsize>,
+    grandparent_object_reads: Arc<AtomicUsize>,
     member_object_reads: Arc<AtomicUsize>,
 }
 
-impl StorageAdapterRead for TopologyCountingRead {
+impl<R> StorageAdapterRead for SharedParentCountingRead<R>
+where
+    R: StorageAdapterRead,
+{
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.inner.snapshot_cache_key()
     }
@@ -746,12 +754,22 @@ impl StorageAdapterRead for TopologyCountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        let member_key = self.forbidden_member.as_bytes();
-        if requests.iter().any(|request| {
-            request.space == OBJECT_SPACE
-                && request.keys.iter().any(|key| key.0.as_ref() == member_key)
-        }) {
-            self.member_object_reads.fetch_add(1, Ordering::Relaxed);
+        for request in requests {
+            if request.space != OBJECT_SPACE {
+                continue;
+            }
+            for key in request.keys {
+                if key.0.as_ref() == self.parent_object.as_bytes() {
+                    self.parent_object_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                if key.0.as_ref() == self.grandparent_object.as_bytes() {
+                    self.grandparent_object_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if key.0.as_ref() == self.member_object.as_bytes() {
+                    self.member_object_reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         self.inner.get_many(requests)
     }
@@ -963,42 +981,178 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
 }
 
 #[tokio::test]
-async fn commit_topology_never_hydrates_member_changes_and_member_history_fails_closed() {
-    let seed = build_seed();
-    let storage = Memory::new();
+async fn commit_topology_batch_loads_one_shared_parent_once_and_seeds_graph_walk() {
+    let mut seed = build_seed();
+    let grandparent = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x50)),
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        member_change_object_ids: Vec::new(),
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: b"grandparent".to_vec(),
+    };
+    let (grandparent_object_id, grandparent_bytes) = grandparent.encode().expect("grandparent");
+    seed.objects
+        .insert(grandparent_object_id, grandparent_bytes)
+        .expect("grandparent object");
+    let parent = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x51)),
+        generation: 2,
+        parent_commit_object_ids: vec![grandparent_object_id],
+        member_change_object_ids: vec![seed.semantic_change_object_id],
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: b"shared-parent".to_vec(),
+    };
+    let (parent_object_id, parent_bytes) = parent.encode().expect("shared parent");
+    seed.objects
+        .insert(parent_object_id, parent_bytes)
+        .expect("shared parent object");
+    let child_a = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x52)),
+        generation: 3,
+        parent_commit_object_ids: vec![parent_object_id],
+        member_change_object_ids: Vec::new(),
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: b"child-a".to_vec(),
+    };
+    let (child_a_object_id, child_a_bytes) = child_a.encode().expect("child a");
+    seed.objects
+        .insert(child_a_object_id, child_a_bytes)
+        .expect("child a object");
+    let child_b = CommitObjectV1 {
+        commit_id: CommitId::from_bytes(raw_id(0x53)),
+        generation: 3,
+        parent_commit_object_ids: vec![parent_object_id],
+        member_change_object_ids: Vec::new(),
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: b"child-b".to_vec(),
+    };
+    let (child_b_object_id, child_b_bytes) = child_b.encode().expect("child b");
+    seed.objects
+        .insert(child_b_object_id, child_b_bytes)
+        .expect("child b object");
+    let creation = ChangeObjectV1::BranchRef {
+        change_id: ChangeId::from_bytes(raw_id(0x54)),
+        branch_id: seed.branch_id,
+        before_semantic_head_commit_object_id: None,
+        after_semantic_head_commit_object_id: Some(child_a_object_id),
+        previous_ref_change_object_id: None,
+        payload: b"shared-parent-branch".to_vec(),
+    };
+    let (creation_object_id, creation_bytes) = creation.encode().expect("creation ref");
+    seed.objects
+        .insert(creation_object_id, creation_bytes)
+        .expect("creation ref object");
+    let branch_id = seed.branch_id;
+    let semantic_change_id = seed.semantic_change_id;
+    let semantic_change_object_id = seed.semantic_change_object_id;
+    replace_selected_history_graph(
+        &mut seed,
+        &[
+            (
+                grandparent.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: grandparent_object_id,
+                },
+            ),
+            (
+                parent.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: parent_object_id,
+                },
+            ),
+            (
+                child_a.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: child_a_object_id,
+                },
+            ),
+            (
+                child_b.commit_id,
+                CommitCatalogEntry {
+                    commit_object_id: child_b_object_id,
+                },
+            ),
+        ],
+        &[
+            (
+                semantic_change_id,
+                ChangeCatalogEntry {
+                    change_object_id: semantic_change_object_id,
+                    owner: ChangeCatalogOwner::CommitMember {
+                        commit_object_id: parent_object_id,
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                creation.change_id(),
+                ChangeCatalogEntry {
+                    change_object_id: creation_object_id,
+                    owner: ChangeCatalogOwner::BranchRef {
+                        ref_change_object_id: creation_object_id,
+                        branch_id,
+                    },
+                },
+            ),
+        ],
+        child_a_object_id,
+        creation_object_id,
+    );
+
+    let storage = CountingStorage::new();
     seed_storage(&storage, &seed).await;
+    let parent_object_reads = Arc::new(AtomicUsize::new(0));
+    let grandparent_object_reads = Arc::new(AtomicUsize::new(0));
     let member_object_reads = Arc::new(AtomicUsize::new(0));
-    let read = TopologyCountingRead {
+    let read = SharedParentCountingRead {
         inner: StorageAdapterReadScope::new(
             storage
                 .begin_read(ReadOptions::default())
                 .await
-                .expect("topology read"),
+                .expect("one retained topology read"),
         ),
-        forbidden_member: seed.semantic_change_object_id,
+        parent_object: parent_object_id,
+        grandparent_object: grandparent_object_id,
+        member_object: seed.semantic_change_object_id,
+        parent_object_reads: Arc::clone(&parent_object_reads),
+        grandparent_object_reads: Arc::clone(&grandparent_object_reads),
         member_object_reads: Arc::clone(&member_object_reads),
     };
-    let public_id = public_commit_id(0x20);
-    assert_eq!(
-        load_commit_topologies(&read, &[public_id])
+    let mut graph = CommitGraphContext::new().reader(read);
+    let siblings = graph
+        .load_nodes(&[public_commit_id(0x52), public_commit_id(0x53)])
+        .await
+        .expect("shared-parent sibling batch");
+    assert!(siblings.into_iter().all(|(_, node)| node.is_some()));
+    assert!(
+        graph
+            .load_node(&public_commit_id(0x51))
             .await
-            .expect("topology")
-            .into_iter()
-            .next()
-            .flatten(),
-        Some(super::CommitTopology {
-            commit_id: public_id,
-            parent_commit_ids: Vec::new(),
-            generation: 1,
-        })
+            .expect("visit seeded parent")
+            .is_some()
     );
+    assert!(
+        graph
+            .load_node(&public_commit_id(0x50))
+            .await
+            .expect("visit seeded grandparent")
+            .is_some()
+    );
+    assert_eq!(storage.begin_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(parent_object_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(grandparent_object_reads.load(Ordering::Relaxed), 1);
     assert_eq!(member_object_reads.load(Ordering::Relaxed), 0);
-    drop(read);
+    drop(graph);
 
     let mut corrupt = storage
         .begin_write(WriteOptions::default())
         .await
-        .expect("corruption write");
+        .expect("member corruption write");
     corrupt
         .delete_many(
             OBJECT_SPACE,
@@ -1008,7 +1162,7 @@ async fn commit_topology_never_hydrates_member_changes_and_member_history_fails_
         )
         .await
         .expect("delete member");
-    corrupt.commit().await.expect("commit corruption");
+    corrupt.commit().await.expect("commit member corruption");
 
     let read = StorageAdapterReadScope::new(
         storage
@@ -1017,15 +1171,17 @@ async fn commit_topology_never_hydrates_member_changes_and_member_history_fails_
             .expect("post-corruption read"),
     );
     assert!(
-        load_commit_topologies(&read, &[public_id])
+        load_commit_topologies(&read, &[public_commit_id(0x52), public_commit_id(0x53)],)
             .await
-            .expect("member corruption remains latent for topology")
+            .expect("member corruption remains latent for sibling topology")
             .into_iter()
-            .next()
-            .flatten()
-            .is_some()
+            .all(|topology| topology.is_some())
     );
-    assert!(load_commit_member_records(&read, public_id).await.is_err());
+    assert!(
+        load_commit_member_records(&read, public_commit_id(0x51))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

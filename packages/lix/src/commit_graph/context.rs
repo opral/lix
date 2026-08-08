@@ -48,6 +48,7 @@ impl CommitGraphContext {
         CommitGraphStoreReader {
             store,
             node_cache: HashMap::new(),
+            topology_cache: crate::forktree::CommitTopologyReadCache::default(),
             reachable_nodes_cache: HashMap::new(),
             member_changes_cache: HashMap::new(),
         }
@@ -61,6 +62,7 @@ where
 {
     store: S,
     node_cache: HashMap<CommitId, Option<CommitGraphNode>>,
+    topology_cache: crate::forktree::CommitTopologyReadCache,
     reachable_nodes_cache: HashMap<CommitId, Arc<[ReachableCommitGraphNode]>>,
     // A reader is bound to one pinned storage snapshot for the duration of a
     // SQL statement. File-history shaping asks the same reader for distinct
@@ -108,9 +110,18 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         if !uncached_ids.is_empty() {
-            let topologies =
-                crate::forktree::load_commit_topologies(&self.store, &uncached_ids).await?;
-            let batch = ExactBatch::try_new("ForkTree commit graph", &uncached_ids, topologies)?;
+            let loaded = crate::forktree::load_commit_topology_batch(
+                &self.store,
+                &uncached_ids,
+                &mut self.topology_cache,
+            )
+            .await?;
+            for topology in loaded.cache_seeded {
+                let node = commit_graph_node_from_topology(topology);
+                self.node_cache.insert(node.commit_id, Some(node));
+            }
+            let batch =
+                ExactBatch::try_new("ForkTree commit graph", &uncached_ids, loaded.requested)?;
             for (commit_id, topology) in batch {
                 self.node_cache
                     .insert(*commit_id, topology.map(commit_graph_node_from_topology));

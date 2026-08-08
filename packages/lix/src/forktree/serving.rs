@@ -124,6 +124,26 @@ pub(crate) struct CommitTopology {
     pub(crate) generation: u64,
 }
 
+#[derive(Clone, Debug)]
+struct CachedCommitTopologyEnvelope {
+    object_id: ObjectId,
+    commit: CommitObjectV1,
+}
+
+/// Reader-local authenticated topology working set. This cache is bound to the
+/// caller's retained StorageRead and is never persisted or used as authority.
+#[derive(Default)]
+pub(crate) struct CommitTopologyReadCache {
+    by_commit_id: BTreeMap<crate::changelog::CommitId, CachedCommitTopologyEnvelope>,
+    by_object_id: BTreeMap<ObjectId, crate::changelog::CommitId>,
+    resolved: BTreeMap<crate::changelog::CommitId, CommitTopology>,
+}
+
+pub(crate) struct CommitTopologyBatch {
+    pub(crate) requested: Vec<Option<CommitTopology>>,
+    pub(crate) cache_seeded: Vec<CommitTopology>,
+}
+
 /// Loads one authenticated moving branch head through the ForkTree selector
 /// owner. Missing selectors are ordinary branch absence; malformed selectors,
 /// snapshots, and selected commit edges fail closed.
@@ -334,8 +354,27 @@ pub(crate) async fn load_commit_topologies<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    let mut cache = CommitTopologyReadCache::default();
+    Ok(load_commit_topology_batch(read, ids, &mut cache)
+        .await?
+        .requested)
+}
+
+/// Loads one exact topology batch through one retained StorageRead. Requested
+/// Commit objects and the union of their immediate parent Commit objects are
+/// each authenticated at most once. Decoded parent envelopes remain in the
+/// reader-local cache so a later graph step never reloads the parent object.
+pub(crate) async fn load_commit_topology_batch<R>(
+    read: &R,
+    ids: &[crate::changelog::CommitId],
+    cache: &mut CommitTopologyReadCache,
+) -> Result<CommitTopologyBatch, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let repository = load_repository_root(read).await?;
-    let mut topologies = Vec::with_capacity(ids.len());
+    let mut requested_objects = Vec::with_capacity(ids.len());
+    let mut missing_requested_objects = BTreeSet::new();
     for id in ids {
         let catalog_id = CommitId::from_bytes(*id.as_uuid().as_bytes());
         let Some(value) = lookup_on_read(
@@ -346,18 +385,105 @@ where
         )
         .await?
         else {
-            topologies.push(None);
+            requested_objects.push(None);
             continue;
         };
         let entry = CommitCatalogEntry::decode(&value)?;
-        let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
-        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
-        topologies.push(Some(
-            validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit)
-                .await?,
-        ));
+        if let Some(cached) = cache.by_commit_id.get(id) {
+            if cached.object_id != entry.commit_object_id {
+                return Err(corruption("CommitCatalog changed within one topology read").into());
+            }
+        } else {
+            missing_requested_objects.insert(entry.commit_object_id);
+        }
+        requested_objects.push(Some((*id, entry.commit_object_id)));
     }
-    Ok(topologies)
+
+    load_topology_envelopes(read, missing_requested_objects, cache).await?;
+
+    let mut missing_parent_objects = BTreeSet::new();
+    for requested in requested_objects.iter().flatten() {
+        let envelope = cache.by_commit_id.get(&requested.0).ok_or_else(|| {
+            corruption("requested Commit object was not decoded into the topology batch")
+        })?;
+        validate_commit_identity(requested.0, requested.1, envelope)?;
+        let mut unique_parent_objects = BTreeSet::new();
+        for parent_object_id in &envelope.commit.parent_commit_object_ids {
+            if !unique_parent_objects.insert(*parent_object_id) {
+                return Err(
+                    corruption("Commit topology contains duplicate parent object edges").into(),
+                );
+            }
+            if !cache.by_object_id.contains_key(parent_object_id) {
+                missing_parent_objects.insert(*parent_object_id);
+            }
+        }
+    }
+    load_topology_envelopes(read, missing_parent_objects, cache).await?;
+
+    let mut unique_parent_back_edges = BTreeMap::new();
+    for requested in requested_objects.iter().flatten() {
+        let envelope = cache
+            .by_commit_id
+            .get(&requested.0)
+            .expect("requested topology envelope was checked above");
+        for parent_object_id in &envelope.commit.parent_commit_object_ids {
+            let parent_id = *cache.by_object_id.get(parent_object_id).ok_or_else(|| {
+                corruption(format!("Commit parent object {parent_object_id} is absent"))
+            })?;
+            unique_parent_back_edges
+                .entry(parent_id)
+                .or_insert(*parent_object_id);
+        }
+    }
+    for (parent_id, parent_object_id) in &unique_parent_back_edges {
+        validate_commit_catalog_back_edge(
+            read,
+            repository.commit_catalog_root,
+            *parent_id,
+            *parent_object_id,
+        )
+        .await?;
+    }
+
+    let mut requested = Vec::with_capacity(ids.len());
+    for requested_object in requested_objects {
+        let Some((id, _)) = requested_object else {
+            requested.push(None);
+            continue;
+        };
+        let topology = resolve_cached_topology(id, cache)?;
+        cache.resolved.insert(id, topology.clone());
+        requested.push(Some(topology));
+    }
+
+    // Any decoded parent whose own parent envelopes are already present can be
+    // seeded directly into the graph node cache. Roots are the important
+    // shared-parent case; deeper nodes remain as decoded envelopes and are
+    // completed without reloading themselves when traversal reaches them.
+    let candidate_ids = cache.by_commit_id.keys().copied().collect::<Vec<_>>();
+    for id in candidate_ids {
+        if cache.resolved.contains_key(&id) {
+            continue;
+        }
+        let can_resolve = cache
+            .by_commit_id
+            .get(&id)
+            .expect("candidate came from topology cache")
+            .commit
+            .parent_commit_object_ids
+            .iter()
+            .all(|parent| cache.by_object_id.contains_key(parent));
+        if can_resolve {
+            let topology = resolve_cached_topology(id, cache)?;
+            cache.resolved.insert(id, topology);
+        }
+    }
+
+    Ok(CommitTopologyBatch {
+        requested,
+        cache_seeded: cache.resolved.values().cloned().collect(),
+    })
 }
 
 pub(crate) async fn scan_commit_topologies<R>(
@@ -616,6 +742,115 @@ where
         )),
         parent_commit_ids,
         generation: commit.generation,
+    })
+}
+
+async fn load_topology_envelopes<R>(
+    read: &R,
+    object_ids: BTreeSet<ObjectId>,
+    cache: &mut CommitTopologyReadCache,
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if object_ids.is_empty() {
+        return Ok(());
+    }
+    let objects = super::view::load_object_map(read, object_ids.iter().copied()).await?;
+    for object_id in object_ids {
+        let bytes = objects
+            .get(&object_id)
+            .ok_or_else(|| corruption(format!("Commit object {object_id} is absent")))?;
+        let commit = CommitObjectV1::decode(object_id, bytes)?;
+        let public_id =
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit.commit_id.as_bytes()));
+        if let Some(existing_id) = cache.by_object_id.insert(object_id, public_id)
+            && existing_id != public_id
+        {
+            return Err(
+                corruption("Commit object identity changed within one topology read").into(),
+            );
+        }
+        let envelope = CachedCommitTopologyEnvelope { object_id, commit };
+        if let Some(existing) = cache.by_commit_id.insert(public_id, envelope.clone())
+            && existing.object_id != object_id
+        {
+            return Err(corruption("multiple Commit objects claim one CommitId").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_identity(
+    expected_id: crate::changelog::CommitId,
+    expected_object_id: ObjectId,
+    envelope: &CachedCommitTopologyEnvelope,
+) -> Result<(), crate::LixError> {
+    if envelope.object_id != expected_object_id
+        || envelope.commit.commit_id.as_bytes() != expected_id.as_uuid().as_bytes()
+    {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    Ok(())
+}
+
+async fn validate_commit_catalog_back_edge<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    parent_id: crate::changelog::CommitId,
+    parent_object_id: ObjectId,
+) -> Result<(), crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let catalog_value = lookup_on_read(
+        commit_catalog_root,
+        "commit",
+        parent_id.as_uuid().as_bytes(),
+        read,
+    )
+    .await?
+    .ok_or_else(|| corruption("Commit parent has no CommitCatalog back-edge"))?;
+    let catalog_entry = CommitCatalogEntry::decode(&catalog_value)?;
+    if catalog_entry.commit_object_id != parent_object_id {
+        return Err(corruption("Commit parent CommitCatalog back-edge is invalid").into());
+    }
+    Ok(())
+}
+
+fn resolve_cached_topology(
+    id: crate::changelog::CommitId,
+    cache: &CommitTopologyReadCache,
+) -> Result<CommitTopology, crate::LixError> {
+    let envelope = cache
+        .by_commit_id
+        .get(&id)
+        .ok_or_else(|| corruption("Commit topology envelope is absent from its exact batch"))?;
+    let mut parent_commit_ids = Vec::with_capacity(envelope.commit.parent_commit_object_ids.len());
+    let mut unique_parent_ids = BTreeSet::new();
+    for parent_object_id in &envelope.commit.parent_commit_object_ids {
+        let parent_id = *cache.by_object_id.get(parent_object_id).ok_or_else(|| {
+            corruption(format!("Commit parent object {parent_object_id} is absent"))
+        })?;
+        let parent = cache
+            .by_commit_id
+            .get(&parent_id)
+            .ok_or_else(|| corruption("decoded parent Commit identity is absent"))?;
+        if parent.commit.generation >= envelope.commit.generation {
+            return Err(corruption(
+                "Commit parent generation is not strictly earlier than its child",
+            )
+            .into());
+        }
+        if !unique_parent_ids.insert(parent_id) {
+            return Err(corruption("Commit topology contains duplicate parent CommitIds").into());
+        }
+        parent_commit_ids.push(parent_id);
+    }
+    Ok(CommitTopology {
+        commit_id: id,
+        parent_commit_ids,
+        generation: envelope.commit.generation,
     })
 }
 
