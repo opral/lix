@@ -1,0 +1,61 @@
+class	path	scope/action	blocker-or-owner
+DELETE/REWRITE	packages/lix/src/tracked_state/context.rs	Reader factory and TrackedStateStoreReader; delete after all callers move	ForkTree CoherentView
+DELETE/REWRITE	packages/lix/src/tracked_state/diff.rs	Tracked-state diff reader; replace with selected-root diff	ForkTree diff
+DELETE/REWRITE	packages/lix/src/tracked_state/mod.rs	Reader-only reexports; delete after compiler wave	ForkTree module
+MIGRATE	packages/lix/src/live_state/context.rs	Remove TrackedHeadContext/HotStateTransactionCache and fresh reader constructors	CoherentView facade
+MIGRATE	packages/lix/src/live_state/mod.rs	Reexport only view-bound semantic facades; no old owner	CoherentView/forktree_reader
+MIGRATE	packages/lix/src/live_state/types.rs	Replace CertifiedCurrentStatePredecessor/ColumnarBaseCoordinate ownership	Authenticated state objects
+RETAIN	packages/lix/src/live_state/reader.rs	Keep semantic boundary; remove scan/fallback authority	CoherentView
+RETAIN/PROMOTE	packages/lix/src/live_state/forktree_reader.rs	Exact/range implementation behind caller-owned view	CoherentView
+RETAIN/PROMOTE	packages/lix/src/live_state/visibility.rs	Keep NULL/tombstone/branch-global/staged precedence	Typed selected roots
+RETAIN-DERIVED	packages/lix/src/live_state/entity_columnar.rs	Rebuildable row-group materialization only	No tracked authority
+MIGRATE	packages/lix/src/transaction/context.rs	Opening, reconciliation, generation, working diff, savepoint and publication readers	One retained view/one PreparedPublication
+MIGRATE	packages/lix/src/transaction/schema_resolver.rs	Selected-root plus staged schema; delete tracked-head fixtures	CoherentView
+MIGRATE	packages/lix/src/session/merge/branch.rs	Delete opening tracked reader; pass selected view	Authenticated merge roots
+MIGRATE/BLOCKER	packages/lix/src/session/merge/analysis.rs	Move after historical parent/member contract	History owner
+MIGRATE	packages/lix/src/init.rs	Delete CurrentStateDeltaRef/WorkingDiffIndexCoverage bootstrap	Selector/root bootstrap
+MIGRATE	packages/lix/src/functions/context.rs	Untracked generation must not use TrackedHeadContext	Selector epoch
+MIGRATE	packages/lix/src/functions/state.rs	Current state and stage generation use selected roots	CoherentView
+MIGRATE	packages/lix/src/sql2/providers/working_diff.rs	Selected-root versus transaction-local diff	CoherentView diff
+MIGRATE	packages/lix/src/sql2/providers/filesystem_working_diff.rs	Remove TrackedStateStoreReader callbacks	CoherentView diff
+MIGRATE	packages/lix/src/sql2/providers/checkpoint.rs	Checkpoint/recovery selected roots	Checkpoint selectors
+MIGRATE	packages/lix/src/sql2/providers/diff.rs	Diff from authenticated roots	Owner diff
+RETAIN-FACADE	packages/lix/src/sql2/providers/branch.rs	Public branch semantics; direct reader move is a separate gate	Typed branch selectors
+RETAIN-FACADE	packages/lix/src/sql2/providers/directory.rs	Public directory semantics; direct reader move is a separate gate	Typed state/file roots
+RETAIN-FACADE	packages/lix/src/sql2/providers/file.rs	Public file semantics; direct reader move is a separate gate	BlobRef/selected roots
+RETAIN-BLOCKER	packages/lix/src/sql2/providers/entity.rs	Direct SQL EntityPk/point/projection path excluded from smallest R5	Independent SQL oracle
+RETAIN-BLOCKER	packages/lix/src/sql2/entity_batch.rs	CurrentEntitySnapshotReader direct path excluded until SQL gate	Independent SQL oracle
+RETAIN-DERIVED-BLOCKER	packages/lix/src/sql2/entity_columnar_layout.rs	Derived columnar layout; never source of truth	Independent SQL oracle
+RETAIN-BLOCKER	packages/lix/src/sql2/providers/file_history.rs	TrackedStateStoreReader history consumer	History-provider successor
+RETAIN-BLOCKER	packages/lix/src/sql2/providers/directory_history.rs	History identity/ordering consumer	History-provider successor
+RETAIN-BLOCKER	packages/lix/src/sql2/providers/entity_history.rs	History identity/ordering consumer	History-provider successor
+RETAIN-BLOCKER	packages/lix/src/sql2/history_route.rs	History routing consumer	History-provider successor
+RETAIN	packages/lix/src/entity_pk.rs	Public typed primary-key semantics	API type
+RETAIN	packages/lix/src/sql2/entity_projection.rs	Public projection/value semantics	API type
+MIGRATE	packages/lix/src/gc.rs	Root enumeration, generation and working-diff observation	Selector/epoch owner sweep
+REWRITE/DELETE	packages/lix/src/storage_bench.rs	Remove old marker-space probes; retain measurements only	No authority
+MIGRATE/DELETE	packages/lix/src/test_support.rs	Rewrite old TrackedHead fixtures or delete	Typed owner fixtures
+MIGRATE/DELETE	packages/lix/src/transaction/bench_support.rs	Rewrite old generation fixtures or delete	Typed owner fixtures
+RETAIN-FACADE	packages/lix/src/catalog/context.rs	Test-only exact-batch adapter; keep only as facade probe	CoherentView test seam
+RETAIN-FACADE	packages/lix/src/filesystem/path_index.rs	Path-index semantics; bind visibility to selected roots	Filesystem facade
+RETAIN-FACADE	packages/lix/src/filesystem/visibility.rs	Filesystem visibility and exact-batch facade	CoherentView
+MIGRATE	packages/lix/src/session/context.rs	Session read acquisition must pass one retained view	CoherentView
+MIGRATE	packages/lix/src/sql2/catalog/entity_surface.rs	Entity surface catalog remains public; snapshot source moves	CoherentView
+MIGRATE/BLOCKER	packages/lix/src/sql2/change_materialization.rs	Change/history materialization must resolve authenticated objects	History provider
+MIGRATE	packages/lix/src/sql2/context.rs	SQL context read boundary must retain one view	CoherentView
+MIGRATE	packages/lix/src/sql2/exec/bound_public_write.rs	Columnar output is derived; writes lower through one plan	One PreparedPublication
+MIGRATE	packages/lix/src/sql2/exec/datafusion.rs	Remove direct tracked scan/exact fallback readers	CoherentView
+RETAIN-BLOCKER	packages/lix/src/sql2/history_projection.rs	History projection waits for authenticated provider	History provider
+MIGRATE	packages/lix/src/sql2/mod.rs	Remove legacy reexports; preserve public SQL types	Facade reexports
+MIGRATE	packages/lix/src/sql2/providers/mod.rs	Remove test scan fallback and old reader glue	CoherentView
+MIGRATE	packages/lix/src/sql2/test_support/differential.rs	Differential fixtures use typed owner only	Test owner
+RETAIN-LOCAL	packages/lix/src/transaction/staging.rs	Transaction-local staged rows remain non-durable authority	Transaction staging
+RETAIN-DERIVED	packages/lix/src/transaction/types.rs	Columnar payload fields remain derived/rebuildable	No tracked authority
+MIGRATE	packages/lix/src/transaction/validation.rs	Validation reads selected roots and staged overlay	CoherentView
+DELETE	packages/lix/src/live_state/tracked_head.rs	Already absent at b59; invariant	No legacy path
+DELETE	packages/lix/src/live_state/tracked_head/hot.rs	Already absent at b59; invariant	No legacy path
+DELETE	TrackedHeadContext/HotStateTransactionCache/TrackedWorkingDiff	All declarations/imports/tests/bench references	No superseded symbols
+DELETE	TrackedWorkingDiffEpoch/WorkingDiffIndexCoverage	All marker/coverage state	Selector epoch and owner plan
+DELETE	CurrentStateDeltaRef/TrackedHeadDeltaRef	All delta publication/read state	Typed mutation source
+DELETE	TRACKED_WORKING_DIFF_MARKER_SPACE and stage_* helpers	All durable marker and generation helpers	One selector/epoch plane
+DELETE	with_opening_tracked_reader/load_exact_batch_via_scan_for_test	All callbacks and test-only fallback readers	One retained StorageRead

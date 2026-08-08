@@ -1,0 +1,4 @@
+FORBIDDEN_PATH packages/lix/src/tracked_state/context.rs
+FORBIDDEN_PATH packages/lix/src/tracked_state/diff.rs
+anchor=b59e1f11a51153e0a787a81f0f25bf104d150aaf oracle=1d9c47728377c6ec7d2646704d51f3aadb11c773 head=1d9c47728377c6ec7d2646704d51f3aadb11c773
+RED source deletion contract

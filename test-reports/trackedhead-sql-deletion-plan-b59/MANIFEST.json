@@ -1,0 +1,99 @@
+{
+  "kind": "test-report-only",
+  "status": "dormant-read-only-plan",
+  "source_frontier": {
+    "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24"
+  },
+  "oracle_v2": {
+    "commit": "1d9c47728377c6ec7d2646704d51f3aadb11c773",
+    "tree": "df2a373a1c0e7917f4abbd167c7659efd1c3e6a1",
+    "parent": "422319cca0dad82525ab840d157aba5be49b09f0",
+    "normalized_b59_red": "f8e3c11af5fa5fe3c35973a727ad31bbfed9e27b4908b23d907ebbdc71d12867",
+    "model_binary": "5d9c6a9e5d20de07a55465ba8e267a9ec708185f46e6a4e96b7879662b6a3abf",
+    "model_log": "176e4c840641415c4354591c3fd8d20169c0a8b4cb4131f6b3e6d933ac61925f"
+  },
+  "known_followup_blocker": {
+    "oracle_v3_required": true,
+    "missing_domains": [
+      "GlobalSelector",
+      "BranchSelector",
+      "CommitCatalog",
+      "ChangeCatalog",
+      "CheckpointRoot"
+    ],
+    "required_result": "one retained read followed by zero plan/write/commit/selector rotation"
+  },
+  "artifacts": [
+    "PLAN.md",
+    "SOURCE_INVENTORY.tsv",
+    "verify_trackedhead_sql_deletion_plan.sh",
+    "CALIBRATION.md",
+    "v2-calibration.log"
+  ],
+  "artifact_sha256": {
+    "PLAN.md": "5d8d20ab2a20244ed8bb72b646677104baaa38807fcf898595cc30fa5fade4b2",
+    "SOURCE_INVENTORY.tsv": "f1ee5173628f4676edd092602ec6973d4f29aa849a48f84c70bcffb48c1da11b",
+    "verify_trackedhead_sql_deletion_plan.sh": "3d00503103d05670bd5e85780c2d2661890ed5f6c21d4084b4c04ac4bf3540b1",
+    "CALIBRATION.md": "da20a356213c406625a56b91424cb22f2cea0a0955e2714b400ae7bc58937442",
+    "v2-calibration.log": "4203cfb771b58cab263c0235db69a248e08c569a80bedfc2044d1713756c0196"
+  },
+  "classification": {
+    "migrate": [
+      "live_state/context.rs",
+      "live_state/mod.rs",
+      "live_state/types.rs",
+      "transaction/context.rs",
+      "transaction/schema_resolver.rs",
+      "session/merge/branch.rs",
+      "init.rs",
+      "functions/context.rs",
+      "functions/state.rs",
+      "gc.rs",
+      "sql2/providers/working_diff.rs",
+      "sql2/providers/filesystem_working_diff.rs",
+      "sql2/providers/checkpoint.rs",
+      "sql2/providers/diff.rs"
+    ],
+    "delete_or_rewrite": [
+      "tracked_state/context.rs",
+      "tracked_state/diff.rs",
+      "tracked_state/mod.rs",
+      "storage_bench.rs",
+      "test_support.rs",
+      "transaction/bench_support.rs"
+    ],
+    "retain_blocker": [
+      "sql2/providers/entity.rs",
+      "sql2/entity_batch.rs",
+      "sql2/entity_columnar_layout.rs",
+      "sql2/providers/file_history.rs",
+      "sql2/providers/directory_history.rs",
+      "sql2/providers/entity_history.rs",
+      "sql2/history_route.rs"
+    ],
+    "retain_facade": [
+      "live_state/reader.rs",
+      "live_state/visibility.rs",
+      "live_state/forktree_reader.rs",
+      "entity_pk.rs",
+      "sql2/entity_projection.rs"
+    ]
+  },
+  "direct_sql_exclusion_paths": [
+    "packages/lix/src/sql2/providers/entity.rs",
+    "packages/lix/src/sql2/entity_batch.rs",
+    "packages/lix/src/sql2/entity_columnar_layout.rs"
+  ],
+  "future_order": [
+    "source-residue-and-negative-api",
+    "fmt-diff-clippy-no-run",
+    "standalone-model",
+    "memory",
+    "rocksdb",
+    "slatedb"
+  ],
+  "runtime_claimed": false,
+  "production_edits": false,
+  "broad_benchmarks_claimed": false
+}
