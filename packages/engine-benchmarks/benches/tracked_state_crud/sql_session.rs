@@ -525,8 +525,6 @@ impl SqlFixture {
         }
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) async fn read_all_result(&self) -> ExecuteResult {
         match self {
             Self::RocksDB(fixture) => fixture.read_all_result().await,
@@ -543,8 +541,6 @@ impl SqlFixture {
         }
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) async fn read_many_by_pk_result(&self) -> ExecuteResult {
         match self {
             Self::RocksDB(fixture) => fixture.read_many_by_pk_result().await,
@@ -561,8 +557,6 @@ impl SqlFixture {
         }
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) async fn read_one_by_pk_result(&self) -> ExecuteResult {
         match self {
             Self::RocksDB(fixture) => fixture.read_one_by_pk_result().await,

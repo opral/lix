@@ -49,6 +49,7 @@ datafusion = { version = "53.0.0", default-features = false, features = ["sql"] 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -77,6 +78,11 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "cas_publication_epoch_qualification"
 path = "examples/cas_publication_epoch_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "forktree_sqlite_oltp"
+path = "examples/forktree_sqlite_oltp.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
