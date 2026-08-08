@@ -3,18 +3,18 @@
 Status: frozen test/report-only preparation for the first immutable runnable
 Stage 2 head. No candidate artifact has been applied and no build has run.
 
-The verifier worktree carries acceptance-matrix successor
-`ae484a2d42172ee9670fb0926546eb3b4ce1dfe9`, tree
-`1e08be3f85fe7cc76458e3008b9de907b89c95e8`. At creation the workspace
+The verifier worktree carries ten-row acceptance-matrix successor
+`5fa26f5a341d035afb114b09a0b840a253892860`, tree
+`9a3bd58e872839035d345d965d96e78e6d48f4c3`. At creation the workspace
 filesystem had 49 GiB available. Cargo targets and databases will remain under
 this workspace filesystem and every future cell is capped at 20 minutes.
 
 ## Verifier
 
-forktree_stage2_acceptance_verify.sh fetches the nine immutable artifact
+forktree_stage2_acceptance_verify.sh fetches the ten immutable artifact
 branches into refs/stage2-acceptance-verifier/*, without checking them out or
 applying them. It reproduces every expected commit, tree, canonical full-index
-binary diff, and 24 embedded source/report hashes. The external delete report
+binary diff, and 27 embedded source/report hashes. The external delete report
 and point-read report/manifest/binary hashes are recorded as provenance but
 correctly marked non-embedded. The point-read report and manifest are not
 mounted on this reviewer host; their supplied hashes and author-reported 3/3
@@ -24,7 +24,12 @@ Invocation:
 
     timeout 20m packages/rs-sdk-tests/tests/forktree_stage2_acceptance_verify.sh .
 
-Result: PASS for 9/9 refs and 24/24 embedded files. The frozen
+The OLAP diff is reproduced with `GIT_ATTR_SOURCE` bound to its exact head so
+the committed binary attributes govern the 42,863-byte canonical stream. The
+same-object worktree text rendering is documented in the matrix but is not the
+verifier identity.
+
+Result: PASS for 10/10 refs and 27/27 embedded files. The frozen
 machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 
 ## Runnable-head boundary
@@ -50,7 +55,11 @@ On the first runnable immutable head:
 8. run SQL RocksDB then SlateDB;
 9. run checkpoint RocksDB then SlateDB;
 10. run no-lease and sealed GC/publication RocksDB then SlateDB;
-11. only then run broader version-control and multimedia gates.
+11. run OLAP 10K RocksDB/SlateDB plus corruption, then 50K RocksDB/SlateDB,
+    then 500K RocksDB/SlateDB; a SlateDB six-versus-five or twelve-versus-ten
+    physical-object residual hard-blocks without the exact narrow hash-bound
+    manager waiver;
+12. only then run broader version-control and multimedia gates.
 
 A pass by the detached delete benchmark model is not production acceptance.
 The delete sequence must be bound to the production ForkTree owner. Likewise,

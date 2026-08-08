@@ -25,6 +25,9 @@ verify_ref() {
   local expected_tree=$4
   local base=$5
   local expected_diff=$6
+  local attr_mode=${7:-worktree}
+  local expected_patch_id=${8:--}
+  local expected_bytes=${9:-0}
   local local_ref="refs/stage2-acceptance-verifier/$id"
 
   timeout 20m "${git_cmd[@]}" fetch --no-tags origin "+refs/heads/$remote_branch:$local_ref" >/dev/null
@@ -37,10 +40,25 @@ verify_ref() {
   [[ "$tree" == "$expected_tree" ]] ||
     fail "$id tree expected=$expected_tree actual=$tree"
   "${git_cmd[@]}" cat-file -e "$base^{commit}"
-  diff=$("${git_cmd[@]}" diff --binary --full-index "$base..$head" | sha_stdin)
+  if [[ "$attr_mode" == "head" ]]; then
+    diff=$(GIT_ATTR_SOURCE="$local_ref" "${git_cmd[@]}" -c core.abbrev=40 -c diff.noprefix=false diff --binary --full-index --no-ext-diff "$base..$head" | sha_stdin)
+  else
+    diff=$("${git_cmd[@]}" diff --binary --full-index "$base..$head" | sha_stdin)
+  fi
   [[ "$diff" == "$expected_diff" ]] ||
     fail "$id diff expected=$expected_diff actual=$diff"
   printf 'ref\t%s\tPASS\t%s\t%s\t%s\n' "$id" "$head" "$tree" "$diff"
+
+  if [[ "$expected_patch_id" != "-" ]]; then
+    local patch_id stream_bytes
+    patch_id=$(GIT_ATTR_SOURCE="$local_ref" "${git_cmd[@]}" -c core.abbrev=40 -c diff.noprefix=false diff --binary --full-index --no-ext-diff "$base..$head" | git patch-id --stable | awk '{print $1}')
+    [[ "$patch_id" == "$expected_patch_id" ]] ||
+      fail "$id patch-id expected=$expected_patch_id actual=$patch_id"
+    stream_bytes=$(GIT_ATTR_SOURCE="$local_ref" "${git_cmd[@]}" -c core.abbrev=40 -c diff.noprefix=false diff --binary --full-index --no-ext-diff "$base..$head" | wc -c | tr -d ' ')
+    [[ "$stream_bytes" == "$expected_bytes" ]] ||
+      fail "$id stream-bytes expected=$expected_bytes actual=$stream_bytes"
+    printf 'patch\t%s\tPASS\t%s\thead-attributes\t%s bytes\n' "$id" "$patch_id" "$stream_bytes"
+  fi
 }
 
 verify_file() {
@@ -65,6 +83,7 @@ verify_ref pointread agent/stage2-point-read-oracle-a12 33117e1c128b038a5bbe486d
 verify_ref residue codex/forktree-stage2-deletion-oracle-v2 1dbbf3d206540d36f5912eab8372a42819778b47 7fe3b3c83133344dff4025b558dbdd63bb1be21f d00584e845fed69422282e164387275267a77018 0a6edac94dd03cd287e134bd873962bc841c0d2d5aebb9f92b1de45d5e359da5
 verify_ref nolease codex/stage2-no-lease-read-view-boundary-ee402 89c73a24b97ce8dedee5e6c9a85e67c481b29090 6b90abcc440a3c13a6e95c641426629593536012 138b55e1de90806c380ad27b2b349f4c66a1387f e93a1d78d01f3c7d29d4038627c691047fa8953c55bd61e77c6351e714114796
 verify_ref gc codex/stage2-gc-publication-acceptance-oracle 0b4e5042b6a79b8be80dbfe4e4cdbff3b28d9a9c 0ac1ab8e74b85a92a8044cb4280adf8cf66ba387 cbe48835f6f07a21e0babf1ba16652a0c6b8a214 bb6a70454484b9bba9e29929656a205a0706d1a0a2e60e495ea52fc19e567224
+verify_ref olap codex/forktree-stage2-olap-acceptance-oracle-a12 b9055810dff42c9eb2a096a83ab2207024dce1c6 231939d8a8d0f2a46803264184eea8171fa05f90 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 545ff4e7c74b6bc19223d4977fd4dbba11914d46e3e5efadcae8407741e44b42 head f88e0ea04bef0e93b0280c19f7c89d59c678223e 42863
 verify_ref multimedia codex/forktree-stage2-multimedia-oracle-a12 61fc367988190b3438672743331a81d83d450fae 1600e8ce54d9f52f6ee3546068362ae298d4d243 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 65cda6ee906b6986bf70b636dfaadda5f8f89a2f8f4af407852687c474472660
 
 verify_file sql packages/rs-sdk-tests/tests/forktree_stage2_sql_dml.rs b410b717f45d68e928e93dcf1332de2895db0246202e9ba9a6e5bc10b416c6bb
@@ -86,6 +105,9 @@ verify_file nolease packages/engine-benchmarks/benches/forktree_stage2_recovery_
 verify_file nolease packages/engine-benchmarks/tests/forktree_stage2_recovery_no_lease_adversarial.rs 8972c5f7dfef8bf033bee782c4c9fb8a26acad2ab9699ddc29e9c85cdac560d0
 verify_file gc packages/engine-benchmarks/tests/FORKTREE_STAGE2_GC_PUBLICATION_ACCEPTANCE.md 6373db1e21d7c4e74f6fcff4329b9fcbaf93ca36681e8b04c47b5da80ffc4403
 verify_file gc packages/engine-benchmarks/tests/forktree_stage2_gc_publication_acceptance.rs a43980d3de613d5800478e6c7e8a12c73a4d1833f53ec213f3fb26f317aec1c7
+verify_file olap packages/engine-benchmarks/tests/forktree_stage2_olap_acceptance/REPORT.md 005646c33cda54a363ab3c81f0b7ed0a5891e24de20639f05d8ca00a0f66009f
+verify_file olap packages/engine-benchmarks/tests/forktree_stage2_olap_acceptance/SPI.md c54c50ee301338ef3c04a3364eaff06e075a3f0212099cbc9a4290e8c5197193
+verify_file olap packages/engine-benchmarks/tests/forktree_stage2_olap_acceptance/HASHES.sha256 8e8b616f39bd37fc7eb3dda7aa19da7ce2011c16561c1687caa2cb6942d1a7c2
 verify_file multimedia packages/engine-benchmarks/tests/forktree_stage2_multimedia_oracle/stage2_multimedia_acceptance.rs cc0d3cfb14b562b7821ca124c67cbb8ead0da7287f9e0125ba39738304a4a09e
 verify_file multimedia packages/engine-benchmarks/tests/forktree_stage2_multimedia_oracle/REPORT.md 0dd241e1d6bd8fa32d84751972bd96fed666f2dafe742b447ca496f06aadc5bb
 verify_file multimedia packages/engine-benchmarks/tests/forktree_stage2_multimedia_oracle/COMPILE_RUN_MANIFEST.md 2463197613022e9321e24f09f12211faae3cc85c5cb156ee6c9c7bb1667f2b4d
@@ -96,4 +118,5 @@ printf 'external\tdelete65\tNOTE\tFORKTREE_DELETE_BLOCKER.md\tac5bb9a01d0e696aac
 printf 'external\tpointread\tNOTE\tREPORT.md\tb86db402ec0bf9b25ca619564edb82a420fcdb34f68de2f972f6c774e863dbf5\tnot embedded in ref; not mounted on reviewer host\n'
 printf 'external\tpointread\tNOTE\tSHA256SUMS\tcacbcee8f7b80a627f96dd8b7d6d55beef0fe2a2f7228f0290b488ae7717a888\tnot embedded in ref; author reports 3/3 verify\n'
 printf 'external\tpointread\tNOTE\tstage2_point_read_oracle-025c3b394ec8760c\tead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a\tbench binary; rebuild on candidate\n'
-printf 'summary\tall\tPASS\t9 refs\t24 embedded files\tno artifacts applied\n'
+printf 'external\tolap\tNOTE\tprovenance-report\te78821631888e8a8810df78e9bdffbe31c8a8124227c5ad0c3b549a6e60795a4\tnot embedded in ref\n'
+printf 'summary\tall\tPASS\t10 refs\t27 embedded files\tno artifacts applied\n'
