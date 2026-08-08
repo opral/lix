@@ -135,29 +135,30 @@ does not qualify it: readiness also requires independent R2 atomicity approval,
 H2 deletion/residue approval, and zero independent transaction/upload/GC
 ForkTree publication points. Until then this worktree remains provenance-only.
 
-On the first runnable immutable head:
+On the first runnable immutable head, apply only the minimum landing gate in
+this order:
 
-1. run the frozen P0+W1a source gate and stop unless direct publication commit
-   is unnameable and W1a uses one read/plan/prepare/commit;
-2. create a fresh detached candidate worktree and isolated target;
-3. materialize only exact test/report files, never merge their historical
-   branches wholesale;
-4. run fmt/diff and the static residue/facade/CLI/cursor gate;
-5. stop on any nonzero legacy authority;
-6. run the production-bound 65-row delete on RocksDB, then SlateDB;
-7. bind and source-map the actual public point/BlobRef seam, then run the 1K
-   point-read gate on RocksDB and SlateDB; require the frozen counts/digest,
-   cold reopen, four fail-closed corruption cases, greater than 10% meaningful
-   paired improvement, and no critical regression greater than 5%;
-8. stop before SQL and 10K/50K scaling if the point gate fails;
-9. run SQL RocksDB then SlateDB;
-10. run checkpoint RocksDB then SlateDB;
-11. run no-lease and sealed GC/publication RocksDB then SlateDB;
-12. run OLAP 10K RocksDB/SlateDB plus corruption, then 50K RocksDB/SlateDB,
-    then 500K RocksDB/SlateDB; a SlateDB six-versus-five or twelve-versus-ten
-    physical-object residual hard-blocks without the exact narrow hash-bound
-    manager waiver;
-13. only then run broader version-control and multimedia gates.
+1. Run the P0+W1a source gate, then materialize exact test/report artifacts in
+   a fresh detached candidate worktree. Never merge historical artifact refs.
+2. Run deletion/residue, semantic delegation, CLI-routing, cursor, compile,
+   fmt/diff, and warnings-denied Clippy. Stop on any residue, compatibility
+   route, dual writer, missing facade, compile, or lint failure.
+3. Run production-owner 65-row batch-1 delete on RocksDB, then SlateDB.
+4. Run SQL transaction/publication smoke on RocksDB, then SlateDB.
+5. Run core branch/diff/merge/history/undo-redo on RocksDB, then SlateDB,
+   including parsed-file/public-file callers, corruption, and cold reopen.
+6. Run the parsed-file plus large-BlobRef identity cells from the immutable
+   discovery runner: `vc-rocks-1k`, `vc-slate-1k`, `blob-rocks-64`, and
+   `blob-slate-64`, each with fresh paths and exact candidate binding.
+7. Run three-row checkpoint/recovery on RocksDB, then SlateDB.
+8. Run sealed GC/publication on RocksDB, then SlateDB, including both race
+   orders, upload completion/abort, corruption, reopen, and final release.
+
+Stop at the first focused blocker. The point-read A/B threshold, OLAP
+10K/50K/500K, broad retained-history/version-control, broad multimedia shapes,
+512 MiB blobs, and detached comparator/scaling artifacts are post-landing
+follow-ups, not prerequisites. They retain their existing rows, exact source
+identities, fresh paths, and 20-minute per-cell cap.
 
 A pass by the detached delete benchmark model is not production acceptance.
 The delete sequence must be bound to the production ForkTree owner. Likewise,
