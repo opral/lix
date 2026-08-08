@@ -1,0 +1,11 @@
+[package]
+name = "sqlite_oltp_baseline_0e543716"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+sha2 = "=0.10.9"

@@ -1,0 +1,68 @@
+{
+  "package": "sqlite-oltp-baseline-0e543716",
+  "status": "test-report-only-sqlite-baseline-qualified-no-forktree-comparison",
+  "forktree_reference": {
+    "head": "0e543716b0a89d377015ce8cdb1579cad70408ff",
+    "tree": "b0589d9037a8b3a530d252150360ce9f5648577c",
+    "parent": "cd76d29406ed7e00711a5b5ba9c40da537524dd3",
+    "role": "integration-gap-reference-only",
+    "comparison_run": false
+  },
+  "sqlite": {
+    "rusqlite": "0.32.1",
+    "libsqlite3_sys": "0.30.1",
+    "sqlite_version": "3.46.0",
+    "libsqlite3_sys_crate_sha256": "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149",
+    "sqlite3_c_sha256": "c01235302fe80da901fb70c7622c39147e29d9f29b7f6eb746b23517f320c90d",
+    "sqlite3_h_sha256": "d088aa96aa70db50f02acc5c86eca61a5d17556e4c363b9c06079239bf7f87b1",
+    "bundled_static_archive_sha256": "e2532979ce9bde50b950ffb7c63c4f2fc2da72f7499c75afc4275948faa674ca",
+    "pragmas": [
+      "journal_mode=DELETE",
+      "synchronous=FULL",
+      "foreign_keys=ON",
+      "recursive_triggers=OFF",
+      "temp_store=MEMORY",
+      "locking_mode=NORMAL",
+      "busy_timeout=0"
+    ]
+  },
+  "baseline_source": {
+    "cargo_toml_sha256": "3f231cef147ab28d0eb3c16784d1a1c95b122735771969a6587066c2a10f61da",
+    "cargo_lock_sha256": "96ee6d6d52a9cdc5651554f2f710c8a4364c1d280a3a5f47eff8926508c2beba",
+    "main_rs_sha256": "16b856a6ef138f15df8c15f9e1ff8d56b046b25bc62dee4ce0386b1e04778211",
+    "release_binary_sha256": "137133bfe3d8de7181475560b79f95e5ae3873a196b4dab656da29ad1da4fbfb"
+  },
+  "fixture": {
+    "seed_rows": 1000,
+    "row_ids": "r000000..r000999",
+    "digest_domain": "lix.sqlite-oltp.baseline.0e543716.v1\\0",
+    "fresh_file_per_cell": true,
+    "setup_excluded_from_operation_ns": true
+  },
+  "cells": [
+    {"id": "point-1000", "status": "pass", "digest": "2ea96bf2d3094a61573ee0588137b55eef63e34526cb47be8ee529ee04fc0993", "logical_ops": 1000, "returned_rows": 1000, "writes": 0},
+    {"id": "crud", "status": "pass", "digest": "b501057d6c4dd0036658be668ea994216ba6ae68983373bc3cbbd5e7d68b3e5c", "logical_ops": 160, "returned_rows": 160, "commits": 1},
+    {"id": "transaction-savepoint", "status": "pass", "digest": "67cd85c940f91644ce075b84ff367f296519ab3f9b6b37eee09324b05533d2d9", "logical_ops": 16, "returned_rows": 8, "rollbacks": 1, "commits": 1},
+    {"id": "conflict", "status": "pass", "digest": "5819079f2fd2842c59c7db441df6aed89705e9864bb1c8c3554c3c9b9ffb4860", "logical_ops": 3, "returned_rows": 2},
+    {"id": "reopen", "status": "pass", "warm_digest": "324787fa756b25ce9aa18d5ba5ccaefedb8755876ea3fa949da5bd887209029d", "cold_digest": "324787fa756b25ce9aa18d5ba5ccaefedb8755876ea3fa949da5bd887209029d"},
+    {"id": "file-row", "status": "pass", "digest": "6c072e95f6155e04aa512c335bdde8466d719e1396f0e24a43d77bcaf49ab068"},
+    {"id": "corruption", "status": "pass", "digest": "fb5f056508e366304743467d19be363f3ca777511d1bf9d76386b3530e678f1b", "negative_cases": 3, "explicit_empty_valid": true}
+  ],
+  "evidence": {
+    "command": "timeout 1200 /usr/bin/time -v target/release/sqlite_oltp_baseline_0e543716 /tmp/sqlite-oltp-baseline-0e543716-direct smoke 1000",
+    "evidence_sha256": "45c3db5a8c4205e8db36a56744d950dd66583520378421b9dd83956a7b93ecfd",
+    "wall_seconds": 0.05,
+    "max_rss_kib": 4296,
+    "filesystem_outputs": 9600,
+    "exit_status": 0
+  },
+  "integration_gap": {
+    "sqlite_baseline_complete": true,
+    "forktree_oltp_target_available": false,
+    "forktree_oltp_cells_run": false,
+    "performance_comparison": false,
+    "required_future_target": ["CRUD", "RETURNING", "UPSERT", "savepoint", "stale-writer conflict", "file-row mutation", "cold reopen", "corruption fail-closed", "backend counters"]
+  },
+  "production_edits": false,
+  "pull_request": false
+}
