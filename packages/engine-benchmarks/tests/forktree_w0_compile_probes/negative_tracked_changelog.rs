@@ -1,8 +1,11 @@
-// MUST fail: chronology/catalog authority is not a legacy physical reader.
-use lix::changelog::{CHANGE_SPACE, COMMIT_SPACE};
-use lix::tracked_state::TrackedStateStoreReader;
+// MUST fail with E0599: the public storage-adapter read trait has no legacy
+// tracked/changelog loaders.
+use lix::storage_adapter::StorageAdapterRead;
 
-fn main() {
-    let _ = (CHANGE_SPACE, COMMIT_SPACE);
-    let _ = std::mem::size_of::<TrackedStateStoreReader<()>>();
+fn probe<R: StorageAdapterRead>(read: &R) {
+    let _ = read.load_commit_state_manifest();
+    let _ = read.load_tracked_state();
+    let _ = read.load_branch_head_control();
 }
+
+fn main() {}

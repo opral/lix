@@ -1,9 +1,10 @@
 # ForkTree W0 storage-boundary correction oracle
 
-Status: TEST/REPORT-ONLY. This direct successor is based on the immutable
-blocked W0 head `465786fccbf55decd92e169d646670e3351d077a` (tree
-`0f553a521c91983e6d0ea1db98bc7397793aa449`, parent/base
-`e92ea2e505ee3d96abbb529dbaedb23d4908ff42`). It changes only benchmark tests,
+Status: TEST/REPORT-ONLY. This direct successor is based on the immutable W0
+correction `4abf60b0115c114d3e3784fb0fb8a9ea2e559dfc` (tree
+`30aaecc6a2bff719c44499ad933a42437e42c2da`), whose original blocked anchor is
+`465786fccbf55decd92e169d646670e3351d077a` (tree
+`0f553a521c91983e6d0ea1db98bc7397793aa449`). It changes only benchmark tests,
 probes, reports, and verifier scripts. It does not change production source,
 start an adapter, add a compatibility path, or open a PR.
 
@@ -59,8 +60,13 @@ This successor corrects those gaps:
   an actual positive descriptor crate, four external Rust compile-fail probes,
   the real TypeScript negative probe, and the native-export absence check. A
   future candidate must make the positive gates pass and the forbidden API
-  gates fail. The runner is bounded by `W0_TIMEOUT_SECONDS` (default 1200s)
-  per command and never runs a storage adapter.
+  gates fail with the expected compiler diagnostic code and symbol token; an
+  arbitrary nonzero exit is not accepted. The Rust negatives import only
+  actual public crate-root `lix::storage`/`lix::storage_adapter` APIs, and the
+  runner enables the public `storage-benches` feature rather than depending on
+  private or fabricated modules. The runner is bounded by
+  `W0_TIMEOUT_SECONDS` (default 1200s) per command and never runs a storage
+  adapter.
 
 ## Model oracle
 
@@ -112,8 +118,8 @@ and zero-read-write controls. Every future cell is capped at 20 minutes.
 
 ## Immutable baseline calibration
 
-The predecessor verifier, run unchanged against the exact blocked head, exited
-1 with 565 residues and no missing boundary tokens:
+The original predecessor verifier, run unchanged against the exact blocked
+anchor, exited 1 with 565 residues and no missing boundary tokens:
 
 ```text
 node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root <465-review-worktree>
@@ -121,17 +127,28 @@ node scripts/forktree_w0_storage_boundary_residue_verify.mjs --root <465-review-
 SHA-256 4cecc96ae9569e5a8c3db0c6860e903b6d114aaa94ef3436fb35be94211fa271
 ```
 
-The corrected verifier against this successor worktree is intentionally still
+The v1 corrected verifier against its own exact correction worktree was
+intentionally still red with 956 residues. The corrected verifier against
+this direct successor worktree is intentionally still
 red on the blocked production source because it scans the full tracked
 workspace and finds the existing binary-CAS/columnar/tracked/changelog/raw
-owner residues and old JS/native filesystem exports:
+owner residues and old JS/native filesystem exports. This successor extends
+the existing public tracked/changelog probe to cover the legacy branch-owner
+diagnostic and fixes the required `SpaceId(u32)` declaration allowance; it does
+not hide any production residue:
 
 ```text
-598 scanned source files / 605 tracked source files
-996 lines, 130133 bytes
-SHA-256 3e6be4f97c79487e2a6359dfab05088db7306689b1a21b88752bf639c1100d40
-exit 1; missing retained boundary none; structural findings 0; residues 956
+598 scanned source files / 606 tracked source files
+995 lines, 130025 bytes
+SHA-256 6e054be650935553b8efc894c38afd5158e0416fb3cc58fe2681f029602d4749
+exit 1; missing retained boundary none; structural findings 0; residues 955
 ```
+
+The hash above is for the exact detached review root
+`/tmp/lix-w0-correction-v2`; the scanner's first line includes its root path.
+The canonical count/result is therefore the 606 tracked / 598 scanned source
+files and 955-residue RED outcome, with the recorded root-bound hash preserved
+for replay.
 
 The explicit generic-storage allowlist is printed separately and is not
 counted as residue. This is a diagnostic blocker for a future production W0
@@ -144,16 +161,19 @@ binary SHA-256 e33005d7653e17a1d8acbf13c323ba195ebbe7fad7b66cd8afec800cd0b9985e
 run log SHA-256 d63dc63486f4cef75e6bb0625ce70adb7bf3ab366e9dfca9f7ed51e9333e603f
 ```
 
-The executable probe runner was calibrated against the exact blocked source
-with `W0_TIMEOUT_SECONDS=30`. It correctly rejected the legacy Rust probes,
-but the positive Rust gates could not compile through the inherited source
-frontier; `tsc` was unavailable on the review host; and native Rust export
-residue was found. It therefore exits nonzero and is not candidate acceptance:
-
-```text
-22 lines, 1765 bytes
-SHA-256 82b3e5ab4ae8e5943225aecdd2885fc0861db64f0577a4055d08df4fe7254b00
-```
+The executable probe runner is wired against the exact blocked source with
+per-probe diagnostic validation. Each negative Rust probe now requires its
+expected error code and the attempted removed symbol in the captured log;
+the raw-space probe additionally retains the `SpaceId` constructor error. The
+four probes are `raw_space`, `columnar_owner`, `tracked_changelog`, and
+`binary_cas_owner`; the tracked/changelog probe asserts all three removed
+reader/selector symbols. A full rerun was deliberately not
+claimed after the review host hit the inherited compile frontier: the bounded
+attempt was stopped before completion and is non-evidence, not a candidate
+acceptance result. An earlier partial attempt used pre-final five-probe
+wiring and is intentionally not evidence for this frozen command. The exact
+replay command remains the one above; its positive/negative results must be
+regenerated on a compile-capable successor.
 
 No adapter runtime, production build matrix, or performance result was
 started. The accepted next step is a compile-green production candidate that

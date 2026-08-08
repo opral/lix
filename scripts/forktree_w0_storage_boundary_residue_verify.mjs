@@ -121,6 +121,12 @@ for (const file of sourceFiles) {
   content.split("\n").forEach((line, index) => {
     for (const [name, pattern] of forbiddenSymbols) {
       if (!pattern.test(line)) continue;
+      if (
+        name === "raw SpaceId constructor" &&
+        /\b(?:pub(?:\(crate\))?\s+)?struct\s+SpaceId\s*\(u32\)/.test(line)
+      ) {
+        continue;
+      }
       const finding = `${file}:${index + 1}:${name}:${line.trim()}`;
       if (isGenericStorageOwner(file) && name === "raw StorageSpace mutable constructor") {
         allowlisted.push(`${finding}:generic adapter test/implementation owner`);

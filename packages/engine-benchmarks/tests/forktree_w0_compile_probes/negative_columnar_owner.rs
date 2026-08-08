@@ -1,7 +1,12 @@
-// MUST fail: the deleted columnar owner/physical space is not an adapter API.
-use lix::columnar_row_group::ColumnarRowGroup;
-use lix::live_state::EntityColumnarWriteSets;
+// MUST fail with E0599: these are real public crate-root storage APIs, but the
+// deleted columnar owner is not represented by a reader method or space forge.
+use lix::storage::{StorageSpace, ValueSemantics};
+use lix::storage_adapter::StorageAdapterRead;
+
+fn probe<R: StorageAdapterRead>(read: &R) {
+    let _ = read.load_columnar_row_group();
+}
 
 fn main() {
-    let _ = (std::mem::size_of::<ColumnarRowGroup>(), std::mem::size_of::<EntityColumnarWriteSets>());
+    let _ = StorageSpace::columnar(ValueSemantics::Immutable);
 }

@@ -1,7 +1,12 @@
-// MUST fail type-checking: the deleted binary-CAS owner is not a consumer API.
-use lix::binary_cas::{BinaryCasContext, BinaryCasSpace};
+// MUST fail with E0599: binary-CAS ownership is not exposed as an adapter read
+// method or forgeable storage space.
+use lix::storage::{StorageSpace, ValueSemantics};
+use lix::storage_adapter::StorageAdapterRead;
+
+fn probe<R: StorageAdapterRead>(read: &R) {
+    let _ = read.load_binary_cas_manifest();
+}
 
 fn main() {
-    let _ = BinaryCasContext::new();
-    let _ = BinaryCasSpace::manifest();
+    let _ = StorageSpace::binary_cas(ValueSemantics::Immutable);
 }
