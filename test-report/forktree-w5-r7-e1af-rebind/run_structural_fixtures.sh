@@ -8,7 +8,7 @@ green=$(timeout 1200 node "$verifier" /tmp fixture-anchor fixture-anchor --fixtu
 printf '%s\n' "$green"
 printf '%s\n' "$green" | grep -q '^GREEN structural W5/R7 authority gate '
 
-for fixture in negative_second_read.rs negative_second_writer.rs negative_fallback_alias.rs; do
+for fixture in negative_second_read.rs negative_second_writer.rs negative_fallback_alias.rs negative_read_alias.rs; do
   if timeout 1200 node "$verifier" /tmp "fixture-$fixture" fixture-anchor --fixture "$script_dir/structural_fixtures/$fixture" >"/tmp/w5-r7-$fixture.out" 2>&1; then
     echo "fixture unexpectedly passed: $fixture" >&2
     exit 1
@@ -17,4 +17,4 @@ for fixture in negative_second_read.rs negative_second_writer.rs negative_fallba
   grep -q '^RED structural authority gate:' "/tmp/w5-r7-$fixture.out"
 done
 
-echo 'structural fixtures: GREEN positive and 3 discriminating RED negatives'
+echo 'structural fixtures: GREEN positive and 4 discriminating RED negatives'

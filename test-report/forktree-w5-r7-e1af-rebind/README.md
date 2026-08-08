@@ -1,7 +1,8 @@
-# W5/R7 GC and reachability oracle — e1af structural correction
+# W5/R7 GC and reachability oracle — e1af structural correction3
 
-Status: **TEST/REPORT-ONLY EXPECTED-RED CORRECTION**. This is a direct
-successor to the immutable `5850b4b9a40540dd027ef95a3b1139f262efd76d` package.
+Status: **TEST/REPORT-ONLY EXPECTED-RED CORRECTION3**. This is a direct
+successor to immutable correction2 head
+`63f86ff4f0ccb14a089ef259fdc81004c8e82d5c`.
 No production source, Cargo, adapter, runtime, benchmark, PR, or merge action
 is included.
 
@@ -85,12 +86,14 @@ No second root authority, compatibility reader, fallback, cache, raw
 ## Strengthened model and candidate-parametric source gate
 
 `w5_r7_e1af_readiness_model.rs` is the executable model for the selector,
-authenticated object graph, transitive H/S/C roots, owner-bound fence,
-authenticated queue identity/order, owner+view-scoped pins, root owners,
-atomic publication/GC state, and cold-reopen controls. Corruption is bound to
-object and queue fingerprints; failed graph, queue, fence, or root validation
-must leave the complete staged state unchanged. It is independent of Lix
-production and must compile with warnings denied before any adapter gate.
+authenticated object graph/catalog/back-edge, immutable H/S/C parent order and
+generation, owner-bound fence, authenticated queue identity/order, owner+view-
+scoped pins, open-upload/shared/final root owners, atomic publication/GC state,
+and cold-reopen controls. Corruption is bound to object, catalog, and queue
+fingerprints; failed graph, queue, fence, or root validation must leave the
+complete staged state unchanged. Blocked debt is serialized and retained
+through reopen before safe-point release. It is independent of Lix production
+and must compile with warnings denied before any adapter gate.
 
 ```sh
 timeout 1200 rustc --edition=2021 --test -D warnings \
@@ -99,24 +102,31 @@ timeout 1200 rustc --edition=2021 --test -D warnings \
 timeout 1200 /tmp/w5-r7-e1af-readiness-model --nocapture --test-threads=1
 ```
 
+The correction3 model result is 16/16. It includes catalog/back-edge and H/S/C
+parent-order checks, pin-held physical deletion safety, complete old-or-new
+publication-first/GC-first state digests, and blocked-debt cold reopen.
+
 The verifier is cwd-independent and takes a candidate target and exact e1af
-anchor. It now performs a candidate-parametric structural check over the full
-allowed production closure, rejects changed paths outside that closure, and
-extracts operation bodies to require:
+anchor. It requires `git merge-base --is-ancestor`, exact anchor identity, and
+rejects changed Cargo, script, production, or source paths outside the package
+and explicit W5 closure. It performs a candidate-parametric structural check
+over the full source closure and extracts operation bodies to require:
 
 - typed `OBJECT_SPACE` and `SELECTOR_SPACE` declarations plus the ForkTree
   `CoherentView` and `PreparedPublication` owners;
-- exactly one retained coherent-read construction per publication/GC operation,
-  with selector, queue, mark, upload, and object use through that read;
+- one typed caller-owned `StorageRead` into one non-aliased
+  `CoherentView::open(&read)`, with owner/view_id/snapshot identity and
+  selector, queue, mark, upload, and object use through that exact view;
 - exactly one `into_storage_plan`, one transaction `prepare_write_set`, one
   transaction `.commit`, and no direct `PreparedPublication::commit`;
 - exact positional owner/epoch/progress/selector CAS arguments; and
-- rejection of fallback/cache/alternate/second-reader aliases and second
-  authority declarations.
+- rejection of copied/swapped/reacquired handles, fallback/cache/alternate/
+  second-reader aliases, generic writers, raw storage calls, direct commits,
+  and second authority declarations across every function in the closure.
 
-The structural fixtures include one genuine GREEN operation and three
-discriminating RED cases for a second read, a second writer, and a fallback
-reader alias:
+The structural fixtures include one genuine GREEN operation and four
+discriminating RED cases for a second read, a second writer, a fallback reader
+alias, and a copied/swapped view alias:
 
 ```sh
 timeout 1200 bash test-report/forktree-w5-r7-e1af-rebind/verify_e1af_rebind.sh \
@@ -128,6 +138,9 @@ timeout 1200 bash test-report/forktree-w5-r7-e1af-rebind/run_structural_fixtures
 The baseline `SOURCE_RED.log` remains bound to the exact e1af residue count;
 it is not used to mask candidate results. The old controls remain exact: e1af
 prints RED 168 and the unchanged 5850 candidate prints RED 384.
+The correction3 target produces the same RED 384 because this package changes
+only tests/reports and does not claim a production residue cut; the exact
+candidate-gate transcript is preserved in `CANDIDATE_SOURCE_RED.log`.
 
 ## Dormant first-runnable order
 

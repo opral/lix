@@ -13,6 +13,7 @@ parent_tree=4477c83b246bddac09cd972564bd4ccd67f90f7b
 target_commit=$(git -C "$repo" rev-parse "$target^{commit}")
 anchor_commit=$(git -C "$repo" rev-parse "$anchor^{commit}")
 test "$anchor_commit" = "$commit"
+git -C "$repo" merge-base --is-ancestor "$anchor_commit" "$target_commit"
 test "$(git -C "$repo" show -s --format=%T "$commit")" = "$tree"
 test "$(git -C "$repo" show -s --format=%P "$commit")" = "$parent"
 test "$(git -C "$repo" show -s --format=%T "$parent")" = "$parent_tree"
