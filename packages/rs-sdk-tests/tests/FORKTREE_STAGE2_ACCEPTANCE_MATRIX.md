@@ -251,53 +251,61 @@ source gate is:
 cd /root/repos/lix-stage2-point-read-oracle-a12 && packages/engine-benchmarks/tests/stage2_point_read_source_gate.sh packages/engine-benchmarks/tests/stage2_point_read_source_gate_fixture/entry.rs packages/engine-benchmarks/tests/stage2_point_read_source_gate_fixture/helper.rs
 ```
 
-## Minimal first-runnable sequence
+## Minimum first-runnable landing gate
 
-1. Verify the candidate SHA/tree and run the frozen P0+W1a source package
-   against it. Require direct publication commit to be unnameable, ordered
-   single-branch history to use one read/plan/prepare/commit, exact selected
-   member authentication, and unsupported families to fail before a plan.
-2. Apply only exact test/report artifacts in a disposable prospective tree.
-   Run `cargo fmt --all -- --check`,
-   `git diff --check`, the residue scanner, semantic delegation audit, CLI
-   routing audit, cursor compile probes, and the 21-path/39-symbol #1258 map.
-   Any nonzero legacy authority stops all runtime work.
-3. Run the production-owner 65-row, batch-1 delete on RocksDB. Only after it
-   cold-reopens empty, run SlateDB. Retain 64-row/batch-1 and
-   65-row/batch-100 controls. A detached benchmark-model pass is insufficient.
-4. Bind the actual public point plus BlobRef seam and enumerate every transitive
-   helper. Run the 1K point-read gate on RocksDB and then SlateDB with at least
-   five samples and setup excluded. Each sample must perform exactly 1,000
-   `begin_read` calls, 6,000 authenticated gets, and 3,922,880 logical read
-   bytes; perform zero scans, writes, or commits; leave disk unchanged; return
-   digest `0f28fc4645fef236d6332733a943b5b43ab35034c2b1d365d928bda0718295a1`
-   hot and cold; and fail closed for malformed selector/catalog and kind/ID
-   substitution. Require a meaningful paired improvement greater than 10% on
-   both adapters and no critical regression greater than 5%. Any failure stops
-   before SQL and before 10K/50K scaling.
-5. Run the 18-statement SQL RocksDB smoke, then SlateDB. Both public-result and
-   cold-state digests must equal the frozen current-layout values.
-6. Run the three-row checkpoint/merge RocksDB test, then SlateDB. This single
-   focused gate includes 64 rotations, true conflict, missing-parent,
-   undo/redo, cold reopen, and final release.
-7. Run the no-lease discriminator and then the sealed GC/publication RocksDB
-   gate. Only after both are green, run their SlateDB counterparts. Exact
-   one-view transport, progress rotation, persisted bounded packs, upload and
-   final-reference checks are mandatory.
-8. Build the sealed OLAP oracle once, then run its ordered gate into a new empty
-   evidence directory: 10K RocksDB plus both corruption cells, 10K SlateDB plus
-   both corruption cells, 50K RocksDB then SlateDB, and finally 500K RocksDB
-   then SlateDB. Every process cell is capped at 20 minutes. Query digests and
-   row counts must match hot and cold; query writes remain zero; range and
-   projection improve by more than 10%; all critical regressions remain within
-   5%. SlateDB's six-versus-five range reads or twelve-versus-ten join reads
-   hard-block broad closeout unless a checked-in manager waiver binds the exact
-   candidate, scale, query, values, report hash, and at least 20% aggregate
-   improvement. No waiver can cover any other metric.
-9. Run broader version-control RocksDB/SlateDB. With H4's exact normalized
-   multimedia transport bound, run 64 MiB/1% image RocksDB first, then SlateDB, then
-   the remaining 64 MiB shape and only then 512 MiB/10% archive/video. No
-   broader workspace or performance matrix precedes these focused gates.
+This is the reduced non-negotiable landing gate for the first explicitly
+compile-green immutable candidate. It is test/report-only and does not authorize
+running current main, any compiler-red frontier, or any artifact branch. Every
+build, adapter, corruption, and recovery cell is independently wrapped in
+`timeout 20m`; stop on the first focused blocker.
+
+1. Verify the candidate exact head/tree against current main
+   `822c204c...` and require the immutable descendant to carry the accepted
+   ForkTree lineage, R2 atomicity approval, H2 deletion/residue approval, and
+   zero independent transaction/upload/GC publication points.
+2. Run the immutable P0+W1a source gate, then the deletion/residue, semantic
+   delegation, CLI-routing, cursor, `cargo check`, `cargo fmt`, `git diff --check`,
+   and warnings-denied Clippy gates. Any legacy authority, compatibility route,
+   dual writer, facade gap, or lint/compile failure stops the sequence.
+3. Run the production-owner 65-row batch-1 delete on RocksDB, then SlateDB;
+   require cold reopen with zero remaining logical rows and no missing-object
+   failure. This is the focused OLTP/path-copy publication gate.
+4. Run the public SQL/transaction smoke on RocksDB, then SlateDB; require
+   atomic batch, rollback, savepoint, `RETURNING`/`ON CONFLICT`,
+   idempotency, exact result metadata, and cold-reopen digests.
+5. Run the core branch/diff/merge/history/undo-redo gate on RocksDB, then
+   SlateDB; require exact graph chronology, branch semantics, public file and
+   parsed-file callers, corruption fail-closed, and cold reopen.
+6. Run the parsed-file plus large-BlobRef identity gate on RocksDB, then
+   SlateDB. It uses only the immutable discovery runner's `vc-*-1k` and
+   `blob-*-64` cells: exact parsed/file bytes, authenticated BlobId and
+   declared size/domain/hash/range identity, corruption fail-closed, cold
+   reopen, and final-reference behavior. It is not the broad multimedia matrix.
+7. Run the three-row checkpoint/recovery gate on RocksDB, then SlateDB;
+   require 64 rotations, exact merge base, true conflict, missing-parent
+   fail-closed, undo/redo, recovery, cold reopen, and bounded final release.
+8. Run the sealed GC/publication gate on RocksDB, then SlateDB; require one
+   coherent view, epoch/progress fencing in both race orders, bounded persisted
+   mark/queue state, upload/ordinary publication, corruption fail-closed,
+   reader-pin safety, cold reopen, and final-reference reclamation.
+
+No point-read performance threshold, OLAP scale, broad retained-history matrix,
+large-shape multimedia scale, 512 MiB cell, or detached comparator result is a
+landing prerequisite. The candidate remains blocked if any minimum gate fails.
+
+## Post-landing follow-up queue
+
+Preserve these rows and their provenance, but do not make them prerequisites:
+
+- 1K point-read A/B and its >10% paired-win / <=5% critical-regression rule;
+- 10K/50K/500K ordered OLAP and the SlateDB physical-object residual rule;
+- broad retained-history/version-control qualification;
+- 64 MiB shape families beyond the identity gate and 512 MiB blobs; and
+- external comparator, scaling, and target-discovery measurements.
+
+These follow-ups may run only after the landing gate is green and must retain
+the same exact candidate, fresh paths, source map, corruption contract, and
+20-minute per-cell cap.
 
 ## Blocker routing
 

@@ -184,7 +184,7 @@ ref, exact head and tree as compile-green. Before creating a worktree:
    one atomic owner publication/epoch fence with no second commit boundary;
 6. require H2 deletion/residue approval and zero surviving independent ForkTree
    publication entry points for those three writer families;
-7. run the frozen ten-ref verifier and require every identity/file check green;
+7. run the frozen verifier and require the current-main/frontier anchors, ten core refs, P0 transport files, and discovery files all green;
 8. check disk, then create a fresh detached disposable worktree and isolated
    Cargo target outside Ryzen-V's production worktree.
 
@@ -219,20 +219,31 @@ After each materialization, record candidate head/tree, artifact ref/head,
 prospective tree, patch SHA-256, and changed paths. Use a fresh nonexistent
 database/evidence path and the row's isolated target. Stop at the first failure.
 
-The fixed execution order is:
+The fixed execution order for the minimum landing gate is:
 
-1. frozen P0+W1a source gate: no direct publication commit, ordered
-   single-branch history through one read/plan/prepare/commit, exact selected
-   member authentication, and unsupported families rejected before a plan;
-2. fmt/diff, residue/delegation/CLI/cursor source gates;
-3. production-owner 65-row batch-1 delete, RocksDB then SlateDB;
-4. 1K point read, RocksDB then SlateDB; stop unless both show a meaningful
-   improvement greater than 10% and no critical regression greater than 5%;
-5. SQL RocksDB/SlateDB;
-6. three-row checkpoint RocksDB/SlateDB;
-7. no-lease and sealed GC/publication RocksDB/SlateDB;
-8. OLAP 10K RocksDB/SlateDB plus corruption, then 50K, then 500K;
-9. multimedia and broader version-control closeout.
+1. Verify exact candidate ancestry/current-main anchor, then run the immutable
+   P0+W1a source gate. Direct publication commit must be unnameable; W1a must
+   use one read/plan/prepare/commit and reject unsupported families before a
+   plan.
+2. Run deletion/residue, semantic delegation, CLI-routing, cursor, compile,
+   fmt/diff, and warnings-denied Clippy gates. Stop on any source residue or
+   lint/compile failure.
+3. Run the production-owner 65-row batch-1 delete, RocksDB then SlateDB.
+4. Run SQL transaction/publication smoke, RocksDB then SlateDB.
+5. Run core branch/diff/merge/history/undo-redo, RocksDB then SlateDB,
+   including parsed-file/public-file callers, corruption, and cold reopen.
+6. Run parsed-file plus large-BlobRef identity: discovery-runner
+   `vc-rocks-1k` then `vc-slate-1k`, followed by `blob-rocks-64` then
+   `blob-slate-64`, with fresh evidence paths and exact candidate binding.
+7. Run three-row checkpoint/recovery, RocksDB then SlateDB.
+8. Run sealed GC/publication, RocksDB then SlateDB, including both race
+   orders, upload completion/abort, corruption, reopen, and final release.
+
+The following remain post-landing and must not block the first merge: point-read
+A/B scaling, OLAP 10K/50K/500K, broad retained-history/version-control, broad
+multimedia shapes, 512 MiB blobs, and detached comparator/scaling evidence.
+Run them only after the minimum gate is green, preserving exact source maps,
+fresh paths, and one `timeout 20m` cell per build/adapter/shape.
 
 Every build and process cell is capped at 20 minutes. A compile timeout is a
 host boundary, not a pass. No broad gate runs after a focused blocker.
