@@ -1,7 +1,8 @@
 # W1b-2 stale transaction/plugin/cohort readiness package — exact e1af
 
 Status: test/report-only, frozen for independent review. No production edit,
-Cargo/build, adapter runtime, benchmark, PR, or merge was performed.
+Cargo build, adapter runtime, benchmark, PR, or merge was performed. The
+standalone model correction gate is the only executed build/runtime artifact.
 
 ## Pinned source and scope
 
@@ -119,8 +120,9 @@ The future candidate must preserve:
 
 The model's read trace rejects multiple begin events, multiple reader
 instances, or cross-view event identities. stale_reconciliation_oracle.rs is
-not a production implementation and is intentionally not compiled or run in
-this task.
+not a production implementation; the correction gate compiles it with
+warnings denied and runs its deterministic tests, while making no Cargo or
+adapter qualification claim.
 
 ## Expected exact-e1af RED calibration
 
@@ -161,7 +163,7 @@ Run only on an immutable candidate after the source/compiler gate:
 
     timeout 1200s test-reports/w1b2-stale-reconciliation-e1af/verify_source_contract.sh "$PWD" HEAD e1af471b9ab0f598dafa7c2ddec7867667c81740
 
-    timeout 1200s rustc --edition=2024 --test test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs -o /tmp/w1b2-stale-reconciliation-oracle
+    timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs -o /tmp/w1b2-stale-reconciliation-oracle
     timeout 1200s /tmp/w1b2-stale-reconciliation-oracle
 
     timeout 1200s cargo test -p lix stale_commit --lib

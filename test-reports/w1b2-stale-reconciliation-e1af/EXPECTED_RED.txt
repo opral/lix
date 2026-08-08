@@ -6,4 +6,3 @@ RED-3 cohort reconciliation still owns a legacy tracked-state reader
 RED-4 cohort owner/version discovery still uses legacy projected batch loading
 RED-5 plugin owner/version/revision discovery still uses legacy projected batch loading
 EXPECTED-RED predicates=5 target=e1af471b9ab0f598dafa7c2ddec7867667c81740
-verifier exit: 1 (intentional RED)

@@ -18,7 +18,8 @@ merge change.
 - SOURCE_ALLOWLIST.md: exact candidate production path allowlist and forbidden
   widening.
 - stale_reconciliation_oracle.rs: standalone deterministic model and
-  positive/negative fixtures; not compiled or run in this task.
+  positive/negative fixtures; the correction gate compiles it with
+  `rustc --edition=2024 --test -D warnings` and runs all tests.
 - verify_source_contract.sh: source-only verifier; exact e1af is intentionally
   RED because the legacy stale reader remains.
 - EXPECTED_RED.txt: exact source-only calibration from e1af.

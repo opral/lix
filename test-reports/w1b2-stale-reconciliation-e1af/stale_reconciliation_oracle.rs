@@ -26,7 +26,10 @@ enum Proof {
     Missing,
     Malformed,
     WrongKind,
-    IdentitySubstituted { claimed_file: String, actual_file: String },
+    IdentitySubstituted {
+        claimed_file: String,
+        actual_file: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,7 +42,10 @@ enum RegistryProof {
     Missing,
     Malformed,
     WrongKind,
-    IdentitySubstituted { claimed: String, actual: String },
+    IdentitySubstituted {
+        claimed: String,
+        actual: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,7 +89,6 @@ enum Conflict {
     GlobalOwnerOrSchemaChanged,
     BranchMissing,
     OwnerIdentityChanged,
-    OverlapOutsideStablePlugin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,7 +117,7 @@ fn valid_view(opening: &Snapshot, current: &Snapshot) -> Result<(), Corruption> 
     Ok(())
 }
 
-fn valid_owner(proof: &Proof, file_id: &str) -> Result<(&str, &str), Corruption> {
+fn valid_owner<'a>(proof: &'a Proof, file_id: &str) -> Result<(&'a str, &'a str), Corruption> {
     match proof {
         Proof::Valid {
             file_id: actual_file,
@@ -170,14 +175,8 @@ fn reconcile(
     }
 
     for file_id in &overlapping_files {
-        let opening_owner = opening
-            .owners
-            .get(file_id)
-            .ok_or(Corruption::OwnerProof)?;
-        let current_owner = current
-            .owners
-            .get(file_id)
-            .ok_or(Corruption::OwnerProof)?;
+        let opening_owner = opening.owners.get(file_id).ok_or(Corruption::OwnerProof)?;
+        let current_owner = current.owners.get(file_id).ok_or(Corruption::OwnerProof)?;
         let (opening_plugin, opening_generation) = valid_owner(opening_owner, file_id)?;
         let (current_plugin, current_generation) = valid_owner(current_owner, file_id)?;
         if opening_plugin != current_plugin || opening_generation != current_generation {
@@ -249,7 +248,9 @@ fn write(operation_id: &str, file_id: &str, entity: &str, value: Value) -> Prepa
 fn unrelated_owner_change_succeeds_without_reconciliation() {
     let opening = snapshot(1);
     let mut current = snapshot(2);
-    current.changed_keys.insert(("other-file".into(), "row".into()));
+    current
+        .changed_keys
+        .insert(("other-file".into(), "row".into()));
     let result = reconcile(
         &opening,
         &current,
@@ -294,7 +295,7 @@ fn owner_generation_or_registry_substitution_conflicts() {
         &[write("op-a", "file-a", "row", Value::Null)],
     )
     .expect("valid authority");
-    assert_eq!(result, Ok(Err(Conflict::OwnerIdentityChanged)));
+    assert_eq!(result, Err(Conflict::OwnerIdentityChanged));
 }
 
 #[test]
@@ -338,11 +339,39 @@ fn missing_malformed_wrong_kind_and_identity_proofs_fail_closed() {
 }
 
 #[test]
+fn missing_malformed_wrong_kind_and_identity_registry_fails_closed() {
+    let opening = snapshot(1);
+    for bad in [
+        RegistryProof::Missing,
+        RegistryProof::Malformed,
+        RegistryProof::WrongKind,
+        RegistryProof::IdentitySubstituted {
+            claimed: "plugin-a".into(),
+            actual: "plugin-b".into(),
+        },
+    ] {
+        let mut current = snapshot(2);
+        current.changed_keys.insert(("file-a".into(), "row".into()));
+        current.registry = bad;
+        assert_eq!(
+            reconcile(
+                &opening,
+                &current,
+                &[write("op-a", "file-a", "row", Value::Json("a".into()))],
+            ),
+            Err(Corruption::RegistryProof)
+        );
+    }
+}
+
+#[test]
 fn separate_reader_or_cross_view_events_fail_closed() {
     let opening = snapshot(1);
     let mut current = snapshot(2);
     current.view.view_id = 12;
-    current.changed_keys.insert(("other-file".into(), "row".into()));
+    current
+        .changed_keys
+        .insert(("other-file".into(), "row".into()));
     assert_eq!(
         reconcile(&opening, &current, &[]),
         Err(Corruption::ReadView)
