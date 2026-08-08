@@ -45,7 +45,8 @@ for token in \
   'semantic_equal' 'plugin_handoffs' 'struct MergeOperation' \
   'RetainedStorageRead' 'ReadEvent' 'assert_one_owner' \
   'wrong_member_kind' 'wrong_payload_kind' 'payload_substitution' \
-  'malformed_catalog' 'malformed_root' 'disjoint merge succeeds'; do
+  'malformed_payload' 'malformed_catalog' 'malformed_root' \
+  'disjoint merge succeeds'; do
   if rg -n --no-heading -F "$token" "$model" >/dev/null 2>&1; then
     pass "model-contract=$token"
   else

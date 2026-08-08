@@ -319,6 +319,11 @@ fn load_payload(
             detail: format!("payload {} names the wrong member", payload.id),
         });
     }
+    if payload.digest.is_empty() {
+        return Err(ReadError::Malformed {
+            detail: format!("payload {} has no authenticated digest", payload.id),
+        });
+    }
     Ok(payload)
 }
 
@@ -1037,6 +1042,20 @@ fn main() {
     assert!(matches!(
         run(payload_substitution, request.clone()),
         Err(ReadError::IdentityMismatch { .. })
+    ));
+
+    let mut malformed_payload = store.clone();
+    malformed_payload.put(
+        "payload-S-a".to_owned(),
+        StoredObject::Payload(PayloadRecord {
+            id: "payload-S-a".to_owned(),
+            member_id: "member-S-a".to_owned(),
+            digest: String::new(),
+        }),
+    );
+    assert!(matches!(
+        run(malformed_payload, request.clone()),
+        Err(ReadError::Malformed { .. })
     ));
 
     let mut malformed_catalog = store.clone();
