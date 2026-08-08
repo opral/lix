@@ -17,10 +17,15 @@ use super::model::{
 };
 use super::object::ObjectId;
 use super::state::{StateCell, StateKey};
-use super::tree::{ReceiptTreeRoot, scan_page_on_read, validate_receipt_root_on_read};
+use super::tree::{
+    ImmutableObjectSet, ReceiptTreeEdit, ReceiptTreeRoot, empty_receipt_tree,
+    insert_receipt_part_on_read, lookup_on_read, scan_page_on_read, validate_receipt_root_on_read,
+};
 use super::view::{CoherentView, SELECTOR_SPACE, load_object_bytes, load_object_map};
 
 const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+const UPLOAD_PART_BYTES: u64 = CANONICAL_BLOB_CHUNK_BYTES as u64 * 16;
+const UPLOAD_PART_WINDOW: u64 = 4;
 
 /// Computes the existing public fixed-chunk BlobId while upload completion is
 /// already authenticating payload bytes. Memory is one canonical chunk plus
@@ -612,6 +617,385 @@ pub(crate) struct CompletedUpload {
     pub(super) raw_upload_selector: Bytes,
     pub(super) selector: UploadSelectorV1,
     pub(super) manifest: BlobManifestV1,
+}
+
+/// One part publication prepared from one coherent upload view. The caller
+/// either persists the typed receipt selector or, when the receipt is complete,
+/// hands `complete_receipt` to the ordinary file-row transaction lowering.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedUploadPart {
+    pub(crate) part: UploadPartV1,
+    pub(crate) chunks: Vec<BlobChunkV1>,
+    pub(crate) receipt: ReceiptTreeEdit,
+    pub(crate) progress: UploadProgressV1,
+    pub(crate) selector: UploadSelectorV1,
+    pub(crate) raw_selector: Option<Bytes>,
+    pub(crate) complete_manifest: Option<BlobManifestV1>,
+    pub(crate) complete_receipt: Option<crate::binary_cas::BlobWriteReceipt>,
+    pub(crate) already_present: bool,
+}
+
+/// Prepares one aligned upload part without opening a second read. Existing
+/// receipt objects are authenticated from `view`; new chunks, the part, and
+/// path-copied receipt nodes remain operation-local until the publication is
+/// merged into the transaction's sole storage plan.
+pub(crate) async fn prepare_upload_part<R>(
+    view: &CoherentView<R>,
+    upload_id: CanonicalUploadId,
+    binding: UploadBindingRef<'_>,
+    part_number: u64,
+    byte_offset: u64,
+    content: &[u8],
+) -> Result<PreparedUploadPart, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let expected_binding = upload_binding_digest(
+        binding.repository_identity,
+        binding.path,
+        binding.payload_domain,
+        binding.declared_total_size,
+        binding.declared_final_hash,
+    )?;
+    let selector_key = [Key(upload_selector_key(&upload_id)?)];
+    let loaded = view
+        .storage_read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &selector_key,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    let raw_selector = match loaded.values.as_slice() {
+        [None] => None,
+        [Some(ProjectedValue::FullValue(bytes))] => Some(bytes.clone()),
+        [Some(ProjectedValue::KeyOnly)] => {
+            return Err(corruption(
+                "upload selector point read returned key-only data",
+            ));
+        }
+        _ => return Err(corruption("upload selector read cardinality is invalid")),
+    };
+
+    let (root, prior_progress, selector_generation) = if let Some(raw) = &raw_selector {
+        let selector = UploadSelectorV1::decode(raw)?;
+        if selector.upload_id != upload_id || selector.binding_digest != expected_binding {
+            return Err(corruption(
+                "upload selector binding does not match this request",
+            ));
+        }
+        let progress_bytes =
+            load_object_bytes(view.storage_read(), selector.progress_object_id).await?;
+        let progress = UploadProgressV1::decode(selector.progress_object_id, &progress_bytes)?;
+        if progress.upload_id != upload_id || progress.binding_digest != expected_binding {
+            return Err(corruption(
+                "upload progress binding does not match its selector",
+            ));
+        }
+        validate_receipt_root_on_read(
+            ReceiptTreeRoot {
+                object_id: progress.receipt_tree_root,
+                completed_part_count: progress.completed_part_count,
+                received_bytes: progress.received_bytes,
+                contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
+            },
+            view.storage_read(),
+        )
+        .await?;
+        (
+            ReceiptTreeRoot {
+                object_id: progress.receipt_tree_root,
+                completed_part_count: progress.completed_part_count,
+                received_bytes: progress.received_bytes,
+                contiguous_prefix_bytes: progress.contiguous_prefix_bytes,
+            },
+            Some(progress),
+            selector.selector_generation,
+        )
+    } else {
+        let empty = empty_receipt_tree()?;
+        (empty.root, None, 0)
+    };
+
+    let mut chunks = Vec::with_capacity(content.len().div_ceil(CANONICAL_BLOB_CHUNK_BYTES));
+    let mut ordered_chunks = Vec::with_capacity(chunks.capacity());
+    let mut part_hasher = blake3::Hasher::new();
+    for fragment in content.chunks(CANONICAL_BLOB_CHUNK_BYTES) {
+        let chunk = BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(fragment),
+        };
+        let (chunk_object_id, _) = chunk.encode()?;
+        part_hasher.update(fragment);
+        ordered_chunks.push(BlobChunkRefV1 {
+            chunk_object_id,
+            declared_len: fragment.len() as u64,
+        });
+        chunks.push(chunk);
+    }
+    let part = UploadPartV1 {
+        upload_id: upload_id.clone(),
+        part_number,
+        byte_offset,
+        declared_part_len: content.len() as u64,
+        ordered_chunks,
+        part_digest: *part_hasher.finalize().as_bytes(),
+    };
+    let (part_object_id, _) = part.encode()?;
+
+    let (already_present, receipt, progress) = if let Some(ref prior) = prior_progress {
+        let existing = lookup_on_read(
+            prior.receipt_tree_root,
+            "receipt",
+            &part_number.to_be_bytes(),
+            view.storage_read(),
+        )
+        .await?;
+        if let Some(existing) = existing {
+            let existing_id = ObjectId::from_bytes(
+                existing
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| corruption("receipt part edge is not an object ID"))?,
+            );
+            let existing_bytes = load_object_bytes(view.storage_read(), existing_id).await?;
+            let existing_part = UploadPartV1::decode(existing_id, &existing_bytes)?;
+            if existing_part != part {
+                return Err(corruption("upload part was replayed with different bytes"));
+            }
+            (
+                true,
+                ReceiptTreeEdit {
+                    root,
+                    objects: ImmutableObjectSet::default(),
+                    copied_nodes: 0,
+                    inserted: false,
+                },
+                prior.clone(),
+            )
+        } else {
+            let edit = insert_receipt_part_on_read(
+                root,
+                part_object_id,
+                &part,
+                view.storage_read(),
+                &ImmutableObjectSet::default(),
+            )
+            .await?;
+            let progress = UploadProgressV1 {
+                upload_id: upload_id.clone(),
+                binding_digest: expected_binding,
+                receipt_tree_root: edit.root.object_id,
+                completed_part_count: prior
+                    .completed_part_count
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("upload part count overflows u64"))?,
+                received_bytes: prior
+                    .received_bytes
+                    .checked_add(content.len() as u64)
+                    .ok_or_else(|| corruption("upload byte count overflows u64"))?,
+                contiguous_prefix_bytes: edit.root.contiguous_prefix_bytes,
+            };
+            (false, edit, progress)
+        }
+    } else {
+        let empty = empty_receipt_tree()?;
+        let mut overlay = empty.objects.clone();
+        let edit = insert_receipt_part_on_read(
+            empty.root,
+            part_object_id,
+            &part,
+            view.storage_read(),
+            &overlay,
+        )
+        .await?;
+        let progress = UploadProgressV1 {
+            upload_id: upload_id.clone(),
+            binding_digest: expected_binding,
+            receipt_tree_root: edit.root.object_id,
+            completed_part_count: 1,
+            received_bytes: content.len() as u64,
+            contiguous_prefix_bytes: edit.root.contiguous_prefix_bytes,
+        };
+        overlay.extend(edit.objects.clone())?;
+        (false, edit, progress)
+    };
+
+    let next_part = prior_progress.as_ref().map_or(0, |progress| {
+        progress.contiguous_prefix_bytes / UPLOAD_PART_BYTES
+    });
+    if part_number >= next_part.saturating_add(UPLOAD_PART_WINDOW) {
+        return Err(corruption(
+            "upload part is outside the four-part completion window",
+        ));
+    }
+
+    let selector = UploadSelectorV1 {
+        upload_id: upload_id.clone(),
+        binding_digest: expected_binding,
+        progress_object_id: progress.encode()?.0,
+        selector_generation: selector_generation
+            .checked_add(1)
+            .ok_or_else(|| corruption("upload selector generation overflows u64"))?,
+    };
+    let complete_manifest = if progress.received_bytes == binding.declared_total_size
+        && progress.contiguous_prefix_bytes == binding.declared_total_size
+    {
+        Some(
+            build_completed_manifest(
+                view,
+                raw_selector.is_some().then_some(root),
+                &part,
+                &chunks,
+                binding.declared_total_size,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let complete_receipt = if let Some(manifest) = &complete_manifest {
+        let (manifest_id, _) = manifest.encode()?;
+        Some(crate::binary_cas::BlobWriteReceipt {
+            hash: manifest.canonical_blob_id,
+            size_bytes: manifest.logical_bytes,
+            layout: if manifest.logical_bytes == 0 {
+                crate::binary_cas::BlobLayout::Empty
+            } else if manifest.logical_bytes <= CANONICAL_BLOB_CHUNK_BYTES as u64 {
+                crate::binary_cas::BlobLayout::SingleChunk {
+                    chunk_hash: chunks
+                        .first()
+                        .map(|chunk| crate::binary_cas::ChunkHash::from_content(&chunk.bytes))
+                        .ok_or_else(|| corruption("completed single-chunk upload has no chunk"))?,
+                }
+            } else {
+                crate::binary_cas::BlobLayout::Chunked {
+                    chunk_count: u32::try_from(manifest.ordered_chunks.len())
+                        .map_err(|_| corruption("upload manifest has too many chunks"))?,
+                }
+            },
+            manifest_object_id: *manifest_id.as_bytes(),
+            manifest_was_existing: false,
+        })
+    } else {
+        None
+    };
+    Ok(PreparedUploadPart {
+        part,
+        chunks,
+        receipt,
+        progress,
+        selector,
+        raw_selector,
+        complete_manifest,
+        complete_receipt,
+        already_present,
+    })
+}
+
+async fn build_completed_manifest<R>(
+    view: &CoherentView<R>,
+    prior_root: Option<ReceiptTreeRoot>,
+    new_part: &UploadPartV1,
+    new_chunks: &[BlobChunkV1],
+    total_size: u64,
+) -> Result<BlobManifestV1, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let mut parts = BTreeMap::<u64, UploadPartV1>::new();
+    if let Some(prior_root) = prior_root {
+        let mut start_after = None;
+        loop {
+            let page = scan_page_on_read(
+                prior_root.object_id,
+                "receipt",
+                start_after.as_deref(),
+                super::tree::RECEIPT_TREE_LEAF_ENTRIES,
+                view.storage_read(),
+            )
+            .await?;
+            if page.is_empty() {
+                break;
+            }
+            for (key, value) in &page {
+                let part_number = u64::from_be_bytes(
+                    key.as_slice()
+                        .try_into()
+                        .map_err(|_| corruption("receipt key is not a part number"))?,
+                );
+                let part_id = ObjectId::from_bytes(
+                    value
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| corruption("receipt value is not an object ID"))?,
+                );
+                let part_bytes = load_object_bytes(view.storage_read(), part_id).await?;
+                let part = UploadPartV1::decode(part_id, &part_bytes)?;
+                if parts.insert(part_number, part).is_some() {
+                    return Err(corruption("receipt tree contains a duplicate part number"));
+                }
+            }
+            if page.len() < super::tree::RECEIPT_TREE_LEAF_ENTRIES {
+                break;
+            }
+            start_after = page.last().map(|(key, _)| key.clone());
+        }
+    }
+    parts.insert(new_part.part_number, new_part.clone());
+    let mut next_offset = 0_u64;
+    let mut digest = blake3::Hasher::new();
+    let mut blob_id = CanonicalBlobIdBuilder::default();
+    let mut ordered_chunks = Vec::new();
+    for (_, part) in parts {
+        if part.byte_offset != next_offset {
+            return Err(corruption("upload parts are not contiguous at completion"));
+        }
+        let mut part_digest = blake3::Hasher::new();
+        for chunk_ref in &part.ordered_chunks {
+            let bytes = if part.part_number == new_part.part_number {
+                new_chunks
+                    .iter()
+                    .find_map(|chunk| {
+                        chunk.encode().ok().and_then(|(id, _)| {
+                            (id == chunk_ref.chunk_object_id).then_some(chunk.bytes.clone())
+                        })
+                    })
+                    .ok_or_else(|| corruption("new upload chunk is absent"))?
+            } else {
+                let bytes =
+                    load_object_bytes(view.storage_read(), chunk_ref.chunk_object_id).await?;
+                BlobChunkV1::decode(chunk_ref.chunk_object_id, &bytes)?.bytes
+            };
+            if bytes.len() as u64 != chunk_ref.declared_len {
+                return Err(corruption("upload chunk length does not match its receipt"));
+            }
+            part_digest.update(&bytes);
+            digest.update(&bytes);
+            blob_id.update(&bytes)?;
+            ordered_chunks.push(chunk_ref.clone());
+        }
+        if part_digest.finalize().as_bytes() != &part.part_digest {
+            return Err(corruption("upload part digest does not match its chunks"));
+        }
+        next_offset = next_offset
+            .checked_add(part.declared_part_len)
+            .ok_or_else(|| corruption("upload completion byte count overflows u64"))?;
+    }
+    if next_offset != total_size {
+        return Err(corruption(
+            "upload completion size does not match its binding",
+        ));
+    }
+    let manifest = BlobManifestV1::from_authenticated_chunks(
+        next_offset,
+        ordered_chunks,
+        blob_id.finish(),
+        *digest.finalize().as_bytes(),
+    );
+    let _ = manifest.encode()?;
+    Ok(manifest)
 }
 
 /// Authenticates an open upload and streams its path-copied ReceiptTree in

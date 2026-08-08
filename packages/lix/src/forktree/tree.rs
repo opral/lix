@@ -704,6 +704,48 @@ pub(super) fn insert_receipt_part(
     })
 }
 
+/// Applies one receipt edit using the caller's retained authenticated read.
+/// The synchronous tree rewriter needs a lookup closure, so this adapter
+/// eagerly loads only the existing receipt-node path set before it performs
+/// the path copy. Newly staged nodes are supplied through `overlay` and are
+/// never read from a second storage snapshot.
+pub(super) async fn insert_receipt_part_on_read<R>(
+    root: ReceiptTreeRoot,
+    part_object_id: ObjectId,
+    part: &UploadPartV1,
+    read: &R,
+    overlay: &ImmutableObjectSet,
+) -> Result<ReceiptTreeEdit, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut loaded = BTreeMap::<ObjectId, Bytes>::new();
+    let mut pending = vec![root.object_id];
+    while let Some(id) = pending.pop() {
+        if loaded.contains_key(&id) {
+            continue;
+        }
+        let bytes = match overlay.get(id) {
+            Some(bytes) => bytes.clone(),
+            None => load_object_on_read(read, id).await?,
+        };
+        let node = decode_node(id, &bytes)?;
+        if node.kind != TreeKind::Receipt {
+            return Err(corruption("receipt edit encountered a non-receipt node"));
+        }
+        if let NodeBody::Internal(children) = &node.body {
+            pending.extend(children.iter().map(|child| child.id));
+        }
+        loaded.insert(id, bytes);
+    }
+    insert_receipt_part(root, part_object_id, part, |id| {
+        loaded
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| corruption("receipt edit path references an unloaded node"))
+    })
+}
+
 pub(super) fn lookup(
     root: ObjectId,
     expected_kind: &'static str,

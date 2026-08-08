@@ -89,8 +89,7 @@ where
             && transaction.opening_tracked_mutation_revision
                 == leader.opening_tracked_mutation_revision
             && transaction.idempotency_receipt.is_none()
-            && transaction.atomic_metadata_writes.is_none()
-            && transaction.atomic_metadata_preconditions.is_empty()
+            && transaction.pending_forktree_publication.is_none()
             && !transaction.await_durable_commit
     })
 }

@@ -21,9 +21,7 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{
-    BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId, BlobWriteReceipt,
-};
+use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
     BranchReferenceRole, branch_ref_stage_row,
@@ -46,7 +44,10 @@ use crate::filesystem::{
     FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
     FilesystemRowContext, load_path_index_revision,
 };
-use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
+use crate::forktree::{
+    CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow, PreparedPublication, StateKey,
+    UploadBindingRef, prepare_upload_part,
+};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
     CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef,
@@ -91,8 +92,7 @@ use crate::sql2::{
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
-    StorageWriteSetStats,
+    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -175,10 +175,8 @@ where
         && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
         && a.idempotency_receipt.is_none()
         && b.idempotency_receipt.is_none()
-        && a.atomic_metadata_writes.is_none()
-        && b.atomic_metadata_writes.is_none()
-        && a.atomic_metadata_preconditions.is_empty()
-        && b.atomic_metadata_preconditions.is_empty()
+        && a.pending_forktree_publication.is_none()
+        && b.pending_forktree_publication.is_none()
         && !a.await_durable_commit
         && !b.await_durable_commit
         && eligible_a
@@ -560,8 +558,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Storage-native metadata that must publish in the same backend commit as
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
-    atomic_metadata_writes: Option<StorageWriteSet>,
-    atomic_metadata_preconditions: Vec<StoragePrecondition>,
+    pending_forktree_publication: Option<PreparedPublication>,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -772,30 +769,128 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) fn stage_atomic_cas_publication(
+    pub(crate) async fn stage_forktree_upload_part(
         &mut self,
-        writes: StorageWriteSet,
-        preconditions: Vec<StoragePrecondition>,
-        receipt: BlobWriteReceipt,
-    ) -> Result<(), LixError> {
-        if self.atomic_metadata_writes.is_some() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "atomic transaction metadata was staged more than once",
-            ));
+        upload_id: &str,
+        binding: UploadBindingRef<'_>,
+        part_number: u64,
+        byte_offset: u64,
+        content: &[u8],
+    ) -> Result<crate::forktree::PreparedUploadPart, LixError> {
+        let upload_id = CanonicalUploadId::new(upload_id.as_bytes())?;
+        let facade = self.forktree_read_facade();
+        let view = facade.branch(&self.active_branch_id).await?;
+        let prepared =
+            prepare_upload_part(&view, upload_id, binding, part_number, byte_offset, content)
+                .await
+                .map_err(|error| {
+                    let error = LixError::from(error);
+                    if error
+                        .message
+                        .contains("upload selector binding does not match this request")
+                    {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "upload id is already bound to a different path or size",
+                        )
+                    } else if error
+                        .message
+                        .contains("upload part is outside the four-part completion window")
+                    {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "upload part is outside the four-part completion window",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+        if !prepared.already_present {
+            let mut publication = PreparedPublication::from_branch_view(&view)?;
+            publication.publish_upload_part(prepared.clone())?;
+            if let Some(mut pending) = self.pending_forktree_publication.take() {
+                pending.merge_from(publication)?;
+                self.pending_forktree_publication = Some(pending);
+            } else {
+                self.pending_forktree_publication = Some(publication);
+            }
+            self.await_durable_commit = true;
         }
-        if !writes.has_put(crate::forktree::OBJECT_SPACE, &receipt.manifest_object_id)
-            && !receipt.manifest_was_existing
+        Ok(prepared)
+    }
+
+    /// Rejects a resumable upload that races with an already-published file.
+    ///
+    /// Completed upload selectors are deliberately retired with the receipt
+    /// tree, so the visible BlobRef is the only durable idempotency witness
+    /// after completion. An exact one-part replay may therefore return
+    /// success without staging a second publication; a different payload (or
+    /// a multipart continuation) fails closed as a stale target.
+    pub(crate) async fn check_forktree_upload_target(
+        &mut self,
+        path: &str,
+        total_size: u64,
+        byte_offset: u64,
+        content: &[u8],
+    ) -> Result<bool, LixError> {
+        let request = FilesystemPathIndexRequest::new(vec![self.active_branch_id.clone()])
+            .with_blob_refs(true);
+        let index = self.filesystem_path_index(&request).await?;
+        let Some(entry) = index
+            .exact_entries(path)
+            .into_iter()
+            .find(|entry| entry.kind == FilesystemPathKind::File)
+        else {
+            return Ok(false);
+        };
+        let row = entry.blob_ref_live_row().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "visible upload target has no authenticated BlobRef",
+            )
+        })?;
+        let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "visible upload target BlobRef has no snapshot",
+            )
+        })?;
+        let snapshot = serde_json::from_str::<serde_json::Value>(snapshot).map_err(|_| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "visible upload target BlobRef snapshot is malformed",
+            )
+        })?;
+        let declared_size = snapshot
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "visible upload target BlobRef size is absent",
+                )
+            })?;
+        let blob_hash = snapshot
+            .get("blob_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "visible upload target BlobRef identity is absent",
+                )
+            })?;
+        let expected = BlobId::from_content(content).to_hex();
+        if byte_offset == 0
+            && total_size == content.len() as u64
+            && declared_size == total_size
+            && blob_hash == expected
         {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "atomic CAS publication is missing its prepared manifest",
-            ));
+            return Ok(true);
         }
-        self.atomic_metadata_writes = Some(writes);
-        self.atomic_metadata_preconditions.extend(preconditions);
-        self.await_durable_commit = true;
-        Ok(())
+        Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "upload target is already bound to a different file identity",
+        ))
     }
 
     fn opening_read(&self) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
@@ -1470,8 +1565,7 @@ where
                     trust_filesystem_planner: false,
                     origin_key: None,
                     idempotency_receipt: None,
-                    atomic_metadata_writes: None,
-                    atomic_metadata_preconditions: Vec::new(),
+                    pending_forktree_publication: None,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
@@ -1636,6 +1730,20 @@ where
                 return Err(error);
             }
         };
+        let prepared_forktree_plan = match (
+            prepared_forktree_plan,
+            transaction.pending_forktree_publication.take(),
+        ) {
+            (commit::PreparedForkTreePlan::Noop, None) => commit::PreparedForkTreePlan::Noop,
+            (commit::PreparedForkTreePlan::Noop, Some(publication)) => {
+                commit::PreparedForkTreePlan::Publication(publication)
+            }
+            (commit::PreparedForkTreePlan::Publication(mut publication), Some(upload)) => {
+                publication.merge_from(upload)?;
+                commit::PreparedForkTreePlan::Publication(publication)
+            }
+            (publication, None) => publication,
+        };
         // ForkTree never commits independently. Its authenticated objects,
         // selectors, untracked rows, and exact CAS fences are lowered once
         // into the transaction-owned in-memory plan. Runtime metadata and the
@@ -1649,17 +1757,11 @@ where
         if tracked_state_changed {
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
-        if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
-            writes.extend(metadata_writes);
-        }
         let mut write_options = StorageWriteOptions::default();
         write_options.await_durable = transaction.await_durable_commit;
         write_options
             .preconditions
             .extend(materialization_preconditions);
-        write_options
-            .preconditions
-            .append(&mut transaction.atomic_metadata_preconditions);
         if requires_tracked_snapshot_fence {
             write_options.preconditions.push(
                 StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
