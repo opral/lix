@@ -17,7 +17,8 @@
     "prior_6eba_parent": "482e10c88767a426a8b6ed0aff7fad1b43903b1f",
     "blocker_report_sha256": "69ddb8b7024ac436af29ae7efe19fb2bfc2a74a03d4f206f45ceb1cb8e6d35a3",
     "blocker_manifest_sha256": "8af37ef5dcf992d43e9afa65cdfbc76578763d9db0c33b3fb6f6ee3813ef2072",
-    "prior_handoff_sha256": "288926d43355526489908c84845ba2d30343e97117f04652f0d58754862c128b"
+    "prior_handoff_sha256": "288926d43355526489908c84845ba2d30343e97117f04652f0d58754862c128b",
+    "prior_v3_handoff_sha256": "8177bfde4c1732281e66eb30c507ed69b11eccaa65f2511147d243ea03e9d0e0"
   },
   "source_calibration": {
     "anchor": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
@@ -58,6 +59,7 @@
   ],
   "forbidden_production_changes": true,
   "runtime_claimed": false,
+  "v4_provenance": "This v4 binds the immutable predecessor v3 handoff above. Its own provenance is the immutable commit/ref/tree/diff identity; no post-commit external v4 HANDOFF digest is advertised as manifest-bound.",
   "authority_contract": {
     "global": "one authenticated GlobalSelectorV1 in SELECTOR_SPACE",
     "branch": "one authenticated BranchSelectorV1 per branch in SELECTOR_SPACE",
