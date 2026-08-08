@@ -82,6 +82,7 @@ verify_readiness_ref() {
   local expected_focused_diff=$6
   local lineage_base=$7
   local expected_lineage_diff=$8
+  local output_kind=${9:-readiness}
   local local_ref="refs/stage2-acceptance-verifier/readiness-$id"
 
   timeout 20m "${git_cmd[@]}" fetch --no-tags origin "+refs/heads/$remote_branch:$local_ref" >/dev/null
@@ -102,8 +103,24 @@ verify_readiness_ref() {
   lineage_diff=$("${git_cmd[@]}" diff --binary --full-index "$lineage_base..$head" | sha_stdin)
   [[ "$lineage_diff" == "$expected_lineage_diff" ]] ||
     fail "$id lineage diff expected=$expected_lineage_diff actual=$lineage_diff"
-  printf 'readiness\t%s\tPASS\t%s\t%s\t%s\n' "$id" "$head" "$tree" "$focused_diff"
-  printf 'lineage\t%s\tPASS\t%s\t%s\t%s\n' "$id" "$parent" "$lineage_base" "$lineage_diff"
+  local lineage_kind=lineage
+  if [[ "$output_kind" == "blocked-readiness" ]]; then
+    lineage_kind=blocked-lineage
+  fi
+  printf '%s\t%s\tPASS\t%s\t%s\t%s\n' "$output_kind" "$id" "$head" "$tree" "$focused_diff"
+  printf '%s\t%s\tPASS\t%s\t%s\t%s\n' "$lineage_kind" "$id" "$parent" "$lineage_base" "$lineage_diff"
+}
+
+verify_blob_oid() {
+  local id=$1
+  local path=$2
+  local expected=$3
+  local ref="refs/stage2-acceptance-verifier/readiness-$id"
+  local actual
+  actual=$("${git_cmd[@]}" rev-parse "$ref:$path")
+  [[ "$actual" == "$expected" ]] ||
+    fail "$id blob=$path expected=$expected actual=$actual"
+  printf 'blob\t%s\tPASS\t%s\t%s\t-\n' "$id" "$path" "$actual"
 }
 
 printf 'kind\tid\tstatus\tidentity_or_path\ttree_or_sha\tdiff_sha256\n'
@@ -120,6 +137,12 @@ verify_ref olap codex/forktree-stage2-olap-acceptance-oracle-a12 b9055810dff42c9
 verify_ref multimedia codex/forktree-stage2-multimedia-oracle-a12 61fc367988190b3438672743331a81d83d450fae 1600e8ce54d9f52f6ee3546068362ae298d4d243 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 65cda6ee906b6986bf70b636dfaadda5f8f89a2f8f4af407852687c474472660
 
 verify_readiness_ref topology codex/forktree-stage2-milestone3e-topology-owned-reader af7899f41c489fe763ce1a64c5468083570979e2 da097bd739b50629ea39b155d4fa9efc870654e0 2e0cea1b91558179e6ed90847bc8b04b23de246f 942d05f6c92f89e6c32c3b706c82c4e506e498263b5798c92eb2af607a219587 a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 734d02bfe332e4f8384301de243d85248b639aec0edeffac48b3f56a4ec271e5
+verify_readiness_ref blobref codex/forktree-stage2-milestone4-blobref-owned-view 08f8dd5cf20842f79996fae9eb7b0924f074a084 19c8706d6bc3d1dbe9217b4f8386b19c66f027a8 af7899f41c489fe763ce1a64c5468083570979e2 d7217fafa02e3c50a6c10b7e3a7a0985697b4ba82beb1ba896d2cf636f34d71f a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 2a06b554cea5f28a24117dfb52c3e24be9ddc408bbb59405ea66b051b73ddb47 blocked-readiness
+verify_blob_oid blobref packages/lix/src/forktree/blob.rs fa277d08a57b67cfbb70b613089734b2f4fda49a
+verify_blob_oid blobref packages/lix/src/forktree/mod.rs 445e9ba1a13c48fab34fed1f16ff208a2141010a
+verify_blob_oid blobref packages/lix/src/forktree/serving.rs 8ec1d5a19c2a265fc0d1a790426016081fc661ef
+verify_blob_oid blobref packages/lix/src/forktree/tests.rs 0c21a4e54bf070be1717af9e08d9cba66bea9926
+verify_blob_oid blobref packages/lix/src/forktree/view.rs 0102fd6c0229dab2b19a032ff724d6f6161e9bfe
 
 verify_file sql packages/rs-sdk-tests/tests/forktree_stage2_sql_dml.rs b410b717f45d68e928e93dcf1332de2895db0246202e9ba9a6e5bc10b416c6bb
 verify_file sql packages/rs-sdk-tests/tests/FORKTREE_STAGE2_SQL_DML_ORACLE.md 1867643051628903232c3cbe8f4ae2c1e2655b7cbb0b044ec1046acf35947e22
@@ -154,4 +177,4 @@ printf 'external\tpointread\tNOTE\tREPORT.md\tb86db402ec0bf9b25ca619564edb82a420
 printf 'external\tpointread\tNOTE\tSHA256SUMS\tcacbcee8f7b80a627f96dd8b7d6d55beef0fe2a2f7228f0290b488ae7717a888\tnot embedded in ref; author reports 3/3 verify\n'
 printf 'external\tpointread\tNOTE\tstage2_point_read_oracle-025c3b394ec8760c\tead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a\tbench binary; rebuild on candidate\n'
 printf 'external\tolap\tNOTE\tprovenance-report\te78821631888e8a8810df78e9bdffbe31c8a8124227c5ad0c3b549a6e60795a4\tnot embedded in ref\n'
-printf 'summary\tall\tPASS\t10 acceptance refs; 1 readiness milestone\t27 embedded files\tno artifacts applied\n'
+printf 'summary\tall\tPASS\t10 acceptance refs; 1 approved readiness; 1 blocked frontier\t27 embedded files; 5 blocked-source blobs\tno artifacts applied\n'
