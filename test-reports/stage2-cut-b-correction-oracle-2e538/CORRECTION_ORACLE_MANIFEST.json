@@ -1,0 +1,32 @@
+{
+  "kind": "test-report-only-source-oracle",
+  "anchor": {
+    "ref": "origin/codex/forktree-stage2-cut-b-reader-correction-51ff",
+    "head": "2e5389265d0495728325efe43d7eb6d9ad715aa0",
+    "tree": "17087b2241deacfa83f5ae95052d8f0703668eb6",
+    "parent": "51ff5dbc353cb0322bcedcd191d6e2082e7ed479",
+    "parent_to_head_full_index_sha256": "6845fd08feee545f732f8011979b3c9a60fb2ba2ec3e85c2e7ed8f22f7699f53",
+    "stable_patch_id": "55544da1d0395b9924299d25ef76518501c1e346"
+  },
+  "scope": "Cut B historical filesystem/plugin/merge reader ownership only",
+  "runtime": false,
+  "production_edits": false,
+  "required_owner": "one opaque operation owner retaining one authenticated CoherentView/read",
+  "required_methods": [
+    "ForkTreeReadFacade",
+    "load_commit_member_records",
+    "load_state_value_at_commit",
+    "load_json_slot",
+    "scan_view",
+    "scan_untracked_view"
+  ],
+  "forbidden": [
+    "TrackedStateStoreReader historical plugin/merge reads",
+    "raw scan_branch/open_coherent_view entry points for Cut B consumers",
+    "arbitrary raw &R facade construction or read extraction",
+    "detached branch/history views",
+    "writer/selector/GC algorithm/scalar/W2-W5/CAS/cache/compatibility widening"
+  ],
+  "expected_anchor_result": "RED",
+  "verification": "verify_source_contract.sh <repo-root> <base> <head>"
+}
