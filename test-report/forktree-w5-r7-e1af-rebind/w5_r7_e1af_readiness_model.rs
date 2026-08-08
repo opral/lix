@@ -23,6 +23,7 @@ struct ObjectRecord {
     kind: ObjectKind,
     refs: Vec<ObjectId>,
     body: Vec<u8>,
+    fingerprint: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,8 +67,46 @@ enum AuthError {
     IdentitySubstituted,
     Cycle,
     Malformed,
+    Integrity,
+    Order,
     StaleEpoch,
     OwnerMismatch,
+}
+
+fn object_fingerprint(kind: ObjectKind, refs: &[ObjectId], body: &[u8]) -> u64 {
+    let kind_tag = match kind {
+        ObjectKind::Root => 1,
+        ObjectKind::Node => 2,
+        ObjectKind::Payload => 3,
+    };
+    let mut hash = 0xcbf29ce484222325u64 ^ kind_tag;
+    for reference in refs {
+        for byte in reference.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in body {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn object_record(id: &str, kind: ObjectKind, refs: &[&str], body: &[u8]) -> ObjectRecord {
+    let refs = refs
+        .iter()
+        .map(|reference| (*reference).into())
+        .collect::<Vec<_>>();
+    ObjectRecord {
+        id: id.into(),
+        kind,
+        fingerprint: object_fingerprint(kind, &refs, body),
+        refs,
+        body: body.to_vec(),
+    }
 }
 
 fn expected_kind(id: &str) -> Option<ObjectKind> {
@@ -158,6 +197,21 @@ impl GraphAuthority {
         self.authenticate_object(root, &mut visiting, &mut visited)
     }
 
+    fn authenticate_root_closure(&self, roots: &[&str]) -> Result<BTreeSet<ObjectId>, AuthError> {
+        if roots.is_empty() {
+            return Err(AuthError::Malformed);
+        }
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        for root in roots {
+            if expected_kind(root) != Some(ObjectKind::Root) {
+                return Err(AuthError::WrongKind);
+            }
+            self.authenticate_object(root, &mut visiting, &mut visited)?;
+        }
+        Ok(visited)
+    }
+
     fn authenticate_object(
         &self,
         id: &str,
@@ -184,6 +238,9 @@ impl GraphAuthority {
         if expected_kind(id) != Some(record.kind) {
             return Err(AuthError::WrongKind);
         }
+        if record.fingerprint != object_fingerprint(record.kind, &record.refs, &record.body) {
+            return Err(AuthError::Integrity);
+        }
         if record.body.is_empty() && record.kind != ObjectKind::Payload {
             return Err(AuthError::Malformed);
         }
@@ -205,30 +262,20 @@ fn valid_graph() -> GraphAuthority {
     let mut objects = BTreeMap::new();
     objects.insert(
         "root:global".into(),
-        ObjectRecord {
-            id: "root:global".into(),
-            kind: ObjectKind::Root,
-            refs: vec!["node:global".into()],
-            body: b"root".to_vec(),
-        },
+        object_record("root:global", ObjectKind::Root, &["node:global"], b"root"),
     );
     objects.insert(
         "node:global".into(),
-        ObjectRecord {
-            id: "node:global".into(),
-            kind: ObjectKind::Node,
-            refs: vec!["payload:global".into()],
-            body: b"node".to_vec(),
-        },
+        object_record(
+            "node:global",
+            ObjectKind::Node,
+            &["payload:global"],
+            b"node",
+        ),
     );
     objects.insert(
         "payload:global".into(),
-        ObjectRecord {
-            id: "payload:global".into(),
-            kind: ObjectKind::Payload,
-            refs: Vec::new(),
-            body: Vec::new(),
-        },
+        object_record("payload:global", ObjectKind::Payload, &[], b""),
     );
     let global = GlobalSelectorV1 {
         epoch: 7,
@@ -299,6 +346,20 @@ impl SelectorPlaneState {
         Ok(())
     }
 
+    fn commit_gc_and_publish(
+        &mut self,
+        expected: &Fence,
+        owner: &str,
+        root: &str,
+    ) -> Result<(), FenceError> {
+        self.validate_fence(expected, owner)?;
+        self.fence.epoch += 1;
+        self.fence.progress += 1;
+        self.fence.selector += 1;
+        self.root = root.into();
+        Ok(())
+    }
+
     fn validate_fence(&self, expected: &Fence, owner: &str) -> Result<(), FenceError> {
         if owner != self.fence.owner || expected.owner != owner {
             return Err(FenceError::OwnerMismatch);
@@ -314,6 +375,34 @@ impl SelectorPlaneState {
 struct QueueEntry {
     object: String,
     blocked: bool,
+    fingerprint: u64,
+}
+
+impl QueueEntry {
+    fn new(object: &str, blocked: bool) -> Self {
+        Self {
+            object: object.into(),
+            blocked,
+            fingerprint: Self::fingerprint_for(object, blocked),
+        }
+    }
+
+    fn fingerprint_for(object: &str, blocked: bool) -> u64 {
+        let mut hash = 0x84222325cbf29ce4u64 ^ u64::from(blocked);
+        for byte in object.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn authenticate(&self) -> Result<(), AuthError> {
+        if self.fingerprint != Self::fingerprint_for(&self.object, self.blocked) {
+            Err(AuthError::Integrity)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,6 +412,7 @@ struct PageResult {
     reclaimed: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct QueueState {
     plane: SelectorPlaneState,
     entries: Vec<QueueEntry>,
@@ -348,23 +438,51 @@ impl QueueState {
     }
 
     fn process(&mut self, max_entries: usize) -> PageResult {
+        self.process_checked(max_entries)
+            .expect("queue state is authenticated before processing")
+    }
+
+    fn process_checked(&mut self, max_entries: usize) -> Result<PageResult, AuthError> {
+        let expected = self.plane.fence.clone();
+        let result = self.process_entries_only(max_entries)?;
+        if result.advanced {
+            self.plane
+                .advance_gc(&expected, "gc-owner")
+                .expect("queue owns its selector fence");
+        }
+        Ok(result)
+    }
+
+    fn process_entries_only(&mut self, max_entries: usize) -> Result<PageResult, AuthError> {
+        if max_entries == 0
+            || self.queue_head > self.queue_tail
+            || self.queue_tail != self.entries.len()
+        {
+            return Err(AuthError::Malformed);
+        }
+        let mut seen = BTreeSet::new();
+        for entry in &self.entries {
+            entry.authenticate()?;
+            if !seen.insert(entry.object.clone()) {
+                return Err(AuthError::Order);
+            }
+        }
         self.calls += 1;
         if self.queue_head == self.entries.len() {
-            return PageResult {
+            return Ok(PageResult {
                 advanced: false,
                 drained: true,
                 reclaimed: 0,
-            };
+            });
         }
         if self.entries[self.queue_head].blocked {
             self.debt_tokens = 1;
-            return PageResult {
+            return Ok(PageResult {
                 advanced: false,
                 drained: false,
                 reclaimed: 0,
-            };
+            });
         }
-        let expected = self.plane.fence.clone();
         let old_head = self.queue_head;
         let new_head = (old_head + max_entries).min(self.entries.len());
         let mut reclaimed = 0;
@@ -374,25 +492,36 @@ impl QueueState {
             }
         }
         self.queue_head = new_head;
-        self.plane
-            .advance_gc(&expected, "gc-owner")
-            .expect("queue owns its selector fence");
-        PageResult {
+        Ok(PageResult {
             advanced: true,
             drained: new_head == self.entries.len(),
             reclaimed,
-        }
+        })
     }
 
     fn release_blocked_head(&mut self) {
         if let Some(entry) = self.entries.get_mut(self.queue_head) {
             entry.blocked = false;
+            entry.fingerprint = QueueEntry::fingerprint_for(&entry.object, entry.blocked);
         }
     }
 
     fn persist(&self) -> String {
+        let encoded_entries = self
+            .entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}:{}:{}",
+                    entry.object,
+                    u8::from(entry.blocked),
+                    entry.fingerprint
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.plane.fence.epoch,
             self.plane.fence.progress,
             self.plane.fence.selector,
@@ -400,13 +529,14 @@ impl QueueState {
             self.plane.root,
             self.queue_head,
             self.queue_tail,
-            self.deleted.len()
+            self.deleted.len(),
+            encoded_entries
         )
     }
 
     fn reopen(encoded: &str, entries: Vec<QueueEntry>) -> Result<Self, AuthError> {
         let parts: Vec<_> = encoded.split('|').collect();
-        if parts.len() != 8 || parts[3] != "gc-owner" || parts[4] != "root:global" {
+        if parts.len() != 9 || parts[3] != "gc-owner" || parts[4] != "root:global" {
             return Err(AuthError::Malformed);
         }
         let parse = |index: usize| {
@@ -426,6 +556,24 @@ impl QueueState {
             || progress > epoch
         {
             return Err(AuthError::Malformed);
+        }
+        let mut seen = BTreeSet::new();
+        for (encoded, entry) in parts[8].split(',').zip(&entries) {
+            let fields: Vec<_> = encoded.split(':').collect();
+            if fields.len() != 3
+                || fields[0] != entry.object
+                || fields[1] != u8::from(entry.blocked).to_string()
+                || fields[2] != entry.fingerprint.to_string()
+            {
+                return Err(AuthError::Integrity);
+            }
+            if !seen.insert(entry.object.clone()) {
+                return Err(AuthError::Order);
+            }
+            entry.authenticate()?;
+        }
+        if parts[8].split(',').count() != entries.len() {
+            return Err(AuthError::Order);
         }
         let deleted = entries[..deleted_len]
             .iter()
@@ -457,6 +605,7 @@ struct ReadId(u64);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct View {
     id: ReadId,
+    owner: OwnerId,
     root: RootId,
     valid: bool,
     last_key: Option<String>,
@@ -464,6 +613,7 @@ struct View {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Cursor {
+    owner: OwnerId,
     read_id: ReadId,
     last_key: Option<String>,
 }
@@ -473,8 +623,10 @@ enum ReadError {
     ReadExpired,
     InvalidCursor,
     Malformed,
+    OwnerMismatch,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ReaderPins {
     next_read: u64,
     views: BTreeMap<ReadId, View>,
@@ -490,10 +642,11 @@ impl ReaderPins {
         }
     }
 
-    fn begin_read(&mut self, root: &str) -> View {
+    fn begin_read(&mut self, owner: &str, root: &str) -> View {
         self.next_read += 1;
         let view = View {
             id: ReadId(self.next_read),
+            owner: owner.into(),
             root: root.into(),
             valid: true,
             last_key: None,
@@ -503,8 +656,11 @@ impl ReaderPins {
         view
     }
 
-    fn poison(&mut self, read_id: ReadId, delivered: &str) -> Result<(), ReadError> {
+    fn poison(&mut self, owner: &str, read_id: ReadId, delivered: &str) -> Result<(), ReadError> {
         let view = self.views.get_mut(&read_id).ok_or(ReadError::ReadExpired)?;
+        if view.owner != owner {
+            return Err(ReadError::OwnerMismatch);
+        }
         view.valid = false;
         view.last_key = Some(delivered.into());
         if let Some(readers) = self.roots.get_mut(&view.root) {
@@ -516,7 +672,11 @@ impl ReaderPins {
         Err(ReadError::Malformed)
     }
 
-    fn close(&mut self, read_id: ReadId) -> Result<(), ReadError> {
+    fn close(&mut self, owner: &str, read_id: ReadId) -> Result<(), ReadError> {
+        let view = self.views.get(&read_id).ok_or(ReadError::ReadExpired)?;
+        if view.owner != owner {
+            return Err(ReadError::OwnerMismatch);
+        }
         let view = self.views.remove(&read_id).ok_or(ReadError::ReadExpired)?;
         if let Some(readers) = self.roots.get_mut(&view.root) {
             readers.remove(&read_id);
@@ -534,6 +694,9 @@ impl ReaderPins {
             .ok_or(ReadError::ReadExpired)?;
         if !view.valid {
             return Err(ReadError::ReadExpired);
+        }
+        if view.owner != cursor.owner {
+            return Err(ReadError::OwnerMismatch);
         }
         if view.last_key != cursor.last_key {
             return Err(ReadError::InvalidCursor);
@@ -572,6 +735,7 @@ impl CoherentRead {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RootOwners {
     owners: BTreeMap<RootId, BTreeSet<String>>,
 }
@@ -590,10 +754,15 @@ impl RootOwners {
             .insert(owner.into());
     }
 
-    fn release(&mut self, root: &str, owner: &str) {
-        if let Some(owners) = self.owners.get_mut(root) {
-            owners.remove(owner);
+    fn release(&mut self, root: &str, owner: &str) -> Result<(), AuthError> {
+        let owners = self.owners.get_mut(root).ok_or(AuthError::Missing {
+            space: Space::Object,
+            id: root.into(),
+        })?;
+        if !owners.remove(owner) {
+            return Err(AuthError::OwnerMismatch);
         }
+        Ok(())
     }
 
     fn reclaim_released(&mut self) -> usize {
@@ -609,6 +778,252 @@ impl RootOwners {
         }
         count
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AtomicW5State {
+    plane: SelectorPlaneState,
+    queue: QueueState,
+    roots: RootOwners,
+    pins: ReaderPins,
+}
+
+impl AtomicW5State {
+    fn new(entries: Vec<QueueEntry>) -> Self {
+        let queue = QueueState::new(entries);
+        Self {
+            plane: queue.plane.clone(),
+            queue,
+            roots: RootOwners::new(),
+            pins: ReaderPins::new(),
+        }
+    }
+
+    fn apply(
+        &mut self,
+        expected: &Fence,
+        owner: &str,
+        new_root: &str,
+        max_entries: usize,
+        graph: &GraphAuthority,
+        roots: &[&str],
+    ) -> Result<PageResult, AuthError> {
+        let mut staged = self.clone();
+        staged
+            .plane
+            .validate_fence(expected, owner)
+            .map_err(|error| match error {
+                FenceError::StaleEpoch => AuthError::StaleEpoch,
+                FenceError::OwnerMismatch => AuthError::OwnerMismatch,
+            })?;
+        graph.authenticate_root_closure(roots)?;
+        if expected_kind(new_root) != Some(ObjectKind::Root) {
+            return Err(AuthError::WrongKind);
+        }
+        let result = staged.queue.process_entries_only(max_entries)?;
+        if result.advanced {
+            staged
+                .plane
+                .commit_gc_and_publish(expected, owner, new_root)
+                .map_err(|error| match error {
+                    FenceError::StaleEpoch => AuthError::StaleEpoch,
+                    FenceError::OwnerMismatch => AuthError::OwnerMismatch,
+                })?;
+            staged.queue.plane = staged.plane.clone();
+        } else if staged.plane.root != new_root {
+            return Err(AuthError::StaleEpoch);
+        }
+        *self = staged;
+        Ok(result)
+    }
+}
+
+#[test]
+fn transitive_h_s_c_roots_share_authenticated_closure_and_fail_closed() {
+    let mut graph = valid_graph();
+    for root in ["root:history", "root:serving", "root:checkpoint"] {
+        graph.objects.objects.insert(
+            root.into(),
+            object_record(root, ObjectKind::Root, &["node:global"], b"root"),
+        );
+    }
+    let closure = graph
+        .authenticate_root_closure(&["root:history", "root:serving", "root:checkpoint"])
+        .expect("all H/S/C roots authenticate");
+    assert_eq!(closure.len(), 5);
+
+    let mut missing = graph.clone();
+    missing.objects.objects.remove("root:checkpoint");
+    assert!(matches!(
+        missing.authenticate_root_closure(&["root:history", "root:serving", "root:checkpoint"]),
+        Err(AuthError::Missing { .. })
+    ));
+
+    let mut cycle = graph.clone();
+    let checkpoint = cycle
+        .objects
+        .objects
+        .get_mut("root:checkpoint")
+        .expect("checkpoint");
+    checkpoint.refs = vec!["root:checkpoint".into()];
+    checkpoint.fingerprint =
+        object_fingerprint(checkpoint.kind, &checkpoint.refs, &checkpoint.body);
+    assert_eq!(
+        cycle.authenticate_root_closure(&["root:history", "root:serving", "root:checkpoint"]),
+        Err(AuthError::Cycle)
+    );
+
+    let mut substituted = graph;
+    substituted
+        .objects
+        .objects
+        .get_mut("root:serving")
+        .expect("serving")
+        .body = b"transplanted".to_vec();
+    assert_eq!(
+        substituted.authenticate_root_closure(&["root:history", "root:serving", "root:checkpoint"]),
+        Err(AuthError::Integrity)
+    );
+}
+
+#[test]
+fn queue_identity_order_and_reopen_substitution_fail_without_mutation() {
+    let mut queue = QueueState::new(vec![
+        QueueEntry::new("queue-a", false),
+        QueueEntry::new("queue-b", false),
+    ]);
+    queue.entries[0].fingerprint ^= 1;
+    let corrupted = queue.clone();
+    assert_eq!(queue.process_checked(1), Err(AuthError::Integrity));
+    assert_eq!(queue, corrupted);
+
+    let mut duplicate = QueueState::new(vec![
+        QueueEntry::new("queue-a", false),
+        QueueEntry::new("queue-b", false),
+    ]);
+    duplicate.entries[1] = QueueEntry::new("queue-a", false);
+    let duplicate_before = duplicate.clone();
+    assert_eq!(duplicate.process_checked(1), Err(AuthError::Order));
+    assert_eq!(duplicate, duplicate_before);
+
+    let mut progressed = QueueState::new(vec![
+        QueueEntry::new("queue-a", false),
+        QueueEntry::new("queue-b", false),
+    ]);
+    assert_eq!(progressed.process(1).reclaimed, 1);
+    let encoded = progressed.persist();
+    let substituted = QueueState::reopen(
+        &encoded,
+        vec![
+            QueueEntry::new("queue-a", false),
+            QueueEntry::new("queue-x", false),
+        ],
+    );
+    assert_eq!(substituted, Err(AuthError::Integrity));
+    let reordered = QueueState::reopen(
+        &encoded,
+        vec![
+            QueueEntry::new("queue-b", false),
+            QueueEntry::new("queue-a", false),
+        ],
+    );
+    assert_eq!(reordered, Err(AuthError::Integrity));
+
+    let duplicate_reopen = QueueState::new(vec![
+        QueueEntry::new("queue-a", false),
+        QueueEntry::new("queue-a", false),
+    ]);
+    let duplicate_encoded = duplicate_reopen.persist();
+    assert_eq!(
+        QueueState::reopen(&duplicate_encoded, duplicate_reopen.entries.clone()),
+        Err(AuthError::Order)
+    );
+}
+
+#[test]
+fn atomic_publication_gc_rejects_bad_graph_fence_and_root_without_partial_state() {
+    let graph = valid_graph();
+    let mut state = AtomicW5State::new(vec![QueueEntry::new("atomic", false)]);
+    let fence = state.plane.fence.clone();
+    let before = state.clone();
+
+    let mut malformed = graph.clone();
+    malformed
+        .objects
+        .objects
+        .get_mut("node:global")
+        .expect("node")
+        .body = b"bad".to_vec();
+    assert_eq!(
+        state.apply(
+            &fence,
+            "gc-owner",
+            "root:global",
+            1,
+            &malformed,
+            &["root:global"]
+        ),
+        Err(AuthError::Integrity)
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        state.apply(
+            &fence,
+            "other-owner",
+            "root:global",
+            1,
+            &graph,
+            &["root:global"]
+        ),
+        Err(AuthError::OwnerMismatch)
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        state.apply(
+            &fence,
+            "gc-owner",
+            "node:global",
+            1,
+            &graph,
+            &["root:global"]
+        ),
+        Err(AuthError::WrongKind)
+    );
+    assert_eq!(state, before);
+
+    assert_eq!(
+        state.apply(
+            &fence,
+            "gc-owner",
+            "root:global",
+            1,
+            &graph,
+            &["root:global"]
+        ),
+        Ok(PageResult {
+            advanced: true,
+            drained: true,
+            reclaimed: 1,
+        })
+    );
+    assert_eq!(state.queue.queue_head, 1);
+    assert_eq!(state.plane.fence.epoch, fence.epoch + 1);
+    assert_eq!(state.plane.fence.progress, fence.progress + 1);
+    assert_eq!(state.plane.fence.selector, fence.selector + 1);
+    assert_eq!(state.queue.plane, state.plane);
+    let after = state.clone();
+    assert_eq!(
+        state.apply(
+            &fence,
+            "gc-owner",
+            "root:global",
+            1,
+            &graph,
+            &["root:global"]
+        ),
+        Err(AuthError::StaleEpoch)
+    );
+    assert_eq!(state, after);
 }
 
 #[test]
@@ -677,9 +1092,30 @@ fn graph_corruption_missing_wrong_kind_substitution_cycle_and_stale_owner_fail_c
         .expect("payload")
         .refs
         .push("root:global".into());
+    let cyclic_payload = cyclic
+        .objects
+        .objects
+        .get_mut("payload:global")
+        .expect("payload");
+    cyclic_payload.fingerprint = object_fingerprint(
+        cyclic_payload.kind,
+        &cyclic_payload.refs,
+        &cyclic_payload.body,
+    );
     assert_eq!(
         cyclic.authenticate_global(7, "owner-a"),
         Err(AuthError::Cycle)
+    );
+    let mut corrupted_body = valid_graph();
+    corrupted_body
+        .objects
+        .objects
+        .get_mut("node:global")
+        .expect("node")
+        .body = b"substituted".to_vec();
+    assert_eq!(
+        corrupted_body.authenticate_global(7, "owner-a"),
+        Err(AuthError::Integrity)
     );
     assert_eq!(
         valid_graph().authenticate_global(8, "owner-a"),
@@ -723,10 +1159,7 @@ fn publication_first_gc_first_stale_epoch_and_owner_fences_fail_closed() {
 #[test]
 fn retireable_65_entry_queue_drains_64_then_suffix_exactly() {
     let entries = (0..65)
-        .map(|index| QueueEntry {
-            object: format!("root-{index:02}"),
-            blocked: false,
-        })
+        .map(|index| QueueEntry::new(&format!("root-{index:02}"), false))
         .collect();
     let mut queue = QueueState::new(entries);
     assert_eq!(
@@ -757,14 +1190,8 @@ fn retireable_65_entry_queue_drains_64_then_suffix_exactly() {
 #[test]
 fn blocked_head_keeps_one_debt_without_spin_and_releases_at_safe_point() {
     let mut queue = QueueState::new(vec![
-        QueueEntry {
-            object: "blocked-source".into(),
-            blocked: true,
-        },
-        QueueEntry {
-            object: "released-suffix".into(),
-            blocked: false,
-        },
+        QueueEntry::new("blocked-source", true),
+        QueueEntry::new("released-suffix", false),
     ]);
     assert_eq!(
         queue.process(64),
@@ -785,31 +1212,41 @@ fn blocked_head_keeps_one_debt_without_spin_and_releases_at_safe_point() {
 #[test]
 fn poisoned_view_releases_only_its_pin_and_cursor_restart_is_exclusive() {
     let mut readers = ReaderPins::new();
-    let first = readers.begin_read("root:global");
-    let second = readers.begin_read("root:global");
+    let first = readers.begin_read("owner-a", "root:global");
+    let second = readers.begin_read("owner-b", "root:global");
     assert_eq!(readers.pin_count("root:global"), 2);
     let cursor = Cursor {
+        owner: "owner-b".into(),
         read_id: second.id,
         last_key: None,
     };
     assert_eq!(readers.resume(&cursor), Ok("<start>".into()));
     assert_eq!(
-        readers.poison(first.id, "row-09"),
+        readers.poison("owner-a", first.id, "row-09"),
         Err(ReadError::Malformed)
     );
     assert_eq!(readers.pin_count("root:global"), 1);
     assert_eq!(readers.resume(&cursor), Ok("<start>".into()));
-    let fresh = readers.begin_read("root:global");
+    assert_eq!(
+        readers.close("owner-a", second.id),
+        Err(ReadError::OwnerMismatch)
+    );
+    let fresh = readers.begin_read("owner-a", "root:global");
     assert_eq!(
         readers.resume(&Cursor {
+            owner: "owner-a".into(),
             read_id: fresh.id,
             last_key: Some("row-09".into()),
         }),
         Err(ReadError::InvalidCursor)
     );
-    readers.close(second.id).expect("second view closes");
+    readers
+        .close("owner-b", second.id)
+        .expect("second view closes");
     assert_eq!(readers.pin_count("root:global"), 1);
-    readers.close(fresh.id).expect("fresh view closes");
+    readers
+        .close("owner-a", fresh.id)
+        .expect("fresh view closes");
     assert_eq!(readers.pin_count("root:global"), 0);
 }
 
@@ -831,39 +1268,37 @@ fn uploads_shared_and_final_roots_reclaim_only_after_last_owner_release() {
     roots.retain("root:shared", "branch");
     roots.retain("root:shared", "upload");
     roots.retain("root:final", "branch");
-    roots.release("root:shared", "branch");
+    roots
+        .release("root:shared", "branch")
+        .expect("branch release");
     assert_eq!(roots.reclaim_released(), 0);
-    roots.release("root:shared", "upload");
+    assert_eq!(
+        roots.release("root:shared", "other"),
+        Err(AuthError::OwnerMismatch)
+    );
+    roots
+        .release("root:shared", "upload")
+        .expect("upload release");
     assert_eq!(roots.reclaim_released(), 1);
-    roots.release("root:final", "branch");
+    roots
+        .release("root:final", "branch")
+        .expect("final release");
     assert_eq!(roots.reclaim_released(), 1);
 }
 
 #[test]
 fn cold_reopen_reauthenticates_persisted_queue_and_fence() {
     let mut queue = QueueState::new(vec![
-        QueueEntry {
-            object: "reopen-root".into(),
-            blocked: false,
-        },
-        QueueEntry {
-            object: "reopen-tail".into(),
-            blocked: false,
-        },
+        QueueEntry::new("reopen-root", false),
+        QueueEntry::new("reopen-tail", false),
     ]);
     assert_eq!(queue.process(1).reclaimed, 1);
     let encoded = queue.persist();
     let reopened = QueueState::reopen(
         &encoded,
         vec![
-            QueueEntry {
-                object: "reopen-root".into(),
-                blocked: false,
-            },
-            QueueEntry {
-                object: "reopen-tail".into(),
-                blocked: false,
-            },
+            QueueEntry::new("reopen-root", false),
+            QueueEntry::new("reopen-tail", false),
         ],
     )
     .expect("authenticated persisted queue");

@@ -1,7 +1,9 @@
-# W5/R7 GC and reachability oracle — e1af rebind
+# W5/R7 GC and reachability oracle — e1af structural correction
 
-Status: **TEST/REPORT-ONLY EXPECTED-RED PACKAGE FROZEN**. No production
-source, Cargo, adapter, runtime, benchmark, PR, or merge action is included.
+Status: **TEST/REPORT-ONLY EXPECTED-RED CORRECTION**. This is a direct
+successor to the immutable `5850b4b9a40540dd027ef95a3b1139f262efd76d` package.
+No production source, Cargo, adapter, runtime, benchmark, PR, or merge action
+is included.
 
 ## Exact source anchor
 
@@ -80,12 +82,15 @@ The pure W5/R7 model and future adapter gate must preserve:
 No second root authority, compatibility reader, fallback, cache, raw
 `StorageSpace` forge, or independent writer is accepted.
 
-## Standalone model and candidate-parametric source gate
+## Strengthened model and candidate-parametric source gate
 
 `w5_r7_e1af_readiness_model.rs` is the executable model for the selector,
-authenticated object graph, owner-bound fence, queue, pin, root-owner, and
-cold-reopen controls. It is independent of Lix production and must compile
-with warnings denied before any adapter gate.
+authenticated object graph, transitive H/S/C roots, owner-bound fence,
+authenticated queue identity/order, owner+view-scoped pins, root owners,
+atomic publication/GC state, and cold-reopen controls. Corruption is bound to
+object and queue fingerprints; failed graph, queue, fence, or root validation
+must leave the complete staged state unchanged. It is independent of Lix
+production and must compile with warnings denied before any adapter gate.
 
 ```sh
 timeout 1200 rustc --edition=2021 --test -D warnings \
@@ -95,17 +100,34 @@ timeout 1200 /tmp/w5-r7-e1af-readiness-model --nocapture --test-threads=1
 ```
 
 The verifier is cwd-independent and takes a candidate target and exact e1af
-anchor. Exact e1af is intentionally RED; a future candidate can reach GREEN
-only when its whole `packages/lix/src` scope has no forbidden legacy/fallback/
-second-authority residues and retains the required ForkTree owner symbols:
+anchor. It now performs a candidate-parametric structural check over the full
+allowed production closure, rejects changed paths outside that closure, and
+extracts operation bodies to require:
+
+- typed `OBJECT_SPACE` and `SELECTOR_SPACE` declarations plus the ForkTree
+  `CoherentView` and `PreparedPublication` owners;
+- exactly one retained coherent-read construction per publication/GC operation,
+  with selector, queue, mark, upload, and object use through that read;
+- exactly one `into_storage_plan`, one transaction `prepare_write_set`, one
+  transaction `.commit`, and no direct `PreparedPublication::commit`;
+- exact positional owner/epoch/progress/selector CAS arguments; and
+- rejection of fallback/cache/alternate/second-reader aliases and second
+  authority declarations.
+
+The structural fixtures include one genuine GREEN operation and three
+discriminating RED cases for a second read, a second writer, and a fallback
+reader alias:
 
 ```sh
 timeout 1200 bash test-report/forktree-w5-r7-e1af-rebind/verify_e1af_rebind.sh \
   <repo-root> <candidate-or-e1af> e1af471b9ab0f598dafa7c2ddec7867667c81740
+
+timeout 1200 bash test-report/forktree-w5-r7-e1af-rebind/run_structural_fixtures.sh
 ```
 
 The baseline `SOURCE_RED.log` remains bound to the exact e1af residue count;
-it is not used to mask candidate results.
+it is not used to mask candidate results. The old controls remain exact: e1af
+prints RED 168 and the unchanged 5850 candidate prints RED 384.
 
 ## Dormant first-runnable order
 
