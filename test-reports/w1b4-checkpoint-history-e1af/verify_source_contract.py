@@ -13,6 +13,7 @@ import argparse
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -24,6 +25,7 @@ ALLOWLIST = {
     "packages/lix/src/sql2/providers/checkpoint.rs",
     "packages/lix/src/transaction/context.rs",
 }
+PACKAGE_PREFIX = "test-reports/w1b4-checkpoint-history-e1af/"
 LEGACY_RE = re.compile(r"\b(?:TrackedStateStoreReader|tracked_state_reader)\b")
 
 
@@ -235,13 +237,26 @@ def structural_checkpoint_check(source: str, label: str) -> list[str]:
 
 def static_source_check(root: Path, base: str, target: str) -> list[str]:
     errors: list[str] = []
+    if base != ANCHOR:
+        errors.append(f"base is not exact e1af anchor: {base}")
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ANCHOR, target],
+        cwd=root,
+        check=False,
+    )
+    if ancestry.returncode != 0:
+        errors.append("target is not descended from exact e1af anchor")
     changed = []
     for line in git(root, "diff", "--name-status", "--find-renames", base, target).splitlines():
         if not line:
             continue
         fields = line.split("\t")
         changed.extend(fields[1:] if fields[0].startswith("R") else fields[1:2])
-    out_of_scope = sorted(set(changed) - ALLOWLIST)
+    out_of_scope = sorted(
+        path
+        for path in set(changed)
+        if path not in ALLOWLIST and not path.startswith(PACKAGE_PREFIX)
+    )
     if out_of_scope:
         errors.append("out-of-scope changed paths: " + ", ".join(out_of_scope))
 
@@ -292,17 +307,42 @@ def static_source_check(root: Path, base: str, target: str) -> list[str]:
 
 
 def self_test(fixtures: Path) -> None:
-    expected = {"shared.rs": True}
-    for name, should_pass in expected.items():
-        errors = structural_checkpoint_check((fixtures / name).read_text(), name)
-        if bool(errors) != (not should_pass):
-            raise VerificationError(f"fixture {name} unexpected result: {errors}")
-    for path in sorted(fixtures.glob("negative_*.rs")):
-        errors = structural_checkpoint_check(path.read_text(), path.name)
-        if not errors:
-            raise VerificationError(f"negative fixture unexpectedly passed: {path.name}")
-        print(f"FIXTURE_REJECT={path.name}")
-    print("FIXTURE_SHARED=shared.rs PASS")
+    fixture = fixtures / "structural_fixtures.rs"
+    if not fixture.is_file():
+        raise VerificationError(f"compiled fixture is absent: {fixture}")
+    with tempfile.TemporaryDirectory(prefix="w1b4-structural-fixture-") as directory:
+        binary = Path(directory) / "structural-fixtures"
+        compile_result = subprocess.run(
+            [
+                "rustc",
+                "--edition=2024",
+                "--test",
+                "-D",
+                "warnings",
+                str(fixture),
+                "-o",
+                str(binary),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if compile_result.returncode:
+            raise VerificationError(
+                "compiled fixture failed: " + compile_result.stderr.strip()
+            )
+        run_result = subprocess.run(
+            [str(binary), "--nocapture", "--test-threads=1"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        print(run_result.stdout, end="")
+        if run_result.returncode:
+            raise VerificationError(
+                "compiled fixture tests failed: " + run_result.stderr.strip()
+            )
+    print("COMPILED_STRUCTURAL_FIXTURE=PASS")
 
 
 def main() -> int:

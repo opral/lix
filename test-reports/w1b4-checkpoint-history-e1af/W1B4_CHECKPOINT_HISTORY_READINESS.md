@@ -8,6 +8,9 @@ The package is anchored directly to `e1af471b9ab0f598dafa7c2ddec7867667c81740`
 TEST/REPORT-only. It is not an implementation and does not qualify an
 adapter.
 
+The v3 correction is bound to the independent blocker report SHA
+`87b94fe452eecaeea107c5e03b3311e06f192d1f06b5aa288e0ddea5a084fc78`.
+
 The current source already has a useful ForkTree checkpoint-history reader:
 `ForkTreeReadFacade::checkpoint_history_from_head` walks authenticated
 commit records through one retained read, treats the parentless root as an
@@ -95,9 +98,11 @@ same binding must receive both chronology and state-diff calls. The operation
 body cannot construct a fresh read/facade/graph, use a raw store, or route
 through a legacy reader/fallback/cache. `view.rs` and the checkpoint provider
 are checked for the authenticated marker/root and ForkTree-only authority
-contracts. The `--self-test` suite proves GREEN acceptance for the shared-view
-fixture and rejection for distinct views, mismatched receiver, fresh read,
-parallel graph authority, and partial chronology/diff scope.
+contracts. The `--self-test` suite compiles and runs the typed structural
+fixture with warnings denied. Its positive case proves one retained
+StorageRead/CoherentView/facade, a complete plan, and one atomic commit; five
+negative cases reject swapped aliases, fresh reads, raw/parallel graph
+authority, fallback/cache/compatibility, and incomplete/duplicate commits.
 
 The verifier does not claim that the current anchor is GREEN. The exact e1af
 source RED remains the frozen two-condition calibration, while a future child
@@ -113,7 +118,8 @@ The standalone model supplies five deterministic tests:
 - root implicit-checkpoint and absent/deleted non-root-marker controls.
 - null, malformed, wrong-branch, and substituted marker controls, plus missing,
   malformed, wrong-kind, and substituted root authority controls.
-- missing parent, generation gap, and cyclic parent controls.
+- missing parent, generation gap, duplicate/reordered parent, and cyclic
+  parent controls.
 - one-view/one-read provider use, rejection of a duplicated reader/view, and
   cold reopen with identical chronology and retained identities.
 
@@ -130,6 +136,15 @@ timeout 1200s rustc --edition=2024 --test -D warnings \
   test-reports/w1b4-checkpoint-history-e1af/checkpoint_history_oracle.rs \
   -o /tmp/w1b4-checkpoint-history-oracle
 timeout 1200s /tmp/w1b4-checkpoint-history-oracle --nocapture
+
+```
+
+Warnings-denied structural fixture:
+
+```sh
+timeout 1200s python3 \
+  test-reports/w1b4-checkpoint-history-e1af/verify_source_contract.py \
+  --self-test
 ```
 
 Future compile/test gate after the production slice is compiler-green:

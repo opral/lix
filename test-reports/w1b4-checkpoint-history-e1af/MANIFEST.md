@@ -12,19 +12,26 @@ one checkpoint operation. The future correction must bind chronology, state
 diff, undo/history retention, and checkpoint-floor decisions to one
 operation-owned facade/read.
 
+This direct v3 correction preserves the independent R2 blocker report binding:
+`87b94fe452eecaeea107c5e03b3311e06f192d1f06b5aa288e0ddea5a084fc78`.
+
 Files:
 
 - `W1B4_CHECKPOINT_HISTORY_READINESS.md`: contract, scope, call graph, and
   future gates.
 - `SOURCE_ALLOWLIST.md`: exact future production slice and forbidden paths.
-- `checkpoint_history_oracle.rs`: standalone model and five tests.
+- `checkpoint_history_oracle.rs`: standalone authenticated model and five
+  warnings-denied tests.
 - `verify_source_contract.sh` plus `verify_source_contract.py`: a
   candidate-parametric, whole-diff-scope, argument-aware source gate.
-- `fixtures/`: one GREEN shared-view fixture and five discriminating negative
-  fixtures for duplicate/mismatched/fresh/parallel/partial authorities.
+- `fixtures/structural_fixtures.rs`: one warnings-denied compiled harness
+  containing a positive one-read/one-plan/one-commit case and five executable
+  negative cases for swapped/mismatched/fresh/parallel/partial authorities.
+- `STRUCTURAL_FIXTURE_RUN.txt`: exact fixture source/binary/output hashes and
+  the verifier self-test result.
 - `EXPECTED_RED.txt`: captured verifier output for the immutable anchor.
 - `MODEL_RUN.txt`: standalone `rustc -D warnings` run and digest.
-- `SHA256SUMS`: package artifact hashes.
+- `SHA256SUMS`: package artifact hashes, excluding the checksum file itself.
 
 The model treats the checkpoint marker as an authenticated claim about the
 commit currently being walked. A root with no parent is an implicit
@@ -32,8 +39,10 @@ checkpoint; it is not inferred from an unrelated marker. A configured
 checkpoint floor is a retention boundary, not a truncation boundary: all
 walked commits remain available for history/undo replay.
 
-The verifier accepts `WORKTREE BASE_COMMIT TARGET_COMMIT`. It rejects every
-base..target path outside the future production allowlist, extracts the full
+The verifier accepts `WORKTREE BASE_COMMIT TARGET_COMMIT`. It requires exact
+e1af as the base and as an ancestor of the target, and rejects every
+base..target path outside the future production allowlist plus this package,
+extracts the full
 checkpoint-selection function with a comment/string-aware brace scanner, and
 requires one local facade binding to be the receiver of both chronology and
 state-diff calls. It rejects additional reads, graph readers, raw stores,

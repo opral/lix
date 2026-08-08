@@ -1,0 +1,21 @@
+W1B-4 compiled structural fixture run
+
+Command:
+  timeout 1200s rustc --edition=2024 --test -D warnings \
+    test-reports/w1b4-checkpoint-history-e1af/fixtures/structural_fixtures.rs \
+    -o /tmp/w1b4-v3-fixtures
+  timeout 1200s /tmp/w1b4-v3-fixtures --nocapture --test-threads=1
+
+Result:
+  5 passed; 0 failed; 0 ignored; 0 measured
+
+Source SHA-256:
+  a4a05e1ae2766329fd3e74f126d253219315d133809b92769f080b9fbe2c5acf
+Binary SHA-256:
+  185bca3cf7953f04910c59b8cdabad237dfa4dbc01396c82dc8a942831f02a66
+Direct output SHA-256:
+  0516b7c88b6d51b21e1427f78b0ab91f4fcbb7e9222b07cfbcc16332d6a7d40d
+
+The candidate-parametric verifier compiles and runs the same fixture under
+`python3 verify_source_contract.py --self-test`; its complete output SHA-256
+is `65ec1d36e1d0954e78c0aff5c272c08c489ee1067439da6ed70357c4535d4f84`.

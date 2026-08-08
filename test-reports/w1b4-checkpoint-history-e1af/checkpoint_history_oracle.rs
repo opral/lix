@@ -2,20 +2,86 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum Domain {
+    CommitCatalog,
+    CommitRecord,
+    CommitTopology,
+    CheckpointMarker,
+    StateRoot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ObjectId(String);
+
+fn object_id(domain: Domain, commit: &str) -> ObjectId {
+    ObjectId(format!("{:?}:{commit}", domain))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Authority {
-    Valid(String),
+enum Authority<T> {
+    Valid(T),
     Missing,
     Malformed,
     WrongKind,
-    IdentitySubstituted,
+    IdentitySubstituted(T),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParentEdge {
+    object: ObjectId,
+    commit: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommitCatalogEntry {
+    key: ObjectId,
+    record_object: ObjectId,
+    domain: Domain,
+    commit: String,
+    generation: u64,
+    parents: Vec<ParentEdge>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommitRecord {
+    object: ObjectId,
+    domain: Domain,
+    commit: String,
+    generation: u64,
+    parents: Vec<ParentEdge>,
+    payload_digest: String,
+    payload_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommitTopology {
+    object: ObjectId,
+    domain: Domain,
+    commit: String,
+    generation: u64,
+    parents: Vec<ParentEdge>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StateRoot {
+    object: ObjectId,
+    domain: Domain,
+    commit: String,
+    digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Marker {
     Absent,
     Deleted,
-    Checkpoint { branch: String, commit: String },
+    Checkpoint {
+        object: ObjectId,
+        branch: String,
+        commit: String,
+        root: ObjectId,
+        bytes: Vec<u8>,
+    },
     Null,
     Malformed,
     WrongBranch,
@@ -27,13 +93,28 @@ struct Commit {
     id: String,
     generation: u64,
     parents: Vec<String>,
-    root: Authority,
+    catalog: Authority<CommitCatalogEntry>,
+    record: Authority<CommitRecord>,
+    topology: Authority<CommitTopology>,
+    root: Authority<StateRoot>,
     marker: Marker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StorageRead {
+    id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoherentView {
+    read_id: u64,
+    view_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadLease {
-    view_id: u64,
+    read: StorageRead,
+    view: CoherentView,
     begin_reads: u32,
     reader_instances: u32,
     provider_reads: u32,
@@ -61,12 +142,16 @@ struct Reconstruction {
     checkpoint_floor: Option<String>,
     retained_for_history_undo: BTreeSet<String>,
     view_id: u64,
+    read_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Reject {
     ReadOwnership,
     MissingCommit(String),
+    Catalog(String),
+    Record(String),
+    Topology(String),
     RootAuthority(String),
     RootIdentity(String),
     MarkerNull(String),
@@ -74,50 +159,206 @@ enum Reject {
     MarkerBranch(String),
     MarkerIdentity(String),
     Generation(String),
+    DuplicateParent(String),
+    ParentOrder(String),
     Cycle(String),
     FloorMissing(String),
     Depth,
 }
 
+fn parent_edges(parents: &[String]) -> Vec<ParentEdge> {
+    parents
+        .iter()
+        .map(|parent| ParentEdge {
+            object: object_id(Domain::CommitRecord, parent),
+            commit: parent.clone(),
+        })
+        .collect()
+}
+
+fn marker_bytes(branch: &str, commit: &str, root: &ObjectId) -> Vec<u8> {
+    format!("marker:{branch}:{commit}:{}", root.0).into_bytes()
+}
+
+fn record_payload_bytes(commit: &str) -> Vec<u8> {
+    format!("record:{commit}").into_bytes()
+}
+
+fn checkpoint_marker(branch: &str, commit: &str) -> Marker {
+    let root = object_id(Domain::StateRoot, commit);
+    Marker::Checkpoint {
+        object: object_id(Domain::CheckpointMarker, commit),
+        branch: branch.to_owned(),
+        commit: commit.to_owned(),
+        root: root.clone(),
+        bytes: marker_bytes(branch, commit, &root),
+    }
+}
+
 fn valid_commit(id: &str, generation: u64, parents: Vec<String>, marker: Marker) -> Commit {
+    let edges = parent_edges(&parents);
     Commit {
         id: id.to_owned(),
         generation,
         parents,
-        root: Authority::Valid(format!("root:{id}")),
+        catalog: Authority::Valid(CommitCatalogEntry {
+            key: object_id(Domain::CommitCatalog, id),
+            record_object: object_id(Domain::CommitRecord, id),
+            domain: Domain::CommitCatalog,
+            commit: id.to_owned(),
+            generation,
+            parents: edges.clone(),
+        }),
+        record: Authority::Valid(CommitRecord {
+            object: object_id(Domain::CommitRecord, id),
+            domain: Domain::CommitRecord,
+            commit: id.to_owned(),
+            generation,
+            parents: edges.clone(),
+            payload_digest: format!("payload:{id}"),
+            payload_bytes: record_payload_bytes(id),
+        }),
+        topology: Authority::Valid(CommitTopology {
+            object: object_id(Domain::CommitTopology, id),
+            domain: Domain::CommitTopology,
+            commit: id.to_owned(),
+            generation,
+            parents: edges,
+        }),
+        root: Authority::Valid(StateRoot {
+            object: object_id(Domain::StateRoot, id),
+            domain: Domain::StateRoot,
+            commit: id.to_owned(),
+            digest: format!("root:{id}"),
+        }),
         marker,
     }
 }
 
 fn validate_read(lease: &ReadLease) -> Result<(), Reject> {
-    if lease.begin_reads != 1 || lease.reader_instances != 1 || lease.provider_reads != 0 {
+    if lease.begin_reads != 1
+        || lease.reader_instances != 1
+        || lease.provider_reads != 0
+        || lease.view.read_id != lease.read.id
+    {
         return Err(Reject::ReadOwnership);
     }
     Ok(())
 }
 
-fn validate_root(commit: &Commit) -> Result<(), Reject> {
-    match &commit.root {
-        Authority::Valid(root) if root == &format!("root:{}", commit.id) => Ok(()),
-        Authority::Valid(_) | Authority::IdentitySubstituted => {
-            Err(Reject::RootIdentity(commit.id.clone()))
-        }
-        Authority::Missing | Authority::Malformed | Authority::WrongKind => {
-            Err(Reject::RootAuthority(commit.id.clone()))
+fn validate_edges(commit: &Commit) -> Result<(), Reject> {
+    let expected = parent_edges(&commit.parents);
+    let authorities = [
+        match &commit.catalog {
+            Authority::Valid(value) => &value.parents,
+            _ => return Err(Reject::Catalog(commit.id.clone())),
+        },
+        match &commit.record {
+            Authority::Valid(value) => &value.parents,
+            _ => return Err(Reject::Record(commit.id.clone())),
+        },
+        match &commit.topology {
+            Authority::Valid(value) => &value.parents,
+            _ => return Err(Reject::Topology(commit.id.clone())),
+        },
+    ];
+    let mut unique = BTreeSet::new();
+    for edge in &expected {
+        if !unique.insert(edge.commit.clone()) {
+            return Err(Reject::DuplicateParent(commit.id.clone()));
         }
     }
+    for actual in authorities {
+        if actual.len() != expected.len() {
+            return Err(Reject::ParentOrder(commit.id.clone()));
+        }
+        if actual != &expected {
+            return Err(Reject::ParentOrder(commit.id.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit(map_key: &str, commit: &Commit) -> Result<(), Reject> {
+    if map_key != commit.id {
+        return Err(Reject::Catalog(commit.id.clone()));
+    }
+    let expected_catalog = object_id(Domain::CommitCatalog, &commit.id);
+    let expected_record = object_id(Domain::CommitRecord, &commit.id);
+    let expected_topology = object_id(Domain::CommitTopology, &commit.id);
+    let expected_root = object_id(Domain::StateRoot, &commit.id);
+    match &commit.catalog {
+        Authority::Valid(value)
+            if value.key == expected_catalog
+                && value.record_object == expected_record
+                && value.domain == Domain::CommitCatalog
+                && value.commit == commit.id
+                && value.generation == commit.generation => {}
+        _ => return Err(Reject::Catalog(commit.id.clone())),
+    }
+    match &commit.record {
+        Authority::Valid(value)
+            if value.object == expected_record
+                && value.domain == Domain::CommitRecord
+                && value.commit == commit.id
+                && value.generation == commit.generation
+                && value.payload_digest == format!("payload:{}", commit.id)
+                && value.payload_bytes == record_payload_bytes(&commit.id) => {}
+        _ => return Err(Reject::Record(commit.id.clone())),
+    }
+    match &commit.topology {
+        Authority::Valid(value)
+            if value.object == expected_topology
+                && value.domain == Domain::CommitTopology
+                && value.commit == commit.id
+                && value.generation == commit.generation => {}
+        _ => return Err(Reject::Topology(commit.id.clone())),
+    }
+    match &commit.root {
+        Authority::Valid(value)
+            if value.object == expected_root
+                && value.domain == Domain::StateRoot
+                && value.commit == commit.id
+                && value.digest == format!("root:{}", commit.id) => {}
+        Authority::Valid(_) | Authority::IdentitySubstituted(_) => {
+            return Err(Reject::RootIdentity(commit.id.clone()));
+        }
+        Authority::Missing | Authority::Malformed | Authority::WrongKind => {
+            return Err(Reject::RootAuthority(commit.id.clone()));
+        }
+    }
+    validate_edges(commit)
 }
 
 fn validate_marker(commit: &Commit, branch: &str) -> Result<bool, Reject> {
+    let expected_root = object_id(Domain::StateRoot, &commit.id);
+    let expected_marker = object_id(Domain::CheckpointMarker, &commit.id);
     match &commit.marker {
+        Marker::Absent | Marker::Deleted if commit.parents.is_empty() => Ok(false),
         Marker::Absent | Marker::Deleted => Ok(false),
         Marker::Checkpoint {
+            object,
             branch: marker_branch,
             commit: marker_commit,
-        } if marker_branch == branch && marker_commit == &commit.id => Ok(true),
-        Marker::Checkpoint { .. } | Marker::WrongBranch => {
-            Err(Reject::MarkerBranch(commit.id.clone()))
+            root,
+            bytes,
+        } => {
+            if object != &expected_marker
+                || marker_commit != &commit.id
+                || root != &expected_root
+                || bytes != &marker_bytes(branch, &commit.id, &expected_root)
+            {
+                return Err(Reject::MarkerIdentity(commit.id.clone()));
+            }
+            if marker_branch != branch {
+                return Err(Reject::MarkerBranch(commit.id.clone()));
+            }
+            if commit.parents.is_empty() {
+                return Err(Reject::MarkerIdentity(commit.id.clone()));
+            }
+            Ok(true)
         }
+        Marker::WrongBranch => Err(Reject::MarkerBranch(commit.id.clone())),
         Marker::IdentitySubstituted => Err(Reject::MarkerIdentity(commit.id.clone())),
         Marker::Null => Err(Reject::MarkerNull(commit.id.clone())),
         Marker::Malformed => Err(Reject::MarkerMalformed(commit.id.clone())),
@@ -143,7 +384,7 @@ fn reconstruct(graph: &Graph, lease: &ReadLease) -> Result<Reconstruction, Rejec
             .commits
             .get(&commit_id)
             .ok_or_else(|| Reject::MissingCommit(commit_id.clone()))?;
-        validate_root(commit)?;
+        validate_commit(&commit_id, commit)?;
         if commit.parents.is_empty() {
             if commit.generation != 0 {
                 return Err(Reject::Generation(commit.id.clone()));
@@ -154,7 +395,8 @@ fn reconstruct(graph: &Graph, lease: &ReadLease) -> Result<Reconstruction, Rejec
                 .commits
                 .get(parent_id)
                 .ok_or_else(|| Reject::MissingCommit(parent_id.clone()))?;
-            if commit.generation != parent.generation.saturating_add(1) {
+            validate_commit(parent_id, parent)?;
+            if commit.generation != parent.generation.checked_add(1).unwrap_or(u64::MAX) {
                 return Err(Reject::Generation(commit.id.clone()));
             }
         }
@@ -181,7 +423,8 @@ fn reconstruct(graph: &Graph, lease: &ReadLease) -> Result<Reconstruction, Rejec
         entries,
         checkpoint_floor: graph.checkpoint_floor.clone(),
         retained_for_history_undo: retained,
-        view_id: lease.view_id,
+        view_id: lease.view.view_id,
+        read_id: lease.read.id,
     })
 }
 
@@ -218,13 +461,10 @@ fn rotations(count: usize) -> Graph {
     let mut parent = root;
     for index in 1..count {
         let id = format!("c{index:03}");
-        let marker = Marker::Checkpoint {
-            branch: "main".to_owned(),
-            commit: id.clone(),
-        };
+        let marker = checkpoint_marker("main", &id);
         commits.insert(
             id.clone(),
-            valid_commit(&id, index as u64, vec![parent], marker),
+            valid_commit(&id, index as u64, vec![parent.clone()], marker),
         );
         parent = id;
     }
@@ -236,9 +476,53 @@ fn rotations(count: usize) -> Graph {
     }
 }
 
+fn two_parent_graph() -> Graph {
+    let mut commits = BTreeMap::new();
+    commits.insert(
+        "c000".to_owned(),
+        valid_commit("c000", 0, Vec::new(), Marker::Absent),
+    );
+    commits.insert(
+        "s000".to_owned(),
+        valid_commit("s000", 0, Vec::new(), Marker::Absent),
+    );
+    commits.insert(
+        "c001".to_owned(),
+        valid_commit(
+            "c001",
+            1,
+            vec!["c000".to_owned(), "s000".to_owned()],
+            checkpoint_marker("main", "c001"),
+        ),
+    );
+    Graph {
+        commits,
+        head: "c001".to_owned(),
+        branch: "main".to_owned(),
+        checkpoint_floor: None,
+    }
+}
+
+fn set_authority_generation(commit: &mut Commit, generation: u64) {
+    commit.generation = generation;
+    if let Authority::Valid(value) = &mut commit.catalog {
+        value.generation = generation;
+    }
+    if let Authority::Valid(value) = &mut commit.record {
+        value.generation = generation;
+    }
+    if let Authority::Valid(value) = &mut commit.topology {
+        value.generation = generation;
+    }
+}
+
 fn lease(view_id: u64) -> ReadLease {
     ReadLease {
-        view_id,
+        read: StorageRead { id: 1 },
+        view: CoherentView {
+            read_id: 1,
+            view_id,
+        },
         begin_reads: 1,
         reader_instances: 1,
         provider_reads: 0,
@@ -262,6 +546,7 @@ fn sixty_five_rotations_keep_floor_separate_and_retain_history_undo() {
     assert_eq!(reconstruction.checkpoint_floor.as_deref(), Some("c032"));
     assert_eq!(reconstruction.retained_for_history_undo.len(), 65);
     assert_eq!(reconstruction.view_id, 7);
+    assert_eq!(reconstruction.read_id, 1);
     assert_eq!(operation.undo_redo_retention().unwrap().len(), 65);
 }
 
@@ -277,7 +562,7 @@ fn root_is_implicit_and_absent_or_deleted_non_root_markers_are_not_checkpoints()
 }
 
 #[test]
-fn marker_and_root_corruption_fail_closed_before_history_output() {
+fn marker_root_catalog_record_and_topology_corruption_fail_closed_before_output() {
     let marker_cases = [
         Marker::Null,
         Marker::Malformed,
@@ -290,45 +575,104 @@ fn marker_and_root_corruption_fail_closed_before_history_output() {
         graph.commits.get_mut("c001").unwrap().marker = marker;
         assert!(reconstruct(&graph, &lease(9)).is_err());
     }
-    let root_cases = [
+    let mut marker_bytes = rotations(2);
+    marker_bytes.checkpoint_floor = None;
+    if let Marker::Checkpoint { bytes, .. } =
+        &mut marker_bytes.commits.get_mut("c001").unwrap().marker
+    {
+        *bytes = b"tampered-marker".to_vec();
+    }
+    assert!(matches!(
+        reconstruct(&marker_bytes, &lease(9)),
+        Err(Reject::MarkerIdentity(_))
+    ));
+    for authority in [
         Authority::Missing,
         Authority::Malformed,
         Authority::WrongKind,
-        Authority::IdentitySubstituted,
-    ];
-    for authority in root_cases {
+        Authority::IdentitySubstituted(StateRoot {
+            object: object_id(Domain::StateRoot, "substituted"),
+            domain: Domain::StateRoot,
+            commit: "substituted".to_owned(),
+            digest: "root:substituted".to_owned(),
+        }),
+    ] {
         let mut graph = rotations(2);
         graph.checkpoint_floor = None;
         graph.commits.get_mut("c001").unwrap().root = authority;
         assert!(reconstruct(&graph, &lease(10)).is_err());
     }
+    let mut graph = rotations(2);
+    graph.checkpoint_floor = None;
+    graph.commits.get_mut("c001").unwrap().record = Authority::WrongKind;
+    assert!(matches!(
+        reconstruct(&graph, &lease(10)),
+        Err(Reject::Record(_))
+    ));
+    let mut graph = rotations(2);
+    graph.checkpoint_floor = None;
+    if let Authority::Valid(record) = &mut graph.commits.get_mut("c001").unwrap().record {
+        record.payload_bytes = b"tampered-record".to_vec();
+    }
+    assert!(matches!(
+        reconstruct(&graph, &lease(10)),
+        Err(Reject::Record(_))
+    ));
+    let mut graph = rotations(2);
+    graph.checkpoint_floor = None;
+    graph.commits.get_mut("c001").unwrap().catalog = Authority::Missing;
+    assert!(matches!(
+        reconstruct(&graph, &lease(10)),
+        Err(Reject::Catalog(_))
+    ));
+    let mut graph = rotations(2);
+    graph.checkpoint_floor = None;
+    graph.commits.get_mut("c001").unwrap().topology = Authority::Malformed;
+    assert!(matches!(
+        reconstruct(&graph, &lease(10)),
+        Err(Reject::Topology(_))
+    ));
 }
 
 #[test]
-fn missing_parent_generation_gap_and_cycle_fail_closed() {
+fn missing_parent_generation_duplicate_order_and_cycle_fail_closed() {
     let mut missing = rotations(2);
     missing.checkpoint_floor = None;
-    missing.commits.get_mut("c001").unwrap().parents = vec!["missing".to_owned()];
+    missing.commits.remove("c000");
     assert_eq!(
         reconstruct(&missing, &lease(11)),
-        Err(Reject::MissingCommit("missing".to_owned()))
+        Err(Reject::MissingCommit("c000".to_owned()))
     );
 
     let mut generation = rotations(2);
     generation.checkpoint_floor = None;
-    generation.commits.get_mut("c001").unwrap().generation = 9;
+    set_authority_generation(generation.commits.get_mut("c001").unwrap(), 9);
     assert!(matches!(
         reconstruct(&generation, &lease(12)),
         Err(Reject::Generation(_))
     ));
 
+    let mut duplicate = rotations(2);
+    duplicate.checkpoint_floor = None;
+    duplicate.commits.get_mut("c001").unwrap().parents = vec!["c000".to_owned(), "c000".to_owned()];
+    assert!(matches!(
+        reconstruct(&duplicate, &lease(12)),
+        Err(Reject::DuplicateParent(_))
+    ));
+
     let mut cycle = rotations(3);
     cycle.checkpoint_floor = None;
     cycle.commits.get_mut("c000").unwrap().parents = vec!["c002".to_owned()];
-    cycle.commits.get_mut("c000").unwrap().generation = 3;
+    assert!(reconstruct(&cycle, &lease(13)).is_err());
+
+    let mut reordered = two_parent_graph();
+    let record = reordered.commits.get_mut("c001").unwrap();
+    if let Authority::Valid(value) = &mut record.record {
+        value.parents.reverse();
+    }
     assert!(matches!(
-        reconstruct(&cycle, &lease(13)),
-        Err(Reject::Cycle(_) | Reject::Generation(_))
+        reconstruct(&reordered, &lease(13)),
+        Err(Reject::ParentOrder(_))
     ));
 }
 
@@ -347,7 +691,11 @@ fn cold_reopen_is_identical_and_second_reader_or_provider_read_is_rejected() {
     assert_eq!(first, second);
 
     let duplicate_reader = ReadLease {
-        view_id: 15,
+        read: StorageRead { id: 2 },
+        view: CoherentView {
+            read_id: 2,
+            view_id: 15,
+        },
         begin_reads: 2,
         reader_instances: 2,
         provider_reads: 0,
@@ -358,7 +706,11 @@ fn cold_reopen_is_identical_and_second_reader_or_provider_read_is_rejected() {
     ));
 
     let provider_refresh = ReadLease {
-        view_id: 16,
+        read: StorageRead { id: 1 },
+        view: CoherentView {
+            read_id: 1,
+            view_id: 16,
+        },
         begin_reads: 1,
         reader_instances: 1,
         provider_reads: 1,
