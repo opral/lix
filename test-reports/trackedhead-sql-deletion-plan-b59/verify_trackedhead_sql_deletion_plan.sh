@@ -7,15 +7,56 @@ if test "$#" -ne 0; then
 fi
 ROOT="$(pwd -P)"
 ANCHOR="b59e1f11a51153e0a787a81f0f25bf104d150aaf"
-ORACLE="1d9c47728377c6ec7d2646704d51f3aadb11c773"
+ORACLE="33aa59975808099dfb5e9ca675a1633d713dccf3"
+ORACLE_TREE="1ced701e3351af59c48dce75731947dcd1606f3e"
+ORACLE_PARENT="1d9c47728377c6ec7d2646704d51f3aadb11c773"
+ORACLE_DIFF="31b9374a14846f5e082d193296f6eb33255e667d5775c041a876077fc7952194"
+ORACLE_PATCH="d4d96f33fa535171d20e32e1b859ee1b58000cb7"
+ORACLE_PACKAGE="f54422520ea2ac7c47427d0e57f95ea6392b990e6e1861a31d6ae7848f509556"
+MANIFEST="$ROOT/test-reports/trackedhead-sql-deletion-plan-b59/MANIFEST.json"
 
 cd "$ROOT"
 git rev-parse --is-inside-work-tree >/dev/null
 git merge-base --is-ancestor "$ANCHOR" HEAD
-git merge-base --is-ancestor "$ORACLE" HEAD
 
 status=0
 say() { printf '%s\n' "$*"; }
+metadata() {
+  needle="$1"
+  if ! rg -n -F -- "$needle" "$MANIFEST" >/dev/null; then
+    say "MISSING_ORACLE_METADATA $needle"
+    status=1
+  fi
+}
+
+if ! git cat-file -e "${ORACLE}^{commit}"; then
+  say "MISSING_ORACLE_OBJECT $ORACLE"
+  status=1
+else
+  actual_tree="$(git rev-parse "${ORACLE}^{tree}")"
+  actual_parent="$(git rev-list --parents -n1 "$ORACLE")"
+  if test "$actual_tree" != "$ORACLE_TREE"; then
+    say "ORACLE_TREE_MISMATCH expected=$ORACLE_TREE actual=$actual_tree"
+    status=1
+  fi
+  if test "$actual_parent" != "$ORACLE $ORACLE_PARENT"; then
+    say "ORACLE_PARENT_MISMATCH expected='$ORACLE $ORACLE_PARENT' actual='$actual_parent'"
+    status=1
+  fi
+fi
+
+metadata '"corruption_oracle_v3"'
+metadata "\"commit\": \"$ORACLE\""
+metadata "\"tree\": \"$ORACLE_TREE\""
+metadata "\"parent\": \"$ORACLE_PARENT\""
+metadata "\"full_index_binary_diff\": \"$ORACLE_DIFF\""
+metadata "\"stable_patch_id\": \"$ORACLE_PATCH\""
+metadata "\"package_sha256sums\": \"$ORACLE_PACKAGE\""
+metadata '"case_count": 24'
+for domain in StateRoot GlobalSelector BranchSelector CommitCatalog ChangeCatalog CheckpointRoot; do
+  metadata "\"$domain\""
+done
+
 zero() {
   needle="$1"
   tmp="$ROOT/.trackedhead-plan-residue.$$"

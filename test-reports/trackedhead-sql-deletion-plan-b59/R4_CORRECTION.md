@@ -19,12 +19,12 @@ and history consumer has a concrete ForkTree migration owner or a typed
 fail-closed deletion outcome. A retain-blocker without one of those actions is
 not accepted.
 
-The verifier now has no parameters. It always checks the fixed b59 and v2
-anchors and rejects branch-control, stage-writer, mutation-revision, and
-tracked-state-manifest residues. The required order places the selector/epoch
-control fence first, reader migrations next, mutation-revision deletion after
-its observers move, and physical owner deletion before the first accepted
-compile.
+The verifier now has no parameters. It always checks the fixed b59 anchor and
+the exact approved six-domain v3 corruption oracle, and rejects branch-control,
+stage-writer, mutation-revision, and tracked-state-manifest residues. The
+required order places the selector/epoch control fence first, reader migrations
+next, mutation-revision deletion after its observers move, and physical owner
+deletion before the first accepted compile.
 
 The independently frozen corruption discriminator is bound as R4 head
 7ff277c297e93eba83da09bf12f83d6485a8458b, tree

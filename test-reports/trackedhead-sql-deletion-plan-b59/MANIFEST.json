@@ -5,21 +5,23 @@
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24"
   },
-  "oracle_v2": {
-    "commit": "1d9c47728377c6ec7d2646704d51f3aadb11c773",
-    "tree": "df2a373a1c0e7917f4abbd167c7659efd1c3e6a1",
-    "parent": "422319cca0dad82525ab840d157aba5be49b09f0",
-    "normalized_b59_red": "f8e3c11af5fa5fe3c35973a727ad31bbfed9e27b4908b23d907ebbdc71d12867",
-    "model_binary": "5d9c6a9e5d20de07a55465ba8e267a9ec708185f46e6a4e96b7879662b6a3abf",
-    "model_log": "176e4c840641415c4354591c3fd8d20169c0a8b4cb4131f6b3e6d933ac61925f"
-  },
-  "oracle_v3": {
+  "corruption_oracle_v3": {
     "commit": "33aa59975808099dfb5e9ca675a1633d713dccf3",
     "tree": "1ced701e3351af59c48dce75731947dcd1606f3e",
     "parent": "1d9c47728377c6ec7d2646704d51f3aadb11c773",
     "full_index_binary_diff": "31b9374a14846f5e082d193296f6eb33255e667d5775c041a876077fc7952194",
     "stable_patch_id": "d4d96f33fa535171d20e32e1b859ee1b58000cb7",
-    "package_sha256sums": "f54422520ea2ac7c47427d0e57f95ea6392b990e6e1861a31d6ae7848f509556"
+    "package_sha256sums": "f54422520ea2ac7c47427d0e57f95ea6392b990e6e1861a31d6ae7848f509556",
+    "case_count": 24,
+    "domains": [
+      "StateRoot",
+      "GlobalSelector",
+      "BranchSelector",
+      "CommitCatalog",
+      "ChangeCatalog",
+      "CheckpointRoot"
+    ],
+    "required_result": "one retained view/read followed by zero plan/write/commit/selector rotation"
   },
   "r4_correction": {
     "head": "7ff277c297e93eba83da09bf12f83d6485a8458b",
@@ -27,36 +29,23 @@
     "full_index_binary_diff": "55d018ea5389898414dbf7844053c5339b316bf36652574b86983c1c8cb43b4b",
     "stable_patch_id": "1ad9a7cc93f5386920032d3d1b1cebc8febaa43d"
   },
-  "known_followup_blocker": {
-    "oracle_v3_required": true,
-    "missing_domains": [
-      "GlobalSelector",
-      "BranchSelector",
-      "CommitCatalog",
-      "ChangeCatalog",
-      "CheckpointRoot"
-    ],
-    "required_result": "one retained read followed by zero plan/write/commit/selector rotation"
-  },
   "artifacts": [
     "PLAN.md",
     "SOURCE_INVENTORY.tsv",
     "verify_trackedhead_sql_deletion_plan.sh",
     "CALIBRATION.md",
-    "v2-calibration.log",
     "COMPILER_WAVE.tsv",
     "R4_CORRECTION.md",
     "R4_CALIBRATION.md"
   ],
   "artifact_sha256": {
-    "PLAN.md": "5fa8bf214592f42347d41ae43365d9aad7f804dfc010111bf07e79d1ee705d0c",
+    "PLAN.md": "f339a1100aa987d58e2b5e2c412a35fd23aed97d7d6cb00b483a2a4f1b747709",
     "SOURCE_INVENTORY.tsv": "ab20ea62d7bcd2225091a12611179f668d8ab3b032e51c8dbb830b4822b9bf4f",
-    "verify_trackedhead_sql_deletion_plan.sh": "0b14d1f51bf4fd2a6a53715658052b20cede87a1172420c6a59a94eb232d4fbc",
-    "CALIBRATION.md": "feceae4a2233165bc4e2737d89d3a892388bc8f96c044b13e1ddb51a43e6e59a",
-    "v2-calibration.log": "4203cfb771b58cab263c0235db69a248e08c569a80bedfc2044d1713756c0196",
+    "verify_trackedhead_sql_deletion_plan.sh": "0ae21d58e9c9865b96d3ca3654639d92c9398c27bf0512405973ccddfceb23b9",
+    "CALIBRATION.md": "f1ff3c9f1a74794bf1c9dbde994325e0eab59c3909e77272706bef6e7686f37c",
     "COMPILER_WAVE.tsv": "82c8380ff25b798980dbeff4fe4ccf6e0b792ba1544a8bb7602af99be8ce30c5",
-    "R4_CORRECTION.md": "73fe1056b8b848e18235b758021d533df42f0f2bc3971e43f601e734dc19c1ba",
-    "R4_CALIBRATION.md": "b3cf4fc9b8554e5c453fb336498871bfc4d7bb3097180013f9f6cff9252be818"
+    "R4_CORRECTION.md": "b4035c1d7e0c48d6b70220d47013f416fb82a0f4f6b4bc4c242b51589586e08c",
+    "R4_CALIBRATION.md": "77ea3f85116e4c5999176d366e500692befb14a36c58d9afb82283288c3ef6b5"
   },
   "classification": {
     "migrate": [
@@ -114,6 +103,14 @@
     "slatedb"
   ],
   "fixed_anchor_verifier": true,
+  "required_corruption_domains": [
+    "StateRoot",
+    "GlobalSelector",
+    "BranchSelector",
+    "CommitCatalog",
+    "ChangeCatalog",
+    "CheckpointRoot"
+  ],
   "verifier_invocation": "bash test-reports/trackedhead-sql-deletion-plan-b59/verify_trackedhead_sql_deletion_plan.sh",
   "forbidden_authorities": [
     "BranchHeadControlContext",

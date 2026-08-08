@@ -2,7 +2,7 @@
 
 Status: read-only implementation contract. This package contains no production
 source and makes no runtime or benchmark claim. It is anchored to exact b59
-and the corrected TrackedHead whole-module oracle v2.
+and the approved six-domain TrackedHead whole-module oracle v3.
 
 ## Immutable anchors
 
@@ -10,15 +10,15 @@ and the corrected TrackedHead whole-module oracle v2.
 |---|---|
 | source frontier | b59e1f11a51153e0a787a81f0f25bf104d150aaf |
 | source tree | 700fd04d21bc40c05425c9fc9e10d65c9e1eda24 |
-| oracle v2 | 1d9c47728377c6ec7d2646704d51f3aadb11c773 |
-| oracle v2 tree | df2a373a1c0e7917f4abbd167c7659efd1c3e6a1 |
-| v2 parent to head full-index diff | ac1a0e19661af961a3b9688028a13776b39e025fd85afb591ffcaf94ae26afc3 |
-| v2 b59 to head full-index diff | 998d81e31ee686f68a1c214167bf9603ce80a44e591ad23c2d03d45d54696fd8 |
-| v2 model binary | 5d9c6a9e5d20de07a55465ba8e267a9ec708185f46e6a4e96b7879662b6a3abf |
-| v2 model log | 176e4c840641415c4354591c3fd8d20169c0a8b4cb4131f6b3e6d933ac61925f |
+| approved corruption oracle v3 | 33aa59975808099dfb5e9ca675a1633d713dccf3 |
+| v3 tree | 1ced701e3351af59c48dce75731947dcd1606f3e |
+| v3 parent | 1d9c47728377c6ec7d2646704d51f3aadb11c773 |
+| v3 parent-to-head full-index diff | 31b9374a14846f5e082d193296f6eb33255e667d5775c041a876077fc7952194 |
+| v3 stable patch ID | d4d96f33fa535171d20e32e1b859ee1b58000cb7 |
+| v3 package SHA256SUMS | f54422520ea2ac7c47427d0e57f95ea6392b990e6e1861a31d6ae7848f509556 |
 | b59 source-gate normalized RED | f8e3c11af5fa5fe3c35973a727ad31bbfed9e27b4908b23d907ebbdc71d12867 |
 
-The b59 source is the inventory target. The oracle v2 is an acceptance
+The b59 source is the inventory target. The v3 oracle is an acceptance
 contract and calibration source, not a production dependency.
 
 This successor incorporates the R4 correction. The previous plan omitted
@@ -26,17 +26,15 @@ checkpoint TrackedStateStoreReader, session execute branch-control reads,
 branch-ref stage writers, commit-graph manifest ownership, and the adapter
 mutation-revision spaces. Those omissions are now explicit deletion gates.
 
-## Current oracle limitation
+## Approved corruption oracle
 
-The v2 model is valid for one-read/zero-write, no-fallback, and the seven
-existing semantic cases, but its corruption fixtures mutate only state_root.
-They do not independently prove malformed, missing, wrong-kind, or
-identity-substituted GlobalSelector, BranchSelector, catalog-root, or
-checkpoint-root handling. This plan therefore does not call v2 runtime-green.
-The next test/report-only v3 must add one stateful fixture per selector/root
-domain and require exactly one retained read followed by zero plan, writes,
-commits, or selector rotations. Production implementation must not proceed
-from this omission by weakening assertions or adding a fallback.
+The v3 oracle is the required six-domain discriminator. It covers
+StateRoot, GlobalSelector, BranchSelector, CommitCatalog, ChangeCatalog, and
+CheckpointRoot with malformed, missing, wrong-kind, and identity-substituted
+stateful fixtures. Every case requires exactly one retained view/read followed
+by zero plan, writes, commits, or selector rotations. The oracle is independent
+test/report evidence, not a production dependency; no implementation may
+weaken these cases or add a fallback.
 
 ## Sole owner and invariants
 
@@ -208,8 +206,8 @@ action and fail condition.
 No intermediate edit in this sequence is runnable or publishable.
 
 1. Fence the boundary. Record the exact b59 ancestor and introduce no
-   ForkTree adapter. The verifier pins b59 and oracle v2 internally; callers
-   cannot override either anchor. Mark direct SQL/columnar and historical
+   ForkTree adapter. The verifier pins b59 and the exact v3 oracle identity
+   internally; callers cannot override either anchor. Mark direct SQL/columnar and historical
    providers as concrete migrate-or-delete actions.
 2. Move W4 readers first. Replace branch-control/cache reads and stage writers
    with the selector pair and global epoch CAS.
@@ -274,10 +272,11 @@ error before durable work.
 The future verifier is verify_trackedhead_sql_deletion_plan.sh. It takes no
 arguments and always pins the current worktree to the following constants:
 ANCHOR=b59e1f11a51153e0a787a81f0f25bf104d150aaf and
-ORACLE=1d9c47728377c6ec7d2646704d51f3aadb11c773. It must:
+ORACLE=33aa59975808099dfb5e9ca675a1633d713dccf3. It must:
 
-1. prove the candidate contains the exact b59 ancestor and the v2 oracle
-   contract is present in acceptance metadata;
+1. prove the exact v3 commit/tree/parent/diff/patch/package identities are
+   present in acceptance metadata and that all six corruption domains are
+   named;
 2. reject tracked_state/context.rs, tracked_state/diff.rs, old marker spaces,
    TrackedHeadContext, HotStateTransactionCache, TrackedWorkingDiff,
    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, CurrentStateDeltaRef,
@@ -298,8 +297,9 @@ ORACLE=1d9c47728377c6ec7d2646704d51f3aadb11c773. It must:
    that uses only the public/facade seam;
 7. inspect source declarations item by item rather than truncating at the
    first cfg(test); test-only imports cannot conceal production residue;
-8. model malformed, missing, wrong-kind, identity-substituted, stale, and
-   cross-view reads as zero plan/write/commit/rotation outcomes;
+8. bind the v3 model's six-domain malformed, missing, wrong-kind,
+   identity-substituted, stale, and cross-view reads to zero
+   plan/write/commit/rotation outcomes;
 9. require no raw put/delete or forgeable sweep token, no persisted cache, and
    no compatibility or fallback call path.
 
