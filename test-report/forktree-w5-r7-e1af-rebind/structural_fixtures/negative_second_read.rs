@@ -1,16 +1,21 @@
 const OBJECT_SPACE: ObjectSpace = ObjectSpace;
 const SELECTOR_SPACE: SelectorSpace = SelectorSpace;
+struct StorageRead;
+struct CoherentView;
 
-fn w5_r7_publish(owner: OwnerId, epoch: u64, progress: u64, selector: u64) {
-    let read = CoherentView::open(OBJECT_SPACE);
+fn w5_r7_publish(read: &StorageRead, owner: OwnerId, epoch: u64, progress: u64, selector: u64) {
+    let view = CoherentView::open(read);
+    view.owner;
+    view.view_id;
+    view.snapshot;
     let second = ForkTreeReadFacade::open(OBJECT_SPACE);
-    read.selector();
-    read.queue();
-    read.mark();
-    read.upload();
-    read.object();
-    let publication = PreparedPublication::new(SELECTOR_SPACE);
-    publication.into_storage_plan(read);
+    view.selector();
+    view.queue();
+    view.mark();
+    view.upload();
+    view.object();
+    let publication = PreparedPublication::new(&view);
+    publication.into_storage_plan(&view);
     tx.prepare_write_set(owner, epoch, progress, selector);
     tx.cas(owner, epoch, progress, selector);
     tx.commit();

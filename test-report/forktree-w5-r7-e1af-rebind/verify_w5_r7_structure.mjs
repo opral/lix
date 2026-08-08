@@ -28,6 +28,10 @@ const allowedSource = [
   /^packages\/lix\/src\/transaction\/context\.rs$/,
 ];
 const packagePrefix = "test-report/forktree-w5-r7-e1af-rebind/";
+const BASELINE_COMMIT = "e1af471b9ab0f598dafa7c2ddec7867667c81740";
+const BASELINE_TREE = "bfa0d271a723da8250ab76ada16fda90926f1099";
+const BASELINE_PARENT = "b484e20d845aee3f8137bfa3496f9b3cd0e8cd35";
+const BASELINE_PARENT_TREE = "4477c83b246bddac09cd972564bd4ccd67f90f7b";
 
 const legacyPattern = /CHECKPOINT_RECOVERY_REF_SPACE|CHECKPOINT_GC_STATE_SPACE|GC_REACHABILITY_(DELTA|QUEUE)|GC_TREE_SWEEP_|StorageSpace::mutable|StorageSpaceId|BranchRefReader|BranchHeadControl|CachingBranchRefReader|BranchRefFallback|SecondBranchAuthority|DualSelectorAuthority|LegacyGc|LegacyGC|legacy_gc|fallback_gc|retry_gc/;
 
@@ -54,10 +58,25 @@ function sourceFilesFromFixture() {
 
 function changedPathErrors() {
   if (fixture) return [];
+  const ancestryStatus = (() => {
+    try {
+      execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", anchor, target]);
+      return [];
+    } catch {
+      return [`candidate ${target} is not descended from anchor ${anchor}`];
+    }
+  })();
+  const anchorTree = runGit(["show", "-s", "--format=%T", anchor]).trim();
+  const anchorParent = runGit(["show", "-s", "--format=%P", anchor]).trim();
+  const parentTree = runGit(["show", "-s", "--format=%T", anchorParent]).trim();
+  const identityErrors = [];
+  if (anchor !== BASELINE_COMMIT || anchorTree !== BASELINE_TREE || anchorParent !== BASELINE_PARENT || parentTree !== BASELINE_PARENT_TREE) {
+    identityErrors.push(`anchor identity mismatch: ${anchor} ${anchorTree} ${anchorParent} ${parentTree}`);
+  }
   const changed = runGit(["diff", "--name-only", anchor, target]).split("\n").filter(Boolean);
-  return changed
+  return [...ancestryStatus, ...identityErrors, ...changed
     .filter((name) => !name.startsWith(packagePrefix) && !allowedSource.some((pattern) => pattern.test(name)))
-    .map((name) => `out-of-closure path: ${name}`);
+    .map((name) => `out-of-closure path: ${name}`)];
 }
 
 function extractFunctions(text) {
@@ -117,18 +136,43 @@ function structuralErrors(files) {
 
   for (const operation of operations) {
     const { body, file, name } = operation;
+    if (!/\bread\s*:\s*&?\s*StorageRead\b/.test(extractFunctionHeader(files.find((entry) => entry.name === file)?.text ?? "", name))) {
+      errors.push(`${file}:${name} does not accept a typed caller-owned StorageRead`);
+    }
     const reads = countMatches(
       body,
       /(?:CoherentView::(?:open|new)|ForkTreeReadFacade::(?:open|new)|begin_coherent_read|begin_read)\s*\(/g,
     );
     if (reads !== 1) errors.push(`${file}:${name} has ${reads} coherent-read constructions, expected 1`);
-    if (!/\b(?:let|const)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:CoherentView::(?:open|new)|ForkTreeReadFacade::(?:open|new)|begin_coherent_read|begin_read)\s*\(/.test(body)) {
+    const readBinding = body.match(/\b(?:let|const)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*CoherentView::open\s*\(\s*&?read\s*\)/);
+    if (!readBinding) {
       errors.push(`${file}:${name} does not retain the constructed coherent read`);
     }
+    const viewName = readBinding?.[1] ?? "view";
+    if (/\b(?:StorageRead::open|begin_read|begin_coherent_read|ForkTreeReadFacade::(?:open|new))\s*\(/.test(body)) {
+      errors.push(`${file}:${name} reacquires a second read/facade`);
+    }
+    if (new RegExp(`\\b(?:let|const)\\s+\\w+\\s*=\\s*(?:read|${viewName})\\b`).test(body)) {
+      errors.push(`${file}:${name} copies or aliases the retained read/view`);
+    }
+    if (new RegExp(`\\b${viewName}\\.clone\\s*\\(`).test(body) || /\bread\.clone\s*\(/.test(body)) {
+      errors.push(`${file}:${name} clones the retained read/view`);
+    }
+    for (const identity of ["owner", "view_id", "snapshot"]) {
+      if (!new RegExp(`\\b${viewName}\\.${identity}\\b`).test(body)) {
+        errors.push(`${file}:${name} does not bind view identity ${identity}`);
+      }
+    }
     for (const label of ["selector", "queue", "mark", "upload", "object"]) {
-      if (!new RegExp(`\\b(?:read|view)\\.${label}\\s*\\(`).test(body)) {
+      if (!new RegExp(`\\b${viewName}\\.${label}\\s*\\(`).test(body)) {
         errors.push(`${file}:${name} does not use the retained read for ${label}`);
       }
+    }
+    if (countMatches(body, new RegExp(`\\bPreparedPublication::new\\s*\\(\\s*&${viewName}\\s*\\)`, "g")) !== 1) {
+      errors.push(`${file}:${name} does not construct publication from the exact retained view`);
+    }
+    if (countMatches(body, new RegExp(`\\.into_storage_plan\\s*\\(\\s*&?${viewName}\\s*\\)`, "g")) !== 1) {
+      errors.push(`${file}:${name} does not pass the exact retained view into the plan`);
     }
     if (countMatches(body, /\binto_storage_plan\s*\(/g) !== 1) {
       errors.push(`${file}:${name} must call into_storage_plan exactly once`);
@@ -144,6 +188,31 @@ function structuralErrors(files) {
     }
   }
 
+  return errors;
+}
+
+function extractFunctionHeader(text, functionName) {
+  const match = text.match(new RegExp(`\\bfn\\s+${functionName}\\s*\\([^{}]*\\)`));
+  return match?.[0] ?? "";
+}
+
+function closureWriterErrors(files, operations) {
+  const errors = [];
+  const operationKeys = new Set(operations.map(({ file, name }) => `${file}:${name}`));
+  const rawWriter = /\b(?:begin_write|StorageWrite|StorageSpace::(?:mutable|open|new)|StorageSpaceId)\b|\b(?:storage|store|backend|cas_writer)\s*\.\s*(?:put|delete|write|commit)\s*\(/;
+  const directCommit = /\.(?:commit|prepare_write_set)\s*\(/;
+  for (const { name: file, text } of files) {
+    if (rawWriter.test(text)) errors.push(`${file}:generic/raw writer token in closure`);
+    for (const operation of extractFunctions(text)) {
+      const key = `${file}:${operation.name}`;
+      if (directCommit.test(operation.body) && !operationKeys.has(key)) {
+        errors.push(`${file}:${operation.name}:writer/commit outside accepted operation`);
+      }
+      if (/\bPreparedPublication::commit\s*\(/.test(operation.body)) {
+        errors.push(`${file}:${operation.name}:direct PreparedPublication commit`);
+      }
+    }
+  }
   return errors;
 }
 
@@ -166,7 +235,16 @@ if (legacyCountValue > 0) {
   process.exit(1);
 }
 
-const errors = structuralErrors(files);
+  const errors = structuralErrors(files);
+  const operations = files.flatMap(({ name, text }) =>
+    extractFunctions(text)
+      .filter(({ name: functionName, body }) =>
+        /(?:gc|publish|upload|root|selector|checkpoint|reachability)/i.test(functionName) &&
+        /(?:CoherentView|PreparedPublication|\bcas\s*\()/.test(body),
+      )
+      .map((operation) => ({ ...operation, file: name })),
+  );
+  errors.push(...closureWriterErrors(files, operations));
 if (errors.length > 0) {
   console.log(`RED structural authority gate: ${errors.length} findings`);
   for (const error of errors) console.log(`- ${error}`);

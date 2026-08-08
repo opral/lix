@@ -8,16 +8,15 @@ fn w5_r7_publish(read: &StorageRead, owner: OwnerId, epoch: u64, progress: u64, 
     view.owner;
     view.view_id;
     view.snapshot;
-    let fallback_reader = view;
+    let alias = view;
     view.selector();
     view.queue();
     view.mark();
     view.upload();
     view.object();
     let publication = PreparedPublication::new(&view);
-    publication.into_storage_plan(&view);
+    publication.into_storage_plan(&alias);
     tx.prepare_write_set(owner, epoch, progress, selector);
     tx.cas(owner, epoch, progress, selector);
     tx.commit();
-    let _ = fallback_reader;
 }

@@ -1,0 +1,6 @@
+$ timeout 1200 bash test-report/forktree-w5-r7-e1af-rebind/verify_e1af_rebind.sh \
+    /root/repos/lix-w5-r7-e1af-correction3-work \
+    4eb866565294f6aa16893e53a156bf91858520d9 \
+    e1af471b9ab0f598dafa7c2ddec7867667c81740
+RED 384 forbidden production residues
+exit 1 (expected report-only RED; no production candidate is claimed)

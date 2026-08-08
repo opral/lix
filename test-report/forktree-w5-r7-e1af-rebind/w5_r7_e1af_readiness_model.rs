@@ -55,9 +55,27 @@ struct SelectorSpaceV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogRecord {
+    id: String,
+    root: RootId,
+    back_edge: RootId,
+    fingerprint: u64,
+}
+
+fn catalog_fingerprint(id: &str, root: &str, back_edge: &str) -> u64 {
+    let mut hash = 0x9e3779b97f4a7c15u64;
+    for byte in id.bytes().chain(root.bytes()).chain(back_edge.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GraphAuthority {
     objects: ObjectSpaceV1,
     selectors: SelectorSpaceV1,
+    catalog: CatalogRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,7 +157,8 @@ impl GraphAuthority {
             expected_epoch,
             owner,
         )?;
-        self.authenticate_root(&selector.root)
+        self.authenticate_root(&selector.root)?;
+        self.authenticate_catalog(&selector.root)
     }
 
     fn authenticate_branch(
@@ -167,7 +186,27 @@ impl GraphAuthority {
             expected_epoch,
             owner,
         )?;
-        self.authenticate_root(&selector.root)
+        self.authenticate_root(&selector.root)?;
+        self.authenticate_catalog(&selector.root)
+    }
+
+    fn authenticate_catalog(&self, expected_root: &str) -> Result<(), AuthError> {
+        if self.catalog.id != "catalog:global" {
+            return Err(AuthError::IdentitySubstituted);
+        }
+        if self.catalog.root != expected_root || self.catalog.back_edge != expected_root {
+            return Err(AuthError::Integrity);
+        }
+        if self.catalog.fingerprint
+            != catalog_fingerprint(
+                &self.catalog.id,
+                &self.catalog.root,
+                &self.catalog.back_edge,
+            )
+        {
+            return Err(AuthError::Integrity);
+        }
+        Ok(())
     }
 
     fn validate_selector(
@@ -296,6 +335,54 @@ fn valid_graph() -> GraphAuthority {
             global: Some(global),
             branches: BTreeMap::from([("main".into(), branch)]),
         },
+        catalog: CatalogRecord {
+            id: "catalog:global".into(),
+            root: "root:global".into(),
+            back_edge: "root:global".into(),
+            fingerprint: catalog_fingerprint("catalog:global", "root:global", "root:global"),
+        },
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommitNode {
+    id: String,
+    parents: Vec<String>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HscChronology {
+    history: CommitNode,
+    serving: CommitNode,
+    checkpoint: CommitNode,
+    later_target: Option<CommitNode>,
+}
+
+impl HscChronology {
+    fn authenticate(&self) -> Result<(), AuthError> {
+        if self.serving.parents != vec![self.history.id.clone(), self.checkpoint.id.clone()] {
+            return Err(AuthError::Order);
+        }
+        if self.checkpoint.parents.contains(&self.history.id)
+            || self
+                .later_target
+                .as_ref()
+                .is_some_and(|target| self.serving.parents.contains(&target.id))
+        {
+            return Err(AuthError::Order);
+        }
+        let expected_generation = self.history.generation.max(self.checkpoint.generation) + 1;
+        if self.serving.generation != expected_generation {
+            return Err(AuthError::Malformed);
+        }
+        if self.history.id == self.checkpoint.id
+            || self.history.id == self.serving.id
+            || self.checkpoint.id == self.serving.id
+        {
+            return Err(AuthError::Cycle);
+        }
+        Ok(())
     }
 }
 
@@ -521,7 +608,7 @@ impl QueueState {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.plane.fence.epoch,
             self.plane.fence.progress,
             self.plane.fence.selector,
@@ -530,13 +617,14 @@ impl QueueState {
             self.queue_head,
             self.queue_tail,
             self.deleted.len(),
+            self.debt_tokens,
             encoded_entries
         )
     }
 
     fn reopen(encoded: &str, entries: Vec<QueueEntry>) -> Result<Self, AuthError> {
         let parts: Vec<_> = encoded.split('|').collect();
-        if parts.len() != 9 || parts[3] != "gc-owner" || parts[4] != "root:global" {
+        if parts.len() != 10 || parts[3] != "gc-owner" || parts[4] != "root:global" {
             return Err(AuthError::Malformed);
         }
         let parse = |index: usize| {
@@ -550,15 +638,17 @@ impl QueueState {
         let queue_head = parse(5)? as usize;
         let queue_tail = parse(6)? as usize;
         let deleted_len = parse(7)? as usize;
+        let debt_tokens = parse(8)? as u32;
         if queue_tail != entries.len()
             || queue_head > queue_tail
             || deleted_len > queue_head
+            || debt_tokens > 1
             || progress > epoch
         {
             return Err(AuthError::Malformed);
         }
         let mut seen = BTreeSet::new();
-        for (encoded, entry) in parts[8].split(',').zip(&entries) {
+        for (encoded, entry) in parts[9].split(',').zip(&entries) {
             let fields: Vec<_> = encoded.split(':').collect();
             if fields.len() != 3
                 || fields[0] != entry.object
@@ -572,7 +662,7 @@ impl QueueState {
             }
             entry.authenticate()?;
         }
-        if parts[8].split(',').count() != entries.len() {
+        if parts[9].split(',').count() != entries.len() {
             return Err(AuthError::Order);
         }
         let deleted = entries[..deleted_len]
@@ -593,7 +683,7 @@ impl QueueState {
             queue_head,
             queue_tail,
             deleted,
-            debt_tokens: 0,
+            debt_tokens,
             calls: 0,
         })
     }
@@ -778,6 +868,10 @@ impl RootOwners {
         }
         count
     }
+
+    fn deletion_safe(&self, root: &str, readers: &ReaderPins) -> bool {
+        readers.pin_count(root) == 0 && !self.owners.contains_key(root)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -835,6 +929,71 @@ impl AtomicW5State {
         }
         *self = staged;
         Ok(result)
+    }
+
+    fn publish_only(
+        &mut self,
+        expected: &Fence,
+        owner: &str,
+        new_root: &str,
+        graph: &GraphAuthority,
+        roots: &[&str],
+    ) -> Result<(), AuthError> {
+        let mut staged = self.clone();
+        staged
+            .plane
+            .validate_fence(expected, owner)
+            .map_err(|error| match error {
+                FenceError::StaleEpoch => AuthError::StaleEpoch,
+                FenceError::OwnerMismatch => AuthError::OwnerMismatch,
+            })?;
+        graph.authenticate_root_closure(roots)?;
+        if expected_kind(new_root) != Some(ObjectKind::Root) {
+            return Err(AuthError::WrongKind);
+        }
+        staged
+            .plane
+            .publish(expected, owner, new_root)
+            .map_err(|error| match error {
+                FenceError::StaleEpoch => AuthError::StaleEpoch,
+                FenceError::OwnerMismatch => AuthError::OwnerMismatch,
+            })?;
+        staged.queue.plane = staged.plane.clone();
+        *self = staged;
+        Ok(())
+    }
+
+    fn gc_only(
+        &mut self,
+        expected: &Fence,
+        owner: &str,
+        max_entries: usize,
+    ) -> Result<PageResult, AuthError> {
+        let mut staged = self.clone();
+        staged
+            .plane
+            .validate_fence(expected, owner)
+            .map_err(|error| match error {
+                FenceError::StaleEpoch => AuthError::StaleEpoch,
+                FenceError::OwnerMismatch => AuthError::OwnerMismatch,
+            })?;
+        let result = staged.queue.process_entries_only(max_entries)?;
+        if result.advanced {
+            staged
+                .plane
+                .advance_gc(expected, owner)
+                .map_err(|error| match error {
+                    FenceError::StaleEpoch => AuthError::StaleEpoch,
+                    FenceError::OwnerMismatch => AuthError::OwnerMismatch,
+                })?;
+            staged.queue.plane = staged.plane.clone();
+        }
+        *self = staged;
+        Ok(result)
+    }
+
+    fn digest(&self) -> String {
+        format!("{self:?}")
     }
 }
 
@@ -1034,6 +1193,66 @@ fn authenticated_selector_and_graph_uses_two_typed_planes() {
 }
 
 #[test]
+fn catalog_back_edge_and_h_s_c_parent_order_are_authenticated() {
+    let graph = valid_graph();
+    assert_eq!(graph.authenticate_catalog("root:global"), Ok(()));
+
+    let mut wrong_catalog_id = graph.clone();
+    wrong_catalog_id.catalog.id = "catalog:substituted".into();
+    assert_eq!(
+        wrong_catalog_id.authenticate_catalog("root:global"),
+        Err(AuthError::IdentitySubstituted)
+    );
+
+    let mut wrong_back_edge = graph;
+    wrong_back_edge.catalog.back_edge = "root:other".into();
+    assert_eq!(
+        wrong_back_edge.authenticate_catalog("root:global"),
+        Err(AuthError::Integrity)
+    );
+
+    let valid = HscChronology {
+        history: CommitNode {
+            id: "commit:H".into(),
+            parents: vec!["commit:older".into()],
+            generation: 10,
+        },
+        checkpoint: CommitNode {
+            id: "commit:C".into(),
+            parents: vec!["commit:older".into()],
+            generation: 10,
+        },
+        serving: CommitNode {
+            id: "commit:S".into(),
+            parents: vec!["commit:H".into(), "commit:C".into()],
+            generation: 11,
+        },
+        later_target: Some(CommitNode {
+            id: "commit:T".into(),
+            parents: vec!["commit:S".into()],
+            generation: 12,
+        }),
+    };
+    assert_eq!(valid.authenticate(), Ok(()));
+
+    let mut swapped = valid.clone();
+    swapped.serving.parents.swap(0, 1);
+    assert_eq!(swapped.authenticate(), Err(AuthError::Order));
+
+    let mut wrong_generation = valid.clone();
+    wrong_generation.serving.generation = 12;
+    assert_eq!(wrong_generation.authenticate(), Err(AuthError::Malformed));
+
+    let mut permanent_h_edge = valid.clone();
+    permanent_h_edge.checkpoint.parents.push("commit:H".into());
+    assert_eq!(permanent_h_edge.authenticate(), Err(AuthError::Order));
+
+    let mut later_target_bridge = valid;
+    later_target_bridge.serving.parents.push("commit:T".into());
+    assert_eq!(later_target_bridge.authenticate(), Err(AuthError::Order));
+}
+
+#[test]
 fn graph_corruption_missing_wrong_kind_substitution_cycle_and_stale_owner_fail_closed() {
     let mut missing_selector = valid_graph();
     missing_selector.selectors.global = None;
@@ -1157,6 +1376,47 @@ fn publication_first_gc_first_stale_epoch_and_owner_fences_fail_closed() {
 }
 
 #[test]
+fn publication_first_and_gc_first_races_preserve_complete_old_or_new_state() {
+    let graph = valid_graph();
+
+    let mut publication_first = AtomicW5State::new(vec![QueueEntry::new("race-a", false)]);
+    let prepared = publication_first.plane.fence.clone();
+    publication_first
+        .publish_only(
+            &prepared,
+            "gc-owner",
+            "root:global",
+            &graph,
+            &["root:global"],
+        )
+        .expect("publication wins first");
+    let publication_state = publication_first.digest();
+    assert_eq!(
+        publication_first.gc_only(&prepared, "gc-owner", 1),
+        Err(AuthError::StaleEpoch)
+    );
+    assert_eq!(publication_first.digest(), publication_state);
+
+    let mut gc_first = AtomicW5State::new(vec![QueueEntry::new("race-b", false)]);
+    let prepared = gc_first.plane.fence.clone();
+    gc_first
+        .gc_only(&prepared, "gc-owner", 1)
+        .expect("gc wins first");
+    let gc_state = gc_first.digest();
+    assert_eq!(
+        gc_first.publish_only(
+            &prepared,
+            "gc-owner",
+            "root:global",
+            &graph,
+            &["root:global"],
+        ),
+        Err(AuthError::StaleEpoch)
+    );
+    assert_eq!(gc_first.digest(), gc_state);
+}
+
+#[test]
 fn retireable_65_entry_queue_drains_64_then_suffix_exactly() {
     let entries = (0..65)
         .map(|index| QueueEntry::new(&format!("root-{index:02}"), false))
@@ -1207,6 +1467,31 @@ fn blocked_head_keeps_one_debt_without_spin_and_releases_at_safe_point() {
     assert_eq!(queue.process(64).reclaimed, 2);
     assert_eq!(queue.debt_tokens, 1);
     assert_eq!(queue.calls, 2);
+}
+
+#[test]
+fn blocked_debt_identity_and_fence_survive_cold_reopen_before_release() {
+    let mut queue = QueueState::new(vec![
+        QueueEntry::new("blocked-reopen", true),
+        QueueEntry::new("suffix-reopen", false),
+    ]);
+    assert_eq!(queue.process(64).advanced, false);
+    assert_eq!(queue.debt_tokens, 1);
+    let encoded = queue.persist();
+    let mut reopened = QueueState::reopen(
+        &encoded,
+        vec![
+            QueueEntry::new("blocked-reopen", true),
+            QueueEntry::new("suffix-reopen", false),
+        ],
+    )
+    .expect("blocked debt reopens authenticated");
+    assert_eq!(reopened.debt_tokens, 1);
+    assert_eq!(reopened.process(64).advanced, false);
+    assert_eq!(reopened.debt_tokens, 1);
+    reopened.release_blocked_head();
+    assert_eq!(reopened.process(64).reclaimed, 2);
+    assert_eq!(reopened.debt_tokens, 1);
 }
 
 #[test]
@@ -1284,6 +1569,36 @@ fn uploads_shared_and_final_roots_reclaim_only_after_last_owner_release() {
         .release("root:final", "branch")
         .expect("final release");
     assert_eq!(roots.reclaim_released(), 1);
+}
+
+#[test]
+fn pinned_old_view_blocks_physical_delete_until_exact_view_and_owner_release() {
+    let mut readers = ReaderPins::new();
+    let old = readers.begin_read("branch", "root:retired");
+    let concurrent = readers.begin_read("upload", "root:retired");
+    let mut roots = RootOwners::new();
+    roots.retain("root:retired", "branch");
+    roots.retain("root:retired", "upload");
+    let mut physical = BTreeSet::from(["root:retired".to_string()]);
+
+    assert!(!roots.deletion_safe("root:retired", &readers));
+    readers.close("branch", old.id).expect("old view closes");
+    roots
+        .release("root:retired", "branch")
+        .expect("branch releases");
+    roots.reclaim_released();
+    assert!(!roots.deletion_safe("root:retired", &readers));
+
+    readers
+        .close("upload", concurrent.id)
+        .expect("upload view closes");
+    roots
+        .release("root:retired", "upload")
+        .expect("upload releases");
+    roots.reclaim_released();
+    assert!(roots.deletion_safe("root:retired", &readers));
+    physical.remove("root:retired");
+    assert!(!physical.contains("root:retired"));
 }
 
 #[test]
