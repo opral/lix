@@ -1,0 +1,20 @@
+command: review/stage2-semantic-replay-fd2/verify_source.sh --successor /tmp/lix-stage2-semantic-replay-oracle-fd2
+exit_status: 1
+PASS transaction uses caller facade: forktree_read_facade
+PASS ForkTree semantic owner exists: load_required_commit_record
+PASS ForkTree member owner exists: load_commit_member_records
+REJECT legacy replay authority: forbidden 'crate::tracked_state::load_change_record_by_id' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+REJECT legacy replay authority: forbidden 'crate::tracked_state::load_commit_delta_replay_metadata' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+REJECT legacy replay authority: forbidden 'crate::tracked_state::CommitDeltaReplacementScope' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+REJECT legacy replay authority: forbidden 'TrackedStateContext::new' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+REJECT legacy replay authority: forbidden 'tracked_state_reader()' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+REJECT legacy replay authority: forbidden 'StorageAdapterRead + ?Sized' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+REJECT legacy undo reader: forbidden 'tracked_state_reader()' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/session/undo_redo.rs
+REJECT deleted changelog space: forbidden 'COMMIT_CHANGE_ID_SPACE' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/sql2/providers/change.rs
+REJECT deleted changelog loader: forbidden 'crate::tracked_state::' in /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/sql2/providers/change.rs
+REJECT exact apply caller: missing caller-owned ForkTree facade
+REJECT exact apply caller: raw/second read
+REJECT replay helper: no typed ForkTree view argument
+REJECT replay helper: raw/legacy read path
+REJECT production second authority: COMMIT_CHANGE_ID_SPACE
+SUCCESSOR SOURCE GATE: BLOCKED (14 findings)

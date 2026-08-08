@@ -1,0 +1,11 @@
+command: review/stage2-semantic-replay-fd2/verify_source.sh --baseline /tmp/lix-stage2-semantic-replay-oracle-fd2
+exit_status: 1
+RED old change loader: crate::tracked_state::load_change_record_by_id at /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+RED old replay metadata: crate::tracked_state::load_commit_delta_replay_metadata at /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+RED old replay scope: crate::tracked_state::CommitDeltaReplacementScope at /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+RED legacy undo reader: tracked_state_reader() at /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/session/undo_redo.rs
+RED raw replay read: StorageReadOptions::default() at /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+RED raw replay argument: StorageAdapterRead + ?Sized at /tmp/lix-stage2-semantic-replay-oracle-fd2/packages/lix/src/transaction/context.rs
+RED exact apply caller: old change loader
+RED exact apply caller: raw read
+BASELINE SOURCE GATE: RED as expected; fd2 is not an accepted bridge

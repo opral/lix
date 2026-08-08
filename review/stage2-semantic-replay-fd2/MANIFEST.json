@@ -1,0 +1,36 @@
+{
+  "package": "forktree-stage2-semantic-replay-acceptance",
+  "kind": "TEST/REPORT-ONLY",
+  "anchor": {
+    "head": "fd2be256d763f17e9f127d4c984e36fba191cb82",
+    "tree": "20110ca5e3c33d34217630fff0a2b784b545317a",
+    "parent": "cd91b9b90f7f468158b4df154adbed9551eb5d60",
+    "parent_diff_full_index_binary_sha256": "1a410542cff54e3b1c83a5cfb2cdea568dc9f1f71fc0c3f8598e8936d944a277",
+    "parent_diff_patch_id": "c275ab15f3306c503e6830afee2a66bacf1fb974"
+  },
+  "scope": "authenticated semantic replay bridge only",
+  "production_edits": false,
+  "runtime_claim": false,
+  "deferred_cohorts": [
+    "GC/reachability",
+    "init publication",
+    "replacement-part staging",
+    "current-serving/TrackedHead",
+    "ForkTree reachability borrow frontier"
+  ],
+  "files": [
+    "CONTRACT.md",
+    "CASES.md",
+    "verify_source.sh",
+    "BASELINE.md",
+    "BASELINE_SOURCE_GATE.log",
+    "SUCCESSOR_RED_CONTROL.log",
+    "MANIFEST.json"
+  ],
+  "source_gate": {
+    "baseline": "./verify_source.sh --baseline /absolute/path/to/fd2-worktree",
+    "successor": "./verify_source.sh --successor /absolute/path/to/corrected-worktree",
+    "baseline_expected": "RED",
+    "successor_required": "GREEN"
+  }
+}
