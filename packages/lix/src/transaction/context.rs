@@ -41,6 +41,7 @@ use crate::filesystem::{
     BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemRowContext, load_path_index_revision,
 };
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
     CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_gc_state,
@@ -92,7 +93,7 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
+    TrackedStateContext, TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateStoreReader,
 };
 use crate::transaction::commit;
@@ -209,15 +210,58 @@ struct StalePluginConflictGroup {
     conflicts: Vec<StaleSemanticConflict>,
 }
 
-fn stale_payload_from_tracked(
-    row: Option<crate::tracked_state::MaterializedTrackedStateRowRef<'_>>,
-) -> Option<StaleConflictPayload> {
-    row.filter(|row| !row.deleted()).and_then(|row| {
+fn stale_payload_from_historical(row: Option<&HistoricalStateRow>) -> Option<StaleConflictPayload> {
+    row.filter(|row| !row.deleted).and_then(|row| {
         Some(StaleConflictPayload {
-            snapshot: row.snapshot_content()?.clone(),
-            metadata: row.metadata().cloned(),
+            snapshot: row.snapshot_content.clone()?,
+            metadata: row.metadata.clone(),
         })
     })
+}
+
+fn state_key_from_tracked(key: &TrackedStateKey) -> StateKey {
+    StateKey {
+        schema_key: key.schema_key.clone(),
+        file_id: key.file_id.clone(),
+        entity_pk: key.entity_pk.clone(),
+    }
+}
+
+fn historical_row_matches_key(row: &HistoricalStateRow, key: &TrackedStateKey) -> bool {
+    row.key.schema_key == key.schema_key
+        && row.key.file_id == key.file_id
+        && row.key.entity_pk == key.entity_pk
+}
+
+async fn load_historical_rows_at_commit<R>(
+    facade: &ForkTreeReadFacade<R>,
+    commit_id: CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<Vec<Option<HistoricalStateRow>>, LixError>
+where
+    R: StorageAdapterRead,
+{
+    let state_keys = keys.iter().map(state_key_from_tracked).collect::<Vec<_>>();
+    let rows = facade
+        .load_state_rows_at_commit(&commit_id.to_string(), &state_keys)
+        .await?;
+    if rows.len() != keys.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "ForkTree historical state batch returned the wrong number of rows",
+        ));
+    }
+    for (row, key) in rows.iter().zip(keys) {
+        if let Some(row) = row
+            && !historical_row_matches_key(row, key)
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "ForkTree historical state row identity does not match its requested key",
+            ));
+        }
+    }
+    Ok(rows)
 }
 
 fn stale_conflict_bytes(payload: Option<&StaleConflictPayload>) -> Option<WasmHostBytes> {
@@ -740,9 +784,8 @@ where
     /// storage read and does not expose the underlying handle.
     pub(crate) fn forktree_read_facade(
         &self,
-    ) -> crate::forktree::ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>>
-    {
-        crate::forktree::ForkTreeReadFacade::new(self.opening_read())
+    ) -> ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
+        ForkTreeReadFacade::new(self.opening_read())
     }
 
     async fn reconcile_stale_disjoint_writes<S>(
@@ -837,66 +880,42 @@ where
             prepared_writes.hydrate_and_lower_ordered_mutation_journals(predecessors_by_commit)?;
         }
 
-        let mut tracked = self.tracked_state.reader(read);
-        let opening_head_text = opening_head.to_string();
-        let current_head_text = current_head.to_string();
-        let generation_write_set = tracked
-            .changed_identities_in_first_parent_interval(&opening_head_text, &current_head_text)
+        let facade = self.forktree_read_facade();
+        let concurrent = facade
+            .diff_state_rows_between_commits(opening_head, current_head)
             .instrument(tracing::debug_span!(
                 target: "lix_transaction",
-                "lix.transaction.stale.generation_write_set"
+                "lix.transaction.stale.forktree_diff"
             ))
             .await?;
-        let (plan, concurrent_change_count, discovery) = match generation_write_set {
-            Some(identities) => {
-                let count = identities.len();
-                let plan = {
-                    let span = tracing::debug_span!(
-                        target: "lix_transaction",
-                        "lix.transaction.stale.classify",
-                        prepared_rows = prepared_writes.state_rows.len(),
-                        concurrent_changes = count,
-                    );
-                    let _entered = span.enter();
-                    classify_stale_commit(
-                        prepared_writes,
-                        identities.iter().map(|identity| identity.as_key_ref()),
-                    )
-                };
-                (plan, count, "generation_write_set")
-            }
-            None => {
-                let concurrent = tracked
-                    .diff_commits(
-                        &opening_head_text,
-                        &current_head_text,
-                        &TrackedStateDiffRequest::default(),
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_transaction",
-                        "lix.transaction.stale.general_diff"
-                    ))
-                    .await?;
-                let count = concurrent.entries.len();
-                let plan = {
-                    let span = tracing::debug_span!(
-                        target: "lix_transaction",
-                        "lix.transaction.stale.classify",
-                        prepared_rows = prepared_writes.state_rows.len(),
-                        concurrent_changes = count,
-                    );
-                    let _entered = span.enter();
-                    classify_stale_commit(
-                        prepared_writes,
-                        concurrent
-                            .entries
-                            .iter()
-                            .map(|entry| entry.identity.as_key_ref()),
-                    )
-                };
-                (plan, count, "general_diff")
-            }
+        let concurrent_keys = concurrent
+            .into_iter()
+            .filter_map(|entry| entry.after.or(entry.before))
+            .map(|row| TrackedStateKey {
+                schema_key: row.key.schema_key,
+                file_id: row.key.file_id,
+                entity_pk: row.key.entity_pk,
+            })
+            .collect::<Vec<_>>();
+        let concurrent_change_count = concurrent_keys.len();
+        let plan = {
+            let span = tracing::debug_span!(
+                target: "lix_transaction",
+                "lix.transaction.stale.classify",
+                prepared_rows = prepared_writes.state_rows.len(),
+                concurrent_changes = concurrent_change_count,
+            );
+            let _entered = span.enter();
+            classify_stale_commit(
+                prepared_writes,
+                concurrent_keys.iter().map(|key| TrackedStateKeyRef {
+                    schema_key: key.schema_key.as_str(),
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                }),
+            )
         };
+        let discovery = "forktree_diff";
         tracing::debug!(
             target: "lix_transaction",
             plan = plan.kind(),
@@ -911,7 +930,7 @@ where
                 let file_count = plan.file_ids.len();
                 let semantic_conflict_count = plan.semantic_conflict_indices.len();
                 self.reconcile_stale_plugin_writes(
-                    read,
+                    &facade,
                     prepared_writes,
                     plan,
                     opening_head,
@@ -937,16 +956,16 @@ where
         Ok(())
     }
 
-    async fn reconcile_stale_plugin_writes<S>(
+    async fn reconcile_stale_plugin_writes<R>(
         &mut self,
-        read: &S,
+        facade: &ForkTreeReadFacade<R>,
         prepared_writes: &mut PreparedWriteSet,
         plan: StalePluginReconciliationPlan,
         opening_head: CommitId,
         current_head: CommitId,
     ) -> Result<(), LixError>
     where
-        S: StorageAdapterRead,
+        R: StorageAdapterRead,
     {
         let conflict_error = || {
             LixError::new(
@@ -973,54 +992,49 @@ where
             file_id: None,
             entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
         };
-        let mut tracked = self.tracked_state.reader(read);
-        let base_owners = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                &owner_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let current_owners = tracked
-            .load_projected_batch_at_commit(
-                &current_head.to_string(),
-                &owner_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let base_registry = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                std::slice::from_ref(&registry_key),
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let current_registry = tracked
-            .load_projected_batch_at_commit(
-                &current_head.to_string(),
-                std::slice::from_ref(&registry_key),
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let base_registry_row = base_registry.row(0);
-        let current_registry_row = current_registry.row(0);
-        if base_registry_row.map(|row| row.change_id())
-            != current_registry_row.map(|row| row.change_id())
+        let base_owners = load_historical_rows_at_commit(facade, opening_head, &owner_keys).await?;
+        let current_owners =
+            load_historical_rows_at_commit(facade, current_head, &owner_keys).await?;
+        let base_registry = load_historical_rows_at_commit(
+            facade,
+            opening_head,
+            std::slice::from_ref(&registry_key),
+        )
+        .await?;
+        let current_registry = load_historical_rows_at_commit(
+            facade,
+            current_head,
+            std::slice::from_ref(&registry_key),
+        )
+        .await?;
+        let base_registry_row = base_registry.first().and_then(Option::as_ref);
+        let current_registry_row = current_registry.first().and_then(Option::as_ref);
+        if base_registry_row.map(|row| row.change_id)
+            != current_registry_row.map(|row| row.change_id)
+            || base_registry_row.is_none()
+            || current_registry_row.is_none()
         {
             return Err(conflict_error());
         }
         let registry_snapshot = current_registry_row
-            .filter(|row| !row.deleted())
-            .and_then(|row| row.snapshot_content())
-            .map(|snapshot| serde_json::from_str(snapshot.as_str()))
-            .transpose()
-            .map_err(|error| {
+            .filter(|row| !row.deleted)
+            .and_then(|row| row.snapshot_content.as_ref())
+            .ok_or_else(conflict_error)
+            .and_then(|snapshot| {
+                serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("plugin registry snapshot is invalid JSON: {error}"),
+                    )
+                })
+            })?;
+        let registry =
+            PluginRegistry::from_optional_snapshot(Some(&registry_snapshot)).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
-                    format!("plugin registry snapshot is invalid JSON: {error}"),
+                    format!("plugin registry snapshot is invalid: {error}"),
                 )
             })?;
-        let registry = PluginRegistry::from_optional_snapshot(registry_snapshot.as_ref())?;
 
         let path_index = self
             .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
@@ -1029,19 +1043,18 @@ where
             .await?;
         let mut groups = BTreeMap::<String, StalePluginConflictGroup>::new();
         for (owner_index, file_id) in file_ids.iter().enumerate() {
-            let base_owner_row = base_owners.row(owner_index);
-            let current_owner_row = current_owners.row(owner_index);
-            if base_owner_row.map(|row| row.change_id())
-                != current_owner_row.map(|row| row.change_id())
+            let base_owner_row = base_owners[owner_index].as_ref();
+            let current_owner_row = current_owners[owner_index].as_ref();
+            if base_owner_row.map(|row| row.change_id) != current_owner_row.map(|row| row.change_id)
+                || base_owner_row.is_none()
+                || current_owner_row.is_none()
             {
                 return Err(conflict_error());
             }
-            let owner = current_owner_row
-                .filter(|row| !row.deleted())
-                .map(PluginFileOwner::from_tracked_state_row_ref)
-                .transpose()?
-                .flatten()
-                .ok_or_else(conflict_error)?;
+            let owner = PluginFileOwner::from_historical_state_row(
+                current_owner_row.expect("checked above"),
+            )?
+            .ok_or_else(conflict_error)?;
             let plugin = registry
                 .plugin(owner.plugin_key())
                 .filter(|plugin| plugin.schema_keys() == owner.schema_keys())
@@ -1080,20 +1093,10 @@ where
                 }
             })
             .collect::<Vec<_>>();
-        let base_rows = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                &candidate_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let current_rows = tracked
-            .load_projected_batch_at_commit(
-                &current_head.to_string(),
-                &candidate_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
+        let base_rows =
+            load_historical_rows_at_commit(facade, opening_head, &candidate_keys).await?;
+        let current_rows =
+            load_historical_rows_at_commit(facade, current_head, &candidate_keys).await?;
         for (slot, &row_index) in candidate_indices.iter().enumerate() {
             let source = prepared_writes.state_rows.row(row_index);
             let file_id = source.file_id.expect("candidate has file id").to_string();
@@ -1106,14 +1109,14 @@ where
             {
                 return Err(conflict_error());
             }
-            let target = current_rows.row(slot);
+            let target = current_rows[slot].as_ref();
             let source_payload = source.snapshot.map(|snapshot| StaleConflictPayload {
                 snapshot: snapshot.materialize_shared(),
                 metadata: source
                     .metadata
                     .map(|metadata| metadata.materialize_shared()),
             });
-            let target_payload = stale_payload_from_tracked(target);
+            let target_payload = stale_payload_from_historical(target);
             let source_change_id = source.change_id.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1121,8 +1124,7 @@ where
                 )
             })?;
             let source_rank = ConflictRank::new(source.updated_at, source_change_id);
-            let target_rank =
-                target.map(|row| ConflictRank::new(row.updated_at(), row.change_id()));
+            let target_rank = target.map(|row| ConflictRank::new(row.updated_at, row.change_id));
             let (a, b) = if target_rank.is_some_and(|rank| rank < source_rank) {
                 (target_payload, source_payload)
             } else {
@@ -1130,7 +1132,7 @@ where
             };
             group.conflicts.push(StaleSemanticConflict {
                 key: candidate_keys[slot].clone(),
-                base: stale_payload_from_tracked(base_rows.row(slot)),
+                base: stale_payload_from_historical(base_rows[slot].as_ref()),
                 a,
                 b,
             });
@@ -8198,7 +8200,7 @@ where
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
-            forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
+            forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
         }
     }
 
