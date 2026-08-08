@@ -15,14 +15,13 @@ use crate::filesystem::{
 use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    expanded_branch_ids,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateExactBatch,
+    MaterializedLiveStateRow, MaterializedLiveStateRowRef, expanded_branch_ids,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateContext;
 #[cfg(test)]
-use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest};
+use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::mem::size_of;
@@ -828,103 +827,6 @@ struct LiveStateScanScope {
     branch_heads: BranchHeads,
 }
 
-/// Rows read from one durable hot-state branch source.
-///
-/// A matching hot-state projection is storage-key ordered by visible identity
-/// and has one row per identity.
-struct HotBranchRows {
-    branch_id: String,
-    rows: MaterializedLiveStateBatch,
-    ordered_unique: bool,
-}
-
-/// Returns the only nonempty branch candidate when it can be served without
-/// branch/global visibility resolution. Global rows, multiple requested
-/// branches, and synthesized branch-ref candidates all stay on the general
-/// visibility path.
-fn ordered_unique_branch_row_index(
-    branch_rows: &[HotBranchRows],
-    projection_branch_ids: &[String],
-) -> Option<usize> {
-    let [requested_branch_id] = projection_branch_ids else {
-        return None;
-    };
-    let mut candidates = branch_rows
-        .iter()
-        .enumerate()
-        .filter(|(_, branch_rows)| !branch_rows.rows.is_empty());
-    let (index, candidate) = candidates.next()?;
-    if candidates.next().is_some()
-        || !candidate.ordered_unique
-        || candidate.branch_id != *requested_branch_id
-    {
-        return None;
-    }
-    Some(index)
-}
-
-/// Finalizes a table scan whose rows are already ordered and unique for the
-/// sole requested branch. This intentionally does no identity sort or
-/// deduplication; the tracked-head key codec proves both properties.
-fn finalize_ordered_unique_batch(
-    rows: MaterializedLiveStateBatch,
-    include_tombstones: bool,
-    limit: Option<usize>,
-) -> MaterializedLiveStateBatch {
-    if limit.is_none_or(|limit| limit >= rows.len())
-        && (include_tombstones || !rows.iter().any(|row| row.deleted()))
-    {
-        return rows;
-    }
-    rows.filter(|row| include_tombstones || !row.deleted(), limit)
-}
-
-fn current_row_matches_retention(
-    row: MaterializedLiveStateRowRef<'_>,
-    requested_untracked: Option<bool>,
-) -> bool {
-    requested_untracked.is_none_or(|untracked| row.untracked() == untracked)
-}
-
-fn filter_current_row_retention(
-    rows: MaterializedLiveStateBatch,
-    requested_untracked: Option<bool>,
-) -> MaterializedLiveStateBatch {
-    if requested_untracked.is_none()
-        || rows
-            .iter()
-            .all(|row| current_row_matches_retention(row, requested_untracked))
-    {
-        return rows;
-    }
-    rows.filter(
-        |row| current_row_matches_retention(row, requested_untracked),
-        None,
-    )
-}
-
-fn concat_live_state_batches(
-    batches: impl IntoIterator<Item = MaterializedLiveStateBatch>,
-) -> MaterializedLiveStateBatch {
-    let mut incoming = batches.into_iter().filter(|batch| !batch.is_empty());
-    let Some(first) = incoming.next() else {
-        return MaterializedLiveStateBatch::default();
-    };
-    let Some(second) = incoming.next() else {
-        return first;
-    };
-    let mut batches = vec![first, second];
-    batches.extend(incoming);
-    let capacity = batches.iter().map(MaterializedLiveStateBatch::len).sum();
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(capacity);
-    for batch in &batches {
-        for row in batch.iter() {
-            builder.push_ref(row, None);
-        }
-    }
-    builder.finish()
-}
-
 async fn scan_scope(
     store: &(impl StorageAdapterRead + ?Sized),
     request: &LiveStateScanRequest,
@@ -1449,82 +1351,6 @@ mod tests {
                 ..LiveStateScanRequest::default()
             })
             .await
-    }
-
-    #[test]
-    fn ordered_head_fast_path_requires_one_matching_branch_candidate() {
-        let requested_branch_ids = vec!["branch".to_string()];
-        let branch = HotBranchRows {
-            branch_id: "branch".to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
-                "branch", "branch", None, "branch",
-            )]),
-            ordered_unique: true,
-        };
-        assert_eq!(
-            ordered_unique_branch_row_index(&[branch], &requested_branch_ids),
-            Some(0)
-        );
-
-        let branch = HotBranchRows {
-            branch_id: "branch".to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
-                "branch", "branch", None, "branch",
-            )]),
-            ordered_unique: true,
-        };
-        let global = HotBranchRows {
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
-                GLOBAL_BRANCH_ID,
-                "ffffffff-ffff-7fff-bfff-ffffffffffff",
-                None,
-                "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            )]),
-            ordered_unique: true,
-        };
-        assert_eq!(
-            ordered_unique_branch_row_index(&[branch, global], &requested_branch_ids),
-            None,
-            "a global candidate needs normal branch/global resolution"
-        );
-
-        let unordered_candidate = HotBranchRows {
-            branch_id: "branch".to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
-                "branch", "branch", None, "branch",
-            )]),
-            ordered_unique: false,
-        };
-        assert_eq!(
-            ordered_unique_branch_row_index(&[unordered_candidate], &requested_branch_ids),
-            None,
-            "an unordered candidate does not make the table ordering promise"
-        );
-    }
-
-    #[test]
-    fn ordered_and_single_batch_fast_paths_preserve_the_existing_columns() {
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
-            tracked_row_at_with_commit("branch", "first", None, "first"),
-            tracked_row_at_with_commit("branch", "second", None, "second"),
-        ]);
-        let entity_column = batch.entity_column_ptr();
-        let batch = filter_current_row_retention(batch, Some(false));
-        assert_eq!(batch.entity_column_ptr(), entity_column);
-
-        let entity_column = batch.entity_column_ptr();
-        let batch = finalize_ordered_unique_batch(batch, false, None);
-        assert_eq!(batch.entity_column_ptr(), entity_column);
-
-        let entity_column = batch.entity_column_ptr();
-        let batch = concat_live_state_batches([
-            MaterializedLiveStateBatch::default(),
-            batch,
-            MaterializedLiveStateBatch::default(),
-        ]);
-        assert_eq!(batch.entity_column_ptr(), entity_column);
-        assert_eq!(batch.len(), 2);
     }
 
     #[tokio::test]
