@@ -42,6 +42,13 @@ only: no runtime cell may start until a candidate has a reviewed correction
 frontier replacing blocked `1f742...`, is explicitly compile-green, and the R1
 binding contains the immutable checkpoint/GC ref/head/tree/report identity.
 
+The 705-anchored successor inventory and recipe are
+`FORKTREE_STAGE2_705_READINESS_INVENTORY.tsv` and
+`FORKTREE_STAGE2_705_READINESS_RECIPE.md`. They are metadata-only and preserve
+705 as BLOCKED pending terminal R2/R4/H1/H4 approval; they explicitly identify
+the older overlay and all a12/d6b/e92/9f3 verifiers as base-specific and stale
+for 705.
+
 The historical exact current-layout comparator for the frozen test/report
 artifacts is `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
 `9a705d36392e88d8f5f363b2b23d373deec3321d`; it is a control identity, not a
@@ -311,6 +318,11 @@ The pending correction above blocked 9f3 is head
 `2b8dcb45a2d06bdda86d0fa5add5ea8c12d18c2d`, parent 9f3, diff prefix
 `c68b9338`, patch prefix `7504d3c1`, expected compile frontier 185/7. Its
 transport remains unbound pending review; d6 remains the last approved base.
+
+The complete minimum-landing artifact inventory is frozen in the 705 recipe;
+it includes reader, scalar SQL, checkpoint/GC, W2, Cut B, W3 version-control,
+W4, parsed-file+64MiB, and W5/R7 identities and status without claiming
+runtime qualification.
 
 This is the reduced non-negotiable landing gate for the first explicitly
 compile-green immutable candidate. It is test/report-only and does not authorize
