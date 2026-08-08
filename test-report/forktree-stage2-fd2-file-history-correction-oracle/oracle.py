@@ -33,6 +33,9 @@ RED_IDS = {
     "observed_directory_descriptor_tombstone_payload",
     "observed_plugin_owner_tombstone_payload",
     "selected_missing_or_tombstoned_blob_ref_fails_closed",
+    "composite_entity_pk_first_component_selection",
+    "conflicting_source_change_ids_fail_closed",
+    "zero_blob_ref_projection_state_not_distinguished",
 }
 
 
@@ -90,6 +93,8 @@ def source_findings(root: Path) -> set[str]:
     observed_owner = function_body(fh, "parse_file_history_observed_plugin_owners")
     blob_validator = function_body(fh, "validate_exactly_one_blob_ref")
     row_loader = function_body(fh, "load_file_history_rows")
+    composite_pk_selector = function_body(wd, "single_entity_pk_value")
+    source_change_grouping = function_body(fh, "sorted_grouped_file_history_events")
 
     # These are deliberately function-scoped: a global token elsewhere cannot
     # satisfy the ownership contract.
@@ -120,6 +125,27 @@ def source_findings(root: Path) -> set[str]:
         or ("blob.deleted" in blob_validator and "return Ok(None)" in blob_validator)
     ):
         findings.add("selected_missing_or_tombstoned_blob_ref_fails_closed")
+
+    # The working-diff selector must authenticate the complete EntityPk.  The
+    # b484 implementation deserializes the composite key and returns only its
+    # first component, which can select a different entity under a collision.
+    if not composite_pk_selector or ".next()" in composite_pk_selector:
+        findings.add("composite_entity_pk_first_component_selection")
+
+    # Grouping currently sorts source changes and silently deduplicates by ID.
+    # A same-ID/different-payload pair is corruption, not a legal dedup case.
+    if (
+        not source_change_grouping
+        or "dedup_by" in source_change_grouping
+        and "left.id == right.id" in source_change_grouping
+        and "LixError" not in source_change_grouping
+    ):
+        findings.add("conflicting_source_change_ids_fail_closed")
+
+    # The projection currently turns a missing blob byte value into the same
+    # empty byte vector used by an authenticated zero-length BlobRef.
+    if "unwrap_or_default()" in row_loader:
+        findings.add("zero_blob_ref_projection_state_not_distinguished")
 
     # The working-diff correction is the accepted identity/tombstone pattern.
     if "validate_descriptor_row_identity" not in wd:
@@ -169,6 +195,18 @@ def validate_plugin_owner(row: Row) -> str:
     return "live"
 
 
+def canonical_composite_file_id(parts: tuple[str, ...]) -> str:
+    require(len(parts) == 2, "composite file identity must have two components")
+    require(all(parts), "composite file identity components must be nonempty")
+    return "::".join(parts)
+
+
+def validate_composite_file_identity(parts: tuple[str, ...], file_id: str) -> str:
+    expected = canonical_composite_file_id(parts)
+    require(file_id == expected, "file_id does not bind the complete composite EntityPk")
+    return "live"
+
+
 def validate_blob_binding(row: Row, refs: list[BlobRef] | None) -> str:
     state = validate_descriptor(row)
     if state == "absent":
@@ -190,12 +228,35 @@ def validate_blob_binding(row: Row, refs: list[BlobRef] | None) -> str:
     return "live-empty" if not ref.payload else "live"
 
 
-def project_file(row: Row, refs: list[BlobRef] | None, needs_data: bool) -> bytes | None:
-    """Validate before either metadata-only or data projection."""
+def project_file_result(
+    row: Row, refs: list[BlobRef] | None, needs_data: bool
+) -> tuple[str, bytes | None]:
+    """Return a state tag so empty content cannot equal absence."""
     state = validate_blob_binding(row, refs)
     if state == "absent":
-        return None
-    return b"" if needs_data and state == "live-empty" else None
+        return ("absent", None)
+    if state == "live-empty":
+        return ("live-empty", b"" if needs_data else None)
+    return ("live", None)
+
+
+def project_file(row: Row, refs: list[BlobRef] | None, needs_data: bool) -> bytes | None:
+    """Validate before either metadata-only or data projection."""
+    return project_file_result(row, refs, needs_data)[1]
+
+
+def validate_source_change_records(records: list[dict[str, Any]]) -> None:
+    """Reject conflicting authenticated IDs before any source-change dedup."""
+    seen: dict[str, Any] = {}
+    for record in records:
+        require(record.get("authenticated") is True, "source change is unauthenticated")
+        change_id = record.get("change_id")
+        require(isinstance(change_id, str) and change_id, "source change ID is missing")
+        payload = record.get("payload")
+        if change_id in seen:
+            require(seen[change_id] == payload, "conflicting duplicate source change ID")
+            raise AssertionError("duplicate source change ID cannot be silently deduplicated")
+        seen[change_id] = payload
 
 
 def run_model_cases() -> list[str]:
@@ -395,6 +456,58 @@ def run_model_cases() -> list[str]:
         lambda: expect_error(
             lambda: validate_plugin_owner(Row("plugin_owner", "owner", file_id, {}, True))
         ),
+    )
+    case(
+        "historical_composite_pk_first_component_fails",
+        lambda: [
+            validate_composite_file_identity(("tenant-a", "file-a"), "tenant-a::file-a"),
+            expect_error(
+                lambda: validate_composite_file_identity(("tenant-a", "file-a"), "tenant-a")
+            ),
+        ],
+    )
+    case(
+        "conflicting_authenticated_source_change_ids_fail",
+        lambda: expect_error(
+            lambda: validate_source_change_records(
+                [
+                    {"change_id": "chg-conflict", "payload": "left", "authenticated": True},
+                    {"change_id": "chg-conflict", "payload": "right", "authenticated": True},
+                ]
+            )
+        ),
+    )
+    case(
+        "zero_blob_ref_distinct_from_missing_and_tombstone_in_both_projections",
+        lambda: [
+            require(
+                project_file_result(
+                    Row("file", file_id, file_id, {"id": file_id}),
+                    [BlobRef(file_id, empty_hash, 0, b"")],
+                    needs_data,
+                )
+                == ("live-empty", b"" if needs_data else None),
+                "explicit empty BlobRef was not observable in both projections",
+            )
+            for needs_data in (False, True)
+        ]
+        + [
+            expect_error(
+                lambda: project_file_result(
+                    Row("file", file_id, file_id, {"id": file_id}), refs, needs_data
+                )
+            )
+            for refs in ([], None, [BlobRef(file_id, empty_hash, 0, b"", True)])
+            for needs_data in (False, True)
+        ]
+        + [
+            require(
+                project_file_result(Row("file", file_id, file_id, None, True), [], needs_data)
+                == ("absent", None),
+                "payload-less tombstone was not distinct from live empty",
+            )
+            for needs_data in (False, True)
+        ],
     )
     passed.append("observed_plugin_registry_explicit_empty_value_is_valid")
     return passed
