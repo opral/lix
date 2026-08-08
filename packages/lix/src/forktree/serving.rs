@@ -1249,15 +1249,29 @@ pub(crate) async fn state_point<R>(
 where
     R: StorageAdapterRead,
 {
-    let Some((value, source)) = state_point_on_read(
-        view.repository_root().global_state_root,
-        view.branch_snapshot().local_state_root,
-        key,
-        include_tombstone,
-        view.storage_read(),
-    )
-    .await?
-    else {
+    let (global_root, local_root) = current_state_roots(view);
+    let value_source = match local_root {
+        Some(local_root) => {
+            state_point_on_read(
+                global_root,
+                local_root,
+                key,
+                include_tombstone,
+                view.storage_read(),
+            )
+            .await?
+        }
+        None => state_point_on_read(
+            global_root,
+            global_root,
+            key,
+            include_tombstone,
+            view.storage_read(),
+        )
+        .await?
+        .map(|(value, _)| (value, StateSource::Global)),
+    };
+    let Some((value, source)) = value_source else {
         return Ok(None);
     };
     Ok(Some(VisibleStateRow {
@@ -1309,9 +1323,10 @@ pub(crate) async fn state_range<R>(
 where
     R: StorageAdapterRead,
 {
+    let (global_root, local_root) = current_state_roots(view);
     let rows = state_range_on_roots(
-        view.repository_root().global_state_root,
-        view.branch_snapshot().local_state_root,
+        global_root,
+        local_root,
         view.storage_read(),
         lower,
         upper,
@@ -1330,12 +1345,34 @@ where
         .collect())
 }
 
+/// The global branch has no branch-local overlay. Bootstrap intentionally
+/// retains the same authenticated state root in the selected global snapshot,
+/// so treating that root as a local branch would relabel global rows and make
+/// the SQL schema catalog disappear from the global write domain. Current
+/// global reads therefore resolve only the repository global root; ordinary
+/// branches continue to resolve their local root over that global root.
+fn current_state_roots<R>(view: &CoherentView<R>) -> (ObjectId, Option<ObjectId>)
+where
+    R: StorageAdapterRead,
+{
+    let global_root = view.repository_root().global_state_root;
+    if view.branch_id().as_bytes()
+        == uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .expect("GLOBAL_BRANCH_ID must be a UUID")
+            .as_bytes()
+    {
+        (global_root, None)
+    } else {
+        (global_root, Some(view.branch_snapshot().local_state_root))
+    }
+}
+
 /// Scans the authenticated global/local state overlay for explicit historical
 /// roots. The roots and every leaf are read through the caller's retained
 /// StorageRead; no current selector or legacy tracked-state reader is opened.
 pub(crate) async fn state_range_on_roots<R>(
     global_state_root: ObjectId,
-    local_state_root: ObjectId,
+    local_state_root: Option<ObjectId>,
     read: &R,
     lower: Option<&[u8]>,
     upper: Option<&[u8]>,
@@ -1352,7 +1389,7 @@ where
     let mut global = std::collections::VecDeque::new();
     let mut local = std::collections::VecDeque::new();
     let mut global_done = false;
-    let mut local_done = false;
+    let mut local_done = local_state_root.is_none();
     loop {
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
@@ -1374,7 +1411,7 @@ where
         }
         if local.is_empty() && !local_done {
             let page = scan_bounded_page_on_read(
-                local_state_root,
+                local_state_root.expect("local state root is present while scanning"),
                 "state",
                 lower,
                 upper,
@@ -1458,7 +1495,7 @@ where
     .await?;
     let rows = state_range_on_roots(
         commit.global_state_root,
-        commit.local_state_root,
+        Some(commit.local_state_root),
         read,
         None,
         None,
