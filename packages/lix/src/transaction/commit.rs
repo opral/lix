@@ -218,9 +218,14 @@ where
             file_id: row.file_id.map(|value| value.as_str()),
             entity_pk: row.entity_pk,
         };
+        let untracked_owner = if row.global {
+            canonical_branch_id(crate::GLOBAL_BRANCH_ID)?
+        } else {
+            publication_branch_id
+        };
         if let Some(snapshot) = row.snapshot {
             publication.put_untracked_row(
-                publication_branch_id,
+                untracked_owner,
                 key,
                 UntrackedValueRef {
                     created_at: row.created_at,
@@ -235,7 +240,7 @@ where
                 },
             )?;
         } else {
-            publication.delete_untracked_row(publication_branch_id, key)?;
+            publication.delete_untracked_row(untracked_owner, key)?;
         }
     }
 

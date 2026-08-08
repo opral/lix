@@ -215,8 +215,9 @@ where
             "current ForkTree untracked view does not match requested branch",
         ));
     }
+    let owner_rows = merge_untracked_overlay_rows(view, view.scan_untracked_overlay_rows().await?)?;
     let mut rows = Vec::new();
-    for (key, value) in view.scan_untracked_rows().await? {
+    for (_encoded_key, (owner, key, value)) in owner_rows {
         if !request.filter.schema_keys.is_empty()
             && !request
                 .filter
@@ -246,12 +247,14 @@ where
         if value.cell.deleted() && !request.filter.include_tombstones {
             continue;
         }
+        let owner_is_global = owner.as_bytes() == global_branch_id().as_bytes();
         rows.push(materialize_untracked_row(
             value,
             key.entity_pk,
             key.schema_key,
             key.file_id,
-            branch_id_text(branch_id),
+            branch_id_text(owner),
+            owner_is_global,
         ));
         if request.limit.is_some_and(|limit| rows.len() >= limit) {
             break;
@@ -281,24 +284,15 @@ where
     let mut slots = Vec::with_capacity(request.rows.len());
 
     if request.untracked == Some(true) {
-        let mut untracked_rows = BTreeMap::new();
-        for (key, value) in view.scan_untracked_rows().await? {
-            let encoded_key = encode_state_key(StateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
-            if untracked_rows.insert(encoded_key, (key, value)).is_some() {
-                return Err(overlay_corruption("untracked"));
-            }
-        }
+        let untracked_rows =
+            merge_untracked_overlay_rows(&view, view.scan_untracked_overlay_rows().await?)?;
         for requested in &request.rows {
             let key = encode_state_key(StateKeyRef {
                 schema_key: &requested.schema_key,
                 file_id: requested.file_id.as_deref(),
                 entity_pk: &requested.entity_pk,
             });
-            let Some((decoded_key, value)) = untracked_rows.get(&key) else {
+            let Some((_owner, decoded_key, value)) = untracked_rows.get(&key) else {
                 slots.push(None);
                 continue;
             };
@@ -313,7 +307,8 @@ where
                 decoded_key.entity_pk.clone(),
                 decoded_key.schema_key.clone(),
                 decoded_key.file_id.clone(),
-                branch_id_text(branch_id),
+                branch_id_text(*_owner),
+                _owner.as_bytes() == global_branch_id().as_bytes(),
             ));
             slots.push(Some(ordinal));
         }
@@ -356,6 +351,53 @@ fn validate_scan_request(request: &LiveStateScanRequest) -> Result<(), LixError>
         ));
     }
     Ok(())
+}
+
+fn global_branch_id() -> CanonicalBranchId {
+    let uuid =
+        uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID).expect("GLOBAL_BRANCH_ID must be a UUID");
+    CanonicalBranchId::from_bytes(*uuid.as_bytes())
+}
+
+fn merge_untracked_overlay_rows(
+    view: &crate::forktree::CoherentView<impl StorageAdapterRead>,
+    rows: Vec<(
+        CanonicalBranchId,
+        crate::forktree::StateKey,
+        crate::forktree::UntrackedValue,
+    )>,
+) -> Result<
+    BTreeMap<
+        Vec<u8>,
+        (
+            CanonicalBranchId,
+            crate::forktree::StateKey,
+            crate::forktree::UntrackedValue,
+        ),
+    >,
+    LixError,
+> {
+    let branch_id = view.branch_id();
+    let global_id = global_branch_id();
+    let mut selected = BTreeMap::new();
+    for (owner, key, value) in rows {
+        let encoded_key = encode_state_key(StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        if let Some((existing_owner, _, _)) = selected.get(&encoded_key) {
+            if *existing_owner == owner {
+                return Err(overlay_corruption("untracked"));
+            }
+            if owner != branch_id {
+                debug_assert_eq!(owner, global_id);
+                continue;
+            }
+        }
+        selected.insert(encoded_key, (owner, key, value));
+    }
+    Ok(selected)
 }
 
 fn validate_exact_request(request: &LiveStateExactBatchRequest) -> Result<(), LixError> {
@@ -432,6 +474,7 @@ fn materialize_untracked_row(
     schema_key: String,
     file_id: Option<String>,
     branch_id: String,
+    global: bool,
 ) -> MaterializedLiveStateRow {
     let deleted = value.cell.deleted();
     let snapshot_content = match &value.cell {
@@ -447,7 +490,7 @@ fn materialize_untracked_row(
         deleted,
         created_at: value.created_at,
         updated_at: value.updated_at,
-        global: false,
+        global,
         change_id: None,
         commit_id: None,
         untracked: true,

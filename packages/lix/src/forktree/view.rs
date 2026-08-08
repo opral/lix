@@ -146,6 +146,45 @@ where
     pub(crate) async fn scan_untracked_rows(
         &self,
     ) -> Result<Vec<(super::state::StateKey, super::state::UntrackedValue)>, crate::LixError> {
+        Ok(self
+            .scan_untracked_rows_for_scope(false)
+            .await?
+            .into_iter()
+            .map(|(_owner, key, value)| (key, value))
+            .collect())
+    }
+
+    /// Scans the authenticated untracked overlay owned by this branch. An
+    /// ordinary branch view includes the global owner as the base overlay;
+    /// the global view includes only its own rows. Both owners are resolved
+    /// through this view's retained read and the owner is returned so callers
+    /// cannot accidentally republish a global row as branch-local state.
+    pub(crate) async fn scan_untracked_overlay_rows(
+        &self,
+    ) -> Result<
+        Vec<(
+            CanonicalBranchId,
+            super::state::StateKey,
+            super::state::UntrackedValue,
+        )>,
+        crate::LixError,
+    > {
+        self.scan_untracked_rows_for_scope(true).await
+    }
+
+    async fn scan_untracked_rows_for_scope(
+        &self,
+        include_global_overlay: bool,
+    ) -> Result<
+        Vec<(
+            CanonicalBranchId,
+            super::state::StateKey,
+            super::state::UntrackedValue,
+        )>,
+        crate::LixError,
+    > {
+        let global_branch_id = uuid::Uuid::parse_str(crate::GLOBAL_BRANCH_ID)
+            .expect("GLOBAL_BRANCH_ID must be a UUID");
         let mut cursor = self
             .read
             .begin_scan(
@@ -165,7 +204,11 @@ where
             let page = cursor.next_page(256).await?;
             for entry in page.entries {
                 let (branch_id, key) = super::state::decode_untracked_key(&entry.key.0)?;
-                if branch_id != self.branch_id {
+                if branch_id != self.branch_id
+                    && !(include_global_overlay
+                        && self.branch_id.as_bytes() != global_branch_id.as_bytes()
+                        && branch_id.as_bytes() == global_branch_id.as_bytes())
+                {
                     continue;
                 }
                 let value = match entry.value {
@@ -179,7 +222,7 @@ where
                         ));
                     }
                 };
-                rows.push((key, value));
+                rows.push((branch_id, key, value));
             }
             if !page.has_more {
                 break;
