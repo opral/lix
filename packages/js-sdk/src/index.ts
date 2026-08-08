@@ -21,7 +21,6 @@ export type {
 	ExecuteResult,
 	LixBatchOptions,
 	LixBatchStatement,
-	LocalFilesystemOptions,
 	JsonValue,
 	LixValue,
 	MergeBranchOptions,

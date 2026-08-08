@@ -47,49 +47,15 @@ Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./workspace",
-    syncAllFiles: true,
-  }),
+  storage: new LocalFilesystem("./workspace"),
 });
 ```
 
-Pass `lixDir` for filesystem sync with repository metadata in an external
-`.lix` directory. This does not write `<workspace>/.lix`:
-
-```ts
-const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./workspace",
-    lixDir: "/tmp/session/.lix",
-    syncAllFiles: true,
-  }),
-});
-```
-
-Set `syncAllFiles: false` to start filesystem sync with no regular workspace
-files, then import selected files with `storage.importPaths()`. Imported paths are
-exact workspace-relative file paths, not directories or globs. They may be
-written with or without a leading slash, for example `"notes/today.md"` or
-`"/notes/today.md"`. This scopes disk import, file watching, and
-materialization; it does not filter unrelated Lix SQL state.
-
-```ts
-const storage = new LocalFilesystem({
-  path: "./workspace",
-  syncAllFiles: false,
-});
-const lix = await openLix({ storage });
-await storage.importPaths(["notes/today.md"]);
-```
-
-Call `storage.syncDiskToLix()` to run one manual sync pass that imports pending
-disk changes into Lix. It returns `Promise<void>` and requires an open Lix
-instance.
-
-```ts
-await storage.syncDiskToLix();
-```
+The path is the workspace root and repository state always lives in
+`<workspace>/.lix`. Regular files synchronize automatically in both directions;
+there is no manual synchronization API. The `.lix` directory is never imported
+as workspace content or recursively watched. Closing the Lix drains already
+accepted Lix-to-disk work before the synchronization owner stops.
 
 ## Lix instance
 

@@ -1,9 +1,3 @@
-export type LocalFilesystemOptions = {
-	path: string;
-	lixDir?: string;
-	syncAllFiles: boolean;
-};
-
 export type RemoteLixFetch = (
 	input: RequestInfo | URL,
 	init?: RequestInit,

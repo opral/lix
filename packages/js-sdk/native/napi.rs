@@ -9,7 +9,7 @@ use lix::{
     ObserveEvents as RsObserveEvents, RedoReceipt, SwitchBranchOptions as RsSwitchBranchOptions,
     SwitchBranchReceipt, UndoReceipt, Value, open_lix,
 };
-use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
+use lix_storage_filesystem::LocalFilesystem;
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -48,7 +48,7 @@ pub struct NativeLix {
 
 enum NativeLixInner {
     Memory(RsLix<Memory>),
-    LocalFilesystem(RsLix<LocalFilesystem>, LocalFilesystem),
+    LocalFilesystem(RsLix<LocalFilesystem>),
 }
 
 enum NativeLixTransactionInner {
@@ -143,10 +143,6 @@ enum LixCommand {
         options: RsSwitchBranchOptions,
         deferred: NativeSwitchBranchDeferred,
     },
-    ImportFilesystemPaths {
-        paths: Vec<String>,
-        deferred: NativeUnitDeferred,
-    },
     MergeBranchPreview {
         options: MergeBranchPreviewOptions,
         deferred: NativeMergePreviewDeferred,
@@ -155,7 +151,6 @@ enum LixCommand {
         options: RsMergeBranchOptions,
         deferred: NativeMergeReceiptDeferred,
     },
-    SyncDiskToLix(NativeUnitDeferred),
     Close(NativeUnitDeferred),
     Observe {
         sql: String,
@@ -277,7 +272,25 @@ fn run_lix_actor(
             drain_commands_after_close(&receiver, &send_lock);
             break;
         }
-        if handle_lix_command(&rt, open_state, &closed, command) {
+        let command = match command {
+            LixCommand::Close(deferred) => {
+                let result = rt.block_on(open_state.lix.close());
+                if result.is_ok() {
+                    closed.store(true, Ordering::SeqCst);
+                    // Dropping the filesystem-backed Lix stops admission,
+                    // drains accepted materialization work, stops the watcher,
+                    // and joins its sole worker before close resolves.
+                    drop(state.take());
+                    drain_commands_after_close(&receiver, &send_lock);
+                    settle_deferred(deferred, result);
+                    break;
+                }
+                settle_deferred(deferred, result);
+                continue;
+            }
+            command => command,
+        };
+        if handle_lix_command(&rt, open_state, command) {
             drop(state.take());
             drain_commands_after_close(&receiver, &send_lock);
             break;
@@ -312,9 +325,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
                 deferred.reject(to_napi_error(&error));
             }
             LixCommand::MergeBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
-            LixCommand::SyncDiskToLix(deferred)
-            | LixCommand::Close(deferred)
-            | LixCommand::ImportFilesystemPaths { deferred, .. }
+            LixCommand::Close(deferred)
             | LixCommand::TransactionCommit { deferred, .. }
             | LixCommand::TransactionRollback { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
@@ -328,12 +339,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
     }
 }
 
-fn handle_lix_command(
-    rt: &Runtime,
-    state: &mut NativeLixActorState,
-    closed: &AtomicBool,
-    command: LixCommand,
-) -> bool {
+fn handle_lix_command(rt: &Runtime, state: &mut NativeLixActorState, command: LixCommand) -> bool {
     match command {
         LixCommand::Execute {
             sql,
@@ -417,11 +423,6 @@ fn handle_lix_command(
             settle_deferred(deferred, result);
             false
         }
-        LixCommand::ImportFilesystemPaths { paths, deferred } => {
-            let result = rt.block_on(state.lix.import_filesystem_paths(paths));
-            settle_deferred(deferred, result);
-            false
-        }
         LixCommand::MergeBranchPreview { options, deferred } => {
             let result = rt
                 .block_on(state.lix.merge_branch_preview(options))
@@ -436,20 +437,7 @@ fn handle_lix_command(
             settle_deferred(deferred, result);
             false
         }
-        LixCommand::SyncDiskToLix(deferred) => {
-            let result = rt.block_on(state.lix.sync_disk_to_lix());
-            settle_deferred(deferred, result);
-            false
-        }
-        LixCommand::Close(deferred) => {
-            let result = rt.block_on(state.lix.close());
-            let should_drop_state = result.is_ok();
-            if result.is_ok() {
-                closed.store(true, Ordering::SeqCst);
-            }
-            settle_deferred(deferred, result);
-            should_drop_state
-        }
+        LixCommand::Close(_) => unreachable!("close is handled before command dispatch"),
         LixCommand::Observe {
             sql,
             params,
@@ -549,9 +537,7 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::Observe { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
-        LixCommand::ImportFilesystemPaths { deferred, .. }
-        | LixCommand::SyncDiskToLix(deferred)
-        | LixCommand::TransactionCommit { deferred, .. }
+        LixCommand::TransactionCommit { deferred, .. }
         | LixCommand::TransactionRollback { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -577,7 +563,7 @@ impl NativeLixInner {
     ) -> std::result::Result<RsExecuteResult, LixError> {
         match self {
             Self::Memory(lix) => lix.execute_with_options(sql, params, options).await,
-            Self::LocalFilesystem(lix, _) => lix.execute_with_options(sql, params, options).await,
+            Self::LocalFilesystem(lix) => lix.execute_with_options(sql, params, options).await,
         }
     }
 
@@ -588,9 +574,7 @@ impl NativeLixInner {
     ) -> std::result::Result<Vec<RsExecuteResult>, LixError> {
         match self {
             Self::Memory(lix) => lix.execute_batch_with_options(statements, options).await,
-            Self::LocalFilesystem(lix, _) => {
-                lix.execute_batch_with_options(statements, options).await
-            }
+            Self::LocalFilesystem(lix) => lix.execute_batch_with_options(statements, options).await,
         }
     }
 
@@ -599,7 +583,7 @@ impl NativeLixInner {
             Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
                 lix.begin_transaction().await?,
             )),
-            Self::LocalFilesystem(lix, _) => Ok(NativeLixTransactionInner::LocalFilesystem(
+            Self::LocalFilesystem(lix) => Ok(NativeLixTransactionInner::LocalFilesystem(
                 lix.begin_transaction().await?,
             )),
         }
@@ -612,7 +596,7 @@ impl NativeLixInner {
     ) -> std::result::Result<NativeObserveEventsInner, LixError> {
         match self {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
-            Self::LocalFilesystem(lix, _) => Ok(NativeObserveEventsInner::LocalFilesystem(
+            Self::LocalFilesystem(lix) => Ok(NativeObserveEventsInner::LocalFilesystem(
                 lix.observe(sql, params)?,
             )),
         }
@@ -621,14 +605,14 @@ impl NativeLixInner {
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
-            Self::LocalFilesystem(lix, _) => lix.active_branch_id().await,
+            Self::LocalFilesystem(lix) => lix.active_branch_id().await,
         }
     }
 
     fn active_account_id(&self) -> &str {
         match self {
             Self::Memory(lix) => lix.active_account_id(),
-            Self::LocalFilesystem(lix, _) => lix.active_account_id(),
+            Self::LocalFilesystem(lix) => lix.active_account_id(),
         }
     }
 
@@ -638,28 +622,28 @@ impl NativeLixInner {
     ) -> std::result::Result<CreateBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
-            Self::LocalFilesystem(lix, _) => lix.create_branch(options).await,
+            Self::LocalFilesystem(lix) => lix.create_branch(options).await,
         }
     }
 
     async fn create_checkpoint(&self) -> std::result::Result<CreateCheckpointReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_checkpoint().await,
-            Self::LocalFilesystem(lix, _) => lix.create_checkpoint().await,
+            Self::LocalFilesystem(lix) => lix.create_checkpoint().await,
         }
     }
 
     async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.undo().await,
-            Self::LocalFilesystem(lix, _) => lix.undo().await,
+            Self::LocalFilesystem(lix) => lix.undo().await,
         }
     }
 
     async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.redo().await,
-            Self::LocalFilesystem(lix, _) => lix.redo().await,
+            Self::LocalFilesystem(lix) => lix.redo().await,
         }
     }
 
@@ -669,20 +653,7 @@ impl NativeLixInner {
     ) -> std::result::Result<SwitchBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
-            Self::LocalFilesystem(lix, _) => lix.switch_branch(options).await,
-        }
-    }
-
-    async fn import_filesystem_paths(
-        &self,
-        paths: Vec<String>,
-    ) -> std::result::Result<(), LixError> {
-        match self {
-            Self::LocalFilesystem(_, storage) => storage.import_paths(paths).await,
-            Self::Memory(_) => Err(LixError::new(
-                "LIX_UNSUPPORTED_STORAGE",
-                "importFilesystemPaths requires a filesystem storage",
-            )),
+            Self::LocalFilesystem(lix) => lix.switch_branch(options).await,
         }
     }
 
@@ -692,7 +663,7 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchPreview, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
-            Self::LocalFilesystem(lix, _) => lix.merge_branch_preview(options).await,
+            Self::LocalFilesystem(lix) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -702,24 +673,14 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
-            Self::LocalFilesystem(lix, _) => lix.merge_branch(options).await,
-        }
-    }
-
-    async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
-        match self {
-            Self::LocalFilesystem(_, storage) => storage.sync_disk_to_lix().await,
-            Self::Memory(_) => Err(LixError::new(
-                "LIX_UNSUPPORTED_STORAGE",
-                "syncDiskToLix requires a filesystem storage",
-            )),
+            Self::LocalFilesystem(lix) => lix.merge_branch(options).await,
         }
     }
 
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(lix) => lix.close().await,
-            Self::LocalFilesystem(lix, _) => lix.close().await,
+            Self::LocalFilesystem(lix) => lix.close().await,
         }
     }
 }
@@ -777,8 +738,6 @@ impl NativeObserveEventsInner {
 #[expect(missing_debug_implementations)]
 pub struct OpenLocalFilesystemTask {
     path: String,
-    lix_dir: Option<String>,
-    sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
 
@@ -794,8 +753,6 @@ impl Task for OpenLocalFilesystemTask {
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(open_local_filesystem_native(
             std::mem::take(&mut self.path),
-            self.lix_dir.take(),
-            std::mem::take(&mut self.sync_all_files),
             self.telemetry_dispatch.take(),
         ))
     }
@@ -844,17 +801,13 @@ fn open_memory_native(
 
 fn open_local_filesystem_native(
     path: String,
-    lix_dir: Option<String>,
-    sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let mut options = LocalFilesystemOpenOptions::new(path, sync_all_files);
-    options.lix_dir = lix_dir.map(Into::into);
-    let storage = rt.block_on(LocalFilesystem::open_with_options(options))?;
+    let storage = rt.block_on(LocalFilesystem::open(path))?;
     let lix = match telemetry_dispatch.map(telemetry_sink) {
         Some(telemetry) => rt.block_on(async {
             open_lix()
@@ -864,7 +817,7 @@ fn open_local_filesystem_native(
         })?,
         None => rt.block_on(async { open_lix().with_storage(storage.clone()).await })?,
     };
-    NativeLix::new(NativeLixInner::LocalFilesystem(lix, storage))
+    NativeLix::new(NativeLixInner::LocalFilesystem(lix))
 }
 
 #[napi]
@@ -881,14 +834,10 @@ impl NativeLix {
     #[napi(js_name = "openLocalFilesystem")]
     pub fn open_local_filesystem(
         path: String,
-        lix_dir: Option<String>,
-        sync_all_files: bool,
         telemetry_dispatch: Option<Function<'_, String, ()>>,
     ) -> Result<AsyncTask<OpenLocalFilesystemTask>> {
         Ok(AsyncTask::new(OpenLocalFilesystemTask {
             path,
-            lix_dir,
-            sync_all_files,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
         }))
     }
@@ -1069,21 +1018,6 @@ impl NativeLix {
         Ok(promise)
     }
 
-    #[napi(js_name = "importFilesystemPaths")]
-    pub fn import_filesystem_paths<'env>(
-        &self,
-        env: &'env Env,
-        paths: Vec<String>,
-    ) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
-        self.actor
-            .send_with_deferred(deferred, |deferred| LixCommand::ImportFilesystemPaths {
-                paths,
-                deferred,
-            });
-        Ok(promise)
-    }
-
     #[napi(js_name = "mergeBranchPreview")]
     pub fn merge_branch_preview<'env>(
         &self,
@@ -1113,14 +1047,6 @@ impl NativeLix {
                 options: options.into(),
                 deferred,
             });
-        Ok(promise)
-    }
-
-    #[napi(js_name = "syncDiskToLix")]
-    pub fn sync_disk_to_lix<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
-        self.actor
-            .send_with_deferred(deferred, LixCommand::SyncDiskToLix);
         Ok(promise)
     }
 

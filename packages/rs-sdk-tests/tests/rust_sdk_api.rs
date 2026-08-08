@@ -4,7 +4,7 @@ use lix::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, GLOBAL_BRANCH_ID, Lix, LixError, Memory,
     MergeBranchOptions, MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
 };
-use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
+use lix_storage_filesystem::LocalFilesystem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -965,17 +965,6 @@ async fn open_filesystem_lix(path: &Path) -> Lix<LocalFilesystem> {
     open_lix().with_storage(storage).await.unwrap()
 }
 
-async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> Lix<LocalFilesystem> {
-    let options = LocalFilesystemOpenOptions::new(path.to_path_buf(), false);
-    let storage = LocalFilesystem::open_with_options(options).await.unwrap();
-    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
-    storage
-        .import_paths(file_paths.iter().copied())
-        .await
-        .unwrap();
-    lix
-}
-
 #[tokio::test]
 async fn rocksdb_filesystem_storage_allows_same_process_multi_open() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -1360,10 +1349,10 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 }
 
 #[tokio::test]
-async fn on_demand_filesystem_materializes_lix_created_file_outside_initial_imports() {
+async fn filesystem_materializes_lix_created_file() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
-    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["initial.md"]).await;
+    let lix = open_filesystem_lix(tempdir.path()).await;
 
     write_file(&lix, "/new-file.md", b"new".to_vec())
         .await
@@ -1374,10 +1363,10 @@ async fn on_demand_filesystem_materializes_lix_created_file_outside_initial_impo
 }
 
 #[tokio::test]
-async fn on_demand_filesystem_watches_nested_lix_created_file_after_materialization() {
+async fn filesystem_watches_nested_lix_created_file_after_materialization() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
-    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["initial.md"]).await;
+    let lix = open_filesystem_lix(tempdir.path()).await;
 
     write_file(&lix, "/nested/new-file.md", b"new".to_vec())
         .await
@@ -1391,10 +1380,10 @@ async fn on_demand_filesystem_watches_nested_lix_created_file_after_materializat
 }
 
 #[tokio::test]
-async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
+async fn filesystem_lix_delete_allows_later_disk_recreation() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
-    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["initial.md"]).await;
+    let lix = open_filesystem_lix(tempdir.path()).await;
 
     write_file(&lix, "/new-file.md", b"new".to_vec())
         .await
@@ -1413,15 +1402,15 @@ async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
     std::fs::write(&deleted_path, b"recreated").unwrap();
     std::fs::write(tempdir.path().join("initial.md"), b"changed").unwrap();
     wait_for_lix_file(&lix, "/initial.md", Some(b"changed")).await;
-    assert_eq!(read_file(&lix, "/new-file.md").await.unwrap(), None);
+    wait_for_lix_file(&lix, "/new-file.md", Some(b"recreated")).await;
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
+async fn filesystem_lix_rename_tracks_both_later_disk_edits() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("old.md"), b"old").unwrap();
-    let lix = open_on_demand_filesystem_lix(tempdir.path(), &["old.md"]).await;
+    let lix = open_filesystem_lix(tempdir.path()).await;
 
     lix.execute(
         "UPDATE lix_file SET path = $1 WHERE path = $2",
@@ -1441,7 +1430,7 @@ async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
     std::fs::write(&old_path, b"recreated").unwrap();
     std::fs::write(&renamed_path, b"edited").unwrap();
     wait_for_lix_file(&lix, "/nested/renamed.md", Some(b"edited")).await;
-    assert_eq!(read_file(&lix, "/old.md").await.unwrap(), None);
+    wait_for_lix_file(&lix, "/old.md", Some(b"recreated")).await;
     lix.close().await.unwrap();
 }
 
@@ -1493,11 +1482,38 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     std::fs::create_dir(tempdir.path().join("empty-disk")).unwrap();
     wait_for_lix_directory(&lix, "/empty-disk", true).await;
 
+    let nested = tempdir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("binary.bin"), [0, 255, 1, 254]).unwrap();
+    wait_for_lix_file(&lix, "/nested/binary.bin", Some(&[0, 255, 1, 254])).await;
+    std::fs::rename(nested.join("binary.bin"), nested.join("renamed.bin")).unwrap();
+    wait_for_lix_file(&lix, "/nested/binary.bin", None).await;
+    wait_for_lix_file(&lix, "/nested/renamed.bin", Some(&[0, 255, 1, 254])).await;
+
     std::fs::remove_file(tempdir.path().join("disk.txt")).unwrap();
     wait_for_lix_file(&lix, "/disk.txt", None).await;
 
     std::fs::remove_dir(tempdir.path().join("empty-disk")).unwrap();
     wait_for_lix_directory(&lix, "/empty-disk", false).await;
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_materialization_does_not_create_a_watcher_feedback_commit() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_filesystem_lix(tempdir.path()).await;
+
+    write_file(&lix, "/feedback.bin", vec![0, 255, 1, 254])
+        .await
+        .unwrap();
+    let accepted_head = active_branch_commit_id(&lix).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    assert_eq!(active_branch_commit_id(&lix).await, accepted_head);
+    assert_eq!(
+        std::fs::read(tempdir.path().join("feedback.bin")).unwrap(),
+        [0, 255, 1, 254]
+    );
     lix.close().await.unwrap();
 }
 

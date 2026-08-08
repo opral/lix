@@ -38,19 +38,14 @@ Persist a directory as a Lix workspace with `LocalFilesystem`:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "/var/data/workspace",
-    syncAllFiles: true,
-  }),
+  storage: new LocalFilesystem("/var/data/workspace"),
 });
 ```
 
-Lix stores its repository state in `<workspace>/.lix/.internal` and synchronizes workspace files. Reopen the same path to resume the existing state.
-
-Two options change this behavior:
-
-- `lixDir` stores the repository state outside the workspace. The workspace does not receive a `.lix` directory.
-- `syncAllFiles: false` starts without importing files. Import exact file paths with `storage.importPaths(["notes/today.md"])`.
+Lix stores its repository state in `<workspace>/.lix/.internal` and automatically
+synchronizes every regular workspace file. Reopen the same path to resume the
+existing state. The `.lix` directory itself is never imported as workspace
+content or recursively watched.
 
 Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
 

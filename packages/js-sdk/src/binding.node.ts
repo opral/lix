@@ -14,8 +14,6 @@ type NativeAddon = {
 		): Promise<LixBinding>;
 		openLocalFilesystem(
 			path: string,
-			lixDir: string | undefined,
-			syncAllFiles: boolean,
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
 	};
@@ -83,17 +81,8 @@ export function openLixBinding(
 			return addon.Lix.openMemory();
 		case "localFilesystem":
 			if (nativeTelemetry) {
-				return addon.Lix.openLocalFilesystem(
-					storage.path,
-					storage.lixDir,
-					storage.syncAllFiles,
-					nativeTelemetry,
-				);
+				return addon.Lix.openLocalFilesystem(storage.path, nativeTelemetry);
 			}
-			return addon.Lix.openLocalFilesystem(
-				storage.path,
-				storage.lixDir,
-				storage.syncAllFiles,
-			);
+			return addon.Lix.openLocalFilesystem(storage.path);
 	}
 }

@@ -150,10 +150,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().mergeBranchPreview(operation.options);
 			case "mergeBranch":
 				return requiredLix().mergeBranch(operation.options);
-			case "importFilesystemPaths":
-				return requiredLix().importFilesystemPaths(operation.paths);
-			case "syncDiskToLix":
-				return requiredLix().syncDiskToLix();
 			case "exportSnapshot": {
 				const lix = requiredLix();
 				const exportSnapshot = lix.exportSnapshot;

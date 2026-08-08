@@ -94,10 +94,7 @@ Filesystem sync uses native Node.js dependencies:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "./workspace",
-		syncAllFiles: true,
-	}),
+	storage: new LocalFilesystem("./workspace"),
 });
 
 await lix.execute(
@@ -172,9 +169,10 @@ try {
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
-- Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
-- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
+- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem(path)` for
+  an automatically synchronized workspace backed by
+  `<path>/.lix/.internal/rocksdb`. The `.lix` directory is not workspace
+  content and is never recursively watched.
 - In browsers, local mode and remote mode with client storage load the Rust
   engine as WebAssembly. Supplying a snapshot storage adapter persists that
   local Lix; in remote mode, the local engine contains only client state.

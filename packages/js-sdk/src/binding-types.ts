@@ -66,10 +66,8 @@ export type LixBinding = {
 	undo(): Promise<UndoReceipt>;
 	redo(): Promise<RedoReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
-	importFilesystemPaths(paths: string[]): Promise<void>;
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
-	syncDiskToLix(): Promise<void>;
 	/** Internal snapshot capability implemented by browser memory bindings. */
 	exportSnapshot?(): Promise<Uint8Array>;
 	close(): Promise<void>;
@@ -97,6 +95,4 @@ export type LixStorageConfig =
 	| {
 			kind: "localFilesystem";
 			path: string;
-			lixDir?: string;
-			syncAllFiles: boolean;
 	  };

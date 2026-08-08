@@ -505,11 +505,6 @@ class RemoteLixBinding implements LixBinding {
 		});
 	}
 
-	async importFilesystemPaths(_paths: string[]): Promise<void> {
-		this.#assertOpen();
-		throw unsupportedRemoteOperation("importFilesystemPaths");
-	}
-
 	async mergeBranchPreview(
 		_options: MergeBranchOptions,
 	): Promise<MergeBranchPreview> {
@@ -520,11 +515,6 @@ class RemoteLixBinding implements LixBinding {
 	async mergeBranch(_options: MergeBranchOptions): Promise<MergeBranchReceipt> {
 		this.#assertOpen();
 		throw unsupportedRemoteOperation("mergeBranch");
-	}
-
-	async syncDiskToLix(): Promise<void> {
-		this.#assertOpen();
-		throw unsupportedRemoteOperation("syncDiskToLix");
 	}
 
 	async close(): Promise<void> {

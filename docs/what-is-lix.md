@@ -58,7 +58,7 @@ Run Lix on top of a local filesystem:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+  storage: new LocalFilesystem("./workspace"),
 });
 ```
 

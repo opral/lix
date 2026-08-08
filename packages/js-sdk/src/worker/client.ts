@@ -195,12 +195,9 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 		undo: () => request({ kind: "undo" }),
 		redo: () => request({ kind: "redo" }),
 		switchBranch: (options) => request({ kind: "switchBranch", options }),
-		importFilesystemPaths: (paths) =>
-			request({ kind: "importFilesystemPaths", paths }),
 		mergeBranchPreview: (options) =>
 			request({ kind: "mergeBranchPreview", options }),
 		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
-		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
 		exportSnapshot: () => request({ kind: "exportSnapshot" }),
 		close: async () => {
 			if (closed) return;
@@ -292,13 +289,10 @@ function persistentSnapshotBinding(
 		redo: () => afterMutation(binding.redo()),
 		switchBranch: (branchOptions) =>
 			afterMutation(binding.switchBranch(branchOptions)),
-		importFilesystemPaths: (paths) =>
-			afterMutation(binding.importFilesystemPaths(paths)),
 		mergeBranchPreview: (branchOptions) =>
 			binding.mergeBranchPreview(branchOptions),
 		mergeBranch: (branchOptions) =>
 			afterMutation(binding.mergeBranch(branchOptions)),
-		syncDiskToLix: () => afterMutation(binding.syncDiskToLix()),
 		exportSnapshot: () => {
 			const exportSnapshot = binding.exportSnapshot;
 			if (!exportSnapshot) {

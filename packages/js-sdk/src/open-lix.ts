@@ -1,7 +1,4 @@
-import {
-	localFilesystemAlreadyOpen,
-	localFilesystemNotOpen,
-} from "./errors.js";
+import { localFilesystemAlreadyOpen } from "./errors.js";
 import type { LixBinding } from "./binding-types.js";
 import {
 	ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
@@ -10,72 +7,20 @@ import {
 	openStoredClientState,
 } from "./client-state.js";
 import { Lix } from "./lix.js";
-import type {
-	LixSnapshotStorage,
-	LocalFilesystemOptions,
-	OpenLixOptions,
-} from "./types.js";
+import type { LixSnapshotStorage, OpenLixOptions } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
-const openLocalFilesystems = new WeakMap<LocalFilesystem, LixBinding | null>();
+const openLocalFilesystems = new WeakSet<LocalFilesystem>();
 
 export class LocalFilesystem {
 	readonly path: string;
-	readonly lixDir: string | undefined;
-	readonly syncAllFiles: boolean;
 
-	constructor(options: LocalFilesystemOptions) {
-		if (
-			!options ||
-			typeof options.path !== "string" ||
-			options.path.length === 0
-		) {
+	constructor(path: string) {
+		if (typeof path !== "string" || path.length === 0) {
 			throw new TypeError("LocalFilesystem requires a non-empty path");
 		}
-		if (
-			options.lixDir !== undefined &&
-			(typeof options.lixDir !== "string" || options.lixDir.length === 0)
-		) {
-			throw new TypeError("LocalFilesystem lixDir must be a non-empty string");
-		}
-		if (typeof options.syncAllFiles !== "boolean") {
-			throw new TypeError("LocalFilesystem syncAllFiles must be a boolean");
-		}
-		this.path = options.path;
-		this.lixDir = options.lixDir;
-		this.syncAllFiles = options.syncAllFiles;
-	}
-
-	async importPaths(paths: readonly string[]): Promise<void> {
-		if (!Array.isArray(paths)) {
-			throw new TypeError("importPaths() paths must be an array");
-		}
-		for (const path of paths) {
-			if (typeof path !== "string" || path.length === 0) {
-				throw new TypeError(
-					"importPaths() paths must contain non-empty strings",
-				);
-			}
-			if (path.endsWith("/")) {
-				throw new TypeError(
-					"importPaths() paths must not end with a trailing slash",
-				);
-			}
-		}
-		await this.client("importPaths").importFilesystemPaths([...paths]);
-	}
-
-	async syncDiskToLix(): Promise<void> {
-		return this.client("syncDiskToLix").syncDiskToLix();
-	}
-
-	private client(operation: string): LixBinding {
-		const client = openLocalFilesystems.get(this);
-		if (!client) {
-			throw localFilesystemNotOpen(operation);
-		}
-		return client;
+		this.path = path;
 	}
 }
 
@@ -155,19 +100,16 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		if (openLocalFilesystems.has(storage)) {
 			throw localFilesystemAlreadyOpen();
 		}
-		openLocalFilesystems.set(storage, null);
+		openLocalFilesystems.add(storage);
 		try {
 			const binding = await openLixWorkerBinding(
 				{
 					kind: "localFilesystem",
 					path: storage.path,
-					lixDir: storage.lixDir,
-					syncAllFiles: storage.syncAllFiles,
 				},
 				() => openLocalFilesystems.delete(storage),
 				options.telemetry,
 			);
-			openLocalFilesystems.set(storage, binding);
 			return new Lix(binding);
 		} catch (error) {
 			openLocalFilesystems.delete(storage);

@@ -47,7 +47,7 @@ Use `LocalFilesystem` when the agent works with files on disk:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+  storage: new LocalFilesystem("./workspace"),
 });
 ```
 
