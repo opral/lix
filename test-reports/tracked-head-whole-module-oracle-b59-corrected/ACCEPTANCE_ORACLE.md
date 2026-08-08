@@ -42,6 +42,34 @@ fixtures/benchmarks:
 `tracked_state::TrackedStateContext` remains a separate owner where it is not
 the SQL working-diff fallback; it is not silently deleted or mirrored here.
 
+## Ordered reader-first deletion contract
+
+The first runnable cut must follow this order; deleting a later owner before
+its earlier consumers move is a source-gate failure:
+
+1. Keep the direct SQL entity/typed-PK/columnar slice unchanged. The candidate
+   diff must not touch the four excluded paths in the direct public-SQL
+   exclusion block below.
+2. Move transaction opening, reconciliation, stale-writer checks,
+   savepoint/rollback, selected history, and one-publication lowering to one
+   caller-owned CoherentView. Remove reader factories, tracked-head callbacks,
+   and second-reader factories after their callers are moved.
+3. Move init, schema resolution, and SQL working-diff callers to ForkTree
+   roots/catalogs/selectors. No old reader, wrapper, compatibility path, or
+   fallback may remain.
+4. Move GC root discovery and current-generation observation to authenticated
+   ForkTree roots plus the one epoch/progress fence.
+5. Move test-support and engine-benchmark callers to public ForkTree behavior,
+   then remove fixtures that recreate old spaces or caches.
+6. Delete the TrackedHead module, reexports, factories, marker spaces, cache
+   symbols, and old reader names. Only after this deletion may the first
+   compiler/no-run gate run.
+
+Compiler fail conditions are: any forbidden path/symbol survives; the
+obsolete direct consumer compiles; a merge callback opens a second reader;
+the direct SQL exclusion paths change; or a no-op/unsupported/corrupt cohort
+plans, writes, commits, or rotates a selector.
+
 ## Forbidden production residue
 
 The source gate rejects these paths/symbols in all three Rust source roots:

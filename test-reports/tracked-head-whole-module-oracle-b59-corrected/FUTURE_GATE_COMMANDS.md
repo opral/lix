@@ -4,6 +4,29 @@ No adapter build or runtime is run for the b59 calibration. Each future cell
 uses an immutable candidate, isolated target/evidence directories, and a
 20-minute cap. Stop at the first failure.
 
+## Required source-edit order before compilation
+
+The candidate must demonstrate these ordered source cuts:
+
+1. Direct SQL entity, typed-PK, and columnar paths are unchanged; any diff
+   touching the four excluded paths fails immediately.
+2. Transaction opening, reconciliation, stale-writer, savepoint/rollback,
+   selected-history, and publication callers use one retained CoherentView.
+   Delete reader factories and merge callback wrappers after their callers
+   move; no second read, cache, wrapper, or fallback is accepted.
+3. Init, schema resolution, and SQL working-diff consumers use ForkTree
+   selector/state/catalog roots.
+4. GC and current-generation consumers use authenticated ForkTree roots and
+   one epoch/progress fence.
+5. Test-support and engine-benchmark consumers stop recreating legacy state.
+6. Delete TrackedHead modules/reexports, marker spaces, cache symbols, and
+   old factories. Only then run the first compiler/no-run gate.
+
+The source gate and negative consumer must fail if this order is violated:
+legacy names or paths remain, the direct consumer resolves, a merge callback
+reopens a reader, excluded SQL paths change, or a corrupt/unsupported/no-op
+cohort creates durable work.
+
 ## Reproducible source gate and direct negative consumer
 
 ```bash
