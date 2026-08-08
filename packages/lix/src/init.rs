@@ -449,7 +449,6 @@ where
                 updated_at: change.created_at,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
-                columnar_base_coordinate: None,
             })
             .collect::<Vec<_>>();
         let tracked_head = TrackedHeadContext::new();
@@ -469,7 +468,6 @@ where
                     updated_at: row.updated_at,
                     snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
                     metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
                 }));
             }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
