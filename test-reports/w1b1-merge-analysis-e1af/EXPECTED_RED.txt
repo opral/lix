@@ -1,0 +1,9 @@
+ANCHOR PASS target=e1af471b9ab0f598dafa7c2ddec7867667c81740 anchor=e1af471b9ab0f598dafa7c2ddec7867667c81740
+SCOPE PASS changed_source=<none>
+RED-1 merge analysis still accepts TrackedStateStoreReader
+RED-2 merge analysis still routes through legacy diff_commits
+RED-3 merge branch still enters with_opening_tracked_reader
+RED-4 transaction context still exposes merge callback plumbing
+RED-5 legacy tracked-state diff owner remains reachable
+EXPECTED-RED predicates=5 target=e1af471b9ab0f598dafa7c2ddec7867667c81740
+verifier exit: 1 (intentional RED)
