@@ -97,6 +97,10 @@ impl AuthenticatedBlobRef {
     pub(crate) fn semantic_id(self) -> crate::binary_cas::BlobId {
         self.semantic_id
     }
+
+    pub(crate) fn expected_size(self) -> u64 {
+        self.expected_size
+    }
 }
 
 fn bind_state_blob_ref(
@@ -156,12 +160,37 @@ where
         bind_state_blob_ref(row, self.view_id(), self.view_instance_id())
     }
 
+    /// Re-resolves a filesystem blob owner through this view's authenticated
+    /// state roots before exposing its manifest capability. The materialized
+    /// row is only a terminal index projection; it cannot authorize payload
+    /// reads by itself.
+    pub(crate) async fn bind_blob_at_state_key(
+        &self,
+        key: &super::state::StateKey,
+    ) -> Result<Option<AuthenticatedBlobRef>, crate::LixError>
+    where
+        R: Sync,
+    {
+        let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        let row = super::serving::state_point(self, &encoded_key, false)
+            .await
+            .map_err(crate::LixError::from)?;
+        row.map(|row| self.bind_blob(&row)).transpose()
+    }
+
     /// Loads complete payloads without allowing the authenticated row edge to
     /// be detached from the StorageRead that selected it.
     pub(crate) async fn load_blob_bytes_many(
         &self,
         refs: &[AuthenticatedBlobRef],
-    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError>
+    where
+        R: Sync,
+    {
         load_blob_bytes_many_on_read(
             self.storage_read(),
             self.view_id(),
@@ -176,7 +205,10 @@ where
     pub(crate) async fn load_blob_ranges_many(
         &self,
         requests: &[(AuthenticatedBlobRef, Range<u64>)],
-    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError>
+    where
+        R: Sync,
+    {
         load_blob_ranges_many_on_read(
             self.storage_read(),
             self.view_id(),
@@ -207,16 +239,13 @@ where
             reference,
         )?;
     }
-    let chunks = load_required_chunks(
-        read,
-        manifests.values().flat_map(|manifest| {
-            manifest
-                .ordered_chunks
-                .iter()
-                .map(|chunk| chunk.chunk_object_id)
-        }),
-    )
-    .await?;
+    let mut required_ids = BTreeSet::new();
+    for manifest in manifests.values() {
+        for chunk in &manifest.ordered_chunks {
+            required_ids.insert(chunk.chunk_object_id);
+        }
+    }
+    let chunks = load_required_chunks(read, required_ids).await?;
     let mut entries = Vec::with_capacity(refs.len());
     for reference in refs {
         let manifest = required_manifest(&manifests, reference.manifest_object_id)?;

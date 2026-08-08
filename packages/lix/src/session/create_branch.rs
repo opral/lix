@@ -52,7 +52,7 @@ where
                     BranchOperation::CreateBranch,
                     BranchReferenceRole::CommitSource,
                 )?;
-                let mut commit_graph = transaction.commit_graph_reader().await;
+                let mut commit_graph = transaction.commit_graph_reader_on_opening_read();
                 let commit = BranchLifecycle::require_existing_commit(
                     &mut commit_graph,
                     from_commit_id,
@@ -63,7 +63,7 @@ where
                 commit.commit_id
             } else {
                 let active_branch_id = transaction.active_branch_id().to_string();
-                let reader = transaction.branch_ref_reader().await;
+                let reader = transaction.branch_ref_reader_on_opening_read();
                 BranchLifecycle::new(&reader)
                     .require_existing_commit_id(
                         &active_branch_id,

@@ -5,6 +5,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::Cell;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::Value as JsonValue;
@@ -38,8 +40,9 @@ use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
-    FilesystemPathIndexRequest, FilesystemPathKind, FilesystemRowContext, load_path_index_revision,
+    BlobRefPluginCheckpoint, BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache,
+    FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
+    FilesystemRowContext, load_path_index_revision,
 };
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -329,6 +332,7 @@ fn stale_conflict_resolution_payload(
 struct VisibleMaterialization {
     semantic_root: String,
     bytes: VisibleMaterializationBytes,
+    durable_checkpoint: Option<DecodedDurablePluginCheckpoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,9 +417,48 @@ fn decode_visible_materialization_parts(
             ));
         }
     };
+    let durable_checkpoint = if schema_key == BLOB_REF_SCHEMA_KEY {
+        let snapshot: PluginUpgradeBlobRefSnapshot =
+            serde_json::from_str(snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("invalid authenticated blob reference: {error}"),
+                )
+            })?;
+        snapshot
+            .plugin_checkpoint
+            .map(|checkpoint| {
+                let runtime = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(checkpoint.runtime)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("invalid durable plugin checkpoint runtime: {error}"),
+                        )
+                    })?;
+                let authority = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(checkpoint.authority)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("invalid durable plugin checkpoint authority: {error}"),
+                        )
+                    })?;
+                Ok::<DecodedDurablePluginCheckpoint, LixError>(DecodedDurablePluginCheckpoint {
+                    generation: checkpoint.generation,
+                    semantic_root: checkpoint.semantic_root,
+                    runtime: runtime.into(),
+                    authorities: PluginEntityAuthorities::decode_checkpoint(&authority)?,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     Ok(VisibleMaterialization {
         semantic_root,
         bytes,
+        durable_checkpoint,
     })
 }
 
@@ -2879,6 +2922,14 @@ where
                             )
                         }),
                         size_bytes: payload.len(),
+                        plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
+                            BlobRefPluginCheckpoint {
+                                generation: checkpoint.generation.clone(),
+                                semantic_root: checkpoint.semantic_root.clone(),
+                                runtime: checkpoint.runtime.as_ref().to_vec(),
+                                authority: checkpoint.authority.as_ref().to_vec(),
+                            }
+                        }),
                         context: FilesystemRowContext {
                             branch_id: file_key.branch_id.clone(),
                             global: file_key.global,
@@ -2963,6 +3014,14 @@ where
                             )
                         }),
                         size_bytes: payload.len(),
+                        plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
+                            BlobRefPluginCheckpoint {
+                                generation: checkpoint.generation.clone(),
+                                semantic_root: checkpoint.semantic_root.clone(),
+                                runtime: checkpoint.runtime.as_ref().to_vec(),
+                                authority: checkpoint.authority.as_ref().to_vec(),
+                            }
+                        }),
                         context: FilesystemRowContext {
                             branch_id: file_key.branch_id.clone(),
                             global: file_key.global,
@@ -4774,8 +4833,18 @@ where
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
                             let _ = checkpoint_blob_hash;
-                            let mut durable_checkpoint: Option<DecodedDurablePluginCheckpoint> =
-                                None;
+                            let durable_checkpoint =
+                                visible_materialization.durable_checkpoint.clone();
+                            if let Some(checkpoint) = durable_checkpoint.as_ref() {
+                                if checkpoint.semantic_root != visible_materialization.semantic_root
+                                    || checkpoint.generation != actor_key.plugin_generation
+                                {
+                                    return Err(LixError::new(
+                                        LixError::CODE_INVALID_PLUGIN,
+                                        "durable plugin checkpoint identity does not match its authenticated file owner",
+                                    ));
+                                }
+                            }
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -4817,17 +4886,9 @@ where
                                         .await
                                     {
                                         Ok(document) => Some(document),
-                                        Err(_) => {
+                                        Err(error) => {
                                             let _ = actor.retire().await;
-                                            actor = factory
-                                                .instantiate_actor()
-                                                .instrument(tracing::debug_span!(
-                                                    target: "lix_perf",
-                                                    "lix.perf.plugin_actor_reinstantiate_after_checkpoint_miss"
-                                                ))
-                                                .await?;
-                                            durable_checkpoint = None;
-                                            None
+                                            return Err(error);
                                         }
                                     }
                                 } else {
@@ -8466,24 +8527,40 @@ where
 
     async fn load_collection_generation(
         &mut self,
-        _branch_id: &str,
-        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "collection generation is deferred until its ForkTree publication owner is lowered",
-        ))
+        let reader = self.live_state.reader(self.opening_read());
+        reader.collection_generation(branch_id, scope).await
     }
 
     async fn load_exact_collection_live_count(
         &mut self,
-        _branch_id: &str,
-        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<u64>, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "collection live-count reads are deferred until their ForkTree publication owner is lowered",
-        ))
+        if let Some(generation) = self.load_collection_generation(branch_id, scope).await?
+            && generation.live_count != crate::collection_generation::DEFERRED_LIVE_COUNT
+        {
+            return Ok(Some(generation.live_count));
+        }
+        let file_ids = scope
+            .file_id
+            .map(|file_id| vec![NullableKeyFilter::Value(file_id.to_owned())])
+            .unwrap_or_default();
+        let rows = self
+            .scan_visible_live_state_batch(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![scope.schema_key.to_owned()],
+                    branch_ids: vec![branch_id.to_owned()],
+                    file_ids,
+                    include_tombstones: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
+        Ok(Some(rows.len() as u64))
     }
 
     fn has_staged_collection_rows(
@@ -9717,9 +9794,23 @@ struct PendingFreshPluginOpen {
     >,
 }
 
+#[derive(Clone)]
 struct DecodedDurablePluginCheckpoint {
+    generation: String,
+    semantic_root: String,
     runtime: crate::Blob,
     authorities: PluginEntityAuthorities,
+}
+
+impl fmt::Debug for DecodedDurablePluginCheckpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecodedDurablePluginCheckpoint")
+            .field("generation", &self.generation)
+            .field("semantic_root", &self.semantic_root)
+            .field("runtime_bytes", &self.runtime.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PluginWriteReconciliation {
@@ -10279,6 +10370,16 @@ struct PluginGenerationUpgrade {
 struct PluginUpgradeBlobRefSnapshot {
     id: String,
     blob_hash: String,
+    #[serde(default)]
+    plugin_checkpoint: Option<DurableBlobCheckpointSnapshot>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DurableBlobCheckpointSnapshot {
+    generation: String,
+    semantic_root: String,
+    runtime: String,
+    authority: String,
 }
 
 async fn preflight_owned_generation_upgrades(

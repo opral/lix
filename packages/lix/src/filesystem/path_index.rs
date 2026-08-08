@@ -563,14 +563,77 @@ impl FilesystemPathIndex {
     /// Warms small CAS payloads while the filesystem index is already being
     /// built. The manifest lookup is one batch for the whole view, so exact
     /// file reads do not pay another storage round trip after path selection.
-    pub(crate) async fn hydrate_small_blob_data(
-        self,
-        _store: &impl StorageAdapterRead,
-    ) -> Result<Self, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "path-index blob hydration is deferred until authenticated ForkTree BlobRef serving is lowered",
-        ))
+    pub(crate) async fn hydrate_small_blob_data<S>(self, store: &S) -> Result<Self, LixError>
+    where
+        S: StorageAdapterRead + Send + Sync + 'static,
+    {
+        let facade = crate::forktree::ForkTreeReadFacade::new(store);
+        let mut candidates =
+            BTreeMap::<String, Vec<(FilesystemPathEntryIdentity, MaterializedLiveStateRow)>>::new();
+        for entry in self.entries() {
+            let Some(blob_row) = entry.blob_ref_live_row().cloned() else {
+                continue;
+            };
+            candidates
+                .entry(entry.key.branch_id().to_owned())
+                .or_default()
+                .push((entry_identity(&entry), blob_row));
+        }
+        let mut hydrated = BTreeMap::<FilesystemPathEntryIdentity, crate::Blob>::new();
+        for (branch_id, entries) in candidates {
+            let view = facade.branch(&branch_id).await?;
+            let mut refs = Vec::with_capacity(entries.len());
+            let mut identities = Vec::with_capacity(entries.len());
+            for (identity, row) in entries {
+                let state_key = crate::forktree::StateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                };
+                let reference = view
+                    .bind_blob_at_state_key(&state_key)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "filesystem blob owner disappeared from its authenticated ForkTree view",
+                        )
+                    })?;
+                if reference.expected_size() as usize <= MAX_CACHE_BYTES {
+                    refs.push(reference);
+                    identities.push(identity);
+                }
+            }
+            if refs.is_empty() {
+                continue;
+            }
+            let values = view.load_blob_bytes_many(&refs).await?.into_vec();
+            if values.len() != identities.len() {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "authenticated filesystem blob batch returned the wrong cardinality",
+                ));
+            }
+            for (identity, value) in identities.into_iter().zip(values) {
+                let value = value.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "authenticated filesystem blob owner has no payload",
+                    )
+                })?;
+                hydrated.insert(identity, value.into());
+            }
+        }
+        let mut next = self;
+        for identity in hydrated.keys() {
+            let Some(entry) = next.entries_by_identity.get(identity).cloned() else {
+                continue;
+            };
+            let mut updated = (*entry).clone();
+            updated.cached_blob_data = hydrated.get(identity).cloned();
+            next.insert_entry(Arc::new(updated));
+        }
+        Ok(next)
     }
 
     /// Applies committed descriptor rows by path-copying only the affected AVL

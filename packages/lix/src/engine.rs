@@ -16,9 +16,10 @@ use crate::plugin::{
 };
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
-use crate::storage_adapter::Storage;
-use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
-use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
+use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
+use crate::storage_adapter::{Storage, StorageAdapter};
+#[cfg(test)]
+use crate::storage_adapter::{StorageWriteOptions, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
@@ -300,74 +301,21 @@ where
         self.plugin_host.reset_transition_counters();
     }
 
-    /// Rebuilds the tracked serving commit root for one branch from changelog.
+    /// Verifies the requested branch's authenticated current ForkTree serving projection.
     ///
-    /// This is intentionally an engine-level operation: callers should not need
-    /// to know which KV namespaces back changelog, commit graph, or tracked
-    /// state. The current branch head is read from the live-state facade so
-    /// rebuild uses the same moving-ref visibility as normal execution. Rooted
-    /// heads restore content-addressed chunks only after their immutable root
-    /// metadata passes a full changelog coverage audit. Rootless heads receive
-    /// the same audit transiently and remain bounded-replay layouts.
-    pub async fn rebuild_tracked_state_for_branch(&self, _branch_id: &str) -> Result<(), LixError> {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "tracked-state root rebuild is removed until its ForkTree publication owner is lowered",
-        ));
-        /*
-        let head_commit_id = self
-            .load_branch_head_commit_id(branch_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::branch_not_found(
-                    branch_id.to_string(),
-                    "rebuild_tracked_state_for_branch",
-                    "target",
-                )
-            })?;
-        let storage = self.storage();
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let typed_head_commit_id = crate::changelog::CommitId::parse_lix(
-            &head_commit_id,
-            "tracked-state branch rebuild authority",
-        )?;
-        let manifest = crate::tracked_state::load_commit_state_manifest(
-            &read,
-            typed_head_commit_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot rebuild tracked_state root for commit '{head_commit_id}' without its commit-state manifest"
-                ),
-            )
-        })?;
-        let mut writes = StorageWriteSet::new();
-        let rebuild_result = self
-            .tracked_state
-            .root_rebuilder(&read, &mut writes)
-            .rebuild_commit_root_at(&head_commit_id)
-            .await;
-        rebuild_result?;
-        if manifest.snapshot_root.is_none() {
-            // Rootless heads are audited transiently and remain replay-only;
-            // there is no serving-root publication or cache state to commit.
-            return Ok(());
-        }
-        // A healthy rebuild is content-equivalent, but this API also repairs
-        // missing or damaged serving chunks. Conservatively invalidate
-        // transaction opening catalogs so restored registered-schema facts are
-        // never hidden behind a pre-rebuild cache entry.
-        crate::catalog::stage_catalog_revision(&mut writes);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .map(|_| ())
-            .map_err(LixError::from)
-        */
+    /// ForkTree roots are the sole current-state authority. This operation
+    /// intentionally performs no legacy tracked-state rebuild or secondary
+    /// publication; a successful walk proves the branch can serve its state.
+    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let facade = crate::forktree::ForkTreeReadFacade::new(read);
+        let view = facade.branch(branch_id).await?;
+        let _ = crate::forktree::state_range(&view, None, None, None, true).await?;
+        Ok(())
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {

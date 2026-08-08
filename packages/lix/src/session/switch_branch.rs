@@ -3,7 +3,7 @@ use serde_json::json;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
+use crate::storage_adapter::Storage;
 use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 
 use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
@@ -47,33 +47,32 @@ where
         let observe_invalidation = self.observe_invalidation.clone();
         match current_mode {
             SessionMode::Pinned { .. } => {
-                // A pinned switch changes only this session's in-memory
-                // selector. Keep the existing session/collaboration lease so
-                // branch deletion cannot race target validation, but do not
-                // open and commit an empty repository transaction: the target
-                // branch-head control is the sole authority this path needs.
-                let _write_access = self.begin_session_write_access().await?;
-                let read = SharedStorageAdapterRead::new(
-                    self.storage
-                        .begin_read(StorageReadOptions::default())
-                        .await?,
-                );
-                let reader = self.branch_ctx.ref_reader(&read);
-                BranchLifecycle::new(&reader)
-                    .require_existing_commit_id(
-                        &branch_id,
-                        BranchOperation::SwitchBranch,
-                        BranchReferenceRole::Target,
-                    )
-                    .await?;
-                self.ensure_open()?;
-                *selector.write().map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "session branch selector is poisoned",
-                    )
-                })? = receipt_branch_id.clone();
-                observe_invalidation.bump();
+                let write_access = self.begin_session_write_access().await?;
+                self.with_write_transaction_reserved_lending(
+                    write_access,
+                    async move |transaction| {
+                        let reader = transaction.branch_ref_reader_on_opening_read();
+                        BranchLifecycle::new(&reader)
+                            .require_existing_commit_id(
+                                &branch_id,
+                                BranchOperation::SwitchBranch,
+                                BranchReferenceRole::Target,
+                            )
+                            .await
+                    },
+                    |_| {
+                        self.ensure_open()?;
+                        *selector.write().map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "session branch selector is poisoned",
+                            )
+                        })? = receipt_branch_id.clone();
+                        observe_invalidation.bump();
+                        Ok(())
+                    },
+                )
+                .await?;
             }
             SessionMode::Workspace { .. } => {
                 let write_access = self.begin_session_write_access().await?;
@@ -81,7 +80,7 @@ where
                     write_access,
                     async move |transaction| {
                         {
-                            let reader = transaction.branch_ref_reader().await;
+                            let reader = transaction.branch_ref_reader_on_opening_read();
                             BranchLifecycle::new(&reader)
                                 .require_existing_commit_id(
                                     &branch_id,
