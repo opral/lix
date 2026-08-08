@@ -33,8 +33,9 @@ count-after.txt      702913cd416077151e801f2357a8180400f1dc5481532c31a31096dff8c
 
 The exact trace-driver source SHA-256 is
 `476d2f6253e77aa2a3e463089273c45f4650248b77128e9e5bef601bfa36f03d`.
-The ordered stdout digest and complete output-hash-manifest digest are listed
-in `TARGET_METADATA.md` and are independent of host-local absolute paths.
+The ordered stdout digest and the path-independent complete
+`label stdout_sha256 stderr_sha256 time_sha256` digest are listed in
+`TARGET_METADATA.md`; neither depends on host-local absolute paths.
 
 The trace is deliberately Git/Git-LFS only. It does not call Lix, ForkTree,
 the b59 binary, or a current-main binary; therefore it cannot be misread as a

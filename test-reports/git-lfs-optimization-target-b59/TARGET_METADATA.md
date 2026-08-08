@@ -85,7 +85,7 @@ hashes, is:
 The complete ordered stdout/stderr/time hash manifest is:
 
 ```text
-63724e3735c8247a5c0abfdf310a99a64032a5633f0eeda3d15155093d4f7e67
+a140dd14aa41d1503eb03bf2c30bb4bfeef5654e313dbca7c6a12362a2d6d8a2
 ```
 
 All rows in `REFERENCE_RESULTS.csv` have status 0. The largest workload cell
