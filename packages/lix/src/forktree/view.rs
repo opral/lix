@@ -180,6 +180,47 @@ where
             .await
     }
 
+    /// Loads exact historical rows from the authenticated ForkTree state
+    /// owner. The transaction supplies the key identities; the returned
+    /// ForkTree-owned row shape is a terminal merge-consumer value and never
+    /// opens another reader or consults the superseded tracked-state reader.
+    pub(crate) async fn load_state_rows_at_commit(
+        &self,
+        commit_id: &str,
+        keys: &[super::state::StateKey],
+    ) -> Result<Vec<Option<super::state::HistoricalStateRow>>, crate::LixError> {
+        let commit_id = crate::changelog::CommitId::parse_lix(commit_id, "historical commit")?;
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let encoded_key = super::state::encode_state_key(super::state::StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            let value = self
+                .load_state_value_at_commit(commit_id, &encoded_key, true)
+                .await?;
+            rows.push(value.map(|(value, _source)| {
+                let (snapshot_content, deleted) = match value.cell {
+                    super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+                    super::state::StateCell::Null => (None, false),
+                    super::state::StateCell::Tombstone => (None, true),
+                };
+                super::state::HistoricalStateRow {
+                    key: key.clone(),
+                    snapshot_content,
+                    metadata: value.metadata,
+                    deleted,
+                    created_at: value.created_at,
+                    updated_at: value.updated_at,
+                    change_id: value.change_id,
+                    commit_id: value.commit_id,
+                }
+            }));
+        }
+        Ok(rows)
+    }
+
     pub(crate) async fn load_json_slot(
         &self,
         slot: &crate::json_store::JsonSlot,

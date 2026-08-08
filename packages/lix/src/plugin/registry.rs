@@ -511,39 +511,37 @@ where
     let facade = crate::forktree::ForkTreeReadFacade::new(retained.clone());
     let mut roots = BTreeSet::new();
     for (branch_id, _) in controls {
-        for untracked in [None, Some(true)] {
-            let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
-            let rows = scan_forktree_view(
-                &view,
-                &LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
-                        entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
-                        branch_ids: vec![branch_id.clone()],
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked,
-                        ..LiveStateFilter::default()
-                    },
-                    projection: LiveStateProjection {
-                        columns: vec!["snapshot_content".to_owned()],
-                    },
-                    limit: None,
+        let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
+        let rows = scan_forktree_view(
+            &view,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
+                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                    branch_ids: vec![branch_id.clone()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(false),
+                    ..LiveStateFilter::default()
                 },
-            )
-            .await?;
-            let rows = rows.into_rows();
-            if rows.is_empty() {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!(
-                        "selected plugin registry is missing for branch '{branch_id}'; only an authenticated explicit bootstrap-empty row may be empty"
-                    ),
-                ));
-            }
-            for row in rows {
-                let registry = PluginRegistry::from_optional_live_state_row(Some(&row), branch_id)?;
-                extend_registry_wasm_roots(&registry, &mut roots)?;
-            }
+                projection: LiveStateProjection {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+        )
+        .await?;
+        let rows = rows.into_rows();
+        if rows.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!(
+                    "selected plugin registry is missing for branch '{branch_id}'; only an authenticated explicit bootstrap-empty row may be empty"
+                ),
+            ));
+        }
+        for row in rows {
+            let registry = PluginRegistry::from_optional_live_state_row(Some(&row), branch_id)?;
+            extend_registry_wasm_roots(&registry, &mut roots)?;
         }
     }
 
@@ -670,6 +668,36 @@ impl PluginFileOwner {
             return Ok(None);
         }
         let snapshot = parse_snapshot_content(row, "plugin owner")?;
+        Self::from_snapshot(file_id, &snapshot).map(Some)
+    }
+
+    pub(crate) fn from_historical_state_row(
+        row: &crate::forktree::HistoricalStateRow,
+    ) -> Result<Option<Self>, LixError> {
+        let file_id = row.key.file_id.as_deref().ok_or_else(|| {
+            invalid_registry("plugin owner row is missing its file_id storage identity")
+        })?;
+        if row.key.schema_key != KEY_VALUE_SCHEMA_KEY
+            || row.key.entity_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+        {
+            return Err(invalid_registry(
+                "historical plugin owner row has an invalid storage identity",
+            ));
+        }
+        if row.deleted || row.snapshot_content.is_none() {
+            return Ok(None);
+        }
+        let snapshot = serde_json::from_str(
+            row.snapshot_content
+                .as_ref()
+                .expect("checked above")
+                .as_str(),
+        )
+        .map_err(|error| {
+            invalid_registry(format!(
+                "historical plugin owner snapshot is invalid JSON: {error}"
+            ))
+        })?;
         Self::from_snapshot(file_id, &snapshot).map(Some)
     }
 

@@ -14,11 +14,10 @@ use crate::filesystem::{
 };
 use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReadDomain, LiveStateReader, LiveStateRowFilter,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    resolve_visible_batch,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    expanded_branch_ids,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -26,15 +25,13 @@ use crate::tracked_state::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{StreamExt, TryStreamExt, stream};
 use std::mem::size_of;
 use std::sync::Mutex as StdMutex;
 
-use super::derived::{
-    is_derived_only_request, is_derived_schema, request_may_include_derived, scan_derived_rows,
-};
+use super::derived::{is_derived_schema, request_may_include_derived};
 
-const BRANCH_READ_CONCURRENCY: usize = 8;
+#[cfg(test)]
+use super::derived::scan_derived_rows;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
 const ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -688,177 +685,6 @@ where
         self.scan_forktree_operation(request).await
     }
 
-    async fn scan_batch_with_schema_presence(
-        &self,
-        request: &LiveStateScanRequest,
-        skip_proven_empty_schema: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let store = &self.store;
-        let reads_tracked = !is_derived_only_request(request);
-        let scope = scan_scope(
-            store,
-            request,
-            reads_tracked,
-            self.branch_head_control_cache.as_deref(),
-        )
-        .await?;
-        if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
-            return Ok(MaterializedLiveStateBatch::default());
-        }
-        if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
-            return Ok(rows);
-        }
-        let derived_rows = MaterializedLiveStateBatch::from_rows(
-            scan_derived_rows(
-                store,
-                &self.commit_graph,
-                request,
-                &scope.projection_branch_ids,
-                &scope.storage_branch_ids,
-                request.filter.untracked,
-            )
-            .await?,
-        );
-        let mut hot_branch_rows = if !is_derived_only_request(request) {
-            self.scan_hot_branch_rows(request, &scope).await?
-        } else {
-            Vec::new()
-        };
-        // The ordered single-branch route bypasses the generic visibility
-        // resolver, so apply the retention predicate before taking that fast
-        // path. Otherwise `untracked = Some(..)` accidentally returned both
-        // member kinds from an already-unified group.
-        if request.filter.untracked.is_some() {
-            for branch_rows in &mut hot_branch_rows {
-                branch_rows.rows = filter_current_row_retention(
-                    std::mem::take(&mut branch_rows.rows),
-                    request.filter.untracked,
-                );
-            }
-        }
-        if derived_rows.is_empty()
-            && let Some(index) =
-                ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
-        {
-            return Ok(finalize_ordered_unique_batch(
-                std::mem::take(&mut hot_branch_rows[index].rows),
-                request.filter.include_tombstones,
-                request.limit,
-            ));
-        }
-        let rows = concat_live_state_batches(
-            std::iter::once(derived_rows).chain(
-                hot_branch_rows
-                    .into_iter()
-                    .map(|branch_rows| branch_rows.rows),
-            ),
-        );
-        Ok(resolve_visible_batch(
-            rows,
-            MaterializedLiveStateBatch::default(),
-            &VisibilityRequest {
-                branch_scope: VisibilityBranchScope::BranchIds {
-                    branch_ids: scope.projection_branch_ids.clone(),
-                },
-                include_tombstones: request.filter.include_tombstones,
-                limit: request.limit,
-            },
-        ))
-    }
-
-    /// Serves finite entity-PK scans from the hot current-state index. Every
-    /// row already has its retention tag, so an unrelated untracked row
-    /// cannot route selected tracked identities through a separate scan.
-    #[cfg(test)]
-    async fn scan_direct_entity_pk_rows(
-        &self,
-        request: &LiveStateScanRequest,
-        scope: &LiveStateScanScope,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        Ok(self
-            .scan_direct_entity_pk_batch(request, scope)
-            .await?
-            .map(MaterializedLiveStateBatch::into_rows))
-    }
-
-    async fn scan_direct_entity_pk_batch(
-        &self,
-        request: &LiveStateScanRequest,
-        scope: &LiveStateScanScope,
-    ) -> Result<Option<MaterializedLiveStateBatch>, LixError> {
-        if !matches!(request.filter.rows, LiveStateRowFilter::All)
-            || request.filter.branch_ids.is_empty()
-            || request.filter.schema_keys.is_empty()
-            || request.filter.entity_pks.is_empty()
-            || !request.filter.file_ids.is_empty()
-            || !request.filter.constraints.is_empty()
-            || request_may_include_derived(request)
-        {
-            return Ok(None);
-        }
-        let controls = scope
-            .storage_branch_ids
-            .iter()
-            .map(|branch_id| {
-                scope
-                    .branch_heads
-                    .get(branch_id)
-                    .copied()
-                    .map(|control| (branch_id.clone(), control))
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(mut controls) = controls else {
-            return Ok(None);
-        };
-        // Branch-head schema membership is an atomic, no-false-negative
-        // publication filter. Apply it per generation before a finite PK
-        // lookup so an absent global schema does not pay the complete hot,
-        // packed, and certified point-read stack for every active-branch row.
-        // The bloom summary belongs to the published tracked selector. An
-        // explicit current-only read must inspect the untracked selector even
-        // when the tracked summary has no bit for this schema; otherwise a
-        // durable runtime/ownership check is silently skipped.
-        if request.filter.untracked.is_none() {
-            controls.retain(|(_, control)| {
-                request
-                    .filter
-                    .schema_keys
-                    .iter()
-                    .any(|schema_key| control.may_have_schema(schema_key))
-            });
-        }
-        if controls.is_empty() {
-            return Ok(Some(MaterializedLiveStateBatch::default()));
-        }
-        let tracked_request = tracked_scan_request_from_live(request);
-        let tracked_head = self.branch_head_control_cache.as_ref().map_or_else(
-            || self.tracked_head.reader(&self.store),
-            |cache| {
-                self.tracked_head
-                    .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
-            },
-        );
-        let rows_by_branch = tracked_head
-            .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
-            .await?;
-        let rows = concat_live_state_batches(
-            rows_by_branch
-                .into_iter()
-                .map(|(_, rows)| filter_current_row_retention(rows, request.filter.untracked)),
-        );
-        Ok(Some(resolve_visible_batch(
-            rows,
-            MaterializedLiveStateBatch::default(),
-            &VisibilityRequest {
-                branch_scope: VisibilityBranchScope::BranchIds {
-                    branch_ids: scope.projection_branch_ids.clone(),
-                },
-                include_tombstones: request.filter.include_tombstones,
-                limit: request.limit,
-            },
-        )))
-    }
-
     pub(crate) async fn load_row(
         &self,
         request: &LiveStateRowRequest,
@@ -907,117 +733,6 @@ where
         let facade = crate::forktree::ForkTreeReadFacade::new(&self.store);
         let view = facade.branch(branch_id).await?;
         crate::live_state::scan_forktree_view(&view, request).await
-    }
-
-    async fn scan_tracked_batch_with_schema_presence(
-        &self,
-        request: &LiveStateScanRequest,
-        skip_proven_empty_schema: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        let store = &self.store;
-        let reads_tracked = !is_derived_only_request(request);
-        let scope = scan_scope(
-            store,
-            request,
-            reads_tracked,
-            self.branch_head_control_cache.as_deref(),
-        )
-        .await?;
-        if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
-            return Ok(MaterializedLiveStateBatch::default());
-        }
-        let derived_rows = MaterializedLiveStateBatch::from_rows(
-            scan_derived_rows(
-                store,
-                &self.commit_graph,
-                request,
-                &scope.projection_branch_ids,
-                &scope.storage_branch_ids,
-                Some(false),
-            )
-            .await?,
-        );
-        let mut hot_branch_rows = if !is_derived_only_request(request) {
-            self.scan_hot_branch_rows(request, &scope).await?
-        } else {
-            Vec::new()
-        };
-        for branch_rows in &mut hot_branch_rows {
-            branch_rows.rows =
-                filter_current_row_retention(std::mem::take(&mut branch_rows.rows), Some(false));
-        }
-        if derived_rows.is_empty()
-            && let Some(index) =
-                ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
-        {
-            return Ok(finalize_ordered_unique_batch(
-                std::mem::take(&mut hot_branch_rows[index].rows),
-                request.filter.include_tombstones,
-                request.limit,
-            ));
-        }
-        let rows = concat_live_state_batches(
-            std::iter::once(derived_rows).chain(
-                hot_branch_rows
-                    .into_iter()
-                    .map(|branch_rows| branch_rows.rows),
-            ),
-        );
-        Ok(resolve_visible_batch(
-            rows,
-            MaterializedLiveStateBatch::default(),
-            &VisibilityRequest {
-                branch_scope: VisibilityBranchScope::BranchIds {
-                    branch_ids: scope.projection_branch_ids,
-                },
-                include_tombstones: request.filter.include_tombstones,
-                limit: request.limit,
-            },
-        ))
-    }
-
-    async fn scan_hot_branch_rows(
-        &self,
-        request: &LiveStateScanRequest,
-        scope: &LiveStateScanScope,
-    ) -> Result<Vec<HotBranchRows>, LixError> {
-        let store = &self.store;
-        let tracked_request = tracked_scan_request_from_live(request);
-        let branches = scope
-            .storage_branch_ids
-            .iter()
-            .filter_map(|branch_id| {
-                scope
-                    .branch_heads
-                    .get(branch_id)
-                    .map(|control| (branch_id.clone(), *control))
-            })
-            .collect::<Vec<_>>();
-        let branch_rows = stream::iter(branches)
-            .map(|(branch_id, control)| {
-                let tracked_request = tracked_request.clone();
-                async move {
-                    let rows = self
-                        .tracked_head
-                        .reader(store)
-                        .scan_live_batch_for_retention(
-                            &branch_id,
-                            control,
-                            &tracked_request,
-                            request.filter.untracked,
-                        )
-                        .await?;
-                    Ok::<_, LixError>(HotBranchRows {
-                        branch_id: branch_id.clone(),
-                        rows,
-                        ordered_unique: true,
-                    })
-                }
-            })
-            .buffered(BRANCH_READ_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(branch_rows)
     }
 }
 

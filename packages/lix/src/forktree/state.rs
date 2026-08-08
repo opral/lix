@@ -74,6 +74,21 @@ pub(crate) struct StateValue {
     pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
 }
 
+/// ForkTree-owned historical row shape for semantic readers that have not yet
+/// moved their public result DTOs. It deliberately has no dependency on the
+/// superseded tracked-state module.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoricalStateRow {
+    pub(crate) key: StateKey,
+    pub(crate) change_id: crate::changelog::ChangeId,
+    pub(crate) commit_id: crate::changelog::CommitId,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
+    pub(crate) snapshot_content: Option<SharedStr>,
+    pub(crate) metadata: Option<SharedStr>,
+    pub(crate) deleted: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateCellRef<'a> {
     Value(&'a str),

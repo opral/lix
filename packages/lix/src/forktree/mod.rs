@@ -39,9 +39,10 @@ pub(crate) use serving::{
     state_point_on_read, state_range,
 };
 pub(crate) use state::{
-    StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef, UNTRACKED_ROW_SPACE,
-    UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value, decode_untracked_key,
-    decode_untracked_value, encode_state_key, encode_state_prefix, encode_state_value,
+    HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
+    UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
+    decode_untracked_key, decode_untracked_value, encode_state_key, encode_state_prefix,
+    encode_state_value,
 };
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
