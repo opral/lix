@@ -1,0 +1,34 @@
+{
+  "kind": "test-report-only-forktree-correction-oracle",
+  "base_commit": "fd2be256d763f17e9f127d4c984e36fba191cb82",
+  "base_tree": "20110ca5e3c33d34217630fff0a2b784b545317a",
+  "prior_review_parent": "cd91b9b90f7f468158b4df154adbed9551eb5d60",
+  "prior_review_diff_sha256": "1a410542cff54e3b1c83a5cfb2cdea568dc9f1f71fc0c3f8598e8936d944a277",
+  "prior_review_patch_id": "c275ab15f3306c503e6830afee2a66bacf1fb974",
+  "scope": "test/report only; no production, Cargo, adapter, PR, or main edits",
+  "baseline": {
+    "status": "BLOCKED_EXPECTED_RED",
+    "defects": [
+      "filesystem descriptor tombstone is rejected instead of becoming logical absence/removal",
+      "live file BlobRef/payload validation is gated by content projection"
+    ]
+  },
+  "preserved_fd2_contract": [
+    "checkpoint and working-diff callers use one retained ForkTree history view",
+    "checkpoint marker chronology is exact and parent cycles/missing parents fail closed",
+    "no local historical reader, BranchHeadControl, TrackedHead, or legacy diff fallback in the migrated provider functions"
+  ],
+  "files": [
+    "README.md",
+    "MANIFEST.json",
+    "CORRECTION_ORACLE.md",
+    "correction_model.rs",
+    "verify_source_contract.sh"
+  ],
+  "model_tests": 5,
+  "negative_fixtures": {
+    "descriptor_identity_cases": 4,
+    "blob_reference_or_payload_cases": 5
+  },
+  "source_audit_modes": ["audit", "corrected"]
+}
