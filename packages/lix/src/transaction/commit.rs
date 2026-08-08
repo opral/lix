@@ -5216,7 +5216,10 @@ async fn stage_branch_head_control_publications(
         }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
-            None => stage_delete_branch_head_control(writes, branch_id)?,
+            None => {
+                stage_delete_branch_head_control(writes, branch_id)?;
+                crate::gc::stage_delete_recovery_ref(writes, branch_id)?;
+            }
         }
     }
     Ok(publications

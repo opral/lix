@@ -263,6 +263,8 @@ where
         && b.atomic_metadata_writes.is_none()
         && a.atomic_metadata_preconditions.is_empty()
         && b.atomic_metadata_preconditions.is_empty()
+        && a.pending_branch_checkpoint_replacements.is_empty()
+        && b.pending_branch_checkpoint_replacements.is_empty()
         && !a.await_durable_commit
         && !b.await_durable_commit
         && eligible_a
@@ -581,6 +583,11 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
+    /// Explicit historical branch sources whose branchability may be owned by
+    /// one still-pending authenticated checkpoint replacement. Resolution is
+    /// delayed to the coherent commit-boundary read so its queue observation
+    /// is fenced by the same branch publication batch.
+    pending_branch_checkpoint_replacements: BTreeMap<String, CommitId>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
@@ -1369,6 +1376,154 @@ where
         Ok(())
     }
 
+    async fn resolve_pending_branch_checkpoint_replacements<S>(
+        &mut self,
+        read: &S,
+        prepared_writes: &mut PreparedWriteSet,
+    ) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead + Clone + Send + Sync,
+    {
+        let requests = std::mem::take(&mut self.pending_branch_checkpoint_replacements);
+        for (branch_id, source_commit_id) in requests {
+            let Some(replacement) =
+                crate::gc::resolve_pending_checkpoint_replacement(read, source_commit_id).await?
+            else {
+                continue;
+            };
+            let checkpoint_commit_id = replacement.checkpoint_commit_id;
+            if checkpoint_commit_id == source_commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "checkpoint replacement cannot point to its recovered head",
+                ));
+            }
+
+            // The queue authenticates the root/control transition. Reading
+            // the complete semantic diff on this same snapshot additionally
+            // proves both manifests/roots are present and that compaction did
+            // not change any public tracked fact.
+            let mut tracked = self.tracked_state.reader(read.clone());
+            let diff = tracked
+                .diff_commits(
+                    &source_commit_id.to_string(),
+                    &checkpoint_commit_id.to_string(),
+                    &TrackedStateDiffRequest::default(),
+                )
+                .await?;
+            if let Some(entry) = diff.entries.iter().find(|entry| {
+                !matches!(
+                    entry.identity.schema_key(),
+                    CHECKPOINT_MARKER_SCHEMA_KEY | crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                )
+            }) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "pending checkpoint replacement changes public tracked identity '{}'",
+                        entry.identity.schema_key()
+                    ),
+                ));
+            }
+            let marker_schemas = [CHECKPOINT_MARKER_SCHEMA_KEY.to_string()];
+            let checkpoint_delta = tracked
+                .commit_delta_values_for_schemas(checkpoint_commit_id, &marker_schemas)
+                .await?;
+            let owns_checkpoint_marker = checkpoint_delta.iter().any(|row| {
+                let key = row.key_ref();
+                !row.value().deleted
+                    && key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
+                    && key.file_id.is_none()
+                    && key.entity_pk.as_single_string().ok()
+                        == Some(replacement.checkpoint_branch_id.as_str())
+            });
+            if !owns_checkpoint_marker {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "checkpoint '{checkpoint_commit_id}' lacks its authenticated branch marker"
+                    ),
+                ));
+            }
+            if prepared_writes
+                .checkpoint_publications
+                .iter()
+                .any(|publication| publication.recovery_ref.branch_id == branch_id)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("branch '{branch_id}' already staged checkpoint serving context"),
+                ));
+            }
+            prepared_writes
+                .checkpoint_publications
+                .push(CheckpointPublication {
+                    recovery_ref: CheckpointRecoveryRef {
+                        branch_id,
+                        recovered_head_commit_id: source_commit_id,
+                        checkpoint_commit_id,
+                        interval_has_commits: true,
+                    },
+                    gc_state: load_checkpoint_gc_state(read).await?,
+                });
+        }
+        Ok(())
+    }
+
+    async fn attach_checkpoint_branch_parents<S>(
+        &self,
+        read: &S,
+        prepared_writes: &mut PreparedWriteSet,
+        commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
+    ) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead + Clone + Send + Sync,
+    {
+        let branch_ids = prepared_writes
+            .commit_change_refs_by_branch
+            .keys()
+            .filter(|branch_id| {
+                !prepared_writes
+                    .checkpoint_publications
+                    .iter()
+                    .any(|publication| publication.recovery_ref.branch_id == branch_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let controls = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .load_many(&branch_ids)
+            .await?;
+        for (branch_id, control) in branch_ids.into_iter().zip(controls) {
+            let Some(control) = control else {
+                continue;
+            };
+            let Some(parent_head) = commit_parent_heads.get(&branch_id).copied().flatten() else {
+                continue;
+            };
+            let Some(checkpoint_parent) = crate::gc::resolve_checkpoint_branch_parent(
+                read,
+                &branch_id,
+                parent_head,
+                control.working_diff_checkpoint_commit_id,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let parents = prepared_writes
+                .extra_commit_parents_by_branch
+                .entry(branch_id)
+                .or_default();
+            if !parents.contains(&checkpoint_parent) {
+                // The compacted checkpoint is the canonical ancestry bridge,
+                // so it precedes any merge parent already staged by callers.
+                parents.insert(0, checkpoint_parent);
+            }
+        }
+        Ok(())
+    }
+
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open<T, F>(
         mode: &SessionMode,
@@ -1518,6 +1673,7 @@ where
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
                     pending_plugin_actor_publications: Vec::new(),
+                    pending_branch_checkpoint_replacements: BTreeMap::new(),
                     plugin_generation_read_guard: None,
                     plugin_generation_upgrade_guard: None,
                 },
@@ -1606,6 +1762,15 @@ where
                 .await;
             return Err(error);
         }
+        if let Err(error) = transaction
+            .resolve_pending_branch_checkpoint_replacements(&read, &mut prepared_writes)
+            .await
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
         let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
             transaction.branch_ctx.as_ref(),
             &read,
@@ -1622,6 +1787,15 @@ where
                 return Err(error);
             }
         };
+        if let Err(error) = transaction
+            .attach_checkpoint_branch_parents(&read, &mut prepared_writes, &commit_parent_heads)
+            .await
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
         if let Err(error) = transaction
             .validate_prepared_writes_by_branch(&read, &prepared_writes)
             .instrument(tracing::debug_span!(
@@ -6365,6 +6539,31 @@ where
     /// Returns the active branch resolved inside this write transaction.
     pub(crate) fn active_branch_id(&self) -> &str {
         &self.active_branch_id
+    }
+
+    /// Defers explicit historical-source branchability to the commit boundary.
+    ///
+    /// Ordinary reachable commits need no bridge. A compacted source is
+    /// accepted only through one pending authenticated GC transition observed
+    /// by the same read whose queue row fences branch publication.
+    pub(crate) fn stage_branch_checkpoint_replacement_resolution(
+        &mut self,
+        branch_id: String,
+        source_commit_id: CommitId,
+    ) -> Result<(), LixError> {
+        if self
+            .pending_branch_checkpoint_replacements
+            .insert(branch_id.clone(), source_commit_id)
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "branch '{branch_id}' staged more than one checkpoint replacement resolution"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Reports whether visible untracked state is owned by any requested file.
