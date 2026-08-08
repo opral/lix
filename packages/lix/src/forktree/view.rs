@@ -386,6 +386,86 @@ where
         Ok(rows)
     }
 
+    /// Loads the state rows authored by one authenticated semantic commit.
+    /// Commit membership and the final state row are authenticated together:
+    /// a missing row, substituted key, or row owned by another change/commit
+    /// is corruption rather than an absent value. `schema_keys` is only a
+    /// projection filter; it never changes the ownership checks.
+    pub(crate) async fn load_commit_delta_rows(
+        &self,
+        commit_id: crate::changelog::CommitId,
+        schema_keys: Option<&[&str]>,
+    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
+        let members = self
+            .load_commit_member_records(commit_id)
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_COMMIT_NOT_FOUND,
+                    format!("commit '{commit_id}' has no authenticated member records"),
+                )
+            })?;
+        let mut keys = Vec::with_capacity(members.len());
+        let mut seen = BTreeMap::new();
+        for member in members.iter().filter(|member| {
+            schema_keys.is_none_or(|schemas| {
+                schemas
+                    .iter()
+                    .any(|schema_key| *schema_key == member.schema_key)
+            })
+        }) {
+            let key = super::state::StateKey {
+                schema_key: member.schema_key.clone(),
+                file_id: member.file_id.clone(),
+                entity_pk: member.entity_pk.clone(),
+            };
+            if seen.insert(key.clone(), ()).is_some() {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has duplicate state member identity"),
+                ));
+            }
+            keys.push(key);
+        }
+        let rows = self
+            .load_state_rows_at_commit(&commit_id.to_string(), &keys)
+            .await?;
+        if rows.len() != keys.len() {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("commit '{commit_id}' returned an incomplete state delta"),
+            ));
+        }
+        let mut delta = Vec::with_capacity(keys.len());
+        for ((member, key), row) in members
+            .iter()
+            .filter(|member| {
+                schema_keys.is_none_or(|schemas| {
+                    schemas
+                        .iter()
+                        .any(|schema_key| *schema_key == member.schema_key)
+                })
+            })
+            .zip(keys)
+            .zip(rows)
+        {
+            let row = row.ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' is missing an authenticated state member"),
+                )
+            })?;
+            if row.key != key || row.change_id != member.change_id || row.commit_id != commit_id {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has a substituted state member"),
+                ));
+            }
+            delta.push(row);
+        }
+        Ok(delta)
+    }
+
     /// Loads the complete authenticated historical state overlay through this
     /// facade's retained read. Callers may project the returned ForkTree-owned
     /// rows into their public DTOs, but may not acquire a legacy reader for

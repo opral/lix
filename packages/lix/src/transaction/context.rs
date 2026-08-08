@@ -94,7 +94,6 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -7312,19 +7311,6 @@ where
         self.branch_ctx.ref_reader(&self.opening_read)
     }
 
-    /// Creates a tracked-state reader scoped to this write transaction.
-    pub(crate) async fn tracked_state_reader(
-        &mut self,
-    ) -> TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.tracked_state
-            .reader(SharedStorageAdapterRead::new(read))
-    }
-
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) async fn commit_graph_reader(
         &mut self,
@@ -7359,6 +7345,26 @@ where
         desired_commit_id: CommitId,
         keys: Vec<TrackedStateKey>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        let facade = self.forktree_read_facade();
+        self.execute_tracked_state_transition_with_facade(
+            &facade,
+            current_commit_id,
+            desired_commit_id,
+            keys,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_tracked_state_transition_with_facade<R>(
+        &mut self,
+        facade: &ForkTreeReadFacade<R>,
+        current_commit_id: CommitId,
+        desired_commit_id: CommitId,
+        keys: Vec<TrackedStateKey>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
+    where
+        R: StorageAdapterRead,
+    {
         let branch_id = self.active_branch_id.clone();
         if self.opening_active_branch_head != Some(current_commit_id) {
             return Err(LixError::new(
@@ -7387,32 +7393,28 @@ where
             ));
         }
 
-        let (current_rows, desired_rows) = {
-            let mut tracked = self.tracked_state_reader().await;
-            let current_rows = tracked
-                .load_projected_batch_at_commit(
-                    &current_commit_id.to_string(),
-                    &keys,
-                    &ChangeRecordProjection::identity_only(),
-                )
-                .await?;
-            let desired_rows = tracked
-                .load_projected_batch_at_commit(
-                    &desired_commit_id.to_string(),
-                    &keys,
-                    &ChangeRecordProjection::full(),
-                )
-                .await?;
-            (current_rows, desired_rows)
-        };
+        let state_keys = keys
+            .iter()
+            .map(|identity| StateKey {
+                schema_key: identity.schema_key.clone(),
+                file_id: identity.file_id.clone(),
+                entity_pk: identity.entity_pk.clone(),
+            })
+            .collect::<Vec<_>>();
+        let current_rows = facade
+            .load_state_rows_at_commit(&current_commit_id.to_string(), &state_keys)
+            .await?;
+        let desired_rows = facade
+            .load_state_rows_at_commit(&desired_commit_id.to_string(), &state_keys)
+            .await?;
         let mut transitions = Vec::with_capacity(keys.len());
         for (index, identity) in keys.into_iter().enumerate() {
-            let current = current_rows.row(index).filter(|row| !row.deleted());
-            let desired = desired_rows.row(index).filter(|row| !row.deleted());
+            let current = current_rows[index].as_ref().filter(|row| !row.deleted);
+            let desired = desired_rows[index].as_ref().filter(|row| !row.deleted);
             for row in [current, desired].into_iter().flatten() {
-                if row.schema_key() != identity.schema_key
-                    || row.file_id() != identity.file_id.as_deref()
-                    || row.entity_pk() != &identity.entity_pk
+                if row.key.schema_key != identity.schema_key
+                    || row.key.file_id != identity.file_id
+                    || row.key.entity_pk != identity.entity_pk
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -7420,11 +7422,11 @@ where
                     ));
                 }
             }
-            let expected_change_id = current.map(|row| row.change_id());
+            let expected_change_id = current.map(|row| row.change_id);
             let target = desired.map(|row| TypedStateTransitionTarget {
-                change_id: row.change_id(),
-                snapshot_content: row.snapshot_content().cloned(),
-                metadata: row.metadata().cloned(),
+                change_id: row.change_id,
+                snapshot_content: row.snapshot_content.clone(),
+                metadata: row.metadata.clone(),
             });
             if expected_change_id != target.as_ref().map(|target| target.change_id) {
                 transitions.push(TypedStateTransition {
