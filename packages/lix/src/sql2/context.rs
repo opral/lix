@@ -62,8 +62,8 @@ pub(crate) struct HistoryQuerySource<S> {
 
 #[derive(Clone)]
 pub(crate) struct ChangelogQuerySource<S> {
-    pub(crate) store: S,
     pub(crate) json_reader: JsonStoreReader<S>,
+    pub(crate) forktree_reader: crate::forktree::ForkTreeReadFacade<S>,
 }
 
 /// Read-only context used while executing one SQL statement.

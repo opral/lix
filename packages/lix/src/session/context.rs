@@ -738,8 +738,8 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            store: self.read_store.clone(),
             json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
+            forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
         }
     }
 

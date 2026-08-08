@@ -3381,8 +3381,8 @@ mod tests {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             ChangelogQuerySource {
-                store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope),
+                json_reader: JsonStoreContext::new().reader(read_scope.clone()),
+                forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
             }
         }
 

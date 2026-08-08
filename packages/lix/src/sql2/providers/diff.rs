@@ -34,13 +34,13 @@ pub(crate) fn register_diff_function<S>(
     session.register_udtf(
         "lix_diff",
         Arc::new(DiffFunction {
-            store: query_source.store,
+            forktree_reader: query_source.forktree_reader,
         }),
     );
 }
 
 struct DiffFunction<S> {
-    store: S,
+    forktree_reader: ForkTreeReadFacade<S>,
 }
 
 impl<S> fmt::Debug for DiffFunction<S> {
@@ -64,7 +64,7 @@ where
         let from_commit_id = commit_id_argument(from_commit_id, 1)?;
         let to_commit_id = commit_id_argument(to_commit_id, 2)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
-            store: self.store.clone(),
+            forktree_reader: self.forktree_reader.clone(),
             from_commit_id,
             to_commit_id,
         }))))
@@ -89,7 +89,7 @@ fn commit_id_argument(argument: &Expr, position: usize) -> Result<String> {
 }
 
 struct DiffSpec<S> {
-    store: S,
+    forktree_reader: ForkTreeReadFacade<S>,
     from_commit_id: String,
     to_commit_id: String,
 }
@@ -138,18 +138,17 @@ where
             source: scan_row_source(
                 Arc::clone(&schema),
                 (
-                    self.store.clone(),
+                    self.forktree_reader.clone(),
                     schema,
                     route,
                     self.from_commit_id.clone(),
                     self.to_commit_id.clone(),
                 ),
-                move |(store, schema, route, from_commit_id, to_commit_id)| async move {
+                move |(forktree_reader, schema, route, from_commit_id, to_commit_id)| async move {
                     if route.contradictory {
                         return DIFF_COLS.build(schema, &[]).map_err(diff_batch_error);
                     }
-                    let historical = ForkTreeReadFacade::new(store);
-                    let before = historical
+                    let before = forktree_reader
                         .scan_state_rows_at_commit(
                             crate::changelog::CommitId::parse_lix(
                                 &from_commit_id,
@@ -159,7 +158,7 @@ where
                         )
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    let after = historical
+                    let after = forktree_reader
                         .scan_state_rows_at_commit(
                             crate::changelog::CommitId::parse_lix(&to_commit_id, "diff to commit")
                                 .map_err(lix_error_to_datafusion_error)?,

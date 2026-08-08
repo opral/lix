@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,10 +8,8 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
-use crate::changelog::{
-    COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId,
-};
+use crate::changelog::{ChangeId, ChangeRecord, CommitId};
+use crate::forktree::ForkTreeReadFacade;
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlChangelogQuerySource;
@@ -21,10 +20,7 @@ use crate::sql2::change_materialization::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
-};
-use bytes::Bytes;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -96,10 +92,21 @@ where
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {
                     let mut json_reader = query_source.json_reader;
-                    let canonical_changes =
-                        scan_changelog_changes(query_source.store, pushed_limit, route)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
+                    let canonical_changes = match route {
+                        ChangeScanRoute::Exact(change_id) => {
+                            load_exact_change(&query_source.forktree_reader, change_id)
+                                .await
+                                .map(|change| change.into_iter().collect())
+                                .map_err(lix_error_to_datafusion_error)?
+                        }
+                        ChangeScanRoute::All | ChangeScanRoute::Empty => scan_changelog_changes(
+                            &query_source.forktree_reader,
+                            pushed_limit,
+                            route,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                    };
                     let mut changes = Vec::with_capacity(canonical_changes.len());
                     for change in canonical_changes {
                         match change {
@@ -149,7 +156,7 @@ fn change_payload_projection(schema: &Schema, filters: &[Expr]) -> ChangePayload
 }
 
 async fn scan_changelog_changes<S>(
-    store: S,
+    reader: &ForkTreeReadFacade<S>,
     limit: Option<usize>,
     route: ChangeScanRoute,
 ) -> Result<Vec<LixChangeRow>, LixError>
@@ -158,54 +165,67 @@ where
 {
     match route {
         ChangeScanRoute::Empty => return Ok(Vec::new()),
-        ChangeScanRoute::Exact(change_id) => {
-            return load_exact_change(store, change_id)
-                .await
-                .map(|change| change.into_iter().collect());
+        ChangeScanRoute::Exact(_) => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact changelog routes must use the operation-owned reader at the SQL boundary",
+            ));
         }
         ChangeScanRoute::All => {}
     }
-    let packed_changes =
-        crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
-    let mut reader = ChangelogContext::new().reader(store.clone());
-    let mut changes = packed_changes
-        .into_iter()
-        .map(LixChangeRow::Direct)
-        .collect::<Vec<_>>();
-    let mut start_after = None::<String>;
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    let mut start_after = None;
     loop {
-        let scan = reader
-            .scan_changes(ChangeScanRequest {
-                start_after: start_after.as_deref(),
-                limit: Some(1024),
-            })
-            .await?;
-        changes.extend(scan.entries.into_iter().map(LixChangeRow::Direct));
-        let Some(next) = scan.next_start_after else {
+        let page = reader.scan_change_records(start_after, 1024).await?;
+        let next_start_after = page.last().map(|change| change.change_id);
+        let page_is_full = page.len() == 1024;
+        for change in page {
+            push_unique_change(&mut changes, &mut seen, LixChangeRow::Direct(change))?;
+        }
+        if !page_is_full {
             break;
-        };
-        start_after = Some(next.to_string());
+        }
+        start_after = next_start_after;
     }
-    let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
-    let commits = graph_reader.all_nodes().await?;
-    let commit_ids = commits
-        .iter()
-        .map(|commit| commit.commit_id)
-        .collect::<Vec<_>>();
-    let records = require_commit_records(
-        &commit_ids,
-        graph_reader.load_commit_records(&commit_ids).await?,
-    )?;
-    for record in records {
-        changes.push(LixChangeRow::DerivedCommit(
-            crate::commit_graph::canonical_commit_change(&record),
-        ));
+    let mut start_after = None;
+    loop {
+        let page = reader.scan_commit_records(start_after, 1024).await?;
+        let next_start_after = page.last().map(|record| record.commit_id);
+        let page_is_full = page.len() == 1024;
+        for record in page {
+            push_unique_change(
+                &mut changes,
+                &mut seen,
+                LixChangeRow::DerivedCommit(crate::commit_graph::canonical_commit_change(&record)),
+            )?;
+        }
+        if !page_is_full {
+            break;
+        }
+        start_after = next_start_after;
     }
     changes.sort_by_key(LixChangeRow::change_id);
     if let Some(limit) = limit {
         changes.truncate(limit);
     }
     Ok(changes)
+}
+
+fn push_unique_change(
+    changes: &mut Vec<LixChangeRow>,
+    seen: &mut BTreeSet<ChangeId>,
+    change: LixChangeRow,
+) -> Result<(), LixError> {
+    let change_id = change.change_id();
+    if !seen.insert(change_id) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("ChangeCatalog enumeration returned duplicate change '{change_id}'"),
+        ));
+    }
+    changes.push(change);
+    Ok(())
 }
 
 fn require_commit_records(
@@ -301,69 +321,41 @@ fn exact_change_id_filter(filter: &Expr) -> Option<Option<ChangeId>> {
 }
 
 async fn load_exact_change<S>(
-    store: S,
+    reader: &ForkTreeReadFacade<S>,
     change_id: ChangeId,
 ) -> Result<Option<LixChangeRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    if let Some(change) = crate::tracked_state::load_change_record_by_id(&store, change_id).await? {
-        return Ok(Some(LixChangeRow::Direct(change)));
-    }
-
-    let mut reader = ChangelogContext::new().reader(store.clone());
     if let Some(change) = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: std::slice::from_ref(&change_id),
-        })
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, value)| value)
-    {
-        return Ok(Some(LixChangeRow::Direct(change)));
-    }
-
-    let index_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
-    let indexed_commit =
-        PointReadPlan::new(COMMIT_CHANGE_ID_SPACE, std::slice::from_ref(&index_key))
-            .materialize(&store, StorageGetOptions::default())
-            .await?
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-    let Some(StorageProjectedValue::FullValue(commit_id)) = indexed_commit else {
-        return Ok(None);
-    };
-    let commit_id = CommitId::new(uuid::Uuid::from_slice(&commit_id).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog commit change-id index has invalid commit id: {error}"),
-        )
-    })?);
-    let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
-    let commit = graph_reader.load_node(&commit_id).await?.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog commit change-id index references missing commit '{commit_id}'"),
-        )
-    })?;
-    let commit = graph_reader
-        .load_commit_records(std::slice::from_ref(&commit_id))
+        .load_change_records(std::slice::from_ref(&change_id))
         .await?
         .into_iter()
         .next()
         .flatten()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog commit change-id index references missing commit '{commit_id}'"),
-            )
-        })?;
-    Ok(Some(LixChangeRow::DerivedCommit(
-        crate::commit_graph::canonical_commit_change(&commit),
-    )))
+    {
+        return Ok(Some(LixChangeRow::Direct(change)));
+    }
+
+    let mut start_after = None;
+    loop {
+        let page = reader.scan_commit_records(start_after, 1024).await?;
+        let next_start_after = page.last().map(|record| record.commit_id);
+        let page_is_full = page.len() == 1024;
+        if let Some(record) = page
+            .into_iter()
+            .find(|record| crate::commit_graph::canonical_commit_change(record).id == change_id)
+        {
+            return Ok(Some(LixChangeRow::DerivedCommit(
+                crate::commit_graph::canonical_commit_change(&record),
+            )));
+        }
+        if !page_is_full {
+            break;
+        }
+        start_after = next_start_after;
+    }
+    Ok(None)
 }
 
 enum LixChangeRow {

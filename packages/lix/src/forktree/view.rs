@@ -289,6 +289,29 @@ where
         super::serving::load_commit_member_records(&self.read, commit_id).await
     }
 
+    pub(crate) async fn load_change_records(
+        &self,
+        ids: &[crate::changelog::ChangeId],
+    ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, crate::LixError> {
+        super::serving::load_change_records(&self.read, ids).await
+    }
+
+    pub(crate) async fn scan_change_records(
+        &self,
+        start_after: Option<crate::changelog::ChangeId>,
+        limit: usize,
+    ) -> Result<Vec<crate::changelog::ChangeRecord>, crate::LixError> {
+        super::serving::scan_change_records(&self.read, start_after, limit).await
+    }
+
+    pub(crate) async fn scan_commit_records(
+        &self,
+        start_after: Option<crate::changelog::CommitId>,
+        limit: usize,
+    ) -> Result<Vec<crate::changelog::CommitRecord>, crate::LixError> {
+        super::serving::scan_commit_records(&self.read, start_after, limit).await
+    }
+
     pub(crate) async fn load_state_value_at_commit(
         &self,
         commit_id: crate::changelog::CommitId,
