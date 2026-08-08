@@ -1,0 +1,24 @@
+{
+  "baseline": "cbe48835f6f07a21e0babf1ba16652a0c6b8a214",
+  "baseline_tree": "36ffe0ff867cd31bf52263675de2d16fc54e9b4f",
+  "changed_production_files": 19,
+  "evidence_sha256": "aa8d5570f9e655b72f9d281653a309fee63357a137903ed48d02a1ecb5f6f2e1",
+  "findings": [
+    {"detail":"functions=1 begin_read=1","name":"public-boundary-one-begin-read","passed":true},
+    {"detail":"functions=1 begin_read=0","name":"inner-view-zero-refresh","passed":true},
+    {"detail":"CoherentView must own read: R","name":"view-owns-read-handle","passed":true},
+    {"detail":"found=load_change,load_commit,page_changes,page_commits,state_point,state_range","name":"serving-same-coherent-view","passed":true},
+    {"detail":"functions=32 begin_read=0","name":"topology-zero-snapshot-refresh","passed":true},
+    {"detail":"commit graph must borrow the ForkTree CoherentView rather than a raw/legacy store","name":"topology-same-coherent-view","passed":false},
+    {"detail":"hits=crate::changelog","name":"topology-zero-member-payload","passed":false},
+    {"detail":"requires node cache, input de-duplication, and non-vacuous topology regression","name":"topology-dedupes-parent-loads","passed":false},
+    {"detail":"history_functions=35 fork_tree_change_load=False back_edge=True","name":"history-authenticates-members-back-edges","passed":false},
+    {"detail":"baseline=0 target=0 new=none","name":"deleted-owner-modules-do-not-reappear","passed":true},
+    {"detail":"baseline=9 target=9 new=none","name":"legacy-space-definitions-do-not-reappear","passed":true},
+    {"detail":"hits=none","name":"no-benchmark-model-substitution","passed":true}
+  ],
+  "profile": "topology",
+  "schema": 1,
+  "target": "2e0cea1b91558179e6ed90847bc8b04b23de246f",
+  "target_tree": "334d6b2622f156e65ba7835058cb6d8e7c240181"
+}
