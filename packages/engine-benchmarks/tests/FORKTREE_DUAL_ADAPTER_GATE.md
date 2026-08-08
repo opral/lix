@@ -77,6 +77,23 @@ runtime result is claimed. A future production successor can replace those
 two stale test consumers with public/ForkTree test glue before rerunning the
 exact sequence; it must not re-enable the deleted raw-space helper module.
 
+Frozen preparation result from the dedicated target
+`/root/repos/target-forktree-dual-adapter-gate`:
+
+- runner exit: `101`;
+- compile log: `/root/repos/lix-evidence/forktree-dual-adapter-gate/COMPILE_FRONTIER.log`, SHA-256 `3372dd312ec8f566a3014e23690e2958bc75e42911fe36cda230bc659a42aa3e`;
+- exit record SHA-256 `39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c`;
+- compiled `lix` test binary SHA-256 `7a002be3623bf9fe89041525912eed91422ca036d53dfe6034b4111f0e0727c5`;
+- compiled all-simulations integration binary SHA-256 `f95711efb3db4a3867470fd56c6c81e1b441dbc3f3c220703a8d0e7a9b856e87`;
+- compiled checkpoint adapter binary SHA-256 `79e4f0ab8c2f9d8ede3723eff403ea2b99a2608a6f3bceb623f26f46543cd378`;
+- compiled replacement/delete adapter binary SHA-256 `347fa8ad1ea53d79bb2fbdaa831898dbc9b564ad1424e900dc6af02c8a9df37b`.
+
+The binaries are evidence of this exact target and toolchain run, not a
+runtime approval. The next permitted action is a fresh-target rerun of the
+same command after stale test consumers are replaced by test-only public API
+glue or after the production successor explicitly supplies the required
+public/ForkTree test seam.
+
 ## Current bounded preparation status
 
 The branch is intentionally expected to stop at the first current initializer,
