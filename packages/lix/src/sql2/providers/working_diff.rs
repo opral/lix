@@ -6,21 +6,16 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use tokio::sync::Mutex;
 
-use crate::branch::{BranchHeadControlContext, BranchRefReader};
+use crate::branch::BranchRefReader;
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
-use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
-use crate::forktree::ForkTreeReadFacade;
-use crate::live_state::TrackedHeadContext;
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
+use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
+use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::encode_diff_id;
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateFilter,
-};
 use crate::{LixError, NullableKeyFilter};
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
@@ -34,8 +29,7 @@ pub(super) async fn register_working_diff_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlChangelogQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -47,8 +41,7 @@ where
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
-            store: query_source.store,
+            forktree_reader: query_source.forktree_reader,
         }),
         WriteAccess::read_only(),
     )
@@ -58,8 +51,7 @@ struct WorkingDiffSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    store: S,
+    forktree_reader: ForkTreeReadFacade<S>,
 }
 
 #[async_trait]
@@ -113,12 +105,11 @@ where
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),
-                    Arc::clone(&self.commit_graph),
-                    self.store.clone(),
+                    self.forktree_reader.clone(),
                     schema,
                     route,
                 ),
-                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route)| async move {
+                move |(active_branch_id, branch_ref, historical, schema, route)| async move {
                     if route.contradictory {
                         return WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -131,82 +122,61 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let tracked_head = TrackedHeadContext::new();
-                    // Normal tracked reads use the direct head epoch and do
-                    // not need the historical graph or tracked-state reader.
-                    // Keep both fallback-only so the accelerated route does
-                    // not serialize behind an unrelated historical diff.
-                    let historical = ForkTreeReadFacade::new(store.clone());
-                    let mut tracked = None;
                     let mut rows = Vec::new();
                     for head in heads {
                         if limit.is_some_and(|limit| rows.len() >= limit) {
                             break;
                         }
-                        let direct_diff = match BranchHeadControlContext::new()
-                            .reader(store.clone())
-                            .load(&head.branch_id)
+                        let checkpoint_commit_id = historical
+                            .latest_checkpoint_for_branch(head.commit_id, &head.branch_id)
                             .await
                             .map_err(lix_error_to_datafusion_error)?
-                        {
-                            Some(control) if control.head_commit_id == head.commit_id => {
-                                tracked_head
-                                    .reader(store.clone())
-                                    .working_diff_for_control(
-                                        &head.branch_id,
-                                        control,
-                                        &route.diff_request,
-                                    )
-                                    .await
-                                    .map_err(lix_error_to_datafusion_error)?
-                            }
-                            _ => None,
-                        };
-                        let diff = if let Some(direct) = direct_diff {
-                            direct.diff
-                        } else {
-                            let tracked = tracked.get_or_insert_with(|| {
-                                TrackedStateContext::new().reader(store.clone())
-                            });
-                            let checkpoint_commit_id = historical
-                                .latest_checkpoint_for_branch(head.commit_id, &head.branch_id)
-                                .await
-                                .map_err(lix_error_to_datafusion_error)?
-                                .ok_or_else(|| {
-                                    DataFusionError::Execution(format!(
-                                        "branch '{}' has no checkpoint baseline",
-                                        head.branch_id
-                                    ))
-                                })?;
-                            tracked
-                                .diff_commits(
-                                    &checkpoint_commit_id.to_string(),
-                                    &head.commit_id.to_string(),
-                                    &route.diff_request,
-                                )
-                                .await
-                                .map_err(lix_error_to_datafusion_error)?
-                        };
-                        for entry in diff.entries {
-                            if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY
-                                || entry.identity.schema_key()
-                                    == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "branch '{}' has no checkpoint baseline",
+                                    head.branch_id
+                                ))
+                            })?;
+                        let diff = historical
+                            .diff_state_rows_between_commits(checkpoint_commit_id, head.commit_id)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                        for entry in diff.into_iter().filter(|entry| {
+                            entry
+                                .before
+                                .as_ref()
+                                .or(entry.after.as_ref())
+                                .is_some_and(|row| diff_row_matches(row, &route.filter))
+                        }) {
+                            if entry
+                                .before
+                                .as_ref()
+                                .or(entry.after.as_ref())
+                                .is_some_and(|row| {
+                                    row.key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
+                                        || row.key.schema_key
+                                            == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                                })
                             {
                                 continue;
                             }
+                            let identity = entry
+                                .before
+                                .as_ref()
+                                .or(entry.after.as_ref())
+                                .expect("working diff entry has one side");
                             rows.push(WorkingDiffSqlRow {
                                 diff_id: encode_diff_id(
                                     entry.before.as_ref().map(|row| row.change_id),
                                     entry.after.as_ref().map(|row| row.change_id),
                                 ),
-                                entity_pk: entry.identity.entity_pk().as_json_array_text(),
-                                schema_key: entry.identity.schema_key().to_owned(),
-                                file_id: entry.identity.file_id().map(str::to_owned),
-                                diff_type: match entry.kind {
-                                    TrackedStateDiffKind::Added => "added",
-                                    TrackedStateDiffKind::Modified => "modified",
-                                    TrackedStateDiffKind::Removed => "removed",
-                                },
+                                entity_pk: identity.key.entity_pk.as_json_array_text(),
+                                schema_key: identity.key.schema_key.clone(),
+                                file_id: identity.key.file_id.clone(),
+                                diff_type: working_diff_kind(
+                                    entry.before.as_ref(),
+                                    entry.after.as_ref(),
+                                ),
                                 before_change_id: entry.before.map(|row| row.change_id.to_string()),
                                 after_change_id: entry.after.map(|row| row.change_id.to_string()),
                                 branch_id: head.branch_id.clone(),
@@ -228,7 +198,7 @@ where
 #[derive(Clone, Debug)]
 struct WorkingDiffRoute {
     branch_ids: FileIdConstraint,
-    diff_request: TrackedStateDiffRequest,
+    filter: TrackedStateFilter,
     contradictory: bool,
 }
 
@@ -262,21 +232,45 @@ impl WorkingDiffRoute {
 
         Ok(Self {
             branch_ids,
-            diff_request: TrackedStateDiffRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: schema_keys.unwrap_or_default(),
-                    entity_pks,
-                    file_ids: file_ids
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(NullableKeyFilter::Value)
-                        .collect(),
-                    include_tombstones: true,
-                },
-                retain_payloads: false,
+            filter: TrackedStateFilter {
+                schema_keys: schema_keys.unwrap_or_default(),
+                entity_pks,
+                file_ids: file_ids
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(NullableKeyFilter::Value)
+                    .collect(),
+                include_tombstones: true,
             },
             contradictory,
         })
+    }
+}
+
+fn diff_row_matches(row: &HistoricalStateRow, filter: &TrackedStateFilter) -> bool {
+    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+        && (filter.file_ids.is_empty()
+            || filter.file_ids.iter().any(|file_id| match file_id {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => row.key.file_id.is_none(),
+                NullableKeyFilter::Value(file_id) => {
+                    row.key.file_id.as_deref() == Some(file_id.as_str())
+                }
+            }))
+}
+
+fn working_diff_kind(
+    before: Option<&HistoricalStateRow>,
+    after: Option<&HistoricalStateRow>,
+) -> &'static str {
+    match (before, after) {
+        (None, Some(_)) => "added",
+        (Some(_), None) => "removed",
+        (Some(_), Some(row)) if row.deleted => "removed",
+        (Some(row), Some(_)) if row.deleted => "added",
+        (Some(_), Some(_)) => "modified",
+        (None, None) => "modified",
     }
 }
 
@@ -374,18 +368,15 @@ mod tests {
             route.branch_ids,
             FileIdConstraint::Ids(["01920000-0000-7000-8000-0000000000a1".to_string()].into())
         );
+        assert_eq!(route.filter.schema_keys, vec!["acme_task".to_string()]);
         assert_eq!(
-            route.diff_request.filter.schema_keys,
-            vec!["acme_task".to_string()]
-        );
-        assert_eq!(
-            route.diff_request.filter.entity_pks[0]
+            route.filter.entity_pks[0]
                 .as_json_array_text()
                 .expect("entity pk should encode"),
             "[\"task-a\"]"
         );
         assert_eq!(
-            route.diff_request.filter.file_ids,
+            route.filter.file_ids,
             vec![NullableKeyFilter::Value(
                 "01920000-0000-7000-8000-0000000000a2".to_string()
             )]

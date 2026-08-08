@@ -429,13 +429,21 @@ fn parse_directory_history_observed_records(
             let _ = observed.observed_commit_id();
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            if row.deleted() {
+            let Some(snapshot_content) = row.snapshot_content() else {
+                if row.deleted() {
+                    return Ok(DirectoryHistoryObservedRecord {
+                        id: row_id,
+                        parent_id: None,
+                        name: None,
+                        row: observed.ordinal(),
+                    });
+                }
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!("directory descriptor row '{row_id}' is tombstoned"),
+                    format!("directory descriptor row '{row_id}' has no authenticated payload"),
                 ));
-            }
-            let snapshot_content = row.snapshot_content().ok_or_else(|| {
+            };
+            let snapshot_content = Some(snapshot_content).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("directory descriptor row '{row_id}' has no authenticated payload"),
@@ -475,6 +483,14 @@ fn parse_directory_history_records(
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.snapshot_content.is_none() {
+                return Ok(DirectoryHistoryRecord {
+                    id: row_id,
+                    parent_id: None,
+                    name: None,
+                    entry: entry.clone(),
+                });
+            }
             let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,

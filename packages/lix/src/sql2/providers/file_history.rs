@@ -758,10 +758,23 @@ where
     for prepared_row in prepared {
         let data = if needs_data && prepared_row.descriptor().name.is_some() {
             validate_file_history_materialization(&prepared_row)?;
-            prepared_row.blob_hash.as_deref().map_or_else(
-                || Some(Vec::new()),
-                |blob_hash| blob_bytes.get(blob_hash).cloned().flatten(),
-            )
+            let blob_hash = prepared_row.blob_hash.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "file '{}' has no authenticated blob reference at observed commit '{}'",
+                    prepared_row.id, prepared_row.event.observed_commit_id
+                ))
+            })?;
+            let bytes = blob_bytes
+                .get(blob_hash)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| {
+                    invalid_file_history_state(format!(
+                        "file '{}' blob payload '{}' is missing at observed commit '{}'",
+                        prepared_row.id, blob_hash, prepared_row.event.observed_commit_id
+                    ))
+                })?;
+            Some(bytes)
         } else {
             None
         };
@@ -933,6 +946,12 @@ fn validate_file_history_materialization(
     let state = prepared.observed_state.as_ref();
     let descriptor = prepared.descriptor();
     let has_blob = prepared.blob_hash.is_some();
+    if !has_blob {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has no authenticated blob reference",
+            descriptor.id
+        )));
+    }
     let Some(owner) = live_file_history_plugin_owner(state, &descriptor.id) else {
         return Ok(());
     };
@@ -1809,6 +1828,12 @@ fn parse_file_history_descriptors(
         .filter(|entry| entry.change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.snapshot_content.is_none() {
+                return Ok(FileHistoryDescriptorRecord {
+                    id: row_id,
+                    entry: entry.clone(),
+                });
+            }
             let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
                 invalid_file_history_state(format!(
                     "file descriptor history row '{row_id}' has no authenticated payload"
@@ -1843,6 +1868,14 @@ fn parse_file_history_directories(
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.snapshot_content.is_none() {
+                return Ok(FileHistoryDirectoryRecord {
+                    id: row_id,
+                    parent_id: None,
+                    name: None,
+                    entry: entry.clone(),
+                });
+            }
             let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
                 invalid_file_history_state(format!(
                     "directory descriptor history row '{row_id}' has no authenticated payload"
@@ -1879,6 +1912,12 @@ fn parse_file_history_blobs(
         .filter(|entry| entry.change.schema_key == BLOB_REF_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.snapshot_content.is_none() {
+                return Ok(FileHistoryBlobRecord {
+                    file_id: entry.change.file_id.clone().unwrap_or(row_id),
+                    entry: entry.clone(),
+                });
+            }
             let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
                 invalid_file_history_state(format!(
                     "blob reference history row '{row_id}' has no authenticated payload"
@@ -1929,11 +1968,6 @@ fn parse_file_history_plugin_state(
                     entry.observed_commit_id
                 ))
             })?;
-            if entry.change.snapshot_content.is_none() {
-                return Err(invalid_file_history_state(format!(
-                    "plugin history row for file '{file_id}' has no authenticated payload"
-                )));
-            }
             Ok(FileHistoryPluginStateRecord {
                 file_id,
                 entry: entry.clone(),
@@ -1958,11 +1992,6 @@ fn parse_file_history_plugin_owners(
                     "lix_file_history plugin owner row is missing file_id",
                 )
             })?;
-            if entry.change.snapshot_content.is_none() {
-                return Err(invalid_file_history_state(format!(
-                    "plugin owner history row for file '{file_id}' has no authenticated payload"
-                )));
-            }
             Ok(FileHistoryPluginOwnerRecord {
                 file_id,
                 entry: entry.clone(),
@@ -1980,16 +2009,19 @@ fn parse_file_history_observed_descriptors(
             let _ = observed.observed_commit_id();
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            if row.deleted() {
+            let Some(snapshot_content) = row.snapshot_content() else {
+                if row.deleted() {
+                    return Ok(FileHistoryObservedDescriptorRecord {
+                        id: row_id,
+                        directory_id: None,
+                        name: None,
+                        row: observed.ordinal(),
+                    });
+                }
                 return Err(invalid_file_history_state(format!(
-                    "file descriptor row '{row_id}' is tombstoned"
-                )));
-            }
-            let snapshot_content = row.snapshot_content().ok_or_else(|| {
-                invalid_file_history_state(format!(
                     "file descriptor row '{row_id}' has no authenticated payload"
-                ))
-            })?;
+                )));
+            };
             let snapshot: FileDescriptorSnapshot =
                 serde_json::from_str(snapshot_content).map_err(|error| {
                     LixError::new(
@@ -2021,16 +2053,19 @@ fn parse_file_history_observed_directories(
         .map(|observed| {
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            if row.deleted() {
+            let Some(snapshot_content) = row.snapshot_content() else {
+                if row.deleted() {
+                    return Ok(FileHistoryObservedDirectoryRecord {
+                        id: row_id,
+                        parent_id: None,
+                        name: None,
+                        row: observed.ordinal(),
+                    });
+                }
                 return Err(invalid_file_history_state(format!(
-                    "directory descriptor row '{row_id}' is tombstoned"
-                )));
-            }
-            let snapshot_content = row.snapshot_content().ok_or_else(|| {
-                invalid_file_history_state(format!(
                     "directory descriptor row '{row_id}' has no authenticated payload"
-                ))
-            })?;
+                )));
+            };
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -2062,16 +2097,18 @@ fn parse_file_history_observed_blobs(
         .map(|observed| {
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            if row.deleted() {
+            let Some(snapshot_content) = row.snapshot_content() else {
+                if row.deleted() {
+                    return Ok(FileHistoryObservedBlobRecord {
+                        file_id: row.file_id().map(str::to_owned).unwrap_or(row_id),
+                        blob_hash: None,
+                        row: observed.ordinal(),
+                    });
+                }
                 return Err(invalid_file_history_state(format!(
-                    "blob reference row '{row_id}' is tombstoned"
-                )));
-            }
-            let snapshot_content = row.snapshot_content().ok_or_else(|| {
-                invalid_file_history_state(format!(
                     "blob reference row '{row_id}' has no authenticated payload"
-                ))
-            })?;
+                )));
+            };
             let snapshot: BlobRefSnapshot =
                 serde_json::from_str(snapshot_content).map_err(|error| {
                     LixError::new(
@@ -2112,29 +2149,31 @@ fn parse_file_history_observed_plugin_owners(
                     "lix_file_history plugin owner row is missing file_id",
                 )
             })?;
-            if row.deleted() || row.snapshot_content().is_none() {
-                return Err(invalid_file_history_state(format!(
-                    "plugin owner row for file '{file_id}' has no authenticated payload"
-                )));
+            if row.deleted() {
+                return Ok(FileHistoryObservedPluginOwnerRecord {
+                    file_id,
+                    owner: None,
+                    row: observed.ordinal(),
+                });
             }
-            let owner = row
-                .snapshot_content()
-                .map(|snapshot| {
-                    serde_json::from_str::<serde_json::Value>(snapshot)
-                        .map_err(|error| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "lix_file_history plugin owner snapshot is invalid JSON for file '{file_id}': {error}"
-                                ),
-                            )
-                        })
-                        .and_then(|snapshot| PluginFileOwner::from_snapshot(&file_id, &snapshot))
+            let snapshot = row.snapshot_content().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "plugin owner row for file '{file_id}' has no authenticated payload"
+                ))
+            })?;
+            let owner = serde_json::from_str::<serde_json::Value>(snapshot)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "lix_file_history plugin owner snapshot is invalid JSON for file '{file_id}': {error}"
+                        ),
+                    )
                 })
-                .transpose()?;
+                .and_then(|snapshot| PluginFileOwner::from_snapshot(&file_id, &snapshot))?;
             Ok(FileHistoryObservedPluginOwnerRecord {
                 file_id,
-                owner,
+                owner: Some(owner),
                 row: observed.ordinal(),
             })
         })
@@ -2308,7 +2347,7 @@ mod tests {
     use crate::LixError;
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
     use crate::changelog::{ChangeId, CommitId};
-    use crate::common::SharedStr;
+    use crate::common::{LixTimestamp, SharedStr};
     use crate::entity_pk::EntityPk;
     use crate::forktree::{HistoricalStateRow, StateKey};
     use crate::plugin::{
@@ -2363,6 +2402,31 @@ mod tests {
         FileHistoryDescriptorRecord {
             id: file_id.to_string(),
             entry: history_entry(file_id, depth, snapshot),
+        }
+    }
+
+    fn observed_row(
+        schema_key: &str,
+        entity_pk: EntityPk,
+        file_id: Option<&str>,
+        deleted: bool,
+        ordinal: u128,
+    ) -> HistoricalStateRow {
+        let timestamp =
+            LixTimestamp::expect_parse("test historical row timestamp", "2026-01-01T00:00:00Z");
+        HistoricalStateRow {
+            key: StateKey {
+                entity_pk,
+                schema_key: schema_key.to_string(),
+                file_id: file_id.map(str::to_owned),
+            },
+            snapshot_content: None,
+            metadata: None,
+            deleted,
+            created_at: timestamp,
+            updated_at: timestamp,
+            change_id: ChangeId::new(uuid::Uuid::from_u128(ordinal)),
+            commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
         }
     }
 
@@ -2442,14 +2506,10 @@ mod tests {
             .map(|(index, entry)| {
                 let change = entry.change;
                 let deleted = change.snapshot_content.is_none();
-                let created_at = crate::common::LixTimestamp::expect_parse(
-                    "test history created_at",
-                    &change.created_at,
-                );
-                let updated_at = crate::common::LixTimestamp::expect_parse(
-                    "test history updated_at",
-                    &change.created_at,
-                );
+                let created_at =
+                    LixTimestamp::expect_parse("test history created_at", &change.created_at);
+                let updated_at =
+                    LixTimestamp::expect_parse("test history updated_at", &change.created_at);
                 HistoricalStateRow {
                     key: StateKey {
                         entity_pk: change.entity_pk,
@@ -2734,6 +2794,84 @@ mod tests {
                 .matches("01920000-0000-7000-8000-0000000000a2", Some("/a.md")),
             "a guaranteed public conjunct remains safe for early pruning"
         );
+    }
+
+    #[test]
+    fn authenticated_tombstones_remain_history_rows_but_nulls_fail_closed() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let descriptor_tombstone = ObservedTrackedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::FILE_DESCRIPTOR_SCHEMA_KEY,
+                EntityPk::single(file_id),
+                Some(file_id),
+                true,
+                1,
+            )],
+        )
+        .unwrap();
+        let descriptor = parse_file_history_observed_descriptors(&descriptor_tombstone).unwrap();
+        assert_eq!(descriptor.len(), 1);
+        assert_eq!(descriptor[0].name, None);
+
+        let directory_id = "01920000-0000-7000-8000-0000000000b2";
+        let directory_tombstone = ObservedTrackedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                EntityPk::single(directory_id),
+                None,
+                true,
+                2,
+            )],
+        )
+        .unwrap();
+        let directory = parse_file_history_observed_directories(&directory_tombstone).unwrap();
+        assert_eq!(directory.len(), 1);
+        assert_eq!(directory[0].name, None);
+
+        let blob_tombstone = ObservedTrackedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::BLOB_REF_SCHEMA_KEY,
+                EntityPk::single(file_id),
+                Some(file_id),
+                true,
+                3,
+            )],
+        )
+        .unwrap();
+        let blob = parse_file_history_observed_blobs(&blob_tombstone).unwrap();
+        assert_eq!(blob.len(), 1);
+        assert_eq!(blob[0].blob_hash, None);
+
+        let owner_tombstone = ObservedTrackedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::KEY_VALUE_SCHEMA_KEY,
+                EntityPk::single(super::PLUGIN_OWNER_KEY),
+                Some(file_id),
+                true,
+                4,
+            )],
+        )
+        .unwrap();
+        let owner = parse_file_history_observed_plugin_owners(&owner_tombstone).unwrap();
+        assert_eq!(owner.len(), 1);
+        assert_eq!(owner[0].owner, None);
+
+        let authenticated_null = ObservedTrackedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::FILE_DESCRIPTOR_SCHEMA_KEY,
+                EntityPk::single(file_id),
+                Some(file_id),
+                false,
+                5,
+            )],
+        )
+        .unwrap();
+        assert!(parse_file_history_observed_descriptors(&authenticated_null).is_err());
     }
 
     #[test]

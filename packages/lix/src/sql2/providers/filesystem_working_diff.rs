@@ -6,7 +6,7 @@ use crate::branch::BranchRefReader;
 use crate::common::{compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
+use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -15,6 +15,7 @@ use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -30,7 +31,7 @@ pub(super) async fn register_filesystem_working_diff_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    query_source: SqlChangelogQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     kind: FilesystemWorkingDiffKind,
 ) -> Result<(), LixError>
 where
@@ -43,7 +44,7 @@ where
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
-            store: query_source.store,
+            forktree_reader: query_source.forktree_reader,
             kind,
         }),
         WriteAccess::read_only(),
@@ -60,7 +61,7 @@ struct FilesystemWorkingDiffSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    store: S,
+    forktree_reader: ForkTreeReadFacade<S>,
     kind: FilesystemWorkingDiffKind,
 }
 
@@ -115,12 +116,12 @@ where
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),
-                    self.store.clone(),
+                    self.forktree_reader.clone(),
                     schema,
                     route,
                     self.kind,
                 ),
-                move |(_active_branch_id, _branch_ref, store, schema, route, kind)| async move {
+                move |(_active_branch_id, _branch_ref, historical, schema, route, kind)| async move {
                     if route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -133,7 +134,6 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let historical = ForkTreeReadFacade::new(store);
                     let mut rows = Vec::new();
                     for head in heads {
                         let checkpoint_id = historical
@@ -377,18 +377,31 @@ where
             &directory_by_id,
             &mut directory_paths,
             &mut BTreeSet::new(),
-        )?;
+        )?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("missing authenticated directory path for '{id}'"),
+            )
+        })?;
     }
     let mut file_paths = BTreeMap::new();
     for file in files {
         let directory_path = file
             .directory_id
             .as_ref()
-            .and_then(|directory_id| directory_paths.get(directory_id))
-            .map(String::as_str);
-        if file.directory_id.is_some() && directory_path.is_none() {
-            continue;
-        }
+            .map(|directory_id| {
+                directory_paths
+                    .get(directory_id)
+                    .map(String::as_str)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("missing authenticated directory path for '{directory_id}'"),
+                        )
+                    })
+            })
+            .transpose()?;
         file_paths.insert(file.id, compose_file_path(directory_path, &file.name)?);
     }
     Ok(LogicalSnapshot {
@@ -428,6 +441,16 @@ where
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
+        let loaded_ids = loaded
+            .iter()
+            .map(|directory| directory.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = ids.iter().find(|id| !loaded_ids.contains(id.as_str())) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("missing authenticated directory descriptor for '{missing}'"),
+            ));
+        }
         pending.extend(
             loaded
                 .iter()
@@ -456,7 +479,7 @@ async fn scan_descriptors<S, T>(
 ) -> Result<Vec<T>, LixError>
 where
     S: StorageAdapterRead,
-    T: for<'de> Deserialize<'de>,
+    T: DeserializeOwned,
 {
     let rows = historical
         .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
@@ -466,16 +489,51 @@ where
         .await?;
     rows.into_iter()
         .filter(|row| {
-            !row.deleted
-                && row.key.schema_key == schema_key
+            row.key.schema_key == schema_key
                 && (entity_pks.is_empty() || entity_pks.contains(&row.key.entity_pk))
         })
-        .filter_map(|row| row.snapshot_content)
-        .map(|snapshot| {
-            serde_json::from_str(snapshot.as_str()).map_err(|error| {
+        .map(|row| {
+            let row_id = row.key.entity_pk.as_single_string_owned()?;
+            if row.deleted {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("{schema_key} descriptor '{row_id}' is tombstoned"),
+                ));
+            }
+            let snapshot = row.snapshot_content.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!("invalid {schema_key} snapshot JSON: {error}"),
+                    format!("{schema_key} descriptor '{row_id}' has no authenticated payload"),
+                )
+            })?;
+            let payload: serde_json::Value =
+                serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("invalid {schema_key} snapshot JSON: {error}"),
+                    )
+                })?;
+            let payload_id = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("{schema_key} descriptor '{row_id}' has no payload identity"),
+                    )
+                })?;
+            if payload_id != row_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "{schema_key} payload identity '{payload_id}' does not match row '{row_id}'"
+                    ),
+                ));
+            }
+            serde_json::from_value(payload).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("invalid {schema_key} snapshot shape: {error}"),
                 )
             })
         })

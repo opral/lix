@@ -3,7 +3,9 @@ use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
-use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
+use crate::tracked_state::{
+    TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow, TrackedStateKey,
+};
 use crate::transaction::types::{
     RawWriteBatch, StagedCommitChangeBatchBuilder, TransactionWrite, TransactionWriteMode,
 };
@@ -47,7 +49,7 @@ where
                         .checkpoint_publication_state(&branch_id)
                         .await?;
                     let head_commit_id = {
-                        let reader = transaction.branch_ref_reader().await;
+                        let reader = transaction.branch_ref_reader_on_opening_read();
                         BranchLifecycle::new(&reader)
                             .require_existing_commit_id(
                                 &branch_id,
@@ -56,68 +58,87 @@ where
                             )
                             .await?
                     };
-                    let direct_working_diff = transaction
-                        .working_diff_at_head(
-                            &branch_id,
-                            head_commit_id,
-                            &TrackedStateDiffRequest::default(),
-                        )
-                        .await?;
-                    let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
-                        direct.checkpoint_commit_id
-                    } else {
-                        let historical = transaction.forktree_read_facade();
-                        historical
-                            .checkpoint_history_from_head(head_commit_id, &branch_id)
-                            .await?
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INTERNAL_ERROR,
-                                    format!(
-                                        "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
-                                    ),
-                                )
-                            })?
-                            .commit_id
-                    };
+                    let historical = transaction.forktree_read_facade();
+                    let previous_checkpoint_commit_id = historical
+                        .checkpoint_history_from_head(head_commit_id, &branch_id)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
+                                ),
+                            )
+                        })?
+                        .commit_id;
                     let interval_has_commits =
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
-                        let entries = if let Some(direct) = direct_working_diff {
-                            direct.diff.entries
-                        } else {
-                            let mut reader = transaction.tracked_state_reader().await;
-                            reader
-                                .diff_commits(
-                                    &previous_checkpoint_commit_id.to_string(),
-                                    &head_commit_id.to_string(),
-                                    &TrackedStateDiffRequest::default(),
-                                )
-                                .await?
-                                .entries
-                        };
+                        let entries = historical
+                            .diff_state_rows_between_commits(
+                                previous_checkpoint_commit_id,
+                                head_commit_id,
+                            )
+                            .await?;
                         let mut selected_changes =
                             StagedCommitChangeBatchBuilder::with_capacity(entries.len());
                         let mut source_membership_exact = true;
                         for entry in entries.into_iter().filter(|entry| {
-                            entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
-                                && entry.identity.schema_key()
-                                    != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                            entry
+                                .before
+                                .as_ref()
+                                .or(entry.after.as_ref())
+                                .is_some_and(|row| {
+                                    row.key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
+                                        && row.key.schema_key
+                                            != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                                })
                         }) {
                             let row = entry.after.ok_or_else(|| {
                                 LixError::new(
                                     LixError::CODE_INTERNAL_ERROR,
                                     format!(
                                         "working diff for schema '{}' entity {:?} has no target row",
-                                        entry.identity.schema_key(),
-                                        entry.identity.entity_pk()
+                                        entry
+                                            .before
+                                            .as_ref()
+                                            .map(|row| row.key.schema_key.as_str())
+                                            .unwrap_or("<unknown>"),
+                                        entry
+                                            .before
+                                            .as_ref()
+                                            .map(|row| &row.key.entity_pk)
+                                            .expect("diff entry has one side")
                                     ),
                                 )
                             })?;
+                            let kind = match entry.before.as_ref() {
+                                Some(before) if row.deleted && !before.deleted => {
+                                    TrackedStateDiffKind::Removed
+                                }
+                                Some(before) if before.deleted && !row.deleted => {
+                                    TrackedStateDiffKind::Added
+                                }
+                                Some(_) => TrackedStateDiffKind::Modified,
+                                None if row.deleted => TrackedStateDiffKind::Removed,
+                                None => TrackedStateDiffKind::Added,
+                            };
+                            let tracked_row = TrackedStateDiffRow {
+                                identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
+                                    schema_key: row.key.schema_key.clone(),
+                                    file_id: row.key.file_id.clone(),
+                                    entity_pk: row.key.entity_pk.clone(),
+                                }),
+                                deleted: row.deleted,
+                                created_at: row.created_at,
+                                updated_at: row.updated_at,
+                                change_id: row.change_id,
+                                commit_id: row.commit_id,
+                            };
                             source_membership_exact &=
-                                push_selected_change(&mut selected_changes, row, entry.kind);
+                                push_selected_change(&mut selected_changes, tracked_row, kind);
                         }
                         if source_membership_exact {
                             selected_changes.finish_source_certified()

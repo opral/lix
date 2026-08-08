@@ -9,10 +9,9 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
-use crate::forktree::ForkTreeReadFacade;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{HistoryRoute, parse_history_filter};
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
+use crate::sql2::{SqlHistoryQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -24,7 +23,7 @@ pub(super) async fn register_checkpoint_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    query_source: SqlChangelogQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -36,7 +35,7 @@ where
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
-            store: query_source.store,
+            forktree_reader: query_source.forktree_reader,
         }),
         WriteAccess::read_only(),
     )
@@ -46,7 +45,7 @@ struct CheckpointSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    store: S,
+    forktree_reader: crate::forktree::ForkTreeReadFacade<S>,
 }
 
 #[async_trait]
@@ -103,7 +102,7 @@ where
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),
-                    self.store.clone(),
+                    self.forktree_reader.clone(),
                     schema,
                     branch_ids,
                     depth_route,
@@ -112,7 +111,7 @@ where
                 move |(
                     _active_branch_id,
                     _branch_ref,
-                    store,
+                    historical,
                     schema,
                     branch_ids,
                     depth_route,
@@ -132,7 +131,6 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let historical = ForkTreeReadFacade::new(store);
                     let mut rows = Vec::new();
                     for head in heads {
                         let history = historical

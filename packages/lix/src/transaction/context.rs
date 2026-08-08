@@ -54,8 +54,7 @@ use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
-    StagedLiveStateRows, TrackedHeadContext, TrackedWorkingDiff, overlay_load_exact_batch,
-    overlay_scan_batch,
+    StagedLiveStateRows, TrackedHeadContext, overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -7271,10 +7270,7 @@ where
         &mut self,
         branch_id: &str,
     ) -> Result<(Option<CheckpointRecoveryRef>, CheckpointGcState), LixError> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
+        let read = self.opening_read();
         let recovery_ref = load_recovery_ref(&read, branch_id).await?;
         let gc_state = load_checkpoint_gc_state(&read).await?;
         Ok((recovery_ref, gc_state))
@@ -7324,32 +7320,6 @@ where
     {
         let mut reader = self.tracked_state.reader(self.opening_read());
         f(&mut reader).await
-    }
-
-    /// Attempts the current branch's checkpoint-relative direct diff from one
-    /// transaction-scoped snapshot. A missing or stale accelerator is an
-    /// ordinary `None`; callers retain the historical tracked-state oracle.
-    pub(crate) async fn working_diff_at_head(
-        &mut self,
-        branch_id: &str,
-        head_commit_id: CommitId,
-        request: &TrackedStateDiffRequest,
-    ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        let read = self.opening_read();
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if control.head_commit_id != head_commit_id {
-            return Ok(None);
-        }
-        TrackedHeadContext::new()
-            .reader(read)
-            .working_diff_for_control(branch_id, control, request)
-            .await
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
@@ -7750,16 +7720,10 @@ where
                 )
             })?
             .commit_id;
-        let diff = {
-            let mut tracked = self.tracked_state_reader().await;
-            tracked
-                .diff_commits(
-                    &previous_checkpoint_commit_id.to_string(),
-                    &head_commit_id.to_string(),
-                    &TrackedStateDiffRequest::default(),
-                )
-                .await?
-        };
+        let diff = self
+            .forktree_read_facade()
+            .diff_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)
+            .await?;
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != diff_ids.len() {
             return Err(LixError::new(
@@ -7768,13 +7732,19 @@ where
             ));
         }
         let mut matched = BTreeSet::new();
-        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
-        let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.len());
+        let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.len());
         let mut selected_source_membership_exact = true;
         let mut unselected_source_membership_exact = true;
-        for entry in diff.entries.into_iter().filter(|entry| {
-            entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
-                && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+        for entry in diff.into_iter().filter(|entry| {
+            entry
+                .before
+                .as_ref()
+                .or(entry.after.as_ref())
+                .is_some_and(|row| {
+                    row.key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
+                        && row.key.schema_key != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                })
         }) {
             let diff_id = crate::tracked_state::encode_diff_id(
                 entry.before.as_ref().map(|row| row.change_id),
@@ -7786,13 +7756,34 @@ where
                     format!("working diff '{diff_id}' has no target row"),
                 )
             })?;
+            let kind = match entry.before.as_ref() {
+                Some(before) if target.deleted && !before.deleted => TrackedStateDiffKind::Removed,
+                Some(before) if before.deleted && !target.deleted => TrackedStateDiffKind::Added,
+                Some(_) => TrackedStateDiffKind::Modified,
+                None if target.deleted => TrackedStateDiffKind::Removed,
+                None => TrackedStateDiffKind::Added,
+            };
+            let target = crate::tracked_state::TrackedStateDiffRow {
+                identity: crate::tracked_state::TrackedStateDiffIdentity::from_key(
+                    TrackedStateKey {
+                        schema_key: target.key.schema_key.clone(),
+                        file_id: target.key.file_id.clone(),
+                        entity_pk: target.key.entity_pk.clone(),
+                    },
+                ),
+                deleted: target.deleted,
+                created_at: target.created_at,
+                updated_at: target.updated_at,
+                change_id: target.change_id,
+                commit_id: target.commit_id,
+            };
             if requested.contains(&diff_id) {
                 matched.insert(diff_id);
                 selected_source_membership_exact &=
-                    push_checkpoint_selected_change(&mut selected, target, entry.kind);
+                    push_checkpoint_selected_change(&mut selected, target, kind);
             } else {
                 unselected_source_membership_exact &=
-                    push_checkpoint_selected_change(&mut unselected, target, entry.kind);
+                    push_checkpoint_selected_change(&mut unselected, target, kind);
             }
         }
         let selected = if selected_source_membership_exact {

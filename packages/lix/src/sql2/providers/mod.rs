@@ -234,6 +234,14 @@ where
                 PublicSurfaceKind::FileHistory
                     | PublicSurfaceKind::DirectoryHistory
                     | PublicSurfaceKind::EntityHistory { .. }
+                    | PublicSurfaceKind::Checkpoint
+                    | PublicSurfaceKind::CheckpointByBranch
+                    | PublicSurfaceKind::WorkingDiff
+                    | PublicSurfaceKind::WorkingDiffByBranch
+                    | PublicSurfaceKind::FileWorkingDiff
+                    | PublicSurfaceKind::FileWorkingDiffByBranch
+                    | PublicSurfaceKind::DirectoryWorkingDiff
+                    | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             )
     });
     let history_query_source = if needs_history_query_source {
@@ -276,7 +284,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -286,7 +294,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -296,8 +304,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -307,8 +314,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -318,7 +324,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
@@ -329,7 +335,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
@@ -340,7 +346,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
@@ -351,7 +357,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.changelog_query_source(),
+                    history_query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;

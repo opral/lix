@@ -89,6 +89,15 @@ pub(crate) struct HistoricalStateRow {
     pub(crate) deleted: bool,
 }
 
+/// One semantic change between two authenticated historical ForkTree state
+/// roots. This neutral shape is consumed by SQL/checkpoint projections and
+/// deliberately does not depend on the superseded tracked-state DTOs.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoricalStateDiffEntry {
+    pub(crate) before: Option<HistoricalStateRow>,
+    pub(crate) after: Option<HistoricalStateRow>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateCellRef<'a> {
     Value(&'a str),

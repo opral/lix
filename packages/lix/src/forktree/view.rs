@@ -352,6 +352,45 @@ where
         super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
     }
 
+    /// Diffs two authenticated historical state roots through this facade's
+    /// retained read. The neutral result is the sole source for checkpoint
+    /// and working-diff projections; callers may filter and project it but
+    /// may not reopen a legacy state reader for the same interval.
+    pub(crate) async fn diff_state_rows_between_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateDiffEntry>, crate::LixError> {
+        let before_rows = self.scan_state_rows_at_commit(before).await?;
+        let after_rows = self.scan_state_rows_at_commit(after).await?;
+        let mut by_key = BTreeMap::new();
+        for row in before_rows {
+            by_key.entry(row.key.clone()).or_insert((Some(row), None));
+        }
+        for row in after_rows {
+            by_key
+                .entry(row.key.clone())
+                .and_modify(|entry| entry.1 = Some(row.clone()))
+                .or_insert((None, Some(row)));
+        }
+        Ok(by_key
+            .into_values()
+            .filter_map(|(before, after)| {
+                let changed = match (&before, &after) {
+                    (Some(left), Some(right)) => {
+                        left.deleted != right.deleted
+                            || left.snapshot_content != right.snapshot_content
+                            || left.metadata != right.metadata
+                            || left.key != right.key
+                    }
+                    (Some(_), None) | (None, Some(_)) => true,
+                    (None, None) => false,
+                };
+                changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
+            })
+            .collect())
+    }
+
     /// Resolves one required semantic commit record from the authenticated
     /// catalog on this facade's retained read.
     pub(crate) async fn load_required_commit_record(
