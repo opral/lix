@@ -1,7 +1,5 @@
 #![cfg_attr(not(feature = "storage-benches"), allow(dead_code, unused_imports))]
 
-#[cfg(feature = "storage-benches")]
-mod bench_support;
 mod context;
 mod diff;
 mod diff_id;
@@ -38,8 +36,3 @@ pub(crate) use types::{
 #[cfg(test)]
 pub(crate) use types::{CurrentStatePartDescriptor, TrackedStateCommitRootParent};
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
-
-#[cfg(feature = "storage-benches")]
-pub mod bench {
-    pub use super::bench_support::*;
-}

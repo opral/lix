@@ -1,5 +1,3 @@
-#[cfg(feature = "storage-benches")]
-mod bench_support;
 mod commit;
 mod commit_coordinator;
 mod context;
@@ -9,11 +7,6 @@ mod staging;
 mod stale_commit;
 pub(crate) mod types;
 mod validation;
-
-#[cfg(feature = "storage-benches")]
-pub mod bench {
-    pub use super::bench_support::*;
-}
 
 #[cfg(test)]
 pub(crate) use commit::take_certified_columnar_current_base_publications;
