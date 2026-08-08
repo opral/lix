@@ -158,18 +158,14 @@ fi
 
 if [[ -f "$cases" && -d "$fixtures" ]]; then
   case_ok=1
-  while IFS=$'\t' read -r id class fixture expected; do
-    [[ -z "$id" || "$id" == "id" ]] && continue
-    fixture_path="$fixtures/$fixture"
-    if [[ ! -f "$fixture_path" ]] || \
-       ! contains '"case"' "$fixture_path" || \
-       ! contains '"expected"' "$fixture_path" || \
-       ! contains "$expected" "$fixture_path"; then
-      red_line 11 "fixture contract mismatch: $id"
-      case_ok=0
-    fi
-  done < "$cases"
+  if ! python3 "$package_dir/verify_contract_v2.py" --model-only "$package_dir" >/dev/null 2>&1; then
+    red_line 11 "executable fixture model rejected one or more cases"
+    case_ok=0
+  fi
   if [[ "$case_ok" -eq 1 ]]; then
+    # Keep the historical line stable so RED_CALIBRATION remains byte-identical;
+    # the preceding command now performs executable validation rather than a
+    # fixture substring check.
     pass_line 11 "all discriminating positive/negative fixtures are present"
   fi
 else

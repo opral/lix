@@ -1,6 +1,7 @@
-# ForkTree Stage2 SQL changelog-reader acceptance
+# ForkTree Stage2 SQL changelog-reader acceptance — corrected successor
 
-This package is TEST/REPORT-ONLY. It is anchored to immutable fd2 and does
+This package is TEST/REPORT-ONLY. It is a direct successor to immutable
+blocked head `3221833f879b6e2cc965039c0c3cabdd0709e83e`, anchored to fd2 and does
 not change production SQL, changelog, ForkTree, storage, writer, or runtime
 code. It is a compile/source acceptance contract for the smallest next
 three-diagnostic closure identified in the fd2 dependency map.
@@ -82,6 +83,44 @@ The provider may retain SQL's `LixChangeRow` terminal enum and
 `materialize_*` projection. It may not retain a raw storage handle, construct
 another read/facade, invoke `begin_read`, or use a second changelog/commit
 reader.
+
+## Executable successor gates
+
+`verify_source_contract.sh` retains the historical fd2 output byte-for-byte,
+but its fixture gate now invokes the Python model rather than checking fixture
+substrings. The stronger successor gate is:
+
+```text
+python3 test-reports/stage2-sql-change-reader-fd2/verify_contract_v2.py \
+  <candidate-worktree>
+```
+
+It runs the model and a balanced Rust-token proof. The model parses every TSV
+fixture as JSON and checks typed fields, authenticated absence, exact request
+versus embedded identity, domain/kind, malformed encoding, duplicate logical
+IDs, canonical merged ordering, limit-after-merge, and the single read/view
+identity with all fallback flags false. Missing or empty/mutated fixtures
+fail, rather than passing because an expected word is present.
+
+The structural proof skips Rust comments and quoted literals, balances
+`{}`, `()`, and `[]`, scopes `scan_changelog_changes` and
+`load_exact_change` calls, requires every call's first argument to be exactly
+`&query_source.forktree_reader`, requires the function definitions to type
+their reader as `ForkTreeReadFacade`, and requires exactly one
+`ChangelogQuerySource` constructor in each session/transaction caller. Each
+constructor must initialize `ForkTreeReadFacade::new(self.read_store...)` and
+contain no `begin_read`, raw adapter, or second acquisition.
+
+The model-only gate used by the historical calibration wrapper is:
+
+```text
+python3 test-reports/stage2-sql-change-reader-fd2/verify_contract_v2.py \
+  --model-only test-reports/stage2-sql-change-reader-fd2
+```
+
+The exact fd2 source RED command and output remain unchanged; the added model
+is silent in that wrapper on success, preserving RED calibration hash
+`74d2a1d2512ece658aa213e235142935c161a81bd3d859b2c1ffa8ae2006c0a5`.
 
 ## Semantic cases
 

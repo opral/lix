@@ -2,5 +2,5 @@
   "case": "absent_key",
   "expected": "ok_none",
   "request": {"change_id": "chg-absent"},
-  "catalog": {"key": "authenticated_absence"}
+  "catalog": {"state": "authenticated_absence"}
 }

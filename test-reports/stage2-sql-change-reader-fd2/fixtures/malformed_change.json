@@ -2,5 +2,6 @@
   "case": "malformed_change",
   "expected": "typed_corruption",
   "request": {"change_id": "chg-malformed"},
-  "catalog": {"domain": "ChangeCatalog", "kind": "ChangeRecord", "payload": "malformed"}
+  "catalog": {"domain": "ChangeCatalog", "kind": "ChangeRecord", "encoding": "truncated"},
+  "failure": "typed_corruption"
 }

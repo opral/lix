@@ -2,5 +2,5 @@
   "case": "derived_commit",
   "expected": "return_authenticated_commit_change",
   "request": {"commit_id": "commit-001"},
-  "catalog": {"commit_id": "commit-001", "domain": "CommitCatalog", "kind": "CommitRecord", "parents": []}
+  "catalog": {"commit_id": "commit-001", "change_id": "chg-commit-001", "domain": "CommitCatalog", "kind": "CommitRecord", "parents": [], "authenticated": true}
 }

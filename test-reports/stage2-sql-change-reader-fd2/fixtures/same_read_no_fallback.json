@@ -1,5 +1,14 @@
 {
   "case": "same_read_no_fallback",
   "expected": "one_caller_owned_read",
+  "read_acquisitions": 1,
+  "reader_ids": {"source": "view-001", "scan": "view-001", "exact": "view-001"},
+  "forbidden": {
+    "fresh_begin_read": false,
+    "raw_store": false,
+    "cache": false,
+    "fallback": false,
+    "second_reader": false
+  },
   "rule": "one retained CoherentView/StorageRead; no begin_read, refresh, raw store, cache, fallback, or second reader"
 }

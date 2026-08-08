@@ -2,5 +2,6 @@
   "case": "wrong_kind_or_domain",
   "expected": "typed_corruption",
   "request": {"change_id": "chg-wrong-kind"},
-  "catalog": {"domain": "BlobChunk", "kind": "BlobChunkV1", "identity": "chg-wrong-kind"}
+  "catalog": {"domain": "BlobChunk", "kind": "BlobChunkV1", "embedded_change_id": "chg-wrong-kind"},
+  "failure": "typed_corruption"
 }

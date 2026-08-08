@@ -1,8 +1,15 @@
 {
   "case": "limit_after_merge",
   "expected": "sort_validate_then_limit",
-  "direct": ["chg-z", "chg-b"],
-  "derived": ["chg-a", "chg-c"],
+  "direct": [
+    {"change_id": "chg-z", "authenticated": true},
+    {"change_id": "chg-b", "authenticated": true}
+  ],
+  "derived": [
+    {"change_id": "chg-a", "authenticated": true},
+    {"change_id": "chg-c", "authenticated": true}
+  ],
   "limit": 2,
+  "expected_ids": ["chg-a", "chg-b"],
   "rule": "authenticate and deduplicate all records, canonical-sort, then truncate"
 }
