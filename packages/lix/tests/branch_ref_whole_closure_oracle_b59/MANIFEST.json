@@ -1,0 +1,75 @@
+{
+  "kind": "test-report-only-branch-ref-whole-closure-oracle",
+  "status": "dormant-until-compile-green",
+  "anchor": {
+    "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+    "parent": "713455a3557907ce705d06f720fcdc4486bddd4a"
+  },
+  "scope": [
+    "full-workspace BranchHeadControl/BranchRef closure inventory",
+    "path-aware migration/deletion source gate",
+    "GlobalSelectorV1/BranchSelectorV1/CoherentView/PreparedPublication model",
+    "future Memory/RocksDB/SlateDB acceptance commands"
+  ],
+  "forbidden_production_changes": true,
+  "runtime_claimed": false,
+  "authority_contract": {
+    "global": "one authenticated GlobalSelectorV1 in SELECTOR_SPACE",
+    "branch": "one authenticated BranchSelectorV1 per branch in SELECTOR_SPACE",
+    "read": "one retained CoherentView over one StorageRead",
+    "write": "one PreparedPublication with exact selector CAS and one adapter commit",
+    "derived": "lix_branch_ref is a read-only derived SQL projection, never a selector/control authority"
+  },
+  "legacy_symbols": [
+    "BranchHeadControl",
+    "BranchHeadControlContext",
+    "BranchHeadControlCache",
+    "BranchHeadTrackedReachability",
+    "branch_head_control_precondition",
+    "stage_branch_head_control",
+    "stage_untracked_generation",
+    "untracked_lifecycle_generation",
+    "next_current_state_revision",
+    "BranchRefReader",
+    "CachingBranchRefReader",
+    "BranchRefContext",
+    "BranchRefStoreReader",
+    "branch_ref_stage_row",
+    "branch_ref_tombstone_row",
+    "BRANCH_REF_SCHEMA_KEY"
+  ],
+  "required_forktree_symbols": [
+    "GlobalSelectorV1",
+    "BranchSelectorV1",
+    "CoherentView",
+    "PreparedPublication",
+    "open_coherent_view_on_read",
+    "PreparedPublication::from_branch_view",
+    "PreparedPublication::from_global_epoch",
+    "SELECTOR_SPACE",
+    "global_selector_key",
+    "branch_selector_key"
+  ],
+  "deletion_order": [
+    "replace BranchRef/BranchHead readers at session and SQL boundaries",
+    "replace BranchHeadControl fields and preconditions at transaction/publication boundaries",
+    "move init/create/switch/delete/undo/redo/checkpoint to selector views and prepared publications",
+    "move working-diff and schema generation reads to one coherent view",
+    "move GC roots/races to selector/catalog/object roots and exact publication CAS",
+    "delete legacy branch modules, spaces, stage rows, caches, and reexports",
+    "compile-fail all old consumers, then run adapter oracle"
+  ],
+  "deferred_public_projection": [
+    "lix_branch_ref remains only as a derived SQL surface until its projection is migrated",
+    "derived lix_branch_ref rows must never be read as durable branch authority",
+    "direct SQL entity/PK/columnar and physical row-group lanes are separate"
+  ],
+  "model_requirements": [
+    "fingerprint active branch, histories, object/liveness/allocation sets",
+    "reopen validates global selector sequence and branch selector bindings",
+    "malformed branch identity and branch deletion fail closed",
+    "empty undo/redo are no-op with no partial publication",
+    "every multi-selector operation is atomic with no partial state"
+  ]
+}
