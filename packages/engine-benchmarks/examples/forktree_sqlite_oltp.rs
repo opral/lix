@@ -11,16 +11,12 @@ use blake3::Hasher;
 use lix::{ExecuteResult, Value};
 
 #[path = "../benches/tracked_state_crud/raw_sqlite.rs"]
-#[expect(dead_code)]
 mod raw_sqlite;
 #[path = "../benches/tracked_state_crud/sql_session.rs"]
-#[expect(dead_code)]
 mod sql_session;
 #[path = "../benches/tracked_state_crud/storage.rs"]
-#[expect(dead_code)]
 mod storage;
 #[path = "../benches/tracked_state_crud/workload.rs"]
-#[expect(dead_code)]
 mod workload;
 
 const READ_MANY_PK_COUNT: usize = 10;
@@ -32,6 +28,7 @@ enum Operation {
     Range,
     UpdateOne,
     UpdateAll,
+    Transaction,
     DeleteOne,
     DeleteAll,
 }
@@ -44,10 +41,11 @@ impl Operation {
             "range" => Self::Range,
             "update_one" => Self::UpdateOne,
             "update_all" => Self::UpdateAll,
+            "transaction" => Self::Transaction,
             "delete_one" => Self::DeleteOne,
             "delete_all" => Self::DeleteAll,
             other => panic!(
-                "unknown operation {other}; expected insert, point, range, update_one, update_all, delete_one, or delete_all"
+                "unknown operation {other}; expected insert, point, range, update_one, update_all, transaction, delete_one, or delete_all"
             ),
         }
     }
@@ -58,15 +56,6 @@ impl Operation {
 }
 
 fn main() {
-    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PHASES").is_some() {
-        tracing_subscriber::fmt()
-            .with_env_filter("lix_perf=trace")
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .with_target(false)
-            .with_ansi(false)
-            .try_init()
-            .expect("install benchmark phase tracing subscriber");
-    }
     let mut args = std::env::args().skip(1);
     let backend = args.next().unwrap_or_else(|| usage("missing backend"));
     let rows = args
@@ -93,7 +82,7 @@ fn main() {
 
 fn usage(message: &str) -> ! {
     eprintln!(
-        "{message}\nusage: forktree_sqlite_oltp <rocksdb|slatedb> <rows> <insert|point|range|update_one|update_all|delete_one|delete_all> <samples> [--verify-only]"
+        "{message}\nusage: forktree_sqlite_oltp <rocksdb|slatedb> <rows> <insert|point|range|update_one|update_all|transaction|delete_one|delete_all> <samples> [--verify-only]"
     );
     std::process::exit(2);
 }
@@ -137,19 +126,23 @@ async fn run(
         let baseline_sqlite = sqlite_fixture.read_all_public_result();
         assert_same_digest("baseline", &baseline_lix, &baseline_sqlite);
 
+        let _ = lix::storage_bench::take_crud_physical_write_accounting();
+        let _ = lix::storage_bench::take_crud_commit_state_manifest_bytes();
+        let _ = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
+        lix::storage_bench::begin_crud_ownership_accounting();
         let (lix_result, lix_elapsed) = if verify_only {
             (run_lix(&lix_fixture, operation).await, None)
-        } else if matches!(operation, Operation::UpdateOne)
-            && std::env::var_os("LIX_TRACKED_STATE_CRUD_PHASES").is_some()
-        {
-            let (result, profile) = run_lix_update_profiled(&lix_fixture).await;
-            print_lix_update_profile(sample, &profile);
-            (result, Some(profile.total_elapsed))
         } else {
             let start = Instant::now();
             let result = run_lix(&lix_fixture, operation).await;
             (result, Some(start.elapsed()))
         };
+        let lix_physical = lix::storage_bench::take_crud_physical_write_accounting();
+        let lix_manifest_bytes = lix::storage_bench::take_crud_commit_state_manifest_bytes();
+        let lix_snapshot = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
+        let lix_ownership = lix::storage_bench::take_crud_ownership_accounting();
+        let lix_ownership_totals = ownership_totals(&lix_ownership);
+        let lix_disk_bytes = lix_fixture.disk_bytes();
         let (sqlite_result, sqlite_elapsed) = if verify_only {
             (run_sqlite(&mut sqlite_fixture, operation), None)
         } else {
@@ -162,182 +155,38 @@ async fn run(
         let final_lix = lix_fixture.read_all_result().await;
         let final_sqlite = sqlite_fixture.read_all_public_result();
         assert_same_digest("final", &final_lix, &final_sqlite);
+        let sqlite_disk_bytes = sqlite_fixture.disk_bytes();
+        let cold_lix = lix_fixture.cold_reopen_result().await;
+        let cold_sqlite = sqlite_fixture.cold_reopen_public_result();
+        assert_same_digest("cold_reopen", &cold_lix, &cold_sqlite);
 
         println!(
-            "sample={sample} verified=true operation_digest={} final_digest={} lix_wall_us={} sqlite_wall_us={}",
+            "sample={sample} verified=true operation_digest={} final_digest={} cold_reopen_digest={} lix_wall_us={} sqlite_wall_us={} lix_puts={} lix_deletes={} lix_written_bytes={} lix_manifest_bytes={} lix_snapshot_hits={} lix_snapshot_misses={} lix_ownership_created={} lix_ownership_cloned={} lix_ownership_retained={} lix_ownership_dropped={} lix_disk_bytes={} sqlite_disk_bytes={} native_backend_io=not_instrumented",
             digest(&lix_result),
             digest(&final_lix),
+            digest(&cold_lix),
             lix_elapsed.map_or(0, |value| value.as_micros()),
             sqlite_elapsed.map_or(0, |value| value.as_micros()),
+            lix_physical.puts,
+            lix_physical.deletes,
+            lix_physical.written_bytes,
+            lix_manifest_bytes,
+            lix_snapshot.hits,
+            lix_snapshot.misses,
+            lix_ownership_totals[0],
+            lix_ownership_totals[1],
+            lix_ownership_totals[2],
+            lix_ownership_totals[3],
+            lix_disk_bytes,
+            sqlite_disk_bytes,
         );
-    }
-}
-
-struct LixUpdateProfile {
-    total_elapsed: std::time::Duration,
-    sql_plan_execute: std::time::Duration,
-    readback: std::time::Duration,
-    ownership: lix::storage_bench::CrudOwnershipAccounting,
-    physical_writes: lix::storage_bench::CrudPhysicalWriteAccounting,
-    update_certificate: lix::storage_bench::CrudCertificateAccounting,
-    commit_validation: lix::storage_bench::CrudCommitValidationAccounting,
-}
-
-async fn run_lix_update_profiled(
-    fixture: &sql_session::SqlFixture,
-) -> (ExecuteResult, LixUpdateProfile) {
-    // These counters are feature-gated benchmark instrumentation. Resetting
-    // them immediately before the measured operation keeps fixture seeding and
-    // the baseline read outside the sample, matching the normal timer above.
-    lix::storage_bench::begin_crud_ownership_accounting();
-    let _ = lix::storage_bench::take_crud_physical_write_accounting();
-    let _ = lix::storage_bench::take_certified_entity_update_value_batch_accounting();
-    lix::storage_bench::begin_crud_commit_validation_accounting();
-
-    let total_start = Instant::now();
-    let sql_start = Instant::now();
-    let affected = fixture.update_one_by_pk().await;
-    let sql_plan_execute = sql_start.elapsed();
-    assert_eq!(affected, 1);
-
-    let read_start = Instant::now();
-    let result = fixture.read_all_result().await;
-    let readback = read_start.elapsed();
-    let total_elapsed = total_start.elapsed();
-
-    let ownership = lix::storage_bench::take_crud_ownership_accounting();
-    let physical_writes = lix::storage_bench::take_crud_physical_write_accounting();
-    let update_certificate =
-        lix::storage_bench::take_certified_entity_update_value_batch_accounting();
-    let commit_validation = lix::storage_bench::take_crud_commit_validation_accounting();
-    (
-        result,
-        LixUpdateProfile {
-            total_elapsed,
-            sql_plan_execute,
-            readback,
-            ownership,
-            physical_writes,
-            update_certificate,
-            commit_validation,
-        },
-    )
-}
-
-fn print_lix_update_profile(sample: usize, profile: &LixUpdateProfile) {
-    println!(
-        "phase_sample={sample} sql_plan_execute_us={} readback_us={} total_us={} \
-         physical_puts={} physical_deletes={} physical_written_bytes={} \
-         update_attempts={} update_hits={} certified_rows={} ownership_rows={} \
-         ownership_key_bytes={} ownership_value_bytes={} ownership_vec_entries={} \
-         ownership_string_entries={} ownership_map_entries={} \
-         commit_validation_attempts={} commit_validation_successes={} \
-         commit_validation_memo_hits={} commit_validation_member_bindings={}",
-        profile.sql_plan_execute.as_micros(),
-        profile.readback.as_micros(),
-        profile.total_elapsed.as_micros(),
-        profile.physical_writes.puts,
-        profile.physical_writes.deletes,
-        profile.physical_writes.written_bytes,
-        profile.update_certificate.attempts,
-        profile.update_certificate.hits,
-        profile.update_certificate.certified_rows,
-        profile
-            .ownership
-            .stages
-            .iter()
-            .map(|metric| metric.rows)
-            .sum::<u64>(),
-        profile
-            .ownership
-            .stages
-            .iter()
-            .map(|metric| metric.key_bytes)
-            .sum::<u64>(),
-        profile
-            .ownership
-            .stages
-            .iter()
-            .map(|metric| metric.value_bytes)
-            .sum::<u64>(),
-        profile
-            .ownership
-            .stages
-            .iter()
-            .map(|metric| metric.vec_entries)
-            .sum::<u64>(),
-        profile
-            .ownership
-            .stages
-            .iter()
-            .map(|metric| metric.string_entries)
-            .sum::<u64>(),
-        profile
-            .ownership
-            .stages
-            .iter()
-            .map(|metric| metric.map_entries)
-            .sum::<u64>(),
-        profile.commit_validation.attempts,
-        profile.commit_validation.successes,
-        profile.commit_validation.memo_hits,
-        profile.commit_validation.member_bindings,
-    );
-    for (stage, metric) in profile.ownership.stages.iter().enumerate() {
-        if *metric == lix::storage_bench::CrudOwnershipMetric::default() {
-            continue;
-        }
-        println!(
-            "phase_stage_sample={sample} stage={stage} name={} rows={} key_bytes={} value_bytes={} vec_entries={} string_entries={} map_entries={}",
-            ownership_stage_name(stage),
-            metric.rows,
-            metric.key_bytes,
-            metric.value_bytes,
-            metric.vec_entries,
-            metric.string_entries,
-            metric.map_entries,
-        );
-    }
-    for (stage, transfer) in profile.ownership.transfers.iter().enumerate() {
-        if *transfer == lix::storage_bench::CrudOwnershipTransferMetric::default() {
-            continue;
-        }
-        println!(
-            "phase_transfer_sample={sample} stage={stage} name={} created_bytes={} cloned_bytes={} retained_bytes={} dropped_bytes={}",
-            ownership_stage_name(stage),
-            transfer.created_bytes,
-            transfer.cloned_bytes,
-            transfer.retained_bytes,
-            transfer.dropped_bytes,
-        );
-    }
-}
-
-fn ownership_stage_name(stage: usize) -> &'static str {
-    match stage {
-        lix::storage_bench::CRUD_OWNERSHIP_SQL_BOUND => "sql_bound",
-        lix::storage_bench::CRUD_OWNERSHIP_RAW_BATCH => "raw_batch",
-        lix::storage_bench::CRUD_OWNERSHIP_RAW_TRANSFER => "raw_transfer",
-        lix::storage_bench::CRUD_OWNERSHIP_PREPARED_BATCH => "prepared_batch",
-        lix::storage_bench::CRUD_OWNERSHIP_PREPARED_CLONE => "prepared_clone",
-        lix::storage_bench::CRUD_OWNERSHIP_REPLACEMENT_INPUT => "replacement_input",
-        lix::storage_bench::CRUD_OWNERSHIP_REPLACEMENT_PART => "replacement_part",
-        lix::storage_bench::CRUD_OWNERSHIP_AUTHORITY => "authority",
-        lix::storage_bench::CRUD_OWNERSHIP_ROOT_PUBLICATION => "root_publication",
-        lix::storage_bench::CRUD_OWNERSHIP_WRITE_SET => "write_set",
-        lix::storage_bench::CRUD_OWNERSHIP_ADAPTER => "storage_adapter",
-        lix::storage_bench::CRUD_OWNERSHIP_MUTATION_JOURNAL => "mutation_journal",
-        lix::storage_bench::CRUD_OWNERSHIP_IDENTITY_ENCODING => "identity_encoding",
-        lix::storage_bench::CRUD_OWNERSHIP_NORMALIZATION => "normalization",
-        lix::storage_bench::CRUD_OWNERSHIP_JOURNAL_SEAL => "journal_seal",
-        _ => "unknown",
     }
 }
 
 async fn run_lix(fixture: &sql_session::SqlFixture, operation: Operation) -> ExecuteResult {
     match operation {
         Operation::Insert => {
-            fixture.insert_all().await;
+            fixture.insert_json_pointer_all().await;
             fixture.read_all_result().await
         }
         Operation::Point => fixture.read_one_by_pk_result().await,
@@ -352,6 +201,7 @@ async fn run_lix(fixture: &sql_session::SqlFixture, operation: Operation) -> Exe
             fixture.update_all().await;
             fixture.read_all_result().await
         }
+        Operation::Transaction => fixture.update_one_in_transaction().await,
         Operation::DeleteOne => {
             fixture.delete_one_by_pk().await;
             fixture.read_all_result().await
@@ -379,6 +229,7 @@ fn run_sqlite(fixture: &mut raw_sqlite::RawSqliteFixture, operation: Operation) 
             fixture.update_all();
             fixture.read_all_public_result()
         }
+        Operation::Transaction => fixture.update_one_in_transaction(),
         Operation::DeleteOne => {
             fixture.delete_one_by_pk();
             fixture.read_all_public_result()
@@ -419,6 +270,19 @@ fn digest(result: &ExecuteResult) -> String {
 fn feed_bytes(hasher: &mut Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+fn ownership_totals(accounting: &lix::storage_bench::CrudOwnershipAccounting) -> [u64; 4] {
+    accounting
+        .transfers
+        .iter()
+        .fold([0; 4], |mut totals, transfer| {
+            totals[0] += transfer.created_bytes;
+            totals[1] += transfer.cloned_bytes;
+            totals[2] += transfer.retained_bytes;
+            totals[3] += transfer.dropped_bytes;
+            totals
+        })
 }
 
 #[allow(dead_code)]

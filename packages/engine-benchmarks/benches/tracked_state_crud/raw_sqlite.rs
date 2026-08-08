@@ -7,6 +7,7 @@ use lix::{ExecuteResult, Value};
 pub(crate) struct RawSqliteFixture {
     connection: Connection,
     rows: Vec<WorkloadRow>,
+    present_row_count: usize,
     read_many_by_pk_count: usize,
     read_many_by_pk_sql: String,
     read_many_by_pk_literal_sql: String,
@@ -51,6 +52,7 @@ pub(crate) fn empty_fixture_with_read_many_pk_count(
     RawSqliteFixture {
         connection,
         rows: rows.to_vec(),
+        present_row_count: 0,
         read_many_by_pk_count,
         read_many_by_pk_sql: select_many_by_pk_sql(read_many_by_pk_count),
         read_many_by_pk_literal_sql: literal_select_many_by_pk_sql(rows, read_many_by_pk_count),
@@ -93,6 +95,7 @@ impl RawSqliteFixture {
             .commit()
             .expect("commit raw sqlite insert transaction");
         assert_eq!(affected, self.rows.len());
+        self.present_row_count = self.rows.len();
         affected
     }
 
@@ -116,7 +119,7 @@ impl RawSqliteFixture {
                 .expect("raw sqlite value must be text");
             count += 1;
         }
-        assert_eq!(count, self.rows.len());
+        assert_eq!(count, self.present_row_count);
         count
     }
 
@@ -135,7 +138,7 @@ impl RawSqliteFixture {
         let query = statement
             .query([])
             .expect("query all raw sqlite public-result rows");
-        Self::public_result_from_query(query, self.rows.len())
+        Self::public_result_from_query(query, self.present_row_count)
     }
 
     pub(crate) fn read_one_by_pk(&self) -> usize {
@@ -311,6 +314,25 @@ impl RawSqliteFixture {
         affected
     }
 
+    pub(crate) fn update_one_in_transaction(&mut self) -> ExecuteResult {
+        let row = &self.rows[self.rows.len() / 2];
+        let transaction = self
+            .connection
+            .transaction()
+            .expect("begin explicit raw sqlite transaction");
+        let affected = transaction
+            .execute(
+                "UPDATE json_pointer SET value = ?1 WHERE path = ?2",
+                params![row.updated_value_json, row.path],
+            )
+            .expect("update one raw sqlite row in transaction");
+        assert_eq!(affected, 1);
+        transaction
+            .commit()
+            .expect("commit explicit raw sqlite transaction");
+        self.read_all_public_result()
+    }
+
     pub(crate) fn delete_all(&mut self) -> usize {
         let affected = self
             .connection
@@ -318,6 +340,7 @@ impl RawSqliteFixture {
             .expect("delete all raw sqlite rows");
         assert_eq!(affected, self.rows.len());
         self.rows.clear();
+        self.present_row_count = 0;
         affected
     }
 
@@ -330,7 +353,36 @@ impl RawSqliteFixture {
             .expect("delete one raw sqlite row");
         assert_eq!(affected, 1);
         self.rows.remove(index);
+        self.present_row_count -= 1;
         affected
+    }
+
+    pub(crate) fn cold_reopen_public_result(self) -> ExecuteResult {
+        let RawSqliteFixture {
+            connection,
+            present_row_count,
+            _dir: dir,
+            ..
+        } = self;
+        drop(connection);
+        let path = dir.path().join("raw.sqlite");
+        let connection = Connection::open(path).expect("reopen raw sqlite database");
+        let mut statement = connection
+            .prepare("SELECT path, value FROM json_pointer ORDER BY path")
+            .expect("prepare raw sqlite cold-reopen read");
+        let query = statement
+            .query([])
+            .expect("query raw sqlite cold-reopen rows");
+        Self::public_result_from_query(query, present_row_count)
+    }
+
+    pub(crate) fn disk_bytes(&self) -> u64 {
+        ["raw.sqlite", "raw.sqlite-wal", "raw.sqlite-shm"]
+            .into_iter()
+            .map(|name| {
+                std::fs::metadata(self._dir.path().join(name)).map_or(0, |metadata| metadata.len())
+            })
+            .sum()
     }
 
     fn public_result_from_query(mut query: Rows<'_>, expected_rows: usize) -> ExecuteResult {

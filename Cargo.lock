@@ -3468,7 +3468,6 @@ dependencies = [
  "lix-storage-slatedb",
  "mimalloc",
  "object_store 0.14.0",
- "plugin_csv",
  "rusqlite",
  "rustc-hash",
  "serde",
@@ -3483,7 +3482,6 @@ dependencies = [
  "ulid",
  "uuid",
  "xxhash-rust",
- "zip 8.6.0",
  "zstd",
 ]
 

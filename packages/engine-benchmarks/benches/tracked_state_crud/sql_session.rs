@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{fmt::Write as _, ops::Range};
+use std::{fmt::Write as _, ops::Range, path::Path};
 
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
@@ -194,6 +194,7 @@ pub(crate) enum SqlFixture {
 
 pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     session: SessionContext<StorageImpl>,
+    storage: StorageImpl,
     /// Number of tracked fixture rows. In mixed mode the untracked probe
     /// replaces one of the requested rows rather than adding a 10,001st row.
     row_count: usize,
@@ -243,23 +244,31 @@ async fn empty_fixture_with_shape(
     );
     let untracked_fixture = profile_untracked_fixture();
     match profile.storage() {
-        ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
-            prepare_session(storage).await,
-            rows,
-            read_many_by_pk_count,
-            untracked_fixture,
-            shape,
-            dir,
-        )),
+        ProfileStorage::RocksDB { storage, _dir: dir } => {
+            let session = prepare_session(storage.clone()).await;
+            SqlFixture::RocksDB(fixture_for_session(
+                session,
+                storage,
+                rows,
+                read_many_by_pk_count,
+                untracked_fixture,
+                shape,
+                dir,
+            ))
+        }
         #[cfg(feature = "slatedb")]
-        ProfileStorage::SlateDB { storage, _dir: dir } => SqlFixture::SlateDB(fixture_for_session(
-            prepare_session(storage).await,
-            rows,
-            read_many_by_pk_count,
-            untracked_fixture,
-            shape,
-            dir,
-        )),
+        ProfileStorage::SlateDB { storage, _dir: dir } => {
+            let session = prepare_session(storage.clone()).await;
+            SqlFixture::SlateDB(fixture_for_session(
+                session,
+                storage,
+                rows,
+                read_many_by_pk_count,
+                untracked_fixture,
+                shape,
+                dir,
+            ))
+        }
     }
 }
 
@@ -381,6 +390,25 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.insert_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.insert_all().await,
+        }
+    }
+
+    /// Inserts the CRUD fixture rows into the same `json_pointer` relation
+    /// used by the comparator's reads. The ordinary benchmark insert path
+    /// intentionally targets `tracked_crud_insert`, which is a separate
+    /// benchmark schema and therefore cannot be paired with the comparator's
+    /// `json_pointer` digest.
+    pub(crate) async fn insert_json_pointer_all(&self) -> usize {
+        match self {
+            Self::RocksDB(fixture) => {
+                fixture.seed_rows().await;
+                fixture.row_count
+            }
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => {
+                fixture.seed_rows().await;
+                fixture.row_count
+            }
         }
     }
 
@@ -530,6 +558,33 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.read_all_result().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_all_result().await,
+        }
+    }
+
+    pub(crate) async fn update_one_in_transaction(&self) -> ExecuteResult {
+        match self {
+            Self::RocksDB(fixture) => fixture.update_one_in_transaction().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.update_one_in_transaction().await,
+        }
+    }
+
+    /// Drops the active session/engine handles and opens a fresh engine over
+    /// the same persisted adapter state. Schema/catalog state is read back
+    /// from storage rather than reconstructed by the harness.
+    pub(crate) async fn cold_reopen_result(self) -> ExecuteResult {
+        match self {
+            Self::RocksDB(fixture) => fixture.cold_reopen_result().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.cold_reopen_result().await,
+        }
+    }
+
+    pub(crate) fn disk_bytes(&self) -> u64 {
+        match self {
+            Self::RocksDB(fixture) => fixture.disk_bytes(),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.disk_bytes(),
         }
     }
 
@@ -1148,6 +1203,25 @@ where
         affected as usize
     }
 
+    async fn update_one_in_transaction(&self) -> ExecuteResult {
+        let mut transaction = self
+            .session
+            .begin_transaction()
+            .await
+            .expect("begin explicit comparator transaction");
+        let affected = transaction
+            .execute(&self.update_one_by_pk_sql, &[])
+            .await
+            .expect("execute explicit comparator transaction update")
+            .rows_affected();
+        assert_eq!(affected, 1);
+        transaction
+            .commit()
+            .await
+            .expect("commit explicit comparator transaction");
+        self.read_all_result().await
+    }
+
     #[expect(clippy::cast_possible_truncation)]
     async fn delete_all(&self) -> usize {
         let affected = execute(&self.session, &self.delete_all_sql)
@@ -1165,10 +1239,51 @@ where
         assert_eq!(affected, 1);
         affected as usize
     }
+
+    async fn cold_reopen_result(self) -> ExecuteResult {
+        let GenericSqlFixture {
+            session, storage, ..
+        } = self;
+        drop(session);
+        let engine = Engine::new(storage)
+            .await
+            .expect("reopen comparator engine");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("reopen comparator workspace session");
+        execute(
+            &session,
+            "SELECT path, value FROM json_pointer ORDER BY path",
+        )
+        .await
+    }
+
+    fn disk_bytes(&self) -> u64 {
+        directory_bytes(self._dir.path())
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                directory_bytes(&path)
+            } else {
+                entry.metadata().map_or(0, |metadata| metadata.len())
+            }
+        })
+        .sum()
 }
 
 fn fixture_for_session<StorageImpl>(
     session: SessionContext<StorageImpl>,
+    storage: StorageImpl,
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
     untracked_fixture: UntrackedFixture,
@@ -1196,6 +1311,7 @@ where
     let mid = tracked_rows.len() / 2;
     GenericSqlFixture {
         session,
+        storage,
         row_count: tracked_rows.len(),
         visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
         untracked_fixture,
