@@ -1,0 +1,94 @@
+{
+  "kind": "test-report-only-selector-binding",
+  "status": "bound-source-red",
+  "production_changes": false,
+  "runtime_run": false,
+  "cut_b": {
+    "ref": "origin/codex/forktree-cut-b-reader-acceptance-705",
+    "head": "c80bafbed5545b7768ac3a8dd4ed2ee9d3dacef4",
+    "tree": "18913425e9ce29b1c821837e04339458e200d397",
+    "parent": "705440f55eccba9e2d55c0951d6a684737005d76",
+    "parent_head_full_index_sha256": "74e460189b0fa79d003da8431d805e72fa551836df5e3995c512f8f51f6ae23b",
+    "stable_patch_id": "d69af7a88361a1791bb411729bfe9a7363164deb",
+    "source_gate": "bash test-reports/stage2-filesystem-plugin-reader-705/verify_source_contract.sh",
+    "source_gate_expected": "RED on exact c80 anchor because inherited 705 reader residue is intentional calibration",
+    "allowed_production_paths": [
+      "packages/lix/src/filesystem/read.rs",
+      "packages/lix/src/filesystem/mod.rs",
+      "packages/lix/src/plugin/registry.rs",
+      "packages/lix/src/plugin/mod.rs",
+      "packages/lix/src/sql2/providers/file.rs",
+      "packages/lix/src/session/merge/branch.rs"
+    ],
+    "allowed_artifact_prefix": "test-reports/stage2-filesystem-plugin-reader-705/",
+    "forbidden_scopes": [
+      "selector/ForkTree production owner",
+      "scalar/entity/W2",
+      "transaction/publication/writer",
+      "GC orchestration",
+      "CAS/storage",
+      "compatibility/fallback/second authority"
+    ]
+  },
+  "selector_prerequisite": {
+    "report_ref": "origin/codex/selector-authority-acceptance-705",
+    "report_head": "7f467eb3192c8964c9f25f62ff1a2cd78b280dc3",
+    "report_tree": "530195b10d787c8fc32e014032731f7470ec10c9",
+    "report_parent": "705440f55eccba9e2d55c0951d6a684737005d76",
+    "report_full_index_sha256": "d7938dc112b8f5a0e118831ddddbf2449e3f782a2a2eb3050ccb8b7b6f4b09d8",
+    "report_patch_id": "b1518bcfea98a2ac18e1ac7baf25861ef86347ae",
+    "contract_sha256": "ff784043429f563fb01a29c42eecc90a939f7ce8ac7926d9db07a0f13313da24",
+    "role": "required source/readiness prerequisite; not a Cut B production dependency or edit"
+  },
+  "selector_owner": {
+    "global": "authenticated GlobalSelectorV1 in SELECTOR_SPACE",
+    "branch": "authenticated BranchSelectorV1 keyed by canonical branch UUID",
+    "root_closure": "authenticated RepositoryRootV1/BranchSnapshotV1 and object closure",
+    "chronology": "commit object parent list and semantic commit catalog",
+    "serving_floor": "checkpoint/serving projection as context only",
+    "publication": "PreparedPublication with exact selector CAS",
+    "reader_rule": "one retained CoherentView/StorageRead for all Cut B consumers"
+  },
+  "required_selector_controls": [
+    "A1 valid global+branch selector coherent reopen",
+    "A2 atomic branch create selector publication",
+    "A3 authenticated pinned/workspace switch",
+    "A4 exact-CAS branch delete and closure retirement",
+    "A5 same-owner stale write rejection",
+    "A6 unrelated-owner rejection",
+    "A7 chronology versus serving-floor separation",
+    "A8 undo/redo/reopen stability",
+    "A9-A12 missing/malformed/wrong-kind root, commit, parent, cycle fail-closed",
+    "A13 old-or-new crash publication",
+    "A14 retained-view publication/GC pinning",
+    "A15 key/domain/UUID/generation/root substitution rejection"
+  ],
+  "required_cut_b_controls": [
+    "B1 one CoherentView for filesystem/plugin/history/merge/GC-root reads",
+    "B2 parsed-file, directory, BlobId and file-history semantics",
+    "B3 plugin registry/owner valid, bootstrap and corruption behavior",
+    "B4 BlobId-only deduplicated roots with no payload byte read",
+    "B5 historical merge-registry views",
+    "B6 selected-row/root/owner/scope/key/BlobId fail-closed behavior",
+    "B7 RocksDB and SlateDB flush/drop/reopen",
+    "B8 no legacy reader, write, queue, selector, cache or second authority residue"
+  ],
+  "not_run": [
+    "cargo build/check/test/clippy",
+    "Memory adapter",
+    "RocksDB adapter",
+    "SlateDB adapter",
+    "PR/hosted CI/merge"
+  ],
+  "preexisting_cut_b_artifacts": {
+    "CUT_B_FILESYSTEM_PLUGIN_READER_ACCEPTANCE.md": "36a8e453b2107c2a159070e0d20d05cc59d50f9e408e4a28c88511476de8399b",
+    "RED_CALIBRATION.md": "f4169c48a1e87f20294f3dae357f296bf9810e3fd8ebc0dfd3379cece034659c",
+    "READER_SUCCESSOR_MANIFEST.json": "a593dd302dff4aa365db0c96ca8e8759aa9a8600bec2396a23428431f9df05e3",
+    "verify_source_contract.sh": "8401c71768a5e69efa7f25fbb7acc19b9490a7a058e727c2b3f04ec973c0c76e4"
+  },
+  "binding_artifacts": [
+    "SELECTOR_INVENTORY_BINDING.md",
+    "SELECTOR_READINESS_BINDING.json",
+    "verify_selector_cut_b_binding.sh"
+  ]
+}
