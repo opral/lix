@@ -21,12 +21,14 @@ runnable and does not restore old readers.
 
 ## Sole authority and call graph
 
-All W2 reads begin from one retained CoherentView. The view authenticates the
-selected state root, branch/global overlay roots, commit/diff roots and BlobId
-object root. An opaque ObjectId is the only physical object identity accepted
-by W2; BlobRef is a typed logical reference bound to that ObjectId and its
-size/digest. No caller can provide a storage space, raw key, manifest/chunk
-row, detached root, or second read handle.
+All W2 reads begin from one retained CoherentView owned by one operation. The
+view authenticates the selected state root, branch/global overlay roots,
+commit/diff roots and BlobId object root. An ObjectId is domain-tagged and a
+BlobId is a distinct semantic identity; neither can be substituted for the
+other. BlobRef is bound to the view id, view owner, BlobId, canonical manifest,
+total length, ordered chunk identities, lengths and digests. No caller can
+provide a storage space, raw key, manifest/chunk row, detached root, or second
+read handle.
 
 Canonical paths:
 
@@ -47,11 +49,12 @@ Canonical paths:
       materializer; no write, cache, or alternate tree
 
     BlobRef full:
-      CoherentView -> ObjectId -> authenticated payload/manifest digest ->
-      complete bytes
+      CoherentView -> BlobId -> canonical manifest/chunk identity validation ->
+      authenticated payload -> complete bytes
 
     BlobRef range:
-      CoherentView -> same ObjectId and digest validation -> bounded byte range
+      CoherentView -> same BlobId/ObjectId and metadata validation -> bounded
+      intersecting chunk ranges; no full-payload read or copy
 
 All six paths share the same view/object authority. Reads are side-effect free:
 selector, epoch, receipt, progress, root and write-count digests are unchanged.
@@ -67,6 +70,8 @@ The exact pure-model cases are:
     w2_same_size_manifest_substitution_fails_closed
     w2_corruption_cold_reopen_and_zero_writes
     w2_cross_view_object_pairing_rejected
+    w2_persisted_flush_drop_reopen_reauthenticates_rows_manifest_and_chunks
+    w2_corrupt_rows_reject_before_partial_materialization_and_reads_do_not_write
 
 Required observations:
 
@@ -76,13 +81,20 @@ Required observations:
   equal EntityPk values in different files remain distinct;
 * 65 ordered rows collapse into one canonical root without duplicate or
   out-of-order keys;
-* full and range BlobRef reads validate the same ObjectId, size and digest;
-* a same-size manifest/payload substitution fails by digest, not by length;
-* missing, malformed, noncanonical, wrong-kind, missing-child, wrong-digest,
-  and invalid-range state/blob data fail closed;
-* a second view cannot be paired with the first view's state/object authority;
-* cold reopen restores view/root/epoch state and read operations perform zero
-  writes.
+* full and range BlobRef reads validate the same typed ObjectId, semantic BlobId,
+  manifest, ordered chunk identities, lengths and digests;
+* bounded ranges validate manifest/chunk identity before selecting bytes and
+  count only intersecting payload bytes; a full payload read is never hidden;
+* same-size manifest/chunk substitution, duplicate/reordered identities,
+  missing/malformed/noncanonical/wrong-kind/missing-child/wrong-digest and
+  invalid-range state/blob data fail closed;
+* a second view cannot be paired with the first view's state/object authority,
+  even when root and epoch are unchanged;
+* persisted flush/drop/reopen reauthenticates state-row identity, manifest and
+  every chunk before returning a root; malformed, missing and substituted data
+  fail closed;
+* point reads increment point counters but not scan counters; all read paths
+  preserve durable write/commit counters and reject partial output.
 
 No read may repair, rewrite, repack, update presence, mutate a selector, or
 silently fall back to an old tracked-state or binary-CAS owner.
@@ -111,22 +123,29 @@ readers/writers and must prove rejection.
 
 Run without compiling or mutating:
 
-    node scripts/forktree_w2_tracked_blob_cas_residue_verify.mjs --root <checkout>
+    node scripts/forktree_w2_tracked_blob_cas_residue_verify.mjs \
+      --root <checkout> --base <exact-base> --target <exact-candidate>
 
-The verifier scans packages/lix/src, rejects legacy files/symbols/namespaces,
-and requires CoherentView, ObjectId, BlobId and BlobRef owner symbols. It is
+    node scripts/forktree_w2_tracked_blob_cas_residue_verify.mjs \
+      --root <checkout> --self-test
+
+    python3 scripts/forktree_w2_compile_negative_fixtures.py --root <checkout>
+
+The verifier checks exact ancestry, rejects production changes outside the W2
+path allowlist, scans the complete `packages/lix/src` closure, rejects legacy
+files/symbols/namespaces, and requires CoherentView, ObjectId, BlobId and
+BlobRef owner symbols. Its structural fixtures prove a positive retained-reader
+call and reject fresh views, raw stores and mismatched reader arguments. It is
 expected RED on the d6b/e92 predecessor because the old owners remain. A
 future candidate must pass with zero findings; a source-only pass never grants
 runtime acceptance.
 
-Calibration on the immutable e92/d6b production tree is RED with 472 findings;
-the deterministic output log SHA-256 is
-92877f08d82db2154085e016b3053e7c52b20d2674b74f3781fd1aceb5cc3d08. The pure
-model source compiled with rustc --edition=2021 --test -D warnings and its
-standalone runtime passed all 7 tests; executable SHA-256 is
-0aa20c32193460a180f6ddd4a6fb0c73c35883f3c866a0fb0eecfd34145f93c3. The
-package-level Cargo target is intentionally not claimed until the prerequisite
-reader lineage is compile-green.
+Calibration on the immutable e92/d6b production tree remains RED with 113
+source-contract findings; the deterministic replay log SHA-256 for this
+corrected verifier is recorded in the correction report. The corrected model is
+warnings-denied and its standalone runtime passes all 9 tests. The package-level
+Cargo target is intentionally not claimed until the prerequisite reader lineage
+is compile-green.
 
 ## Exact compile and adapter commands
 
@@ -164,13 +183,21 @@ corruption cases.
 
     cargo fmt --all -- --check
     git diff --check <exact-base>..<exact-head>
-    node scripts/forktree_w2_tracked_blob_cas_residue_verify.mjs --root <exact-root>
+    rustfmt --edition 2021 --check \
+      packages/engine-benchmarks/tests/forktree_w2_tracked_blob_cas_oracle.rs
+    rustc --edition=2021 --test -D warnings \
+      packages/engine-benchmarks/tests/forktree_w2_tracked_blob_cas_oracle.rs
+    python3 scripts/forktree_w2_compile_negative_fixtures.py --root <exact-root>
+    node scripts/forktree_w2_tracked_blob_cas_residue_verify.mjs \
+      --root <exact-root> --base <exact-base> --target <exact-head>
     cargo clippy -p lix_benchmarks \
       --test forktree_w2_tracked_blob_cas_oracle -- -D warnings
 
 The final package records exact base/head/tree/parents, full-index diff,
-ordinary diff, format-patch, patch ID, source/test/script/report hashes,
-static red calibration logs, compile output, and per-adapter terminal logs.
+ordinary diff, format-patch, patch ID, source/test/script/fixture/report
+hashes, static red calibration logs, compile output, and per-adapter terminal
+logs. The current package is test/report-only and makes no durable adapter
+claim.
 
 Acceptance is BLOCKED by any old owner residue, a second view/object authority,
 a write during reads, NULL/tombstone/order mismatch, 65-row collapse failure,
