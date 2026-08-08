@@ -1,19 +1,24 @@
-Standalone model qualification only; no Lix or adapter target was built or
-run.
+Standalone corrected model qualification only; no Lix or adapter target was
+built or run.
 
 Command:
   timeout 1200s rustc --edition=2024 --test -D warnings undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af
   timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af --nocapture
 
 Binary SHA-256:
-  4646b7f072a114752f7f27bebb116512b1d5f9187dd544b12fb113cd2b812019
+  4684f2749233b1015b7953b4a0c085efd0ee9a32bad226f2b8a7a5e114ff53fa
 
 Result:
-  running 5 tests
-  checkpoint_floor_and_merge_or_root_history_fail_closed ... ok
-  cold_reopen_preserves_history_and_transition_identity ... ok
-  read_poisoning_and_missing_history_fail_closed ... ok
-  typed_transition_is_atomic_and_rejects_identity_or_stale_errors ... ok
-  undo_and_redo_preserve_exact_inverse_state_identity ... ok
+  running 9 tests
+  test absence_null_and_tombstone_are_distinct_valid_transition_values ... ok
+  test fresh_alias_raw_store_fallback_and_cache_reads_fail_closed ... ok
+  test duplicate_empty_missing_and_cold_reopen_fail_closed_or_preserve_state ... ok
+  test ordered_checkpoint_floor_allows_to_floor_but_not_below ... ok
+  test atomic_failure_leaves_selector_cursor_and_rows_unchanged ... ok
+  test generation_first_parent_root_and_merge_fail_closed ... ok
+  test ordinary_commit_after_undo_discards_redo_cursor ... ok
+  test undo_and_redo_preserve_exact_inverse_state_identity ... ok
+  test redo_cursor_mismatch_fails_closed_without_selector_update ... ok
 
-  test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  rustfmt --edition 2024 --check: PASS

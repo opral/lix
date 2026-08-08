@@ -1,8 +1,8 @@
 # W1b-3 undo/redo and typed-transition readiness package — exact e1af
 
-Status: test/report-only, frozen for independent review. No production edit,
-Lix build, adapter runtime, benchmark, PR, or merge was performed. The
-standalone model is the only artifact permitted to compile/run in this task.
+Status: corrected test/report-only successor. No production edit, Lix build,
+adapter runtime, benchmark, PR, or merge was performed. The standalone model
+is the only artifact compiled/run in this task.
 
 ## Pinned source and scope
 
@@ -60,7 +60,7 @@ stage_write/commit boundary remains the sole publication path.
 ## One opening-read authority contract
 
 The future candidate must use one transaction-owned
-ForkTreeReadFacade/CoherentView over the transaction opening read for:
+`ForkTreeReadFacade` over the transaction opening read for:
 
 1. first-parent commit chronology and merge/root rejection;
 2. checkpoint marker floor and undo/redo marker cursor;
@@ -69,21 +69,30 @@ ForkTreeReadFacade/CoherentView over the transaction opening read for:
 5. typed transition validation and terminal inverse/replay staging inputs.
 
 No undo/redo helper may begin, refresh, clone, extract, replace, or cross-use a
-read. A branch-bound descriptor may borrow the same read, but a fresh
-commit-graph reader or TrackedStateStoreReader is forbidden. There is no
-fallback, retry authority, durable cache/index, alternate history owner, or
-second transition writer. The source model makes begin count, reader instance,
-write count, and view identity explicit.
+read. Each operation must contain exactly
+
+    let forktree_read =
+        ForkTreeReadFacade::from_opening_read(transaction.opening_read());
+
+and every chronology, marker, exact-row, delta, node, and inverse/replay helper
+call must pass `forktree_read` as an argument. `execute_typed_state_transitions`
+must receive `forktree_read: &ForkTreeReadFacade`; fresh graph/read/raw-store
+paths, aliases, fallback, retry, cache, and alternate authorities are
+forbidden. The source verifier balances function/call delimiters and checks
+these arguments, rather than accepting a token in an unrelated comment.
 
 ## Required semantic gates
 
 The future candidate must preserve:
 
-- first-parent chronology; root and merge commits reject undo/redo;
-- checkpoint marker as an undo floor, including forked floor behavior;
+- first-parent chronology and strictly increasing parent generations; root and
+  merge commits reject undo/redo;
+- checkpoint marker as an ordered undo floor, including a floor reached by a
+  forked history but never crossed below;
 - exact undo target, inverse parent state, and durable redo cursor;
 - exact redo target, replay state, and cursor advancement;
-- ordinary commit after undo discarding the old redo path;
+- ordinary commit after undo discarding the old redo path and both redo cursor
+  fields;
 - atomic batch transition: one identity error means no partial staged result;
 - active branch-head stale rejection and clean-transaction requirement;
 - nonempty unique identity selection and exact schema/file/entity identity;
@@ -95,14 +104,18 @@ The future candidate must preserve:
 - cold reopen preserving history, markers, floors, cursors, and exact state
   identities.
 
-The standalone model covers inverse/redo identity, floor/root/merge
-rejection, atomic identity failure, stale/read poisoning, missing history, and
-cold reopen. It is a contract oracle, not production qualification.
+The standalone model covers inverse/redo identity, generation and first-parent
+validation, ordered floors, root/merge rejection, ordinary-commit redo
+invalidation, explicit redo-cursor mismatch rejection, atomic
+selector/cursor rollback, stale/read/alias/raw-store/fallback/cache poisoning,
+explicit absence/NULL/tombstone, missing history, duplicate/empty identities,
+and cold reopen. Its nine tests are a contract oracle, not production
+qualification.
 
 ## Expected exact-e1af RED calibration
 
 verify_source_contract.sh is source-only and intentionally exits 1 on exact
-e1af. It must report:
+e1af. It must report exactly four RED predicates:
 
 1. undo/redo use of tracked_state_reader();
 2. undo/redo use of a fresh commit_graph_reader();
@@ -110,8 +123,11 @@ e1af. It must report:
 4. typed transition reload through tracked_state_reader().await.
 
 Undo/redo entrypoints, inverse/replay, typed atomic staging, and checkpoint
-marker anchors are positive controls. EXPECTED_RED.txt captures exact output.
-No Lix compiler or adapter result is inferred.
+marker anchors are positive controls. `EXPECTED_RED.txt` captures exact
+output. Once those four legacy predicates are absent on a future target, the
+verifier additionally checks the exact facade constructor, operation-local
+forbidden tokens, balanced helper-call arguments, transition facade argument,
+and complete target-diff scope. No Lix compiler or adapter result is inferred.
 
 ## Compiler-driven deletion order
 
@@ -129,10 +145,18 @@ No Lix compiler or adapter result is inferred.
 
 ## Future commands, each capped at 1200 seconds
 
-The standalone model is the only command run in this task:
+The standalone model and rustfmt are the only local qualification commands run
+in this task:
 
+    timeout 1200s rustfmt --edition 2024 --check test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs
     timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b3-undo-transition-e1af/undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle
-    timeout 1200s /tmp/w1b3-undo-transition-oracle
+    timeout 1200s /tmp/w1b3-undo-transition-oracle --nocapture
+
+Corrected model evidence: 9/9 passed; executable SHA-256
+`4684f2749233b1015b7953b4a0c085efd0ee9a32bad226f2b8a7a5e114ff53fa`.
+The exact e1af source verifier output SHA-256 is
+`8741d99516d096b41f06813c7afdc2dc1ff74fa3b286f45cbfe81c6e2b2dc652` and
+exits 1 with the preserved four RED predicates.
 
 Future immutable production candidates may run, only after the source gate:
 
@@ -142,9 +166,11 @@ Future immutable production candidates may run, only after the source gate:
     timeout 1200s cargo test -p lix --lib --features slatedb undo_redo
 
 Future adapter order is Memory/default, exact RocksDB, then SlateDB. Focused
-controls must include undo/redo round-trip, atomic batch, checkpoint/merge/root
-floors, stale source-head, descriptor cascade, corruption, cold reopen, and
-zero second reads. No broad matrix is authorized before source/compiler gates.
+controls must include undo/redo round-trip, generation/first-parent, ordered
+checkpoint floors, ordinary-commit redo invalidation, atomic selector/cursor
+rollback, absence/NULL/tombstone, descriptor cascade, corruption, cold
+reopen, and zero second reads. No broad matrix is authorized before
+source/compiler gates.
 
 ## Review boundary
 

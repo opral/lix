@@ -1,5 +1,5 @@
 ANCHOR PASS target=e1af471b9ab0f598dafa7c2ddec7867667c81740 anchor=e1af471b9ab0f598dafa7c2ddec7867667c81740
-SCOPE PASS changed_source=<none>
+SCOPE PASS changed_paths=0
 RED-1 undo/redo still opens or uses the legacy tracked-state reader
 RED-2 undo/redo still opens a fresh commit-graph reader
 RED-3 undo/redo lacks the retained ForkTree facade anchor
