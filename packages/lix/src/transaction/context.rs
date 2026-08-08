@@ -1995,13 +1995,17 @@ where
             crate::storage_bench::record_transaction_rows_staged(row_count);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
-        let prepared = self
+        let tracked_certified_rows = rows.iter().all(|row| !row.untracked);
+        let mut prepared = self
             .prepare_transaction_rows(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_prepare_rows"
             ))
             .await?;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -2040,13 +2044,17 @@ where
             crate::storage_bench::record_transaction_rows_staged(row_count);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
-        let prepared = self
+        let tracked_certified_rows = rows.iter().all(|row| !row.untracked);
+        let mut prepared = self
             .prepare_transaction_rows(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_prepare_rows"
             ))
             .await?;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -8275,18 +8283,22 @@ mod certified_change_id_tests {
     fn certified_tracked_rows_get_distinct_ids_once_in_input_order() {
         let functions = FunctionProviderHandle::system();
         let mut prepared = prepared_rows();
-        assert!(prepared
-            .iter()
-            .all(|row| row.change_id == Some(ChangeId::default())));
+        assert!(
+            prepared
+                .iter()
+                .all(|row| row.change_id == Some(ChangeId::default()))
+        );
 
         assign_certified_tracked_change_ids(&mut prepared, &functions);
         let first_ids = prepared
             .iter()
             .map(|row| row.change_id.expect("assigned change id"))
             .collect::<Vec<_>>();
-        assert!(first_ids
-            .iter()
-            .all(|change_id| *change_id != ChangeId::default()));
+        assert!(
+            first_ids
+                .iter()
+                .all(|change_id| *change_id != ChangeId::default())
+        );
         assert_eq!(
             first_ids.iter().copied().collect::<BTreeSet<_>>().len(),
             first_ids.len()
@@ -8308,6 +8320,31 @@ mod certified_change_id_tests {
                 .map(|row| row.change_id.expect("assigned change id"))
                 .collect::<Vec<_>>(),
             first_ids
+        );
+    }
+
+    #[test]
+    fn certified_tracked_rows_preserve_supplied_ids_at_common_boundary() {
+        let functions = FunctionProviderHandle::system();
+        let supplied = ChangeId::for_test_label("supplied");
+        let mut prepared = prepared_rows();
+        prepared.set_change_id(1, Some(supplied));
+
+        assign_certified_tracked_change_ids(&mut prepared, &functions);
+
+        assert_eq!(prepared.row(1).change_id, Some(supplied));
+        assert!(
+            prepared
+                .iter()
+                .all(|row| row.change_id.is_some_and(|id| id != ChangeId::default()))
+        );
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|row| row.change_id.expect("assigned change id"))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            prepared.len()
         );
     }
 }
@@ -8759,13 +8796,12 @@ where
                 ))
                 .await?
         } else {
-            let mut prepared = rows
-                .into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?;
-            if tracked_certified_rows {
-                assign_certified_tracked_change_ids(&mut prepared, &self.functions);
-            }
-            prepared
+            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
         };
+        let mut prepared = prepared;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -8831,13 +8867,12 @@ where
                 ))
                 .await?
         } else {
-            let mut prepared = rows
-                .into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?;
-            if tracked_certified_rows {
-                assign_certified_tracked_change_ids(&mut prepared, &self.functions);
-            }
-            prepared
+            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
         };
+        let mut prepared = prepared;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
