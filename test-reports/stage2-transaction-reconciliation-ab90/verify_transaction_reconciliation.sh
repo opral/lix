@@ -17,6 +17,12 @@ git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null
 HEAD=$(git -C "$ROOT" rev-parse HEAD)
 TREE=$(git -C "$ROOT" rev-parse HEAD^{tree})
 PARENT=$(git -C "$ROOT" rev-parse HEAD^ 2>/dev/null || true)
+display_head=$HEAD
+display_tree=$TREE
+if [[ "${NORMALIZE_OUTPUT:-0}" == 1 ]]; then
+  display_head='<immutable-candidate>'
+  display_tree='<immutable-tree>'
+fi
 
 show_source() {
   git -C "$ROOT" show "HEAD:$1" 2>/dev/null || true
@@ -74,13 +80,17 @@ has_any() {
 
 if [[ "$MODE" == control ]]; then
   if [[ "$HEAD" == "$ANCHOR" && "$TREE" == "$ANCHOR_TREE" && "$PARENT" == "$ANCHOR_PARENT" ]]; then
-    emit PASS provenance "HEAD=$HEAD TREE=$TREE PARENT=$PARENT"
+    if [[ "${NORMALIZE_OUTPUT:-0}" == 1 ]]; then
+      emit PASS provenance "control matches the exact anchor identity"
+    else
+      emit PASS provenance "HEAD=$HEAD TREE=$TREE PARENT=$PARENT"
+    fi
   else
     emit FAIL provenance "control expected HEAD=$ANCHOR TREE=$ANCHOR_TREE PARENT=$ANCHOR_PARENT; got HEAD=$HEAD TREE=$TREE PARENT=$PARENT"
   fi
 else
   if git -C "$ROOT" merge-base --is-ancestor "$ANCHOR" "$HEAD"; then
-    emit PASS provenance "HEAD=$HEAD TREE=$TREE descends from $ANCHOR"
+    emit PASS provenance "HEAD=$display_head TREE=$display_tree descends from $ANCHOR"
   else
     emit FAIL provenance "HEAD=$HEAD is not descended from $ANCHOR"
   fi
@@ -297,7 +307,7 @@ fi
 emit NOT_RUN runtime_matrix "TEST/REPORT-ONLY package: no Memory/RocksDB/SlateDB build or runtime was run"
 
 printf 'SUMMARY\tmode=%s\tpass=%d\tred=%d\tfail=%d\tnot_run=%d\thead=%s\ttree=%s\n' \
-  "$MODE" "$pass_count" "$red_count" "$fail_count" "$not_run_count" "$HEAD" "$TREE"
+  "$MODE" "$pass_count" "$red_count" "$fail_count" "$not_run_count" "$display_head" "$display_tree"
 
 # A calibrated anchor may contain expected REDs, but never an unexpected FAIL.
 (( fail_count == 0 ))

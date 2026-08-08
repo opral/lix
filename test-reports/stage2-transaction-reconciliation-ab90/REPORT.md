@@ -108,10 +108,13 @@ bash test-reports/stage2-transaction-reconciliation-ab90/verify_transaction_reco
   > /tmp/a9dd-successor.stdout 2> /tmp/a9dd-successor.stderr
 ```
 
-At the pre-freeze source checkpoint the verifier produced 11 PASS, 12 expected
-RED, 0 FAIL, and 1 NOT_RUN. The complete stdout SHA-256 was
+At the source checkpoint the verifier produced 11 PASS, 12 expected RED, 0
+FAIL, and 1 NOT_RUN. The complete non-normalized stdout SHA-256 was
 `f50a0a0cc849f663e63f116b5fc45bc108b10df07d6a33f98a3ea37a879cf101`; stderr
 was empty (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
-The final immutable head/tree and final normalized output hash are recorded
-after the freeze commit below; the pre-freeze checkpoint hash is retained only
-to make the source-gate evolution auditable.
+With `NORMALIZE_OUTPUT=1`, which removes moving HEAD/tree values while keeping
+all semantic rows, stdout SHA-256 was
+`5b8ac5cdc2358fee8ed48a5acae257582810f893f5575b82bf4c7b440362dcc1`; this is
+the stable final evidence hash. The immutable successor ref, head, tree,
+diff, and patch identities are supplied in the freeze handoff; no moving-ref
+value is used as semantic evidence.
