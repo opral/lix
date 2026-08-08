@@ -114,12 +114,13 @@ use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
-    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
-    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
+    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
+    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
+    StagedCommitChangeBatchBuilder, TransactionFileContent, TransactionJson, TransactionWrite,
+    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    TransactionWriteOutcome, TransactionWriteRow, TypedMutationJournalBatch,
+    canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
 use crate::transaction::validation::{
@@ -8219,6 +8220,98 @@ fn plan_prepared_row_scalars(
     })
 }
 
+fn assign_certified_tracked_change_ids(
+    prepared: &mut PreparedStateBatch,
+    functions: &FunctionProviderHandle,
+) {
+    for index in 0..prepared.len() {
+        if prepared.row(index).change_id == Some(ChangeId::default()) {
+            prepared.set_change_id(index, Some(ChangeId::from(functions.call_uuid_v7())));
+        }
+    }
+}
+
+#[cfg(test)]
+mod certified_change_id_tests {
+    use super::*;
+
+    fn prepared_rows() -> PreparedStateBatch {
+        let certificate = CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(902),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        };
+        CertifiedParameterReplacementBatch::new(
+            vec![
+                EntityPk::single("row-a"),
+                EntityPk::single("row-b"),
+                EntityPk::single("row-c"),
+            ],
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|value| {
+                    TransactionJson::from_certified_shared_normalized_row_content(
+                        format!(r#"{{"value":"{value}"}}"#).into(),
+                    )
+                })
+                .collect(),
+            "catalog_test".into(),
+            "main".into(),
+            certificate,
+        )
+        .expect("certified rows should construct")
+        .into_dense_prepared(
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-08-08T00:00:00.000Z"),
+        )
+        .expect("certified rows should prepare")
+    }
+
+    #[test]
+    fn certified_tracked_rows_get_distinct_ids_once_in_input_order() {
+        let functions = FunctionProviderHandle::system();
+        let mut prepared = prepared_rows();
+        assert!(prepared
+            .iter()
+            .all(|row| row.change_id == Some(ChangeId::default())));
+
+        assign_certified_tracked_change_ids(&mut prepared, &functions);
+        let first_ids = prepared
+            .iter()
+            .map(|row| row.change_id.expect("assigned change id"))
+            .collect::<Vec<_>>();
+        assert!(first_ids
+            .iter()
+            .all(|change_id| *change_id != ChangeId::default()));
+        assert_eq!(
+            first_ids.iter().copied().collect::<BTreeSet<_>>().len(),
+            first_ids.len()
+        );
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|row| row.entity_pk.as_single_string().expect("single key"))
+                .collect::<Vec<_>>(),
+            vec!["row-a", "row-b", "row-c"]
+        );
+
+        // Retry/idempotency: the authoritative staging boundary assigns only
+        // placeholders, so a repeated call cannot regenerate published IDs.
+        assign_certified_tracked_change_ids(&mut prepared, &functions);
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|row| row.change_id.expect("assigned change id"))
+                .collect::<Vec<_>>(),
+            first_ids
+        );
+    }
+}
+
 fn push_prepared_state_row_from_planned_parts(
     prepared: &mut PreparedStateBatch,
     rows: &mut RawWriteBatch,
@@ -8653,6 +8746,7 @@ where
                 row_count * usize::from(rows.untracked()),
             );
         }
+        let tracked_certified_rows = !rows.untracked();
         let domain = Domain::schema_catalog(branch_id, rows.untracked());
         let prepared = if self
             .staged_writes
@@ -8665,7 +8759,12 @@ where
                 ))
                 .await?
         } else {
-            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+            let mut prepared = rows
+                .into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?;
+            if tracked_certified_rows {
+                assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+            }
+            prepared
         };
         if prepared.len() != row_count {
             return Err(LixError::new(
@@ -8718,6 +8817,7 @@ where
                 row_count * usize::from(rows.untracked()),
             );
         }
+        let tracked_certified_rows = !rows.untracked();
         let domain =
             Domain::schema_catalog(rows.schema_scope_branch_id().to_string(), rows.untracked());
         let prepared = if self
@@ -8731,7 +8831,12 @@ where
                 ))
                 .await?
         } else {
-            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+            let mut prepared = rows
+                .into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?;
+            if tracked_certified_rows {
+                assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+            }
+            prepared
         };
         if prepared.len() != row_count {
             return Err(LixError::new(
