@@ -1,0 +1,11 @@
+# W5/R7 oracle manifest
+
+base=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+base_parent=1f742a382c755399b8a49ab536c4f6dc55fffdd8
+base_tree=641654079f60fcd1c9ff9ccbbd06d3edcabe4096
+control=1f742a382c755399b8a49ab536c4f6dc55fffdd8
+
+test=packages/engine-benchmarks/tests/forktree_w5_r7_gc_reachability_oracle.rs
+verifier=scripts/forktree_w5_r7_residue_verify.mjs
+report=packages/engine-benchmarks/tests/FORKTREE_W5_R7_GC_REACHABILITY_ORACLE.md
+
