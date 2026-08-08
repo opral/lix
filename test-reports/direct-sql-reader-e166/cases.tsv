@@ -1,0 +1,17 @@
+# id	type	control expectation	candidate requirement	owner/evidence
+anchor	provenance	PASS	PASS	e166 commit and tree are exact
+coherent_view	positive	PASS	PASS	caller StorageRead -> ForkTree coherent view
+no_raw_read_getter	negative	RED	PASS	no direct read/storage_read/begin_read helper
+overlay_order	positive	PASS	PASS	global+branch authenticated merge order
+entity_filter_before_limit	positive	PASS	PASS	entity_pk filtering precedes output limit
+null_preserved	positive	PASS	PASS	Null maps to SQL NULL, not deletion
+tombstone_policy	positive	PASS	PASS	tombstone excluded unless explicitly requested
+decode_auth_fail_closed	positive	PASS	PASS	decode/state errors propagate
+untracked_same_view	positive	PASS	PASS	explicit untracked lane uses the view
+unsupported_fail_before_view	positive	PASS	PASS	derived/history/multi-branch reject
+no_tracked_head_owner	negative	RED	PASS	no tracked-head/TrackedState DTO owner
+no_columnar_owner	negative	RED	PASS	no durable/current-state columnar owner
+no_current_state_cache	negative	RED	PASS	no entity snapshot/columnar cache authority
+no_fallback	negative	RED	PASS	no generic or direct-reader fallback
+no_raw_state_shortcut	negative	RED	PASS	SQL entity reader does not invoke scan_direct_* or plan_direct_*
+no_write_side_effect	positive	PASS	PASS	reader sources contain no write/commit path

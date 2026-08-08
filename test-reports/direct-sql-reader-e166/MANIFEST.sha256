@@ -1,0 +1,4 @@
+13c6fe4d9047f2391aaec84c8a86843e0b48e76cf1efd3527e6a5caf91a0f3d7  test-reports/direct-sql-reader-e166/README.md
+3b11a6b92515f3fdbc5acf1721eb5d55648e2645910e699dbc182f12a7700421  test-reports/direct-sql-reader-e166/cases.tsv
+b698482bbf2992425c8b1bc1204cdac0233729a8861260a0d07508167902a325  test-reports/direct-sql-reader-e166/verify_direct_reader.sh
+e9d66cc3f0fd3ce0e4b9ebef2181b50efe6ccf0b7a2641be6a624c36e406b256  test-reports/direct-sql-reader-e166/CONTROL_REPORT.md
