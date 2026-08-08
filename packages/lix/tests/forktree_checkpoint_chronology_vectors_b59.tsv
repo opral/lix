@@ -1,0 +1,4 @@
+# case|branch|root_commit|checkpoint_commits|ordinary_commit|expected_marker_ids|expected_implicit_root|forbidden_marker_ids
+checkpoint_to_ordinary|branch-A|commit-R|commit-C,commit-D|commit-O|commit-C,commit-D|commit-R|commit-O
+wrong_commit_marker|branch-A|commit-R|commit-C|commit-O|ERROR:marker_commit_must_equal_observed_commit|commit-R|commit-C
+wrong_branch_marker|branch-A|commit-R|commit-C|commit-O|ERROR:marker_branch_must_equal_selected_branch|commit-R|commit-C
