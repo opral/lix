@@ -136,3 +136,44 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
     };
     Ok(DeterministicSequence { highest_seen })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_mode_payload_defaults_to_disabled_without_a_legacy_state_owner() {
+        assert_eq!(
+            parse_mode_value(serde_json::json!({})).expect("missing mode should decode"),
+            DeterministicMode::disabled()
+        );
+    }
+
+    #[test]
+    fn deterministic_sequence_rejects_non_integer_payloads_fail_closed() {
+        for value in [
+            JsonValue::Null,
+            JsonValue::String("7".to_owned()),
+            serde_json::json!({ "highest_seen": 7 }),
+        ] {
+            let error = parse_sequence_value(value)
+                .expect_err("a non-integer sequence payload must fail closed");
+            assert_eq!(error.code, LixError::CODE_UNKNOWN);
+            assert!(error.message.contains("must be an integer"));
+        }
+    }
+
+    #[test]
+    fn deterministic_mode_rejects_non_object_payloads_fail_closed() {
+        for value in [
+            JsonValue::Null,
+            JsonValue::Bool(true),
+            JsonValue::String("on".to_owned()),
+        ] {
+            let error =
+                parse_mode_value(value).expect_err("a non-object mode payload must fail closed");
+            assert_eq!(error.code, LixError::CODE_UNKNOWN);
+            assert!(error.message.contains("must be an object"));
+        }
+    }
+}
