@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const REPOSITORY_OWNER: &str = "repository:fixture";
 const SELECTOR_CATALOG_ROOT: &str = "catalog:root";
 const GLOBAL_SELECTOR_KEY: &str = "selector:global";
+const GLOBAL_ROOT: &str = "root-global";
 
 fn authenticated_fingerprint(bytes: &str) -> String {
     // The model intentionally uses a deterministic, dependency-free tag. The
@@ -58,6 +59,8 @@ impl GlobalSelector {
             )
             && self.auth_fingerprint == authenticated_fingerprint(&self.selector_bytes)
             && self.owner == REPOSITORY_OWNER
+            && self.selector_key == GLOBAL_SELECTOR_KEY
+            && self.root == GLOBAL_ROOT
     }
 }
 
@@ -223,11 +226,11 @@ struct Repository {
 impl Repository {
     fn bootstrap() -> Self {
         let mut objects = BTreeSet::new();
-        objects.insert("root-global".into());
+        objects.insert(GLOBAL_ROOT.into());
         objects.insert(SELECTOR_CATALOG_ROOT.into());
         let live_objects = objects.clone();
         Self {
-            global: Some(GlobalSelector::new("root-global", 1, 1)),
+            global: Some(GlobalSelector::new(GLOBAL_ROOT, 1, 1)),
             branches: BTreeMap::new(),
             histories: BTreeMap::new(),
             objects,
@@ -673,7 +676,7 @@ fn authenticated_fingerprint_covers_every_selector_authority_field() {
         fingerprint.branch_selector_key,
         format!("selector:branch:{BRANCH_A}")
     );
-    assert_eq!(fingerprint.global_root, "root-global");
+    assert_eq!(fingerprint.global_root, GLOBAL_ROOT);
     assert_eq!(fingerprint.branch_root, "root-a");
     assert_eq!(fingerprint.global_epoch, 2);
     assert_eq!(fingerprint.global_generation, 2);
@@ -717,6 +720,40 @@ fn selector_bytes_bind_exact_root_catalog_generation_and_owner() {
         repository.open_view(BRANCH_A),
         Err(Failure::InvalidFingerprint)
     );
+}
+
+#[test]
+fn canonical_global_selector_is_accepted() {
+    let mut repository = repository_with_branch();
+    let view = repository.open_view(BRANCH_A).unwrap();
+    assert_eq!(view.global.selector_key, GLOBAL_SELECTOR_KEY);
+    assert_eq!(view.global.root, GLOBAL_ROOT);
+    assert_eq!(repository.read_acquisitions, 1);
+    repository.release_view(&view);
+}
+
+#[test]
+fn same_size_forged_global_key_and_root_fail_before_view_or_write() {
+    let mut repository = repository_with_branch();
+    let mut forged = repository.global.clone().unwrap();
+    forged.selector_key = "selector:forged".to_owned();
+    forged.root = "root-forged".to_owned();
+    forged.selector_bytes = format!(
+        "global|key={}|owner={}|root={}|epoch={}|generation={}",
+        forged.selector_key, forged.owner, forged.root, forged.epoch, forged.generation
+    );
+    forged.auth_fingerprint = authenticated_fingerprint(&forged.selector_bytes);
+    repository.global = Some(forged);
+    let reads = repository.read_acquisitions;
+    let writes = repository.writes;
+    let commits = repository.commits;
+    assert_eq!(
+        repository.open_view(BRANCH_A),
+        Err(Failure::InvalidFingerprint)
+    );
+    assert_eq!(repository.read_acquisitions, reads);
+    assert_eq!(repository.writes, writes);
+    assert_eq!(repository.commits, commits);
 }
 
 #[test]

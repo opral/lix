@@ -1,7 +1,26 @@
 {
   "kind": "test-report-only-branch-ref-whole-closure-oracle",
   "status": "dormant-until-compile-green",
-  "correction": "482e H1 selector-fingerprint/CAS/lifecycle successor",
+  "correction": "6eba H1 global selector identity correction oracle",
+  "corrected_from": {
+    "commit": "6eba1b6f853337985c17cf2ef83fcb3abbccf02c",
+    "tree": "677b645d8e29c2d6ebe07a3494f5a8c2601155ce",
+    "parent": "482e10c88767a426a8b6ed0aff7fad1b43903b1f",
+    "blocker_report_sha256": "69ddb8b7024ac436af29ae7efe19fb2bfc2a74a03d4f206f45ceb1cb8e6d35a3",
+    "blocker_manifest_sha256": "8af37ef5dcf992d43e9afa65cdfbc76578763d9db0c33b3fb6f6ee3813ef2072"
+  },
+  "source_calibration": {
+    "anchor": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "candidate": "6eba1b6f853337985c17cf2ef83fcb3abbccf02c",
+    "required_missing": 0,
+    "legacy_residue": 481,
+    "old_closure_paths": 4,
+    "branch_ref_occurrence_files": 15,
+    "non_derived_branch_ref_files": 4,
+    "authority_use_lines": 343,
+    "normalized_log_sha256": "18f9ac8be382be047445a6c52448d9d4f77785f23b8383dc4846a4d23defecd4",
+    "result": "RED"
+  },
   "anchor": {
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
@@ -73,6 +92,9 @@
     "reject a derived BranchRef/second authority before selector publication",
     "exercise create, switch, advance, delete, retire, retained-view GC, and cold reopen transitions",
     "reopen validates global selector sequence and branch selector bindings",
+    "canonical global selector key and repository root are required",
+    "same-size forged global key/root with recomputed fingerprint fails before view or write",
+    "canonical global selector remains accepted",
     "malformed branch identity and branch deletion fail closed",
     "empty undo/redo are no-op with no partial publication",
     "every multi-selector operation is atomic with no partial state"

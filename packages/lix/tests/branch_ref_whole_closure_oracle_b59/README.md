@@ -6,9 +6,11 @@ adapter fixture, and no compatibility implementation. Its source gate is
 intentionally RED on b59 because the old closure is still referenced while the
 defining BranchHead control owner has already been removed from the tree.
 
-This successor closes the blocked 482e oracle's H1 gaps in the pure model and
-future source contract: selector fingerprints include every authenticated root,
-generation, canonical selector byte string, catalog root, and owner identity;
+This direct correction oracle closes the blocked 6eba H1 gap in the pure model
+and future source contract: selector fingerprints include every authenticated
+root, generation, canonical selector byte string, catalog root, and owner
+identity, and global validation additionally requires the canonical global
+selector key and repository root;
 publication checks distinguish same-owner stale CAS from unrelated-owner
 attempts; a forged derived branch-ref authority is rejected; and create,
 switch, advance, delete/retire, retained-view GC, and cold reopen are exercised
@@ -70,6 +72,9 @@ all remaining consumers.
   global root, branch root, global epoch/generation, branch generation,
   canonical selector bytes, catalog root, global and branch owner identities,
   and deterministic authentication tags.
+  The global selector must additionally carry `selector:global` and
+  `root-global`; recomputing a fingerprint over same-size forged key/root
+  bytes is not sufficient for authentication.
   Same-size root or owner substitutions invalidate the selector before any
   read or write is returned.
 * A same-owner publication whose expected selector bytes are stale returns
