@@ -25,18 +25,6 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::derived::{is_derived_schema, request_may_include_derived};
 
-/// Rejects legacy callers that have not yet been threaded with an operation
-/// facade. This preserves the hard cut: it never opens a view and cannot
-/// revive the deleted raw branch scanner.
-pub(crate) async fn reject_legacy_branch_scan<S>(
-    _read: &S,
-    _request: &LiveStateScanRequest,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    Err(unsupported(
-        "legacy branch scan requires an operation-owned ForkTree view",
-    ))
-}
-
 pub(crate) async fn scan_view<R>(
     view: &crate::forktree::CoherentView<R>,
     request: &LiveStateScanRequest,

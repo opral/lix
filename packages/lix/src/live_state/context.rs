@@ -685,11 +685,7 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        // Current tracked rows are now served by the authenticated
-        // ForkTree selector/state facade. Unsupported lanes fail closed in
-        // that adapter; they must not fall back to the deleted hot-state
-        // reader.
-        crate::live_state::scan_forktree_branch(&self.store, request).await
+        self.scan_forktree_operation(request).await
     }
 
     async fn scan_batch_with_schema_presence(
@@ -895,7 +891,22 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        crate::live_state::scan_forktree_branch(&self.store, request).await
+        self.scan_forktree_operation(request).await
+    }
+
+    async fn scan_forktree_operation(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        let [branch_id] = request.filter.branch_ids.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "ForkTree live-state operation requires exactly one branch",
+            ));
+        };
+        let facade = crate::forktree::ForkTreeReadFacade::new(&self.store);
+        let view = facade.branch(branch_id).await?;
+        crate::live_state::scan_forktree_view(&view, request).await
     }
 
     async fn scan_tracked_batch_with_schema_presence(
@@ -1021,7 +1032,7 @@ where
         tracked_only: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let _ = tracked_only;
-        crate::live_state::scan_forktree_branch(&self.store, request).await
+        self.scan_forktree_operation(request).await
     }
 
     async fn scan_batch(
