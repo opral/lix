@@ -2782,11 +2782,7 @@ where
     }
 
     async fn load_value(&self, value: ValueRef) -> Result<Vec<u8>, String> {
-        match decode_value_pack(&self.load_object(value.pack).await?)?
-            .get(value.index as usize)
-            .cloned()
-            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())?
-        {
+        match decode_value_pack_at(&self.load_object(value.pack).await?, value.index as usize)? {
             RelationalValue::Bytes(bytes) => Ok(bytes),
             RelationalValue::Null => {
                 Err("ForkTree byte-only reader encountered a relational NULL".to_string())
@@ -2795,10 +2791,7 @@ where
     }
 
     async fn load_relational_value(&self, value: ValueRef) -> Result<RelationalValue, String> {
-        decode_value_pack(&self.load_object(value.pack).await?)?
-            .get(value.index as usize)
-            .cloned()
-            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
+        decode_value_pack_at(&self.load_object(value.pack).await?, value.index as usize)
     }
 
     async fn load_blob_manifest(&self, id: Option<ObjectId>) -> Result<BlobManifest, String> {
@@ -3585,6 +3578,42 @@ fn decode_value_pack(bytes: &[u8]) -> Result<Vec<RelationalValue>, String> {
     }
     body.finish()?;
     Ok(values)
+}
+
+fn decode_value_pack_at(bytes: &[u8], index: usize) -> Result<RelationalValue, String> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.object_tag()? != VALUE_PACK_TAG {
+        return Err("ForkTree leaf does not reference a value-pack object".to_string());
+    }
+    let decoded_length = decoder.u32()?;
+    let compressed = decoder.remaining();
+    let decoded = zstd::bulk::decompress(compressed, decoded_length)
+        .map_err(|error| format!("decompress ForkTree value pack: {error}"))?;
+    decoder.finish()?;
+
+    let mut body = Decoder::new(&decoded);
+    let count = body.u32()?;
+    let mut selected = None;
+    for position in 0..count {
+        let value = match body.take(1)?[0] {
+            0 => RelationalValue::Null,
+            1 => {
+                let length = body.u32()?;
+                let bytes = body.take(length)?;
+                if position == index {
+                    RelationalValue::Bytes(bytes.to_vec())
+                } else {
+                    continue;
+                }
+            }
+            tag => return Err(format!("unknown ForkTree relational value tag {tag}")),
+        };
+        if position == index {
+            selected = Some(value);
+        }
+    }
+    body.finish()?;
+    selected.ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
 }
 
 fn validate_blob_chunk(bytes: &[u8], expected_bytes: u64) -> Result<(), String> {
