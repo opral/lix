@@ -94,7 +94,7 @@ DualSelectorAuthority
 Run the source-only verifier:
 
 ~~~sh
-sh test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh \
+bash test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh \
   /tmp/lix-branch-ref-readiness-e1af-1786195688
 ~~~
 

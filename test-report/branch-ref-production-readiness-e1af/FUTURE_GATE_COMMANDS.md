@@ -7,7 +7,7 @@ first compile, source, semantic, corruption, or authority failure.
 ## Static gates
 
 ~~~sh
-sh test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh <candidate-root>
+bash test-report/branch-ref-production-readiness-e1af/verify_readiness_source.sh <candidate-root>
 cargo fmt --all -- --check
 git diff --check
 ~~~

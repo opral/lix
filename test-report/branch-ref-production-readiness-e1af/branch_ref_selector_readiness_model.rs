@@ -114,16 +114,6 @@ enum Failure {
     Retired,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Lifecycle {
-    Create,
-    Switch,
-    Advance,
-    Delete,
-    Retire,
-    Checkpoint,
-}
-
 #[derive(Clone, Debug)]
 struct Repository {
     global: GlobalSelector,
@@ -263,6 +253,53 @@ impl Repository {
         self.objects.insert(root.to_owned());
     }
 
+    fn rotate_selector_plane(&mut self) {
+        let next_epoch = self.global.epoch + 1;
+        self.global = GlobalSelector::canonical(next_epoch);
+        self.epochs.push(next_epoch);
+        self.publications += 1;
+        self.commits += 1;
+        self.selector_writes += 1;
+    }
+
+    fn create_branch(&mut self, branch: &str, root: &str) -> Result<(), Failure> {
+        if !self.objects.contains(root) {
+            return Err(Failure::MissingRoot);
+        }
+        self.branches.insert(
+            branch.to_owned(),
+            BranchSelector::canonical(branch, root, 0),
+        );
+        self.rotate_selector_plane();
+        Ok(())
+    }
+
+    fn switch_branch(&mut self, branch: &str) -> Result<(), Failure> {
+        if !self.branches.contains_key(branch) {
+            return Err(Failure::MissingRoot);
+        }
+        self.active = branch.to_owned();
+        Ok(())
+    }
+
+    fn delete_branch(&mut self, branch: &str) -> Result<(), Failure> {
+        if branch == "main" {
+            return Err(Failure::Retired);
+        }
+        let selector = self.branches.remove(branch).ok_or(Failure::MissingRoot)?;
+        self.retired.insert(selector.root);
+        self.rotate_selector_plane();
+        Ok(())
+    }
+
+    fn checkpoint(&mut self) {
+        self.rotate_selector_plane();
+    }
+
+    fn retire_root(&mut self, root: &str) {
+        self.retired.insert(root.to_owned());
+    }
+
     fn cold_reopen(&self) -> Result<(), Failure> {
         if !self.global.authenticated()
             || self.epochs.windows(2).any(|pair| pair[1] != pair[0] + 1)
@@ -274,15 +311,10 @@ impl Repository {
     }
 
     fn gc(&mut self) {
-        let retained: BTreeSet<_> = self.retained.values().cloned().collect();
+        let mut retained: BTreeSet<_> = self.retained.values().cloned().collect();
+        retained.extend(self.branches.values().map(|selector| selector.root.clone()));
         self.objects
             .retain(|object| object == GLOBAL_ROOT || retained.contains(object));
-    }
-
-    fn lifecycle_marker(&mut self, lifecycle: Lifecycle) {
-        if matches!(lifecycle, Lifecycle::Retire | Lifecycle::Delete) {
-            self.retired.insert(format!("{lifecycle:?}"));
-        }
     }
 }
 
@@ -303,14 +335,22 @@ fn canonical_authority_uses_one_read_and_one_commit() {
 fn create_switch_advance_delete_retire_gc_and_cold_reopen_are_modeled() {
     let mut repo = Repository::bootstrap();
     repo.stage("root-feature");
-    repo.lifecycle_marker(Lifecycle::Create);
-    repo.lifecycle_marker(Lifecycle::Switch);
-    repo.lifecycle_marker(Lifecycle::Advance);
-    repo.lifecycle_marker(Lifecycle::Checkpoint);
-    repo.lifecycle_marker(Lifecycle::Delete);
-    repo.lifecycle_marker(Lifecycle::Retire);
-    assert_eq!(repo.retired.len(), 2);
+    repo.create_branch("feature", "root-feature").unwrap();
+    repo.switch_branch("feature").unwrap();
+    let view = repo.open_view("feature").unwrap();
+    repo.stage("root-feature-next");
+    let prepared = repo
+        .prepare(&view, "root-feature-next", "branch:feature")
+        .unwrap();
+    repo.commit(prepared).unwrap();
+    repo.release(&view);
+    repo.checkpoint();
+    repo.delete_branch("feature").unwrap();
+    repo.retire_root("root-feature");
+    assert!(!repo.branches.contains_key("feature"));
+    assert!(repo.retired.contains("root-feature"));
     repo.gc();
+    assert!(!repo.objects.contains("root-feature"));
     repo.cold_reopen().unwrap();
 }
 
