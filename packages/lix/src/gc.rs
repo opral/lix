@@ -6233,10 +6233,11 @@ mod tests {
 
         for (index, record) in retired.iter().enumerate() {
             let old_control = replay_branch_control(record.commit_id, control_ref, timestamp);
+            let branch_sequence = index + 1;
             stage_replay_root_delta(
                 &storage,
                 RootReachabilityDelta {
-                    branch_id: format!("retireable-branch-{index}"),
+                    branch_id: format!("01920000-0000-7000-8000-{branch_sequence:012x}"),
                     old_root: Some(record.commit_id),
                     new_root: None,
                     old_control: Some(old_control),
