@@ -1,0 +1,14 @@
+id	surface	operation	expected
+direct_change	lix_change	SELECT direct entity change	one authenticated row and stable digest
+derived_commit	lix_change	SELECT schema_key=lix_commit	one authenticated commit change; no duplicate
+authenticated_absence	lix_change	exact missing logical key	empty result only for authenticated absence
+missing_catalog_record	lix_change	physically omit required catalog row	typed corruption error before output
+malformed_change	lix_change	mutate required change encoding	typed corruption error before output
+wrong_kind_domain	lix_change	substitute valid object from another domain	typed corruption error before output
+wrong_embedded_change_id	lix_change	substitute object with mismatched embedded ID	typed identity error before output
+duplicate_logical_id	lix_change	duplicate one logical change ID	typed corruption error before output/order/limit
+merged_ordering	history+diff	merge direct and derived authenticated rows	canonical order and identical digest
+limit_after_merge	history+diff	LIMIT 0/1/2 after authenticated merge	validate/order first; result is canonical prefix
+one_owned_read	all	one public SQL operation	one read scope/facade; no helper acquisition
+cold_reopen	all	close/reopen and repeat all positive queries	identical result digests and counters disclosed
+zero_read_writes	all	read-only query phase	no write/commit/flush/compaction operations
