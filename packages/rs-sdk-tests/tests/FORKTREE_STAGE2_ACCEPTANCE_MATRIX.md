@@ -27,7 +27,7 @@ adapt the test, widen visibility, or restore a legacy API to make it compile.
 
 ## First-runnable readiness
 
-Approved topology milestone
+The approved topology milestone
 `origin/codex/forktree-stage2-milestone3e-topology-owned-reader` is frozen at
 `af7899f41c489fe763ce1a64c5468083570979e2`, tree
 `da097bd739b50629ea39b155d4fa9efc870654e0`, parent
@@ -35,22 +35,36 @@ Approved topology milestone
 full-index SHA-256
 `942d05f6c92f89e6c32c3b706c82c4e506e498263b5798c92eb2af607a219587`
 and patch ID `6ed511438fe08387ea40a5b6861f7db9f3544764`. This is an approved
-topology-ownership frontier only; it remains non-runnable and receives no
-artifact application or build.
+topology-ownership frontier remains valid in the approved lineage.
+
+The latest approved readiness base is the source-only BlobRef identity
+successor `origin/codex/forktree-stage2-milestone4b-blob-manifest-identity`,
+head `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`, tree
+`5a8da9f8b11d83bf8216e266beaf4042cee84068`, parent `08f8dd5c...`.
+Its focused full-index SHA-256 is
+`c507282c79b8de8b9cdec3960157276efef2769e2866a895b4c0d015b77fa8f1`,
+its `a12..head` SHA-256 is
+`d5adb4a322dbf98a590d765c9ee2179a3a1e583211cb6a41c3fe2bf2cd786bae`,
+and its stable patch ID is `242302af3d9db6ecb81f258570b1ed0ec99cde3c`.
+Two independent source reviews approved this exact immutable object. It remains
+non-runnable and receives no artifact application or build.
 
 The next eligible candidate must be an explicitly compile-green immutable
-blob/SPI head on this accepted lineage, unless the coordinator names a
+writer/SPI head descending from `54e90dbf...`, unless the coordinator names a
 replacement lineage. The disposable preflight/application procedure is frozen
 in `FORKTREE_STAGE2_FIRST_RUNNABLE_RECIPE.md`.
 
-Immutable BlobRef milestone
+The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at
 `08f8dd5cf20842f79996fae9eb7b0924f074a084`, tree
 `19c8706d6bc3d1dbe9217b4f8386b19c66f027a8`, parent `af7899f...`, but is
-**BLOCKED**. Its range path authenticates a manifest and intersecting chunks
+was **BLOCKED**. Its range path authenticates a manifest and intersecting chunks
 while checking only owner size, so a same-size valid manifest can be
-substituted under a different row `BlobId`. This object is readiness evidence,
-not an executable candidate; `af7899f...` remains the last approved frontier.
+substituted under a different row `BlobId`. This object remains immutable
+blocker evidence, not an executable candidate. The approved `54e90dbf...`
+successor closes that exact blocker by authenticating an owner-private canonical
+BlobId in the manifest and comparing it with the state-row identity before any
+full or range payload chunk read.
 
 Frozen artifact identities and independently reproduced canonical full-index
 binary diff SHA-256 values are:

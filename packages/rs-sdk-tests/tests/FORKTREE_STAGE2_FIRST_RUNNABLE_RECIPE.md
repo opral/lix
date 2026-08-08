@@ -18,12 +18,12 @@ The independently approved topology milestone is:
 - `a12..head` canonical full-index diff SHA-256
   `734d02bfe332e4f8384301de243d85248b639aec0edeffac48b3f56a4ec271e5`.
 
-This approval covers the one-`StorageRead` topology owner/cache contract. It
-does not make the head runnable and is not an acceptance-matrix result.
+This approval covers the one-`StorageRead` topology owner/cache contract and is
+an ancestor of the latest approved reader frontier.
 
-### Blocked BlobRef frontier
+### Superseded blocked BlobRef predecessor
 
-The next immutable reader milestone was inspected but is not approved:
+The first immutable BlobRef reader milestone was inspected and blocked:
 
 - ref `origin/codex/forktree-stage2-milestone4-blobref-owned-view`;
 - head `08f8dd5cf20842f79996fae9eb7b0924f074a084`;
@@ -46,9 +46,29 @@ with the row ID before full or range publication, and add a same-size
 manifest-substitution fail-closed test. The existing mismatched-size test is
 insufficient. No compatibility or fallback path is permitted.
 
-`af7899f41c489fe763ce1a64c5468083570979e2` therefore remains the last
-approved readiness frontier. `08f8dd5cf20842f79996fae9eb7b0924f074a084`
-is identity-pinned blocker evidence only.
+`08f8dd5cf20842f79996fae9eb7b0924f074a084` remains identity-pinned blocker
+evidence only; it is superseded, not erased.
+
+### Latest approved BlobRef readiness base
+
+Two independent source reviews approved the narrow immutable successor:
+
+- ref `origin/codex/forktree-stage2-milestone4b-blob-manifest-identity`;
+- head `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`;
+- tree `5a8da9f8b11d83bf8216e266beaf4042cee84068`;
+- parent `08f8dd5cf20842f79996fae9eb7b0924f074a084`;
+- parent-to-head full-index SHA-256
+  `c507282c79b8de8b9cdec3960157276efef2769e2866a895b4c0d015b77fa8f1`;
+- `a12..head` full-index SHA-256
+  `d5adb4a322dbf98a590d765c9ee2179a3a1e583211cb6a41c3fe2bf2cd786bae`;
+- stable patch ID `242302af3d9db6ecb81f258570b1ed0ec99cde3c`.
+
+The successor authenticates an owner-private canonical BlobId inside the
+manifest and compares it to the selected state-row identity before any payload
+chunk load on full and range reads. It adds same-size multi-chunk substitution
+negative coverage and a valid control without an index, cache, fallback, or
+second serving owner. This approval is source-only: `54e90dbf...` remains
+non-runnable and is not an acceptance-matrix result.
 
 ## Eligibility fence
 
@@ -57,10 +77,10 @@ ref, exact head and tree as compile-green. Before creating a worktree:
 
 1. fetch that exact ref into a private verification ref;
 2. require its commit and tree to equal the advertised values;
-3. require `af7899f41c489fe763ce1a64c5468083570979e2` to be an ancestor, unless the
+3. require `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c` to be an ancestor, unless the
    coordinator explicitly names a replacement accepted lineage;
-4. require the BlobRef same-size manifest-substitution blocker above to be
-   closed by immutable source and focused fail-closed evidence;
+4. require the BlobRef same-size manifest-substitution correction above to
+   remain byte-identical in the candidate lineage;
 5. run the frozen ten-ref verifier and require every identity/file check green;
 6. check disk, then create a fresh detached disposable worktree and isolated
    Cargo target outside Ryzen-V's production worktree.
@@ -73,7 +93,7 @@ git fetch --no-tags origin \
 test "$(git rev-parse refs/stage2-candidate/next^{commit})" = "<advertised-head>"
 test "$(git rev-parse refs/stage2-candidate/next^{tree})" = "<advertised-tree>"
 git merge-base --is-ancestor \
-  af7899f41c489fe763ce1a64c5468083570979e2 \
+  54e90dbf2bcf55c74de0be6ea4b217dc02cec89c \
   refs/stage2-candidate/next
 timeout 20m \
   packages/rs-sdk-tests/tests/forktree_stage2_acceptance_verify.sh .
