@@ -1,7 +1,9 @@
-# b59 source-gate calibration
+# b59 source-gate calibration and 482e H1 correction
 
 This is a static calibration result on the immutable b59 anchor. It is not a
-candidate acceptance result and does not claim compilation or runtime.
+candidate acceptance result and does not claim production compilation or
+runtime. The corrected successor keeps the source gate intentionally RED on
+b59 while strengthening the pure model and source policy.
 
 Command:
 
@@ -12,6 +14,13 @@ bash packages/lix/tests/branch_ref_whole_closure_oracle_b59/verify_branch_ref_wh
 ```
 
 Result: exit status `1`, expected `RED`.
+
+The corrected successor replayed the same source verifier from its immutable
+482e descendant. It still reports `required-missing=0` and the expected
+compiler-red closure (`legacy-residue=460`, `old-closure-paths=4`); no
+production file changed in the correction. The normalized source-gate capture
+is `/tmp/branch-ref-selector-correction-b59-source.log`, SHA-256
+`6517c8ef1f25af1cc875b7f13ac0f7bb46786b6cc16ad3d3dab800aa6cb2b7f3`.
 
 Summary:
 
@@ -43,4 +52,26 @@ Static checks on this package:
 * `bash -n verify_branch_ref_whole_closure.sh`: PASS
 * `rustfmt --edition 2021 --check branch_ref_whole_closure_model.rs`: PASS
 * `git diff --check`: PASS
-* Rust compilation, adapter tests, and runtime: deliberately not run
+* standalone model `rustc --edition=2021 --test -D warnings`: PASS
+* standalone model runtime: 13/13 PASS, binary SHA-256
+  `c8599f55163dd03ea17a480df49bf342a2778c04c0e35d1dafca269773ae023a`,
+  log SHA-256 `42d98c0fb0bbc875bf4ea85649d9cd7ce305bcdf674bb307ba682cf9bd6f3f17`
+* production compilation, adapter tests, and current-main runtime: deliberately
+  not run
+
+## H1 correction coverage
+
+The successor model adds deterministic selector construction and validation.
+Global and branch selector bytes contain the exact root, epoch/generations,
+catalog root, canonical branch identity, and owner identity; each has a stable
+authentication fingerprint. `SelectorFingerprint` exposes all of those fields
+for equality across reopen and CAS outcomes.
+
+The model has separate `StaleSelector`, `UnrelatedOwner`, and `DualAuthority`
+outcomes. Same-owner stale bytes fail before writes; a publication relabeled
+to another branch owner fails before writes; and a forged derived
+`lix_branch_ref` authority cannot publish. The lifecycle tests exercise create,
+switch, advance, delete, retire, retained-view release/GC, and cold reopen,
+including malformed/same-size substitutions, missing roots, cycles, and epoch
+gaps. Future adapter commands require the same fingerprints, one retained view,
+and zero backend writes for read/CAS rejection.

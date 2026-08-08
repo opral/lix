@@ -31,7 +31,9 @@ CARGO_TARGET_DIR="$TARGET" CARGO_BUILD_JOBS=2 \
   --features 'storage-benches slatedb' --no-run
 ```
 
-The candidate-side Cargo test must exercise the same contract as the model;
+The candidate-side Cargo test must exercise the same contract as the corrected
+model; the frozen package itself deliberately does not wire a production or
+Cargo target on compiler-red b59.
 the frozen package itself deliberately does not wire a production or Cargo
 target on compiler-red b59.
 
@@ -48,11 +50,16 @@ for backend in memory rocksdb slatedb; do
 done
 ```
 
-Each backend must verify one-view reads and one-commit writes for create,
-switch, delete, undo, redo, checkpoint, and GC. It must measure no read-side
-writes, exact selector CAS failures, cold reopen parity, final-reference
-reclamation, and fail-closed malformed/cycle/missing-root cases. It must
-separately assert that a forged or stale `lix_branch_ref` projection cannot
-change the selected branch root. State fingerprints must include active
-branch, histories, object set, live-object set, and in-flight allocation set;
-reopen must reject a global selector epoch gap.
+Each backend must verify one retained-view read and one-commit writes for
+create, switch, advance, delete, retire, undo, redo, checkpoint, and GC. It
+must measure no read-side writes, exact selector CAS failures, and distinguish
+same-owner stale CAS from unrelated-owner CAS without a backend write. Every
+result must include the authenticated global/branch root, generations,
+canonical selector bytes, catalog root, and owner identities. Cold reopen must
+preserve those fingerprints and reject a global selector epoch gap, same-size
+selector substitutions, wrong owner, wrong catalog, missing root, and cycles.
+It must separately assert that a forged or stale `lix_branch_ref` projection
+cannot change the selected branch root and that a second-authority publication
+is rejected before any selector rotation. State fingerprints must include
+active branch, histories, object set, live-object set, in-flight allocations,
+and per-branch selector fingerprints.

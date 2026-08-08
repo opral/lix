@@ -1,10 +1,18 @@
 # BranchHeadControl / BranchRef whole-closure deletion oracle
 
-This is a test/report-only package anchored directly to the compiler-red b59
-frontier. It adds no production code, no Cargo wiring, no adapter fixture, and
-no compatibility implementation. Its source gate is intentionally RED on b59
-because the old closure is still referenced while the defining BranchHead
-control owner has already been removed from the tree.
+This is a test/report-only correction package anchored directly to the
+compiler-red b59 frontier. It adds no production code, no Cargo wiring, no
+adapter fixture, and no compatibility implementation. Its source gate is
+intentionally RED on b59 because the old closure is still referenced while the
+defining BranchHead control owner has already been removed from the tree.
+
+This successor closes the blocked 482e oracle's H1 gaps in the pure model and
+future source contract: selector fingerprints include every authenticated root,
+generation, canonical selector byte string, catalog root, and owner identity;
+publication checks distinguish same-owner stale CAS from unrelated-owner
+attempts; a forged derived branch-ref authority is rejected; and create,
+switch, advance, delete/retire, retained-view GC, and cold reopen are exercised
+as state transitions rather than token-presence claims.
 
 ## Immutable anchor
 
@@ -58,6 +66,16 @@ all remaining consumers.
 * `PreparedPublication` stages immutable objects and selector puts/deletes,
   carries exact raw selector expectations from that view, rotates the global
   epoch, and commits exactly once. Construction is not authority.
+* Every model `SelectorFingerprint` carries the global and branch selector key,
+  global root, branch root, global epoch/generation, branch generation,
+  canonical selector bytes, catalog root, global and branch owner identities,
+  and deterministic authentication tags.
+  Same-size root or owner substitutions invalidate the selector before any
+  read or write is returned.
+* A same-owner publication whose expected selector bytes are stale returns
+  `StaleSelector`; a publication relabeled to an unrelated branch owner returns
+  `UnrelatedOwner`. Both fail before mutation. A `DerivedBranchRef` publication
+  returns `DualAuthority` and cannot alter the selector view.
 * Missing selector is ordinary absence only where the API defines bootstrap;
   malformed, wrong-key, wrong-branch, wrong-root, stale, duplicate, or
   unreachable selector/object data fails closed without fallback or repair.
@@ -67,11 +85,12 @@ all remaining consumers.
 
 ## Lifecycle and race oracle
 
-The pure model covers create, switch, delete, undo, redo, checkpoint, GC,
-reader snapshots, reopen, and state fingerprints. Every selector-changing
-operation is one prepared publication and one commit; GC maintenance is a
-separately fenced deletion commit and never a second selector authority. The
-required future adapter controls include:
+The pure model covers create, switch, advance, delete, retire, undo, redo,
+checkpoint-like rotation, GC, retained reader snapshots, cold reopen, and
+complete state/selector fingerprints. Every selector-changing operation is one
+prepared publication and one commit; session switch is read-validated state
+only; GC maintenance is separately fenced and never a second selector
+authority. The required future adapter controls include:
 
 1. create/switch/delete with stale selector CAS in both publication orders;
 2. undo/redo and checkpoint while an old `CoherentView` is retained;
@@ -86,6 +105,12 @@ required future adapter controls include:
    rotation, write, commit, or partial state;
 7. flush/drop/cold reopen on Memory, RocksDB, and SlateDB, including global
    sequence validation and fingerprint equality.
+
+The corrected model also requires the future adapter lane to report the exact
+selector byte/authentication fingerprint and owner identity in every CAS
+failure, and to prove that an unrelated-owner CAS fails without a backend
+write. A forged `lix_branch_ref` row is a negative input only; it is never a
+selector read or write source.
 
 No race may publish a root selected from a different view. No corruption case
 may write, rotate a selector, or fall back to the old control/row space.

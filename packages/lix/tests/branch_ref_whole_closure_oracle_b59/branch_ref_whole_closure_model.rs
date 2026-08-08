@@ -1,23 +1,140 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+const REPOSITORY_OWNER: &str = "repository:fixture";
+const SELECTOR_CATALOG_ROOT: &str = "catalog:root";
+const GLOBAL_SELECTOR_KEY: &str = "selector:global";
+
+fn authenticated_fingerprint(bytes: &str) -> String {
+    // The model intentionally uses a deterministic, dependency-free tag. The
+    // important property for this oracle is that every authenticated field is
+    // in the canonical bytes and that same-size substitutions do not compare
+    // equal; production authentication remains owned by ForkTree.
+    let mut left = 0xcbf29ce484222325_u64;
+    let mut right = 0x84222325cbf29ce4_u64;
+    for (index, byte) in bytes.bytes().enumerate() {
+        left ^= u64::from(byte);
+        left = left.wrapping_mul(0x100000001b3_u64);
+        right ^= u64::from(byte).wrapping_add(index as u64).rotate_left(1);
+        right = right.wrapping_mul(0x100000001b3_u64);
+    }
+    format!("{left:016x}{right:016x}:{}", bytes.len())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GlobalSelector {
+    selector_key: String,
     root: String,
     epoch: u64,
     generation: u64,
+    owner: String,
+    selector_bytes: String,
+    auth_fingerprint: String,
+}
+
+impl GlobalSelector {
+    fn new(root: &str, epoch: u64, generation: u64) -> Self {
+        let owner = REPOSITORY_OWNER.to_owned();
+        let selector_key = GLOBAL_SELECTOR_KEY.to_owned();
+        let selector_bytes = format!(
+            "global|key={selector_key}|owner={owner}|root={root}|epoch={epoch}|generation={generation}"
+        );
+        let auth_fingerprint = authenticated_fingerprint(&selector_bytes);
+        Self {
+            selector_key,
+            root: root.to_owned(),
+            epoch,
+            generation,
+            owner,
+            selector_bytes,
+            auth_fingerprint,
+        }
+    }
+
+    fn is_authenticated(&self) -> bool {
+        self.selector_bytes
+            == format!(
+                "global|key={}|owner={}|root={}|epoch={}|generation={}",
+                self.selector_key, self.owner, self.root, self.epoch, self.generation
+            )
+            && self.auth_fingerprint == authenticated_fingerprint(&self.selector_bytes)
+            && self.owner == REPOSITORY_OWNER
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BranchSelector {
+    selector_key: String,
     branch: String,
     snapshot: String,
     generation: u64,
+    owner: String,
+    catalog_root: String,
+    selector_bytes: String,
+    auth_fingerprint: String,
+}
+
+impl BranchSelector {
+    fn new(branch: &str, snapshot: &str, generation: u64) -> Self {
+        let owner = format!("branch:{branch}");
+        let selector_key = format!("selector:branch:{branch}");
+        let catalog_root = SELECTOR_CATALOG_ROOT.to_owned();
+        let selector_bytes = format!(
+            "branch|key={selector_key}|owner={owner}|branch={branch}|catalog={catalog_root}|root={snapshot}|generation={generation}"
+        );
+        let auth_fingerprint = authenticated_fingerprint(&selector_bytes);
+        Self {
+            selector_key,
+            branch: branch.to_owned(),
+            snapshot: snapshot.to_owned(),
+            generation,
+            owner,
+            catalog_root,
+            selector_bytes,
+            auth_fingerprint,
+        }
+    }
+
+    fn is_authenticated(&self) -> bool {
+        self.selector_bytes
+            == format!(
+                "branch|key={}|owner={}|branch={}|catalog={}|root={}|generation={}",
+                self.selector_key,
+                self.owner,
+                self.branch,
+                self.catalog_root,
+                self.snapshot,
+                self.generation
+            )
+            && self.auth_fingerprint == authenticated_fingerprint(&self.selector_bytes)
+            && self.owner == format!("branch:{}", self.branch)
+            && self.selector_key == format!("selector:branch:{}", self.branch)
+            && self.catalog_root == SELECTOR_CATALOG_ROOT
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectorFingerprint {
+    global_selector_key: String,
+    branch_selector_key: String,
+    global_root: String,
+    branch_root: String,
+    global_epoch: u64,
+    global_generation: u64,
+    branch_generation: u64,
+    global_selector_bytes: String,
+    branch_selector_bytes: String,
+    global_owner: String,
+    branch_owner: String,
+    catalog_root: String,
+    global_auth_fingerprint: String,
+    branch_auth_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoherentView {
     global: GlobalSelector,
     branch: BranchSelector,
+    read_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,7 +144,22 @@ struct StateFingerprint {
     objects: BTreeSet<String>,
     live_objects: BTreeSet<String>,
     allocations: BTreeSet<String>,
+    selector_fingerprints: BTreeMap<String, SelectorFingerprint>,
     global_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationKind {
+    Create,
+    Advance,
+    Delete,
+    Retire,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationAuthority {
+    Selector,
+    DerivedBranchRef,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,20 +170,27 @@ struct PreparedPublication {
     next_branch: Option<BranchSelector>,
     staged_objects: BTreeSet<String>,
     next_active_branch: Option<String>,
+    owner: String,
+    read_id: u64,
     view_count: u8,
     commit_count: u8,
     selector_cas_count: u8,
+    authority: PublicationAuthority,
+    kind: PublicationKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Failure {
     InvalidBranchIdentity,
     StaleSelector,
+    UnrelatedOwner,
     CorruptSelector,
     MissingRoot,
     Cycle,
     DualAuthority,
     InvalidGlobalSequence,
+    InvalidFingerprint,
+    RetiredBranch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,55 +208,106 @@ struct Repository {
     live_objects: BTreeSet<String>,
     allocations: BTreeSet<String>,
     derived_branch_refs: BTreeMap<String, String>,
+    retired: BTreeSet<String>,
+    retained_views: BTreeMap<u64, String>,
     epoch_history: Vec<u64>,
     active_branch: Option<String>,
     cycles: BTreeSet<String>,
-    views: u8,
-    writes: u8,
-    commits: u8,
+    views: u64,
+    read_acquisitions: u64,
+    writes: u64,
+    commits: u64,
+    next_read_id: u64,
 }
 
 impl Repository {
     fn bootstrap() -> Self {
         let mut objects = BTreeSet::new();
         objects.insert("root-global".into());
-        let mut live_objects = BTreeSet::new();
-        live_objects.insert("root-global".into());
+        objects.insert(SELECTOR_CATALOG_ROOT.into());
+        let live_objects = objects.clone();
         Self {
-            global: Some(GlobalSelector {
-                root: "root-global".into(),
-                epoch: 1,
-                generation: 1,
-            }),
+            global: Some(GlobalSelector::new("root-global", 1, 1)),
             branches: BTreeMap::new(),
             histories: BTreeMap::new(),
             objects,
             live_objects,
             allocations: BTreeSet::new(),
             derived_branch_refs: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            retained_views: BTreeMap::new(),
             epoch_history: vec![1],
             active_branch: None,
             cycles: BTreeSet::new(),
             views: 0,
+            read_acquisitions: 0,
             writes: 0,
             commits: 0,
+            next_read_id: 1,
         }
     }
 
+    fn selector_fingerprint(&self, branch: &str) -> Result<SelectorFingerprint, Failure> {
+        let global = self.global.as_ref().ok_or(Failure::MissingRoot)?;
+        let branch_selector = self.branches.get(branch).ok_or(Failure::MissingRoot)?;
+        Ok(SelectorFingerprint {
+            global_selector_key: global.selector_key.clone(),
+            branch_selector_key: branch_selector.selector_key.clone(),
+            global_root: global.root.clone(),
+            branch_root: branch_selector.snapshot.clone(),
+            global_epoch: global.epoch,
+            global_generation: global.generation,
+            branch_generation: branch_selector.generation,
+            global_selector_bytes: global.selector_bytes.clone(),
+            branch_selector_bytes: branch_selector.selector_bytes.clone(),
+            global_owner: global.owner.clone(),
+            branch_owner: branch_selector.owner.clone(),
+            catalog_root: branch_selector.catalog_root.clone(),
+            global_auth_fingerprint: global.auth_fingerprint.clone(),
+            branch_auth_fingerprint: branch_selector.auth_fingerprint.clone(),
+        })
+    }
+
     fn fingerprint(&self) -> StateFingerprint {
+        let selector_fingerprints = self
+            .branches
+            .keys()
+            .filter_map(|branch| {
+                self.selector_fingerprint(branch)
+                    .ok()
+                    .map(|fingerprint| (branch.clone(), fingerprint))
+            })
+            .collect();
         StateFingerprint {
             active_branch: self.active_branch.clone(),
             histories: self.histories.clone(),
             objects: self.objects.clone(),
             live_objects: self.live_objects.clone(),
             allocations: self.allocations.clone(),
+            selector_fingerprints,
             global_epoch: self.global.as_ref().map_or(0, |selector| selector.epoch),
+        }
+    }
+
+    fn validate_global(&self, global: &GlobalSelector) -> Result<(), Failure> {
+        if global.is_authenticated() {
+            Ok(())
+        } else {
+            Err(Failure::InvalidFingerprint)
+        }
+    }
+
+    fn validate_branch_selector(&self, branch: &BranchSelector) -> Result<(), Failure> {
+        if branch.is_authenticated() {
+            Ok(())
+        } else {
+            Err(Failure::InvalidFingerprint)
         }
     }
 
     fn create_branch(&mut self, branch: &str, snapshot: &str) -> Result<OperationResult, Failure> {
         validate_branch(branch)?;
-        if self.branches.contains_key(branch) {
+        if self.branches.contains_key(branch) || self.retired.contains(branch) {
             return Err(Failure::StaleSelector);
         }
         self.stage_object(snapshot);
@@ -125,15 +315,32 @@ impl Repository {
         self.publish(prepared)
     }
 
+    fn switch_branch(&mut self, branch: &str) -> Result<OperationResult, Failure> {
+        let view = self.open_view(branch)?;
+        if self.active_branch.as_deref() == Some(branch) {
+            self.release_view(&view);
+            return Ok(OperationResult::NoOp);
+        }
+        // Switching the session's selected branch does not rewrite selector
+        // authority; the retained view proves the target branch first.
+        self.active_branch = Some(view.branch.branch.clone());
+        self.release_view(&view);
+        Ok(OperationResult::Published)
+    }
+
     fn open_view(&mut self, branch: &str) -> Result<CoherentView, Failure> {
         validate_branch(branch)?;
-        self.views += 1;
         let global = self.global.clone().ok_or(Failure::MissingRoot)?;
+        self.validate_global(&global)?;
+        if self.retired.contains(branch) {
+            return Err(Failure::RetiredBranch);
+        }
         let selector = self
             .branches
             .get(branch)
             .cloned()
             .ok_or(Failure::MissingRoot)?;
+        self.validate_branch_selector(&selector)?;
         if self.cycles.contains(branch)
             || selector.branch != branch
             || !self.objects.contains(&selector.snapshot)
@@ -145,10 +352,21 @@ impl Repository {
                 Failure::CorruptSelector
             });
         }
+        let read_id = self.next_read_id;
+        self.next_read_id += 1;
+        self.views += 1;
+        self.read_acquisitions += 1;
+        self.retained_views
+            .insert(read_id, selector.snapshot.clone());
         Ok(CoherentView {
             global,
             branch: selector,
+            read_id,
         })
+    }
+
+    fn release_view(&mut self, view: &CoherentView) {
+        self.retained_views.remove(&view.read_id);
     }
 
     fn stage_object(&mut self, object: &str) {
@@ -161,31 +379,29 @@ impl Repository {
         snapshot: &str,
     ) -> Result<PreparedPublication, Failure> {
         validate_branch(branch)?;
-        if self.branches.contains_key(branch) {
+        if self.branches.contains_key(branch) || self.retired.contains(branch) {
             return Err(Failure::StaleSelector);
         }
         if !self.allocations.contains(snapshot) {
             return Err(Failure::MissingRoot);
         }
         let global = self.global.clone().ok_or(Failure::MissingRoot)?;
+        self.validate_global(&global)?;
+        let next_branch = BranchSelector::new(branch, snapshot, 1);
         Ok(PreparedPublication {
             expected_global: global.clone(),
             expected_branch: None,
-            next_global: GlobalSelector {
-                root: global.root,
-                epoch: global.epoch + 1,
-                generation: global.generation + 1,
-            },
-            next_branch: Some(BranchSelector {
-                branch: branch.into(),
-                snapshot: snapshot.into(),
-                generation: 1,
-            }),
+            next_global: GlobalSelector::new(&global.root, global.epoch + 1, global.generation + 1),
+            next_branch: Some(next_branch),
             staged_objects: std::iter::once(snapshot.into()).collect(),
             next_active_branch: Some(branch.into()),
+            owner: format!("branch:{branch}"),
+            read_id: 0,
             view_count: 1,
             commit_count: 1,
             selector_cas_count: 2,
+            authority: PublicationAuthority::Selector,
+            kind: PublicationKind::Create,
         })
     }
 
@@ -194,19 +410,21 @@ impl Repository {
         view: &CoherentView,
         next_snapshot: &str,
     ) -> Result<PreparedPublication, Failure> {
+        self.validate_global(&view.global)?;
+        self.validate_branch_selector(&view.branch)?;
         if !self.objects.contains(next_snapshot) && !self.allocations.contains(next_snapshot) {
             return Err(Failure::MissingRoot);
         }
-        let next_global = GlobalSelector {
-            root: view.global.root.clone(),
-            epoch: view.global.epoch + 1,
-            generation: view.global.generation + 1,
-        };
-        let next_branch = BranchSelector {
-            branch: view.branch.branch.clone(),
-            snapshot: next_snapshot.into(),
-            generation: view.branch.generation + 1,
-        };
+        let next_global = GlobalSelector::new(
+            &view.global.root,
+            view.global.epoch + 1,
+            view.global.generation + 1,
+        );
+        let next_branch = BranchSelector::new(
+            &view.branch.branch,
+            next_snapshot,
+            view.branch.generation + 1,
+        );
         Ok(PreparedPublication {
             expected_global: view.global.clone(),
             expected_branch: Some(view.branch.clone()),
@@ -219,21 +437,25 @@ impl Repository {
                 .cloned()
                 .collect(),
             next_active_branch: self.active_branch.clone(),
+            owner: view.branch.owner.clone(),
+            read_id: view.read_id,
             view_count: 1,
             commit_count: 1,
             selector_cas_count: 2,
+            authority: PublicationAuthority::Selector,
+            kind: PublicationKind::Advance,
         })
     }
 
-    fn prepare_delete(&self, view: &CoherentView) -> PreparedPublication {
+    fn prepare_delete(&self, view: &CoherentView, kind: PublicationKind) -> PreparedPublication {
         PreparedPublication {
             expected_global: view.global.clone(),
             expected_branch: Some(view.branch.clone()),
-            next_global: GlobalSelector {
-                root: view.global.root.clone(),
-                epoch: view.global.epoch + 1,
-                generation: view.global.generation + 1,
-            },
+            next_global: GlobalSelector::new(
+                &view.global.root,
+                view.global.epoch + 1,
+                view.global.generation + 1,
+            ),
             next_branch: None,
             staged_objects: BTreeSet::new(),
             next_active_branch: self
@@ -241,30 +463,74 @@ impl Repository {
                 .as_deref()
                 .filter(|active| *active != view.branch.branch)
                 .map(str::to_owned),
+            owner: view.branch.owner.clone(),
+            read_id: view.read_id,
             view_count: 1,
             commit_count: 1,
             selector_cas_count: 2,
+            authority: PublicationAuthority::Selector,
+            kind,
         }
     }
 
+    fn retire_branch(&mut self, branch: &str) -> Result<OperationResult, Failure> {
+        let view = self.open_view(branch)?;
+        let prepared = self.prepare_delete(&view, PublicationKind::Retire);
+        let result = self.publish(prepared);
+        self.release_view(&view);
+        result
+    }
+
     fn publish(&mut self, prepared: PreparedPublication) -> Result<OperationResult, Failure> {
-        if prepared.view_count != 1
+        if prepared.authority != PublicationAuthority::Selector
+            || prepared.view_count != 1
             || prepared.commit_count != 1
             || prepared.selector_cas_count != 2
         {
             return Err(Failure::DualAuthority);
         }
+        match prepared.kind {
+            PublicationKind::Create if prepared.expected_branch.is_some() => {
+                return Err(Failure::DualAuthority)
+            }
+            PublicationKind::Advance if prepared.expected_branch.is_none() => {
+                return Err(Failure::DualAuthority)
+            }
+            PublicationKind::Delete | PublicationKind::Retire if prepared.next_branch.is_some() => {
+                return Err(Failure::DualAuthority)
+            }
+            _ => {}
+        }
+        if let Some(expected_branch) = prepared.expected_branch.as_ref() {
+            if prepared.owner != expected_branch.owner {
+                return Err(Failure::UnrelatedOwner);
+            }
+            if prepared.read_id == 0 || !self.retained_views.contains_key(&prepared.read_id) {
+                return Err(Failure::StaleSelector);
+            }
+        } else if prepared.owner
+            != prepared
+                .next_branch
+                .as_ref()
+                .map_or_else(String::new, |branch| branch.owner.clone())
+        {
+            return Err(Failure::UnrelatedOwner);
+        }
+        self.validate_global(&prepared.expected_global)?;
+        self.validate_global(&prepared.next_global)?;
         if self.global.as_ref() != Some(&prepared.expected_global) {
             return Err(Failure::StaleSelector);
         }
         if prepared.expected_branch.is_none() {
             if let Some(next_branch) = prepared.next_branch.as_ref() {
+                self.validate_branch_selector(next_branch)?;
                 if self.branches.contains_key(&next_branch.branch) {
                     return Err(Failure::StaleSelector);
                 }
             }
         }
         if let Some(expected_branch) = prepared.expected_branch.as_ref() {
+            self.validate_branch_selector(expected_branch)?;
             if self.branches.get(&expected_branch.branch) != Some(expected_branch) {
                 return Err(Failure::StaleSelector);
             }
@@ -284,6 +550,12 @@ impl Repository {
             next_allocations.remove(object);
         }
         if let Some(next_branch) = prepared.next_branch {
+            if let Some(expected_branch) = prepared.expected_branch.as_ref() {
+                // Replacing a branch selector drops the old root from the
+                // selector-derived live set; retained views keep it alive
+                // only through the separate read lease frontier.
+                next_live.remove(&expected_branch.snapshot);
+            }
             next_live.insert(next_branch.snapshot.clone());
             if prepared.expected_branch.is_none() {
                 next_histories.insert(next_branch.branch.clone(), Vec::new());
@@ -292,7 +564,11 @@ impl Repository {
         } else if let Some(expected_branch) = prepared.expected_branch {
             next_branches.remove(&expected_branch.branch);
             next_histories.remove(&expected_branch.branch);
+            // A retired/deleted selector is no longer live. An old retained
+            // view keeps the immutable root reachable when GC reconstructs
+            // live roots from retained_views.
             next_live.remove(&expected_branch.snapshot);
+            self.retired.insert(expected_branch.branch);
         }
 
         self.global = Some(next_global);
@@ -321,7 +597,8 @@ impl Repository {
     }
 
     fn gc(&mut self) {
-        let live = self.live_objects.clone();
+        let mut live = self.live_objects.clone();
+        live.extend(self.retained_views.values().cloned());
         self.objects.retain(|object| live.contains(object));
         self.writes += 1;
     }
@@ -337,11 +614,19 @@ impl Repository {
         let Some(global) = &self.global else {
             return Err(Failure::MissingRoot);
         };
+        self.validate_global(global)?;
         if self.epoch_history.last() != Some(&global.epoch) {
             return Err(Failure::InvalidGlobalSequence);
         }
+        if !self.objects.contains(&global.root) || !self.objects.contains(SELECTOR_CATALOG_ROOT) {
+            return Err(Failure::MissingRoot);
+        }
         for (branch, selector) in &self.branches {
-            if branch != &selector.branch || !self.objects.contains(&selector.snapshot) {
+            self.validate_branch_selector(selector)?;
+            if branch != &selector.branch
+                || !self.objects.contains(&selector.snapshot)
+                || selector.catalog_root != SELECTOR_CATALOG_ROOT
+            {
                 return Err(Failure::CorruptSelector);
             }
         }
@@ -380,7 +665,62 @@ fn repository_with_branch() -> Repository {
 }
 
 #[test]
-fn fingerprint_covers_active_branch_history_objects_liveness_and_allocations() {
+fn authenticated_fingerprint_covers_every_selector_authority_field() {
+    let repository = repository_with_branch();
+    let fingerprint = repository.selector_fingerprint(BRANCH_A).unwrap();
+    assert_eq!(fingerprint.global_selector_key, GLOBAL_SELECTOR_KEY);
+    assert_eq!(
+        fingerprint.branch_selector_key,
+        format!("selector:branch:{BRANCH_A}")
+    );
+    assert_eq!(fingerprint.global_root, "root-global");
+    assert_eq!(fingerprint.branch_root, "root-a");
+    assert_eq!(fingerprint.global_epoch, 2);
+    assert_eq!(fingerprint.global_generation, 2);
+    assert_eq!(fingerprint.branch_generation, 1);
+    assert!(fingerprint
+        .global_selector_bytes
+        .contains("root=root-global"));
+    assert!(fingerprint.branch_selector_bytes.contains("root=root-a"));
+    assert_eq!(fingerprint.global_owner, REPOSITORY_OWNER);
+    assert_eq!(fingerprint.branch_owner, format!("branch:{BRANCH_A}"));
+    assert_eq!(fingerprint.catalog_root, SELECTOR_CATALOG_ROOT);
+    assert_eq!(
+        fingerprint.global_auth_fingerprint,
+        authenticated_fingerprint(&fingerprint.global_selector_bytes)
+    );
+    assert_eq!(
+        fingerprint.branch_auth_fingerprint,
+        authenticated_fingerprint(&fingerprint.branch_selector_bytes)
+    );
+}
+
+#[test]
+fn selector_bytes_bind_exact_root_catalog_generation_and_owner() {
+    let mut repository = repository_with_branch();
+    let original = repository.branches[BRANCH_A].clone();
+    let mut forged = original.clone();
+    forged.snapshot = "root-b".into();
+    repository.branches.insert(BRANCH_A.into(), forged);
+    assert_eq!(
+        repository.open_view(BRANCH_A),
+        Err(Failure::InvalidFingerprint)
+    );
+
+    repository
+        .branches
+        .insert(BRANCH_A.into(), original.clone());
+    let mut wrong_catalog = original.clone();
+    wrong_catalog.catalog_root = "catalog:other".into();
+    repository.branches.insert(BRANCH_A.into(), wrong_catalog);
+    assert_eq!(
+        repository.open_view(BRANCH_A),
+        Err(Failure::InvalidFingerprint)
+    );
+}
+
+#[test]
+fn fingerprint_covers_state_and_in_flight_allocations() {
     let mut repository = repository_with_branch();
     repository.stage_object("staged-a");
     let fingerprint = repository.fingerprint();
@@ -389,35 +729,66 @@ fn fingerprint_covers_active_branch_history_objects_liveness_and_allocations() {
     assert!(fingerprint.objects.contains("root-global"));
     assert!(fingerprint.live_objects.contains("root-a"));
     assert!(fingerprint.allocations.contains("staged-a"));
+    assert!(fingerprint.selector_fingerprints.contains_key(BRANCH_A));
 }
 
 #[test]
-fn one_view_one_prepared_publication_one_commit() {
+fn one_retained_view_and_one_prepared_publication_one_commit() {
     let mut repository = repository_with_branch();
     repository.stage_object("root-next");
     let view = repository.open_view(BRANCH_A).unwrap();
     let prepared = repository.prepare_branch(&view, "root-next").unwrap();
+    assert_eq!(prepared.read_id, view.read_id);
     assert_eq!(repository.publish(prepared), Ok(OperationResult::Published));
-    assert_eq!(repository.views, 1);
+    assert_eq!(repository.views, 1); // this retained read
+    assert_eq!(repository.read_acquisitions, 1);
     assert_eq!(repository.writes, 2); // create plus advance
     assert_eq!(repository.commits, 2);
     assert!(repository.allocations.is_empty());
+    repository.release_view(&view);
 }
 
 #[test]
-fn stale_or_corrupt_publication_has_no_partial_state() {
+fn same_owner_stale_cas_and_unrelated_owner_are_distinct_failures() {
+    let mut stale = repository_with_branch();
+    stale.stage_object("root-next");
+    let stale_view = stale.open_view(BRANCH_A).unwrap();
+    let stale_prepared = stale.prepare_branch(&stale_view, "root-next").unwrap();
+    stale.branches.get_mut(BRANCH_A).unwrap().generation += 1;
+    let stale_writes = stale.writes;
+    assert_eq!(stale.publish(stale_prepared), Err(Failure::StaleSelector));
+    assert_eq!(stale.writes, stale_writes);
+
+    let mut unrelated = repository_with_branch();
+    unrelated.stage_object("root-next");
+    let unrelated_view = unrelated.open_view(BRANCH_A).unwrap();
+    let mut unrelated_prepared = unrelated
+        .prepare_branch(&unrelated_view, "root-next")
+        .unwrap();
+    unrelated_prepared.owner = format!("branch:{BRANCH_B}");
+    let unrelated_writes = unrelated.writes;
+    assert_eq!(
+        unrelated.publish(unrelated_prepared),
+        Err(Failure::UnrelatedOwner)
+    );
+    assert_eq!(unrelated.writes, unrelated_writes);
+}
+
+#[test]
+fn second_authority_negative_cannot_publish_or_change_selected_root() {
     let mut repository = repository_with_branch();
-    repository.stage_object("root-next");
+    repository
+        .derived_branch_refs
+        .insert(BRANCH_A.into(), "fake-root".into());
     let view = repository.open_view(BRANCH_A).unwrap();
-    let prepared = repository.prepare_branch(&view, "root-next").unwrap();
+    assert_eq!(view.branch.snapshot, "root-a");
+    let mut prepared = repository.prepare_delete(&view, PublicationKind::Delete);
+    prepared.authority = PublicationAuthority::DerivedBranchRef;
     let before = repository.fingerprint();
-    repository.branches.get_mut(BRANCH_A).unwrap().generation += 1;
-    let changed = repository.fingerprint();
-    assert_ne!(before, changed);
     let writes = repository.writes;
-    assert_eq!(repository.publish(prepared), Err(Failure::StaleSelector));
+    assert_eq!(repository.publish(prepared), Err(Failure::DualAuthority));
+    assert_eq!(repository.fingerprint(), before);
     assert_eq!(repository.writes, writes);
-    assert!(repository.allocations.contains("root-next"));
 }
 
 #[test]
@@ -429,11 +800,7 @@ fn malformed_identity_missing_root_and_cycle_fail_closed() {
     );
     repository.branches.insert(
         BRANCH_A.into(),
-        BranchSelector {
-            branch: BRANCH_A.into(),
-            snapshot: "missing-root".into(),
-            generation: 1,
-        },
+        BranchSelector::new(BRANCH_A, "missing-root", 1),
     );
     assert_eq!(
         repository.open_view(BRANCH_A),
@@ -443,11 +810,7 @@ fn malformed_identity_missing_root_and_cycle_fail_closed() {
     repository.live_objects.insert("root-cycle".into());
     repository.branches.insert(
         BRANCH_B.into(),
-        BranchSelector {
-            branch: BRANCH_B.into(),
-            snapshot: "root-cycle".into(),
-            generation: 1,
-        },
+        BranchSelector::new(BRANCH_B, "root-cycle", 1),
     );
     repository.cycles.insert(BRANCH_B.into());
     assert_eq!(repository.open_view(BRANCH_B), Err(Failure::Cycle));
@@ -466,14 +829,37 @@ fn empty_undo_redo_are_true_no_ops() {
 }
 
 #[test]
-fn derived_projection_never_becomes_selector_authority() {
-    let mut repository = repository_with_branch();
-    repository
-        .derived_branch_refs
-        .insert(BRANCH_A.into(), "fake-root".into());
-    let view = repository.open_view(BRANCH_A).unwrap();
-    assert_eq!(view.branch.snapshot, "root-a");
-    assert_eq!(repository.global.as_ref().unwrap().root, "root-global");
+fn create_switch_delete_retire_gc_and_cold_reopen_are_one_authority() {
+    let mut repository = Repository::bootstrap();
+    assert_eq!(
+        repository.create_branch(BRANCH_A, "root-a"),
+        Ok(OperationResult::Published)
+    );
+    assert_eq!(
+        repository.create_branch(BRANCH_B, "root-b"),
+        Ok(OperationResult::Published)
+    );
+    assert_eq!(
+        repository.switch_branch(BRANCH_A),
+        Ok(OperationResult::Published)
+    );
+    repository.stage_object("root-a2");
+    let old_view = repository.open_view(BRANCH_A).unwrap();
+    let advance = repository.prepare_branch(&old_view, "root-a2").unwrap();
+    repository.publish(advance).unwrap();
+    assert_eq!(repository.active_branch.as_deref(), Some(BRANCH_A));
+    assert_eq!(
+        repository.retire_branch(BRANCH_B),
+        Ok(OperationResult::Published)
+    );
+    assert!(repository.retired.contains(BRANCH_B));
+    assert_eq!(repository.open_view(BRANCH_B), Err(Failure::RetiredBranch));
+    let reopened = repository.reopen().unwrap();
+    assert_eq!(reopened.fingerprint(), repository.fingerprint());
+    repository.release_view(&old_view);
+    repository.gc();
+    assert!(repository.objects.contains("root-global"));
+    assert!(repository.objects.contains("root-a2"));
 }
 
 #[test]
@@ -481,28 +867,31 @@ fn delete_and_gc_reclaim_final_branch_reference_only() {
     let mut repository = repository_with_branch();
     let view = repository.open_view(BRANCH_A).unwrap();
     let before = repository.fingerprint();
-    assert_eq!(
-        repository.publish(repository.prepare_delete(&view)),
-        Ok(OperationResult::Published)
-    );
+    let prepared = repository.prepare_delete(&view, PublicationKind::Delete);
+    assert_eq!(repository.publish(prepared), Ok(OperationResult::Published));
     assert_ne!(repository.fingerprint(), before);
+    repository.release_view(&view);
     repository.gc();
     assert!(!repository.objects.contains("root-a"));
     assert!(repository.objects.contains("root-global"));
+    assert!(repository.objects.contains(SELECTOR_CATALOG_ROOT));
 }
 
 #[test]
-fn old_view_survives_switch_checkpoint_like_rotation_and_reopen() {
+fn old_view_survives_rotation_and_reopen_until_released() {
     let mut repository = repository_with_branch();
     repository.stage_object("root-next");
     let old_view = repository.open_view(BRANCH_A).unwrap();
-    repository
-        .publish(repository.prepare_branch(&old_view, "root-next").unwrap())
-        .unwrap();
+    let prepared = repository.prepare_branch(&old_view, "root-next").unwrap();
+    repository.publish(prepared).unwrap();
+    repository.gc();
+    assert!(repository.objects.contains("root-a"));
     assert_eq!(old_view.branch.snapshot, "root-a");
     let reopened = repository.reopen().unwrap();
     assert_eq!(reopened.fingerprint(), repository.fingerprint());
-    assert_eq!(reopened.branches[BRANCH_A].snapshot, "root-next");
+    repository.release_view(&old_view);
+    repository.gc();
+    assert!(!repository.objects.contains("root-a"));
 }
 
 #[test]
@@ -517,7 +906,7 @@ fn reopen_rejects_global_epoch_gap() {
 fn invalid_multi_authority_publication_rejects_before_write() {
     let mut repository = repository_with_branch();
     let view = repository.open_view(BRANCH_A).unwrap();
-    let prepared = repository.prepare_delete(&view);
+    let mut prepared = repository.prepare_delete(&view, PublicationKind::Delete);
     prepared.view_count = 2;
     let writes = repository.writes;
     assert_eq!(repository.publish(prepared), Err(Failure::DualAuthority));

@@ -27,7 +27,7 @@ LEGACY=(
   branch_ref_stage_row branch_ref_tombstone_row BRANCH_REF_SCHEMA_KEY
 )
 REQUIRED=(
-  GlobalSelectorV1 BranchSelectorV1 CoherentView PreparedPublication
+  GlobalSelectorV1 BranchSelectorV1 CoherentView ForkTreeReadFacade StorageRead PreparedPublication
   open_coherent_view_on_read 'from_branch_view' 'from_global_epoch'
   SELECTOR_SPACE global_selector_key branch_selector_key
 )
@@ -83,6 +83,11 @@ forbidden_patterns=(
   BranchHeadFallback
   branch_head_control_cache
   branch_ref_reader_cache
+  BranchRefAuthority
+  BranchRefWriter
+  SecondSelectorAuthority
+  DualSelectorAuthority
+  raw_selector_authority
 )
 for pattern in "${forbidden_patterns[@]}"; do
   while IFS= read -r line; do
