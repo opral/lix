@@ -38,96 +38,13 @@ for path in "${paths[@]}"; do
     fi
 done
 
-for path in "${paths[@]}"; do
-    if rg -n -F 'ForkTreeReadFacade::new' "$ROOT/$path" >/dev/null 2>&1; then
-        emit_red local-forktree-facade "$path"
-    else
-        emit_pass no-local-forktree-facade "$path"
-    fi
-    if rg -n -F 'begin_read(' "$ROOT/$path" >/dev/null 2>&1; then
-        emit_red local-begin-read "$path"
-    else
-        emit_pass no-local-begin-read "$path"
-    fi
-done
-
-for path in \
-    packages/lix/src/session/checkpoint.rs \
-    packages/lix/src/sql2/providers/working_diff.rs \
-    packages/lix/src/transaction/context.rs; do
-    for symbol in BranchHeadControlContext TrackedHeadContext TrackedStateStoreReader \
-        TrackedStateContext working_diff_at_head; do
-        if rg -n -F "$symbol" "$ROOT/$path" >/dev/null 2>&1; then
-            emit_red "legacy-$symbol" "$path"
-        else
-            emit_pass "no-legacy-$symbol" "$path"
-        fi
-    done
-done
-
-for path in \
-    packages/lix/src/sql2/providers/checkpoint.rs \
-    packages/lix/src/sql2/providers/filesystem_working_diff.rs \
-    packages/lix/src/sql2/providers/working_diff.rs; do
-    if rg -n -F 'query_source.forktree_reader' "$ROOT/$path" >/dev/null 2>&1; then
-        emit_pass caller-owned-history-source "$path"
-    else
-        emit_red missing-caller-owned-history-source "$path"
-    fi
-    if rg -n -e 'query_source\.store' -e 'store: query_source\.store' "$ROOT/$path" >/dev/null 2>&1; then
-        emit_red store-extracted-for-history "$path"
-    else
-        emit_pass no-store-history-extraction "$path"
-    fi
-done
-
-if rg -n -F 'transaction.forktree_read_facade()' \
-    "$ROOT/packages/lix/src/session/checkpoint.rs" >/dev/null 2>&1; then
-    emit_pass checkpoint-retained-forktree-view packages/lix/src/session/checkpoint.rs
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if python3 "$SCRIPT_DIR/structural_source_gate.py" \
+    "$ROOT" "$SCRIPT_DIR/source_negative_fixtures"; then
+    emit_pass structural-caller-and-materialization-gate "$SCRIPT_DIR"
 else
-    emit_red missing-checkpoint-retained-forktree-view packages/lix/src/session/checkpoint.rs
+    emit_red structural-caller-and-materialization-gate "$SCRIPT_DIR"
 fi
-
-for needle in \
-    'record.commit_id != reachable.commit.commit_id' \
-    'row.commit_id != certified_commit_id' \
-    'cycle encountered' \
-    'references missing parent' \
-    'BlobId::from_hex' \
-    'load_bytes_many' \
-    'directory parent cycle' \
-    'missing from the authenticated history root'; do
-    if rg -n -F "$needle" "$SRC/forktree/view.rs" "$SRC/sql2/history_route.rs" \
-        "$SRC/sql2/providers/file_history.rs" "$SRC/sql2/providers/filesystem_history_path.rs" \
-        "$SRC/sql2/providers/directory_history.rs" >/dev/null 2>&1; then
-        emit_pass preserved-historical-check "$needle"
-    else
-        emit_red missing-historical-check "$needle"
-    fi
-done
-
-for needle in \
-    '|| Some(Vec::new())' \
-    'blob_bytes.get(blob_hash).cloned().flatten()'; do
-    if rg -n -F "$needle" "$ROOT/packages/lix/src/sql2/providers/file_history.rs" \
-        >/dev/null 2>&1; then
-        emit_red permissive-file-materialization "$needle"
-    else
-        emit_pass strict-file-materialization "$needle"
-    fi
-done
-
-for needle in \
-    'exactly one blob reference' \
-    'missing authenticated blob payload' \
-    'blob reference count'; do
-    if rg -n -F "$needle" "$ROOT/packages/lix/src/sql2/providers/file_history.rs" \
-        >/dev/null 2>&1; then
-        emit_pass required-file-failure-contract "$needle"
-    else
-        emit_red missing-file-failure-contract "$needle"
-    fi
-done
 
 if (( red == 0 )); then
     printf 'GREEN\n'

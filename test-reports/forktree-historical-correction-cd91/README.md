@@ -8,18 +8,28 @@ The package makes the narrow successor contract executable at source level:
 
 1. SQL checkpoint, checkpoint creation, filesystem checkpoint working diff,
    and ordinary working diff borrow the exact caller-owned
-   `HistoryQuerySource.forktree_reader`/retained ForkTree view identity.
+   `HistoryQuerySource.forktree_reader`/retained ForkTree view identity. The
+   verifier balances Rust function/call delimiters, follows local aliases, and
+   checks the actual chronology method receiver and `load_rows` first argument;
+   token co-occurrence is not sufficient.
 2. Local `ForkTreeReadFacade::new`, `begin_read`, branch-head controls,
    `TrackedHeadContext`, fresh `TrackedStateStoreReader`, and
    `TrackedStateContext::diff_commits` fallback are forbidden in those paths.
 3. Historical tombstones remain deletion events. Required value rows,
    descriptors, plugin rows, BlobRefs, and blob payloads fail closed when
    missing, malformed, wrong-kind, duplicated, substituted, or unavailable.
+   The gate binds this contract to the exact production parser/materializer
+   functions and fields (`entry.change.*`, `row.*`, `snapshot.*`,
+   `BlobId::from_hex`, `load_bytes_many`, and plugin registry access), then
+   runs production-shaped fixtures rather than relying on generic model tokens.
 4. A single retained view produces reads only: zero plans, writes, commits, or
    selector/epoch rotations for the read oracle.
 
-The pure model is dependency-free and is not registered with Cargo. The
-source gate is calibrated RED against this baseline because the baseline still
+The pure model is dependency-free and is not registered with Cargo. The new
+`structural_source_gate.py` is also dependency-free and source-only. It runs
+five negative source fixtures (distinct view, fresh read, legacy fallback,
+fake token, and wrong call argument) plus a positive alias fixture. The source
+gate is calibrated RED against this baseline because the baseline still
 contains the legacy paths described above.
 
 ## Frozen provenance
@@ -38,7 +48,8 @@ From a clean candidate checkout, with no build or runtime:
 bash test-reports/forktree-historical-correction-cd91/source_gate.sh .
 ```
 
-The exact baseline calibration is recorded in `CD91_RED_CALIBRATION.log` and
+The exact baseline calibration is recorded in `CD91_RED_CALIBRATION.log`;
+`CD91_V2_RED_CALIBRATION.log` records the corrected structural gate output and
 must remain RED until the direct successor removes every listed residue. A
 future candidate must retain `cd91b9b9` in its ancestry and must not override
 the pinned baseline.

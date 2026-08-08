@@ -1,0 +1,12 @@
+case	schema_key	row_deleted	entity_pk	file_id	snapshot	blob_refs	payload	plugin_registry	expected
+valid-file	file	0	file-a	file-a	valid	1	present	1	Value
+valid-plugin	plugin_owner	0	file-a	file-a	valid	1	present	1	Value
+valid-directory	directory	0	dir-a	dir-a	valid	0	none	1	Value
+valid-tombstone	file	1	file-a	file-a	missing	0	none	1	Deletion
+missing-row	file	0		file-a	valid	1	present	1	FailClosed(MissingIdentity)
+missing-descriptor-payload	file	0	file-a	file-a	missing	1	present	1	FailClosed(MissingOrMalformedPayload)
+malformed-blobref	file	0	file-a	file-a	malformed	1	present	1	FailClosed(MissingOrMalformedPayload)
+substituted-blobref	file	0	file-a	file-b	substituted	1	present	1	FailClosed(IdentityMismatch)
+duplicate-blobref	file	0	file-a	file-a	valid	2	present	1	FailClosed(BlobRefCardinality)
+missing-blob-payload	file	0	file-a	file-a	valid	1	missing	1	FailClosed(MissingBlobPayload)
+missing-plugin-registry	plugin_owner	0	file-a	file-a	valid	1	present	0	FailClosed(MissingPluginRegistry)
