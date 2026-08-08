@@ -7,7 +7,7 @@
 )]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::LixError;
@@ -15,19 +15,13 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
     CommitScanRequest,
 };
-use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_nodes};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
 };
 use crate::common::ExactBatch;
 use crate::entity_pk::EntityPk;
-use crate::storage_adapter::{
-    StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
-    StorageProjectedValue, exact_get_many,
-};
-use crate::storage_codec;
-use bytes::Bytes;
+use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 /// Read model for resolving changelog commit facts at a head.
@@ -117,55 +111,11 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         if !uncached_ids.is_empty() {
-            let commit_keys = uncached_ids
-                .iter()
-                .map(|commit_id| StorageKey(Bytes::from(crate::changelog::commit_key(*commit_id))))
-                .collect::<Vec<_>>();
-            let authority_keys = uncached_ids
-                .iter()
-                .map(|commit_id| crate::tracked_state::commit_state_authority_key(*commit_id))
-                .collect::<Vec<_>>();
-            let requests = [
-                StorageGetManyRequest {
-                    space: crate::changelog::COMMIT_SPACE,
-                    keys: &commit_keys,
-                    opts: StorageGetOptions::default(),
-                },
-                StorageGetManyRequest {
-                    space: crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-                    keys: &authority_keys,
-                    opts: StorageGetOptions::default(),
-                },
-            ];
-            let mut values = exact_get_many(&self.store, &requests)
-                .await?
-                .values
-                .into_iter();
-            let records = uncached_ids
-                .iter()
-                .map(|_| {
-                    let value = values.next().expect("exact commit slot is present");
-                    let Some(bytes) = full_value_bytes(value) else {
-                        return Ok(None);
-                    };
-                    let record = storage_codec::decode("commit record", &bytes)?;
-                    Ok(Some(record))
-                })
-                .collect::<Result<Vec<Option<CommitRecord>>, LixError>>()?;
-            let batch = ExactBatch::try_new("changelog commit", &uncached_ids, records)?;
-            let authority_ids = uncached_ids
-                .iter()
-                .map(|commit_id| {
-                    crate::tracked_state::decode_commit_state_authority_id(
-                        *commit_id,
-                        values.next().expect("exact authority slot is present"),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            debug_assert!(values.next().is_none());
-            for ((commit_id, record), authority_id) in batch.into_iter().zip(authority_ids) {
-                let node = commit_graph_node_from_authority(*commit_id, record, authority_id)?;
-                self.node_cache.insert(*commit_id, node);
+            let records = crate::forktree::load_commit_records(&self.store, &uncached_ids).await?;
+            let batch = ExactBatch::try_new("ForkTree commit graph", &uncached_ids, records)?;
+            for (commit_id, record) in batch {
+                self.node_cache
+                    .insert(*commit_id, record.map(commit_graph_node_from_record));
             }
         }
         let nodes = commit_ids
@@ -190,18 +140,8 @@ where
                     limit: Some(1024),
                 })
                 .await?;
-            let commit_ids = scan
-                .entries
-                .iter()
-                .map(|record| record.commit_id)
-                .collect::<Vec<_>>();
-            let authority_ids =
-                crate::tracked_state::load_commit_state_authority_ids(&self.store, &commit_ids)
-                    .await?;
-            for (record, authority_id) in scan.entries.into_iter().zip(authority_ids) {
-                let commit_id = record.commit_id;
-                let node = commit_graph_node_from_authority(commit_id, Some(record), authority_id)?
-                    .expect("scanned commit projection produces a graph node");
+            for record in scan.entries {
+                let node = commit_graph_node_from_record(record);
                 self.node_cache.insert(node.commit_id, Some(node.clone()));
                 commits.push(node);
             }
@@ -478,17 +418,13 @@ where
         {
             return Ok(changes.clone());
         }
-        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
-            &self.store,
-            commit_id,
-            schema_keys,
-            usize::MAX,
-        )
-        .await?
-        .expect("unbounded commit member load cannot exceed its segment limit");
+        let members = crate::forktree::load_commit_member_records(&self.store, commit_id)
+            .await?
+            .ok_or_else(|| missing_commit_graph_error(&commit_id))?;
         let mut changes = members
             .into_iter()
-            .map(|member| commit_graph_change_from_change_record(member.change))
+            .filter(|change| schema_keys.is_empty() || schema_keys.contains(&change.schema_key))
+            .map(commit_graph_change_from_change_record)
             .collect::<Vec<_>>();
         changes.sort_by_key(|change| change.id);
         self.member_changes_cache
@@ -497,6 +433,163 @@ where
             .insert(commit_id, changes.clone());
         Ok(changes)
     }
+}
+
+/// Storage-free graph walk over authenticated ForkTree Commit objects. The
+/// graph algorithm remains local to the semantic reader; there is no legacy
+/// walker owner or persisted chronology accelerator.
+async fn walk_reachable_nodes<S>(
+    reader: &mut CommitGraphStoreReader<S>,
+    head_commit_id: &CommitId,
+) -> Result<Vec<ReachableCommitGraphNode>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut visiting = BTreeSet::new();
+    let mut nearest_depths = BTreeMap::new();
+    let mut stack = vec![TraversalFrame {
+        commit_id: *head_commit_id,
+        depth: 0,
+        expanded: false,
+    }];
+    while let Some(frame) = stack.pop() {
+        if frame.expanded {
+            visiting.remove(&frame.commit_id);
+            continue;
+        }
+        if visiting.contains(&frame.commit_id) {
+            return Err(LixError::unknown(format!(
+                "commit_graph cycle detected at commit '{}'",
+                frame.commit_id
+            )));
+        }
+        if nearest_depths
+            .get(&frame.commit_id)
+            .is_some_and(|previous| *previous <= frame.depth)
+        {
+            continue;
+        }
+        let commit = reader
+            .load_node(&frame.commit_id)
+            .await?
+            .ok_or_else(|| missing_commit_graph_error(&frame.commit_id))?;
+        nearest_depths.insert(frame.commit_id, frame.depth);
+        visiting.insert(frame.commit_id);
+        stack.push(TraversalFrame {
+            commit_id: frame.commit_id,
+            depth: frame.depth,
+            expanded: true,
+        });
+        for parent_commit_id in commit.parent_commit_ids.iter().rev() {
+            stack.push(TraversalFrame {
+                commit_id: *parent_commit_id,
+                depth: frame.depth + 1,
+                expanded: false,
+            });
+        }
+    }
+    let mut commits = Vec::with_capacity(nearest_depths.len());
+    for (commit_id, depth) in nearest_depths {
+        let commit = reader
+            .load_node(&commit_id)
+            .await?
+            .ok_or_else(|| missing_commit_graph_error(&commit_id))?;
+        commits.push(ReachableCommitGraphNode { commit, depth });
+    }
+    commits.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
+    });
+    Ok(commits)
+}
+
+async fn best_common_ancestors<S>(
+    reader: &mut CommitGraphStoreReader<S>,
+    left_commit_id: &CommitId,
+    right_commit_id: &CommitId,
+) -> Result<Vec<CommitGraphNode>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    const LEFT: u8 = 1;
+    const RIGHT: u8 = 2;
+    const BOTH: u8 = LEFT | RIGHT;
+    const STALE: u8 = 4;
+
+    let left = reader
+        .load_node(left_commit_id)
+        .await?
+        .ok_or_else(|| missing_commit_graph_error(left_commit_id))?;
+    let right = reader
+        .load_node(right_commit_id)
+        .await?
+        .ok_or_else(|| missing_commit_graph_error(right_commit_id))?;
+    let mut colors = BTreeMap::from([(*left_commit_id, LEFT), (*right_commit_id, RIGHT)]);
+    if left_commit_id == right_commit_id {
+        colors.insert(*left_commit_id, BOTH);
+    }
+    let mut queue = BTreeSet::from([
+        (left.generation, *left_commit_id),
+        (right.generation, *right_commit_id),
+    ]);
+    let mut non_stale_queued = BTreeSet::from([*left_commit_id, *right_commit_id]);
+    let mut best = Vec::new();
+    while !queue.is_empty() {
+        if !best.is_empty() && non_stale_queued.is_empty() {
+            break;
+        }
+        let (generation, commit_id) = queue.pop_last().expect("queue is not empty");
+        non_stale_queued.remove(&commit_id);
+        let commit = reader
+            .load_node(&commit_id)
+            .await?
+            .ok_or_else(|| missing_commit_graph_error(&commit_id))?;
+        if commit.generation != generation {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' generation changed during graph walk"
+            )));
+        }
+        let mut color = colors[&commit_id];
+        if color & STALE == 0 && color & BOTH == BOTH {
+            best.push(commit_id);
+            color |= STALE;
+            colors.insert(commit_id, color);
+        }
+        for parent_commit_id in commit.parent_commit_ids.iter().copied() {
+            let parent = reader
+                .load_node(&parent_commit_id)
+                .await?
+                .ok_or_else(|| missing_commit_graph_error(&parent_commit_id))?;
+            validate_parent_generation(&commit, &parent)?;
+            let parent_color = colors.entry(parent_commit_id).or_default();
+            *parent_color |= color;
+            queue.insert((parent.generation, parent_commit_id));
+            if *parent_color & STALE == 0 {
+                non_stale_queued.insert(parent_commit_id);
+            } else {
+                non_stale_queued.remove(&parent_commit_id);
+            }
+        }
+    }
+    best.sort_unstable();
+    best.dedup();
+    let mut nodes = Vec::with_capacity(best.len());
+    for commit_id in best {
+        nodes.push(
+            reader
+                .load_node(&commit_id)
+                .await?
+                .ok_or_else(|| missing_commit_graph_error(&commit_id))?,
+        );
+    }
+    Ok(nodes)
+}
+
+struct TraversalFrame {
+    commit_id: CommitId,
+    depth: u32,
+    expanded: bool,
 }
 
 fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
@@ -513,35 +606,15 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
     }
 }
 
-fn commit_graph_node_from_authority(
-    commit_id: CommitId,
-    record: Option<CommitRecord>,
-    authority_id: Option<CommitId>,
-) -> Result<Option<CommitGraphNode>, LixError> {
-    // Public graph membership belongs to the compact changelog projection.
-    // A physical manifest is an independent serving/replay authority. Its
-    // absence is handled by payload/state readers, not by metadata membership.
-    let Some(record) = record else {
-        return Ok(None);
-    };
-    if let Some(authority_id) = authority_id
-        && record.commit_id != authority_id
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit_graph projection disagrees with commit-state authority for commit '{commit_id}'"
-            ),
-        ));
-    }
-    Ok(Some(CommitGraphNode {
+fn commit_graph_node_from_record(record: CommitRecord) -> CommitGraphNode {
+    CommitGraphNode {
         commit_id: record.commit_id,
         change_id: record.change_id,
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
         created_at: record.created_at,
-    }))
+    }
 }
 
 fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
@@ -549,13 +622,6 @@ fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
         "LIX_ERROR_UNKNOWN",
         format!("commit_graph missing commit '{commit_id}'"),
     )
-}
-
-fn full_value_bytes(value: Option<StorageProjectedValue>) -> Option<Bytes> {
-    match value? {
-        StorageProjectedValue::FullValue(bytes) => Some(bytes),
-        StorageProjectedValue::KeyOnly => None,
-    }
 }
 
 fn validate_parent_generation(
