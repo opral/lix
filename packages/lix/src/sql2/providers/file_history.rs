@@ -560,24 +560,25 @@ impl FileHistoryDirectoryIndex {
         }
     }
 
-    fn affected_file_ids(&self, changed_directory_id: &str) -> BTreeSet<String> {
+    fn affected_file_ids(&self, changed_directory_id: &str) -> Result<BTreeSet<String>, LixError> {
         let mut file_ids = BTreeSet::new();
         self.visit_affected_file_buckets(changed_directory_id, |bucket| {
             file_ids.extend(bucket.iter().cloned());
-        });
-        file_ids
+        })?;
+        Ok(file_ids)
     }
 
     fn visit_affected_file_buckets(
         &self,
         changed_directory_id: &str,
         mut visit: impl FnMut(&BTreeSet<String>),
-    ) {
-        for directory_id in self.tree.descendants_including(changed_directory_id) {
+    ) -> Result<(), LixError> {
+        for directory_id in self.tree.descendants_including(changed_directory_id)? {
             if let Some(bucket) = self.file_ids_by_directory.get(&directory_id) {
                 visit(bucket);
             }
         }
+        Ok(())
     }
 }
 
@@ -723,7 +724,7 @@ where
         &filesystem_context.descriptors,
         &observed_states,
         &parent_commit_ids_by_commit,
-    );
+    )?;
     let plugin_state_events = file_history_plugin_events(
         &event_plugin_state,
         &event_plugin_owners,
@@ -830,10 +831,10 @@ fn prepare_file_history_rows(
         let directory_index = directory_indexes
             .get(event.observed_commit_id.as_str())
             .expect("every observed file state should have a directory index");
-        if !file_history_event_affects_observed_file(&event, descriptor, &directory_index.tree) {
+        if !file_history_event_affects_observed_file(&event, descriptor, &directory_index.tree)? {
             continue;
         }
-        let path = resolve_observed_file_history_path(descriptor, &state.directories);
+        let path = resolve_observed_file_history_path(descriptor, &state.directories)?;
         let id = tombstone_identity_column_value(
             "id",
             &descriptor.id,
@@ -1479,7 +1480,7 @@ fn file_history_events(
     context_descriptors: &[FileHistoryDescriptorRecord],
     observed_states: &BTreeMap<String, Arc<FileHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
-) -> Vec<FileHistoryEvent> {
+) -> Result<Vec<FileHistoryEvent>, LixError> {
     let mut descriptor_ids_by_as_of = BTreeSet::<(String, String)>::new();
 
     for descriptor in context_descriptors {
@@ -1517,7 +1518,7 @@ fn file_history_events(
         let mut affected_file_ids = BTreeSet::new();
         for state_commit_id in state_commit_ids {
             if let Some(directory_index) = directory_indexes.get(state_commit_id) {
-                affected_file_ids.extend(directory_index.affected_file_ids(&directory.id));
+                affected_file_ids.extend(directory_index.affected_file_ids(&directory.id)?);
             }
         }
         for file_id in affected_file_ids {
@@ -1534,7 +1535,7 @@ fn file_history_events(
             ));
         }
     }
-    sorted_grouped_file_history_events(candidates)
+    Ok(sorted_grouped_file_history_events(candidates))
 }
 
 fn sorted_grouped_file_history_events<I>(events: I) -> Vec<FileHistoryEvent>
@@ -1808,12 +1809,11 @@ fn parse_file_history_descriptors(
         .filter(|entry| entry.change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
-                return Ok(FileHistoryDescriptorRecord {
-                    id: row_id,
-                    entry: entry.clone(),
-                });
-            };
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "file descriptor history row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: HistoryIdentitySnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -1843,14 +1843,11 @@ fn parse_file_history_directories(
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
-                return Ok(FileHistoryDirectoryRecord {
-                    id: row_id,
-                    parent_id: None,
-                    name: None,
-                    entry: entry.clone(),
-                });
-            };
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "directory descriptor history row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -1882,12 +1879,11 @@ fn parse_file_history_blobs(
         .filter(|entry| entry.change.schema_key == BLOB_REF_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
-                return Ok(FileHistoryBlobRecord {
-                    file_id: entry.change.file_id.clone().unwrap_or_else(|| row_id.clone()),
-                    entry: entry.clone(),
-                });
-            };
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "blob reference history row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: HistoryIdentitySnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -1933,6 +1929,11 @@ fn parse_file_history_plugin_state(
                     entry.observed_commit_id
                 ))
             })?;
+            if entry.change.snapshot_content.is_none() {
+                return Err(invalid_file_history_state(format!(
+                    "plugin history row for file '{file_id}' has no authenticated payload"
+                )));
+            }
             Ok(FileHistoryPluginStateRecord {
                 file_id,
                 entry: entry.clone(),
@@ -1957,6 +1958,11 @@ fn parse_file_history_plugin_owners(
                     "lix_file_history plugin owner row is missing file_id",
                 )
             })?;
+            if entry.change.snapshot_content.is_none() {
+                return Err(invalid_file_history_state(format!(
+                    "plugin owner history row for file '{file_id}' has no authenticated payload"
+                )));
+            }
             Ok(FileHistoryPluginOwnerRecord {
                 file_id,
                 entry: entry.clone(),
@@ -1974,14 +1980,16 @@ fn parse_file_history_observed_descriptors(
             let _ = observed.observed_commit_id();
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(FileHistoryObservedDescriptorRecord {
-                    id: row_id,
-                    directory_id: None,
-                    name: None,
-                    row: observed.ordinal(),
-                });
-            };
+            if row.deleted() {
+                return Err(invalid_file_history_state(format!(
+                    "file descriptor row '{row_id}' is tombstoned"
+                )));
+            }
+            let snapshot_content = row.snapshot_content().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "file descriptor row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: FileDescriptorSnapshot =
                 serde_json::from_str(snapshot_content).map_err(|error| {
                     LixError::new(
@@ -2013,14 +2021,16 @@ fn parse_file_history_observed_directories(
         .map(|observed| {
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(FileHistoryObservedDirectoryRecord {
-                    id: row_id,
-                    parent_id: None,
-                    name: None,
-                    row: observed.ordinal(),
-                });
-            };
+            if row.deleted() {
+                return Err(invalid_file_history_state(format!(
+                    "directory descriptor row '{row_id}' is tombstoned"
+                )));
+            }
+            let snapshot_content = row.snapshot_content().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "directory descriptor row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -2052,13 +2062,16 @@ fn parse_file_history_observed_blobs(
         .map(|observed| {
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(FileHistoryObservedBlobRecord {
-                    file_id: row.file_id().map(str::to_owned).unwrap_or(row_id),
-                    blob_hash: None,
-                    row: observed.ordinal(),
-                });
-            };
+            if row.deleted() {
+                return Err(invalid_file_history_state(format!(
+                    "blob reference row '{row_id}' is tombstoned"
+                )));
+            }
+            let snapshot_content = row.snapshot_content().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "blob reference row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: BlobRefSnapshot =
                 serde_json::from_str(snapshot_content).map_err(|error| {
                     LixError::new(
@@ -2099,6 +2112,11 @@ fn parse_file_history_observed_plugin_owners(
                     "lix_file_history plugin owner row is missing file_id",
                 )
             })?;
+            if row.deleted() || row.snapshot_content().is_none() {
+                return Err(invalid_file_history_state(format!(
+                    "plugin owner row for file '{file_id}' has no authenticated payload"
+                )));
+            }
             let owner = row
                 .snapshot_content()
                 .map(|snapshot| {
@@ -2127,57 +2145,71 @@ fn file_history_event_affects_observed_file(
     event: &FileHistoryEvent,
     descriptor: &FileHistoryObservedDescriptorRecord,
     directory_tree: &HistoryDirectoryTree,
-) -> bool {
+) -> Result<bool, LixError> {
     event
         .source_changes
         .iter()
-        .any(|change| match change.schema_key.as_str() {
-            FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
-                change
+        .try_fold(false, |matched, change| {
+            if matched {
+                return Ok(true);
+            }
+            let matched = match change.schema_key.as_str() {
+                FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
+                    change
+                        .file_id
+                        .as_deref()
+                        .is_some_and(|file_id| file_id == descriptor.id)
+                        || change
+                            .entity_pk
+                            .as_single_string_owned()
+                            .is_ok_and(|entity_id| entity_id == descriptor.id)
+                }
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                    let Ok(changed_directory_id) = change.entity_pk.as_single_string_owned() else {
+                        return Ok(false);
+                    };
+                    let Some(directory_id) = descriptor.directory_id.as_deref() else {
+                        return Ok(false);
+                    };
+                    directory_tree.has_ancestor_including(directory_id, &changed_directory_id)?
+                }
+                KEY_VALUE_SCHEMA_KEY
+                    if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
+                {
+                    event.file_id == descriptor.id
+                }
+                _ => change
                     .file_id
                     .as_deref()
-                    .is_some_and(|file_id| file_id == descriptor.id)
-                    || change
-                        .entity_pk
-                        .as_single_string_owned()
-                        .is_ok_and(|entity_id| entity_id == descriptor.id)
-            }
-            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                let Ok(changed_directory_id) = change.entity_pk.as_single_string_owned() else {
-                    return false;
-                };
-                let Some(directory_id) = descriptor.directory_id.as_deref() else {
-                    return false;
-                };
-                directory_tree.has_ancestor_including(directory_id, &changed_directory_id)
-            }
-            KEY_VALUE_SCHEMA_KEY
-                if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
-            {
-                event.file_id == descriptor.id
-            }
-            _ => change
-                .file_id
-                .as_deref()
-                .is_some_and(|file_id| file_id == descriptor.id),
+                    .is_some_and(|file_id| file_id == descriptor.id),
+            };
+            Ok(matched)
         })
 }
 
 fn resolve_observed_file_history_path(
     descriptor: &FileHistoryObservedDescriptorRecord,
     directories: &[FileHistoryObservedDirectoryRecord],
-) -> Option<String> {
-    let name = descriptor.name.as_ref()?;
+) -> Result<Option<String>, LixError> {
+    let Some(name) = descriptor.name.as_ref() else {
+        return Ok(None);
+    };
     let Some(directory_id) = descriptor.directory_id.as_deref() else {
-        return compose_file_path(None, name).ok();
+        return compose_file_path(None, name).map(Some);
     };
     let directory_path = resolve_observed_directory_path(
         directory_id,
         directories,
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
-    )?;
-    compose_file_path(Some(&directory_path), name).ok()
+    )?
+    .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("directory '{directory_id}' has no authenticated path"),
+        )
+    })?;
+    compose_file_path(Some(&directory_path), name).map(Some)
 }
 
 static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
@@ -2833,7 +2865,8 @@ mod tests {
             &descriptors,
             &observed_states,
             &BTreeMap::new(),
-        );
+        )
+        .expect("valid directory history should fan out");
 
         assert_eq!(events.len(), SIBLING_COUNT);
         for (index, event) in events.iter().enumerate() {
@@ -2848,10 +2881,12 @@ mod tests {
         let mut visited_buckets = 0;
         let mut visited_file_candidates = 0;
         for directory in &directories {
-            directory_index.visit_affected_file_buckets(&directory.id, |bucket| {
-                visited_buckets += 1;
-                visited_file_candidates += bucket.len();
-            });
+            directory_index
+                .visit_affected_file_buckets(&directory.id, |bucket| {
+                    visited_buckets += 1;
+                    visited_file_candidates += bucket.len();
+                })
+                .expect("valid directory tree should have no cycle");
         }
         assert_eq!(visited_buckets, SIBLING_COUNT);
         assert_eq!(visited_file_candidates, SIBLING_COUNT);

@@ -16,7 +16,7 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde::Deserialize;
 
-use super::checkpoint::filter_conjuncts;
+use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -120,16 +120,49 @@ where
                     route,
                     self.kind,
                 ),
-                move |(_active_branch_id, _branch_ref, _store, schema, route, _kind)| async move {
+                move |(_active_branch_id, _branch_ref, store, schema, route, kind)| async move {
                     if route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
                             .map_err(batch_error);
                     }
-                    return Err(datafusion::common::DataFusionError::Execution(
-                        "filesystem working-diff checkpoint baseline is deferred until its sole ForkTree chronology owner is wired"
-                            .to_string(),
-                    ));
+                    let heads = selected_heads(
+                        _branch_ref.as_ref(),
+                        _active_branch_id.as_deref(),
+                        &route.branch_ids,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    let historical = ForkTreeReadFacade::new(store);
+                    let mut rows = Vec::new();
+                    for head in heads {
+                        let checkpoint_id = historical
+                            .latest_checkpoint_for_branch(head.commit_id, &head.branch_id)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                            .ok_or_else(|| {
+                                datafusion::common::DataFusionError::Execution(format!(
+                                    "branch '{}' has no checkpoint baseline",
+                                    head.branch_id
+                                ))
+                            })?;
+                        let mut branch_rows = load_rows(
+                            &historical,
+                            &checkpoint_id.to_string(),
+                            &head.commit_id.to_string(),
+                            &head.branch_id,
+                            kind,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                        if let FileIdConstraint::Ids(ids) = &route.ids {
+                            branch_rows.retain(|row| ids.contains(&row.id));
+                        }
+                        rows.extend(branch_rows);
+                    }
+                    FILESYSTEM_WORKING_DIFF_COLS
+                        .build(schema, &rows)
+                        .map_err(batch_error)
                 },
             ),
         })

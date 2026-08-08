@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
+use crate::entity_pk::EntityPk;
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
     ReadOptions, ScanOrder, Storage, StorageError,
@@ -236,6 +237,23 @@ pub(crate) struct ForkTreeReadFacade<R> {
     read: R,
 }
 
+/// ForkTree-owned first-parent checkpoint chronology. The state marker is
+/// authenticated from the same retained read as the commit envelope; an
+/// inherited marker never reclassifies a descendant ordinary commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointHistoryEntry {
+    pub(crate) commit_id: crate::changelog::CommitId,
+    pub(crate) created_at: String,
+    pub(crate) depth: u32,
+}
+
+fn checkpoint_marker_matches_commit(
+    marker_commit_id: crate::changelog::CommitId,
+    walked_commit_id: crate::changelog::CommitId,
+) -> bool {
+    marker_commit_id == walked_commit_id
+}
+
 impl<R> ForkTreeReadFacade<R>
 where
     R: StorageAdapterRead,
@@ -341,6 +359,120 @@ where
         commit_id: crate::changelog::CommitId,
     ) -> Result<crate::changelog::CommitRecord, crate::LixError> {
         super::serving::load_required_commit_record(&self.read, commit_id).await
+    }
+
+    /// Returns the authenticated checkpoint history for one branch head. The
+    /// root is an implicit checkpoint; every other checkpoint requires an
+    /// active marker whose authenticated state-row commit_id equals the
+    /// walked commit. This is the sole chronology owner used by SQL and
+    /// filesystem working-diff baselines.
+    pub(crate) async fn checkpoint_history_from_head(
+        &self,
+        head: crate::changelog::CommitId,
+        branch_id: &str,
+    ) -> Result<Vec<CheckpointHistoryEntry>, crate::LixError> {
+        let marker_key = super::state::StateKey {
+            schema_key: "lix_checkpoint_marker".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INVALID_PARAM,
+                    format!("checkpoint branch_id must be a canonical UUID: {error}"),
+                )
+            })?,
+        };
+        let mut checkpoints = Vec::new();
+        let mut current = Some(head);
+        let mut depth = 0_u32;
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = current {
+            if !visited.insert(commit_id) {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "cycle encountered while walking checkpoint first-parent history",
+                ));
+            }
+            let record = self.load_required_commit_record(commit_id).await?;
+            let is_root = record.parent_commit_ids.is_empty();
+            let row = self
+                .load_state_rows_at_commit(
+                    &commit_id.to_string(),
+                    std::slice::from_ref(&marker_key),
+                )
+                .await?
+                .into_iter()
+                .next()
+                .flatten();
+            let marker_matches = match row {
+                None => false,
+                Some(row) if row.deleted => false,
+                Some(row) => {
+                    let snapshot = row.snapshot_content.ok_or_else(|| {
+                        crate::LixError::new(
+                            crate::LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "checkpoint marker for branch '{branch_id}' is null at commit '{commit_id}'"
+                            ),
+                        )
+                    })?;
+                    let payload: serde_json::Value = serde_json::from_str(snapshot.as_str())
+                        .map_err(|error| {
+                            crate::LixError::new(
+                                crate::LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "checkpoint marker for branch '{branch_id}' is malformed: {error}"
+                                ),
+                            )
+                        })?;
+                    let payload_branch = payload
+                        .get("branch_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            crate::LixError::new(
+                                crate::LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "checkpoint marker for branch '{branch_id}' has the wrong shape"
+                                ),
+                            )
+                        })?;
+                    if payload_branch != branch_id {
+                        return Err(crate::LixError::new(
+                            crate::LixError::CODE_INTERNAL_ERROR,
+                            format!("checkpoint marker branch identity mismatch for '{branch_id}'"),
+                        ));
+                    }
+                    checkpoint_marker_matches_commit(row.commit_id, commit_id)
+                }
+            };
+            if is_root || marker_matches {
+                checkpoints.push(CheckpointHistoryEntry {
+                    commit_id,
+                    created_at: record.created_at.to_string(),
+                    depth,
+                });
+            }
+            current = record.parent_commit_ids.first().copied();
+            depth = depth.checked_add(1).ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "checkpoint history depth overflow",
+                )
+            })?;
+        }
+        Ok(checkpoints)
+    }
+
+    pub(crate) async fn latest_checkpoint_for_branch(
+        &self,
+        head: crate::changelog::CommitId,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::CommitId>, crate::LixError> {
+        Ok(self
+            .checkpoint_history_from_head(head, branch_id)
+            .await?
+            .into_iter()
+            .next()
+            .map(|entry| entry.commit_id))
     }
 
     pub(crate) async fn load_json_slot(
@@ -675,5 +807,19 @@ fn projected_required(
             "full-value projection returned a key-only value",
         )),
         None => Err(corruption(missing)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoint_marker_matches_commit;
+    use crate::changelog::CommitId;
+
+    #[test]
+    fn inherited_marker_does_not_classify_descendant_commit() {
+        let checkpoint = CommitId::for_test_label("checkpoint");
+        let ordinary = CommitId::for_test_label("ordinary");
+        assert!(checkpoint_marker_matches_commit(checkpoint, checkpoint));
+        assert!(!checkpoint_marker_matches_commit(checkpoint, ordinary));
     }
 }

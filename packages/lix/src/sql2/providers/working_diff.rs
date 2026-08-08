@@ -9,9 +9,10 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use tokio::sync::Mutex;
 
 use crate::branch::{BranchHeadControlContext, BranchRefReader};
-use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, latest_checkpoint_for_branch};
+use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
+use crate::forktree::ForkTreeReadFacade;
 use crate::live_state::TrackedHeadContext;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
@@ -117,7 +118,7 @@ where
                     schema,
                     route,
                 ),
-                move |(active_branch_id, branch_ref, commit_graph, store, schema, route)| async move {
+                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route)| async move {
                     if route.contradictory {
                         return WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -135,7 +136,7 @@ where
                     // not need the historical graph or tracked-state reader.
                     // Keep both fallback-only so the accelerated route does
                     // not serialize behind an unrelated historical diff.
-                    let mut graph = None;
+                    let historical = ForkTreeReadFacade::new(store.clone());
                     let mut tracked = None;
                     let mut rows = Vec::new();
                     for head in heads {
@@ -164,29 +165,19 @@ where
                         let diff = if let Some(direct) = direct_diff {
                             direct.diff
                         } else {
-                            if graph.is_none() {
-                                graph = Some(commit_graph.lock().await);
-                            }
-                            let graph = graph
-                                .as_mut()
-                                .expect("historical working-diff graph should be initialized");
                             let tracked = tracked.get_or_insert_with(|| {
                                 TrackedStateContext::new().reader(store.clone())
                             });
-                            let checkpoint_commit_id = latest_checkpoint_for_branch(
-                                graph.as_mut(),
-                                tracked,
-                                &head.commit_id,
-                                &head.branch_id,
-                            )
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "branch '{}' has no checkpoint baseline",
-                                    head.branch_id
-                                ))
-                            })?;
+                            let checkpoint_commit_id = historical
+                                .latest_checkpoint_for_branch(head.commit_id, &head.branch_id)
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?
+                                .ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "branch '{}' has no checkpoint baseline",
+                                        head.branch_id
+                                    ))
+                                })?;
                             tracked
                                 .diff_commits(
                                     &checkpoint_commit_id.to_string(),

@@ -9,6 +9,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
+use crate::forktree::ForkTreeReadFacade;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{HistoryRoute, parse_history_filter};
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
@@ -86,7 +87,7 @@ where
         &self,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
@@ -106,26 +107,59 @@ where
                     schema,
                     branch_ids,
                     depth_route,
+                    limit,
                 ),
                 move |(
                     _active_branch_id,
                     _branch_ref,
-                    _store,
+                    store,
                     schema,
                     branch_ids,
-                    _depth_route,
+                    depth_route,
+                    limit,
                 )| async move {
-                    if _depth_route.is_contradictory()
+                    if depth_route.is_contradictory()
                         || matches!(branch_ids, FileIdConstraint::None)
                     {
                         return CHECKPOINT_COLS
                             .build(schema, &[])
                             .map_err(checkpoint_batch_error);
                     }
-                    return Err(DataFusionError::Execution(
-                        "checkpoint history is deferred until its sole ForkTree chronology owner is wired"
-                            .to_string(),
-                    ));
+                    let heads = selected_heads(
+                        _branch_ref.as_ref(),
+                        _active_branch_id.as_deref(),
+                        &branch_ids,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    let historical = ForkTreeReadFacade::new(store);
+                    let mut rows = Vec::new();
+                    for head in heads {
+                        let history = historical
+                            .checkpoint_history_from_head(head.commit_id, &head.branch_id)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                        for entry in history {
+                            if !checkpoint_depth_matches(&depth_route, entry.depth) {
+                                continue;
+                            }
+                            rows.push(CheckpointSqlRow {
+                                commit_id: entry.commit_id.to_string(),
+                                created_at: entry.created_at,
+                                branch_id: head.branch_id.clone(),
+                                depth: i64::from(entry.depth),
+                            });
+                            if limit.is_some_and(|limit| rows.len() >= limit) {
+                                break;
+                            }
+                        }
+                        if limit.is_some_and(|limit| rows.len() >= limit) {
+                            break;
+                        }
+                    }
+                    CHECKPOINT_COLS
+                        .build(schema, &rows)
+                        .map_err(checkpoint_batch_error)
                 },
             ),
         })

@@ -33,10 +33,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
     materialize_known_change_payloads,
 };
-use crate::checkpoint::{
-    CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head, checkpoint_marker_stage_row,
-    latest_checkpoint_at_head,
-};
+use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
@@ -7740,27 +7737,19 @@ where
             .load_branch_head(&branch_id)
             .await?
             .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let direct_checkpoint = {
-            let mut tracked = self.tracked_state_reader().await;
-            latest_checkpoint_at_head(&mut tracked, &head_commit_id, &branch_id).await?
-        };
-        let previous_checkpoint_commit_id = match direct_checkpoint {
-            Some(commit_id) => commit_id,
-            None => {
-                let mut graph = self.commit_graph_reader().await;
-                checkpoint_history_from_head(&mut graph, &head_commit_id)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("branch '{branch_id}' has no checkpoint baseline"),
-                        )
-                    })?
-                    .commit_id
-            }
-        };
+        let previous_checkpoint_commit_id = self
+            .forktree_read_facade()
+            .checkpoint_history_from_head(head_commit_id, &branch_id)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("branch '{branch_id}' has no checkpoint baseline"),
+                )
+            })?
+            .commit_id;
         let diff = {
             let mut tracked = self.tracked_state_reader().await;
             tracked

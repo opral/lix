@@ -283,7 +283,7 @@ where
         &event_descriptors,
         &observed_states,
         &parent_commit_ids_by_commit,
-    );
+    )?;
     let mut output = Vec::new();
 
     for event in events {
@@ -316,7 +316,7 @@ where
                 &observed_state.descriptors,
                 &mut BTreeMap::new(),
                 &mut BTreeSet::new(),
-            )
+            )?
         } else {
             None
         };
@@ -429,14 +429,18 @@ fn parse_directory_history_observed_records(
             let _ = observed.observed_commit_id();
             let row = observed.row();
             let row_id = row.entity_pk().as_single_string_owned()?;
-            let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(DirectoryHistoryObservedRecord {
-                    id: row_id,
-                    parent_id: None,
-                    name: None,
-                    row: observed.ordinal(),
-                });
-            };
+            if row.deleted() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descriptor row '{row_id}' is tombstoned"),
+                ));
+            }
+            let snapshot_content = row.snapshot_content().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descriptor row '{row_id}' has no authenticated payload"),
+                )
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -471,14 +475,12 @@ fn parse_directory_history_records(
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
             let row_id = entry.change.entity_pk.as_single_string_owned()?;
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
-                return Ok(DirectoryHistoryRecord {
-                    id: row_id,
-                    parent_id: None,
-                    name: None,
-                    entry: entry.clone(),
-                });
-            };
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descriptor history row '{row_id}' has no authenticated payload"),
+                )
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -509,7 +511,7 @@ fn grouped_directory_history_events(
     descriptors: &[DirectoryHistoryRecord],
     observed_states: &BTreeMap<String, Arc<DirectoryHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
-) -> Vec<DirectoryHistoryEvent> {
+) -> Result<Vec<DirectoryHistoryEvent>, LixError> {
     let mut grouped = BTreeMap::<(String, String, String), DirectoryHistoryEvent>::new();
     let directory_trees = observed_states
         .iter()
@@ -535,7 +537,7 @@ fn grouped_directory_history_events(
                     directory_trees
                         .get(state_commit_id)
                         .expect("every observed directory state should have a directory tree")
-                        .descendants_including(&descriptor.id),
+                        .descendants_including(&descriptor.id)?,
                 );
             }
         }
@@ -577,7 +579,7 @@ fn grouped_directory_history_events(
             .then(left.depth.cmp(&right.depth))
             .then(left.observed_commit_id.cmp(&right.observed_commit_id))
     });
-    events
+    Ok(events)
 }
 
 fn directory_history_event_from_entry(

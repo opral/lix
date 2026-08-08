@@ -1,9 +1,6 @@
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::checkpoint::{
-    CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head, checkpoint_marker_stage_row,
-    latest_checkpoint_at_head,
-};
+use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
@@ -69,30 +66,21 @@ where
                     let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
                         direct.checkpoint_commit_id
                     } else {
-                        let direct_checkpoint = {
-                            let mut tracked = transaction.tracked_state_reader().await;
-                            latest_checkpoint_at_head(&mut tracked, &head_commit_id, &branch_id)
-                                .await?
-                        };
-                        match direct_checkpoint {
-                            Some(commit_id) => commit_id,
-                            None => {
-                                let mut reader = transaction.commit_graph_reader().await;
-                                checkpoint_history_from_head(&mut reader, &head_commit_id)
-                                    .await?
-                                    .into_iter()
-                                    .next()
-                                    .ok_or_else(|| {
-                                        LixError::new(
-                                            LixError::CODE_INTERNAL_ERROR,
-                                            format!(
-                                                "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
-                                            ),
-                                        )
-                                    })?
-                                    .commit_id
-                            }
-                        }
+                        let historical = transaction.forktree_read_facade();
+                        historical
+                            .checkpoint_history_from_head(head_commit_id, &branch_id)
+                            .await?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
+                                    ),
+                                )
+                            })?
+                            .commit_id
                     };
                     let interval_has_commits =
                         head_commit_id != previous_checkpoint_commit_id;

@@ -375,43 +375,45 @@ where
             let history = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
                 .await?;
-            let reachable_nodes = if metadata_projection.commit_created_at {
-                history.reachable_nodes
-            } else {
-                Arc::from([])
-            };
+            // Reachability is also the authenticated source of certified
+            // event/plugin rows.  It must not depend on whether the caller
+            // projected the optional created_at column: omitting metadata is
+            // a SQL projection choice, not permission to drop the topology
+            // and its commit identities.
+            let reachable_nodes = history.reachable_nodes;
             let mut reachable_by_id = BTreeMap::new();
             if !reachable_nodes.is_empty() {
                 let commit_ids = reachable_nodes
                     .iter()
                     .map(|reachable| reachable.commit.commit_id)
                     .collect::<Vec<_>>();
-                let records = if metadata_projection.commit_created_at {
-                    Some(guard.load_commit_records(&commit_ids).await?)
-                } else {
-                    None
-                };
+                let records = guard.load_commit_records(&commit_ids).await?;
+                if records.len() != commit_ids.len() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "history commit record batch length does not match reachable commit IDs",
+                    ));
+                }
                 for (index, reachable) in reachable_nodes.iter().enumerate() {
-                    let created_at = if let Some(records) = records.as_ref() {
-                        let record =
-                            records.get(index).and_then(Option::as_ref).ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INTERNAL_ERROR,
-                                    format!(
-                                        "history commit '{}' is missing its commit timestamp",
-                                        reachable.commit.commit_id
-                                    ),
-                                )
-                            })?;
-                        if record.commit_id != reachable.commit.commit_id {
-                            return Err(LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "history commit metadata identity mismatch for '{}'",
-                                    reachable.commit.commit_id
-                                ),
-                            ));
-                        }
+                    let record = records.get(index).and_then(Option::as_ref).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "history commit '{}' is missing its authenticated record",
+                                reachable.commit.commit_id
+                            ),
+                        )
+                    })?;
+                    if record.commit_id != reachable.commit.commit_id {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "history commit metadata identity mismatch for '{}'",
+                                reachable.commit.commit_id
+                            ),
+                        ));
+                    }
+                    let created_at = if metadata_projection.commit_created_at {
                         record.created_at.to_string()
                     } else {
                         String::new()
@@ -467,21 +469,30 @@ where
             let mut guard = commit_graph.lock().await;
             guard.load_commit_records(&certified_commit_ids).await?
         };
+        if certified_records.len() != certified_commit_ids.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified history record batch length does not match requested commit IDs",
+            ));
+        }
         let mut accounts_by_commit = BTreeMap::new();
-        for (commit_id, record) in certified_commit_ids.iter().copied().zip(certified_records) {
-            let record = record.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("certified historical row references missing commit '{commit_id}'"),
-                )
-            })?;
+        for (index, commit_id) in certified_commit_ids.iter().copied().enumerate() {
+            let record = certified_records
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("certified historical row references missing commit '{commit_id}'"),
+                    )
+                })?;
             if record.commit_id != commit_id {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("certified historical commit identity mismatch for '{commit_id}'"),
                 ));
             }
-            accounts_by_commit.insert(commit_id, record.account_id);
+            accounts_by_commit.insert(commit_id, record.account_id.clone());
         }
         let mut existing_change_ids = rows
             .iter()
@@ -508,9 +519,15 @@ where
                 .scan_state_rows_at_commit(certified_commit_id)
                 .await?;
             for row in certified_rows {
-                if row.commit_id != certified_commit_id
-                    || !historical_row_matches_request(&row, &request)
-                {
+                if row.commit_id != certified_commit_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "certified historical row commit identity mismatch for '{certified_commit_id}'"
+                        ),
+                    ));
+                }
+                if !historical_row_matches_request(&row, &request) {
                     continue;
                 }
                 let change_id = row.change_id.to_string();
