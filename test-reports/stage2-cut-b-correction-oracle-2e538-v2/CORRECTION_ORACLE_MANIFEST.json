@@ -1,0 +1,46 @@
+{
+  "kind": "test-report-only-source-oracle",
+  "anchor": {
+    "ref": "origin/codex/forktree-cut-b-reader-correction-oracle-2e538",
+    "head": "2ace19022e7cb6aa74936c759e96b6311beac00f",
+    "tree": "52bbe3727ab85e76fdd28d929aea45ffb5fb463e",
+    "production_anchor": "2e5389265d0495728325efe43d7eb6d9ad715aa0"
+  },
+  "h4_report_sha256": "a9a13f5f58410e779d8494f288f9dafbecf69f6e5a0c2c984b63f813c1a7eb7b",
+  "production_allowlist_relative_to_2e": [
+    "packages/lix/src/filesystem/read.rs",
+    "packages/lix/src/forktree/mod.rs",
+    "packages/lix/src/forktree/view.rs",
+    "packages/lix/src/live_state/forktree_reader.rs",
+    "packages/lix/src/live_state/mod.rs",
+    "packages/lix/src/plugin/registry.rs",
+    "packages/lix/src/session/merge/branch.rs",
+    "packages/lix/src/tracked_state/context.rs (deletions only)"
+  ],
+  "runtime": false,
+  "production_edits": false,
+  "required_owner": "one opaque operation owner retaining exactly one authenticated StorageRead",
+  "required_methods": [
+    "ForkTreeReadFacade",
+    "load_commit_member_records",
+    "load_state_value_at_commit",
+    "load_json_slot",
+    "scan_view",
+    "scan_untracked_view"
+  ],
+  "required_discriminators": [
+    "missing selected registry errors; authenticated explicit empty bootstrap succeeds",
+    "BlobRef snapshot.id + blob_hash + size bind to semantic row before root output",
+    "same-size remapped BlobRef JSON fails",
+    "branch cursor identity cannot cross descriptor identities"
+  ],
+  "forbidden": [
+    "TrackedStateStoreReader historical plugin/merge paths",
+    "raw scan/open_coherent_view entry points usable by Cut B",
+    "arbitrary raw &R facade construction or read extraction",
+    "detached branch/history views",
+    "writer/transaction/selector/GC algorithm/scalar-W2-W5/CAS/storage/cache/compat/fallback widening"
+  ],
+  "expected_anchor_result": "RED",
+  "verification": "verify_source_contract.sh <repo-root> <base> <head>"
+}
