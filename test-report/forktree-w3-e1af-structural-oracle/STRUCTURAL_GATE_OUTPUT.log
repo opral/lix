@@ -1,0 +1,10 @@
+PASS negative_second_read
+PASS negative_second_publication
+PASS negative_second_commit
+legacy_control_generation	58
+checkpoint_history	1139
+snapshot_pin	16
+selector_epoch	770
+mutation_revision	24
+PASS embedded_map_and_diagnostics
+RED e1af legacy W3 source frontier

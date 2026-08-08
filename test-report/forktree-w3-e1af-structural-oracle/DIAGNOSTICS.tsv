@@ -1,0 +1,15 @@
+id	paths	current_diagnostic_class	sole_owner	required_cut	boundary
+W3-01	branch/mod.rs; branch/refs.rs	legacy BranchHeadControl import/stage writer	BranchSelectorV1+GlobalSelectorV1	delete control exports, direct stage writer, legacy tests	W4 fence consumed by W3
+W3-02	live_state/context.rs; live_state/mod.rs	BranchHeadControlCache and fresh control reader	CoherentView	remove cache/refresh/fresh readers	W4 read owner
+W3-03	functions/context.rs; functions/state.rs	global sequence/revision/generation legacy writer	GlobalSelectorV1 epoch/root	classify sequence intent and path-copy in one publication	W3 sequence slice
+W3-04	functions/state.rs	TrackedHead generation/control-byte CAS	CoherentView+PreparedPublication	remove stage_branch_head_control/retry/fallback	W4 exact CAS
+W3-05	init.rs; engine.rs	legacy bootstrap/control/delta/working-diff owner	RepositoryRoot+global/branch selectors	replace initialization; fail closed on existing malformed storage	W3 bootstrap
+W3-06	branch/{context,lifecycle,refs}.rs	branch create/switch/delete direct control stage	BranchSelectorV1+GlobalSelectorV1	one branch root/ref-change publication	W4 epoch fence
+W3-07	transaction/context.rs	fresh branch/tracked reader factories and cache	one retained CoherentView	delete helper begin_read and old callbacks	reader-first
+W3-08	transaction/context.rs	mutation revision and separate generation reads	view_id+selector/epoch expectations	one open view; stale/unrelated owner semantics	W3 reader/open
+W3-09	transaction/context.rs; transaction/commit.rs	second commit read plus legacy revision append	one PreparedPublication/plan/prepare/commit	writer last; Noop zero writes/rotation	W3 writer
+W3-10	session/checkpoint.rs; transaction/context.rs; checkpoint.rs	checkpoint/recovery-ref/GC-state/marker readers	checkpoint selectors/catalog/root edges	migrate readers/writers then delete recovery-ref rows	W5 sweep later
+W3-11	gc.rs	control/TrackedHead/recovery rows as GC roots	selector root universe+typed sweep plan	publication/root prerequisites before sweep	W5 owns sweep
+W3-12	storage_adapter/context.rs; spaces.rs; observe_invalidation.rs	dual mutation revision spaces/writers/polling	global selector epoch observation	delete spaces and adapter writer	W3 observation
+W3-13	tracked_state/{context,diff,mod}.rs; session/merge/analysis.rs	reader factories/diff/reexports	selected roots+retained view	migrate or typed fail closed; delete modules	b484 facade retained only
+W3-14	test_support.rs; transaction/bench_support.rs; storage_bench.rs	legacy test/bench owner/space references	typed selector/object fixtures or deletion	remove before first compile	support fallout
