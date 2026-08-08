@@ -27,6 +27,8 @@ entity_batch=$(show_source packages/lix/src/sql2/entity_batch.rs)
 reader_trait=$(show_source packages/lix/src/live_state/reader.rs)
 live_mod=$(show_source packages/lix/src/live_state/mod.rs)
 serving=$(show_source packages/lix/src/forktree/serving.rs)
+view_all=$(show_source packages/lix/src/forktree/view.rs)
+view_facade=$(printf '%s\n' "$view_all" | sed -n '/pub(crate) struct ForkTreeReadFacade/,/pub(crate) async fn load_commit_member_records/p')
 
 pass_count=0
 red_count=0
@@ -67,7 +69,8 @@ forbidden() {
 }
 
 expect_head() {
-  [[ "$HEAD" == "$ANCHOR" ]]
+  git -C "$ROOT" merge-base --is-ancestor "$ANCHOR" "$HEAD" \
+    && ! git -C "$ROOT" diff --name-only "$ANCHOR" "$HEAD" | rg -q '^packages/'
 }
 
 source_has() {
@@ -115,6 +118,14 @@ decode_auth_gate() {
     && source_lacks "$fork_reader" '\.(unwrap|expect)\('
 }
 
+coherent_view_gate() {
+  all_literal "$fork_reader" 'open_coherent_view_on_read' \
+    "$context_prod" 'ForkTreeReadFacade::new' \
+    "$context_prod" 'scan_forktree_view' \
+    "$view_facade" 'open_coherent_view_on_read' \
+    && source_lacks "$view_facade" 'begin_read\s*\('
+}
+
 no_write_side_effect() {
   ! printf '%s\n' "$fork_reader$context_prod$entity_batch" \
     | rg -q -- '(prepare_write_set|StorageWrite|\.commit\(|\.write\()'
@@ -128,9 +139,7 @@ fi
 
 positive coherent_view \
   'forktree_reader uses caller-provided read and open_coherent_view_on_read; context routes through ForkTreeReadFacade' \
-  all_literal "$fork_reader" 'open_coherent_view_on_read' \
-    "$context_prod" 'ForkTreeReadFacade::new' \
-    "$context_prod" 'scan_forktree_view'
+  coherent_view_gate
 
 forbidden no_raw_read_getter \
   'direct reader/context/entity adapter has no public raw-read, storage_read, or begin_read helper' \
