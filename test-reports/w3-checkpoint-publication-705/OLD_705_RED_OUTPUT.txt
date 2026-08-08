@@ -1,0 +1,9 @@
+RED-01 checkpoint_publications is rejected before W3 planning
+CONTROL-01 existing ordinary one-view/plan/prepare/commit route is present
+CONTROL-02 checkpoint staging and recovery publication intent are present
+CONTROL-03 no independent production publication commit seam
+COUNTS checkpoint_publications=28
+ recovery_refs=21
+ into_storage_plan=7
+ rotations_required=65 suffix_required=64
+ORACLE_STATUS=RED
