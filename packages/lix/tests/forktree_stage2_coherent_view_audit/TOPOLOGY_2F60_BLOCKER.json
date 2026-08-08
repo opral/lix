@@ -1,0 +1,72 @@
+{
+  "baseline": "cbe48835f6f07a21e0babf1ba16652a0c6b8a214",
+  "baseline_tree": "36ffe0ff867cd31bf52263675de2d16fc54e9b4f",
+  "changed_production_files": 19,
+  "evidence_sha256": "f2a3e156f2e287db11207275b5b7f8cac3bb133878888f2d7ea97790e2094c7c",
+  "findings": [
+    {
+      "detail": "functions=1 begin_read=1",
+      "name": "public-boundary-one-begin-read",
+      "passed": true
+    },
+    {
+      "detail": "functions=1 begin_read=0",
+      "name": "inner-view-zero-refresh",
+      "passed": true
+    },
+    {
+      "detail": "CoherentView must own read: R",
+      "name": "view-owns-read-handle",
+      "passed": true
+    },
+    {
+      "detail": "found=load_change,load_commit,page_changes,page_commits,state_point,state_range",
+      "name": "serving-same-coherent-view",
+      "passed": true
+    },
+    {
+      "detail": "functions=28 begin_read=0",
+      "name": "topology-zero-snapshot-refresh",
+      "passed": true
+    },
+    {
+      "detail": "commit graph must borrow the ForkTree CoherentView rather than a raw/legacy store",
+      "name": "topology-same-coherent-view",
+      "passed": false
+    },
+    {
+      "detail": "hits=crate::changelog",
+      "name": "topology-zero-member-payload",
+      "passed": false
+    },
+    {
+      "detail": "requires node cache, input de-duplication, and non-vacuous topology regression",
+      "name": "topology-dedupes-parent-loads",
+      "passed": false
+    },
+    {
+      "detail": "history_functions=30 fork_tree_change_load=False back_edge=True",
+      "name": "history-authenticates-members-back-edges",
+      "passed": false
+    },
+    {
+      "detail": "baseline=0 target=0 new=none",
+      "name": "deleted-owner-modules-do-not-reappear",
+      "passed": true
+    },
+    {
+      "detail": "baseline=9 target=9 new=none",
+      "name": "legacy-space-definitions-do-not-reappear",
+      "passed": true
+    },
+    {
+      "detail": "hits=none",
+      "name": "no-benchmark-model-substitution",
+      "passed": true
+    }
+  ],
+  "profile": "topology",
+  "schema": 1,
+  "target": "2f60fcfc46f71b87d71e8cd74591576a98dec4e5",
+  "target_tree": "f938ebb380f874dbc947bef2ccec02506477b659"
+}
