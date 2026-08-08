@@ -3,9 +3,9 @@
 Status: frozen test/report-only preparation for the first immutable runnable
 Stage 2 head. No candidate artifact has been applied and no build has run.
 
-The verifier worktree carries ten-row acceptance-matrix successor
-`5fa26f5a341d035afb114b09a0b840a253892860`, tree
-`9a3bd58e872839035d345d965d96e78e6d48f4c3`. At creation the workspace
+The verifier worktree carries ten-row acceptance-matrix readiness successor
+`29b59ffaaadc5d26ef32ddd8a1d65e496a3a473c`, tree
+`9fdca7f4fb235c5d83e47a9deb7f870e80db0013`. At creation the workspace
 filesystem had 49 GiB available. Cargo targets and databases will remain under
 this workspace filesystem and every future cell is capped at 20 minutes.
 
@@ -29,7 +29,16 @@ the committed binary attributes govern the 42,863-byte canonical stream. The
 same-object worktree text rendering is documented in the matrix but is not the
 verifier identity.
 
-Result: PASS for 10/10 refs and 27/27 embedded files. The frozen
+The verifier separately checks one non-runnable readiness milestone without
+counting it as an acceptance row: topology owner head
+`af7899f41c489fe763ce1a64c5468083570979e2`, tree
+`da097bd739b50629ea39b155d4fa9efc870654e0`, parent
+`2e0cea1b91558179e6ed90847bc8b04b23de246f`. It verifies focused and
+`a12` lineage diffs. Approval of this object does not authorize a build or
+artifact application.
+
+Result: PASS for 10/10 acceptance refs, 1/1 readiness milestone, and 27/27
+embedded files. The frozen
 machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 
 ## Runnable-head boundary
