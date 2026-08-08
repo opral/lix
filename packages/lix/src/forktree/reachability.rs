@@ -454,6 +454,7 @@ where
             "GC selector scan claims more after an empty page",
         ));
     }
+    drop(cursor);
     commit_progress(
         storage,
         snapshot,
@@ -527,6 +528,7 @@ where
             "GC untracked scan claims more after an empty page",
         ));
     }
+    drop(cursor);
     commit_progress(
         storage,
         snapshot,
@@ -703,6 +705,7 @@ where
     } else if page.entries.is_empty() {
         return Err(corruption("GC object scan claims more after an empty page"));
     }
+    drop(cursor);
     commit_progress(storage, snapshot, progress.clone(), edit, sweep, false).await?;
     Ok(status(progress))
 }
@@ -758,6 +761,7 @@ where
         }
         resume_after = Some(id);
     }
+    drop(cursor);
     progress.maintenance_resume_after = resume_after;
     if processed_all && !page.has_more {
         let reclaimed = progress.reclaimed_count;
