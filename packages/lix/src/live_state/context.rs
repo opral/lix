@@ -105,6 +105,10 @@ impl LiveStateContext {
         self.filesystem_path_index_cache
             .advance_committed(previous_revision, next_revision, rows);
     }
+
+    pub(crate) fn clear_filesystem_path_indexes(&self) {
+        self.filesystem_path_index_cache.clear();
+    }
 }
 
 /// Visible live-state reader backed by a caller-provided KV store.

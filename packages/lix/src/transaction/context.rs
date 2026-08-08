@@ -1590,24 +1590,23 @@ where
                 .await;
             return Err(error);
         }
-        let filesystem_delta_rows =
-            if prepared_writes_require_filesystem_index_rebuild(&prepared_writes) {
-                Vec::new()
-            } else {
-                prepared_writes
-                    .state_rows
-                    .iter()
-                    .filter(|row| {
-                        matches!(
-                            row.schema_key.as_str(),
-                            "lix_file_descriptor"
-                                | "lix_directory_descriptor"
-                                | BLOB_REF_SCHEMA_KEY
-                        )
-                    })
-                    .map(MaterializedLiveStateRow::from)
-                    .collect::<Vec<_>>()
-            };
+        let rebuild_filesystem_path_index =
+            prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
+        let filesystem_delta_rows = if rebuild_filesystem_path_index {
+            Vec::new()
+        } else {
+            prepared_writes
+                .state_rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.schema_key.as_str(),
+                        "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+                    )
+                })
+                .map(MaterializedLiveStateRow::from)
+                .collect::<Vec<_>>()
+        };
         let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
             None
         } else {
@@ -1721,7 +1720,9 @@ where
         ))
         .await?;
         let post_commit_read_storage = transaction.storage.clone();
-        if !filesystem_delta_rows.is_empty()
+        if rebuild_filesystem_path_index {
+            transaction.live_state.clear_filesystem_path_indexes();
+        } else if !filesystem_delta_rows.is_empty()
             && incremental_filesystem_index_enabled()
             && let Ok(next_read) = post_commit_read_storage
                 .begin_read(StorageReadOptions::default())
