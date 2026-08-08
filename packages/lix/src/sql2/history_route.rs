@@ -372,7 +372,7 @@ where
     for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
-        let (entries, reachable_nodes) = {
+        let (entries, reachable_by_id) = {
             let mut guard = commit_graph.lock().await;
             let history = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
@@ -384,17 +384,48 @@ where
             } else {
                 Arc::from([])
             };
-            (history.entries, reachable_nodes)
+            let mut reachable_by_id = BTreeMap::new();
+            if !reachable_nodes.is_empty() {
+                let commit_ids = reachable_nodes
+                    .iter()
+                    .map(|reachable| reachable.commit.commit_id)
+                    .collect::<Vec<_>>();
+                let records = if metadata_projection.commit_created_at {
+                    Some(guard.load_commit_records(&commit_ids).await?)
+                } else {
+                    None
+                };
+                for (index, reachable) in reachable_nodes.iter().enumerate() {
+                    let created_at = if let Some(records) = records.as_ref() {
+                        let record =
+                            records.get(index).and_then(Option::as_ref).ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "history commit '{}' is missing its commit timestamp",
+                                        reachable.commit.commit_id
+                                    ),
+                                )
+                            })?;
+                        if record.commit_id != reachable.commit.commit_id {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "history commit metadata identity mismatch for '{}'",
+                                    reachable.commit.commit_id
+                                ),
+                            ));
+                        }
+                        record.created_at.to_string()
+                    } else {
+                        String::new()
+                    };
+                    reachable_by_id
+                        .insert(reachable.commit.commit_id, (reachable.depth, created_at));
+                }
+            }
+            (history.entries, reachable_by_id)
         };
-        let reachable_by_id = reachable_nodes
-            .iter()
-            .map(|reachable| {
-                (
-                    reachable.commit.commit_id,
-                    (reachable.depth, reachable.commit.created_at.to_string()),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
             let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
@@ -831,7 +862,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::LixError;
-    use crate::changelog::{ChangeId, CommitId};
+    use crate::changelog::{ChangeId, CommitId, CommitRecord};
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
         CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
@@ -1060,14 +1091,33 @@ mod tests {
             Ok(Arc::from([ReachableCommitGraphNode {
                 commit: CommitGraphNode {
                     commit_id: self.start_commit_id,
-                    change_id: ChangeId::for_test_label("commit-change"),
-                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     generation: 0,
                     parent_commit_ids: Vec::new(),
-                    created_at: commit_timestamp(),
                 },
                 depth: 0,
             }]))
+        }
+
+        async fn load_commit_records(
+            &mut self,
+            commit_ids: &[CommitId],
+        ) -> Result<Vec<Option<CommitRecord>>, LixError> {
+            Ok(commit_ids
+                .iter()
+                .map(|commit_id| {
+                    (self.include_reachable_commit && *commit_id == self.start_commit_id).then(
+                        || CommitRecord {
+                            format_version: 2,
+                            commit_id: *commit_id,
+                            generation: 0,
+                            parent_commit_ids: Vec::new(),
+                            change_id: ChangeId::for_test_label("commit-change"),
+                            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+                            created_at: commit_timestamp(),
+                        },
+                    )
+                })
+                .collect())
         }
 
         async fn change_history_from_commit(
@@ -1080,11 +1130,8 @@ mod tests {
                 .then(|| ReachableCommitGraphNode {
                     commit: CommitGraphNode {
                         commit_id: self.start_commit_id,
-                        change_id: ChangeId::for_test_label("commit-change"),
-                        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                         generation: 0,
                         parent_commit_ids: Vec::new(),
-                        created_at: commit_timestamp(),
                     },
                     depth: 0,
                 });

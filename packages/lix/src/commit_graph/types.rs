@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::LixError;
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::{ChangeId, CommitId, CommitRecord};
 use crate::common::{ExactValue, LixTimestamp};
 use crate::entity_pk::EntityPk;
 
@@ -112,6 +112,14 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         &mut self,
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError>;
+
+    /// Loads semantic commit metadata through this reader's retained
+    /// authenticated view. Topology consumers must not hydrate this payload
+    /// into `CommitGraphNode`.
+    async fn load_commit_records(
+        &mut self,
+        commit_ids: &[CommitId],
+    ) -> Result<Vec<Option<CommitRecord>>, LixError>;
 
     async fn change_history_from_commit(
         &mut self,

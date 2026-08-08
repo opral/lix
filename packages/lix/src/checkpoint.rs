@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::json;
 
 use crate::LixError;
-use crate::changelog::{ChangeRecordProjection, CommitId};
+use crate::changelog::{ChangeRecordProjection, CommitId, CommitRecord};
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
-use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader};
+use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{TrackedStateKey, TrackedStateStoreReader};
@@ -22,7 +22,7 @@ const CHECKPOINT_RECORD_SCAN_PAGE_SIZE: usize = 1_024;
 /// point reads turns a K-checkpoint history into K serial storage requests. A
 /// paged record scan trades that N+1 pattern for work linear in retained
 /// commits, which is substantially cheaper for remote LSM-backed storage.
-pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitGraphNode>;
+pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitRecord>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointHistoryEntry {
@@ -76,17 +76,7 @@ where
             .await?;
         records.reserve(batch.entries.len());
         for record in batch.entries {
-            records.insert(
-                record.commit_id,
-                CommitGraphNode {
-                    commit_id: record.commit_id,
-                    change_id: record.change_id,
-                    account_id: record.account_id,
-                    generation: record.generation,
-                    parent_commit_ids: record.parent_commit_ids,
-                    created_at: record.created_at,
-                },
-            );
+            records.insert(record.commit_id, record);
         }
         let Some(next) = batch.next_start_after else {
             break;
@@ -291,9 +281,21 @@ async fn checkpoint_history_from_checkpoint(
                 format!("checkpoint history references missing commit '{commit_id}'"),
             )
         })?;
+        let record = reader
+            .load_commit_records(std::slice::from_ref(&commit_id))
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("checkpoint history references missing commit '{commit_id}'"),
+                )
+            })?;
         checkpoints.push(CheckpointHistoryEntry {
             commit_id,
-            created_at: commit.created_at.to_string(),
+            created_at: record.created_at.to_string(),
             depth,
         });
         current = commit.parent_commit_ids.first().copied();
@@ -390,11 +392,23 @@ pub(crate) async fn checkpoint_history_from_head(
                 format!("checkpoint history references missing commit '{commit_id}'"),
             )
         })?;
+        let record = reader
+            .load_commit_records(std::slice::from_ref(&commit_id))
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("checkpoint history references missing commit '{commit_id}'"),
+                )
+            })?;
         let is_root = commit.parent_commit_ids.is_empty();
         if is_root || marker_commits.contains(&commit_id) {
             checkpoints.push(CheckpointHistoryEntry {
                 commit_id,
-                created_at: commit.created_at.to_string(),
+                created_at: record.created_at.to_string(),
                 depth,
             });
         }

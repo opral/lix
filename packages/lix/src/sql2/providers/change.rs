@@ -187,9 +187,19 @@ where
         start_after = Some(next.to_string());
     }
     let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
-    for commit in graph_reader.all_nodes().await? {
+    let commits = graph_reader.all_nodes().await?;
+    let commit_ids = commits
+        .iter()
+        .map(|commit| commit.commit_id)
+        .collect::<Vec<_>>();
+    for record in graph_reader
+        .load_commit_records(&commit_ids)
+        .await?
+        .into_iter()
+        .flatten()
+    {
         changes.push(LixChangeRow::DerivedCommit(
-            crate::commit_graph::canonical_commit_change(&commit),
+            crate::commit_graph::canonical_commit_change(&record),
         ));
     }
     changes.sort_by_key(LixChangeRow::change_id);
@@ -292,10 +302,19 @@ where
             format!("changelog commit change-id index has invalid commit id: {error}"),
         )
     })?);
-    let commit = crate::commit_graph::CommitGraphContext::new()
-        .reader(store)
-        .load_node(&commit_id)
+    let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
+    let commit = graph_reader.load_node(&commit_id).await?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("changelog commit change-id index references missing commit '{commit_id}'"),
+        )
+    })?;
+    let commit = graph_reader
+        .load_commit_records(std::slice::from_ref(&commit_id))
         .await?
+        .into_iter()
+        .next()
+        .flatten()
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

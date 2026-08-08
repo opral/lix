@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tracing::Instrument;
 
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::{ChangeId, CommitId, CommitRecord};
 use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
 use crate::live_state::{LiveStateRowFilter, LiveStateScanRequest, MaterializedLiveStateRow};
@@ -76,6 +76,7 @@ where
     store: &'a S,
     commit_graph: &'a CommitGraphContext,
     all_nodes: Option<Vec<CommitGraphNode>>,
+    all_records: Option<Vec<CommitRecord>>,
 }
 
 impl<'a, S> DerivedReadContext<'a, S>
@@ -87,6 +88,7 @@ where
             store,
             commit_graph,
             all_nodes: None,
+            all_records: None,
         }
     }
 
@@ -98,6 +100,35 @@ where
             .all_nodes
             .as_deref()
             .expect("derived commit scan cache was initialized"))
+    }
+
+    async fn all_records(&mut self) -> Result<&[CommitRecord], LixError> {
+        if self.all_records.is_none() {
+            let commit_ids = self
+                .all_nodes()
+                .await?
+                .iter()
+                .map(|node| node.commit_id)
+                .collect::<Vec<_>>();
+            let mut reader = self.commit_graph.reader(self.store);
+            let records = reader.load_commit_records(&commit_ids).await?;
+            let mut decoded = Vec::with_capacity(records.len());
+            for (commit_id, record) in commit_ids.into_iter().zip(records) {
+                let record = record.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("derived commit scan missing commit '{commit_id}'"),
+                    )
+                })?;
+                validate_commit_point_identity(commit_id, &record)?;
+                decoded.push(record);
+            }
+            self.all_records = Some(decoded);
+        }
+        Ok(self
+            .all_records
+            .as_deref()
+            .expect("derived commit record cache was initialized"))
     }
 }
 
@@ -150,7 +181,7 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let commits = reads.all_nodes().await?;
+        let commits = reads.all_records().await?;
         let mut rows = Vec::with_capacity(commits.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
             for commit in commits {
@@ -186,14 +217,11 @@ where
         if commit_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let records = reads
-            .commit_graph
-            .reader(reads.store)
-            .load_nodes(&commit_ids)
-            .await?;
+        let mut graph_reader = reads.commit_graph.reader(reads.store);
+        let records = graph_reader.load_commit_records(&commit_ids).await?;
         let mut rows = Vec::with_capacity(records.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
-            for (requested_commit_id, record) in records.iter() {
+            for (requested_commit_id, record) in commit_ids.iter().zip(records.iter()) {
                 let Some(record) = record else {
                     continue;
                 };
@@ -551,7 +579,7 @@ fn uuid_string_from_entity_pk(entity_pk: &EntityPk) -> Option<String> {
 
 fn validate_commit_point_identity(
     requested_commit_id: CommitId,
-    record: &CommitGraphNode,
+    record: &CommitRecord,
 ) -> Result<(), LixError> {
     if record.commit_id == requested_commit_id {
         return Ok(());

@@ -1173,6 +1173,13 @@ mod tests {
             Ok(Vec::new().into())
         }
 
+        async fn load_commit_records(
+            &mut self,
+            commit_ids: &[CommitId],
+        ) -> Result<Vec<Option<crate::changelog::CommitRecord>>, LixError> {
+            Ok(vec![None; commit_ids.len()])
+        }
+
         async fn change_history_from_commit(
             &mut self,
             _start_commit_id: &CommitId,

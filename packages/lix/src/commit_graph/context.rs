@@ -113,12 +113,18 @@ where
                 let node = commit_graph_node_from_topology(topology);
                 self.node_cache.insert(node.commit_id, node);
             }
-            let batch =
-                ExactBatch::try_new("ForkTree commit graph", &uncached_ids, loaded.requested)?;
+            let batch = ExactBatch::try_new(
+                "ForkTree commit graph",
+                &uncached_ids,
+                loaded
+                    .requested
+                    .into_iter()
+                    .map(|topology| topology.map(commit_graph_node_from_topology))
+                    .collect(),
+            )?;
             for (commit_id, topology) in batch {
                 if let Some(topology) = topology {
-                    self.node_cache
-                        .insert(*commit_id, commit_graph_node_from_topology(topology));
+                    self.node_cache.insert(*commit_id, topology);
                 }
             }
         }
@@ -370,11 +376,9 @@ where
 
             let node = &reachable.commit;
             if may_include_commits {
-                let records = crate::forktree::load_commit_records(
-                    self.topology.read(),
-                    std::slice::from_ref(&node.commit_id),
-                )
-                .await?;
+                let records = self
+                    .load_commit_records(std::slice::from_ref(&node.commit_id))
+                    .await?;
                 let record = records
                     .into_iter()
                     .next()
@@ -418,6 +422,15 @@ where
             entries,
             reachable_nodes: nodes,
         })
+    }
+
+    /// Loads semantic commit records through the same retained authenticated
+    /// view as topology and member reads.
+    pub(crate) async fn load_commit_records(
+        &mut self,
+        commit_ids: &[CommitId],
+    ) -> Result<Vec<Option<CommitRecord>>, LixError> {
+        crate::forktree::load_commit_records(self.topology.read(), commit_ids).await
     }
 
     async fn load_member_changes(
@@ -676,6 +689,13 @@ where
         Self::reachable_nodes(self, head_commit_id).await
     }
 
+    async fn load_commit_records(
+        &mut self,
+        commit_ids: &[CommitId],
+    ) -> Result<Vec<Option<CommitRecord>>, LixError> {
+        Self::load_commit_records(self, commit_ids).await
+    }
+
     async fn change_history_from_commit(
         &mut self,
         start_commit_id: &CommitId,
@@ -809,7 +829,6 @@ mod tests {
 
         assert_eq!(commit.commit_id, commit_id("commit-1"));
         assert_eq!(commit.parent_commit_ids, commit_ids(["parent-1"]));
-        assert_eq!(commit.change_id, change_id("commit-1-change"));
     }
 
     #[tokio::test]
@@ -1598,14 +1617,11 @@ mod tests {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
             commit_id,
-            change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             generation: 0,
             parent_commit_ids: parent_commit_ids
                 .iter()
                 .map(|parent_id| CommitId::for_test_label(parent_id))
                 .collect(),
-            created_at: ts("2026-01-01T00:00:00Z"),
         }
     }
 
