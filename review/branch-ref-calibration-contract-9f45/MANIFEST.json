@@ -1,0 +1,36 @@
+{
+  "kind": "test-report-only-branch-ref-calibration-contract",
+  "status": "frozen-canonical-red-control",
+  "base": {
+    "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24"
+  },
+  "candidate": {
+    "commit": "9f45f77955317b8dd64fadb049d85c33ca109bf4",
+    "tree": "c38c4d60c74bf70994378029ad9e286a83cf2d69",
+    "parent": "ee00381fd95148cd85a4c0940c3c17ee6805aa25",
+    "parent_diff_sha256": "b77a739ac6231e3fac859bb80a4d38b968f5cb911aaca1f88644e20996953b37",
+    "patch_id": "872cb7d3d4e7756ca895119ec0ebdee13aa1717a",
+    "handoff_sha256": "288926d43355526489908c84845ba2d30343e97117f04652f0d58754862c128b"
+  },
+  "scanner": {
+    "path": "packages/lix/tests/branch_ref_whole_closure_oracle_b59/verify_branch_ref_whole_closure.sh",
+    "anchor": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "normalization": "normalize_branch_ref_scan.sh",
+    "stdout_and_stderr_are_separate": true,
+    "normalizer_sha256": "1536d8146f87a4fc26a440789eb08a1825404c40bb517ccbb49ef32f6ff66678",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "expected": {
+    "required_missing": 0,
+    "legacy_residue": 460,
+    "old_closure_paths": 4,
+    "branch_ref_occurrence_files": 15,
+    "non_derived_branch_ref_files": 4,
+    "authority_use_lines": 331,
+    "normalized_sha256": "026fcd6b7aaa9afd8341fdca6451962d4addd5aedef63724b6f90d50b8b573bb",
+    "normalized_bytes": 78700,
+    "normalized_lines": 26
+  },
+  "alternative_claim_policy": "481/343 is rejected unless the normalizer/source, raw captures, normalized output, and hashes are committed and reproduce from these exact base and candidate trees."
+}
