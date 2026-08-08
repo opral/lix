@@ -4,8 +4,8 @@ Status: frozen test/report-only preparation for the first immutable runnable
 Stage 2 head. No candidate artifact has been applied and no build has run.
 
 The verifier worktree carries ten-row acceptance-matrix readiness successor
-`d6bb712a8205263c344db0b9ea41f92bba0add52`, tree
-`8bf0baf0f4e7d8246b9a5ab368fec6114b01b512`. At creation the workspace
+`7678fb1cd4bad261c5a667c5916645bfb731b944`, tree
+`98390511cdc0b2591a1813b16b681928807a6232`. At creation the workspace
 filesystem had 49 GiB available. Cargo targets and databases will remain under
 this workspace filesystem and every future cell is capped at 20 minutes.
 
@@ -52,8 +52,23 @@ The verifier reproduces its focused and `a12` lineage diffs and all three change
 source blob IDs. It remains non-runnable and does not authorize a build or
 artifact application.
 
+The later ordinary-writer milestone
+`5c4cae810324a34c0adbbb5a1a0be5fba5348054`, tree
+`16741cdf6efce6bccdcf469406be1e1bce9b5f37`, is separately identity-pinned as a
+blocked frontier with its three changed source blobs. It discards deterministic
+runtime sequence state; can drop ref-only/selected-history intent while still
+publishing untracked/epoch work; and errors on true empty commits instead of
+preserving no-op behavior. It also remains compile-red and retains independent
+upload/checkpoint/history/multi-branch/reachability publication families, so it
+does not supersede `54e90dbf...` as readiness base.
+
+No 5A residue count is canonical. The author handoff's 170/`ae4250...` lacks a
+bound scanner identity, while R2's frozen-oracle 166/`3891a486...` is a
+different provenance. A successor must replay baseline and candidate with one
+exact scanner source/binary hash before residue can contribute to readiness.
+
 Result: PASS for 10/10 acceptance refs, latest approved readiness
-`54e90dbf...`, one retained superseded blocker, 8/8 readiness source blobs, and
+`54e90dbf...`, two retained blocked frontiers, 11/11 readiness source blobs, and
 27/27 embedded acceptance files. The frozen
 machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 

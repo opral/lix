@@ -106,6 +106,8 @@ verify_readiness_ref() {
   local lineage_kind=lineage
   if [[ "$output_kind" == "blocked-readiness" ]]; then
     lineage_kind=blocked-lineage
+  elif [[ "$output_kind" == "blocked-writer" ]]; then
+    lineage_kind=blocked-writer-lineage
   fi
   printf '%s\t%s\tPASS\t%s\t%s\t%s\n' "$output_kind" "$id" "$head" "$tree" "$focused_diff"
   printf '%s\t%s\tPASS\t%s\t%s\t%s\n' "$lineage_kind" "$id" "$parent" "$lineage_base" "$lineage_diff"
@@ -147,6 +149,10 @@ verify_readiness_ref blobref_identity codex/forktree-stage2-milestone4b-blob-man
 verify_blob_oid blobref_identity packages/lix/src/forktree/blob.rs a9ab0f78cace48a036966fd8f53b0b3941ba2ef3
 verify_blob_oid blobref_identity packages/lix/src/forktree/model.rs 62209166b0168e094653dceacdd69ea6783d80ca
 verify_blob_oid blobref_identity packages/lix/src/forktree/tests.rs 483ea45dfad532ef4d744d6719a4b0bd1d5db878
+verify_readiness_ref writer5a codex/forktree-stage2-milestone5a-ordinary-atomic-writer 5c4cae810324a34c0adbbb5a1a0be5fba5348054 16741cdf6efce6bccdcf469406be1e1bce9b5f37 54e90dbf2bcf55c74de0be6ea4b217dc02cec89c 80f48db60e9205b2d3f242ee966f8d61d539a9dff65030d002a71c7f82bfaf2d a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 ad49aa816f4cece010f361f6fadf7f7b59f2003d6e905bd8f44341d613d08f56 blocked-writer
+verify_blob_oid writer5a packages/lix/src/forktree/publication.rs 853079b1b4ac0a89b507e34b0221d5038f89e054
+verify_blob_oid writer5a packages/lix/src/transaction/commit.rs b6e5b977c6777f986565dd1bfe3d3edac066cf24
+verify_blob_oid writer5a packages/lix/src/transaction/context.rs 74f482d6e2345e781b929d047bfea71486111f16
 
 verify_file sql packages/rs-sdk-tests/tests/forktree_stage2_sql_dml.rs b410b717f45d68e928e93dcf1332de2895db0246202e9ba9a6e5bc10b416c6bb
 verify_file sql packages/rs-sdk-tests/tests/FORKTREE_STAGE2_SQL_DML_ORACLE.md 1867643051628903232c3cbe8f4ae2c1e2655b7cbb0b044ec1046acf35947e22
@@ -181,4 +187,4 @@ printf 'external\tpointread\tNOTE\tREPORT.md\tb86db402ec0bf9b25ca619564edb82a420
 printf 'external\tpointread\tNOTE\tSHA256SUMS\tcacbcee8f7b80a627f96dd8b7d6d55beef0fe2a2f7228f0290b488ae7717a888\tnot embedded in ref; author reports 3/3 verify\n'
 printf 'external\tpointread\tNOTE\tstage2_point_read_oracle-025c3b394ec8760c\tead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a\tbench binary; rebuild on candidate\n'
 printf 'external\tolap\tNOTE\tprovenance-report\te78821631888e8a8810df78e9bdffbe31c8a8124227c5ad0c3b549a6e60795a4\tnot embedded in ref\n'
-printf 'summary\tall\tPASS\t10 acceptance refs; latest approved readiness=54e90dbf; 1 superseded blocker\t27 embedded files; 8 readiness-source blobs\tno artifacts applied\n'
+printf 'summary\tall\tPASS\t10 acceptance refs; latest approved readiness=54e90dbf; 2 blocked frontiers\t27 embedded files; 11 readiness-source blobs\tno artifacts applied\n'
