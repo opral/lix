@@ -35,6 +35,12 @@ The candidate-side Cargo test must exercise the same contract as the corrected
 model; the frozen package itself deliberately does not wire a production or
 Cargo target on compiler-red b59.
 
+Error taxonomy is part of that contract: absent or non-live global roots,
+branch snapshots, and selector-catalog closure return `MissingRoot`; malformed
+selector authentication or an embedded branch identity mismatch returns
+`CorruptSelector` (subject to the model's earlier `InvalidFingerprint`/
+`InvalidBranchIdentity` validation boundary).
+
 After compile/no-run green, run one backend cell at a time, in this order:
 
 ```sh

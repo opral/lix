@@ -383,6 +383,22 @@ impl Repository {
         }
     }
 
+    fn validate_branch_snapshot(
+        &self,
+        expected_branch: &str,
+        selector: &BranchSelector,
+    ) -> Result<(), Failure> {
+        if selector.branch != expected_branch {
+            return Err(Failure::CorruptSelector);
+        }
+        if !self.objects.contains(&selector.snapshot)
+            || !self.live_objects.contains(&selector.snapshot)
+        {
+            return Err(Failure::MissingRoot);
+        }
+        Ok(())
+    }
+
     fn validate_catalog_root(&self, catalog_root: &str) -> Result<(), Failure> {
         if !self.objects.contains(catalog_root) || !self.live_objects.contains(catalog_root) {
             return Err(Failure::MissingRoot);
@@ -448,17 +464,10 @@ impl Repository {
             .ok_or(Failure::MissingRoot)?;
         self.validate_branch_selector(&selector)?;
         self.validate_catalog_root(&selector.catalog_root)?;
-        if self.cycles.contains(branch)
-            || selector.branch != branch
-            || !self.objects.contains(&selector.snapshot)
-            || !self.live_objects.contains(&selector.snapshot)
-        {
-            return Err(if self.cycles.contains(branch) {
-                Failure::Cycle
-            } else {
-                Failure::CorruptSelector
-            });
+        if self.cycles.contains(branch) {
+            return Err(Failure::Cycle);
         }
+        self.validate_branch_snapshot(branch, &selector)?;
         let read_id = self.next_read_id;
         self.next_read_id += 1;
         self.views += 1;
@@ -800,11 +809,8 @@ impl Repository {
         for (branch, selector) in &self.branches {
             self.validate_branch_selector(selector)?;
             self.validate_catalog_root(&selector.catalog_root)?;
-            if branch != &selector.branch
-                || !self.objects.contains(&selector.snapshot)
-                || !self.live_objects.contains(&selector.snapshot)
-                || selector.catalog_root != SELECTOR_CATALOG_ROOT
-            {
+            self.validate_branch_snapshot(branch, selector)?;
+            if selector.catalog_root != SELECTOR_CATALOG_ROOT {
                 return Err(Failure::CorruptSelector);
             }
         }
@@ -1046,8 +1052,13 @@ fn malformed_identity_missing_root_and_cycle_fail_closed() {
         BRANCH_A.into(),
         BranchSelector::new(BRANCH_A, "missing-root", 1),
     );
+    assert_eq!(repository.open_view(BRANCH_A), Err(Failure::MissingRoot));
+    let mut mismatched_identity = repository_with_branch();
+    mismatched_identity
+        .branches
+        .insert(BRANCH_A.into(), BranchSelector::new(BRANCH_B, "root-a", 1));
     assert_eq!(
-        repository.open_view(BRANCH_A),
+        mismatched_identity.open_view(BRANCH_A),
         Err(Failure::CorruptSelector)
     );
     repository.objects.insert("root-cycle".into());

@@ -45,6 +45,19 @@ resurrect a dead object. The catalog ID/kind/back-edge, selector substitution,
 CAS, dual-authority, lifecycle, and no-partial-write controls remain intact.
 The added v3 cases are source-only and no runtime claim is made.
 
+## Direct v4 error-taxonomy correction
+
+This is a new immutable test/report-only child of v3 commit
+`3a3c687f30c5190ac5eb9dc397745aec5d3a18d2`; v3 remains unchanged. The model
+now classifies an absent or non-live global root, branch snapshot, or
+selector-catalog closure as `MissingRoot`. A malformed or unauthenticated
+selector, including an embedded branch identity that does not match the
+requested branch, remains `CorruptSelector` (or the existing authentication
+failure where validation stops earlier). The correction uses one shared
+branch-snapshot validation rule in `open_view` and `reopen`; it adds no
+production path, authority, fallback, or adapter behavior. All 19 standalone
+model tests are rerun for this successor.
+
 ## Immutable anchor
 
 ```text

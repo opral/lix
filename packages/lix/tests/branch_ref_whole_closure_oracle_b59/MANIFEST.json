@@ -1,7 +1,7 @@
 {
   "kind": "test-report-only-branch-ref-whole-closure-oracle",
   "status": "dormant-until-compile-green",
-  "correction": "882b direct read-closure/liveness successor",
+  "correction": "v4 BranchRef closure error-taxonomy successor of 3a3c",
   "anchor": {
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
@@ -78,6 +78,8 @@
     "reject a derived BranchRef/second authority before selector publication",
     "open_view and reopen require an existing, authenticated selector-catalog object with canonical object ID, kind, and global-selector back-edge",
     "open_view and reopen require physically present and live global roots, branch snapshots, and catalog closure",
+    "classify absent or non-live global, branch-snapshot, and catalog closure as MissingRoot",
+    "retain CorruptSelector for malformed selector authentication and embedded branch-identity mismatch",
     "prepare_branch and update publication reject non-live objects and never resurrect them",
     "exercise create, switch, advance, delete, retire, retained-view GC, and cold reopen transitions",
     "reopen validates global selector sequence and branch selector bindings",

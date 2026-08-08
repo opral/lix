@@ -1,4 +1,4 @@
-# b59 source-gate calibration and BranchRef v3 correction
+# b59 source-gate calibration and BranchRef v4 correction
 
 This is a static calibration result on the immutable b59 anchor. It is not a
 candidate acceptance result and does not claim production compilation or
@@ -105,3 +105,25 @@ before mutation and cannot resurrect them. Four discriminating model cases
 cover branch-sharing, root mismatch, global liveness, non-live preparation/
 publication, and reopen closure. The v3 model is source-only here; no compile
 or runtime claim is made.
+
+## Direct v4 error-taxonomy correction
+
+This immutable test/report-only child of v3 commit
+`3a3c687f30c5190ac5eb9dc397745aec5d3a18d2` changes only the model's failure
+classification. `open_view` and `reopen` share a branch-snapshot validator:
+an absent or non-live global root, branch snapshot, or selector-catalog
+closure is `MissingRoot`; malformed selector authentication and an embedded
+branch identity mismatch remain `CorruptSelector` (or the earlier explicit
+authentication/identity error). No production source, adapter, format,
+compatibility path, or authority changed. The exact standalone v4 model
+compile and 19-test runtime are recorded below; production and adapter
+runtime remain unclaimed.
+
+* direct v4 `rustc --edition=2021 --test -D warnings`: PASS
+* direct v4 model runtime: 19/19 PASS, binary SHA-256
+  `cf49f6b83d088f0a642ef8434fc9b59802bf67dfc7147bb5cad0c3c1f178953f`,
+  log SHA-256
+  `2efcf07abc35e28bd258ed9592f66da89333bc917e96f322693794c579fb457b`
+* direct v4 source-verifier capture: expected RED, log SHA-256
+  `c1c39f02df2f99116cf4aa9ef5a30e8719774a54d7d9ffb9e943483c046e522d`
+* `rustfmt --edition 2021 --check`, `bash -n`, and `git diff --check`: PASS
