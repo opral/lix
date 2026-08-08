@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Test/report-only seven-stage readiness overlay.
 # Default mode is read-only provenance verification. Runtime is impossible
-# unless RUN_RUNTIME=1, COMPILE_GREEN=1, and R1 is fully immutable/bound.
+# unless RUN_RUNTIME=1, COMPILE_GREEN=1, R1 is fully immutable/bound, and the
+# reviewed R5 correction plus W5/R7 contract are bound.
 
 die() { printf 'BLOCKER\t%s\n' "$*" >&2; exit 1; }
 note() { printf '%b\n' "$*"; }
@@ -20,6 +21,8 @@ base_parent_tree=ee96c5b64912b8fa8bb15fb7c31916244a255523
 base_diff=18a7df6d37fce9809b2214f5b1530204b1a2dd4cf19760aa876ec7856249dbc7
 main_head=822c204ce0670969ca71045bc74f9ca25fde8093
 main_tree=fac3f2b713683be17c34515062dd72edc8feed95
+r5_binding="$script_dir/R5_CORRECTED_FRONTIER_BINDING.tsv"
+w5_binding="$script_dir/W5_R7_GC_REACHABILITY_CONTRACT.tsv"
 
 gitc() { git -C "$root" "$@"; }
 sha_file() { sha256sum "$1" | awk '{print $1}'; }
@@ -39,9 +42,16 @@ verify_identity() {
   [[ "$parent_tree" == "$base_parent_tree" ]] || die "1f742 parent tree mismatch"
   diff=$(gitc diff --binary --full-index "$base_parent..$base_head" | sha256sum | awk '{print $1}')
   [[ "$diff" == "$base_diff" ]] || die "1f742 parent diff mismatch expected=$base_diff actual=$diff"
-  gitc merge-base --is-ancestor "$base_head" "$actual" || die "candidate is not a descendant of exact 1f742"
-  note "anchor\t1f742\tPASS\t$base_head\t$base_tree\t$base_diff"
-  note "candidate\tPASS\t$actual\t$tree\tcurrent-main-anchor=$main_head/$main_tree"
+  note "anchor\t1f742\tBLOCKED\t$base_head\t$base_tree\t$base_diff\tmissing CommitRecord fail-closed correction"
+  if gitc merge-base --is-ancestor "$base_head" "$actual"; then
+    if [[ "$(r5_status)" == ready ]] && gitc merge-base --is-ancestor "$(r5_value corrected_head)" "$actual"; then
+      note "candidate\tR5-LINEAGE\t$actual\t$tree\tdescends from reviewed R5 correction"
+    else
+      note "candidate\tBLOCKED-LINEAGE\t$actual\t$tree\t1f742 lineage is not executable before exact R5 transport"
+    fi
+  else
+    note "candidate\tUNBOUND\t$actual\t$tree\tawaiting R5 corrected frontier"
+  fi
 }
 
 verify_scope() {
@@ -51,6 +61,8 @@ verify_scope() {
     FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.md \
     FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.tsv \
     R1_CHECKPOINT_GC_BINDING.tsv \
+    R5_CORRECTED_FRONTIER_BINDING.tsv \
+    W5_R7_GC_REACHABILITY_CONTRACT.tsv \
     forktree_stage2_seven_stage_overlay.sh; do
     [[ "$p" =~ $forbidden ]] && die "overlay scope contains forbidden legacy token in path: $p"
     [[ -f "$script_dir/$p" ]] || die "overlay artifact missing: $p"
@@ -64,6 +76,20 @@ r1_status() {
   awk -F '\t' '$1=="status" {print $2}' "$binding"
 }
 
+r5_status() {
+  awk -F '\t' '$1=="status" {print $2}' "$r5_binding"
+}
+
+binding_value() {
+  local key=$1
+  awk -F '\t' -v k="$key" '$1==k {print $2}' "$binding"
+}
+
+r5_value() {
+  local key=$1
+  awk -F '\t' -v k="$key" '$1==k {print $2}' "$r5_binding"
+}
+
 verify_r1() {
   local status
   status=$(r1_status)
@@ -71,12 +97,92 @@ verify_r1() {
     note "r1\tHOLD\tstatus=$status\tno checkpoint/GC runtime enabled"
     return 0
   fi
-  for key in ref head tree parent source_sha256 report_sha256 rocks_checkpoint_case slate_checkpoint_case rocks_gc_case slate_gc_case; do
+  for key in ref head tree parent full_index_diff_sha256 ordinary_diff_sha256 patch_id report_sha256 checkpoint_test_path checkpoint_test_sha256 oracle_report_path oracle_report_sha256 rocks_checkpoint_case slate_checkpoint_case gc_contract_case rocks_gc_case slate_gc_case; do
     local value
-    value=$(awk -F '\t' -v k="$key" '$1==k {print $2}' "$binding")
+    value=$(binding_value "$key")
     [[ -n "$value" && "$value" != UNBOUND ]] || die "R1 binding is ready but $key is unbound"
   done
-  note "r1\tREADY\t$(awk -F '\t' '$1=="ref" {print $2}' "$binding")\t$(awk -F '\t' '$1=="head" {print $2}' "$binding")\t$(awk -F '\t' '$1=="tree" {print $2}' "$binding")"
+  local advertised_ref remote_branch local_ref actual tree parent full_index ordinary patch_id test_sha report_sha
+  advertised_ref=$(binding_value ref)
+  remote_branch=${advertised_ref#origin/}
+  local_ref=refs/stage2-acceptance-overlay/r1
+  timeout 20m git -C "$root" fetch --no-tags origin "+refs/heads/$remote_branch:$local_ref" >/dev/null
+  actual=$(gitc rev-parse "$local_ref^{commit}")
+  tree=$(gitc rev-parse "$local_ref^{tree}")
+  parent=$(gitc rev-parse "$local_ref^")
+  [[ "$actual" == "$(binding_value head)" ]] || die "R1 head mismatch expected=$(binding_value head) actual=$actual"
+  [[ "$tree" == "$(binding_value tree)" ]] || die "R1 tree mismatch expected=$(binding_value tree) actual=$tree"
+  [[ "$parent" == "$(binding_value parent)" ]] || die "R1 parent mismatch expected=$(binding_value parent) actual=$parent"
+  full_index=$(gitc -c core.abbrev=40 -c diff.noprefix=false diff --binary --full-index --no-ext-diff "$parent..$local_ref" | sha256sum | awk '{print $1}')
+  [[ "$full_index" == "$(binding_value full_index_diff_sha256)" ]] || die "R1 full-index diff mismatch expected=$(binding_value full_index_diff_sha256) actual=$full_index"
+  ordinary=$(gitc diff --no-ext-diff "$parent..$local_ref" | sha256sum | awk '{print $1}')
+  [[ "$ordinary" == "$(binding_value ordinary_diff_sha256)" ]] || die "R1 ordinary diff mismatch expected=$(binding_value ordinary_diff_sha256) actual=$ordinary"
+  patch_id=$(gitc -c core.abbrev=40 -c diff.noprefix=false diff --binary --full-index --no-ext-diff "$parent..$local_ref" | git patch-id --stable | awk '{print $1}')
+  [[ "$patch_id" == "$(binding_value patch_id)" ]] || die "R1 patch-id mismatch expected=$(binding_value patch_id) actual=$patch_id"
+  test_sha=$(gitc show "$local_ref:$(binding_value checkpoint_test_path)" | sha256sum | awk '{print $1}')
+  [[ "$test_sha" == "$(binding_value checkpoint_test_sha256)" ]] || die "R1 test blob mismatch expected=$(binding_value checkpoint_test_sha256) actual=$test_sha"
+  report_sha=$(gitc show "$local_ref:$(binding_value oracle_report_path)" | sha256sum | awk '{print $1}')
+  [[ "$report_sha" == "$(binding_value oracle_report_sha256)" ]] || die "R1 oracle blob mismatch expected=$(binding_value oracle_report_sha256) actual=$report_sha"
+  if [[ -n "${R1_REPORT_PATH:-}" ]]; then
+    [[ "$(sha_file "$R1_REPORT_PATH")" == "$(binding_value report_sha256)" ]] || die "R1 external report mismatch"
+    note "r1-report\tPASS\t$(binding_value report_sha256)\t$R1_REPORT_PATH"
+  else
+    note "r1-report\tEXTERNAL\texpected=$(binding_value report_sha256)\tset R1_REPORT_PATH to verify mounted report"
+  fi
+  note "r1\tREADY\t$advertised_ref\t$actual\t$tree\tfull-index=$full_index\tpatch=$patch_id"
+}
+
+verify_r5() {
+  local status blocked_head blocked_tree
+  status=$(r5_status)
+  blocked_head=$(r5_value blocked_frontier_head)
+  blocked_tree=$(r5_value blocked_frontier_tree)
+  [[ "$blocked_head" == "$base_head" ]] || die "R5 binding blocked-head mismatch"
+  [[ "$blocked_tree" == "$base_tree" ]] || die "R5 binding blocked-tree mismatch"
+  if [[ "$status" != ready ]]; then
+    [[ "$(r5_value corrected_head)" == "d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768" ]] || die "R5 pending head mismatch"
+    [[ "$(r5_value corrected_tree)" == "641654079f60fcd1c9ff9ccbbd06d3edcabe4096" ]] || die "R5 pending tree mismatch"
+    [[ "$(r5_value corrected_parent)" == "$base_head" ]] || die "R5 pending parent mismatch"
+    [[ "$(r5_value corrected_diff_sha256_prefix)" == "be940f41" ]] || die "R5 source-approved diff prefix mismatch"
+    [[ "$(r5_value corrected_patch_id_prefix)" == "1902f4c9" ]] || die "R5 source-approved patch prefix mismatch"
+    note "r5\tHOLD\tstatus=$status\tsource-approved=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768\tapprovals=R2,R4\tawaiting immutable ref/report; no candidate runtime enabled"
+    return 0
+  fi
+  for key in corrected_ref corrected_head corrected_tree corrected_parent corrected_diff_sha256 corrected_report_sha256; do
+    local value
+    value=$(r5_value "$key")
+    [[ -n "$value" && "$value" != UNBOUND ]] || die "R5 binding is ready but $key is unbound"
+  done
+  local corrected_ref remote_branch local_ref corrected_head corrected_tree actual tree candidate
+  corrected_ref=$(r5_value corrected_ref)
+  remote_branch=${corrected_ref#origin/}
+  local_ref=refs/stage2-acceptance-overlay/r5-corrected
+  timeout 20m git -C "$root" fetch --no-tags origin "+refs/heads/$remote_branch:$local_ref" >/dev/null
+  corrected_head=$(r5_value corrected_head)
+  corrected_tree=$(r5_value corrected_tree)
+  actual=$(gitc rev-parse "$local_ref^{commit}")
+  tree=$(gitc rev-parse "$local_ref^{tree}")
+  [[ "$actual" == "$corrected_head" && "$tree" == "$corrected_tree" ]] || die "R5 corrected identity mismatch"
+  candidate=$(gitc rev-parse "$requested_head^{commit}")
+  gitc merge-base --is-ancestor "$local_ref" "$candidate" || die "candidate is not descended from R5 corrected frontier"
+  note "r5\tREADY\t$corrected_ref\t$actual\t$tree\tcandidate lineage verified"
+}
+
+verify_w5() {
+  local status contract sums path
+  status=$(awk -F '\t' '$1=="status" {print $2}' "$w5_binding")
+  contract=$(awk -F '\t' '$1=="contract_sha256" {print $2}' "$w5_binding")
+  sums=$(awk -F '\t' '$1=="sums_sha256" {print $2}' "$w5_binding")
+  [[ "$status" == external-report-only ]] || die "W5/R7 status changed unexpectedly"
+  [[ "$contract" == 9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8 ]] || die "W5/R7 contract hash mismatch"
+  [[ "$sums" == cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88 ]] || die "W5/R7 sums hash mismatch"
+  path=$(awk -F '\t' '$1=="contract_path" {print $2}' "$w5_binding")
+  if [[ -f "$path" ]]; then
+    [[ "$(sha_file "$path")" == "$contract" ]] || die "mounted W5/R7 contract hash mismatch"
+    note "w5-r7\tPASS\t$contract\tmounted contract verified"
+  else
+    note "w5-r7\tEXTERNAL\t$contract\tcontract not mounted; identity bound"
+  fi
 }
 
 print_commands() {
@@ -99,12 +205,17 @@ case "$mode" in
     verify_identity
     verify_scope
     verify_r1
+    verify_r5
+    verify_w5
     note "runtime\tDORMANT\tset RUN_RUNTIME=1 only after explicit compile-green immutable approval"
     ;;
   commands)
     print_commands
     ;;
   materialize)
+    verify_identity
+    verify_r5
+    [[ "$(r5_status)" == ready ]] || die "R5 corrected frontier is not ready; no materialization"
     [[ -z "$(gitc status --porcelain)" ]] || die "candidate checkout is dirty"
     overlay=${OVERLAY_DIR:?set OVERLAY_DIR to a fresh nonexistent directory}
     [[ ! -e "$overlay" ]] || die "OVERLAY_DIR already exists: $overlay"
@@ -112,6 +223,8 @@ case "$mode" in
     mkdir -p "$overlay/.stage2-acceptance-overlay"
     cp "$script_dir"/FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.{md,tsv,sh} "$overlay/.stage2-acceptance-overlay/"
     cp "$binding" "$overlay/.stage2-acceptance-overlay/"
+    cp "$r5_binding" "$overlay/.stage2-acceptance-overlay/"
+    cp "$w5_binding" "$overlay/.stage2-acceptance-overlay/"
     note "materialized\tPASS\t$overlay\tproduction paths unchanged\truntime dormant"
     ;;
   run)
@@ -120,6 +233,7 @@ case "$mode" in
     verify_identity
     verify_scope
     [[ "$(r1_status)" == ready ]] || die "R1 immutable checkpoint/GC binding is not ready"
+    [[ "$(r5_status)" == ready ]] || die "R5 reviewed correction is not ready"
     die "execution handoff requires the exact R1 command fields; use commands after binding"
     ;;
   *) die "unknown mode: $mode (verify|commands|materialize|run)" ;;

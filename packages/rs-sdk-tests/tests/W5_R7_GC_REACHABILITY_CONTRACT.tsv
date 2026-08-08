@@ -1,0 +1,10 @@
+key	value
+status	external-report-only
+contract_path	/root/repos/lix-evidence/forktree-w5-r7-gc-reachability-contract/CONTRACT.md
+contract_sha256	9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8
+sums_path	/root/repos/lix-evidence/forktree-w5-r7-gc-reachability-contract/SHA256SUMS
+sums_sha256	cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88
+stage	7
+required_semantics	one epoch-fenced authority; 64+suffix and one-debt/no-spin; H/S/C chronology; reader pins; all roots; final-reference reclamation; corruption; cold reopen
+adapters	Memory,RocksDB,SlateDB
+runtime_prerequisite	candidate compile-green and reviewed R5 correction

@@ -1,14 +1,16 @@
 # ForkTree Stage 2 seven-stage landing overlay
 
-Status: test/report-only, dormant, and disposable. This package does not
+Status: test/report-only, R1-bound, R5 source-approved but transport-pending,
+dormant, and disposable. This package does not
 modify production source, merge artifact branches, or execute a runtime cell.
 The `run` mode is fenced on purpose: it requires an explicitly compile-green
-candidate and a complete immutable R1 binding. Until both exist, `verify` may
-only return provenance plus a HOLD for checkpoint/GC.
+candidate. `verify` validates the immutable R1 binding, while runtime still
+requires an explicitly compile-green candidate.
 
 ## Exact compatibility anchor
 
-The overlay is prepared for the exact topology/semantic successor:
+The overlay records the exact topology/semantic frontier, which is now blocked
+and is not a promotable execution anchor:
 
 ```text
 base head:       1f742a382c755399b8a49ab536c4f6dc55fffdd8
@@ -21,10 +23,11 @@ remote ref:      origin/codex/forktree-stage2-milestone5c-topology-semantic-brid
 ```
 
 The current-main anchor remains `822c204ce0670969ca71045bc74f9ca25fde8093`
-with tree `fac3f2b713683be17c34515062dd72edc8feed95`. The candidate must be a
-descendant of the exact `1f742...` object, or the coordinator must record a
-replacement lineage before qualification. The overlay never assumes that a
-mutable branch tip is equivalent to this object.
+with tree `fac3f2b713683be17c34515062dd72edc8feed95`. The SQL change provider
+at `1f742...` can silently omit missing authenticated `CommitRecord` entries,
+so this object and its broad descendants are blocked. A candidate may become
+eligible only after `R5_CORRECTED_FRONTIER_BINDING.tsv` names a narrow reviewed
+correction and the candidate descends from that corrected object.
 
 ## Seven stages and source mapping
 
@@ -32,8 +35,8 @@ The machine-readable order and commands are in
 `FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.tsv`. Stage 1 combines the P0 publication
 cut with deletion/residue, so the former broad/comparator prerequisites are not
 part of landing. Stages 2--5 exercise the production transaction, version
-control, parsed-file, and authenticated BlobRef owners. Stages 6--7 are held
-for the R1 checkpoint/GC landing oracle.
+control, parsed-file, and authenticated BlobRef owners. Stages 6--7 are bound
+to the R1 checkpoint/GC landing oracle.
 
 Every stage is RocksDB first, then SlateDB, with a fresh database/evidence path
 and an isolated target. Each build or process is independently capped at 20
@@ -51,26 +54,54 @@ The production mapping is intentionally semantic:
 | 4 | ForkTree branch/history/merge owner | branch/diff/merge/history/undo-redo, corruption, cold reopen |
 | 5 | ForkTree parsed-file and BlobRef owner | exact bytes, authenticated BlobId/size/domain/hash/range, cold reopen |
 | 6 | R1 checkpoint/recovery selector/object owner | 3-row H/C bridge, 64 rotations, merge-base C, recovery and reclaim |
-| 7 | R1 GC/publication/upload owner | both race orders, upload completion/abort, corruption, reopen, final release |
+| 7 | R1 GC/publication/upload owner plus external W5/R7 reachability contract | both race orders, upload completion/abort, corruption, reopen, reader pins, complete roots, final release |
 
 No stage may add a second writer, compatibility reader, fallback format,
-raw-object SPI, or physical-serving authority. Missing R1 identity is a
-provenance hold, not permission to use the existing a12 checkpoint or GC
-references as a substitute.
+raw-object SPI, or physical-serving authority.
 
 ## R1 binding
 
-`R1_CHECKPOINT_GC_BINDING.tsv` is deliberately unbound until R1 publishes an
-immutable ref. Existing checkpoint and GC oracle refs remain historical matrix
-rows; they are not silently relabeled R1. The binding must supply exact
-`ref`, `head`, `tree`, `parent`, source/report hashes, and the two case names
-for RocksDB and SlateDB. The verifier checks that identity and requires the
-candidate to expose the named typed facade before enabling stages 6--7.
+`R1_CHECKPOINT_GC_BINDING.tsv` is bound to exact immutable ref
+`origin/codex/forktree-stage2-checkpoint-gc-landing-v4`, head
+`f01b08a2db1bd71650eec11123adec26b5222dcc`, tree
+`165efdd6ca58c84d737249c41718001823e20ffb`, parent
+`9bace2186664fc77877aa24abae6e516855313a1`, full-index diff
+`5675e2b0ada7ce8e54b5f5746f1845f3f8a834bbc3f6aef7cc6ad435d937f83f`, and
+patch ID `e7f44903bddf8acd7fa5a4eb38895ed8c3340995`. It contains exactly the
+two test/report paths named in the binding. The external report is recorded by
+SHA-256 `2ab06208bb46aeee5b4cd853a6957b19647b48aabd5cc7ee5d865ba3c3c41290`.
+The verifier checks the remote object, parent, both embedded blob hashes, and
+the external report when `R1_REPORT_PATH` is supplied. Runtime remains gated
+on candidate compile-green status and the reviewed R5 correction.
+
+The stage-7 reachability contract is additionally bound to the external,
+report-only W5/R7 artifact in `W5_R7_GC_REACHABILITY_CONTRACT.tsv`. Its exact
+contract SHA-256 is
+`9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8`; the
+companion `SHA256SUMS` SHA-256 is
+`cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88`.
+The artifact is not mounted on this host, so the binding is identity-only.
+It supplies the one epoch-fenced authority, 64+suffix and one-debt/no-spin,
+H/S/C chronology, reader-pin, complete-root, final-reference, corruption, and
+cold-reopen requirements for stage 7. It does not authorize runtime before a
+compile-green reviewed R5 successor.
+
+## R5 correction hold
+
+`R5_CORRECTED_FRONTIER_BINDING.tsv` preserves the blocked `1f742...` identity
+and records source-approved frontier `d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768`
+(tree `641654079f60fcd1c9ff9ccbbd06d3edcabe4096`, parent `1f742...`, diff
+`be940f41...`, patch `1902f4c9`) with status
+`source-approved-awaiting-immutable-transport`. R2 and R4 approvals are
+recorded, but its ref and report are intentionally unbound. The overlay
+verifier still rejects materialization and runtime until the exact immutable
+R5 ref/head/tree/report hashes are complete.
 
 ## Overlay scope
 
-The overlay consists only of this manifest, its TSV, the R1 binding placeholder,
-and the dormant verifier script. Materialization creates a disposable detached
+The overlay consists only of this manifest, its TSV, the R1 binding, the R5
+correction hold, the W5/R7 external contract binding, and the dormant verifier
+script. Materialization creates a disposable detached
 candidate worktree and places these files under `.stage2-acceptance-overlay/`;
 it does not patch production paths or copy oracle implementations into them.
 The candidate's own production diff is recorded, not rewritten. Artifact refs

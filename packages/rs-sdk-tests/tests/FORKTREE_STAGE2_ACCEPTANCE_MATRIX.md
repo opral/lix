@@ -25,8 +25,8 @@ Both are non-runnable; the latest held frontier remains blocked until an
 immutable descendant is explicitly compile-green and independently clears R2
 atomicity and H2 residue approval.
 
-The seven-stage landing overlay is now pinned to the exact compatible topology
-successor `1f742a382c755399b8a49ab536c4f6dc55fffdd8`, tree
+The seven-stage landing overlay records the exact blocked topology frontier
+`1f742a382c755399b8a49ab536c4f6dc55fffdd8`, tree
 `860a047b98eaa38368a3d889497628e244c2e0ec`, parent
 `7c9b1060bc396dfa54efcc6c888e37894a7cfb04`, with parent-to-head full-index
 SHA-256 `18a7df6d37fce9809b2214f5b1530204b1a2dd4cf19760aa876ec7856249dbc7`.
@@ -35,11 +35,12 @@ Its exact remote ref is
 disposable overlay and machine-readable seven-stage order are
 `FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.md`,
 `FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.tsv`,
-`R1_CHECKPOINT_GC_BINDING.tsv`, and
+`R1_CHECKPOINT_GC_BINDING.tsv`, `R5_CORRECTED_FRONTIER_BINDING.tsv`,
+`W5_R7_GC_REACHABILITY_CONTRACT.tsv`, and
 `forktree_stage2_seven_stage_overlay.sh`. They are dormant and test/report
-only: no runtime cell may start until a candidate descends from this exact
-object, is explicitly compile-green, and the R1 binding contains an immutable
-checkpoint/GC ref/head/tree/report identity.
+only: no runtime cell may start until a candidate has a reviewed correction
+frontier replacing blocked `1f742...`, is explicitly compile-green, and the R1
+binding contains the immutable checkpoint/GC ref/head/tree/report identity.
 
 The historical exact current-layout comparator for the frozen test/report
 artifacts is `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
@@ -274,9 +275,23 @@ stage 1 and checkpoint/recovery plus GC/publication retained as separate
 RocksDB-then-SlateDB stages. The former broad/comparator prerequisite is
 removed. The exact order is static owner/residue, 65-row delete, SQL DML,
 branch/diff/merge/history, parsed files plus BlobRef, checkpoint/recovery, and
-GC/publication. The final two stages remain held by the unbound R1 file until
-its immutable ref arrives; existing historical checkpoint/GC rows are not
-silently relabeled as R1.
+GC/publication. The final two stages are now source-mapped to the exact R1
+oracle at `f01b08a2db1bd71650eec11123adec26b5222dcc`; older checkpoint and GC
+refs remain historical provenance. The package remains held because `1f742...`
+is blocked for silent missing-CommitRecord omission; R5 must publish a narrow
+reviewed correction before any descendant is executable. R2/R4 have approved
+the source correction at `d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768` (tree
+`641654079f60fcd1c9ff9ccbbd06d3edcabe4096`, parent `1f742...`, diff
+`be940f41...`, patch `1902f4c9`); its immutable transport ref and report are
+still unbound, so it remains non-runnable.
+
+Stage 7 also binds the external W5/R7 reachability contract: contract SHA
+`9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8` and
+companion sums SHA
+`cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88`.
+The contract is report-only and not mounted locally; its one authority,
+epoch/race, reader-pin, root-universe, corruption, cold-reopen, and final
+reference requirements are bound without enabling runtime.
 
 This is the reduced non-negotiable landing gate for the first explicitly
 compile-green immutable candidate. It is test/report-only and does not authorize

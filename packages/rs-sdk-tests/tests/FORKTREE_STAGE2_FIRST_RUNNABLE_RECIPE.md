@@ -30,9 +30,12 @@ The next compatibility anchor for the disposable overlay is exact
 SHA-256 `18a7df6d37fce9809b2214f5b1530204b1a2dd4cf19760aa876ec7856249dbc7`.
 Use the dormant
 `forktree_stage2_seven_stage_overlay.sh` only as a read-only preflight or to
-create a fresh detached overlay. It rejects candidates that are not descended
-from this exact object. It will not run a cell while the R1 checkpoint/GC
-binding is `awaiting-immutable-ref`.
+create a fresh detached overlay. It records this `1f742...` object as blocked,
+records the R2/R4 source-approved `d6b2690a...` correction as the latest
+readiness base, requires its exact immutable R5 transport ref/report before
+accepting a descendant, and validates the bound R1 checkpoint/GC ref before
+enabling stages 6--7. It still will not run a cell until the candidate is
+explicitly compile-green.
 
 The historical artifact comparator remains exact a12
 `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree

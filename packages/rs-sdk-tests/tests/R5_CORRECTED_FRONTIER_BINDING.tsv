@@ -1,0 +1,14 @@
+key	value
+status	source-approved-awaiting-immutable-transport
+blocked_frontier_ref	origin/codex/forktree-stage2-milestone5c-topology-semantic-bridge
+blocked_frontier_head	1f742a382c755399b8a49ab536c4f6dc55fffdd8
+blocked_frontier_tree	860a047b98eaa38368a3d889497628e244c2e0ec
+corrected_ref	UNBOUND
+corrected_head	d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+corrected_tree	641654079f60fcd1c9ff9ccbbd06d3edcabe4096
+corrected_parent	1f742a382c755399b8a49ab536c4f6dc55fffdd8
+corrected_diff_sha256_prefix	be940f41
+corrected_patch_id_prefix	1902f4c9
+corrected_report_sha256	UNBOUND
+required_approvals	R2,R4
+required_before_runtime	true
