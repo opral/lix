@@ -789,6 +789,7 @@ impl PreparedPublication {
                         })?;
                         validate_member_catalog_owner(
                             view.read(),
+                            view.repository_root().commit_catalog_root,
                             commit_object_id,
                             commit.generation,
                             ordinal,

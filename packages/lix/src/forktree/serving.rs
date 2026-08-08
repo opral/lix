@@ -624,6 +624,7 @@ where
     }
     validate_retained_commit(
         read,
+        repository.commit_catalog_root,
         repository.change_catalog_root,
         commit_object_id,
         &commit,
@@ -646,6 +647,7 @@ where
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner(
             read,
+            repository.commit_catalog_root,
             commit_object_id,
             commit.generation,
             ordinal,
@@ -965,8 +967,35 @@ where
     )?)
 }
 
+async fn validate_commit_catalog_identity<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let catalog_value = lookup_on_read(
+        commit_catalog_root,
+        "commit",
+        commit.commit_id.as_bytes(),
+        read,
+    )
+    .await?
+    .ok_or_else(|| corruption("Commit object has no authoritative CommitCatalog entry"))?;
+    let catalog_entry = CommitCatalogEntry::decode(&catalog_value)?;
+    if catalog_entry.commit_object_id != commit_object_id {
+        return Err(corruption(
+            "Commit object disagrees with its authoritative CommitCatalog entry",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn validate_member_catalog_owner<R>(
     read: &R,
+    commit_catalog_root: ObjectId,
     target_commit_object_id: ObjectId,
     target_generation: u64,
     target_ordinal: usize,
@@ -988,6 +1017,13 @@ where
         } => {
             let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
             let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
+            validate_commit_catalog_identity(
+                read,
+                commit_catalog_root,
+                commit_object_id,
+                &introduction,
+            )
+            .await?;
             if introduction.members.get(ordinal as usize)
                 != Some(&CommitMemberV1::introduced(member.change_object_id()))
             {
@@ -1016,6 +1052,13 @@ where
         Some((source_commit_object_id, source_ordinal)) => {
             let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
             let source_commit = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
+            validate_commit_catalog_identity(
+                read,
+                commit_catalog_root,
+                source_commit_object_id,
+                &source_commit,
+            )
+            .await?;
             if source_commit.generation >= target_generation {
                 return Err(corruption(
                     "selected membership source generation is not earlier than its target",
@@ -1066,6 +1109,7 @@ where
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner(
             view.read(),
+            view.repository_root().commit_catalog_root,
             source_commit_object_id,
             source.generation,
             source_ordinal,
@@ -1505,6 +1549,7 @@ where
     }
     validate_retained_commit(
         view.read(),
+        view.repository_root().commit_catalog_root,
         view.repository_root().change_catalog_root,
         entry.commit_object_id,
         &commit,
@@ -1571,6 +1616,7 @@ where
         }
         validate_retained_commit(
             view.read(),
+            view.repository_root().commit_catalog_root,
             view.repository_root().change_catalog_root,
             entry.commit_object_id,
             &commit,
@@ -1705,6 +1751,7 @@ where
 /// intentionally latent until its edge is visited.
 pub(super) async fn validate_retained_commit<R>(
     read: &R,
+    commit_catalog_root: ObjectId,
     change_catalog_root: ObjectId,
     commit_object_id: ObjectId,
     commit: &CommitObjectV1,
@@ -1739,6 +1786,7 @@ where
         let entry = ChangeCatalogEntry::decode(&value)?;
         validate_member_catalog_owner(
             read,
+            commit_catalog_root,
             commit_object_id,
             commit.generation,
             ordinal,

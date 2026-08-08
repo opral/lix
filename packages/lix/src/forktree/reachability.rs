@@ -943,8 +943,10 @@ where
         }
         ObjectDomain::Commit => {
             let value = CommitObjectV1::decode(id, bytes)?;
+            let commit_catalog_root = repository_commit_catalog(read, repository_root_id).await?;
             let change_catalog_root = repository_change_catalog(read, repository_root_id).await?;
-            validate_retained_commit(read, change_catalog_root, id, &value).await?;
+            validate_retained_commit(read, commit_catalog_root, change_catalog_root, id, &value)
+                .await?;
             edges.extend(
                 value
                     .parent_commit_object_ids
@@ -1093,6 +1095,17 @@ where
 {
     let bytes = load_object_bytes(read, repository_root_id).await?;
     Ok(RepositoryRootV1::decode(repository_root_id, &bytes)?.change_catalog_root)
+}
+
+async fn repository_commit_catalog<R>(
+    read: &R,
+    repository_root_id: ObjectId,
+) -> Result<ObjectId, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let bytes = load_object_bytes(read, repository_root_id).await?;
+    Ok(RepositoryRootV1::decode(repository_root_id, &bytes)?.commit_catalog_root)
 }
 
 async fn validate_selected_ref_change<R>(

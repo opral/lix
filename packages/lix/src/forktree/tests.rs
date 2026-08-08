@@ -135,6 +135,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     };
     super::serving::validate_member_catalog_owner(
         view.read(),
+        view.repository_root().commit_catalog_root,
         content_id(0xa1),
         2,
         0,
@@ -146,6 +147,7 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
     assert!(
         super::serving::validate_member_catalog_owner(
             view.read(),
+            view.repository_root().commit_catalog_root,
             content_id(0xa1),
             1,
             0,
@@ -155,6 +157,86 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
         .await
         .is_err(),
         "same-generation selected history must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn selected_commit_member_rejects_missing_or_remapped_source_catalog_entry() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+
+    let source_commit = CommitObjectV1 {
+        commit_id: seed.commit_id,
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members: vec![CommitMemberV1::introduced(seed.semantic_change_object_id)],
+        global_state_root: seed.global_state_root,
+        local_state_root: seed.local_state_root,
+        metadata: b"remapped-source-commit".to_vec(),
+    };
+    let (remapped_source_object_id, remapped_source_bytes) =
+        source_commit.encode().expect("remapped source commit");
+    let remapped_catalog = build_commit_catalog(&[(
+        seed.commit_id,
+        CommitCatalogEntry {
+            commit_object_id: remapped_source_object_id,
+        },
+    )])
+    .expect("remapped commit catalog");
+    let empty_catalog = build_commit_catalog(&[]).expect("empty commit catalog");
+    let mut writes = StorageWriteSet::new();
+    writes.put(
+        OBJECT_SPACE,
+        remapped_source_object_id.as_bytes().to_vec(),
+        remapped_source_bytes,
+    );
+    for (object_id, bytes) in remapped_catalog.objects.iter() {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    for (object_id, bytes) in empty_catalog.objects.iter() {
+        writes.put(OBJECT_SPACE, object_id.as_bytes().to_vec(), bytes.to_vec());
+    }
+    commit_write_set_for_test(writes, &storage).await;
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open selected history view");
+    let member = CommitMemberV1::selected(seed.semantic_change_object_id, seed.commit_object_id, 0);
+    let entry = ChangeCatalogEntry {
+        change_object_id: seed.semantic_change_object_id,
+        owner: ChangeCatalogOwner::CommitMember {
+            commit_object_id: seed.commit_object_id,
+            ordinal: 0,
+        },
+    };
+    assert!(
+        super::serving::validate_member_catalog_owner(
+            view.read(),
+            remapped_catalog.root.object_id,
+            content_id(0xa1),
+            2,
+            0,
+            member,
+            entry,
+        )
+        .await
+        .is_err(),
+        "a remapped CommitCatalog source must fail closed"
+    );
+    assert!(
+        super::serving::validate_member_catalog_owner(
+            view.read(),
+            empty_catalog.root.object_id,
+            content_id(0xa1),
+            2,
+            0,
+            member,
+            entry,
+        )
+        .await
+        .is_err(),
+        "a missing CommitCatalog source must fail closed"
     );
 }
 
