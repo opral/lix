@@ -1,0 +1,8 @@
+command: test-reports/forktree-w4a-file-content-e1af/verify_w4a_source.sh --self-test
+expected exit: 0
+
+CANDIDATE-SCOPE paths=packages/lix/src/transaction/commit.rs packages/lix/src/transaction/context.rs
+CANDIDATE-PASS-01 scope and no legacy/independent route
+CANDIDATE-PASS-02 one read -> one publication -> one plan -> one prepare -> one commit
+CANDIDATE-PASS-03 BlobId/manifest/chunk/CoherentView closure is visible
+CANDIDATE-GREEN-RESULT=GREEN

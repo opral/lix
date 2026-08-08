@@ -1,32 +1,37 @@
-# W4a file-content readiness manifest
+# W4a file-content correction manifest
 
-TEST/REPORT-ONLY package; no production source, adapter runtime, production
-build, PR, or merge.
+TEST/REPORT-ONLY direct successor of:
+29f83418ddfbd7509ac7f9ba0245b6340a5fa522
 
-## Exact source binding
+No production source, adapter, PR, or merge changes are present. The package
+freezes the e1af baseline RED and a candidate-parametric source GREEN path.
 
-- e1af: `e1af471b9ab0f598dafa7c2ddec7867667c81740`
-- e1af tree: `bfa0d271a723da8250ab76ada16fda90926f1099`
-- e1af parent: `b484e20d845aee3f8137bfa3496f9b3cd0e8cd35`
-- e1af full-index binary diff:
-  `9795ee3da81a06657a45a47a50417522a6a6bd7057e21eeb75597096417c9f3c`
-- e1af stable patch ID: `31cc575644bf17e65c59d558a03acffc848c2e20`
+## Immutable production baseline
+
+- commit: e1af471b9ab0f598dafa7c2ddec7867667c81740
+- tree: bfa0d271a723da8250ab76ada16fda90926f1099
+- parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
 
 ## Package files
 
+SHA256SUMS covers every listed artifact below; all entries exist in this
+successor and verify.
+
 | file | SHA-256 |
 |---|---|
-| `W4A_FILE_CONTENT_READINESS_E1AF.md` | `adb75158953ca4b80a548999b876eaac4a89c09ab374108413bdc346ea06a1f5` |
-| `w4a_file_content_model.rs` | `76f5e454b800d3e8dcc1d3925b971fe7a0b56a0b16847ebffdf114e90ab2d3ef` |
-| `verify_w4a_source.sh` | `4fea7713d70245dec6ca998edf4408f8eac58ee3ad90c01c57595523bf3e8429` |
-| `MODEL_RUN.log` | `4aa987fa5e7bfbb435aa82a15da6237139a16afd5dc6221d8fb65f45dc1fe520` |
-| `SOURCE_RED.log` | `bc873d73c10a3d078cc784a4893184275b4114e793013ea3ff594d7975c9edfc` |
+| W4A_FILE_CONTENT_READINESS_E1AF.md | 9b02c930a4de48f7b001278fa8d8e2536f0ce6db984e4426c9ce3b86e35fbbdf |
+| verify_w4a_source.sh | 4c90cc74752dc123f71fffa696a316ebd2281d07b97db068eb64d2d88cc868d1 |
+| w4a_file_content_model.rs | 7f30c5555a4121f38c579ae06f790f5d1145c2107e799da3f069c2cc7fd53065 |
+| MODEL_RUN.log | 39b32e65babb01e667e8966b8c2601d23c3518fbf2a83c95e01f49193f3a4988 |
+| SOURCE_RED.log | 820dbe04f4ce6f675d92c3b5bca950d669e51fba99c1cbbbf8798ae6eb0d4e2c |
+| SOURCE_GREEN.log | eb18a39e9970d8bbc79ee4fd397ccf3eb858b2cc81c1120f3525b5646021240e |
 
-The compiled standalone test executable was outside the package and hashed as
-`3d619843f6c7b17bbc87dd74e94ab4e91e8e056d47829219466b28bc0a998ae4`.
+SHA256SUMS itself is the checksum index and is intentionally not self-listed.
 
-## Qualification result
+## Gate identities
 
-- source verifier: expected RED, exit 1;
-- standalone model: 7/7 green under `rustc --edition=2021 -D warnings --test`;
-- Memory/RocksDB/SlateDB: UNRUN by contract.
+- baseline source verifier: SOURCE_RED.log
+- candidate-parametric GREEN self-test: SOURCE_GREEN.log
+- warnings-denied model run: MODEL_RUN.log
+- model source uses no production or adapter dependency
+- adapter and production runtime gates: UNRUN

@@ -1,10 +1,15 @@
-//! Pure W4a model. It is intentionally independent of the Lix production crate.
-//! The model uses deterministic fingerprints, not a production codec or storage
-//! adapter. It proves the ownership/corruption/rollback contract before wiring.
+//! Pure W4a file-content ownership model.
+//!
+//! This is intentionally independent of the production crate.  Unlike the
+//! rejected model, the accepted route is represented by ownership types:
+//! CoherentView -> PreparedPublication -> StoragePlan -> PreparedCommit.
+//! No caller-supplied read/plan/commit counters can make a legacy route pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 const CHUNK_BYTES: usize = 1024 * 1024;
+type BlobId = u64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Chunk {
@@ -23,7 +28,7 @@ impl Chunk {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Manifest {
-    blob_id: u64,
+    blob_id: BlobId,
     total_bytes: usize,
     chunks: Vec<Chunk>,
 }
@@ -90,38 +95,62 @@ enum Failure {
     MissingRoot,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Attempt {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoherentView {
     view_id: u64,
-    expected_generation: u64,
-    idempotency_key: u64,
-    manifest: Manifest,
-    reads: u8,
-    plans: u8,
-    commits: u8,
-    direct_cas: bool,
-    fallback: bool,
+    generation: u64,
 }
 
-impl Attempt {
-    fn valid(engine: &Engine, manifest: Manifest, idempotency_key: u64) -> Self {
-        Self {
-            view_id: engine.view_id,
-            expected_generation: engine.generation,
-            idempotency_key,
-            manifest,
-            reads: 1,
-            plans: 1,
-            commits: 1,
-            direct_cas: false,
-            fallback: false,
-        }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedPublication {
+    view: CoherentView,
+    idempotency_key: u64,
+    manifest: Manifest,
+}
+
+impl PreparedPublication {
+    fn into_storage_plan(self) -> Result<StoragePlan, Failure> {
+        self.manifest.authenticate()?;
+        Ok(StoragePlan {
+            view: self.view,
+            idempotency_key: self.idempotency_key,
+            manifest: self.manifest,
+        })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct StoragePlan {
+    view: CoherentView,
+    idempotency_key: u64,
+    manifest: Manifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedCommit {
+    plan: StoragePlan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyRoute {
+    SecondRead,
+    SecondWriter,
+    DirectCas,
+    Fallback,
+}
+
+fn reject_legacy_route(route: LegacyRoute) -> Result<(), Failure> {
+    Err(match route {
+        LegacyRoute::SecondRead => Failure::SecondRead,
+        LegacyRoute::SecondWriter => Failure::SecondWriter,
+        LegacyRoute::DirectCas => Failure::DirectCas,
+        LegacyRoute::Fallback => Failure::Fallback,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct VisibleState {
-    blob_id: u64,
+    blob_id: BlobId,
     generation: u64,
 }
 
@@ -130,8 +159,8 @@ struct Engine {
     view_id: u64,
     generation: u64,
     visible: Option<VisibleState>,
-    idempotency: BTreeMap<u64, u64>,
-    roots: BTreeSet<u64>,
+    idempotency: BTreeMap<u64, BlobId>,
+    roots: BTreeSet<BlobId>,
 }
 
 impl Engine {
@@ -145,28 +174,45 @@ impl Engine {
         }
     }
 
-    fn publish(&mut self, attempt: Attempt) -> Result<u64, Failure> {
-        if attempt.view_id != self.view_id {
+    fn begin_coherent_read(&self) -> CoherentView {
+        CoherentView {
+            view_id: self.view_id,
+            generation: self.generation,
+        }
+    }
+
+    fn prepare_file_content(
+        &self,
+        view: CoherentView,
+        manifest: Manifest,
+        idempotency_key: u64,
+    ) -> PreparedPublication {
+        PreparedPublication {
+            view,
+            idempotency_key,
+            manifest,
+        }
+    }
+
+    fn prepare_write_set(&self, plan: StoragePlan) -> Result<PreparedCommit, Failure> {
+        if plan.view.view_id != self.view_id || plan.view.generation != self.generation {
             return Err(Failure::Stale);
         }
-        if attempt.reads != 1 {
-            return Err(Failure::SecondRead);
+        if let Some(previous) = self.idempotency.get(&plan.idempotency_key) {
+            if *previous != plan.manifest.blob_id {
+                return Err(Failure::IdempotencyConflict);
+            }
         }
-        if attempt.plans != 1 || attempt.commits != 1 {
-            return Err(Failure::SecondWriter);
-        }
-        if attempt.direct_cas {
-            return Err(Failure::DirectCas);
-        }
-        if attempt.fallback {
-            return Err(Failure::Fallback);
-        }
-        if attempt.expected_generation != self.generation {
+        Ok(PreparedCommit { plan })
+    }
+
+    fn commit(&mut self, prepared: PreparedCommit) -> Result<BlobId, Failure> {
+        let plan = prepared.plan;
+        if plan.view.view_id != self.view_id || plan.view.generation != self.generation {
             return Err(Failure::Stale);
         }
-        attempt.manifest.authenticate()?;
-        if let Some(previous) = self.idempotency.get(&attempt.idempotency_key) {
-            return if *previous == attempt.manifest.blob_id {
+        if let Some(previous) = self.idempotency.get(&plan.idempotency_key) {
+            return if *previous == plan.manifest.blob_id {
                 Ok(*previous)
             } else {
                 Err(Failure::IdempotencyConflict)
@@ -176,13 +222,25 @@ impl Engine {
         let next_generation = self.generation + 1;
         self.generation = next_generation;
         self.visible = Some(VisibleState {
-            blob_id: attempt.manifest.blob_id,
+            blob_id: plan.manifest.blob_id,
             generation: next_generation,
         });
         self.idempotency
-            .insert(attempt.idempotency_key, attempt.manifest.blob_id);
-        self.roots.insert(attempt.manifest.blob_id);
-        Ok(attempt.manifest.blob_id)
+            .insert(plan.idempotency_key, plan.manifest.blob_id);
+        self.roots.insert(plan.manifest.blob_id);
+        Ok(plan.manifest.blob_id)
+    }
+
+    fn publish_file_content(
+        &mut self,
+        manifest: Manifest,
+        idempotency_key: u64,
+    ) -> Result<BlobId, Failure> {
+        let view = self.begin_coherent_read();
+        let publication = self.prepare_file_content(view, manifest, idempotency_key);
+        let plan = publication.into_storage_plan()?;
+        let prepared_commit = self.prepare_write_set(plan)?;
+        self.commit(prepared_commit)
     }
 
     fn cold_reopen(&self) -> Result<Self, Failure> {
@@ -198,7 +256,7 @@ impl Engine {
         Ok(self.clone())
     }
 
-    fn w5_handoff(&self) -> Result<u64, Failure> {
+    fn w5_handoff(&self) -> Result<BlobId, Failure> {
         let Some(visible) = &self.visible else {
             return Err(Failure::MissingRoot);
         };
@@ -231,7 +289,7 @@ fn reuse_profile(before: &[u64], after: &[u64]) -> ReuseProfile {
     }
 }
 
-fn partial_read(manifest: &Manifest, range: std::ops::Range<usize>) -> Result<(Vec<u8>, usize), Failure> {
+fn partial_read(manifest: &Manifest, range: Range<usize>) -> Result<(Vec<u8>, usize), Failure> {
     manifest.authenticate_shape()?;
     let mut output = Vec::new();
     let mut visited_chunks = 0;
@@ -255,7 +313,7 @@ fn partial_read(manifest: &Manifest, range: std::ops::Range<usize>) -> Result<(V
     Ok((output, visited_chunks))
 }
 
-fn manifest_id(chunks: &[Chunk], total_bytes: usize) -> u64 {
+fn manifest_id(chunks: &[Chunk], total_bytes: usize) -> BlobId {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"W4A-MANIFEST");
     bytes.extend_from_slice(&(total_bytes as u64).to_be_bytes());
@@ -288,9 +346,12 @@ fn valid_write_is_one_view_one_plan_one_commit_and_reopens() {
     let mut engine = Engine::new();
     let manifest = small_manifest();
     let blob_id = engine
-        .publish(Attempt::valid(&engine, manifest, 10))
+        .publish_file_content(manifest, 10)
         .expect("valid publication");
-    assert_eq!(engine.visible.as_ref().map(|state| state.blob_id), Some(blob_id));
+    assert_eq!(
+        engine.visible.as_ref().map(|state| state.blob_id),
+        Some(blob_id)
+    );
     assert_eq!(engine.w5_handoff(), Ok(blob_id));
     assert_eq!(engine.cold_reopen(), Ok(engine.clone()));
 }
@@ -302,7 +363,7 @@ fn same_size_substitution_fails_before_publication() {
     let mut substituted = good.clone();
     substituted.chunks[1] = Chunk::new(b"xxxx".to_vec());
     let before = engine.clone();
-    let result = engine.publish(Attempt::valid(&engine, substituted, 11));
+    let result = engine.publish_file_content(substituted, 11);
     assert_eq!(result, Err(Failure::WrongBlobIdentity));
     assert_eq!(engine, before);
 }
@@ -316,7 +377,7 @@ fn malformed_size_and_chunk_identity_fail_without_partial_state() {
     wrong_size.total_bytes += 1;
     let before = engine.clone();
     assert_eq!(
-        engine.publish(Attempt::valid(&engine, wrong_size, 12)),
+        engine.publish_file_content(wrong_size, 12),
         Err(Failure::WrongSize)
     );
     assert_eq!(engine, before);
@@ -325,7 +386,7 @@ fn malformed_size_and_chunk_identity_fail_without_partial_state() {
     wrong_chunk.chunks[0].id ^= 1;
     let before = engine.clone();
     assert_eq!(
-        engine.publish(Attempt::valid(&engine, wrong_chunk, 13)),
+        engine.publish_file_content(wrong_chunk, 13),
         Err(Failure::WrongChunkIdentity)
     );
     assert_eq!(engine, before);
@@ -335,22 +396,31 @@ fn malformed_size_and_chunk_identity_fail_without_partial_state() {
 fn stale_and_idempotency_conflicts_are_atomic() {
     let mut engine = Engine::new();
     let first = small_manifest();
-    let attempt = Attempt::valid(&engine, first.clone(), 14);
-    engine.publish(attempt).expect("first publication");
+    let stale_view = engine.begin_coherent_read();
 
-    let mut stale = Attempt::valid(&engine, first.clone(), 15);
-    stale.expected_generation -= 1;
+    engine
+        .publish_file_content(first.clone(), 14)
+        .expect("first publication");
+
+    let stale_publication = engine.prepare_file_content(stale_view, first.clone(), 15);
+    let stale_plan = stale_publication
+        .into_storage_plan()
+        .expect("stale shape is still authenticated");
     let before = engine.clone();
-    assert_eq!(engine.publish(stale), Err(Failure::Stale));
+    assert_eq!(engine.prepare_write_set(stale_plan), Err(Failure::Stale));
     assert_eq!(engine, before);
 
-    let replay = Attempt::valid(&engine, first.clone(), 14);
-    assert_eq!(engine.publish(replay), Ok(first.blob_id));
+    let replay = engine
+        .publish_file_content(first.clone(), 14)
+        .expect("identical replay");
+    assert_eq!(replay, first.blob_id);
 
     let different = Manifest::from_chunks(vec![Chunk::new(b"different".to_vec())]);
-    let conflict = Attempt::valid(&engine, different, 14);
     let before = engine.clone();
-    assert_eq!(engine.publish(conflict), Err(Failure::IdempotencyConflict));
+    assert_eq!(
+        engine.publish_file_content(different, 14),
+        Err(Failure::IdempotencyConflict)
+    );
     assert_eq!(engine, before);
 }
 
@@ -361,10 +431,13 @@ fn partial_read_is_range_bounded_and_authenticates_visited_chunks() {
     assert_eq!(bytes, b"bbbb");
     assert_eq!(visited, 1);
 
-    let mut corrupt = manifest;
+    let mut corrupt = manifest.clone();
     corrupt.chunks[0].bytes[0] = b'!';
+    assert_eq!(
+        partial_read(&corrupt, 0..4),
+        Err(Failure::WrongChunkIdentity)
+    );
     assert_eq!(partial_read(&corrupt, 4..8), Ok((b"bbbb".to_vec(), 1)));
-    assert_eq!(partial_read(&corrupt, 0..4), Err(Failure::WrongChunkIdentity));
 }
 
 #[test]
@@ -387,27 +460,33 @@ fn sixty_four_mib_layout_reuses_sixty_three_unchanged_one_mib_chunks() {
 
 #[test]
 fn second_read_writer_direct_cas_and_fallback_fixtures_are_rejected() {
-    let mut engine = Engine::new();
-    let manifest = small_manifest();
-    for (name, expected) in [
-        ("second-read", Failure::SecondRead),
-        ("second-writer", Failure::SecondWriter),
-        ("direct-cas", Failure::DirectCas),
-        ("fallback", Failure::Fallback),
+    let engine = Engine::new();
+    for route in [
+        LegacyRoute::SecondRead,
+        LegacyRoute::SecondWriter,
+        LegacyRoute::DirectCas,
+        LegacyRoute::Fallback,
     ] {
-        let mut attempt =
-            Attempt::valid(&engine, manifest.clone(), 100 + u64::from(name.len() as u8));
-        match name {
-            "second-read" => attempt.reads = 2,
-            "second-writer" => attempt.plans = 2,
-            "direct-cas" => attempt.direct_cas = true,
-            "fallback" => attempt.fallback = true,
-            _ => unreachable!("fixture list is closed"),
-        }
-        let before = engine.clone();
-        assert_eq!(engine.publish(attempt), Err(expected), "fixture {name}");
-        assert_eq!(engine, before, "fixture {name} changed state");
+        assert!(reject_legacy_route(route).is_err());
     }
+
+    let manifest = small_manifest();
+    let mut published = engine.clone();
+    published
+        .publish_file_content(manifest, 100)
+        .expect("transaction route");
+    assert!(published.visible.is_some());
+}
+
+#[test]
+fn missing_root_fails_cold_reopen_and_w5_final_reference_handoff() {
+    let mut engine = Engine::new();
+    let blob_id = engine
+        .publish_file_content(small_manifest(), 200)
+        .expect("valid publication");
+    engine.roots.remove(&blob_id);
+    assert_eq!(engine.cold_reopen(), Err(Failure::MissingRoot));
+    assert_eq!(engine.w5_handoff(), Err(Failure::MissingRoot));
 }
 
 fn main() {}

@@ -1,0 +1,17 @@
+command: bash test-reports/forktree-w4a-file-content-e1af/verify_w4a_source.sh /root/repos/lix-dead-module-audit-e1af e1af471b9ab0f598dafa7c2ddec7867667c81740
+expected exit: 1
+
+BASE-RED-01 file_content_writes is still rejected before ForkTree lowering
+BASE-PASS-02 one commit-prepared coherent-read acquisition
+BASE-PASS-03 one prepare and one backend commit
+BASE-PASS-04 no direct PreparedPublication commit symbol
+135:        crate::binary_cas::kv::load_ranges_many(&self.store, requests).await
+153:        crate::binary_cas::kv::load_bytes_many(&self.store, hashes).await
+188:        crate::binary_cas::kv::stage_blob_write_skipping_existing_chunks(
+204:        crate::binary_cas::kv::stage_fixed_part_skipping_existing(
+217:        crate::binary_cas::kv::stage_fixed_manifest(self.writes, chunks)
+231:            && crate::binary_cas::kv::try_stage_blob_write_as_flat_delta(
+244:            && crate::binary_cas::kv::try_stage_blob_write_reusing_same_length_splice(
+BASE-RED-06 stale Binary CAS KV owner references remain
+BASE-SOURCE-RESULT=RED
+source_exit=1

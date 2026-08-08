@@ -1,206 +1,167 @@
-# W4a file-content publication readiness package for e1af
+# W4a file-content publication correction package
 
-Status: `TEST/REPORT-ONLY`, source gate `RED` as expected, standalone model
-`GREEN`, adapters and production builds `UNRUN`.
+Status: TEST/REPORT-ONLY. This package is the direct report-only successor of
+29f83418ddfbd7509ac7f9ba0245b6340a5fa522. It changes no production source,
+adapter, PR, or merge state.
 
-This is the smallest W4a cut. It covers ordinary `file_content_writes` only.
-Multipart open/part/progress/abort lifecycle is excluded; an already completed
-and authenticated manifest/Blob closure is an input to the file-content
-publication. W5 root traversal and reclamation are a handoff contract, not a
-W4a implementation.
+## Immutable source binding
 
-## Immutable binding
+The frozen production baseline is:
 
-Production baseline:
+- commit: e1af471b9ab0f598dafa7c2ddec7867667c81740
+- tree: bfa0d271a723da8250ab76ada16fda90926f1099
+- parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
+- parent..baseline full-index binary SHA-256:
+  9795ee3da81a06657a45a47a50417522a6a6bd7057e21eeb75597096417c9f3c
+- parent..baseline stable patch ID:
+  31cc575644bf17e65c59d558a03acffc848c2e20
 
-- commit: `e1af471b9ab0f598dafa7c2ddec7867667c81740`
-- tree: `bfa0d271a723da8250ab76ada16fda90926f1099`
-- parent: `b484e20d845aee3f8137bfa3496f9b3cd0e8cd35`
-- parent..e1af full-index binary diff SHA-256:
-  `9795ee3da81a06657a45a47a50417522a6a6bd7057e21eeb75597096417c9f3c`
-- parent..e1af stable patch ID: `31cc575644bf17e65c59d558a03acffc848c2e20`
+This package freezes the baseline RED calibration and adds a candidate-aware
+source verifier with a genuine GREEN self-test. The verifier accepts:
 
-The source map uses the frozen W4 v2 contract at
-`origin/codex/forktree-w4-fileblob-upload-readiness-e1af` / head
-`ff79e87fdc9cf8db7d1b47158cf9c8715b7471a9`, report SHA
-`f2bd370af93df7e9267592cf4dde8692e20a4aae81420e08307a68d8564f37a5`.
+  BASE_ROOT BASE_COMMIT
+  BASE_ROOT BASE_COMMIT CANDIDATE_ROOT CANDIDATE_COMMIT
 
-## Exact W4a production path allowlist
+The base must be the exact e1af commit/tree/parent. The candidate must be the
+actual checked-out candidate commit, and its diff from the supplied base must
+be limited to the W4a closure allowlist.
 
-The future production cut may touch only these existing seams, and only for
-the stated ownership conversion:
+## Exact candidate scope
 
-1. `packages/lix/src/transaction/commit.rs` — lower
-   `PreparedWriteSet::file_content_writes` after stale reconciliation and
-   remove its typed fail-closed rejection only when the lowerer is complete.
-2. `packages/lix/src/transaction/context.rs` — only a transaction-local
-   publication-plan handoff or counter adjustment if compiler-driven wiring
-   requires it; never restore direct CAS publication or a second commit.
-3. `packages/lix/src/transaction/staging.rs` and `transaction/types.rs` —
-   only to preserve/consume existing `TransactionFileContent` and rollback
-   snapshots. `PreparedCas` remains deferred with multipart and is not deleted
-   in W4a.
-4. `packages/lix/src/forktree/publication.rs` and `forktree/blob.rs` — only
-   internal typed integration of the existing completed-manifest input; no new
-   format, authority, cache, or public API.
-5. `packages/lix/src/sql2/providers/file.rs` — only if the existing provider
-   needs a typed completed-manifest handoff; SQL row/path/empty/tombstone
-   semantics must remain unchanged.
+The candidate source allowlist is deliberately narrow:
 
-No W4a production change is made by this package. Multipart
-`session/media_upload.rs`, legacy CAS deletion, GC, checkpoint, selected
-history, and multi-branch publication are explicitly deferred.
+1. packages/lix/src/transaction/commit.rs: lower file_content_writes only after
+   authenticated ForkTree lowering; remove the old typed rejection.
+2. packages/lix/src/transaction/context.rs: transaction-local handoff only;
+   one operation-owned coherent read, one publication plan, and the existing
+   sole backend prepare/commit boundary.
+3. packages/lix/src/transaction/staging.rs and transaction/types.rs: preserve
+   existing file-content staging and rollback types only.
+4. packages/lix/src/forktree/publication.rs and forktree/blob.rs: typed
+   BlobId/BlobManifestV1/BlobChunkV1 closure authentication and publication
+   lowering only.
+5. packages/lix/src/sql2/providers/file.rs: existing typed file-provider
+   handoff only when required.
 
-## Required one-authority chain
+Any changed path outside this set is a candidate blocker. Multipart upload,
+legacy CAS deletion, GC, checkpoint, history, selected branch, W5
+implementation, new format, cache, compatibility reader, fallback writer,
+or second durable authority is outside this package.
 
-The accepted file-content operation must have exactly this shape:
+## Source-proof contract
 
-```text
-one retained commit CoherentView
-  -> authenticate visible lix_binary_blob_ref + completed BlobManifestV1
-  -> validate ordered BlobChunkV1 identities, sizes, and content digest
-  -> extend one PreparedPublication with the state transition
-  -> one into_storage_plan()
-  -> transaction-owned prepare_write_set()
-  -> transaction-owned prepared_commit.commit()
-```
+The candidate verifier is structural and argument-aware, not a token/counter
+oracle. It inspects the commit_prepared operation through its actual single
+storage commit and requires:
 
-The visible `lix_binary_blob_ref` row remains the semantic BlobId owner.
-`BlobManifestV1` and ordered `BlobChunkV1` objects are the authenticated
-physical closure. A caller cannot supply an unverified BlobId or replace the
-manifest with a fallback full writer. Existing transaction metadata,
-idempotency receipts, selector fences, and filesystem index updates join the
-same plan and commit.
+  operation-owned begin_read binding
+    -> the same bound read argument enters the one
+       prepare_forktree_publication_with_parent_heads call
+    -> one into_storage_plan
+    -> one prepare_write_set
+    -> one prepared_commit.commit
 
-The current e1af source correctly already has the final transaction boundary
-at `transaction/context.rs:1476-1690`, including one commit-time read,
-`commit::prepare_forktree_publication_with_parent_heads`, one
-`into_storage_plan`, one `prepare_write_set`, and one backend commit. But
-`transaction/commit.rs:1182-1189` still rejects nonempty
-`file_content_writes`; that is W4a RED-01 and the primary production blocker.
+It rejects a second operation read, a second plan, a second backend prepare or
+commit, and any direct PreparedPublication commit. The closure must expose
+BlobId, BlobManifestV1, BlobChunkV1, CoherentView, and
+PreparedPublication. It rejects the independent or legacy route spellings
+stage_atomic_cas_publication, execute_fast_lix_file_prepared_path_write,
+binary_cas::kv, fallback_full_write, and legacy_file_content_writer in the
+W4a closure.
 
-## File-content correctness contract
+The verifier first freezes the e1af RED baseline. Its two-argument mode must
+exit 1 with RED-01 and RED-06. Its four-argument mode runs the same baseline
+calibration, enforces the whole candidate diff scope, and can return genuine
+GREEN only when all argument-aware checks pass. The self-test creates an
+ephemeral two-commit source repository and exercises the same four-argument
+candidate path; it is not a production source or adapter claim.
 
-The lowerer must authenticate before staging visible state:
+## File-content model
 
-- visible row identity equals the completed manifest's canonical BlobId;
-- manifest logical length equals the declared row size;
-- every named chunk has the expected domain/size/hash and ordered position;
-- same-length replacement of any chunk or manifest fails closed;
-- malformed, absent, wrong-kind, wrong-size, wrong-hash, or transplanted
-  manifest/chunk closure produces no partial state, selector, or visible row;
-- empty content and tombstone deletion remain distinct valid semantic cases;
-- rollback/savepoint restores the pending file-content write and never leaves
-  a staged manifest visible;
-- stale same-owner state, stale selector/epoch, and idempotency conflicts
-  reject atomically; an identical idempotency replay is a no-op;
-- full reads authenticate the complete closure; bounded range reads use the
-  retained view, authenticate the manifest/visited chunks, and never perform
-  an unbounded payload scan; and
-- cold reopen reproduces the same visible BlobId and bytes.
+The pure Rust model is ownership-shaped:
 
-The fixed-chunk target is 64 MiB as 64 x 1 MiB. A 1% update must hash/write
-only the changed chunk(s), reuse unchanged authenticated chunk IDs, and stage
-one successor manifest/state edit. The standalone model checks the exact
-64-chunk identity accounting without allocating adapter storage. Adapter
-qualification remains future work.
+  CoherentView
+    -> PreparedPublication
+    -> into_storage_plan
+    -> PreparedCommit
+    -> commit
 
-## W5 final-root handoff
+There are no caller-supplied read, plan, commit, direct-CAS, or fallback flags
+that can make an accepted publication valid. Legacy paths are represented only
+as rejected enum fixtures; the transaction-owned route never consumes them.
+BlobId is derived from the authenticated manifest/chunk closure rather than
+accepted from a caller as an independent authority.
 
-After the one W4a commit, W5 receives the visible BlobId root and must observe
-it from a fresh coherent read before reachability work. W5 then authenticates
-the transitive manifest/chunk closure, protects roots from branch/history/
-checkpoint/serving selectors, retains shared chunks, and reclaims only after
-the final root is retired. Corrupt or missing roots fail closed. W4a does not
-delete immutable objects, call a GC writer, or recreate a root registry.
+The model and negative fixtures cover:
 
-## Negative fixtures
+- manifest size, chunk identity, BlobId identity, and same-size substitution;
+- partial reads that authenticate a visited chunk before returning its bytes;
+- no partial state on malformed size/chunk or manifest failure;
+- stale view/generation and same-owner idempotency conflict;
+- identical idempotency replay as a no-op;
+- second-read, second-writer, direct-CAS, and fallback rejection fixtures;
+- exact 64 x 1 MiB layout with 63 unchanged chunk identities and one rehash;
+- cold reopen and W5 final-reference handoff;
+- missing root failure on both reopen and W5 handoff.
 
-The standalone model has executable, state-preserving rejection fixtures for:
+The model uses deterministic u64 fingerprints and no production codec or
+adapter. It is a structural/semantic preflight oracle, not production
+authentication evidence.
 
-| fixture | required result |
-|---|---|
-| wrong declared size | typed failure, no state change |
-| wrong chunk identity | typed failure, no state change |
-| same-size substituted chunk/manifest | typed failure before publication |
-| second coherent read | reject; no silent refresh |
-| second writer/plan or commit | reject; no second publication |
-| direct CAS publication | reject; transaction boundary remains sole owner |
-| fallback writer | reject; no unauthenticated downgrade |
-| stale generation | reject atomically |
-| idempotency conflict | reject; identical replay is a no-op |
-| missing W5 root on reopen/handoff | fail closed |
+## Replayed evidence
 
-The source verifier separately checks the existing e1af one-read/one-prepare/
-one-commit boundary, no direct `PreparedPublication::commit`, and reports the
-expected file-content rejection. The old multipart direct-CAS bridge is
-reported `DEFERRED`, not silently accepted as part of W4a.
+Baseline source calibration:
 
-## Expected source RED
+  bash verify_w4a_source.sh /root/repos/lix-dead-module-audit-e1af \
+    e1af471b9ab0f598dafa7c2ddec7867667c81740
 
-Run from the exact e1af source:
+Expected exit is 1. It reproduces one coherent read, one prepare, one backend
+commit, no direct PreparedPublication commit, RED-01 file-content rejection,
+and RED-06 stale Binary CAS KV references.
 
-```bash
-bash test-reports/forktree-w4a-file-content-e1af/verify_w4a_source.sh \
-  "$PWD" e1af471b9ab0f598dafa7c2ddec7867667c81740
-```
+Candidate-parametric GREEN self-test:
 
-Expected exit is `1` because RED-01 (`file_content_writes` rejection) and the
-known stale `binary_cas::kv` reference remain. The source verifier must not
-fail because multipart's deferred `stage_atomic_cas_publication` and prepared
-path bridge still exist; those are W4b/multipart deletion work.
+  bash verify_w4a_source.sh --self-test
 
-## Standalone model command and contract
+It creates a temporary base/candidate repository, invokes the four-argument
+path, validates the allowlisted diff and bound read argument, and reports
+CANDIDATE-GREEN-RESULT=GREEN.
 
-The model is pure Rust and has no Lix, storage, adapter, or network dependency:
+Standalone model:
 
-```bash
-rustc --edition=2021 -D warnings --test \
-  test-reports/forktree-w4a-file-content-e1af/w4a_file_content_model.rs \
-  -o /tmp/w4a-file-content-model-e1af
-/tmp/w4a-file-content-model-e1af --test-threads=1
-```
+  rustfmt --edition 2021 --check \
+    test-reports/forktree-w4a-file-content-e1af/w4a_file_content_model.rs
 
-Expected model result is 7/7 passing. The model is not a production
-authentication implementation; it is a deterministic oracle for ownership,
-identity, atomicity, range bounds, reuse accounting, and W5 root handoff.
+  rustc --edition=2021 -D warnings --test \
+    test-reports/forktree-w4a-file-content-e1af/w4a_file_content_model.rs \
+    -o w4a-model
 
-Frozen standalone evidence:
+  ./w4a-model --test-threads=1
 
-- model source SHA-256: `76f5e454b800d3e8dcc1d3925b971fe7a0b56a0b16847ebffdf114e90ab2d3ef`
-- verifier source SHA-256: `4fea7713d70245dec6ca998edf4408f8eac58ee3ad90c01c57595523bf3e8429`
-- compiled test executable SHA-256:
-  `3d619843f6c7b17bbc87dd74e94ab4e91e8e056d47829219466b28bc0a998ae4`
-- model run log SHA-256: `4aa987fa5e7bfbb435aa82a15da6237139a16afd5dc6221d8fb65f45dc1fe520`
-- expected source-RED log SHA-256:
-  `bc873d73c10a3d078cc784a4893184275b4114e793013ea3ff594d7975c9edfc`
+The corrected model is rustfmt-clean, compiles with warnings denied, and has
+8/8 passing tests. The exact logs are included in this package and verified by
+SHA256SUMS.
 
-## Future adapter command order (UNRUN)
+## Future production qualification
 
-After an immutable production successor wires the allowlisted cut, use separate
-exact-SHA targets and stop on the first blocker:
+This package does not claim Memory, RocksDB, or SlateDB execution. After a
+candidate source gate turns GREEN, run the existing bounded checks in order:
 
-```bash
-set -Eeuo pipefail
-TARGET=/root/repos/target-w4a-file-content
-timeout --foreground --kill-after=5s 1200s cargo fmt --all -- --check
-timeout --foreground --kill-after=5s 1200s \
-  env CARGO_TARGET_DIR="$TARGET" cargo check -p lix
-timeout --foreground --kill-after=5s 1200s \
-  env CARGO_TARGET_DIR="$TARGET" cargo clippy -p lix --lib -- -D warnings
-timeout --foreground --kill-after=5s 1200s \
-  env CARGO_TARGET_DIR="$TARGET" cargo test -p lix --lib --no-run
-```
+  cargo fmt --all -- --check
+  cargo check -p lix
+  cargo clippy -p lix --lib -- -D warnings
+  cargo test -p lix --lib --no-run
 
-Then run the focused oracle in exactly `Memory -> RocksDB -> SlateDB`, each
-with `timeout --foreground --kill-after=5s 1200s`; a failed or expired cell
-prevents later adapters. Record result digests, visible-row/manifest/chunk
-reads and writes, changed/unchanged chunk bytes, allocation/RSS, backend
-calls, disk after flush/reopen, and partial-publication state. Do not widen to
-multipart lifecycle, 512 MiB, or comparator workloads from this W4a package.
+Then run the focused file-content oracle in Memory, RocksDB, and SlateDB, one
+adapter at a time with a 1200-second cap and stop on first blocker. It must
+prove one retained view, one PreparedPublication/plan/backend commit,
+BlobId-only visible authority, authenticated manifest/chunk closure, bounded
+partial reads, stale/rollback CAS, 63/64 unchanged-chunk reuse, cold reopen,
+corruption fail-closed, and W5 final-reference retention/reclamation. No
+token-only model result substitutes for these adapter gates.
 
-## Package status
+## Package state
 
-No production compilation, adapter runtime, benchmark, PR mutation, or merge
-is performed here. This package is ready for independent review once its
-standalone model and source RED command are hashed below.
+No production edits, adapter runtime, production build, PR mutation, or merge
+was performed. Independent review is still required; this package is not
+self-approved.
