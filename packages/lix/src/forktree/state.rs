@@ -98,6 +98,26 @@ pub(crate) struct HistoricalStateDiffEntry {
     pub(crate) after: Option<HistoricalStateRow>,
 }
 
+/// Authenticated write identity for one historical state row. Payload bytes
+/// are intentionally absent: stale classification receives this separately
+/// from endpoint payload diffs so equal bytes with a new write identity still
+/// remain observable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalStateWriteIdentity {
+    pub(crate) change_id: crate::changelog::ChangeId,
+    pub(crate) commit_id: crate::changelog::CommitId,
+}
+
+/// One logical key whose authenticated write identity changed between two
+/// retained ForkTree commits. Both endpoints are preserved for chronology and
+/// deletion handling; the payload itself is owned by the separate diff path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalStateIdentityChange {
+    pub(crate) key: StateKey,
+    pub(crate) before: Option<HistoricalStateWriteIdentity>,
+    pub(crate) after: Option<HistoricalStateWriteIdentity>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateCellRef<'a> {
     Value(&'a str),

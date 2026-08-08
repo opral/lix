@@ -409,6 +409,18 @@ where
         diff_state_rows_between_commits_on_read(&self.read, before, after).await
     }
 
+    /// Returns authenticated state-write identity changes separately from
+    /// endpoint payload differences. Both scans use this facade's retained
+    /// read and therefore inherit the same catalog, root, and member
+    /// fail-closed validation as the payload path.
+    pub(crate) async fn touched_state_identities_between_commits(
+        &self,
+        before: crate::changelog::CommitId,
+        after: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError> {
+        touched_state_identities_between_commits_on_read(&self.read, before, after).await
+    }
+
     /// Resolves one required semantic commit record from the authenticated
     /// catalog on this facade's retained read.
     pub(crate) async fn load_required_commit_record(
@@ -593,18 +605,13 @@ where
     Ok(by_key
         .into_values()
         .filter_map(|(before, after)| {
-            let changed = historical_state_rows_differ(before.as_ref(), after.as_ref());
+            let changed = historical_state_payloads_differ(before.as_ref(), after.as_ref());
             changed.then_some(super::state::HistoricalStateDiffEntry { before, after })
         })
         .collect())
 }
 
-/// A stale-write diff must retain both payload changes and the authenticated
-/// write identity. Equal visible bytes do not make two writes equivalent:
-/// same-key rows with a different change or commit identity still represent a
-/// concurrent write and must reach the stale classifier. The caller maps any
-/// returned entry to its logical key only after this complete comparison.
-fn historical_state_rows_differ(
+fn historical_state_payloads_differ(
     before: Option<&super::state::HistoricalStateRow>,
     after: Option<&super::state::HistoricalStateRow>,
 ) -> bool {
@@ -614,12 +621,69 @@ fn historical_state_rows_differ(
                 || left.deleted != right.deleted
                 || left.snapshot_content != right.snapshot_content
                 || left.metadata != right.metadata
-                || left.change_id != right.change_id
-                || left.commit_id != right.commit_id
         }
         (Some(_), None) | (None, Some(_)) => true,
         (None, None) => false,
     }
+}
+
+fn historical_state_identity_changed(
+    before: Option<&super::state::HistoricalStateRow>,
+    after: Option<&super::state::HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (Some(left), Some(right)) => {
+            left.change_id != right.change_id || left.commit_id != right.commit_id
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
+async fn touched_state_identities_between_commits_on_read<R>(
+    read: &R,
+    before: crate::changelog::CommitId,
+    after: crate::changelog::CommitId,
+) -> Result<Vec<super::state::HistoricalStateIdentityChange>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let before_rows = super::serving::scan_state_rows_at_commit(read, before).await?;
+    let after_rows = super::serving::scan_state_rows_at_commit(read, after).await?;
+    let mut by_key = BTreeMap::new();
+    for row in before_rows {
+        by_key.entry(row.key.clone()).or_insert((Some(row), None));
+    }
+    for row in after_rows {
+        by_key
+            .entry(row.key.clone())
+            .and_modify(|entry| entry.1 = Some(row.clone()))
+            .or_insert((None, Some(row)));
+    }
+    Ok(by_key
+        .into_values()
+        .filter_map(|(before, after)| {
+            historical_state_identity_changed(before.as_ref(), after.as_ref()).then(|| {
+                let key = after
+                    .as_ref()
+                    .or(before.as_ref())
+                    .expect("identity change has an endpoint")
+                    .key
+                    .clone();
+                let identity = |row: &super::state::HistoricalStateRow| {
+                    super::state::HistoricalStateWriteIdentity {
+                        change_id: row.change_id,
+                        commit_id: row.commit_id,
+                    }
+                };
+                super::state::HistoricalStateIdentityChange {
+                    key,
+                    before: before.as_ref().map(identity),
+                    after: after.as_ref().map(identity),
+                }
+            })
+        })
+        .collect())
 }
 
 pub(crate) async fn open_coherent_view<S>(
@@ -921,7 +985,10 @@ fn projected_required(
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint_marker_matches_commit, historical_state_rows_differ};
+    use super::{
+        checkpoint_marker_matches_commit, historical_state_identity_changed,
+        historical_state_payloads_differ,
+    };
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
@@ -958,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn same_payload_with_new_authenticated_change_identity_is_a_diff() {
+    fn same_payload_with_new_authenticated_change_identity_is_a_touched_identity() {
         let before = historical_row(
             ChangeId::for_test_label("change-before"),
             CommitId::for_test_label("commit-before"),
@@ -972,11 +1039,14 @@ mod tests {
             Some(r#"{"id":"row-a","value":"same"}"#),
         );
 
-        assert!(historical_state_rows_differ(
+        assert!(historical_state_identity_changed(
             Some(&before),
             Some(&same_payload_new_change),
         ));
-        assert!(!historical_state_rows_differ(Some(&before), Some(&before)));
+        assert!(!historical_state_identity_changed(
+            Some(&before),
+            Some(&before)
+        ));
     }
 
     #[test]
@@ -986,8 +1056,11 @@ mod tests {
         let null = historical_row(change, commit, false, None);
         let tombstone = historical_row(change, commit, true, None);
 
-        assert!(historical_state_rows_differ(Some(&null), Some(&tombstone)));
-        assert!(historical_state_rows_differ(Some(&tombstone), None));
-        assert!(historical_state_rows_differ(None, Some(&null)));
+        assert!(historical_state_payloads_differ(
+            Some(&null),
+            Some(&tombstone)
+        ));
+        assert!(historical_state_payloads_differ(Some(&tombstone), None));
+        assert!(historical_state_payloads_differ(None, Some(&null)));
     }
 }
