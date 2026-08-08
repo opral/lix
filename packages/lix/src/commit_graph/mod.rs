@@ -1,6 +1,5 @@
 mod context;
 mod types;
-mod walker;
 
 pub(crate) use context::{CommitGraphContext, CommitGraphStoreReader, canonical_commit_change};
 pub(crate) use types::{

@@ -58,6 +58,10 @@ impl StorageSpace {
         self.id.value()
     }
 
+    pub(super) const fn declared_id(self) -> SpaceId {
+        self.id
+    }
+
     pub const fn name(self) -> &'static str {
         self.name
     }

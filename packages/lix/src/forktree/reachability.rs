@@ -4,9 +4,9 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::storage::{
-    CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, Precondition, ProjectedValue,
-    PutBatch, PutEntry, ReadOptions, ScanOptions, Storage, StorageError, StorageWrite, StoredValue,
-    WriteOptions,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, Precondition,
+    ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanOrder, Storage, StorageError,
+    StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
@@ -385,21 +385,18 @@ where
     S: Storage,
     R: StorageAdapterRead,
 {
-    let page = snapshot
+    let mut cursor = snapshot
         .read
-        .scan(
+        .begin_scan(
             SELECTOR_SPACE,
-            unbounded_range(),
-            ScanOptions {
+            restart_range(progress.selector_resume_after.as_deref()),
+            BeginScanOptions {
                 projection: CoreProjection::FullValue,
-                limit_rows: SELECTOR_PAGE_ROWS,
-                resume_after: progress
-                    .selector_resume_after
-                    .as_ref()
-                    .map(|key| Key(Bytes::copy_from_slice(key))),
+                order: ScanOrder::Ascending,
             },
         )
         .await?;
+    let page = cursor.next_page(SELECTOR_PAGE_ROWS).await?;
     let mut edit = MaintenanceEdit::default();
     let mut previous = progress.selector_resume_after.as_deref();
     for entry in &page.entries {
@@ -539,21 +536,18 @@ where
     S: Storage,
     R: StorageAdapterRead,
 {
-    let page = snapshot
+    let mut cursor = snapshot
         .read
-        .scan(
+        .begin_scan(
             UNTRACKED_ROW_SPACE,
-            unbounded_range(),
-            ScanOptions {
+            restart_range(progress.untracked_resume_after.as_deref()),
+            BeginScanOptions {
                 projection: CoreProjection::FullValue,
-                limit_rows: UNTRACKED_PAGE_ROWS,
-                resume_after: progress
-                    .untracked_resume_after
-                    .as_ref()
-                    .map(|key| Key(Bytes::copy_from_slice(key))),
+                order: ScanOrder::Ascending,
             },
         )
         .await?;
+    let page = cursor.next_page(UNTRACKED_PAGE_ROWS).await?;
     let mut edit = MaintenanceEdit::default();
     for entry in &page.entries {
         let (branch_id, _) =
@@ -702,18 +696,22 @@ where
     S: Storage,
     R: StorageAdapterRead,
 {
-    let page = snapshot
+    let object_resume_key = progress.object_resume_after.map(object_key);
+    let mut cursor = snapshot
         .read
-        .scan(
+        .begin_scan(
             OBJECT_SPACE,
-            unbounded_range(),
-            ScanOptions {
+            KeyRange {
+                lower: object_resume_key.map_or(Bound::Unbounded, Bound::Excluded),
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
                 projection: CoreProjection::KeyOnly,
-                limit_rows: SWEEP_PAGE_ROWS,
-                resume_after: progress.object_resume_after.map(object_key),
+                order: ScanOrder::Ascending,
             },
         )
         .await?;
+    let page = cursor.next_page(SWEEP_PAGE_ROWS).await?;
     let edit = MaintenanceEdit::default();
     let mut sweep = SweepBatch::default();
     let mut resume_after = progress.object_resume_after;
@@ -780,18 +778,22 @@ where
     S: Storage,
     R: StorageAdapterRead,
 {
-    let page = snapshot
+    let maintenance_resume_key = progress.maintenance_resume_after.map(object_key);
+    let mut cursor = snapshot
         .read
-        .scan(
+        .begin_scan(
             OBJECT_SPACE,
-            unbounded_range(),
-            ScanOptions {
+            KeyRange {
+                lower: maintenance_resume_key.map_or(Bound::Unbounded, Bound::Excluded),
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions {
                 projection: CoreProjection::KeyOnly,
-                limit_rows: SWEEP_PAGE_ROWS,
-                resume_after: progress.maintenance_resume_after.map(object_key),
+                order: ScanOrder::Ascending,
             },
         )
         .await?;
+    let page = cursor.next_page(SWEEP_PAGE_ROWS).await?;
     let current_progress_id = snapshot
         .progress_selector
         .expect("cleanup has a progress selector")
@@ -1472,6 +1474,15 @@ fn full_value<'a>(value: &'a ProjectedValue, message: &str) -> Result<&'a Bytes,
 fn unbounded_range() -> KeyRange {
     KeyRange {
         lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    }
+}
+
+fn restart_range(resume_after: Option<&[u8]>) -> KeyRange {
+    KeyRange {
+        lower: resume_after.map_or(Bound::Unbounded, |key| {
+            Bound::Excluded(Key(Bytes::copy_from_slice(key)))
+        }),
         upper: Bound::Unbounded,
     }
 }

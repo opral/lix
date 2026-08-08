@@ -302,7 +302,7 @@ impl StorageRead for MemoryRead {
             .flat_map(|request| {
                 request.keys.iter().map(|key| {
                     self.entries
-                        .get(&physical_key(request.space.id, key))
+                        .get(&physical_key(request.space.declared_id(), key))
                         .map(|value| project_value(value, request.opts.projection))
                 })
             })
@@ -320,7 +320,7 @@ impl StorageRead for MemoryRead {
         if opts.order == ScanOrder::Descending {
             return Err(StorageError::Unsupported(Capability::ReverseScan));
         }
-        let physical = physical_range(space.id, range.clone());
+        let physical = physical_range(space.declared_id(), range.clone());
         ScanCursor::from_source(
             range,
             opts.order,
@@ -370,7 +370,7 @@ impl StorageScanSource for MemoryScanSource<'_> {
 
 fn decode_memory_scan_key(space: StorageSpace, key: Key) -> Result<Key, StorageError> {
     let bytes = key.0;
-    if bytes.len() < 4 || bytes[..4] != space.id.0.to_be_bytes() {
+    if bytes.len() < 4 || bytes[..4] != space.id().to_be_bytes() {
         return Err(StorageError::Corruption(
             "in-memory scan key escaped its storage space".to_string(),
         ));
@@ -385,9 +385,9 @@ impl StorageWrite for MemoryWrite {
         entries: PutBatch,
     ) -> Result<(), StorageError> {
         for entry in entries.entries {
-            let key = physical_key(space.id, &entry.key);
+            let key = physical_key(space.declared_id(), &entry.key);
             let value = stored_value_bytes(entry.value);
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 if let Some(existing) = self.immutable_values.get(&key) {
                     if existing != &value {
                         return Err(StorageError::Corruption(
@@ -419,7 +419,7 @@ impl StorageWrite for MemoryWrite {
 
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         for key in keys {
-            let key = physical_key(space.id, key);
+            let key = physical_key(space.declared_id(), key);
             if !self.overlay.puts.is_empty() {
                 self.overlay.puts.remove(&key);
             }
@@ -435,7 +435,7 @@ impl StorageWrite for MemoryWrite {
         space: StorageSpace,
         range: KeyRange,
     ) -> Result<(), StorageError> {
-        let range = physical_range(space.id, range);
+        let range = physical_range(space.declared_id(), range);
         let base_keys = self
             .base
             .entries_range(lower_bound(&range), upper_bound(&range), usize::MAX)
@@ -502,24 +502,24 @@ fn check_preconditions(
         .enumerate()
         .filter_map(|(index, precondition)| {
             let matches = match precondition {
-                Precondition::KeyAbsent { space, key } => {
-                    entries.get(&physical_key(space.id, key)).is_none()
-                }
-                Precondition::KeyPresent { space, key } => {
-                    entries.get(&physical_key(space.id, key)).is_some()
-                }
+                Precondition::KeyAbsent { space, key } => entries
+                    .get(&physical_key(space.declared_id(), key))
+                    .is_none(),
+                Precondition::KeyPresent { space, key } => entries
+                    .get(&physical_key(space.declared_id(), key))
+                    .is_some(),
                 Precondition::KeyValueHashEquals { space, key, hash } => entries
-                    .get(&physical_key(space.id, key))
+                    .get(&physical_key(space.declared_id(), key))
                     .is_some_and(|value| blake3::hash(value).as_bytes() == hash),
                 Precondition::KeyValueEquals {
                     space,
                     key,
                     expected,
                 } => entries
-                    .get(&physical_key(space.id, key))
+                    .get(&physical_key(space.declared_id(), key))
                     .is_some_and(|value| value == expected),
                 Precondition::RangeEmpty { space, range } => {
-                    let range = physical_range(space.id, range.clone());
+                    let range = physical_range(space.declared_id(), range.clone());
                     entries
                         .entries_range(lower_bound(&range), upper_bound(&range), 1)
                         .is_empty()

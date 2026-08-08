@@ -41,7 +41,6 @@ pub(crate) mod changelog;
 pub(crate) mod checkpoint;
 mod client_state;
 pub(crate) mod collection_generation;
-pub(crate) mod columnar_row_group;
 pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod compression;
