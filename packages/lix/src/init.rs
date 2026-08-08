@@ -6,10 +6,8 @@ use crate::storage_adapter::{
     StorageProjectedValue, StorageSpace, StorageWriteSet, ValueSemantics,
 };
 
-/// Repository bootstrap is intentionally outside the current compiler hard
-/// cut. The old initializer owned the deleted tracked-head and branch-control
-/// physical layout; keeping a compatibility seed path here would recreate a
-/// second publication authority.
+/// Repository bootstrap is owned by the authenticated ForkTree object and
+/// selector spaces. The protocol marker remains a lifecycle guard only.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::engine_declared(
     0x0004_0011,
     "repository.protocol.v1",
@@ -60,6 +58,13 @@ pub(crate) fn unsupported_repository_protocol_error() -> LixError {
     )
 }
 
+pub(crate) fn already_initialized_error() -> LixError {
+    LixError::new(
+        "LIX_ERROR_ALREADY_INITIALIZED",
+        "engine storage is already initialized",
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitReceipt {
     pub lix_id: String,
@@ -69,14 +74,20 @@ pub struct InitReceipt {
 }
 
 pub(crate) async fn initialize<StorageImpl>(
-    _storage: StorageAdapter<StorageImpl>,
+    storage: StorageAdapter<StorageImpl>,
     _tracked_state: &crate::tracked_state::TrackedStateContext,
 ) -> Result<InitReceipt, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Err(LixError::new(
-        LixError::CODE_UNSUPPORTED_SQL,
-        "repository initialization is deferred until transaction-owned ForkTree publication is lowered",
-    ))
+    let read = storage.begin_read(Default::default()).await?;
+    match repository_protocol_status(&read).await? {
+        RepositoryProtocolStatus::Current => return Err(already_initialized_error()),
+        RepositoryProtocolStatus::Unsupported => {
+            return Err(unsupported_repository_protocol_error());
+        }
+        RepositoryProtocolStatus::Missing => {}
+    }
+    drop(read);
+    crate::forktree::initialize_empty_repository(storage).await
 }

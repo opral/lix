@@ -279,6 +279,47 @@ where
     let view = open_coherent_view_on_read(read, branch_id).await?;
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
     let mut slots = Vec::with_capacity(request.rows.len());
+
+    if request.untracked == Some(true) {
+        let mut untracked_rows = BTreeMap::new();
+        for (key, value) in view.scan_untracked_rows().await? {
+            let encoded_key = encode_state_key(StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            if untracked_rows.insert(encoded_key, (key, value)).is_some() {
+                return Err(overlay_corruption("untracked"));
+            }
+        }
+        for requested in &request.rows {
+            let key = encode_state_key(StateKeyRef {
+                schema_key: &requested.schema_key,
+                file_id: requested.file_id.as_deref(),
+                entity_pk: &requested.entity_pk,
+            });
+            let Some((decoded_key, value)) = untracked_rows.get(&key) else {
+                slots.push(None);
+                continue;
+            };
+            let ordinal = u32::try_from(builder.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "exact live-state result exceeds u32 rows",
+                )
+            })?;
+            builder.push_owned(materialize_untracked_row(
+                value.clone(),
+                decoded_key.entity_pk.clone(),
+                decoded_key.schema_key.clone(),
+                decoded_key.file_id.clone(),
+                branch_id_text(branch_id),
+            ));
+            slots.push(Some(ordinal));
+        }
+        return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
+    }
+
     for requested in &request.rows {
         let key = encode_state_key(StateKeyRef {
             schema_key: &requested.schema_key,
@@ -318,11 +359,6 @@ fn validate_scan_request(request: &LiveStateScanRequest) -> Result<(), LixError>
 }
 
 fn validate_exact_request(request: &LiveStateExactBatchRequest) -> Result<(), LixError> {
-    if request.untracked == Some(true) {
-        return Err(unsupported(
-            "current ForkTree reader does not serve untracked exact rows",
-        ));
-    }
     let Some(first) = request.rows.first() else {
         return Ok(());
     };

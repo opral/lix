@@ -5,6 +5,7 @@
 //! selector fencing, and reachability cannot become competing authorities.
 
 mod blob;
+mod bootstrap;
 mod codec;
 mod gc_index;
 mod model;
@@ -17,6 +18,7 @@ mod tree;
 mod view;
 
 pub(crate) use blob::{AuthenticatedBlobRef, UploadBindingRef, prepare_upload_completion};
+pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
@@ -42,7 +44,7 @@ pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
     UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
     decode_untracked_key, decode_untracked_value, encode_state_key, encode_state_prefix,
-    encode_state_value,
+    encode_state_value, encode_untracked_key, encode_untracked_value,
 };
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,

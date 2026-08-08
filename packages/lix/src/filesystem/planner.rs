@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -357,7 +358,16 @@ pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
     pub(crate) blob_hash: BlobId,
     pub(crate) size_bytes: u64,
+    pub(crate) plugin_checkpoint: Option<BlobRefPluginCheckpoint>,
     pub(crate) context: FilesystemRowContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlobRefPluginCheckpoint {
+    pub(crate) generation: String,
+    pub(crate) semantic_root: String,
+    pub(crate) runtime: Vec<u8>,
+    pub(crate) authority: Vec<u8>,
 }
 
 impl BlobRefRowInput {
@@ -366,6 +376,12 @@ impl BlobRefRowInput {
             "id": self.file_id,
             "blob_hash": self.blob_hash.to_hex(),
             "size_bytes": self.size_bytes,
+            "plugin_checkpoint": self.plugin_checkpoint.map(|checkpoint| json!({
+                "generation": checkpoint.generation,
+                "semantic_root": checkpoint.semantic_root,
+                "runtime": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(checkpoint.runtime),
+                "authority": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(checkpoint.authority),
+            })),
         });
         let file_id = self.file_id;
         append_state_row(
@@ -1084,6 +1100,7 @@ fn plan_parsed_file_path_write_with_fallback(
                     .blob_hash()
                     .expect("non-empty payload should have blob hash"),
                 size_bytes: file_payload.len(),
+                plugin_checkpoint: None,
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
@@ -1142,6 +1159,7 @@ pub(crate) fn plan_file_descriptor_write(
                     .blob_hash()
                     .expect("non-empty payload should have blob hash"),
                 size_bytes: file_payload.len(),
+                plugin_checkpoint: None,
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
@@ -1902,6 +1920,7 @@ mod tests {
             file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             blob_hash: BlobId::from_content(b"Hello"),
             size_bytes: 5,
+            plugin_checkpoint: None,
             context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         })
         .expect("blob ref row should build");
