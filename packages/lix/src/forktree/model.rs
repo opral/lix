@@ -742,6 +742,23 @@ pub(crate) struct BlobManifestV1 {
 }
 
 impl BlobManifestV1 {
+    /// Constructs the sole authenticated upload manifest representation from
+    /// the complete ordered chunk closure. Callers cannot provide a detached
+    /// manifest identity; encoding remains the owner validation boundary.
+    pub(crate) fn from_authenticated_chunks(
+        logical_bytes: u64,
+        ordered_chunks: Vec<BlobChunkRefV1>,
+        canonical_blob_id: BlobId,
+        content_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            logical_bytes,
+            ordered_chunks,
+            canonical_blob_id,
+            content_digest,
+        }
+    }
+
     pub(crate) fn encode(&self) -> Result<(ObjectId, Bytes), StorageError> {
         self.validate()?;
         let count = u32::try_from(self.ordered_chunks.len())

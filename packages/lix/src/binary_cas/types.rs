@@ -284,10 +284,16 @@ pub(crate) struct BlobWriteReceipt {
     pub(crate) hash: BlobId,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
+    /// The authenticated ForkTree manifest object staged for this receipt.
+    /// A semantic BlobId alone cannot authorize a physical object edge.
+    pub(crate) manifest_object_id: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobChunkReceipt {
     pub(crate) hash: ChunkHash,
     pub(crate) size_bytes: u64,
+    /// The authenticated ForkTree chunk object carrying this content hash.
+    /// The physical owner is retained across resumable receipt rows.
+    pub(crate) object_id: [u8; 32],
 }
