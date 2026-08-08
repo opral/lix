@@ -31,13 +31,13 @@ use super::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
-    CommitMemberV1, CommitObjectV1, GcBudget, GcStepStatus, GlobalSelectorV1, ObjectId,
-    PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
+    CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1,
+    ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
     ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource,
-    StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1,
-    UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc,
-    edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
+    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
+    StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
+    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
     load_commit_member_records, load_commit_topologies, open_coherent_view, page_changes,
     page_commits, prepare_upload_completion, put_change_catalog_entries,
     put_commit_catalog_entries, state_point, state_range,
@@ -807,6 +807,144 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     .expect("update/remove path copy");
     assert_eq!(edit.entry_count(), 2);
     assert!(edit.copied_nodes() >= 2);
+}
+
+#[tokio::test]
+async fn historical_absence_requires_authenticated_commit_and_root() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("historical absence read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    let public_commit_id = public_commit_id(0x20);
+    let absent_key = encode_state_key(StateKeyRef {
+        schema_key: "app.row",
+        file_id: Some("file"),
+        entity_pk: &EntityPk::single("absent"),
+    });
+    assert!(
+        facade
+            .load_state_value_at_commit(public_commit_id, &absent_key, true)
+            .await
+            .expect("authenticated absent key")
+            .is_none(),
+        "a missing key is None only after commit and roots authenticate"
+    );
+}
+
+#[tokio::test]
+async fn historical_missing_commit_catalog_fails_for_point_and_batch() {
+    let mut seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let commit_object_id = seed.commit_object_id;
+    let ref_change_object_id = seed.ref_change_object_id;
+    replace_selected_history_graph(&mut seed, &[], &[], commit_object_id, ref_change_object_id);
+    seed_storage(&storage, &seed).await;
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("missing catalog read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    let public_commit_id = public_commit_id(0x20);
+    assert!(
+        facade
+            .load_state_value_at_commit(public_commit_id, &seed.state_keys[0], true)
+            .await
+            .is_err(),
+        "missing selected CommitCatalog entry must not become None"
+    );
+    let key = StateKey {
+        schema_key: "app.row".to_owned(),
+        file_id: Some("file".to_owned()),
+        entity_pk: EntityPk::single("a"),
+    };
+    assert!(
+        facade
+            .load_state_rows_at_commit(&public_commit_id.to_string(), &[key])
+            .await
+            .is_err(),
+        "batch lowering must propagate missing selected commit corruption"
+    );
+}
+
+#[tokio::test]
+async fn historical_missing_state_root_fails_before_empty_result() {
+    let mut seed = build_seed();
+    let storage = Memory::new();
+    let commit_id = seed.commit_id;
+    let semantic_change_id = seed.semantic_change_id;
+    let semantic_change_object_id = seed.semantic_change_object_id;
+    let ref_change_id = seed.ref_change_id;
+    let ref_change_object_id = seed.ref_change_object_id;
+    let branch_id = seed.branch_id;
+    let commit = CommitObjectV1 {
+        commit_id,
+        generation: 1,
+        parent_commit_object_ids: Vec::new(),
+        members: vec![CommitMemberV1::introduced(semantic_change_object_id)],
+        global_state_root: content_id(0xf1),
+        local_state_root: seed.local_state_root,
+        metadata: b"missing-state-root".to_vec(),
+    };
+    let (commit_object_id, commit_bytes) = commit.encode().expect("missing-root commit");
+    seed.objects
+        .insert(commit_object_id, commit_bytes)
+        .expect("missing-root commit object");
+    let changes = vec![
+        (
+            semantic_change_id,
+            ChangeCatalogEntry {
+                change_object_id: semantic_change_object_id,
+                owner: ChangeCatalogOwner::CommitMember {
+                    commit_object_id,
+                    ordinal: 0,
+                },
+            },
+        ),
+        (
+            ref_change_id,
+            ChangeCatalogEntry {
+                change_object_id: ref_change_object_id,
+                owner: ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id,
+                    branch_id,
+                },
+            },
+        ),
+    ];
+    seed_storage(&storage, &seed).await;
+    replace_selected_history_graph(
+        &mut seed,
+        &[(commit_id, CommitCatalogEntry { commit_object_id })],
+        &changes,
+        commit_object_id,
+        ref_change_object_id,
+    );
+    seed_storage(&storage, &seed).await;
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("missing state root read"),
+    );
+    let facade = ForkTreeReadFacade::new(read);
+    assert!(
+        facade
+            .load_state_value_at_commit(public_commit_id(0x20), &seed.state_keys[2], true)
+            .await
+            .is_err(),
+        "missing selected state root must not become an empty historical result"
+    );
 }
 
 #[test]

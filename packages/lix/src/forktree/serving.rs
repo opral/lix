@@ -596,6 +596,20 @@ where
 /// Loads the authenticated semantic Change members owned by one commit. The
 /// Commit object supplies ordered membership; the unified ChangeCatalog must
 /// supply the exact reverse owner/ordinal edge for every returned payload.
+async fn load_required_commit_catalog_entry<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_id: CommitId,
+) -> Result<CommitCatalogEntry, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let value = lookup_on_read(commit_catalog_root, "commit", commit_id.as_bytes(), read)
+        .await?
+        .ok_or_else(|| corruption("selected CommitCatalog entry is absent"))?;
+    Ok(CommitCatalogEntry::decode(&value)?)
+}
+
 pub(crate) async fn load_commit_member_records<R>(
     read: &R,
     commit_id: crate::changelog::CommitId,
@@ -605,17 +619,8 @@ where
 {
     let repository = load_repository_root(read).await?;
     let commit_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
-    let Some(value) = lookup_on_read(
-        repository.commit_catalog_root,
-        "commit",
-        commit_id.as_bytes(),
-        read,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let entry = CommitCatalogEntry::decode(&value)?;
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, commit_id).await?;
     let commit_object_id = entry.commit_object_id;
     let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
     let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
@@ -676,17 +681,8 @@ where
 {
     let repository = load_repository_root(read).await?;
     let commit_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
-    let Some(value) = lookup_on_read(
-        repository.commit_catalog_root,
-        "commit",
-        commit_id.as_bytes(),
-        read,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let entry = CommitCatalogEntry::decode(&value)?;
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, commit_id).await?;
     let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
     let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
     if commit.commit_id != commit_id {
