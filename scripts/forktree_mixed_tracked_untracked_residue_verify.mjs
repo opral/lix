@@ -12,7 +12,13 @@ const files = [
   "packages/lix/src/sql2/entity_batch.rs",
   "packages/lix/src/sql2/providers/entity.rs",
 ];
-const required = ["LiveStateReader", "scan_batch", "MaterializedLiveStateBatch"];
+const required = [
+  "LiveStateReader",
+  "scan_batch",
+  "MaterializedLiveStateBatch",
+  "canonical_snapshot_projection",
+  "canonical_primary_key_projection",
+];
 const forbiddenByFile = new Map([
   [
     "packages/lix/src/live_state/context.rs",
@@ -26,14 +32,13 @@ const forbiddenByFile = new Map([
   [
     "packages/lix/src/sql2/entity_batch.rs",
     [
-      ["raw entity snapshot reader", /\b(?:EntitySnapshotReader|CurrentEntitySnapshotReader)\b/],
-      ["raw adapter ownership", /\bStorageAdapterRead\b/],
       ["direct entity snapshot path", /\bscan_direct_entity_/],
+      ["alternate ForkTree view", /\bForkTreeReadFacade\b/],
+      [
+        "alternate storage read",
+        /\b(?:begin_read|begin_scan|get_many|state_range|load_object_bytes)\s*\(/,
+      ],
     ],
-  ],
-  [
-    "packages/lix/src/sql2/providers/entity.rs",
-    [["second entity reader", /\b(?:EntitySnapshotReader|entity_snapshot_reader)\b/]],
   ],
 ]);
 
