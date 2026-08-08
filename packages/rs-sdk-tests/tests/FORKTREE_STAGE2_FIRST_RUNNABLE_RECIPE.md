@@ -5,6 +5,30 @@ milestone and do not apply artifacts to Ryzen-V's production worktree.
 
 ## Readiness frontier
 
+The current-main integration anchor for every future prospective tree is
+`822c204ce0670969ca71045bc74f9ca25fde8093`, tree
+`fac3f2b713683be17c34515062dd72edc8feed95`. The prior immutable, but still
+non-runnable, ForkTree frontier is `34f2dacad4a0126a58d015f27ed75c2142547dd5`,
+tree `2e68fb8becd480f97364dbc2cc70416e66e765c1`, parent
+`a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737`, parent-to-head full-index
+SHA-256 `6fadece2bdb9cbd3d36d52ba738834ee6172cae5031d4fac4dd87099a77661ac`.
+The latest held catalog-boundary frontier is
+`7c9b1060bc396dfa54efcc6c888e37894a7cfb04`, tree
+`ee96c5b64912b8fa8bb15fb7c31916244a255523`, parent `34f2dacad4a0126a58d015f27ed75c2142547dd5`,
+parent-to-head full-index SHA-256
+`109ae9bc8eb4e24487bde7c50da28b020a23da4f7ebcf744d25bdc5787f3d779`.
+Its stable patch ID is `1e9b50c12a8db7a3db9024e28ff2d06b5a0dbb0d` and its
+source report SHA-256 is
+`8fe40b5fe63895a132293151e126394161552bf95a4106e02c01bb068c2b17ff`.
+Do not run acceptance artifacts against either frontier: both remain
+compiler-red and have no first-runnable approval.
+
+The historical artifact comparator remains exact a12
+`a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
+`9a705d36392e88d8f5f363b2b23d373deec3321d`; all a12-based artifact diffs are
+control provenance and must be re-bound to current main plus the candidate
+before results are accepted.
+
 The independently approved topology milestone is:
 
 - ref `origin/codex/forktree-stage2-milestone3e-topology-owned-reader`;
@@ -121,10 +145,29 @@ Raw stdout SHA `6f4013da...` and combined audit stdout+stderr SHA `3891a486...`
 differ only by the expected terminal audit error line; they are presentation
 hashes, not competing semantic results.
 
-The first source gate is the externally frozen P0+W1a package manifest
-`73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6`
+The first source gate is immutable transport ref
+`origin/codex/forktree-stage2-p0-w1a-acceptance-a1cf` at
+`d03d03a4925b51c7d43801bf256b9c9b37f53f67`/tree
+`d5016a33f069c5151944eff1f11eca650d8fd872`, parent `a1cf8f7f...`, with
+parent diff `e568ad37ff4531958780b6530124c91dccb9df4f572c0c41d4e75918605447d9`
+and patch ID `ef8f5f2bac0a7bd5f8d10f356fddc706e30803c4`. Its exact four-file
+package manifest is `73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6`
 (contract `cfd25a60...`, cases `77af0924...`, verifier `35dfbedc...`, freeze
-report `77a07625...`). It must pass before artifact application or runtime.
+report `77a07625...`); transport report SHA is
+`db5a29e0bac9f09da6defa6af4be0b3c3a79d06890f386392e124169d1fb1a8e`. Verify
+the five transport-tree files and run the package only against the future
+candidate. It must pass before artifact application or runtime.
+
+The external target-discovery ref
+`origin/codex/forktree-post-stage2-acceptance-manifest` at
+`1ad4c879b1d8339bca7fdc414fdee36305ce9a69`/tree
+`bc9728cfa0b761d98c0639479c80c65cbad5e4a9`, parent a12, is verified as a
+test-only discovery package. Its `a12..head` diff is
+`1bf97fb4037add7d5ecf3d046359e6ab92188f3740532c155e5bd885a0fa841d`, patch
+ID `7389880b6907b20c3d97971883b352105e15a816`, 28,494 bytes. It identifies
+parsed-file/public-file, OLTP, version-control, DataFusion, multimedia, and
+recovery/GC target families; it is not a current-main result and must not be
+applied wholesale. Rebind each selected cell to exact main and the candidate.
 
 ## Eligibility fence
 

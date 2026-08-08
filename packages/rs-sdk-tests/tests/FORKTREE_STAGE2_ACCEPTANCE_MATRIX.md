@@ -6,9 +6,29 @@ exact-head qualification worktree with an isolated Cargo target.
 
 ## Provenance and interpretation
 
-The matrix is rooted at exact current-layout comparator
-`a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
-`9a705d36392e88d8f5f363b2b23d373deec3321d`, and accepted unwired Stage 1
+The current qualification target is exact main
+`822c204ce0670969ca71045bc74f9ca25fde8093`, tree
+`fac3f2b713683be17c34515062dd72edc8feed95`. The prior immutable
+non-runnable ForkTree frontier is `34f2dacad4a0126a58d015f27ed75c2142547dd5`,
+tree `2e68fb8becd480f97364dbc2cc70416e66e765c1`, parent
+`a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737`, with parent-to-head full-index
+SHA-256 `6fadece2bdb9cbd3d36d52ba738834ee6172cae5031d4fac4dd87099a77661ac`.
+The latest held catalog-boundary frontier is
+`7c9b1060bc396dfa54efcc6c888e37894a7cfb04`, tree
+`ee96c5b64912b8fa8bb15fb7c31916244a255523`, parent
+`34f2dacad4a0126a58d015f27ed75c2142547dd5`, with parent-to-head full-index
+SHA-256 `109ae9bc8eb4e24487bde7c50da28b020a23da4f7ebcf744d25bdc5787f3d779`.
+Its stable patch ID is `1e9b50c12a8db7a3db9024e28ff2d06b5a0dbb0d` and the
+source report SHA-256 is
+`8fe40b5fe63895a132293151e126394161552bf95a4106e02c01bb068c2b17ff`.
+Both are non-runnable; the latest held frontier remains blocked until an
+immutable descendant is explicitly compile-green and independently clears R2
+atomicity and H2 residue approval.
+
+The historical exact current-layout comparator for the frozen test/report
+artifacts is `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
+`9a705d36392e88d8f5f363b2b23d373deec3321d`; it is a control identity, not a
+replacement for current main. Accepted unwired Stage 1 remains
 `138b55e1de90806c380ad27b2b349f4c66a1387f`, tree
 `26a3e6ead4d690bf1fe2ebca1e2da7d597256b84`.
 
@@ -16,6 +36,9 @@ The matrix is rooted at exact current-layout comparator
 Commands are shell fragments with `<candidate>`, `<target>`, and `<fresh-db>`
 placeholders. Each command is independently capped at 20 minutes. A timeout
 without test execution is a host compile boundary, never a candidate pass.
+The latest read-only verifier pass is frozen with stdout SHA-256
+`96e6e33bd8b550ad0c0a1bb758e3281cd0455b468ec78d4868e5e27c24712e5e` and empty
+stderr SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 
 The refs have different historical bases and must not be merged wholesale.
 For qualification, materialize only each row's named test/report artifacts in
@@ -116,19 +139,58 @@ Acceptance
 binds scanner source/binary identity and the normalized semantic set, not a
 cwd/path/redirection-dependent raw presentation.
 
-The externally frozen P0+W1a source-gate package is bound by manifest SHA-256
+The immutable transport ref for the P0+W1a source-gate package is
+`origin/codex/forktree-stage2-p0-w1a-acceptance-a1cf`, head
+`d03d03a4925b51c7d43801bf256b9c9b37f53f67`, tree
+`d5016a33f069c5151944eff1f11eca650d8fd872`, parent `a1cf8f7f...`, and
+parent-to-head full-index SHA-256
+`e568ad37ff4531958780b6530124c91dccb9df4f572c0c41d4e75918605447d9`.
+Its stable patch ID is `ef8f5f2bac0a7bd5f8d10f356fddc706e30803c4`. The exact
+four-file package manifest is SHA-256
 `73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6`.
-Its contract, case table, verifier, and freeze report respectively hash to
+The contract, case table, verifier, freeze report, and transport report
+respectively hash to
 `cfd25a6064aa1c5fd3ad06558c43f79c2169ac88f7b80bd9dab05a90f739d249`,
 `77af0924a86cf023a2924075507545b52035739e8c5bfc33accc080e8f4a9b17`,
 `35dfbedc0373f5292d96d9e0ab2feafbc11b3f35618adcaa2d5c921514304550`,
-and `77a0762582364b3c77ca78720e8feca9c2b44c3cbdf40b4a91037ca704064e8e`.
-It is external evidence, not mounted or rehashed here. Every first-runnable
+`77a0762582364b3c77ca78720e8feca9c2b44c3cbdf40b4a91037ca704064e8e`, and
+`db5a29e0bac9f09da6defa6af4be0b3c3a79d06890f386392e124169d1fb1a8e`.
+The five transport-tree files are independently checked by the verifier. The
+package remains test/report-only and is never applied to production. Every first-runnable
 candidate must pass it before residue or runtime artifact application: P0
 removes direct `PreparedPublication::commit`/independent write entry points;
 W1a lowers ordered single-branch history and selected members through exactly
 one read, plan, prepare, and commit, with unsupported families failing before
 any plan or epoch rotation.
+
+## External target-discovery package
+
+The updated goal includes OLTP, version control, parsed files, large
+multimedia, both RocksDB and SlateDB, corruption/recovery/GC, and external
+target-discovery artifacts. The immutable discovery package is
+`origin/codex/forktree-post-stage2-acceptance-manifest`, head
+`1ad4c879b1d8339bca7fdc414fdee36305ce9a69`, tree
+`bc9728cfa0b761d98c0639479c80c65cbad5e4a9`, parent
+`a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, and exact `a12..head`
+full-index binary SHA-256
+`1bf97fb4037add7d5ecf3d046359e6ab92188f3740532c155e5bd885a0fa841d`.
+Its stable patch ID is `7389880b6907b20c3d97971883b352105e15a816`, and its
+canonical diff stream is 28,494 bytes. The three test-only files hash to:
+
+- `FORKTREE_POST_STAGE2_ACCEPTANCE_MANIFEST.md`:
+  `456dd164a7a1742c917ad69acc806c3eebf1205125c44dccb5561c9def778a06`;
+- `forktree_post_stage2_acceptance/SOURCE_REFS.tsv`:
+  `349ca7019d7e4db03c57ee0f2e8123f7e1f85666a945221ad5a8997b33c9b39d`;
+- `forktree_post_stage2_acceptance/run.sh`:
+  `8b1a6ef66e32ba795c415b02486ead7a030fe5aa1ecbe33f65246661348de8ac`.
+
+This is a discovery/recipe row, not a current-main result and not a candidate
+artifact. It supplies parsed-file/public-file lifecycle, DataFusion
+range/projection, OLTP/SQL, version-control, multimedia, and bounded-GC target
+families. Its a12 controls must be replayed or re-bound to exact main
+`822c204c...` and the first compile-green ForkTree descendant before any result
+is accepted. The runner is dry-run by default; individual cells, never a
+whole-matrix command, retain the 20-minute cap.
 
 The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at
