@@ -13,6 +13,7 @@ use crate::storage::{
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapterRead, StorageAdapterReadScope, StorageWriteSet,
+    StorageWriteSetError,
 };
 
 use super::model::{
@@ -66,7 +67,10 @@ where
         },
     )
     .await
-    .map_err(|error| StorageError::Io(error.to_string()))?;
+    .map_err(|error| match error {
+        StorageWriteSetError::Storage(error) => error,
+        error => StorageError::Io(error.to_string()),
+    })?;
     Ok(())
 }
 

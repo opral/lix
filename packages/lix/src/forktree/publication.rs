@@ -70,6 +70,7 @@ pub(crate) struct PreparedPublication {
     selector_puts: BTreeMap<Bytes, Bytes>,
     selector_deletes: BTreeSet<Bytes>,
     object_puts: ImmutableObjectSet,
+    object_deletes: BTreeSet<ObjectId>,
     untracked_puts: BTreeMap<Bytes, Bytes>,
     untracked_deletes: BTreeSet<Bytes>,
 }
@@ -103,9 +104,80 @@ impl PreparedPublication {
             selector_puts: BTreeMap::new(),
             selector_deletes: BTreeSet::new(),
             object_puts: ImmutableObjectSet::default(),
+            object_deletes: BTreeSet::new(),
             untracked_puts: BTreeMap::new(),
             untracked_deletes: BTreeSet::new(),
         })
+    }
+
+    /// Starts a repository-global publication from an already authenticated
+    /// selector claim. GC keeps the claim and its retained read in its
+    /// operation-owned snapshot; this constructor only makes that exact
+    /// claim usable by the same publication lowering boundary.
+    pub(super) fn from_global_selector_claim(
+        raw_global: Bytes,
+        global: GlobalSelectorV1,
+    ) -> Result<Self, StorageError> {
+        if global.encode()?.as_ref() != raw_global.as_ref() {
+            return Err(corruption(
+                "global selector claim does not match its authenticated bytes",
+            ));
+        }
+        Ok(Self {
+            expected_global: raw_global,
+            next_global: global.rotated()?,
+            selector_expectations: BTreeMap::new(),
+            selector_puts: BTreeMap::new(),
+            selector_deletes: BTreeSet::new(),
+            object_puts: ImmutableObjectSet::default(),
+            object_deletes: BTreeSet::new(),
+            untracked_puts: BTreeMap::new(),
+            untracked_deletes: BTreeSet::new(),
+        })
+    }
+
+    /// Adds one authenticated maintenance object mutation to this publication.
+    /// Reachability owns the typed bytes; publication owns the single object
+    /// namespace and rejects put/delete ambiguity before lowering.
+    pub(super) fn stage_gc_object_put(
+        &mut self,
+        id: ObjectId,
+        bytes: Bytes,
+    ) -> Result<(), StorageError> {
+        if self.object_deletes.contains(&id) {
+            return Err(corruption("GC publication puts and deletes one object"));
+        }
+        self.stage_encoded_object(id, bytes)
+    }
+
+    pub(super) fn stage_gc_object_delete(&mut self, id: ObjectId) -> Result<(), StorageError> {
+        if self.object_puts.get(id).is_some() {
+            return Err(corruption("GC publication puts and deletes one object"));
+        }
+        self.object_deletes.insert(id);
+        Ok(())
+    }
+
+    /// Atomically advances or retires the rebuildable GC progress selector.
+    pub(super) fn stage_gc_progress_selector(
+        &mut self,
+        expected: Option<Bytes>,
+        next: Option<Bytes>,
+    ) -> Result<(), StorageError> {
+        let key = gc_progress_selector_key();
+        match next {
+            Some(value) => self.put_selector(
+                key,
+                value,
+                expected
+                    .map(SelectorExpectation::Equals)
+                    .unwrap_or(SelectorExpectation::Absent),
+            ),
+            None => self.delete_selector(
+                key,
+                expected.ok_or_else(|| corruption("GC selector retirement is not present"))?,
+            ),
+        }
     }
 
     pub(super) fn stage_repository_root(
@@ -1092,12 +1164,16 @@ impl PreparedPublication {
             });
         }
         let next_global = self.next_global.encode()?;
+        let preserves_gc_progress_selector =
+            self.selector_puts.contains_key(&gc_progress_selector_key())
+                || self.selector_deletes.contains(&gc_progress_selector_key());
         let mut writes = StorageWriteSet::with_capacity(
             self.object_puts
                 .iter()
                 .count()
                 .saturating_add(self.selector_puts.len())
                 .saturating_add(self.selector_deletes.len())
+                .saturating_add(self.object_deletes.len())
                 .saturating_add(self.untracked_puts.len())
                 .saturating_add(self.untracked_deletes.len())
                 .saturating_add(2),
@@ -1105,6 +1181,9 @@ impl PreparedPublication {
         );
         for (id, bytes) in self.object_puts.iter() {
             writes.put(OBJECT_SPACE, id.as_bytes().to_vec(), bytes.to_vec());
+        }
+        for id in self.object_deletes {
+            writes.delete(OBJECT_SPACE, id.as_bytes().to_vec());
         }
         writes.put(
             SELECTOR_SPACE,
@@ -1114,7 +1193,10 @@ impl PreparedPublication {
         for (key, value) in self.selector_puts {
             writes.put(SELECTOR_SPACE, key.to_vec(), value.to_vec());
         }
-        writes.delete(SELECTOR_SPACE, gc_progress_selector_key().to_vec());
+        let gc_key = gc_progress_selector_key();
+        if !preserves_gc_progress_selector {
+            writes.delete(SELECTOR_SPACE, gc_key.to_vec());
+        }
         for key in self.selector_deletes {
             writes.delete(SELECTOR_SPACE, key.to_vec());
         }
