@@ -3203,19 +3203,6 @@ where
     .await?;
     for commit_id in &sweep_authority_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
-            let schema_keys = entry
-                .members
-                .iter()
-                .map(|member| member.key.schema_key.as_str())
-                .collect::<BTreeSet<_>>();
-            for schema_key in schema_keys {
-                crate::columnar_row_group::stage_delete_row_group_set(
-                    store,
-                    writes,
-                    crate::live_state::entity_row_group_set_id(*commit_id, schema_key),
-                )
-                .await?;
-            }
             crate::tracked_state::stage_delete_commit_delta_inventory_entry(
                 writes, *commit_id, entry,
             )?;
