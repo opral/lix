@@ -281,7 +281,12 @@ def function_bodies(tokens: list[Token], name: str) -> list[tuple[int, int]]:
         brace = index + 2
         while brace < len(tokens) and tokens[brace].text not in {"{", ";"}:
             brace += 1
-        need(brace < len(tokens) and tokens[brace].text == "{", f"{name} has no body")
+        need(brace < len(tokens), f"{name} declaration is unterminated")
+        if tokens[brace].text == ";":
+            # Trait/extern declarations are declarations, not reachable
+            # executable functions.  A concrete definition of the same name
+            # is still collected if one follows it.
+            continue
         result.append((brace, matching(tokens, brace)))
     return result
 
@@ -295,8 +300,12 @@ def function_definitions(path: Path) -> list[FunctionDefinition]:
         brace = index + 2
         while brace < len(tokens) and tokens[brace].text not in {"{", ";"}:
             brace += 1
-        need(brace < len(tokens) and tokens[brace].text == "{",
-             f"{path}: function {tokens[index + 1].text} has no body")
+        need(brace < len(tokens),
+             f"{path}: function {tokens[index + 1].text} declaration is unterminated")
+        if tokens[brace].text == ";":
+            # Bodyless trait/extern declarations have no executable body to
+            # traverse.  Concrete reachable definitions remain in the result.
+            continue
         result.append(FunctionDefinition(
             path=path,
             name=tokens[index + 1].text,
@@ -547,13 +556,24 @@ def structural_proof(candidate: Path) -> None:
 
 
 def negative_source_fixture_proof(package: Path) -> None:
-    fixture = package / "source-fixtures" / "extra-reader"
-    try:
-        source_closure_proof(fixture)
-    except (OSError, ContractError, KeyError, IndexError) as error:
-        print(f"NEGATIVE-PASS extra reader rejected: {error}")
-        return
-    raise ContractError("extra-reader source fixture unexpectedly passed")
+    for fixture_name in ("extra-reader", "hidden-extra-reader"):
+        fixture = package / "source-fixtures" / fixture_name
+        try:
+            source_closure_proof(fixture)
+        except (OSError, ContractError, KeyError, IndexError) as error:
+            print(f"NEGATIVE-PASS {fixture_name} rejected: {error}")
+            continue
+        raise ContractError(f"{fixture_name} source fixture unexpectedly passed")
+
+
+def positive_source_fixture_proof(package: Path) -> None:
+    fixture = package / "source-fixtures" / "bodyless-declaration"
+    closure = source_closure(fixture)
+    need(any(definition.path.name == "view.rs" and
+             definition.name == "reachable_helper" for definition in closure),
+         "bodyless fixture did not traverse its concrete reachable helper")
+    source_closure_proof(fixture)
+    print("POSITIVE-PASS bodyless declarations skipped; concrete reachable helper traversed")
 
 
 def main(argv: list[str]) -> int:
@@ -566,6 +586,7 @@ def main(argv: list[str]) -> int:
     package = Path(__file__).resolve().parent
     model_ok = run_fixture_model(package)
     try:
+        positive_source_fixture_proof(package)
         negative_source_fixture_proof(package)
         structural_proof(candidate)
     except (OSError, ContractError, KeyError, IndexError) as error:

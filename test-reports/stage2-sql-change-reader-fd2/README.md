@@ -1,8 +1,9 @@
-# ForkTree Stage2 SQL changelog-reader acceptance — v3 successor
+# ForkTree Stage2 SQL changelog-reader acceptance — v4 successor
 
-This package is TEST/REPORT-ONLY. It is a direct successor to immutable v2
-head `62bcabf0c0188612493ae2d11af2649a9313b73f` and the prior blocked
-head `3221833f879b6e2cc965039c0c3cabdd0709e83e`, anchored to fd2 and does
+This package is TEST/REPORT-ONLY. It is a direct successor to immutable v3
+head `e6ca79542b11245ba5f1ed31b2f62d4a492e035a`, itself descended from v2
+head `62bcabf0c0188612493ae2d11af2649a9313b73f` and the prior blocked head
+`3221833f879b6e2cc965039c0c3cabdd0709e83e`, anchored to fd2 and does
 not change production SQL, changelog, ForkTree, storage, writer, or runtime
 code. It is a compile/source acceptance contract for the smallest next
 three-diagnostic closure identified in the fd2 dependency map.
@@ -89,7 +90,7 @@ reader.
 
 `verify_source_contract.sh` retains the historical fd2 output byte-for-byte,
 but its fixture gate now invokes the Python model rather than checking fixture
-substrings. The v3 successor gate is:
+substrings. The v4 successor gate is:
 
 ```text
 python3 test-reports/stage2-sql-change-reader-fd2/verify_contract_v2.py \
@@ -111,12 +112,14 @@ The structural proof skips Rust comments and quoted literals, balances
 their reader as `ForkTreeReadFacade`, and requires exactly one
 `ChangelogQuerySource` constructor in each session/transaction caller. It
 then enumerates the complete function/transitive source closure through the
-declared SQL/ForkTree files. Each constructor must initialize exactly one
-`ForkTreeReadFacade::new(self.read_store...)`; every extra
+declared SQL/ForkTree files. Bodyless trait/extern declarations ending in `;`
+are skipped as non-executable declarations, while every concrete definition
+reachable by call name is still traversed. Each constructor must initialize
+exactly one `ForkTreeReadFacade::new(self.read_store...)`; every extra
 `ForkTreeReadFacade::new`, `open_coherent_view`, or `begin_read` in that
-closure is rejected. The package includes a candidate-shaped negative fixture
-with a valid field plus `ForkTreeReadFacade::new(self.other_store)` and the
-gate requires that fixture to fail.
+closure is rejected. The package retains the direct constructor negative and
+adds a hidden transitive-helper acquisition negative, plus a positive fixture
+with `BranchSelector::active_branch_id(...);` and a reachable concrete helper.
 
 The model-only gate used by the historical calibration wrapper is:
 
