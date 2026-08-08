@@ -128,6 +128,91 @@ where
     }
 }
 
+/// One operation-scoped ForkTree read facade. Branch views borrow the same
+/// retained read identity; no branch or untracked traversal can refresh it.
+pub(crate) struct ForkTreeReadFacade<'a, R: ?Sized> {
+    read: &'a R,
+}
+
+impl<'a, R: ?Sized> ForkTreeReadFacade<'a, R>
+where
+    R: StorageAdapterRead,
+{
+    pub(crate) fn from_retained_read(read: &'a R) -> Self {
+        Self { read }
+    }
+
+    pub(crate) async fn branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<CoherentView<&'a R>, crate::LixError> {
+        let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INVALID_PARAM,
+                format!("branch ID must be a UUID: {error}"),
+            )
+        })?;
+        open_coherent_view_on_read(self.read, CanonicalBranchId::from_bytes(*uuid.as_bytes()))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn load_commit_member_records(
+        &self,
+        commit_id: crate::changelog::CommitId,
+    ) -> Result<Option<Vec<crate::changelog::ChangeRecord>>, crate::LixError> {
+        super::serving::load_commit_member_records(self.read, commit_id).await
+    }
+
+    pub(crate) async fn load_state_value_at_commit(
+        &self,
+        commit_id: crate::changelog::CommitId,
+        key: &[u8],
+        include_tombstone: bool,
+    ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
+    {
+        super::serving::load_state_value_at_commit(self.read, commit_id, key, include_tombstone)
+            .await
+    }
+
+    pub(crate) async fn load_json_slot(
+        &self,
+        slot: &crate::json_store::JsonSlot,
+    ) -> Result<Option<String>, crate::LixError> {
+        match slot {
+            crate::json_store::JsonSlot::None => Ok(None),
+            crate::json_store::JsonSlot::Inline(value) => Ok(Some(value.to_string())),
+            crate::json_store::JsonSlot::Ref(json_ref) => {
+                let refs = [*json_ref];
+                let values = crate::json_store::JsonStoreContext::new()
+                    .load_bytes_many(
+                        self.read,
+                        crate::json_store::JsonLoadRequestRef {
+                            refs: &refs,
+                            scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+                        },
+                    )
+                    .await?
+                    .into_values();
+                let Some(Some(bytes)) = values.into_iter().next() else {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "authenticated change snapshot payload is missing",
+                    ));
+                };
+                String::from_utf8(bytes.to_vec())
+                    .map(Some)
+                    .map_err(|error| {
+                        crate::LixError::new(
+                            crate::LixError::CODE_STORAGE_ERROR,
+                            format!("authenticated change snapshot payload is not UTF-8: {error}"),
+                        )
+                    })
+            }
+        }
+    }
+}
+
 pub(crate) async fn open_coherent_view<S>(
     storage: &S,
     branch_id: CanonicalBranchId,

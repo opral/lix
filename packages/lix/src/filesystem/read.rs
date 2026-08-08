@@ -4,9 +4,8 @@ use serde::Deserialize;
 
 use crate::LixError;
 use crate::common::compose_file_path;
-use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonSlot};
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, scan_forktree_branch,
+    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, scan_forktree_view,
 };
 
 use super::keys::{
@@ -19,18 +18,20 @@ use super::{DirectoryPathRecord, derive_directory_paths};
 /// controls and retained commit/checkpoint roots. Tracked history is read from
 /// commit state; current-only untracked rows are read from each control's
 /// untracked selector through the live-state owner.
-pub(crate) async fn collect_gc_binary_blob_roots<S, C>(
-    store: &S,
+pub(crate) async fn collect_gc_binary_blob_roots<O, C>(
+    owner: &O,
     controls: &[(String, C)],
     retained_commits: &BTreeSet<crate::changelog::CommitId>,
 ) -> Result<BTreeSet<crate::binary_cas::BlobId>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    O: crate::storage_adapter::StorageAdapterRead + ?Sized,
 {
+    let facade = crate::forktree::ForkTreeReadFacade::from_retained_read(owner);
     let mut roots = BTreeSet::new();
     for (branch_id, _) in controls {
-        let rows = scan_forktree_branch(
-            store,
+        let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
+        let rows = scan_forktree_view(
+            &view,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_owned()],
@@ -57,56 +58,26 @@ where
     }
 
     for commit_id in retained_commits {
-        let records = crate::forktree::load_commit_member_records(store, *commit_id)
+        let records = facade
+            .load_commit_member_records(*commit_id)
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("retained commit '{commit_id}' has no authenticated member records"),
+                )
+            })?;
         for record in records {
             if record.schema_key != BLOB_REF_SCHEMA_KEY || record.snapshot.is_none() {
                 continue;
             }
-            let Some(snapshot) = load_json_slot(store, &record.snapshot).await? else {
+            let Some(snapshot) = facade.load_json_slot(&record.snapshot).await? else {
                 continue;
             };
             roots.insert(blob_id_from_snapshot(&snapshot)?);
         }
     }
     Ok(roots)
-}
-
-async fn load_json_slot<S>(store: &S, slot: &JsonSlot) -> Result<Option<String>, LixError>
-where
-    S: crate::storage_adapter::StorageAdapterRead + ?Sized,
-{
-    match slot {
-        JsonSlot::None => Ok(None),
-        JsonSlot::Inline(value) => Ok(Some(value.to_string())),
-        JsonSlot::Ref(json_ref) => {
-            let refs = [*json_ref];
-            let values = crate::json_store::JsonStoreContext::new()
-                .load_bytes_many(
-                    store,
-                    JsonLoadRequestRef {
-                        refs: &refs,
-                        scope: JsonReadScopeRef::OutOfBand,
-                    },
-                )
-                .await?
-                .into_values();
-            let Some(Some(bytes)) = values.into_iter().next() else {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "authenticated change snapshot payload is missing",
-                ));
-            };
-            let value = String::from_utf8(bytes.to_vec()).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("authenticated change snapshot payload is not UTF-8: {error}"),
-                )
-            })?;
-            Ok(Some(value))
-        }
-    }
 }
 
 fn blob_id_from_snapshot(snapshot: &str) -> Result<crate::binary_cas::BlobId, LixError> {

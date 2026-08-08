@@ -25,9 +25,9 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::derived::{is_derived_schema, request_may_include_derived};
 
-/// Reads one selected branch through its authenticated global/local state
-/// pair. Unsupported lanes return a typed error so callers cannot silently
-/// revive an old reader.
+/// Reads one selected branch through a caller-owned authenticated
+/// global/local state pair. Unsupported lanes return a typed error so
+/// callers cannot silently revive an old reader or acquire a second view.
 pub(crate) async fn scan_branch<S>(
     store: &S,
     request: &LiveStateScanRequest,
@@ -36,8 +36,24 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     validate_scan_request(request)?;
+    let [branch_id] = request.filter.branch_ids.as_slice() else {
+        return Err(unsupported("current ForkTree reader requires one branch"));
+    };
+    let branch_id = parse_branch_id(branch_id)?;
+    let view = open_coherent_view_on_read(store, branch_id).await?;
+    scan_view(&view, request).await
+}
+
+pub(crate) async fn scan_view<R>(
+    view: &crate::forktree::CoherentView<R>,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    R: StorageAdapterRead,
+{
+    validate_scan_request(request)?;
     if request.filter.untracked == Some(true) {
-        return scan_untracked_branch(store, request).await;
+        return scan_untracked_view(view, request).await;
     }
     let [branch_id] = request.filter.branch_ids.as_slice() else {
         return Err(unsupported("current ForkTree reader requires one branch"));
@@ -52,7 +68,11 @@ where
     }
 
     let branch_id = parse_branch_id(branch_id)?;
-    let view = open_coherent_view_on_read(store, branch_id).await?;
+    if view.branch_id() != branch_id {
+        return Err(unsupported(
+            "current ForkTree reader view does not match requested branch",
+        ));
+    }
     let rows = state_range(&view, None, None, None, true).await?;
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
@@ -107,12 +127,12 @@ where
 /// Reads current untracked rows through the same authenticated selector view
 /// as tracked rows. The raw untracked space is owned and decoded here; no
 /// caller receives a space, key, or alternate serving authority.
-pub(crate) async fn scan_untracked_branch<S>(
-    store: &S,
+pub(crate) async fn scan_untracked_view<R>(
+    view: &crate::forktree::CoherentView<R>,
     request: &LiveStateScanRequest,
 ) -> Result<MaterializedLiveStateBatch, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    R: StorageAdapterRead,
 {
     validate_scan_request(request)?;
     if !request.filter.constraints.is_empty()
@@ -128,7 +148,11 @@ where
         ));
     };
     let branch_id = parse_branch_id(branch_id)?;
-    let view = open_coherent_view_on_read(store, branch_id).await?;
+    if view.branch_id() != branch_id {
+        return Err(unsupported(
+            "current ForkTree untracked view does not match requested branch",
+        ));
+    }
     let mut cursor = view
         .read()
         .begin_scan(

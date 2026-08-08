@@ -16,14 +16,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
+use crate::changelog::ChangeRecordProjection;
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::forktree::{StateCell, StateKeyRef, encode_state_key, load_state_value_at_commit};
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateScanRequest, MaterializedLiveStateRow,
-    scan_forktree_branch,
+    scan_forktree_view,
 };
-use crate::tracked_state::MaterializedTrackedStateRowRef;
+use crate::storage_adapter::StorageAdapterRead;
+use crate::tracked_state::{MaterializedTrackedStateRowRef, TrackedStateStoreReader};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
@@ -457,29 +458,46 @@ impl PluginRegistry {
 
 /// Loads one retained registry through the plugin-owned durable decoder.
 pub(crate) async fn load_plugin_registry_at_commit<S>(
-    store: &S,
+    reader: &mut TrackedStateStoreReader<S>,
     commit_id: &str,
 ) -> Result<PluginRegistry, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
-    let commit_id = CommitId::parse_lix(commit_id, "historical plugin registry commit")?;
-    let key = encode_state_key(StateKeyRef {
-        schema_key: KEY_VALUE_SCHEMA_KEY,
-        entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
+    let registry_key = crate::tracked_state::TrackedStateKey {
+        schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
+        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
         file_id: None,
-    });
-    let value = load_state_value_at_commit(store, commit_id, &key, true).await?;
-    let snapshot = match value.map(|(value, _)| value.cell) {
-        None | Some(StateCell::Null | StateCell::Tombstone) => None,
-        Some(StateCell::Value(value)) => {
-            Some(serde_json::from_str(value.as_str()).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!("historical plugin registry snapshot is invalid JSON: {error}"),
-                )
-            })?)
-        }
+    };
+    let rows = reader
+        .load_projected_batch_at_commit(
+            commit_id,
+            std::slice::from_ref(&registry_key),
+            &ChangeRecordProjection::full(),
+        )
+        .await?
+        .into_rows();
+    let row = rows.into_iter().next().flatten().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("historical plugin registry is missing at commit '{commit_id}'"),
+        )
+    })?;
+    let snapshot = if row.deleted {
+        None
+    } else {
+        let content = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("historical plugin registry has no snapshot at commit '{commit_id}'"),
+            )
+        })?;
+        Some(serde_json::from_str(content).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("historical plugin registry snapshot is invalid JSON: {error}"),
+            )
+        })?)
     };
     PluginRegistry::from_optional_snapshot(snapshot.as_ref())
 }
@@ -487,19 +505,21 @@ where
 /// Re-derives every WASM payload root owned by current and retained plugin
 /// registry generations. Registry snapshots remain the sole serving authority;
 /// this returns only their authenticated content hashes for binary-CAS marking.
-pub(crate) async fn collect_gc_wasm_blob_roots<S, C>(
-    store: &S,
+pub(crate) async fn collect_gc_wasm_blob_roots<O, C>(
+    owner: &O,
     controls: &[(String, C)],
     retained_commits: &BTreeSet<CommitId>,
 ) -> Result<BTreeSet<BlobId>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    O: StorageAdapterRead + ?Sized,
 {
+    let facade = crate::forktree::ForkTreeReadFacade::from_retained_read(owner);
     let mut roots = BTreeSet::new();
     for (branch_id, _) in controls {
         for untracked in [None, Some(true)] {
-            let rows = scan_forktree_branch(
-                store,
+            let view: crate::forktree::CoherentView<_> = facade.branch(branch_id).await?;
+            let rows = scan_forktree_view(
+                &view,
                 &LiveStateScanRequest {
                     filter: LiveStateFilter {
                         schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
@@ -524,7 +544,37 @@ where
     }
 
     for commit_id in retained_commits {
-        let registry = load_plugin_registry_at_commit(store, &commit_id.to_string()).await?;
+        let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: KEY_VALUE_SCHEMA_KEY,
+            entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
+            file_id: None,
+        });
+        let value = facade
+            .load_state_value_at_commit(*commit_id, &key, true)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("retained plugin registry is missing at commit '{commit_id}'"),
+                )
+            })?;
+        let snapshot = match value.0.cell {
+            crate::forktree::StateCell::Value(value) => {
+                Some(serde_json::from_str(value.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("historical plugin registry snapshot is invalid JSON: {error}"),
+                    )
+                })?)
+            }
+            crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("retained plugin registry is deleted at commit '{commit_id}'"),
+                ));
+            }
+        };
+        let registry = PluginRegistry::from_optional_snapshot(snapshot.as_ref())?;
         extend_registry_wasm_roots(&registry, &mut roots)?;
     }
     Ok(roots)
@@ -1245,7 +1295,7 @@ mod tests {
                     serde_json::to_string(&content).expect("plugin content type should serialize");
                 format!(r#","content":{value}"#)
             })
-            .unwrap_or_default();
+            .unwrap_or_else(String::new);
         format!(
             r#"{{
                 "schemas":["schema/default.json"],
