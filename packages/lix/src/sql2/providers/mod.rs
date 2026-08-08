@@ -7,6 +7,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::LixError;
 use crate::branch::BranchRefReader;
+use crate::commit_graph::CommitGraphReader;
 
 mod branch;
 mod change;
@@ -33,10 +34,66 @@ mod working_diff;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
-use crate::sql2::{SqlExecutionContext, SqlWriteContext};
+use crate::sql2::{SqlChangelogQuerySource, SqlExecutionContext, SqlWriteContext};
 
 use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::TableSource;
+
+pub(crate) type SharedCommitGraph = Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>;
+
+struct SharedCommitGraphReader {
+    inner: SharedCommitGraph,
+}
+
+#[async_trait::async_trait]
+impl CommitGraphReader for SharedCommitGraphReader {
+    async fn load_node(
+        &mut self,
+        commit_id: &crate::changelog::CommitId,
+    ) -> Result<Option<crate::commit_graph::CommitGraphNode>, LixError> {
+        self.inner.lock().await.load_node(commit_id).await
+    }
+
+    async fn reachable_nodes(
+        &mut self,
+        head_commit_id: &crate::changelog::CommitId,
+    ) -> Result<Arc<[crate::commit_graph::ReachableCommitGraphNode]>, LixError> {
+        self.inner
+            .lock()
+            .await
+            .reachable_nodes(head_commit_id)
+            .await
+    }
+
+    async fn load_commit_records(
+        &mut self,
+        commit_ids: &[crate::changelog::CommitId],
+    ) -> Result<Vec<Option<crate::changelog::CommitRecord>>, LixError> {
+        self.inner
+            .lock()
+            .await
+            .load_commit_records(commit_ids)
+            .await
+    }
+
+    async fn change_history_from_commit(
+        &mut self,
+        start_commit_id: &crate::changelog::CommitId,
+        request: &crate::commit_graph::CommitGraphChangeHistoryRequest,
+    ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
+        self.inner
+            .lock()
+            .await
+            .change_history_from_commit(start_commit_id, request)
+            .await
+    }
+}
+
+fn shared_commit_graph_reader(commit_graph: &SharedCommitGraph) -> Box<dyn CommitGraphReader> {
+    Box::new(SharedCommitGraphReader {
+        inner: Arc::clone(commit_graph),
+    })
+}
 
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
 pub(crate) use file::{
@@ -66,6 +123,8 @@ pub(crate) async fn register_read<C>(
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
+    commit_graph: SharedCommitGraph,
+    changelog_query_source: SqlChangelogQuerySource<C::ReadStore>,
     selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
@@ -86,6 +145,8 @@ where
         ctx,
         branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        changelog_query_source,
         catalog,
         ReadProviderScope::All,
         selection,
@@ -219,6 +280,8 @@ async fn register_read_from_catalog<C>(
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
+    commit_graph: SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<C::ReadStore>,
     catalog: &PublicCatalog,
     scope: ReadProviderScope,
     selection: &ProviderSelection,
@@ -244,7 +307,8 @@ where
                     | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             )
     });
-    let history_query_source = if needs_history_query_source {
+    let changelog_query_source = query_source;
+    let query_source = if needs_history_query_source {
         let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
             LixError::branch_not_found(
                 ctx.active_branch_id(),
@@ -252,12 +316,12 @@ where
                 "active branch",
             )
         })?;
-        Some(ctx.history_query_source(active_branch_commit_id))
+        Some(changelog_query_source.history_query_source(active_branch_commit_id))
     } else {
         None
     };
-    let history_query_source_for_provider = || {
-        history_query_source.clone().ok_or_else(|| {
+    let query_source_for_provider = || {
+        query_source.clone().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "selected history provider is missing its query source",
@@ -284,7 +348,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -294,7 +358,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -304,7 +368,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -314,7 +378,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -324,7 +388,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
@@ -335,7 +399,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
@@ -346,7 +410,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
@@ -357,7 +421,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    history_query_source_for_provider()?,
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
@@ -366,7 +430,7 @@ where
                 change::register_lix_change_read_provider(
                     session,
                     &surface.name,
-                    ctx.changelog_query_source(),
+                    changelog_query_source.clone(),
                 )
                 .await?;
             }
@@ -403,8 +467,8 @@ where
                 file_history::register_lix_file_history_surface(
                     session,
                     &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
+                    shared_commit_graph_reader(&commit_graph),
+                    query_source_for_provider()?,
                     ctx.blob_reader(),
                     ctx.plugin_host(),
                 )
@@ -437,8 +501,8 @@ where
                 directory_history::register_lix_directory_history_surface(
                     session,
                     &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
+                    shared_commit_graph_reader(&commit_graph),
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -461,9 +525,9 @@ where
         ctx.live_state(),
         ctx.entity_snapshot_reader(),
         Arc::clone(&branch_ref),
-        needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
+        needs_entity_history.then(|| Arc::clone(&commit_graph)),
         if needs_entity_history {
-            Some(history_query_source_for_provider()?)
+            Some(query_source_for_provider()?)
         } else {
             None
         },
@@ -494,6 +558,8 @@ pub(crate) async fn register_transaction<C>(
     read_ctx: &C,
     read_branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
+    commit_graph: SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<C::ReadStore>,
     write_ctx: SqlWriteContext,
     write_branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
@@ -511,6 +577,8 @@ where
         read_ctx,
         read_branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        query_source,
         &catalog,
         ReadProviderScope::ReadOnly,
         selection,
@@ -654,14 +722,9 @@ mod tests {
         CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
         ReachableCommitGraphNode,
     };
-    use crate::json_store::JsonStoreContext;
     use crate::live_state::{LiveStateReader, LiveStateScanRequest};
-    use crate::sql2::HistoryQuerySource;
     use crate::sql2::catalog::{
         PublicCatalog, PublicSurfaceKind, derive_entity_surface_spec_from_schema,
-    };
-    use crate::storage_adapter::{
-        Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
     };
 
     use super::{
@@ -1011,7 +1074,7 @@ mod tests {
             Some(Arc::new(tokio::sync::Mutex::new(Box::new(
                 EmptyCommitGraphReader,
             )))),
-            Some(empty_history_query_source().await),
+            Some(crate::sql2::empty_history_query_source_for_test().await),
             &catalog,
             true,
             &ProviderSelection::All,
@@ -1101,22 +1164,6 @@ mod tests {
                 provider_schema.fields(),
                 "{surface_name}"
             );
-        }
-    }
-
-    async fn empty_history_query_source()
-    -> crate::sql2::SqlHistoryQuerySource<SharedStorageAdapterRead<MemoryRead>> {
-        let storage = StorageAdapter::new(Memory::new());
-        let read_scope = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let read_scope = SharedStorageAdapterRead::new(read_scope);
-        HistoryQuerySource {
-            store: read_scope.clone(),
-            json_reader: JsonStoreContext::new().reader(read_scope.clone()),
-            forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
-            default_as_of_commit_id: CommitId::for_test_label("history-default").to_string(),
         }
     }
 

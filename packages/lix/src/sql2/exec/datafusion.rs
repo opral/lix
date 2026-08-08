@@ -3079,7 +3079,6 @@ mod tests {
     use crate::live_state::{LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::sql2::{
         ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
-        SqlHistoryQuerySource,
     };
     use crate::sql2::{
         PublicCatalog, WriteExecutorMode, WriteExecutorPath, create_write_logical_plan,
@@ -3363,20 +3362,6 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn history_query_source(
-            &self,
-            default_as_of_commit_id: String,
-        ) -> SqlHistoryQuerySource<Self::ReadStore> {
-            let storage = StorageAdapter::new(Memory::new());
-            let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
-            HistoryQuerySource {
-                store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope.clone()),
-                forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
-                default_as_of_commit_id,
-            }
-        }
-
         fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
@@ -3384,6 +3369,15 @@ mod tests {
                 json_reader: JsonStoreContext::new().reader(read_scope.clone()),
                 forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
             }
+        }
+
+        fn history_query_source(
+            &self,
+            default_as_of_commit_id: String,
+            query_source: SqlChangelogQuerySource<Self::ReadStore>,
+        ) -> HistoryQuerySource<Self::ReadStore> {
+            let _ = self;
+            query_source.history_query_source(default_as_of_commit_id)
         }
 
         fn commit_graph(&self) -> Box<dyn CommitGraphReader> {

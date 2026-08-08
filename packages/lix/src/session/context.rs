@@ -28,7 +28,7 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
+    SqlExecutionContext, SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
@@ -724,23 +724,20 @@ where
         reader
     }
 
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-    ) -> SqlHistoryQuerySource<Self::ReadStore> {
-        HistoryQuerySource {
-            store: self.read_store.clone(),
-            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
-            forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
-            default_as_of_commit_id,
-        }
-    }
-
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
             json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
             forktree_reader: crate::forktree::ForkTreeReadFacade::new(self.read_store.clone()),
         }
+    }
+
+    fn history_query_source(
+        &self,
+        default_as_of_commit_id: String,
+        query_source: SqlChangelogQuerySource<Self::ReadStore>,
+    ) -> HistoryQuerySource<Self::ReadStore> {
+        let _ = self;
+        query_source.history_query_source(default_as_of_commit_id)
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {

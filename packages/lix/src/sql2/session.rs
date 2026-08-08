@@ -72,13 +72,18 @@ where
         Some(ctx.active_branch_id().to_string()),
         active_branch_commit_id.clone(),
     );
-    providers::register_diff_function(&session, ctx.changelog_query_source());
+    let commit_graph = ctx.commit_graph();
+    let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
+    let changelog_query_source = ctx.changelog_query_source();
+    providers::register_diff_function(&session, changelog_query_source.clone());
     let provider_selection = providers::read_provider_selection(&session, statements);
     providers::register_read(
         &session,
         ctx,
         branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        changelog_query_source,
         &provider_selection,
     )
     .await?;
@@ -108,7 +113,10 @@ where
         Some(read_ctx.active_branch_id().to_string()),
         active_branch_commit_id.clone(),
     );
-    providers::register_diff_function(&session, read_ctx.changelog_query_source());
+    let commit_graph = read_ctx.commit_graph();
+    let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
+    let changelog_query_source = read_ctx.changelog_query_source();
+    providers::register_diff_function(&session, changelog_query_source.clone());
     let write_ctx = SqlWriteContext::new(write_ctx);
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
@@ -120,6 +128,8 @@ where
         read_ctx,
         read_branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        changelog_query_source,
         write_ctx,
         write_branch_ref,
         SqlWriteSessionOptions::default(),

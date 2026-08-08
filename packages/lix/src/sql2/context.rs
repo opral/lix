@@ -49,7 +49,6 @@ pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 
 #[derive(Clone)]
 pub(crate) struct HistoryQuerySource<S> {
-    pub(crate) store: S,
     pub(crate) json_reader: JsonStoreReader<S>,
     pub(crate) forktree_reader: crate::forktree::ForkTreeReadFacade<S>,
     /// Active-branch head pinned by the SQL session that owns this provider.
@@ -64,6 +63,39 @@ pub(crate) struct HistoryQuerySource<S> {
 pub(crate) struct ChangelogQuerySource<S> {
     pub(crate) json_reader: JsonStoreReader<S>,
     pub(crate) forktree_reader: crate::forktree::ForkTreeReadFacade<S>,
+}
+
+impl<S: Clone> ChangelogQuerySource<S> {
+    pub(crate) fn history_query_source(
+        &self,
+        default_as_of_commit_id: String,
+    ) -> HistoryQuerySource<S> {
+        HistoryQuerySource {
+            json_reader: self.json_reader.clone(),
+            forktree_reader: self.forktree_reader.clone(),
+            default_as_of_commit_id,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn empty_history_query_source_for_test() -> SqlHistoryQuerySource<
+    crate::storage_adapter::SharedStorageAdapterRead<crate::storage_adapter::MemoryRead>,
+> {
+    let storage =
+        crate::storage_adapter::StorageAdapter::new(crate::storage_adapter::Memory::new());
+    let read_scope = storage
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .expect("read should open");
+    let read_scope = crate::storage_adapter::SharedStorageAdapterRead::new(read_scope);
+    let changelog_query_source = ChangelogQuerySource {
+        json_reader: crate::json_store::JsonStoreContext::new().reader(read_scope.clone()),
+        forktree_reader: crate::forktree::ForkTreeReadFacade::new(read_scope),
+    };
+    changelog_query_source.history_query_source(
+        crate::changelog::CommitId::for_test_label("history-default").to_string(),
+    )
 }
 
 /// Read-only context used while executing one SQL statement.
@@ -112,11 +144,12 @@ pub(crate) trait SqlExecutionContext: Sync {
         Arc::new(UncachedFilesystemPathIndexReader::new(self.live_state()))
     }
     fn functions(&self) -> FunctionProviderHandle;
+    fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn history_query_source(
         &self,
         default_as_of_commit_id: String,
+        query_source: SqlChangelogQuerySource<Self::ReadStore>,
     ) -> SqlHistoryQuerySource<Self::ReadStore>;
-    fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
