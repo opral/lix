@@ -32,7 +32,7 @@ use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
 use super::model::{ForkTree, Update};
 use super::{
-    Backend, CountingStorage, IoStats, Layout, Parameters, begin_allocation_profile,
+    Backend, CountingStorage, IoStats, Layout, Parameters, ProcIo, begin_allocation_profile,
     directory_bytes, end_allocation_profile, physical_delta, process_cpu_nanos,
     process_resident_bytes, take_stats,
 };
@@ -589,9 +589,13 @@ async fn run_queries(
         run_semantic_oracle(context).await;
     }
     for &(query, digest, rows) in &expected.queries {
+        if parameters.rows == 10_000 {
+            let _ = execute_sql(context, query.sql(), true).await;
+        }
         for sample in 0..parameters.warmups + parameters.samples {
             let _ = take_stats(stats);
             let physical_before = counters.map(SlateDBIoCounters::snapshot);
+            let proc_before = ProcIo::read();
             let rss_before = process_resident_bytes();
             let cpu_before = process_cpu_nanos();
             begin_allocation_profile();
@@ -610,14 +614,21 @@ async fn run_queries(
             assert_eq!(common::digest(&result), digest);
             let logical = take_stats(stats);
             let physical = physical_delta(counters, physical_before);
+            let proc_io = ProcIo::read().saturating_sub(proc_before);
+            assert_eq!(logical.begin_writes, 0, "SELECT opened a write transaction");
+            assert_eq!(logical.write_batches, 0, "SELECT staged writes");
+            assert_eq!(logical.commits, 0, "SELECT committed writes");
+            assert_eq!(physical.write_objects, 0, "SELECT wrote physical objects");
+            assert_eq!(physical.write_bytes, 0, "SELECT wrote physical bytes");
             if sample >= parameters.warmups {
                 println!(
-                    "forktree_datafusion_olap,sample={},backend={},rows={},query={},wall_us={wall_us:.3},cpu_us={cpu_us:.3},alloc_bytes={alloc_bytes},alloc_calls={alloc_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},begin_reads={},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},physical_read_objects={},physical_read_bytes={},physical_write_objects={},physical_write_bytes={},logical_result_rows={},disk_bytes={}",
+                    "forktree_datafusion_olap,sample={},backend={},rows={},query={},wall_us={wall_us:.3},cpu_us={cpu_us:.3},alloc_bytes={alloc_bytes},alloc_calls={alloc_calls},rss_before_bytes={rss_before},rss_after_bytes={rss_after},begin_reads={},begin_writes={},get_calls={},get_keys={},get_values={},get_value_bytes={},scan_calls={},scan_entries={},scan_value_bytes={},write_batches={},write_puts={},write_deletes={},write_ranges={},logical_write_bytes={},commits={},physical_read_objects={},physical_read_bytes={},physical_write_objects={},physical_write_bytes={},os_read_calls={},os_read_chars={},os_read_bytes={},os_write_calls={},os_write_bytes={},logical_result_rows={},result_digest={},disk_bytes={}",
                     sample - parameters.warmups + 1,
                     parameters.backend.label(),
                     parameters.rows,
                     query.label(),
                     logical.begin_reads,
+                    logical.begin_writes,
                     logical.get_calls,
                     logical.get_keys,
                     logical.get_values,
@@ -625,11 +636,23 @@ async fn run_queries(
                     logical.scan_calls,
                     logical.scan_entries,
                     logical.scan_value_bytes,
+                    logical.write_batches,
+                    logical.write_puts,
+                    logical.write_deletes,
+                    logical.write_ranges,
+                    logical.write_bytes,
+                    logical.commits,
                     physical.read_objects,
                     physical.read_bytes,
                     physical.write_objects,
                     physical.write_bytes,
+                    proc_io.syscr,
+                    proc_io.rchar,
+                    proc_io.read_bytes,
+                    proc_io.syscw,
+                    proc_io.write_bytes,
                     result.len(),
+                    hex_digest(digest),
                     directory_bytes(path),
                 );
             }

@@ -6,6 +6,8 @@ pub const WIDE_PAYLOAD_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Query {
+    Point,
+    Range,
     NarrowScan,
     WideScan,
     Filter,
@@ -16,7 +18,9 @@ pub enum Query {
 }
 
 impl Query {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
+        Self::Point,
+        Self::Range,
         Self::NarrowScan,
         Self::WideScan,
         Self::Filter,
@@ -28,6 +32,8 @@ impl Query {
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Point => "pk_point",
+            Self::Range => "pk_range",
             Self::NarrowScan => "narrow_scan",
             Self::WideScan => "wide_scan",
             Self::Filter => "filtered_scan",
@@ -40,6 +46,12 @@ impl Query {
 
     pub const fn sql(self) -> &'static str {
         match self {
+            Self::Point => {
+                "SELECT id, score FROM forktree_olap_narrow WHERE id = '/~forktree-olap/000000123'"
+            }
+            Self::Range => {
+                "SELECT id, ordinal FROM forktree_olap_narrow WHERE id >= '/~forktree-olap/000000120' AND id < '/~forktree-olap/000000130' ORDER BY id"
+            }
             Self::NarrowScan => {
                 "SELECT id, ordinal, lane, score, active FROM forktree_olap_narrow ORDER BY ordinal"
             }
@@ -182,6 +194,16 @@ pub fn evaluate(
     dimensions: &[(i64, String)],
 ) -> Vec<Vec<Cell>> {
     match query {
+        Query::Point => narrow
+            .iter()
+            .filter(|row| row.ordinal == 123)
+            .map(|row| vec![Cell::Text(row.id.clone()), Cell::Integer(row.score)])
+            .collect(),
+        Query::Range => narrow
+            .iter()
+            .filter(|row| (120..130).contains(&row.ordinal))
+            .map(|row| vec![Cell::Text(row.id.clone()), Cell::Integer(row.ordinal)])
+            .collect(),
         Query::NarrowScan => narrow.iter().map(narrow_cells).collect(),
         Query::WideScan => wide.iter().map(wide_cells).collect(),
         Query::Filter => narrow

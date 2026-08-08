@@ -1063,6 +1063,48 @@ fn process_resident_bytes() -> u64 {
         .map_or(0, |kilobytes| kilobytes.saturating_mul(1_024))
 }
 
+#[derive(Clone, Copy, Default)]
+struct ProcIo {
+    rchar: u64,
+    syscr: u64,
+    read_bytes: u64,
+    syscw: u64,
+    write_bytes: u64,
+}
+
+impl ProcIo {
+    fn read() -> Self {
+        let mut result = Self::default();
+        if let Ok(contents) = std::fs::read_to_string("/proc/self/io") {
+            for line in contents.lines() {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let value = value.trim().parse().unwrap_or(0);
+                match name {
+                    "rchar" => result.rchar = value,
+                    "syscr" => result.syscr = value,
+                    "read_bytes" => result.read_bytes = value,
+                    "syscw" => result.syscw = value,
+                    "write_bytes" => result.write_bytes = value,
+                    _ => {}
+                }
+            }
+        }
+        result
+    }
+
+    fn saturating_sub(self, before: Self) -> Self {
+        Self {
+            rchar: self.rchar.saturating_sub(before.rchar),
+            syscr: self.syscr.saturating_sub(before.syscr),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            syscw: self.syscw.saturating_sub(before.syscw),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+        }
+    }
+}
+
 fn process_clock_ticks_per_second() -> u64 {
     std::process::Command::new("getconf")
         .arg("CLK_TCK")
