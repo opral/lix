@@ -1,0 +1,44 @@
+PASS	provenance	baseline=cd91b9b90f7f468158b4df154adbed9551eb5d60 head=cd91b9b90f7f468158b4df154adbed9551eb5d60
+PASS	path-present	packages/lix/src/session/checkpoint.rs
+PASS	path-present	packages/lix/src/sql2/providers/checkpoint.rs
+PASS	path-present	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+PASS	path-present	packages/lix/src/sql2/providers/working_diff.rs
+RED	caller-owned-reader-field	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/checkpoint.rs:register_checkpoint_provider/CheckpointSpec
+RED	no-history-store-extraction	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/checkpoint.rs:register_checkpoint_provider
+RED	caller-owned-reader-field	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/filesystem_working_diff.rs:register_filesystem_working_diff_provider/FilesystemWorkingDiffSpec
+RED	no-history-store-extraction	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/filesystem_working_diff.rs:register_filesystem_working_diff_provider
+RED	caller-owned-reader-field	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/working_diff.rs:register_working_diff_provider/WorkingDiffSpec
+RED	no-history-store-extraction	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/working_diff.rs:register_working_diff_provider
+RED	chronology-receiver-identity	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/checkpoint.rs:plan_scan method=checkpoint_history_from_head receivers=['historical']
+RED	chronology-receiver-identity	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/filesystem_working_diff.rs:plan_scan method=latest_checkpoint_for_branch receivers=['historical']
+RED	chronology-call-argument-identity	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/filesystem_working_diff.rs:plan_scan call=load_rows first_args=['historical']
+RED	chronology-receiver-identity	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/working_diff.rs:plan_scan method=latest_checkpoint_for_branch receivers=['historical']
+RED	chronology-receiver-identity	/tmp/lix-historical-correction-cd91-base/packages/lix/src/session/checkpoint.rs:create_checkpoint method=checkpoint_history_from_head receivers=['historical']
+RED	no-scoped-legacy-fallback	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/checkpoint.rs:plan_scan bad=['ForkTreeReadFacade::new']
+RED	no-scoped-legacy-fallback	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/filesystem_working_diff.rs:plan_scan bad=['ForkTreeReadFacade::new']
+RED	no-scoped-legacy-fallback	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/working_diff.rs:plan_scan bad=['ForkTreeReadFacade::new', 'BranchHeadControlContext', 'TrackedHeadContext', 'TrackedStateContext']
+RED	no-scoped-legacy-fallback	/tmp/lix-historical-correction-cd91-base/packages/lix/src/session/checkpoint.rs:create_checkpoint bad=['working_diff_at_head']
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_descriptors missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_directories missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_blobs missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_observed_descriptors missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_observed_directories missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_observed_blobs missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_plugin_state missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_plugin_owners missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:parse_file_history_observed_plugin_owners missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:load_file_history_blob_bytes missing=[]
+PASS	production-function-fields	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs:validate_file_history_materialization missing=[]
+RED	exactly-one-production-BlobRef	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs
+PASS	authenticated-production-payload	/tmp/lix-historical-correction-cd91-base/packages/lix/src/sql2/providers/file_history.rs
+PASS	production-shaped-history-fixtures	cases=11
+PASS	positive-source-fixture	/tmp/lix-historical-correction-v3/test-reports/forktree-historical-correction-cd91/source_negative_fixtures/valid_owner.rs
+PASS	negative-source-fixture	distinct_view.rs
+PASS	negative-source-fixture	fake_token.rs
+PASS	negative-source-fixture	fresh_read.rs
+PASS	negative-source-fixture	legacy_fallback.rs
+PASS	negative-source-fixture	wrong_call_argument.rs
+RED
+RED	structural-caller-and-materialization-gate	/tmp/lix-historical-correction-v3/test-reports/forktree-historical-correction-cd91
+RED
+exit_status=1

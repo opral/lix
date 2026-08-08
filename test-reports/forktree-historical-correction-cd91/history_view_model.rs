@@ -195,9 +195,8 @@ mod tests {
             Surface::FilesystemCheckpoint,
             Surface::WorkingDiff,
         ] {
-            let result =
-                read_surface(HistoryQuerySource::new(VIEW), VIEW, surface, valid_row())
-                    .expect("valid row");
+            let result = read_surface(HistoryQuerySource::new(VIEW), VIEW, surface, valid_row())
+                .expect("valid row");
             assert_eq!(result.row, Some(ResultRow::Value));
             assert_eq!(result.counters.retained_reads, 1);
             assert_eq!(result.counters.plans, 0);
