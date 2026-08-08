@@ -4413,7 +4413,7 @@ mod tests {
         ) -> Result<GetManyResult, StorageError> {
             let reads_branch_control = requests
                 .iter()
-                .any(|request| request.space.name == "branch.head_control.v10");
+                .any(|request| request.space.name() == "branch.head_control.v10");
             if reads_branch_control
                 && self
                     .gate
