@@ -7,8 +7,8 @@ use lix::CreateBranchOptions;
 use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
-    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, WriteOptions,
+    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError, StorageRead,
+    StorageWrite, WriteOptions,
 };
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1580,7 +1580,7 @@ impl RecordingWrite {
     fn fail_if_space_matches(&self, space: lix::storage::StorageSpace) -> Result<(), StorageError> {
         if let Some(namespace) = self.fail_write_namespace() {
             if let Some(failing) = namespace_space(&namespace) {
-                if space.id == failing {
+                if space.id() == failing {
                     return Err(forced_write_failure(&namespace));
                 }
             }
@@ -1600,7 +1600,7 @@ impl RecordingRead {
     fn fail_if_space_matches(&self, space: lix::storage::StorageSpace) -> Result<(), StorageError> {
         if let Some(namespace) = self.fail_read_namespace() {
             if let Some(failing) = namespace_space(&namespace) {
-                if space.id == failing {
+                if space.id() == failing {
                     return Err(forced_read_failure(&namespace));
                 }
             }
@@ -1616,10 +1616,10 @@ impl RecordingRead {
     }
 }
 
-fn namespace_space(namespace: &str) -> Option<SpaceId> {
+fn namespace_space(namespace: &str) -> Option<u32> {
     match namespace {
-        "changelog.commit" => Some(SpaceId(0x0006_0001)),
-        "changelog.change" => Some(SpaceId(0x0006_0002)),
+        "changelog.commit" => Some(0x0006_0001),
+        "changelog.change" => Some(0x0006_0002),
         _ => None,
     }
 }

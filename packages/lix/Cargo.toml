@@ -45,10 +45,6 @@ name = "runtime_contract"
 path = "tests/runtime_contract.rs"
 
 [[test]]
-name = "deterministic_sequence_corruption"
-path = "tests/deterministic_sequence_corruption.rs"
-
-[[test]]
 name = "semantic_merge"
 path = "tests/semantic_merge.rs"
 

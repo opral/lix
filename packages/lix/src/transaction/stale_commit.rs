@@ -185,8 +185,8 @@ mod tests {
             SchemaPlanId::for_test(0),
             PreparedRowFacts::default(),
             EntityPk::single("row-a"),
-            "plugin_entity".to_owned(),
-            Some("file-a".to_owned()),
+            "plugin_entity".to_owned().into(),
+            Some("file-a".to_owned().into()),
             None,
             None,
             None,
@@ -198,7 +198,7 @@ mod tests {
             false,
             None,
             false,
-            "main".to_owned(),
+            "main".to_owned().into(),
         );
         let prepared = PreparedWriteSet {
             state_rows,
