@@ -24,13 +24,17 @@ crates and never edits this repository.
 * `negative_binary_cas_owner.rs` imports the real public storage/read surface
   and must fail with the expected missing `load_binary_cas_manifest`
   diagnostic; the deleted binary-CAS owner is not a consumer API.
+* `negative_legacy_owner.rs` imports the real public storage/read surface and
+  must fail with the expected missing `load_branch_head_control` diagnostic;
+  selector/legacy owner APIs are not consumer APIs.
 * `negative_native_exports.ts` imports the actual JS SDK `LocalFilesystem` and
   `LixBinding` declarations and must fail when removed filesystem members are
   named. It does not declare those members itself.
 
 The negative probes are source/compile-fail assertions, not compatibility
 shims. The runner validates both the expected diagnostic code and the
-attempted removed symbol, so an unrelated nonzero exit is not a pass. A
+attempted removed symbol, including `TS2339` and removed JS/native member
+tokens for the TypeScript probe, so an unrelated nonzero exit is not a pass. A
 candidate that makes one compile, or emits a different diagnostic, is
 rejected. Native registration is checked by the runner and full-workspace residue verifier over the actual
 `packages/js-sdk/native/napi.rs` source and by the negative TypeScript probe;

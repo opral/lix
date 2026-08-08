@@ -1,12 +1,23 @@
 # ForkTree W0 storage-boundary correction oracle
 
-Status: TEST/REPORT-ONLY. This direct successor is based on the immutable W0
-correction `4abf60b0115c114d3e3784fb0fb8a9ea2e559dfc` (tree
-`30aaecc6a2bff719c44499ad933a42437e42c2da`), whose original blocked anchor is
-`465786fccbf55decd92e169d646670e3351d077a` (tree
+Status: TEST/REPORT-ONLY. This direct v3 successor is based on the exact
+current v2 object `dc4323d56be98237c54099c67d46bfc0e3b2ef63` (tree
+`4b78165712947bc8e3b953a698e3494a15532226`), whose parent is the immutable W0
+correction `4abf60b0115c114d3e3784fb0fb8a9ea2e559dfc`. The original blocked
+anchor is `465786fccbf55decd92e169d646670e3351d077a` (tree
 `0f553a521c91983e6d0ea1db98bc7397793aa449`). It changes only benchmark tests,
 probes, reports, and verifier scripts. It does not change production source,
 start an adapter, add a compatibility path, or open a PR.
+
+## v2 provenance reconciliation
+
+The exact remote query returned v2 as `dc4323d56be98237c54099c67d46bfc0e3b2ef63`.
+R1's `be4154b103216fc99cd106bc0d676c6a5c759247` is a distinct sibling object:
+both have parent `4abf60b0115c114d3e3784fb0fb8a9ea2e559dfc`, but their trees are
+`4b78165712947bc8e3b953a698e3494a15532226` and
+`4a8ff2ba25385ba16d9674c60e4fbbee31fae12c`, respectively. Their merge base is
+exactly `4abf60b0115c114d3e3784fb0fb8a9ea2e559dfc`; R1's object is not the
+current v2 remote ref, and v2 was not rewritten during this reconciliation.
 
 ## Contract being frozen
 
@@ -55,9 +66,10 @@ This successor corrects those gaps:
 * `negative_native_exports.ts` imports `LocalFilesystem` and `LixBinding` from
   the actual `packages/js-sdk/src` sources. It does not declare the removed
   properties or methods. The runner separately scans the actual N-API Rust
-  registration for the old exports.
+  registration for the old exports and requires `TS2339` plus removed-member
+  diagnostic tokens from `tsc`.
 * `forktree_w0_compile_probes.sh` runs an actual package compile-pass gate,
-  an actual positive descriptor crate, four external Rust compile-fail probes,
+  an actual positive descriptor crate, five external Rust compile-fail probes,
   the real TypeScript negative probe, and the native-export absence check. A
   future candidate must make the positive gates pass and the forbidden API
   gates fail with the expected compiler diagnostic code and symbol token; an
@@ -86,7 +98,9 @@ not a claim about an adapter. It now has six executable tests:
 The model intentionally uses a deterministic identity stand-in and makes no
 cryptographic claim. Future production qualification must use the real
 authenticated objects and separate Memory, RocksDB, and SlateDB lifecycle
-oracles only after the production crate compiles.
+oracles only after the production crate compiles. The v3 model additionally
+calls `reopen(wrong_domain_id, ...)` with the complete wrong-domain bytes and
+requires `WrongDomain`, distinct from the `open_view` wrong-domain controls.
 
 ## Exact gates
 
@@ -138,15 +152,15 @@ diagnostic and fixes the required `SpaceId(u32)` declaration allowance; it does
 not hide any production residue:
 
 ```text
-598 scanned source files / 606 tracked source files
+598 scanned source files / 607 tracked source files
 995 lines, 130025 bytes
-SHA-256 6e054be650935553b8efc894c38afd5158e0416fb3cc58fe2681f029602d4749
+SHA-256 c517336db118100dc1ae6689d4a0f6595949d5d85b4d50ea819cfa818ea9823c
 exit 1; missing retained boundary none; structural findings 0; residues 955
 ```
 
 The hash above is for the exact detached review root
 `/tmp/lix-w0-correction-v2`; the scanner's first line includes its root path.
-The canonical count/result is therefore the 606 tracked / 598 scanned source
+The canonical count/result is therefore the 607 tracked / 598 scanned source
 files and 955-residue RED outcome, with the recorded root-bound hash preserved
 for replay.
 
@@ -157,7 +171,7 @@ cut, not a claim that this test-only successor should delete production code.
 The corrected model compiles and passes 6/6 with no warnings:
 
 ```text
-binary SHA-256 e33005d7653e17a1d8acbf13c323ba195ebbe7fad7b66cd8afec800cd0b9985e
+binary SHA-256 d2955ecca3d9f66b9eff72950bf688e9b462581de2205783a17ad0d5e86adfe8
 run log SHA-256 d63dc63486f4cef75e6bb0625ce70adb7bf3ab366e9dfca9f7ed51e9333e603f
 ```
 
@@ -165,9 +179,9 @@ The executable probe runner is wired against the exact blocked source with
 per-probe diagnostic validation. Each negative Rust probe now requires its
 expected error code and the attempted removed symbol in the captured log;
 the raw-space probe additionally retains the `SpaceId` constructor error. The
-four probes are `raw_space`, `columnar_owner`, `tracked_changelog`, and
-`binary_cas_owner`; the tracked/changelog probe asserts all three removed
-reader/selector symbols. A full rerun was deliberately not
+five probes are `raw_space`, `columnar_owner`, `tracked_changelog`,
+`binary_cas_owner`, and `legacy_owner`; the tracked/changelog and dedicated
+legacy probes assert the removed reader/selector symbols. A full rerun was deliberately not
 claimed after the review host hit the inherited compile frontier: the bounded
 attempt was stopped before completion and is non-evidence, not a candidate
 acceptance result. An earlier partial attempt used pre-final five-probe

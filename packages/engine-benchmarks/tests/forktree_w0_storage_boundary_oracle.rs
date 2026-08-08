@@ -334,6 +334,10 @@ fn w0_reopen_root_identity_domain_and_missing_cases_fail_closed() {
         adapter.reopen(root_id, b"torn-root"),
         Err(Error::CorruptObject)
     );
+    assert_eq!(
+        adapter.reopen(wrong_domain_id, b"not-root"),
+        Err(Error::WrongDomain)
+    );
     adapter.tamper_object(root_id, b"mutated-root");
     assert_eq!(
         adapter.open_view(root_id, ObjectDomain::RepositoryRoot),

@@ -94,7 +94,7 @@ run_failure rust-negative-columnar-owner E0599 load_columnar_row_group \
   env CARGO_TARGET_DIR="$TARGET/cargo-negative-columnar-owner" \
   cargo check --manifest-path "$(make_probe_crate negative_columnar_owner "$PROBES/negative_columnar_owner.rs")" --quiet
 
-run_failure rust-negative-tracked-changelog E0599 load_commit_state_manifest,load_tracked_state,load_branch_head_control \
+run_failure rust-negative-tracked-changelog E0599 load_commit_state_manifest,load_tracked_state \
   env CARGO_TARGET_DIR="$TARGET/cargo-negative-tracked-changelog" \
   cargo check --manifest-path "$(make_probe_crate negative_tracked_changelog "$PROBES/negative_tracked_changelog.rs")" --quiet
 
@@ -102,12 +102,16 @@ run_failure rust-negative-binary-cas-owner E0599 load_binary_cas_manifest \
   env CARGO_TARGET_DIR="$TARGET/cargo-negative-binary-cas-owner" \
   cargo check --manifest-path "$(make_probe_crate negative_binary_cas_owner "$PROBES/negative_binary_cas_owner.rs")" --quiet
 
+run_failure rust-negative-legacy-owner E0599 load_branch_head_control \
+  env CARGO_TARGET_DIR="$TARGET/cargo-negative-legacy-owner" \
+  cargo check --manifest-path "$(make_probe_crate negative_legacy_owner "$PROBES/negative_legacy_owner.rs")" --quiet
+
 TSC_BIN=${TSC:-$(command -v tsc || true)}
 if [[ -z "$TSC_BIN" ]]; then
   echo "PROBE ts-native UNAVAILABLE: tsc not found"
   status=1
 else
-  run_failure ts-native \
+  run_failure ts-native TS2339 syncAllFiles,importFilesystemPaths,syncDiskToLix,lixDir \
     "$TSC_BIN" --noEmit --strict --module NodeNext --moduleResolution NodeNext \
     --target ES2024 --skipLibCheck "$PROBES/negative_native_exports.ts"
 fi
