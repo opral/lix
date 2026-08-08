@@ -1162,9 +1162,11 @@ where
                     Arc::new(self.live_state.reader(read_store.clone()));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-                let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> = Arc::new(
-                    crate::forktree::blob_reader_on_read(read_store, &active_branch_id)?,
-                );
+                let authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader> =
+                    Arc::new(crate::forktree::blob_reader_on_read(
+                        read_store.clone(),
+                        &active_branch_id,
+                    )?);
                 // A raw file download delivers the same bytes as a direct
                 // `lix_file.content` read, so it must acknowledge rendered
                 // plugin state for subsequent collaborative writes.
@@ -1174,7 +1176,7 @@ where
                     live_state,
                     filesystem_path_index,
                     branch_ref,
-                    blob_reader,
+                    authenticated_blob_reader,
                     self.plugin_host.clone(),
                     Some(file_view_collector.clone()),
                     plugin_cache_snapshot,
@@ -2335,7 +2337,13 @@ where
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                     let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                        Arc::new(self.binary_cas.reader(read_store));
+                        Arc::new(self.binary_cas.reader(read_store.clone()));
+                    let authenticated_blob_reader: Arc<
+                        dyn crate::forktree::AuthenticatedBlobReader,
+                    > = Arc::new(crate::forktree::blob_reader_on_read(
+                        read_store.clone(),
+                        &active_branch_id,
+                    )?);
                     match exact_filesystem_read {
                         ExactFilesystemRead::Point(selector, column) => {
                             sql2::execute_exact_lix_file_read(
@@ -2357,7 +2365,7 @@ where
                                 live_state,
                                 filesystem_path_index,
                                 branch_ref,
-                                blob_reader,
+                                authenticated_blob_reader,
                                 self.plugin_host.clone(),
                                 file_view_collector.clone(),
                                 None,
@@ -2444,15 +2452,18 @@ where
                 Arc::new(self.live_state.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-            let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                Arc::new(self.binary_cas.reader(read_store));
+            let authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader> =
+                Arc::new(crate::forktree::blob_reader_on_read(
+                    read_store.clone(),
+                    &active_branch_id,
+                )?);
             let mut materialized = query.query.into_sql_query_result()?;
             hydrate_lix_file_content_result(
                 &active_branch_id,
                 Arc::clone(&live_state),
                 filesystem_path_index,
                 branch_ref,
-                blob_reader,
+                authenticated_blob_reader,
                 self.plugin_host.clone(),
                 file_view_collector.clone(),
                 &mut materialized,
@@ -2684,7 +2695,7 @@ async fn hydrate_lix_file_content_result(
     live_state: Arc<dyn crate::live_state::LiveStateReader>,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: crate::plugin::PluginRuntimeHost,
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
@@ -2709,7 +2720,7 @@ async fn hydrate_lix_file_content_result(
         live_state,
         filesystem_path_index,
         branch_ref,
-        blob_reader,
+        authenticated_blob_reader,
         plugin_host,
         session_file_views,
         None,

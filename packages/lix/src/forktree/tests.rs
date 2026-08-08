@@ -11,7 +11,9 @@ use crate::storage::{
     KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage,
     StorageError, StorageRead, StorageWrite, WriteOptions,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope, StorageWriteSet};
+use crate::storage_adapter::{
+    SharedStorageAdapterRead, StorageAdapterRead, StorageAdapterReadScope, StorageWriteSet,
+};
 
 use super::model::{
     GcProgressSelectorV2, GcProgressV2, branch_selector_key, gc_progress_selector_key,
@@ -2724,6 +2726,138 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     assert!(!object_present(&storage, upload.progress_id).await);
     assert!(object_present(&storage, manifest_id).await);
     assert!(object_present(&storage, upload.chunk_id).await);
+}
+
+#[tokio::test]
+async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("duplicate-owner view");
+
+    let valid_payload = b"aaaa";
+    let wrong_payload = b"bbbb";
+    let semantic_id = crate::binary_cas::BlobId::from_content(valid_payload);
+    let valid_chunk = BlobChunkV1 {
+        bytes: Bytes::copy_from_slice(valid_payload),
+    };
+    let wrong_chunk = BlobChunkV1 {
+        bytes: Bytes::copy_from_slice(wrong_payload),
+    };
+    let (valid_chunk_id, _) = valid_chunk.encode().expect("valid duplicate chunk");
+    let (wrong_chunk_id, _) = wrong_chunk.encode().expect("wrong duplicate chunk");
+    let valid_manifest = BlobManifestV1 {
+        logical_bytes: valid_payload.len() as u64,
+        ordered_chunks: vec![BlobChunkRefV1 {
+            chunk_object_id: valid_chunk_id,
+            declared_len: valid_payload.len() as u64,
+        }],
+        canonical_blob_id: semantic_id,
+        content_digest: *blake3::hash(valid_payload).as_bytes(),
+    };
+    let wrong_manifest = BlobManifestV1 {
+        logical_bytes: wrong_payload.len() as u64,
+        ordered_chunks: vec![BlobChunkRefV1 {
+            chunk_object_id: wrong_chunk_id,
+            declared_len: wrong_payload.len() as u64,
+        }],
+        // This is the exact duplicate-owner trap: the wrong row claims the
+        // same semantic ID while pointing at different authenticated bytes.
+        canonical_blob_id: semantic_id,
+        content_digest: *blake3::hash(wrong_payload).as_bytes(),
+    };
+    let (valid_manifest_id, _) = valid_manifest.encode().expect("valid duplicate manifest");
+    let (wrong_manifest_id, _) = wrong_manifest.encode().expect("wrong duplicate manifest");
+    let (wrong_key, wrong_value) = blob_ref_state_entry(
+        "duplicate-a-wrong",
+        semantic_id,
+        valid_payload.len() as u64,
+        0x70,
+        wrong_manifest_id,
+    );
+    let (valid_key, valid_value) = blob_ref_state_entry(
+        "duplicate-b-valid",
+        semantic_id,
+        valid_payload.len() as u64,
+        0x70,
+        valid_manifest_id,
+    );
+    let mut mutations = vec![
+        StateTreeMutation::insert(wrong_key, wrong_value),
+        StateTreeMutation::insert(valid_key.clone(), valid_value),
+    ];
+    mutations.sort_by(|left, right| {
+        let left_key: &[u8] = match left {
+            StateTreeMutation::Insert { key, .. }
+            | StateTreeMutation::Update { key, .. }
+            | StateTreeMutation::Remove { key } => key,
+        };
+        let right_key: &[u8] = match right {
+            StateTreeMutation::Insert { key, .. }
+            | StateTreeMutation::Update { key, .. }
+            | StateTreeMutation::Remove { key } => key,
+        };
+        left_key.cmp(right_key)
+    });
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        mutations,
+        view.storage_read(),
+    )
+    .await
+    .expect("duplicate-owner state edit");
+    let transition = branch_transition(&view, state_edit, 0x70).await;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    publication
+        .stage_blob_chunk(&valid_chunk)
+        .expect("stage valid duplicate chunk");
+    publication
+        .stage_blob_chunk(&wrong_chunk)
+        .expect("stage wrong duplicate chunk");
+    publication
+        .stage_blob_manifest(&valid_manifest)
+        .expect("stage valid duplicate manifest");
+    publication
+        .stage_blob_manifest(&wrong_manifest)
+        .expect("stage wrong duplicate manifest");
+    publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("publish duplicate-owner state");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("commit duplicate-owner state");
+
+    let reader = super::blob_reader_on_read(
+        SharedStorageAdapterRead::new(StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("duplicate-owner read"),
+        )),
+        &uuid::Uuid::from_bytes(*seed.branch_id.as_bytes()).to_string(),
+    )
+    .expect("duplicate-owner reader");
+    let selected_key = super::decode_state_key(&valid_key).expect("selected valid state key");
+    let ranges = reader
+        .load_ranges_for_state_keys(&[(selected_key.clone(), 0..1), (selected_key.clone(), 1..2)])
+        .await
+        .expect("selected duplicate-owner ranges")
+        .into_vec();
+    assert_eq!(ranges.len(), 2, "duplicate request slots must be preserved");
+    assert_eq!(ranges[0].as_ref().expect("first range").bytes, b"a");
+    assert_eq!(ranges[1].as_ref().expect("second range").bytes, b"a");
+    assert_eq!(
+        reader
+            .load_bytes_for_state_keys(&[selected_key])
+            .await
+            .expect("selected duplicate-owner full read")
+            .into_vec(),
+        vec![Some(valid_payload.to_vec())]
+    );
 }
 
 async fn publish_untracked_manifest(
