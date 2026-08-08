@@ -1,8 +1,9 @@
 # Dormant first-runnable readiness commands
 
-These are recipes only. They were not run for this report-only package. Each
-cell is independently isolated and hard-capped at 1200 seconds; stop on the
-first compile, source, semantic, corruption, or authority failure.
+These are recipes only. Cargo and adapter commands remain unrun for this
+report-only package. Each cell is independently isolated and hard-capped at
+1200 seconds; stop on the first compile, source, semantic, corruption, or
+authority failure.
 
 ## Static gates
 
@@ -35,9 +36,9 @@ rustc --edition=2021 --test -D warnings \
 /tmp/branch-ref-selector-readiness-model --nocapture --test-threads=1
 ```
 
-The package records the source identity but makes no model compile/runtime
-claim until a separately authorized review runs this command. The model is
-warnings-denied and its seven tests cover one-read/one-commit authority,
+The package records a standalone warnings-denied model compile/run and makes
+no production or adapter runtime claim. The model's seven tests cover
+one-read/one-commit authority,
 create/switch/advance/delete/retire/cold reopen, stale versus unrelated
 owners, malformed key/root/cycle/epoch, no fallback/dual authority, retained
 view GC, and empty undo/redo no-ops.

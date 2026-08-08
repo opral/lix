@@ -114,12 +114,14 @@ projection paths (or test/benchmark packages). Thus the gate cannot report
 GREEN while BranchRef/BranchHeadControl, old spaces, readers, caches,
 fallbacks, non-derived projections, or a second authority remain.
 
-The source gate includes one positive publication fixture and four
-discriminating negatives: mismatched read, fresh read, dual authority, and
-fallback. The fixtures require the same operation-owned read in both prepared
-publication and CAS; forbidden ownership/read patterns must be rejected. The
-standalone Rust model supplies the lifecycle, stale/unrelated-owner,
-cold-reopen, retained-root, corruption, and zero-write controls.
+The source gate compiles and runs one warnings-denied Rust fixture containing a
+positive publication and four executable discriminators: mismatched read,
+fresh read, dual authority, and fallback. It requires the same
+operation-owned read in both prepared publication and CAS; forbidden
+ownership/read patterns are exercised as typed failures rather than accepted
+by source-text token counts. The standalone Rust model supplies the
+lifecycle, stale/unrelated-owner, cold-reopen, retained-root, corruption, and
+zero-write controls.
 
 ## e1af source RED calibration
 
@@ -138,11 +140,11 @@ Expected exit status is 1. The exact e1af/e1af calibration is recorded in
 
 ~~~text
 legacy.branch_head_control 80
-legacy.branch_head_cache 25
+legacy.branch_head_cache 45
 legacy.branch_ref_reader 196
 legacy.branch_ref_stage 38
 legacy.mutation_revision 48
-legacy.tracked_generation 47
+legacy.tracked_generation 48
 ~~~
 
 The gate prints RED because old control/generation, mutation/revision,

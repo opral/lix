@@ -65,3 +65,14 @@ not production or adapter runtime evidence:
 binary SHA-256 04c749d9d90f8134a791e8b095e8adcf5f3b153b9e324ec8cf44682b0a891f57
 log SHA-256    ff7ec3a355b21a730a261525c30f223bd7dc4ab2c7410cda88da39dee0ea9789
 ~~~
+
+The candidate-aware gate also compiles and runs the five-test selector
+fixture with `-D warnings`; this replaces the old uncompiled source snippets
+and is not a production/runtime claim:
+
+~~~text
+source SHA-256  b0155133ee0abcb3ca14b74befb1e266ac083ed76539b796c7f559f1039d5356
+binary SHA-256  5c35b9813baa76f151f2ad0570554e0d58250a8e664218779e71ed275ec777e6
+log SHA-256     0515dc138bd33d334c539f21556f18d9be74ad6c5666ac247f50376bd515e569
+result          5/5 PASS
+~~~

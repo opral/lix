@@ -1,5 +1,5 @@
 {
-  "kind": "test-report-only-branch-ref-production-readiness-candidate-aware-v2",
+  "kind": "test-report-only-branch-ref-production-readiness-candidate-aware-v3",
   "status": "dormant-until-source-and-compile-green",
   "production_anchor": {
     "commit": "e1af471b9ab0f598dafa7c2ddec7867667c81740",
@@ -22,6 +22,24 @@
     "identity_inputs": "explicit base and candidate roots/commits; no hardcoded e1af candidate",
     "normalized_delta": "per selector-specific legacy category, candidate minus base; positive or nonzero candidate is RED",
     "green_requires_zero_legacy_closure": true,
+    "production_changed_path_allowlist": [
+      "packages/lix/src/forktree/",
+      "packages/lix/src/schema/builtin/lix_branch_ref.json",
+      "packages/lix/src/schema/builtin/lix_branch_descriptor.json",
+      "packages/lix/src/schema/builtin/mod.rs",
+      "packages/lix/src/sql2/bind/table.rs",
+      "packages/lix/src/sql2/catalog/registry.rs",
+      "packages/lix/src/sql2/catalog/entity_surface.rs",
+      "packages/lix/src/sql2/read_only.rs",
+      "packages/lix/src/engine.rs"
+    ],
+    "test_report_changed_path_allowlist": [
+      "test-report/branch-ref-production-readiness-e1af/",
+      "test-report/forktree-w3-e1af-selector-rebind/"
+    ],
+    "whole_workspace_scan_roots": ["packages", "plugins", "crates", "src"],
+    "approved_v4_report_path": "fixtures/approved_v4_report.md",
+    "approved_v4_report_sha256": "3cca3a49a4578720dfac22b59e2412916fa90a73cecdf5c9aa5daaa4d4aedec4",
     "required_owner_symbols": [
       "GlobalSelectorV1",
       "BranchSelectorV1",
@@ -32,13 +50,8 @@
       "global_selector_key",
       "branch_selector_key"
     ],
-    "fixtures": [
-      "positive_selector_publication.rs",
-      "negative_mismatched_read.rs",
-      "negative_fresh_read.rs",
-      "negative_dual_authority.rs",
-      "negative_fallback.rs"
-    ],
+    "fixtures": ["fixtures/selector_readiness_fixtures.rs", "fixtures/approved_v4_report.md"],
+    "fixture_command": "rustc --edition=2021 --test -D warnings fixtures/selector_readiness_fixtures.rs -o <tmp>; <tmp> --exact --test-threads=1",
     "model_tests": 7
   },
   "source_calibration": {
@@ -84,6 +97,15 @@
     "calibration": "7/7 PASS",
     "binary_sha256": "04c749d9d90f8134a791e8b095e8adcf5f3b153b9e324ec8cf44682b0a891f57",
     "log_sha256": "ff7ec3a355b21a730a261525c30f223bd7dc4ab2c7410cda88da39dee0ea9789"
+  },
+  "compiled_fixture": {
+    "source_path": "fixtures/selector_readiness_fixtures.rs",
+    "source_sha256": "b0155133ee0abcb3ca14b74befb1e266ac083ed76539b796c7f559f1039d5356",
+    "binary_sha256": "5c35b9813baa76f151f2ad0570554e0d58250a8e664218779e71ed275ec777e6",
+    "log_sha256": "0515dc138bd33d334c539f21556f18d9be74ad6c5666ac247f50376bd515e569",
+    "tests": 5,
+    "warnings_denied": true,
+    "command": "rustc --edition=2021 --test -D warnings fixtures/selector_readiness_fixtures.rs -o <tmp>; <tmp> --exact --test-threads=1"
   },
   "runtime_claimed": false,
   "production_changes": false

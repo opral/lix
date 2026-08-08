@@ -13,12 +13,14 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 
 V4_HEAD = "32200a21f4cb7a77276ff619179b2c05687ffd2a"
 V4_TREE = "5eef6528fcde96417c0303d3c1df78c48e257ffb"
 V4_REPORT_SHA = "3cca3a49a4578720dfac22b59e2412916fa90a73cecdf5c9aa5daaa4d4aedec4"
 FIXTURE_DIR = pathlib.Path(__file__).with_name("fixtures")
+V4_REPORT_PATH = FIXTURE_DIR / "approved_v4_report.md"
 
 LEGACY_PATTERNS: dict[str, str] = {
     "branch_head_control": r"BranchHeadControl|BranchHeadControlContext|BranchHeadTrackedReachability",
@@ -52,8 +54,23 @@ REQUIRED_OWNERS = (
     "from_branch_view",
     "from_global_epoch",
 )
+AUTHORIZED_PRODUCTION_PREFIXES = (
+    "packages/lix/src/forktree/",
+    "packages/lix/src/schema/builtin/lix_branch_ref.json",
+    "packages/lix/src/schema/builtin/lix_branch_descriptor.json",
+    "packages/lix/src/schema/builtin/mod.rs",
+    "packages/lix/src/sql2/bind/table.rs",
+    "packages/lix/src/sql2/catalog/registry.rs",
+    "packages/lix/src/sql2/catalog/entity_surface.rs",
+    "packages/lix/src/sql2/read_only.rs",
+    "packages/lix/src/engine.rs",
+)
 V4_MODEL_RESULT = (
     "packages/lix/tests/branch_ref_whole_closure_oracle_b59/SOURCE_GATE_RESULT.md"
+)
+REPORT_ALLOWED_PREFIXES = (
+    "test-report/branch-ref-production-readiness-e1af/",
+    "test-report/forktree-w3-e1af-selector-rebind/",
 )
 
 
@@ -83,6 +100,7 @@ def verify_identity(root: pathlib.Path, commit: str, label: str) -> str:
 
 
 ORACLE_PATHSPEC = ":(exclude)packages/lix/tests/branch_ref_whole_closure_oracle_b59/**"
+WORKSPACE_PATHS = ("packages", "plugins", "crates", "src")
 
 
 def grep_lines(root: pathlib.Path, commit: str, pattern: str) -> list[str]:
@@ -97,7 +115,7 @@ def grep_lines(root: pathlib.Path, commit: str, pattern: str) -> list[str]:
             pattern,
             commit,
             "--",
-            "packages",
+            *WORKSPACE_PATHS,
             ORACLE_PATHSPEC,
         ],
         check=False,
@@ -127,7 +145,7 @@ DERIVED_ONLY_PATHS = {
 
 def code_paths(root: pathlib.Path, commit: str) -> list[str]:
     result = subprocess.run(
-        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", commit, "--", "packages"],
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", commit],
         check=False,
         capture_output=True,
         text=True,
@@ -138,7 +156,8 @@ def code_paths(root: pathlib.Path, commit: str) -> list[str]:
     return [
         path
         for path in result.stdout.splitlines()
-        if path.endswith(suffixes)
+        if path.startswith(tuple(f"{prefix}/" for prefix in WORKSPACE_PATHS))
+        and path.endswith(suffixes)
         and not path.startswith("packages/lix/tests/branch_ref_whole_closure_oracle_b59/")
     ]
 
@@ -175,45 +194,92 @@ def file_text(root: pathlib.Path, commit: str, path: str) -> str:
     return result.stdout
 
 
-def fixture_errors(text: str) -> list[str]:
+def run_compiled_fixtures() -> list[str]:
     errors: list[str] = []
-    if text.count("PreparedPublication::from_branch_view") != 1:
-        errors.append("must contain exactly one PreparedPublication::from_branch_view")
-    if not re.search(
-        r"PreparedPublication::from_branch_view\(\s*read\s*,\s*view\s*,\s*next_root\s*\)",
-        text,
-    ):
-        errors.append("publication does not receive the operation-owned read and view")
-    if not re.search(r"compare_and_swap\(\s*read\s*,\s*prepared\s*\)", text):
-        errors.append("publication CAS does not receive the same operation-owned read")
-    if text.count("begin_read"):
-        errors.append("fixture acquires a fresh read")
-    if re.search(r"BranchHeadControl|BranchRefReader|fallback|other_read|second_authority", text):
-        errors.append("fixture contains a legacy/fallback/mismatched authority")
+    fixture = FIXTURE_DIR / "selector_readiness_fixtures.rs"
+    if not fixture.is_file():
+        return ["missing compiled selector fixture"]
+    with tempfile.TemporaryDirectory(prefix="branch-ref-fixture-") as directory:
+        binary = pathlib.Path(directory) / "selector-fixtures"
+        compile_result = subprocess.run(
+            [
+                "rustc",
+                "--edition=2021",
+                "--test",
+                "-D",
+                "warnings",
+                str(fixture),
+                "-o",
+                str(binary),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if compile_result.returncode != 0:
+            return [f"compiled fixture failed to compile: {compile_result.stderr.strip()}"]
+        run_result = subprocess.run(
+            [str(binary), "--exact", "--test-threads=1"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if run_result.returncode != 0:
+            errors.append(f"compiled fixture failed: {run_result.stdout}{run_result.stderr}")
     return errors
 
 
-def run_fixtures() -> list[str]:
-    errors: list[str] = []
-    positive = FIXTURE_DIR / "positive_selector_publication.rs"
-    if not positive.is_file():
-        return ["missing positive selector fixture"]
-    positive_errors = fixture_errors(positive.read_text(encoding="utf-8"))
-    if positive_errors:
-        errors.extend(f"positive fixture: {error}" for error in positive_errors)
+def verify_v4_report(errors: list[str]) -> None:
+    try:
+        report_bytes = V4_REPORT_PATH.read_bytes()
+    except OSError as error:
+        errors.append(f"approved v4 report unavailable: {error}")
+        return
+    import hashlib
 
-    for name in (
-        "negative_mismatched_read.rs",
-        "negative_fresh_read.rs",
-        "negative_dual_authority.rs",
-        "negative_fallback.rs",
-    ):
-        path = FIXTURE_DIR / name
-        if not path.is_file():
-            errors.append(f"missing negative fixture: {name}")
+    actual_sha = hashlib.sha256(report_bytes).hexdigest()
+    if actual_sha != V4_REPORT_SHA:
+        errors.append(f"approved v4 report hash mismatch: {actual_sha} != {V4_REPORT_SHA}")
+    report = report_bytes.decode("utf-8")
+    for required in (V4_HEAD, V4_TREE, "15/15 model tests", "Terminal verdict: **APPROVE**"):
+        if required not in report:
+            errors.append(f"approved v4 report is missing bound bytes: {required}")
+
+
+def verify_changed_path_allowlist(root: pathlib.Path, base: str, candidate: str) -> list[str]:
+    errors: list[str] = []
+    changed = git(root, "diff", "--name-only", base, candidate)
+    for path in changed.splitlines():
+        if path.startswith(REPORT_ALLOWED_PREFIXES):
             continue
-        if not fixture_errors(path.read_text(encoding="utf-8")):
-            errors.append(f"negative fixture accepted: {name}")
+        if any(path == allowed or path.startswith(allowed) for allowed in AUTHORIZED_PRODUCTION_PREFIXES):
+            continue
+        errors.append(f"candidate path outside BranchRef/report allowlist: {path}")
+    return errors
+
+
+def verify_structural_owner_contract(source: str) -> list[str]:
+    errors: list[str] = []
+    publication_calls = list(
+        re.finditer(
+            r"PreparedPublication::from_branch_view\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*,",
+            source,
+        )
+    )
+    if len(publication_calls) != 1:
+        errors.append("expected exactly one structured PreparedPublication::from_branch_view call")
+    else:
+        read_alias, view_alias = publication_calls[0].groups()
+        if not re.search(
+            rf"compare_and_swap\(\s*{re.escape(read_alias)}\s*,\s*prepared\s*\)",
+            source,
+        ):
+            errors.append("CAS does not use the exact publication read alias")
+        if not re.search(rf"from_branch_view\(\s*{re.escape(read_alias)}\s*,\s*{re.escape(view_alias)}\s*,", source):
+            errors.append("publication view/read arguments are not structurally paired")
+    for field in ("owner", "expected_epoch", "generation", "compare_and_swap"):
+        if field not in source:
+            errors.append(f"owner/epoch/generation CAS field is absent: {field}")
     return errors
 
 
@@ -247,6 +313,8 @@ def main() -> int:
             check=False,
         ).returncode != 0:
             errors.append("candidate is not descended from the explicit base commit")
+        verify_v4_report(errors)
+        errors.extend(verify_changed_path_allowlist(candidate_root, base_commit, candidate_commit))
     except RuntimeError as error:
         print(f"SOURCE_GATE=ERROR {error}")
         return 2
@@ -284,11 +352,14 @@ def main() -> int:
             errors.append(f"legacy closure path introduced: {path}")
 
     candidate_source = source_text(candidate_root, candidate_commit)
-    for token in REQUIRED_OWNERS:
-        count = candidate_source.count(token)
-        print(f"required_owner.{token}={count}")
-        if count == 0:
-            errors.append(f"required selector owner is absent: {token}")
+    calibration = base_commit == candidate_commit
+    if calibration:
+        for token in REQUIRED_OWNERS:
+            count = candidate_source.count(token)
+            print(f"required_owner.{token}={count}")
+    else:
+        for error in verify_structural_owner_contract(candidate_source):
+            errors.append(error)
 
     candidate_projection = projection_files(candidate_root, candidate_commit)
     candidate_non_derived = non_derived_projection_files(candidate_projection)
@@ -297,7 +368,7 @@ def main() -> int:
     for path in candidate_non_derived:
         errors.append(f"lix_branch_ref is not derived-only: {path}")
 
-    for error in run_fixtures():
+    for error in run_compiled_fixtures():
         errors.append(f"fixture: {error}")
 
     if errors:
