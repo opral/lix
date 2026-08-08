@@ -59,3 +59,26 @@ DELETE	TrackedWorkingDiffEpoch/WorkingDiffIndexCoverage	All marker/coverage stat
 DELETE	CurrentStateDeltaRef/TrackedHeadDeltaRef	All delta publication/read state	Typed mutation source
 DELETE	TRACKED_WORKING_DIFF_MARKER_SPACE and stage_* helpers	All durable marker and generation helpers	One selector/epoch plane
 DELETE	with_opening_tracked_reader/load_exact_batch_via_scan_for_test	All callbacks and test-only fallback readers	One retained StorageRead
+MIGRATE/BLOCKER	packages/lix/src/checkpoint.rs	TrackedStateStoreReader parameters and replay intervals	CoherentView selected history; compiler must reject old signatures
+MIGRATE/BLOCKER	packages/lix/src/session/execute.rs	BranchHeadControlContext and commit-state manifest loads	BranchSelectorV1/CommitCatalog; unsupported cohorts fail closed
+MIGRATE/BLOCKER	packages/lix/src/branch/refs.rs	stage_branch_head_control writer	Atomic BranchSelectorV1 publication
+DELETE/REWRITE	packages/lix/src/branch/control.rs	BranchHeadControlContext/Cache owner and BRANCH_HEAD_CONTROL_SPACE	Selector/epoch owner
+DELETE/REWRITE	packages/lix/src/branch/mod.rs	Branch control exports and stage writer reexports	Selector facade only
+MIGRATE/BLOCKER	packages/lix/src/commit_graph/context.rs	Tracked-state commit manifest space/tests	CommitCatalog and authenticated topology
+MIGRATE/BLOCKER	packages/lix/src/engine.rs	Tracked-state root rebuild through commit manifest	Selected commit/state roots; fail closed until owner path exists
+MIGRATE/BLOCKER	packages/lix/src/storage_adapter/context.rs	Mutation revision loads, preconditions, and stage writers	Global epoch/CAS plane
+DELETE	packages/lix/src/storage_adapter/spaces.rs	MUTATION_REVISION_SPACE and TRACKED_MUTATION_REVISION_SPACE	Selector/epoch plane
+REWRITE	packages/lix/src/storage_adapter/write_set.rs	Remove adapter-appended mutation revision authority	One ForkTree publication write set
+MIGRATE	packages/lix/src/observe_invalidation.rs	Observe revision polling	Authenticated global epoch observation
+MIGRATE	packages/lix/src/session/context.rs	storage_mutation_revision facade implementation	Observe epoch facade; no old space
+MIGRATE/BLOCKER	packages/lix/src/functions/context.rs	BranchHeadControlContext and stage_branch_head_control	Global/branch selectors
+MIGRATE/BLOCKER	packages/lix/src/functions/state.rs	Branch control observation and stage writer	Global/branch selectors
+MIGRATE/BLOCKER	packages/lix/src/live_state/context.rs	BranchHeadControlCache and reader calls	CoherentView pair
+MIGRATE/BLOCKER	packages/lix/src/sql2/providers/working_diff.rs	BranchHeadControlContext direct diff	Selected-root diff or typed fail-closed
+MIGRATE/BLOCKER	packages/lix/src/sql2/providers/file_history.rs	TrackedStateStoreReader history callbacks	Authenticated history provider or fail-closed deletion
+MIGRATE/BLOCKER	packages/lix/src/sql2/providers/filesystem_working_diff.rs	TrackedStateStoreReader callbacks	Selected-root diff or typed fail-closed
+MIGRATE/BLOCKER	packages/lix/src/session/merge/analysis.rs	TrackedStateStoreReader merge reader	Authenticated history/provider view or fail-closed
+RETAIN-FACADE-BLOCKER	packages/lix/src/sql2/providers/entity.rs	Direct SQL/PK reader must be concrete ForkTree migration or fail-closed	Independent SQL oracle
+RETAIN-FACADE-BLOCKER	packages/lix/src/sql2/providers/entity_history.rs	History reader must be concrete owner migration or fail-closed	History provider
+RETAIN-FACADE-BLOCKER	packages/lix/src/sql2/providers/directory_history.rs	History reader must be concrete owner migration or fail-closed	History provider
+RETAIN-FACADE-BLOCKER	packages/lix/src/sql2/providers/file_history.rs	History reader must be concrete owner migration or fail-closed	History provider

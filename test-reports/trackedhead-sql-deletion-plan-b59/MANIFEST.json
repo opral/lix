@@ -13,6 +13,20 @@
     "model_binary": "5d9c6a9e5d20de07a55465ba8e267a9ec708185f46e6a4e96b7879662b6a3abf",
     "model_log": "176e4c840641415c4354591c3fd8d20169c0a8b4cb4131f6b3e6d933ac61925f"
   },
+  "oracle_v3": {
+    "commit": "33aa59975808099dfb5e9ca675a1633d713dccf3",
+    "tree": "1ced701e3351af59c48dce75731947dcd1606f3e",
+    "parent": "1d9c47728377c6ec7d2646704d51f3aadb11c773",
+    "full_index_binary_diff": "31b9374a14846f5e082d193296f6eb33255e667d5775c041a876077fc7952194",
+    "stable_patch_id": "d4d96f33fa535171d20e32e1b859ee1b58000cb7",
+    "package_sha256sums": "f54422520ea2ac7c47427d0e57f95ea6392b990e6e1861a31d6ae7848f509556"
+  },
+  "r4_correction": {
+    "head": "7ff277c297e93eba83da09bf12f83d6485a8458b",
+    "tree": "a0e6be2c9029144497b75e4f9dcd6b001d71fec9",
+    "full_index_binary_diff": "55d018ea5389898414dbf7844053c5339b316bf36652574b86983c1c8cb43b4b",
+    "stable_patch_id": "1ad9a7cc93f5386920032d3d1b1cebc8febaa43d"
+  },
   "known_followup_blocker": {
     "oracle_v3_required": true,
     "missing_domains": [
@@ -29,14 +43,20 @@
     "SOURCE_INVENTORY.tsv",
     "verify_trackedhead_sql_deletion_plan.sh",
     "CALIBRATION.md",
-    "v2-calibration.log"
+    "v2-calibration.log",
+    "COMPILER_WAVE.tsv",
+    "R4_CORRECTION.md",
+    "R4_CALIBRATION.md"
   ],
   "artifact_sha256": {
-    "PLAN.md": "5d8d20ab2a20244ed8bb72b646677104baaa38807fcf898595cc30fa5fade4b2",
-    "SOURCE_INVENTORY.tsv": "f1ee5173628f4676edd092602ec6973d4f29aa849a48f84c70bcffb48c1da11b",
-    "verify_trackedhead_sql_deletion_plan.sh": "3d00503103d05670bd5e85780c2d2661890ed5f6c21d4084b4c04ac4bf3540b1",
-    "CALIBRATION.md": "da20a356213c406625a56b91424cb22f2cea0a0955e2714b400ae7bc58937442",
-    "v2-calibration.log": "4203cfb771b58cab263c0235db69a248e08c569a80bedfc2044d1713756c0196"
+    "PLAN.md": "5fa8bf214592f42347d41ae43365d9aad7f804dfc010111bf07e79d1ee705d0c",
+    "SOURCE_INVENTORY.tsv": "ab20ea62d7bcd2225091a12611179f668d8ab3b032e51c8dbb830b4822b9bf4f",
+    "verify_trackedhead_sql_deletion_plan.sh": "0b14d1f51bf4fd2a6a53715658052b20cede87a1172420c6a59a94eb232d4fbc",
+    "CALIBRATION.md": "feceae4a2233165bc4e2737d89d3a892388bc8f96c044b13e1ddb51a43e6e59a",
+    "v2-calibration.log": "4203cfb771b58cab263c0235db69a248e08c569a80bedfc2044d1713756c0196",
+    "COMPILER_WAVE.tsv": "82c8380ff25b798980dbeff4fe4ccf6e0b792ba1544a8bb7602af99be8ce30c5",
+    "R4_CORRECTION.md": "73fe1056b8b848e18235b758021d533df42f0f2bc3971e43f601e734dc19c1ba",
+    "R4_CALIBRATION.md": "b3cf4fc9b8554e5c453fb336498871bfc4d7bb3097180013f9f6cff9252be818"
   },
   "classification": {
     "migrate": [
@@ -92,6 +112,17 @@
     "memory",
     "rocksdb",
     "slatedb"
+  ],
+  "fixed_anchor_verifier": true,
+  "verifier_invocation": "bash test-reports/trackedhead-sql-deletion-plan-b59/verify_trackedhead_sql_deletion_plan.sh",
+  "forbidden_authorities": [
+    "BranchHeadControlContext",
+    "BranchHeadControlCache",
+    "stage_branch_head_control",
+    "BRANCH_HEAD_CONTROL_SPACE",
+    "MUTATION_REVISION_SPACE",
+    "TRACKED_MUTATION_REVISION_SPACE",
+    "TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE"
   ],
   "runtime_claimed": false,
   "production_edits": false,

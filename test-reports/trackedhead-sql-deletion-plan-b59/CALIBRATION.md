@@ -17,4 +17,9 @@ process exit status is 1.
 The v2 stateful model remains 7/7 for its covered semantics, but is not a
 runtime approval because selector/catalog/checkpoint corruption domains were
 not independently mutated. A separate v3 test/report-only successor is
-required before any implementation promotion.
+required before any implementation promotion. That v3 is now bound in the
+manifest at 33aa59975808099dfb5e9ca675a1633d713dccf3.
+
+The corrected deletion verifier is intentionally invoked with no arguments.
+It pins both the b59 source anchor and the v2 oracle internally, preventing a
+candidate from masking residue by supplying alternate anchors.

@@ -21,6 +21,11 @@ and the corrected TrackedHead whole-module oracle v2.
 The b59 source is the inventory target. The oracle v2 is an acceptance
 contract and calibration source, not a production dependency.
 
+This successor incorporates the R4 correction. The previous plan omitted
+checkpoint TrackedStateStoreReader, session execute branch-control reads,
+branch-ref stage writers, commit-graph manifest ownership, and the adapter
+mutation-revision spaces. Those omissions are now explicit deletion gates.
+
 ## Current oracle limitation
 
 The v2 model is valid for one-read/zero-write, no-fallback, and the seven
@@ -144,43 +149,95 @@ before planning. It may not leave a legacy read behind a wrapper.
   test-only callback that opens the superseded reader.
 - old branch-control/current-generation marker spaces and old working-diff
   codecs. Their names cannot survive as a compatibility registry.
+- BranchHeadControlContext, BranchHeadControlCache, stage_branch_head_control,
+  BRANCH_HEAD_CONTROL_SPACE, and their module/reexports.
+- MUTATION_REVISION_SPACE, TRACKED_MUTATION_REVISION_SPACE,
+  load_mutation_revision, load_tracked_mutation_revision, and adapter mutation
+  revision stage/precondition helpers.
+- TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE, commit-state manifest loaders,
+  and root-rebuild orchestration once CommitCatalog and selected state roots
+  serve the same chronology.
 - old physical scan/reader wrappers only where the cursor/deletion contract has
   separately approved them; this plan does not relax the strict cursor gate.
+
+## R4 correction: compiler-actionable consumers
+
+COMPILER_WAVE.tsv is the required path-by-path action ledger. A listed
+consumer has only two legal outcomes in the first runnable wave:
+
+1. its concrete call site is migrated to the named ForkTree owner, with the
+   compiler proving the old signature and writer are gone; or
+2. the route is deleted or returns a typed unsupported/fail-closed result
+   before opening a plan, reading a legacy root, or rotating an epoch.
+
+An empty result is not fail-closed. A compatibility wrapper, adapter that
+reconstructs the old state, cache that hides an old read, or a second writer
+is a residue failure.
+
+The required order is:
+
+1. **W4 control fence first:** move BranchHeadControlContext/Cache readers and
+   branch/refs stage_branch_head_control to GlobalSelectorV1/BranchSelectorV1
+   plus the single epoch/CAS write. Do not delete the selector owner until
+   functions, live_state, transaction, GC, session/execute, and branch/refs
+   callers have compiler errors resolved.
+2. **W1-W3 reader wave:** move checkpoint.rs, session/execute.rs,
+   commit_graph/context.rs, engine.rs, SQL working-diff, and history readers.
+   Every direct SQL/history route must be concretely migrated or deleted with
+   typed fail-closed behavior; no route may be left as a vague retain blocker.
+3. **Mutation-revision replacement:** move observe/session/transaction
+   preconditions to the global epoch and delete both mutation-revision
+   spaces, loaders, stage functions, and write-set appenders.
+4. **Writer-last deletion:** delete branch-control, manifest, tracked-state,
+   marker, cache, and old mutation-revision owners only after their readers
+   and writers have moved. Physically remove spaces before the first accepted
+   compile.
+5. **Static compiler gate:** run the no-argument verifier, negative consumers,
+   declaration extraction, fmt/diff, and warnings-denied checks. A candidate
+   that passes only by supplying alternate anchors is invalid.
+
+Direct SQL and history are therefore compiler-actionable in this wave:
+entity/entity-batch/columnar routes require a concrete selected-root
+migration or a typed deletion; file/directory/entity history and history_route
+require authenticated CommitCatalog/ChangeCatalog parent/member validation or
+typed deletion. They cannot remain in a retain-blocker category without an
+action and fail condition.
 
 ## Dependency-ordered non-runnable wave
 
 No intermediate edit in this sequence is runnable or publishable.
 
 1. Fence the boundary. Record the exact b59 ancestor and introduce no
-   ForkTree adapter. Mark the four direct SQL/columnar paths and historical
-   providers as blockers, not fallback consumers.
-2. Move readers first. Add the view-bound read shape to current semantic
+   ForkTree adapter. The verifier pins b59 and oracle v2 internally; callers
+   cannot override either anchor. Mark direct SQL/columnar and historical
+   providers as concrete migrate-or-delete actions.
+2. Move W4 readers first. Replace branch-control/cache reads and stage writers
+   with the selector pair and global epoch CAS.
+3. Move remaining readers. Add the view-bound read shape to current semantic
    facades, schema resolution, transaction opening, reconciliation,
    savepoint/rollback, merge analysis, working-diff consumers, and GC
    observation. Every path receives the same retained read; no helper calls
    begin_read again.
-3. Move generation and publication. Classify intent before planning; lower
+4. Move generation and publication. Classify intent before planning; lower
    supported current/state/history intent to one PreparedPublication.
    Unsupported ref-only, selected-history, file, or multi-branch cohorts fail
    closed with zero plan/write/epoch work until their named successor exists.
-4. Move initialization and schema. Bootstrap only typed global/branch
+5. Move initialization and schema. Bootstrap only typed global/branch
    selectors, root/catalog/checkpoint objects, and one epoch. Delete current
    delta/marker setup. Schema resolver reads selected state plus staged overlay.
-5. Move merge/checkpoint/GC consumers. Make branch/diff/merge, checkpoint,
+6. Move merge/checkpoint/GC consumers. Make branch/diff/merge, checkpoint,
    recovery, undo/redo, and root discovery consume authenticated roots. GC
    observes the same selector/epoch fence and never decodes a legacy table.
-6. Move the explicit blockers. The history-provider successor supplies
-   parent/member/root validation. The direct SQL successor supplies typed PK,
-   projection/order/LIMIT, NULL/tombstone, and columnar-derived semantics.
-   These are separate acceptance gates, not bridges.
-7. Rewrite fixtures/support. Migrate tests, engine benchmarks, CLI/file
+7. Resolve direct SQL/history actions. Each row in COMPILER_WAVE.tsv must be
+   migrated or deleted/fail-closed; leaving an unowned reader is forbidden.
+8. Rewrite fixtures/support. Migrate tests, engine benchmarks, CLI/file
    support, and native/adapter call sites. Delete old test-only setup that
    would make an obsolete owner appear live.
-8. Delete the plane. Delete tracked-state reader modules, old spaces, marker
+9. Delete the plane. Delete tracked-state reader modules, old spaces, marker
    codecs, branch-control/current-generation owners, and wrappers only after
    the last consumer moved. Run source residue and negative compile probes
    before any accepted compile.
-9. First runnable gate. Run the ordered commands below on the immutable
+10. First runnable gate. Run the ordered commands below on the immutable
    post-wave head. A failure returns to the source wave; no compatibility
    patch is permitted.
 
@@ -214,7 +271,10 @@ error before durable work.
 
 ## Static and negative gates
 
-The future verifier is verify_trackedhead_sql_deletion_plan.sh. It must:
+The future verifier is verify_trackedhead_sql_deletion_plan.sh. It takes no
+arguments and always pins the current worktree to the following constants:
+ANCHOR=b59e1f11a51153e0a787a81f0f25bf104d150aaf and
+ORACLE=1d9c47728377c6ec7d2646704d51f3aadb11c773. It must:
 
 1. prove the candidate contains the exact b59 ancestor and the v2 oracle
    contract is present in acceptance metadata;
@@ -223,19 +283,24 @@ The future verifier is verify_trackedhead_sql_deletion_plan.sh. It must:
    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, CurrentStateDeltaRef,
    TrackedHeadDeltaRef, with_opening_tracked_reader, and all old stage helpers
    in production, tests, benchmarks, and support;
-3. require CoherentView, open_coherent_view, view_id, state_point,
+3. also reject BranchHeadControlContext, BranchHeadControlCache,
+   stage_branch_head_control, BRANCH_HEAD_CONTROL_SPACE,
+   MUTATION_REVISION_SPACE, TRACKED_MUTATION_REVISION_SPACE,
+   load_mutation_revision, load_tracked_mutation_revision,
+   TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE, and legacy manifest loaders;
+4. require CoherentView, open_coherent_view, view_id, state_point,
    state_range, PreparedPublication, into_storage_plan, prepare_write_set,
    checkpoint_root, and generation in the retained implementation closure;
-4. reject candidate diffs that modify the direct SQL/columnar blocker paths
+5. reject candidate diffs that modify the direct SQL/columnar blocker paths
    unless their independent SQL oracle is named in the manifest;
-5. compile a direct obsolete-consumer probe and require it to fail because
+6. compile a direct obsolete-consumer probe and require it to fail because
    old reader/space APIs are absent; compile a typed ForkTree consumer probe
    that uses only the public/facade seam;
-6. inspect source declarations item by item rather than truncating at the
+7. inspect source declarations item by item rather than truncating at the
    first cfg(test); test-only imports cannot conceal production residue;
-7. model malformed, missing, wrong-kind, identity-substituted, stale, and
+8. model malformed, missing, wrong-kind, identity-substituted, stale, and
    cross-view reads as zero plan/write/commit/rotation outcomes;
-8. require no raw put/delete or forgeable sweep token, no persisted cache, and
+9. require no raw put/delete or forgeable sweep token, no persisted cache, and
    no compatibility or fallback call path.
 
 The expected b59 baseline is RED; it must retain normalized finding set
