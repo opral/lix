@@ -1,46 +1,40 @@
-# ForkTree historical correction oracle (fd2)
+# ForkTree historical correction oracle (fd2 defect successor)
 
-This package is test/report-only. It is pinned to the blocked production
-commit `fd2be256d763f17e9f127d4c984e36fba191cb82` (tree
-`20110ca5e3c33d34217630fff0a2b784b545317a`) and does not alter production
-sources.
+This package is a test/report-only direct successor to immutable head
+`2edc5cda354c456b1ece54f3f3a81485276e728d`. Its actual parent is
+`b493056059136ac1a394c912c80416d3d4b7fde4`; the fd2 source anchor remains
+`fd2be256d763f17e9f127d4c984e36fba191cb82` with its separate `fd2..2ed`
+diff identity. No production source, Cargo manifest, adapter, PR, or main
+branch is changed.
 
-It freezes two independent corrections for the historical filesystem/file
-read path:
+The pure model and structural verifier cover:
 
-1. a valid authenticated descriptor tombstone is absence in the logical
-   snapshot and therefore emits a removal when diffed against a live prior
-   descriptor; missing, malformed, wrong-kind, and identity-substituted
-   descriptor authority fails closed;
-2. every live content-bearing historical file validates exactly one
-   authenticated BlobRef and its payload before projection gating. Metadata-only
-   projection may omit byte materialization, but may not bypass that
-   authentication. Zero, multiple, substituted, or missing-payload references
-   fail closed. A valid descriptor tombstone has no live-payload obligation.
+1. authenticated descriptor row key, snapshot ID, descriptor ID, and file ID;
+2. valid descriptor tombstone as logical absence/removal;
+3. live content-bearing rows requiring exactly one BlobRef and authenticated
+   key, snapshot, descriptor, file ID, BlobId, declared size, and payload;
+4. metadata-only projection performing the same authentication while omitting
+   only byte materialization;
+5. zero, multiple, missing, malformed, wrong-kind, substituted, wrong-size,
+   wrong-BlobId, and missing-payload failures; and
+6. a valid empty-file payload and its transition to a valid tombstone removal.
 
-The structural verifier uses balanced, function-scoped Rust extraction. The
-pure model supplies negative fixtures for each failure class and preserves the
-fd2 chronology contract: one retained ForkTree history view, exact checkpoint
-marker ancestry, and fail-closed missing/cyclic parent evidence.
-
-The exact fd2 source is expected to fail the correction audit in two places;
-that RED result is the calibration, not a production test pass. The model is
-the green executable specification for the successor.
+The verifier uses balanced, function-scoped Rust extraction for production
+source checks and explicit model markers for the field-complete oracle. The
+negative fixtures are executable model cases, not token-only assertions.
 
 ## Frozen commands
 
-From this package directory:
+From the repository root:
 
 ```text
-bash verify_source_contract.sh audit       # expected exit 1 on exact fd2
-rustc --edition=2021 --test correction_model.rs -o /tmp/forktree-fd2-correction-model
-/tmp/forktree-fd2-correction-model
+bash test-reports/forktree-stage2-historical-correction-fd2-defects/verify_source_contract.sh audit
+rustfmt --edition 2021 --check test-reports/forktree-stage2-historical-correction-fd2-defects/correction_model.rs
+rustc --edition=2021 --test test-reports/forktree-stage2-historical-correction-fd2-defects/correction_model.rs -o <isolated-model-binary>
+<isolated-model-binary> --nocapture --test-threads=1
 ```
 
-Future candidate-only adapter gates remain dormant until the production
-successor compiles. Run the model and source gate first, then one fresh,
-single-threaded Memory, RocksDB, and SlateDB cell in that order; cap every
-cell at 20 minutes. Each adapter must exercise filesystem working diff,
-metadata-only and content projections, tombstone removal, reopen, and
-corruption fail-closed behavior. This package does not claim those runtime
-cells.
+The exact fd2 source audit remains expected RED. The model is the executable
+test-only specification; no production or adapter runtime is claimed. Future
+candidate qualification, if authorized, runs fresh Memory, RocksDB, then
+SlateDB cells only after the source and model gates pass.

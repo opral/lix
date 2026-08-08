@@ -27,6 +27,8 @@ if any(not name.startswith(package) for name in names):
 def source(path):
     return subprocess.check_output(["git", "-C", root, "show", f"HEAD:{path}"], text=True)
 
+model = source(package + "correction_model.rs")
+
 def balanced_body(text, name, occurrence=0):
     needle = f"fn {name}"
     starts = []
@@ -185,8 +187,27 @@ if not has_tombstone_absence(descriptors):
 if not has_exact_one_before_projection(history):
     print("corrected candidate has no structural pre-projection exact-one BlobRef check", file=sys.stderr)
     sys.exit(1)
+for marker in [
+    "struct BlobExpectation",
+    "row_key: String",
+    "snapshot_id: String",
+    "descriptor_id: String",
+    "file_id: String",
+    "blob_id: String",
+    "declared_size: usize",
+    "fn blob_id_for",
+    "metadata_only",
+    "valid_empty_file_is_authenticated_and_transitions_to_tombstone",
+    "for bad in [",
+]:
+    if marker not in model:
+        print(f"corrected model is missing integrity/negative-fixture marker: {marker}", file=sys.stderr)
+        sys.exit(1)
 print("STATUS=CORRECTED_STRUCTURAL_GREEN")
 print("CHECK=descriptor_tombstone_to_logical_absence")
 print("CHECK=exact_one_blobref_and_payload_before_projection")
 print("CHECK=metadata_projection_does_not_bypass_authentication")
+print("CHECK=row_key_snapshot_descriptor_file_id_blob_id_declared_size_payload")
+print("CHECK=explicit_empty_and_tombstone_transition")
+print("CHECK=executed_negative_fixture_model_required")
 PY

@@ -1,34 +1,49 @@
 {
   "kind": "test-report-only-forktree-correction-oracle",
-  "base_commit": "fd2be256d763f17e9f127d4c984e36fba191cb82",
-  "base_tree": "20110ca5e3c33d34217630fff0a2b784b545317a",
-  "prior_review_parent": "cd91b9b90f7f468158b4df154adbed9551eb5d60",
-  "prior_review_diff_sha256": "1a410542cff54e3b1c83a5cfb2cdea568dc9f1f71fc0c3f8598e8936d944a277",
-  "prior_review_patch_id": "c275ab15f3306c503e6830afee2a66bacf1fb974",
-  "scope": "test/report only; no production, Cargo, adapter, PR, or main edits",
+  "direct_successor_of": "2edc5cda354c456b1ece54f3f3a81485276e728d",
+  "direct_successor_parent_tree": "bf3e42c39c458dcd4e2c72e94e5ce59d94b71ea6",
+  "actual_parent_of_prior": "b493056059136ac1a394c912c80416d3d4b7fde4",
+  "fd2_anchor": "fd2be256d763f17e9f127d4c984e36fba191cb82",
+  "fd2_anchor_tree": "20110ca5e3c33d34217630fff0a2b784b545317a",
+  "fd2_to_prior_full_index_diff_sha256": "849d73bdfd09687f2708c702d73df6550a63dd7c0175849fbe8ae676bbf2450e",
+  "fd2_to_prior_patch_id": "932662594f98b01e1dcec6cd2f99ad69800b2345",
+  "scope": "test/report only; package-only; no production, Cargo, adapter, PR, or main edits",
   "baseline": {
     "status": "BLOCKED_EXPECTED_RED",
     "defects": [
       "filesystem descriptor tombstone is rejected instead of becoming logical absence/removal",
-      "live file BlobRef/payload validation is gated by content projection"
+      "live file BlobRef/payload validation is gated by content projection",
+      "BlobRef cardinality is not structurally enforced"
     ]
   },
-  "preserved_fd2_contract": [
-    "checkpoint and working-diff callers use one retained ForkTree history view",
-    "checkpoint marker chronology is exact and parent cycles/missing parents fail closed",
-    "no local historical reader, BranchHeadControl, TrackedHead, or legacy diff fallback in the migrated provider functions"
+  "integrity_contract": [
+    "row_key",
+    "snapshot_id",
+    "descriptor_id",
+    "file_id",
+    "BlobId",
+    "declared_size",
+    "payload",
+    "exactly_one_reference_before_projection",
+    "metadata_only_does_not_bypass_authentication"
   ],
   "files": [
     "README.md",
     "MANIFEST.json",
     "CORRECTION_ORACLE.md",
+    "REPORT.md",
+    "SHA256SUMS",
     "correction_model.rs",
     "verify_source_contract.sh"
   ],
-  "model_tests": 5,
+  "model_tests": 6,
   "negative_fixtures": {
-    "descriptor_identity_cases": 4,
-    "blob_reference_or_payload_cases": 5
+    "descriptor_identity_cases": 5,
+    "blob_integrity_cases": 15,
+    "metadata_projection_cases": 2,
+    "valid_empty_transition_cases": 1,
+    "chronology_cases": 4
   },
+  "valid_cases": ["tombstone_removal", "empty_payload", "empty_to_tombstone"],
   "source_audit_modes": ["audit", "corrected"]
 }
