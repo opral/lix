@@ -3356,10 +3356,6 @@ mod tests {
             test_functions()
         }
 
-        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-            Arc::clone(&self.blob_reader)
-        }
-
         fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
@@ -4208,7 +4204,7 @@ mod tests {
 
     #[tokio::test]
     #[expect(trivial_casts)]
-    async fn sql_execution_context_exposes_live_state_and_blob_reader() {
+    async fn sql_execution_context_exposes_live_state() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
@@ -4226,7 +4222,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1"
         );
         assert!(Arc::ptr_eq(&actual, &expected));
-        assert!(Arc::ptr_eq(&ctx.blob_reader(), &blob_reader));
     }
 
     #[tokio::test]

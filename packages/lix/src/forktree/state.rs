@@ -87,6 +87,7 @@ pub(crate) struct HistoricalStateRow {
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) deleted: bool,
+    pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
 }
 
 /// One semantic change between two authenticated historical ForkTree state

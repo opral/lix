@@ -397,7 +397,7 @@ where
                     ctx.live_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
-                    ctx.blob_reader(),
+                    ctx.authenticated_blob_reader()?,
                     ctx.plugin_host(),
                     ctx.functions(),
                     ctx.session_file_views(),
@@ -411,7 +411,7 @@ where
                     ctx.live_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
-                    ctx.blob_reader(),
+                    ctx.authenticated_blob_reader()?,
                     ctx.plugin_host(),
                     ctx.functions(),
                     ctx.session_file_views(),
@@ -425,7 +425,6 @@ where
                     Arc::clone(&commit_graph),
                     query_source_for_provider()?,
                     history_anchor_for_provider()?,
-                    ctx.blob_reader(),
                     ctx.plugin_host(),
                 )
                 .await?;
