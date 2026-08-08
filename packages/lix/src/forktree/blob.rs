@@ -1,4 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+
 use bytes::Bytes;
+use serde::Deserialize;
 
 use crate::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, StorageError,
@@ -12,7 +16,347 @@ use super::model::{
 };
 use super::object::ObjectId;
 use super::tree::{ReceiptTreeRoot, scan_page_on_read, validate_receipt_root_on_read};
-use super::view::{CoherentView, SELECTOR_SPACE, load_object_bytes};
+use super::view::{CoherentView, SELECTOR_SPACE, load_object_bytes, load_object_map};
+
+/// A public blob identity bound to one immutable manifest by an authenticated
+/// state-tree row. Fields stay owner-private so sibling subsystems cannot
+/// construct an object-space capability or substitute a manifest ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedBlobRef {
+    semantic_id: crate::binary_cas::BlobId,
+    expected_size: u64,
+    manifest_object_id: ObjectId,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+}
+
+#[derive(Deserialize)]
+struct BlobRefOwnerValue {
+    blob_hash: String,
+    size_bytes: u64,
+}
+
+impl AuthenticatedBlobRef {
+    pub(crate) fn semantic_id(self) -> crate::binary_cas::BlobId {
+        self.semantic_id
+    }
+}
+
+fn bind_state_blob_ref(
+    row: &super::serving::VisibleStateRow,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+) -> Result<AuthenticatedBlobRef, crate::LixError> {
+    let key = super::state::decode_state_key(&row.encoded_key)?;
+    if key.schema_key != "lix_binary_blob_ref" {
+        return Err(corruption("authenticated state row is not a blob-reference owner").into());
+    }
+    let value = match &row.value.cell {
+        super::state::StateCell::Value(value) => value,
+        super::state::StateCell::Null | super::state::StateCell::Tombstone => {
+            return Err(corruption("blob-reference owner has no live semantic value").into());
+        }
+    };
+    let owner: BlobRefOwnerValue = serde_json::from_str(value).map_err(|error| {
+        corruption(format!(
+            "blob-reference owner semantic value is malformed: {error}"
+        ))
+    })?;
+    let semantic_id = crate::binary_cas::BlobId::from_hex(&owner.blob_hash)?;
+    if row.value.blob_manifest_object_ids.len() != 1 {
+        return Err(
+            corruption("blob-reference owner must contain exactly one manifest edge").into(),
+        );
+    }
+    let manifest_object_id = row
+        .value
+        .blob_manifest_object_ids
+        .first()
+        .copied()
+        .ok_or_else(|| corruption("blob-reference owner manifest edge is absent"))?;
+    Ok(AuthenticatedBlobRef {
+        semantic_id,
+        expected_size: owner.size_bytes,
+        manifest_object_id,
+        view_id,
+        view_instance_id,
+    })
+}
+
+impl<R> CoherentView<R>
+where
+    R: StorageAdapterRead,
+{
+    /// Binds a public blob identity to an immutable manifest edge carried by
+    /// a row authenticated on this exact coherent view.
+    pub(crate) fn bind_blob(
+        &self,
+        row: &super::serving::VisibleStateRow,
+    ) -> Result<AuthenticatedBlobRef, crate::LixError> {
+        if row.view_instance_id != self.view_instance_id() {
+            return Err(StorageError::InvalidCursor.into());
+        }
+        bind_state_blob_ref(row, self.view_id(), self.view_instance_id())
+    }
+
+    /// Loads complete payloads without allowing the authenticated row edge to
+    /// be detached from the StorageRead that selected it.
+    pub(crate) async fn load_blob_bytes_many(
+        &self,
+        refs: &[AuthenticatedBlobRef],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
+        load_blob_bytes_many_on_read(self.read(), self.view_id(), self.view_instance_id(), refs)
+            .await
+    }
+
+    /// Loads payload ranges on the same StorageRead that authenticated their
+    /// state rows and manifest edges.
+    pub(crate) async fn load_blob_ranges_many(
+        &self,
+        requests: &[(AuthenticatedBlobRef, Range<u64>)],
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
+        load_blob_ranges_many_on_read(
+            self.read(),
+            self.view_id(),
+            self.view_instance_id(),
+            requests,
+        )
+        .await
+    }
+}
+
+/// Loads complete payloads through state-authenticated manifest edges. One
+/// object batch authenticates all manifests and one batch authenticates all
+/// distinct chunks, so adapter calls scale with object levels rather than rows.
+async fn load_blob_bytes_many_on_read<R>(
+    read: &R,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+    refs: &[AuthenticatedBlobRef],
+) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    validate_blob_ref_views(view_id, view_instance_id, refs.iter())?;
+    let manifests = load_manifests(read, refs).await?;
+    let chunks = load_required_chunks(
+        read,
+        manifests.values().flat_map(|manifest| {
+            manifest
+                .ordered_chunks
+                .iter()
+                .map(|chunk| chunk.chunk_object_id)
+        }),
+    )
+    .await?;
+    let mut entries = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
+        validate_manifest_owner(manifest, reference)?;
+        let capacity = usize::try_from(manifest.logical_bytes)
+            .map_err(|_| corruption("blob payload length cannot be represented by this process"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut digest = blake3::Hasher::new();
+        for chunk_ref in &manifest.ordered_chunks {
+            let chunk = required_chunk(&chunks, chunk_ref.chunk_object_id)?;
+            validate_chunk_len(chunk, chunk_ref)?;
+            digest.update(&chunk.bytes);
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+        if bytes.len() != capacity || digest.finalize().as_bytes() != &manifest.content_digest {
+            return Err(corruption("blob manifest payload length or digest is invalid").into());
+        }
+        if crate::binary_cas::BlobId::from_content(&bytes) != reference.semantic_id {
+            return Err(corruption(
+                "authenticated state blob identity does not match its manifest payload",
+            )
+            .into());
+        }
+        entries.push(Some(bytes));
+    }
+    Ok(crate::binary_cas::BlobBytesBatch::new(entries))
+}
+
+/// Loads only chunks intersecting each requested range while preserving the
+/// same authenticated state/manifest ownership as full reads.
+async fn load_blob_ranges_many_on_read<R>(
+    read: &R,
+    view_id: [u8; 32],
+    view_instance_id: u64,
+    requests: &[(AuthenticatedBlobRef, Range<u64>)],
+) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    validate_blob_ref_views(
+        view_id,
+        view_instance_id,
+        requests.iter().map(|(reference, _)| reference),
+    )?;
+    let refs = requests
+        .iter()
+        .map(|(reference, _)| *reference)
+        .collect::<Vec<_>>();
+    let manifests = load_manifests(read, &refs).await?;
+    let mut required_ids = BTreeSet::new();
+    for (reference, requested) in requests {
+        let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
+        validate_manifest_owner(manifest, reference)?;
+        let range = validated_range(requested.clone(), manifest.logical_bytes)?;
+        let mut offset = 0_u64;
+        for chunk in &manifest.ordered_chunks {
+            let end = offset
+                .checked_add(chunk.declared_len)
+                .ok_or_else(|| corruption("blob chunk offsets overflow u64"))?;
+            if offset < range.end && end > range.start {
+                required_ids.insert(chunk.chunk_object_id);
+            }
+            offset = end;
+        }
+    }
+    let chunks = load_required_chunks(read, required_ids).await?;
+    let mut entries = Vec::with_capacity(requests.len());
+    for (reference, requested) in requests {
+        let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
+        validate_manifest_owner(manifest, reference)?;
+        let range = validated_range(requested.clone(), manifest.logical_bytes)?;
+        let expected_len = usize::try_from(range.end - range.start)
+            .map_err(|_| corruption("blob range length cannot be represented by this process"))?;
+        let mut bytes = Vec::with_capacity(expected_len);
+        let mut offset = 0_u64;
+        for chunk_ref in &manifest.ordered_chunks {
+            let end = offset
+                .checked_add(chunk_ref.declared_len)
+                .ok_or_else(|| corruption("blob chunk offsets overflow u64"))?;
+            if offset < range.end && end > range.start {
+                let chunk = required_chunk(&chunks, chunk_ref.chunk_object_id)?;
+                validate_chunk_len(chunk, chunk_ref)?;
+                let start_in_chunk = usize::try_from(range.start.saturating_sub(offset))
+                    .map_err(|_| corruption("blob range start exceeds usize"))?;
+                let end_in_chunk = usize::try_from(range.end.min(end) - offset)
+                    .map_err(|_| corruption("blob range end exceeds usize"))?;
+                bytes.extend_from_slice(&chunk.bytes[start_in_chunk..end_in_chunk]);
+            }
+            offset = end;
+        }
+        if bytes.len() != expected_len {
+            return Err(corruption("blob range materialization length is invalid").into());
+        }
+        entries.push(Some(crate::binary_cas::BlobRangeBytes {
+            bytes,
+            total_size: manifest.logical_bytes,
+            range,
+        }));
+    }
+    Ok(crate::binary_cas::BlobRangeBytesBatch::new(entries))
+}
+
+fn validate_blob_ref_views<'a>(
+    view_id: [u8; 32],
+    view_instance_id: u64,
+    refs: impl IntoIterator<Item = &'a AuthenticatedBlobRef>,
+) -> Result<(), crate::LixError> {
+    if refs.into_iter().any(|reference| {
+        reference.view_id != view_id || reference.view_instance_id != view_instance_id
+    }) {
+        return Err(StorageError::InvalidCursor.into());
+    }
+    Ok(())
+}
+
+async fn load_manifests<R>(
+    read: &R,
+    refs: &[AuthenticatedBlobRef],
+) -> Result<BTreeMap<ObjectId, BlobManifestV1>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let ids = refs
+        .iter()
+        .map(|reference| reference.manifest_object_id)
+        .collect::<BTreeSet<_>>();
+    let objects = load_object_map(read, ids.iter().copied()).await?;
+    ids.into_iter()
+        .map(|id| {
+            let bytes = objects
+                .get(&id)
+                .ok_or_else(|| corruption(format!("blob manifest {id} is absent")))?;
+            BlobManifestV1::decode(id, bytes).map(|manifest| (id, manifest))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(Into::into)
+}
+
+async fn load_required_chunks<R>(
+    read: &R,
+    ids: impl IntoIterator<Item = ObjectId>,
+) -> Result<BTreeMap<ObjectId, BlobChunkV1>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let ids = ids.into_iter().collect::<BTreeSet<_>>();
+    let objects = load_object_map(read, ids.iter().copied()).await?;
+    ids.into_iter()
+        .map(|id| {
+            let bytes = objects
+                .get(&id)
+                .ok_or_else(|| corruption(format!("blob chunk {id} is absent")))?;
+            BlobChunkV1::decode(id, bytes).map(|chunk| (id, chunk))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(Into::into)
+}
+
+fn required_manifest(
+    manifests: &BTreeMap<ObjectId, BlobManifestV1>,
+    id: ObjectId,
+) -> Result<&BlobManifestV1, crate::LixError> {
+    manifests
+        .get(&id)
+        .ok_or_else(|| corruption(format!("blob manifest {id} is absent")).into())
+}
+
+fn validate_manifest_owner(
+    manifest: &BlobManifestV1,
+    reference: &AuthenticatedBlobRef,
+) -> Result<(), crate::LixError> {
+    if manifest.logical_bytes != reference.expected_size {
+        return Err(corruption(
+            "blob-reference owner size does not match its authenticated manifest",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn required_chunk(
+    chunks: &BTreeMap<ObjectId, BlobChunkV1>,
+    id: ObjectId,
+) -> Result<&BlobChunkV1, crate::LixError> {
+    chunks
+        .get(&id)
+        .ok_or_else(|| corruption(format!("blob chunk {id} is absent")).into())
+}
+
+fn validate_chunk_len(
+    chunk: &BlobChunkV1,
+    reference: &BlobChunkRefV1,
+) -> Result<(), crate::LixError> {
+    if chunk.bytes.len() as u64 != reference.declared_len {
+        return Err(corruption("blob chunk bytes do not match their declared length").into());
+    }
+    Ok(())
+}
+
+fn validated_range(requested: Range<u64>, total: u64) -> Result<Range<u64>, crate::LixError> {
+    if requested.start >= requested.end || requested.start >= total {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_INVALID_PARAM,
+            "binary blob range is not satisfiable",
+        ));
+    }
+    Ok(requested.start..requested.end.min(total))
+}
 
 /// Binding material supplied by the same public upload request that created
 /// the receipt. Completion recomputes this digest instead of trusting a second

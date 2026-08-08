@@ -30,12 +30,23 @@ pub(crate) enum StateSource {
     Branch,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct VisibleStateRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: StateValue,
     pub(crate) source: StateSource,
+    pub(super) view_instance_id: u64,
 }
+
+impl PartialEq for VisibleStateRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.encoded_key == other.encoded_key
+            && self.value == other.value
+            && self.source == other.source
+    }
+}
+
+impl Eq for VisibleStateRow {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StateTreeMutation {
@@ -980,6 +991,7 @@ where
                 encoded_key: key.to_vec(),
                 value,
                 source: StateSource::Branch,
+                view_instance_id: view.view_instance_id(),
             }))
         };
     }
@@ -1001,6 +1013,7 @@ where
         encoded_key: key.to_vec(),
         value,
         source: StateSource::Global,
+        view_instance_id: view.view_instance_id(),
     }))
 }
 
@@ -1089,6 +1102,7 @@ where
             encoded_key: key,
             value,
             source,
+            view_instance_id: view.view_instance_id(),
         });
     }
     Ok(output)

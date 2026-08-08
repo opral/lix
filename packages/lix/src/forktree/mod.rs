@@ -16,7 +16,7 @@ mod state;
 mod tree;
 mod view;
 
-pub(crate) use blob::{UploadBindingRef, prepare_upload_completion};
+pub(crate) use blob::{AuthenticatedBlobRef, UploadBindingRef, prepare_upload_completion};
 pub(crate) use model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
     CanonicalBranchId, CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
@@ -81,6 +81,7 @@ const _: () = {
         )> = None;
         let _: Option<(
             ObjectId,
+            AuthenticatedBlobRef,
             BranchStateTransition,
             PreparedPublication,
             SelectorExpectation,

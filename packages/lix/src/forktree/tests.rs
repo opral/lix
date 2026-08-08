@@ -99,6 +99,39 @@ fn state_entry(
     (key, value)
 }
 
+fn blob_ref_state_entry(
+    primary_key: &str,
+    blob_id: crate::binary_cas::BlobId,
+    size_bytes: u64,
+    commit_byte: u8,
+    manifest: ObjectId,
+) -> (Vec<u8>, Vec<u8>) {
+    let entity_pk = EntityPk::single(primary_key);
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "lix_binary_blob_ref",
+        file_id: Some(primary_key),
+        entity_pk: &entity_pk,
+    });
+    let semantic_value = serde_json::json!({
+        "id": primary_key,
+        "blob_hash": blob_id.to_hex(),
+        "size_bytes": size_bytes,
+    })
+    .to_string();
+    let value = encode_state_value(StateValueRef {
+        change_id: public_change_id(commit_byte.wrapping_add(1)),
+        commit_id: public_commit_id(commit_byte),
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        cell: StateCellRef::Value(&semantic_value),
+        metadata: None,
+        origin_key: None,
+        blob_manifest_object_ids: &[manifest],
+    })
+    .expect("blob-ref state value");
+    (key, value)
+}
+
 #[derive(Clone)]
 struct SeedData {
     objects: ImmutableObjectSet,
@@ -2167,10 +2200,29 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         content_digest: *blake3::hash(b"data").as_bytes(),
     };
     let (manifest_id, _) = manifest.encode().expect("manifest");
-    let (key, value) = state_entry("blob", StateCellRef::Value("blob"), 0x70, &[manifest_id]);
+    let blob_id = crate::binary_cas::BlobId::from_content(b"data");
+    let (key, value) = blob_ref_state_entry("blob", blob_id, 4, 0x70, manifest_id);
+    let wrong_owner_value = serde_json::json!({
+        "id": "not-blob",
+        "blob_hash": blob_id.to_hex(),
+        "size_bytes": 4,
+    })
+    .to_string();
+    let (wrong_owner_key, wrong_owner) = state_entry(
+        "not-blob",
+        StateCellRef::Value(&wrong_owner_value),
+        0x70,
+        &[manifest_id],
+    );
+    let (mismatched_owner_key, mismatched_owner) =
+        blob_ref_state_entry("mismatched", blob_id, 5, 0x70, manifest_id);
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
-        vec![StateTreeMutation::insert(key.clone(), value)],
+        vec![
+            StateTreeMutation::insert(key.clone(), value),
+            StateTreeMutation::insert(wrong_owner_key.clone(), wrong_owner),
+            StateTreeMutation::insert(mismatched_owner_key.clone(), mismatched_owner),
+        ],
         view.read(),
     )
     .await
@@ -2195,6 +2247,62 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         .expect("blob state")
         .expect("blob row");
     assert_eq!(row.value.blob_manifest_object_ids, vec![manifest_id]);
+    let blob_ref = reopened.bind_blob(&row).expect("authenticated blob edge");
+    assert_eq!(blob_ref.semantic_id(), blob_id);
+    let wrong_owner = state_point(&reopened, &wrong_owner_key, false)
+        .await
+        .expect("wrong-owner state")
+        .expect("wrong-owner row");
+    assert!(
+        reopened.bind_blob(&wrong_owner).is_err(),
+        "a non-BlobRef row cannot donate an otherwise valid manifest edge"
+    );
+    let mismatched_owner = state_point(&reopened, &mismatched_owner_key, false)
+        .await
+        .expect("mismatched-owner state")
+        .expect("mismatched-owner row");
+    let mismatched_ref = reopened
+        .bind_blob(&mismatched_owner)
+        .expect("authenticated malformed owner edge");
+    assert!(
+        reopened
+            .load_blob_ranges_many(&[(mismatched_ref, 0..1)])
+            .await
+            .is_err(),
+        "a transplanted manifest with mismatched owner size must fail closed"
+    );
+    let same_selectors_different_read = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("second coherent read");
+    assert!(
+        same_selectors_different_read.bind_blob(&row).is_err(),
+        "a state row must not be rebound to another coherent view"
+    );
+    assert!(
+        same_selectors_different_read
+            .load_blob_bytes_many(&[blob_ref])
+            .await
+            .is_err(),
+        "an authenticated blob edge must not detach from its selecting StorageRead"
+    );
+    assert_eq!(
+        reopened
+            .load_blob_bytes_many(&[blob_ref])
+            .await
+            .expect("full blob read")
+            .into_vec(),
+        vec![Some(b"data".to_vec())]
+    );
+    let ranges = reopened
+        .load_blob_ranges_many(&[(blob_ref, 1..3)])
+        .await
+        .expect("range blob read")
+        .into_vec();
+    assert_eq!(ranges.len(), 1);
+    let range = ranges[0].as_ref().expect("range value");
+    assert_eq!(range.bytes, b"at");
+    assert_eq!(range.total_size, 4);
+    assert_eq!(range.range, 1..3);
     assert_eq!(
         BlobManifestV1::decode(
             manifest_id,

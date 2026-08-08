@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -23,6 +24,7 @@ pub(super) const SELECTOR_SPACE: crate::storage::StorageSpace =
     );
 
 const VIEW_ID_DOMAIN: &str = "lix forktree coherent selector view v1";
+static NEXT_VIEW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One authenticated branch/global state pair acquired from one immutable
 /// storage read. The owned read handle is retained for every later object and
@@ -37,6 +39,7 @@ pub(crate) struct CoherentView<R> {
     repository_root: RepositoryRootV1,
     branch_snapshot: BranchSnapshotV1,
     view_id: [u8; 32],
+    view_instance_id: u64,
 }
 
 impl<R> CoherentView<R>
@@ -49,6 +52,10 @@ where
 
     pub(crate) fn view_id(&self) -> [u8; 32] {
         self.view_id
+    }
+
+    pub(super) fn view_instance_id(&self) -> u64 {
+        self.view_instance_id
     }
 
     pub(crate) fn raw_global_selector(&self) -> &Bytes {
@@ -229,6 +236,11 @@ where
     )
     .await?;
     let view_id = derive_view_id(&raw_global_selector, &raw_branch_selector);
+    let view_instance_id = NEXT_VIEW_INSTANCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| corruption("coherent view instance identifier space is exhausted"))?;
     Ok(CoherentView {
         read,
         branch_id,
@@ -239,6 +251,7 @@ where
         repository_root,
         branch_snapshot,
         view_id,
+        view_instance_id,
     })
 }
 
