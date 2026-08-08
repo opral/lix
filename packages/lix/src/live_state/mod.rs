@@ -18,7 +18,9 @@ pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
 };
 pub(crate) use entity_decoded_column_cache::EntityDecodedColumnCache;
-pub(crate) use forktree_reader::scan_branch as scan_forktree_branch;
+pub(crate) use forktree_reader::{
+    load_exact_batch as load_forktree_exact_batch, scan_branch as scan_forktree_branch,
+};
 #[cfg(test)]
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[allow(unused_imports)]
