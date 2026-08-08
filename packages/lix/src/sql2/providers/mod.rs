@@ -276,7 +276,6 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
                     ctx.changelog_query_source(),
                 )
                 .await?;
@@ -287,7 +286,6 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
                     ctx.changelog_query_source(),
                 )
                 .await?;
@@ -320,7 +318,6 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
                     ctx.changelog_query_source(),
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
@@ -332,7 +329,6 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
                     ctx.changelog_query_source(),
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
@@ -344,7 +340,6 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
                     ctx.changelog_query_source(),
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
@@ -356,7 +351,6 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
                     ctx.changelog_query_source(),
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )

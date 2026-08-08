@@ -13,7 +13,9 @@ use super::model::{
     RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
-use super::state::{StateCell, StateValue, decode_state_key, decode_state_value};
+use super::state::{
+    HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
+};
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations, lookup_on_read,
     scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
@@ -340,6 +342,47 @@ where
         records.push(Some(semantic_commit_record(commit, &topology)?));
     }
     Ok(records)
+}
+
+/// Loads one required semantic commit record from the authenticated
+/// CommitCatalog. Unlike the historical compatibility readers, an absent
+/// catalog entry is corruption here; only an authenticated state-key absence
+/// is a valid empty result.
+pub(crate) async fn load_required_commit_record<R>(
+    read: &R,
+    id: crate::changelog::CommitId,
+) -> Result<crate::changelog::CommitRecord, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let catalog_id = CommitId::from_bytes(*id.as_uuid().as_bytes());
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, catalog_id)
+            .await?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != catalog_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    validate_commit_catalog_identity(
+        read,
+        repository.commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_retained_commit(
+        read,
+        repository.commit_catalog_root,
+        repository.change_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    let topology =
+        validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit).await?;
+    semantic_commit_record(commit, &topology)
 }
 
 /// Reads one bounded ordered CommitCatalog page. `start_after` is exclusive
@@ -1266,6 +1309,42 @@ pub(crate) async fn state_range<R>(
 where
     R: StorageAdapterRead,
 {
+    let rows = state_range_on_roots(
+        view.repository_root().global_state_root,
+        view.branch_snapshot().local_state_root,
+        view.storage_read(),
+        lower,
+        upper,
+        limit,
+        include_tombstones,
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(encoded_key, value, source)| VisibleStateRow {
+            encoded_key,
+            value,
+            source,
+            view_instance_id: view.view_instance_id(),
+        })
+        .collect())
+}
+
+/// Scans the authenticated global/local state overlay for explicit historical
+/// roots. The roots and every leaf are read through the caller's retained
+/// StorageRead; no current selector or legacy tracked-state reader is opened.
+pub(crate) async fn state_range_on_roots<R>(
+    global_state_root: ObjectId,
+    local_state_root: ObjectId,
+    read: &R,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    limit: Option<usize>,
+    include_tombstones: bool,
+) -> Result<Vec<(Vec<u8>, StateValue, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let page_size = limit.unwrap_or(64).clamp(1, 64);
     let mut output = Vec::new();
     let mut global_cursor = None;
@@ -1280,13 +1359,13 @@ where
         }
         if global.is_empty() && !global_done {
             let page = scan_bounded_page_on_read(
-                view.repository_root().global_state_root,
+                global_state_root,
                 "state",
                 lower,
                 upper,
                 global_cursor.as_deref(),
                 page_size,
-                view.storage_read(),
+                read,
             )
             .await?;
             global_done = page.len() < page_size;
@@ -1295,13 +1374,13 @@ where
         }
         if local.is_empty() && !local_done {
             let page = scan_bounded_page_on_read(
-                view.branch_snapshot().local_state_root,
+                local_state_root,
                 "state",
                 lower,
                 upper,
                 local_cursor.as_deref(),
                 page_size,
-                view.storage_read(),
+                read,
             )
             .await?;
             local_done = page.len() < page_size;
@@ -1337,14 +1416,76 @@ where
         if value.cell.deleted() && !include_tombstones {
             continue;
         }
-        output.push(VisibleStateRow {
-            encoded_key: key,
-            value,
-            source,
-            view_instance_id: view.view_instance_id(),
-        });
+        output.push((key, value, source));
     }
     Ok(output)
+}
+
+/// Loads the complete authenticated state overlay for one historical commit.
+/// A missing commit/catalog/root is an error; an absent key is represented by
+/// the absence of a row in the returned ordered stream.
+pub(crate) async fn scan_state_rows_at_commit<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+) -> Result<Vec<HistoricalStateRow>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let catalog_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
+    let entry =
+        load_required_commit_catalog_entry(read, repository.commit_catalog_root, catalog_id)
+            .await?;
+    let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != catalog_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
+    }
+    validate_commit_catalog_identity(
+        read,
+        repository.commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_retained_commit(
+        read,
+        repository.commit_catalog_root,
+        repository.change_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    let rows = state_range_on_roots(
+        commit.global_state_root,
+        commit.local_state_root,
+        read,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await?;
+    rows.into_iter()
+        .map(|(encoded_key, value, _source)| {
+            let key = decode_state_key(&encoded_key)?;
+            let (snapshot_content, deleted) = match value.cell {
+                StateCell::Value(snapshot) => (Some(snapshot), false),
+                StateCell::Null => (None, false),
+                StateCell::Tombstone => (None, true),
+            };
+            Ok(HistoricalStateRow {
+                key,
+                change_id: value.change_id,
+                commit_id: value.commit_id,
+                created_at: value.created_at,
+                updated_at: value.updated_at,
+                snapshot_content,
+                metadata: value.metadata,
+                deleted,
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn edit_state_tree<R>(

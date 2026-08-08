@@ -6,17 +6,15 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
-use crate::checkpoint::checkpoint_history_for_branch;
-use crate::commit_graph::CommitGraphReader;
+use crate::checkpoint::checkpoint_history_for_branch_forktree;
+use crate::forktree::ForkTreeReadFacade;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{HistoryRoute, parse_history_filter};
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateContext;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
@@ -27,7 +25,6 @@ pub(super) async fn register_checkpoint_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlChangelogQuerySource<S>,
 ) -> Result<(), LixError>
 where
@@ -40,7 +37,6 @@ where
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
             store: query_source.store,
         }),
         WriteAccess::read_only(),
@@ -51,7 +47,6 @@ struct CheckpointSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     store: S,
 }
 
@@ -109,21 +104,12 @@ where
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),
-                    Arc::clone(&self.commit_graph),
                     self.store.clone(),
                     schema,
                     branch_ids,
                     depth_route,
                 ),
-                move |(
-                    active_branch_id,
-                    branch_ref,
-                    commit_graph,
-                    store,
-                    schema,
-                    branch_ids,
-                    depth_route,
-                )| async move {
+                move |(active_branch_id, branch_ref, store, schema, branch_ids, depth_route)| async move {
                     if depth_route.is_contradictory()
                         || matches!(branch_ids, FileIdConstraint::None)
                     {
@@ -145,8 +131,7 @@ where
                         } else {
                             None
                         };
-                    let mut reader = commit_graph.lock().await;
-                    let mut tracked = TrackedStateContext::new().reader(store);
+                    let historical = ForkTreeReadFacade::new(store);
                     let mut rows = Vec::new();
                     for head in heads {
                         let remaining =
@@ -155,16 +140,11 @@ where
                             break;
                         }
                         let head_scan_limit = min_optional(remaining, depth_scan_limit);
-                        for checkpoint in checkpoint_history_for_branch(
-                            reader.as_mut(),
-                            &mut tracked,
+                        for checkpoint in checkpoint_history_for_branch_forktree(
+                            &historical,
                             &head.commit_id,
                             &head.branch_id,
                             head_scan_limit,
-                            // Checkpoint commits directly parent the previous
-                            // checkpoint. Follow that sparse chain instead of
-                            // retaining every unrelated public commit fact.
-                            None,
                         )
                         .await
                         .map_err(lix_error_to_datafusion_error)?

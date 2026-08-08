@@ -15,16 +15,15 @@ use tokio::sync::Mutex;
 use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobId};
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
 use crate::entity_pk::EntityPk;
+use crate::forktree::ForkTreeReadFacade;
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
-    TrackedStateStoreReader,
-};
+use crate::tracked_state::TrackedStateFilter;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
@@ -625,9 +624,11 @@ where
     .await?;
     let parent_commit_ids_by_commit =
         load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
+    let historical = ForkTreeReadFacade::new(query_source.store.clone());
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
+        &historical,
         &event_route,
         &parent_commit_ids_by_commit,
         metadata_projection,
@@ -714,7 +715,7 @@ where
         .collect::<Vec<_>>();
     observed_commit_ids.extend(direct_parent_commit_ids);
     let observed_states =
-        load_file_history_observed_states(query_source, observed_commit_ids, lookup_ids).await?;
+        load_file_history_observed_states(&historical, observed_commit_ids, lookup_ids).await?;
     let filesystem_events = file_history_events(
         &filesystem_context.event_descriptors,
         &filesystem_context.event_directories,
@@ -991,29 +992,24 @@ where
 }
 
 async fn load_file_history_observed_states<S>(
-    query_source: SqlHistoryQuerySource<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_ids: BTreeSet<String>,
     lookup_ids: Option<&FileHistoryLookupIds>,
 ) -> Result<BTreeMap<String, Arc<FileHistoryObservedState>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    // Traversal depth is only a distance from the requested start commit. In a
-    // DAG, an equal-depth row may belong to a sibling and must not shape this
-    // revision. Commit roots are the canonical state as of each observed
-    // commit, so use them directly instead of inferring ancestry from depth.
-    let mut reader = TrackedStateContext::new().reader(query_source.store);
     let mut states = BTreeMap::new();
     for observed_commit_id in observed_commit_ids {
         let state =
-            load_file_history_observed_state(&mut reader, &observed_commit_id, lookup_ids).await?;
+            load_file_history_observed_state(historical, &observed_commit_id, lookup_ids).await?;
         states.insert(observed_commit_id, Arc::new(state));
     }
     Ok(states)
 }
 
 async fn load_file_history_observed_state<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &str,
     lookup_ids: Option<&FileHistoryLookupIds>,
 ) -> Result<FileHistoryObservedState, LixError>
@@ -1021,18 +1017,19 @@ where
     S: StorageAdapterRead,
 {
     let observed_commit: SharedStr = observed_commit_id.into();
-    let plugin_registry = load_plugin_registry_at_observed_commit(reader, &observed_commit).await?;
+    let plugin_registry =
+        load_plugin_registry_at_observed_commit(historical, &observed_commit).await?;
     let plugin_owner_rows = load_file_history_plugin_owner_rows_at_observed_commit(
-        reader,
+        historical,
         &observed_commit,
         lookup_ids,
     )
     .await?;
     let mut rows = if let Some(lookup_ids) = lookup_ids {
-        load_selected_file_history_observed_rows(reader, &observed_commit, lookup_ids).await?
+        load_selected_file_history_observed_rows(historical, &observed_commit, lookup_ids).await?
     } else {
         scan_file_history_observed_rows(
-            reader,
+            historical,
             &observed_commit,
             TrackedStateFilter {
                 schema_keys: file_history_filesystem_schema_keys(),
@@ -1058,7 +1055,7 @@ where
 }
 
 async fn load_file_history_plugin_owner_rows_at_observed_commit<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     lookup_ids: Option<&FileHistoryLookupIds>,
 ) -> Result<ObservedTrackedStateRows, LixError>
@@ -1066,7 +1063,7 @@ where
     S: StorageAdapterRead,
 {
     scan_file_history_observed_rows(
-        reader,
+        historical,
         observed_commit_id,
         TrackedStateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
@@ -1088,7 +1085,7 @@ where
 }
 
 async fn load_selected_file_history_observed_rows<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     lookup_ids: &FileHistoryLookupIds,
 ) -> Result<ObservedTrackedStateRows, LixError>
@@ -1109,7 +1106,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let file_ids = selected_file_id_filters(lookup_ids);
     let mut rows = scan_file_history_observed_rows(
-        reader,
+        historical,
         observed_commit_id,
         TrackedStateFilter {
             schema_keys: vec![
@@ -1125,7 +1122,7 @@ where
     let descriptors = parse_file_history_observed_descriptors(&rows)?;
     rows.append(
         load_file_history_ancestor_directory_rows(
-            reader,
+            historical,
             observed_commit_id,
             &descriptors,
             file_ids.clone(),
@@ -1142,7 +1139,7 @@ fn selected_file_id_filters(lookup_ids: &FileHistoryLookupIds) -> Vec<NullableKe
 }
 
 async fn load_file_history_ancestor_directory_rows<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     descriptors: &[FileHistoryObservedDescriptorRecord],
     file_ids: Vec<NullableKeyFilter<String>>,
@@ -1165,7 +1162,7 @@ where
             break;
         }
         let loaded = scan_file_history_observed_rows(
-            reader,
+            historical,
             observed_commit_id,
             TrackedStateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
@@ -1200,67 +1197,76 @@ where
 }
 
 async fn scan_file_history_observed_rows<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     filter: TrackedStateFilter,
 ) -> Result<ObservedTrackedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
-    let rows = reader
-        .scan_batch_at_commit(
-            observed_commit_id.as_str(),
-            &TrackedStateScanRequest {
-                filter,
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_string(), "metadata".to_string()],
-                },
-                ..TrackedStateScanRequest::default()
-            },
-        )
-        .await?;
-    ObservedTrackedStateRows::from_batch(observed_commit_id.clone(), rows)
+    let commit_id = CommitId::parse_lix(observed_commit_id, "file history observed commit")?;
+    let rows = historical.scan_state_rows_at_commit(commit_id).await?;
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
+                && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+                && (filter.file_ids.is_empty()
+                    || filter.file_ids.iter().any(|file_id| match file_id {
+                        NullableKeyFilter::Any => true,
+                        NullableKeyFilter::Null => row.key.file_id.is_none(),
+                        NullableKeyFilter::Value(file_id) => {
+                            row.key.file_id.as_deref() == Some(file_id.as_str())
+                        }
+                    }))
+                && (filter.include_tombstones || !row.deleted)
+        })
+        .collect();
+    ObservedTrackedStateRows::from_rows(observed_commit_id.clone(), rows)
 }
 
 async fn load_plugin_registry_at_observed_commit<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
 ) -> Result<PluginRegistry, LixError>
 where
     S: StorageAdapterRead,
 {
-    let rows = reader
-        .scan_batch_at_commit(
-            observed_commit_id.as_str(),
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    include_tombstones: true,
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_string()],
-                },
-                ..TrackedStateScanRequest::default()
-            },
-        )
-        .await?;
-    let snapshot = (rows.len() != 0)
-        .then(|| rows.row(rows.len() - 1))
-        .and_then(|row| (!row.deleted()).then_some(row.snapshot_content()))
-        .flatten()
-        .map(|snapshot| {
-            serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
-                    ),
-                )
-            })
+    let rows = scan_file_history_observed_rows(
+        historical,
+        observed_commit_id,
+        TrackedStateFilter {
+            schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+            entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+            file_ids: vec![NullableKeyFilter::Null],
+            include_tombstones: true,
+        },
+    )
+    .await?;
+    let snapshot = rows
+        .iter()
+        .last()
+        .map(|observed| {
+            let row = observed.row();
+            if row.deleted() {
+                Ok(None)
+            } else {
+                row.snapshot_content()
+                    .map(|snapshot| {
+                        serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
+                                ),
+                            )
+                        })
+                    })
+                    .transpose()
+            }
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     PluginRegistry::from_optional_snapshot(snapshot.as_ref())
 }
 
@@ -1569,6 +1575,7 @@ where
 async fn discover_file_history_plugins<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
+    historical: &ForkTreeReadFacade<S>,
     event_route: &HistoryRoute,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
     metadata_projection: HistoryMetadataProjection,
@@ -1584,13 +1591,12 @@ where
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
     let mut schema_keys = BTreeSet::new();
     let mut registries_by_commit = BTreeMap::new();
     for observed_commit_id in observed_commit_ids {
         let shared_observed_commit: SharedStr = observed_commit_id.as_str().into();
         let registry =
-            load_plugin_registry_at_observed_commit(&mut reader, &shared_observed_commit).await?;
+            load_plugin_registry_at_observed_commit(historical, &shared_observed_commit).await?;
         schema_keys.extend(
             registry
                 .plugins()
@@ -2220,13 +2226,13 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::SharedStr;
     use crate::entity_pk::EntityPk;
+    use crate::forktree::{HistoricalStateRow, StateKey};
     use crate::plugin::{
         PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
     };
     use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::history_route::HistoryEntry;
-    use crate::tracked_state::{MaterializedTrackedStateBatch, MaterializedTrackedStateRow};
 
     use super::ObservedTrackedStateRows;
     use super::{
@@ -2346,29 +2352,37 @@ mod tests {
         entries: impl IntoIterator<Item = HistoryEntry>,
         plugin_registry: PluginRegistry,
     ) -> FileHistoryObservedState {
-        let materialized = entries
+        let rows = entries
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
                 let change = entry.change;
                 let deleted = change.snapshot_content.is_none();
-                MaterializedTrackedStateRow {
-                    entity_pk: change.entity_pk,
-                    schema_key: change.schema_key,
-                    file_id: change.file_id,
+                let created_at = crate::common::LixTimestamp::expect_parse(
+                    "test history created_at",
+                    &change.created_at,
+                );
+                let updated_at = crate::common::LixTimestamp::expect_parse(
+                    "test history updated_at",
+                    &change.created_at,
+                );
+                HistoricalStateRow {
+                    key: StateKey {
+                        entity_pk: change.entity_pk,
+                        schema_key: change.schema_key,
+                        file_id: change.file_id,
+                    },
                     snapshot_content: change.snapshot_content,
                     metadata: change.metadata,
                     deleted,
-                    created_at: change.created_at.clone(),
-                    updated_at: change.created_at,
+                    created_at,
+                    updated_at,
                     change_id: ChangeId::new(uuid::Uuid::from_u128(index as u128 + 1)),
                     commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
                 }
             })
             .collect::<Vec<_>>();
-        let batch =
-            MaterializedTrackedStateBatch::from_rows(materialized).expect("test history batch");
-        let rows = ObservedTrackedStateRows::from_batch(SharedStr::from_static("commit-0"), batch)
+        let rows = ObservedTrackedStateRows::from_rows(SharedStr::from_static("commit-0"), rows)
             .expect("test observed rows");
         FileHistoryObservedState {
             descriptors: parse_file_history_observed_descriptors(&rows).expect("test descriptors"),
@@ -2698,6 +2712,40 @@ mod tests {
                 super::BLOB_REF_SCHEMA_KEY,
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
             ])
+        );
+    }
+
+    #[test]
+    fn same_commit_sources_deduplicate_ids_after_grouping_and_sort() {
+        let mut first = history_entry("01920000-0000-7000-8000-0000000000a2", 0, None);
+        first.change.id = "source-b".to_string();
+        let mut second = first.clone();
+        second.change.id = "source-a".to_string();
+        let duplicate = second.clone();
+
+        let events = sorted_grouped_file_history_events([
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &first,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &second,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &duplicate,
+            ),
+        ]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .source_changes
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source-a", "source-b"]
         );
     }
 

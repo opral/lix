@@ -1,6 +1,6 @@
 use crate::LixError;
 use crate::common::SharedStr;
-use crate::tracked_state::{MaterializedTrackedStateBatch, MaterializedTrackedStateRowRef};
+use crate::forktree::HistoricalStateRow;
 
 /// Project a single-string history entity pk as the canonical JSON array
 /// text exposed by the `lixcol_entity_pk` column.
@@ -27,7 +27,7 @@ pub(super) struct ObservedTrackedStateOrdinal {
 #[derive(Debug)]
 struct ObservedTrackedStateBatch {
     observed_commit_id: SharedStr,
-    rows: MaterializedTrackedStateBatch,
+    rows: Vec<HistoricalStateRow>,
 }
 
 /// Owner for one or more exact historical scan batches.
@@ -42,9 +42,9 @@ pub(super) struct ObservedTrackedStateRows {
 }
 
 impl ObservedTrackedStateRows {
-    pub(super) fn from_batch(
+    pub(super) fn from_rows(
         observed_commit_id: SharedStr,
-        rows: MaterializedTrackedStateBatch,
+        rows: Vec<HistoricalStateRow>,
     ) -> Result<Self, LixError> {
         let mut observed = Self::default();
         observed.push_batch(observed_commit_id, rows)?;
@@ -54,7 +54,7 @@ impl ObservedTrackedStateRows {
     pub(super) fn push_batch(
         &mut self,
         observed_commit_id: SharedStr,
-        rows: MaterializedTrackedStateBatch,
+        rows: Vec<HistoricalStateRow>,
     ) -> Result<(), LixError> {
         let batch = u32::try_from(self.batches.len()).map_err(|_| {
             LixError::new(
@@ -137,7 +137,10 @@ impl ObservedTrackedStateRows {
             .expect("historical SQL batch ordinal belongs to its owner");
         ObservedTrackedStateRowRef {
             observed_commit_id: batch.observed_commit_id.as_str(),
-            row: batch.rows.row(ordinal.row as usize),
+            row: batch
+                .rows
+                .get(ordinal.row as usize)
+                .expect("historical row ordinal belongs to its owner"),
             ordinal,
         }
     }
@@ -159,7 +162,7 @@ impl ObservedTrackedStateRows {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ObservedTrackedStateRowRef<'a> {
     observed_commit_id: &'a str,
-    row: MaterializedTrackedStateRowRef<'a>,
+    row: &'a HistoricalStateRow,
     ordinal: ObservedTrackedStateOrdinal,
 }
 
@@ -168,11 +171,58 @@ impl<'a> ObservedTrackedStateRowRef<'a> {
         self.observed_commit_id
     }
 
-    pub(super) fn row(self) -> MaterializedTrackedStateRowRef<'a> {
-        self.row
+    pub(super) fn row(self) -> HistoricalStateRowRef<'a> {
+        HistoricalStateRowRef { row: self.row }
     }
 
     pub(super) fn ordinal(self) -> ObservedTrackedStateOrdinal {
         self.ordinal
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HistoricalStateRowRef<'a> {
+    row: &'a HistoricalStateRow,
+}
+
+impl<'a> HistoricalStateRowRef<'a> {
+    pub(super) fn entity_pk(self) -> &'a crate::entity_pk::EntityPk {
+        &self.row.key.entity_pk
+    }
+
+    pub(super) fn schema_key(self) -> &'a str {
+        &self.row.key.schema_key
+    }
+
+    pub(super) fn file_id(self) -> Option<&'a str> {
+        self.row.key.file_id.as_deref()
+    }
+
+    pub(super) fn snapshot_content(self) -> Option<&'a SharedStr> {
+        self.row.snapshot_content.as_ref()
+    }
+
+    pub(super) fn metadata(self) -> Option<&'a SharedStr> {
+        self.row.metadata.as_ref()
+    }
+
+    pub(super) fn deleted(self) -> bool {
+        self.row.deleted
+    }
+
+    pub(super) fn created_at(self) -> crate::common::LixTimestamp {
+        self.row.created_at
+    }
+
+    pub(super) fn updated_at(self) -> crate::common::LixTimestamp {
+        self.row.updated_at
+    }
+
+    pub(super) fn change_id(self) -> crate::changelog::ChangeId {
+        self.row.change_id
+    }
+
+    pub(super) fn commit_id(self) -> crate::changelog::CommitId {
+        self.row.commit_id
     }
 }

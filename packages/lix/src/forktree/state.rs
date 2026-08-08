@@ -43,7 +43,7 @@ pub(crate) struct StateKeyRef<'a> {
     pub(crate) entity_pk: &'a EntityPk,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct StateKey {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,

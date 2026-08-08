@@ -8,6 +8,7 @@ use crate::changelog::{ChangeRecordProjection, CommitId, CommitRecord};
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{TrackedStateKey, TrackedStateStoreReader};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
@@ -29,6 +30,105 @@ pub(crate) struct CheckpointHistoryEntry {
     pub(crate) commit_id: CommitId,
     pub(crate) created_at: String,
     pub(crate) depth: u32,
+}
+
+/// Reconstructs checkpoint chronology from one caller-owned ForkTree read.
+/// The marker is a state row and the parent chain is taken from authenticated
+/// semantic commit records; recovery/retention rows never participate in
+/// chronology.
+pub(crate) async fn checkpoint_history_for_branch_forktree<S>(
+    historical: &ForkTreeReadFacade<S>,
+    head: &CommitId,
+    branch_id: &str,
+    limit: Option<usize>,
+) -> Result<Vec<CheckpointHistoryEntry>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("checkpoint branch_id must be a canonical UUID: {error}"),
+        )
+    })?;
+    let mut current = Some(*head);
+    let mut depth = 0_u32;
+    let mut visited = std::collections::BTreeSet::new();
+    let mut checkpoints = Vec::new();
+    while let Some(commit_id) = current {
+        if limit.is_some_and(|limit| checkpoints.len() >= limit) {
+            break;
+        }
+        if !visited.insert(commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "cycle encountered while walking ForkTree checkpoint history",
+            ));
+        }
+        let record = historical.load_required_commit_record(commit_id).await?;
+        let rows = historical.scan_state_rows_at_commit(commit_id).await?;
+        let marker = checkpoint_marker_from_rows(&rows, &branch_pk, branch_id)?;
+        if record.parent_commit_ids.is_empty() || marker.is_some() {
+            checkpoints.push(CheckpointHistoryEntry {
+                commit_id,
+                created_at: record.created_at.to_string(),
+                depth,
+            });
+        }
+        current = record.parent_commit_ids.first().copied();
+        depth = depth.checked_add(1).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint history depth overflow",
+            )
+        })?;
+    }
+    Ok(checkpoints)
+}
+
+fn checkpoint_marker_from_rows(
+    rows: &[HistoricalStateRow],
+    branch_pk: &EntityPk,
+    branch_id: &str,
+) -> Result<Option<CommitId>, LixError> {
+    let mut marker = None;
+    for row in rows.iter().filter(|row| {
+        row.key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
+            && row.key.file_id.is_none()
+            && &row.key.entity_pk == branch_pk
+    }) {
+        if row.deleted {
+            continue;
+        }
+        let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "authenticated checkpoint marker has no value",
+            )
+        })?;
+        let payload: serde_json::Value = serde_json::from_str(snapshot).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("authenticated checkpoint marker is invalid JSON: {error}"),
+            )
+        })?;
+        if payload.get("branch_id").and_then(serde_json::Value::as_str) != Some(branch_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint marker branch identity mismatch",
+            ));
+        }
+        if marker.replace(row.commit_id).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint state contains duplicate marker rows",
+            ));
+        }
+    }
+    Ok(marker)
 }
 
 pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRow {

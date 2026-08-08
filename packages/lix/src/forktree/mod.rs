@@ -33,10 +33,10 @@ pub(crate) use serving::{
     CatalogPage, CommitTopology, CommitTopologyReader, StateSource, StateTreeMutation,
     VisibleStateRow, edit_state_tree, edit_state_tree_sequence, load_branch_head, load_change,
     load_change_records, load_commit, load_commit_member_records, load_commit_records,
-    load_commit_topologies, load_state_value_at_commit, page_changes, page_commits,
-    put_change_catalog_entries, put_commit_catalog_entries, scan_branch_heads, scan_change_records,
-    scan_commit_records, scan_commit_topologies, select_historical_commit_member, state_point,
-    state_point_on_read, state_range,
+    load_commit_topologies, page_changes, page_commits, put_change_catalog_entries,
+    put_commit_catalog_entries, scan_branch_heads, scan_change_records, scan_commit_records,
+    scan_commit_topologies, select_historical_commit_member, state_point, state_point_on_read,
+    state_range,
 };
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,

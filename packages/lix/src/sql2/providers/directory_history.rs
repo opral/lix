@@ -13,9 +13,10 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::LixError;
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
-use crate::tracked_state::{TrackedStateContext, TrackedStateFilter, TrackedStateScanRequest};
+use crate::forktree::ForkTreeReadFacade;
 
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
@@ -275,8 +276,9 @@ where
         })
         .collect::<Vec<_>>();
     observed_commit_ids.extend(direct_parent_commit_ids);
+    let historical = ForkTreeReadFacade::new(query_source.store.clone());
     let observed_states =
-        load_directory_history_observed_states(query_source, observed_commit_ids).await?;
+        load_directory_history_observed_states(&historical, observed_commit_ids).await?;
     let events = grouped_directory_history_events(
         &event_descriptors,
         &observed_states,
@@ -384,32 +386,22 @@ where
 }
 
 async fn load_directory_history_observed_states<S>(
-    query_source: SqlHistoryQuerySource<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_ids: BTreeSet<String>,
 ) -> Result<BTreeMap<String, Arc<DirectoryHistoryObservedState>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    // Equal-depth commits can be siblings. Resolve the directory projection
-    // from the observed commit's root so no sibling descriptor can leak into
-    // the row merely because it has the same traversal depth.
-    let mut reader = TrackedStateContext::new().reader(query_source.store);
     let mut states = BTreeMap::new();
     for observed_commit_id in observed_commit_ids {
-        let batch = reader
-            .scan_batch_at_commit(
-                &observed_commit_id,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                        include_tombstones: true,
-                        ..TrackedStateFilter::default()
-                    },
-                    ..TrackedStateScanRequest::default()
-                },
-            )
-            .await?;
-        let rows = ObservedTrackedStateRows::from_batch(
+        let commit_id =
+            CommitId::parse_lix(&observed_commit_id, "directory history observed commit")?;
+        let batch = historical.scan_state_rows_at_commit(commit_id).await?;
+        let batch = batch
+            .into_iter()
+            .filter(|row| row.key.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+            .collect();
+        let rows = ObservedTrackedStateRows::from_rows(
             SharedStr::from(observed_commit_id.as_str()),
             batch,
         )?;

@@ -11,14 +11,13 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
+use crate::tracked_state::TrackedStateFilter;
 use crate::tracked_state::encode_diff_id;
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateFilter,
-};
 use crate::{LixError, NullableKeyFilter};
 
 use super::checkpoint::filter_conjuncts;
@@ -149,34 +148,72 @@ where
                     if route.contradictory {
                         return DIFF_COLS.build(schema, &[]).map_err(diff_batch_error);
                     }
-                    let mut tracked = TrackedStateContext::new().reader(store);
-                    let diff = tracked
-                        .diff_commits(&from_commit_id, &to_commit_id, &route.request)
+                    let historical = ForkTreeReadFacade::new(store);
+                    let before = historical
+                        .scan_state_rows_at_commit(
+                            crate::changelog::CommitId::parse_lix(
+                                &from_commit_id,
+                                "diff from commit",
+                            )
+                            .map_err(lix_error_to_datafusion_error)?,
+                        )
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    let mut rows = Vec::with_capacity(diff.entries.len());
-                    for entry in diff.entries {
-                        if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY
-                            || entry.identity.schema_key()
-                                == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-                        {
+                    let after = historical
+                        .scan_state_rows_at_commit(
+                            crate::changelog::CommitId::parse_lix(&to_commit_id, "diff to commit")
+                                .map_err(lix_error_to_datafusion_error)?,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let mut by_key = std::collections::BTreeMap::new();
+                    for row in before {
+                        if diff_row_matches(&row, &route.filter) {
+                            by_key.entry(row.key.clone()).or_insert((Some(row), None));
+                        }
+                    }
+                    for row in after {
+                        if diff_row_matches(&row, &route.filter) {
+                            by_key
+                                .entry(row.key.clone())
+                                .and_modify(|entry| entry.1 = Some(row.clone()))
+                                .or_insert((None, Some(row)));
+                        }
+                    }
+                    let mut rows = Vec::with_capacity(by_key.len());
+                    for (_key, (before, after)) in by_key {
+                        if before.as_ref().is_some_and(|row| {
+                            row.key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
+                                || row.key.schema_key
+                                    == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                        }) {
                             continue;
                         }
+                        let kind = match (before.as_ref(), after.as_ref()) {
+                            (None, Some(_)) => "added",
+                            (Some(_), None) => "removed",
+                            (Some(_), Some(row)) if row.deleted => "removed",
+                            (Some(row), Some(_)) if row.deleted => "added",
+                            (Some(_), Some(_)) => "modified",
+                            (None, None) => continue,
+                        };
+                        let identity = before
+                            .as_ref()
+                            .or(after.as_ref())
+                            .expect("diff entry has one side")
+                            .key
+                            .clone();
                         rows.push(DiffSqlRow {
                             diff_id: encode_diff_id(
-                                entry.before.as_ref().map(|row| row.change_id),
-                                entry.after.as_ref().map(|row| row.change_id),
+                                before.as_ref().map(|row| row.change_id),
+                                after.as_ref().map(|row| row.change_id),
                             ),
-                            entity_pk: entry.identity.entity_pk().as_json_array_text(),
-                            schema_key: entry.identity.schema_key().to_owned(),
-                            file_id: entry.identity.file_id().map(str::to_owned),
-                            diff_type: match entry.kind {
-                                TrackedStateDiffKind::Added => "added",
-                                TrackedStateDiffKind::Modified => "modified",
-                                TrackedStateDiffKind::Removed => "removed",
-                            },
-                            before_change_id: entry.before.map(|row| row.change_id.to_string()),
-                            after_change_id: entry.after.map(|row| row.change_id.to_string()),
+                            entity_pk: identity.entity_pk.as_json_array_text(),
+                            schema_key: identity.schema_key,
+                            file_id: identity.file_id,
+                            diff_type: kind,
+                            before_change_id: before.map(|row| row.change_id.to_string()),
+                            after_change_id: after.map(|row| row.change_id.to_string()),
                         });
                         if limit.is_some_and(|limit| rows.len() >= limit) {
                             break;
@@ -191,7 +228,7 @@ where
 
 #[derive(Clone, Debug)]
 struct DiffRoute {
-    request: TrackedStateDiffRequest,
+    filter: TrackedStateFilter,
     contradictory: bool,
 }
 
@@ -212,22 +249,32 @@ impl DiffRoute {
             .collect::<Vec<_>>();
         contradictory |= explicit_entity_filter && entity_pks.is_empty();
         Self {
-            request: TrackedStateDiffRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: schema_keys.unwrap_or_default(),
-                    entity_pks,
-                    file_ids: file_ids
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(NullableKeyFilter::Value)
-                        .collect(),
-                    include_tombstones: true,
-                },
-                retain_payloads: false,
+            filter: TrackedStateFilter {
+                schema_keys: schema_keys.unwrap_or_default(),
+                entity_pks,
+                file_ids: file_ids
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(NullableKeyFilter::Value)
+                    .collect(),
+                include_tombstones: true,
             },
             contradictory,
         }
     }
+}
+
+fn diff_row_matches(row: &HistoricalStateRow, filter: &TrackedStateFilter) -> bool {
+    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+        && (filter.file_ids.is_empty()
+            || filter.file_ids.iter().any(|file_id| match file_id {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => row.key.file_id.is_none(),
+                NullableKeyFilter::Value(file_id) => {
+                    row.key.file_id.as_deref() == Some(file_id.as_str())
+                }
+            }))
 }
 
 fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<String>> {

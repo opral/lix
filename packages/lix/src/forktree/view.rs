@@ -322,6 +322,26 @@ where
         Ok(rows)
     }
 
+    /// Loads the complete authenticated historical state overlay through this
+    /// facade's retained read. Callers may project the returned ForkTree-owned
+    /// rows into their public DTOs, but may not acquire a legacy reader for
+    /// the same commit.
+    pub(crate) async fn scan_state_rows_at_commit(
+        &self,
+        commit_id: crate::changelog::CommitId,
+    ) -> Result<Vec<super::state::HistoricalStateRow>, crate::LixError> {
+        super::serving::scan_state_rows_at_commit(&self.read, commit_id).await
+    }
+
+    /// Resolves one required semantic commit record from the authenticated
+    /// catalog on this facade's retained read.
+    pub(crate) async fn load_required_commit_record(
+        &self,
+        commit_id: crate::changelog::CommitId,
+    ) -> Result<crate::changelog::CommitRecord, crate::LixError> {
+        super::serving::load_required_commit_record(&self.read, commit_id).await
+    }
+
     pub(crate) async fn load_json_slot(
         &self,
         slot: &crate::json_store::JsonSlot,

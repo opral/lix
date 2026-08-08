@@ -1,6 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::LixError;
+use crate::branch::BranchRefReader;
+use crate::checkpoint::checkpoint_history_for_branch_forktree;
+use crate::common::{compose_directory_path, compose_file_path};
+use crate::entity_pk::EntityPk;
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
+use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
+use crate::storage_adapter::StorageAdapterRead;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
@@ -8,20 +16,6 @@ use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde::Deserialize;
-use tokio::sync::Mutex;
-
-use crate::LixError;
-use crate::branch::BranchRefReader;
-use crate::checkpoint::latest_checkpoint_for_branch;
-use crate::commit_graph::CommitGraphReader;
-use crate::common::{compose_directory_path, compose_file_path};
-use crate::entity_pk::EntityPk;
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
-use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateReadColumns,
-    TrackedStateScanRequest, TrackedStateStoreReader,
-};
 
 use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -37,7 +31,6 @@ pub(super) async fn register_filesystem_working_diff_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlChangelogQuerySource<S>,
     kind: FilesystemWorkingDiffKind,
 ) -> Result<(), LixError>
@@ -51,7 +44,6 @@ where
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
             store: query_source.store,
             kind,
         }),
@@ -69,7 +61,6 @@ struct FilesystemWorkingDiffSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     store: S,
     kind: FilesystemWorkingDiffKind,
 }
@@ -125,13 +116,12 @@ where
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),
-                    Arc::clone(&self.commit_graph),
                     self.store.clone(),
                     schema,
                     route,
                     self.kind,
                 ),
-                move |(active_branch_id, branch_ref, commit_graph, store, schema, route, kind)| async move {
+                move |(active_branch_id, branch_ref, store, schema, route, kind)| async move {
                     if route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -144,18 +134,20 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let mut graph = commit_graph.lock().await;
-                    let mut tracked = TrackedStateContext::new().reader(store);
+                    let historical = ForkTreeReadFacade::new(store);
                     let mut rows = Vec::new();
                     for head in heads {
-                        let checkpoint_id = latest_checkpoint_for_branch(
-                            graph.as_mut(),
-                            &mut tracked,
+                        let checkpoint_id = checkpoint_history_for_branch_forktree(
+                            &historical,
                             &head.commit_id,
                             &head.branch_id,
+                            Some(1),
                         )
                         .await
                         .map_err(lix_error_to_datafusion_error)?
+                        .into_iter()
+                        .next()
+                        .map(|checkpoint| checkpoint.commit_id)
                         .ok_or_else(|| {
                             datafusion::common::DataFusionError::Execution(format!(
                                 "branch '{}' has no checkpoint baseline",
@@ -163,7 +155,7 @@ where
                             ))
                         })?;
                         let mut branch_rows = load_rows(
-                            &mut tracked,
+                            &historical,
                             &checkpoint_id.to_string(),
                             &head.commit_id.to_string(),
                             &head.branch_id,
@@ -233,7 +225,7 @@ struct LogicalSnapshot {
 }
 
 async fn load_rows<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     checkpoint_id: &str,
     head_id: &str,
     branch_id: &str,
@@ -242,49 +234,64 @@ async fn load_rows<S>(
 where
     S: StorageAdapterRead,
 {
-    let diff = tracked
-        .diff_commits(
+    let before = historical
+        .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
             checkpoint_id,
-            head_id,
-            &TrackedStateDiffRequest {
-                filter: TrackedStateFilter {
-                    include_tombstones: true,
-                    ..TrackedStateFilter::default()
-                },
-                retain_payloads: false,
-            },
-        )
+            "working diff checkpoint",
+        )?)
         .await?;
+    let after = historical
+        .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
+            head_id,
+            "working diff head",
+        )?)
+        .await?;
+    let mut before_by_key = BTreeMap::new();
+    for row in before {
+        before_by_key.insert(row.key.clone(), row);
+    }
+    let mut after_by_key = BTreeMap::new();
+    for row in after {
+        after_by_key.insert(row.key.clone(), row);
+    }
+    let keys = before_by_key
+        .keys()
+        .chain(after_by_key.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut file_ids = BTreeSet::new();
     let mut directory_ids = BTreeSet::new();
-    for entry in &diff.entries {
-        if let Some(file_id) = entry.identity.file_id() {
+    for key in keys {
+        let before = before_by_key.get(&key);
+        let after = after_by_key.get(&key);
+        if !historical_rows_differ(before, after) {
+            continue;
+        }
+        if let Some(file_id) = key.file_id.as_deref() {
             file_ids.insert(file_id.to_owned());
         }
-        match entry.identity.schema_key() {
+        match key.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(entry.identity.entity_pk()) {
+                if let Some(id) = single_entity_pk_value(&key.entity_pk) {
                     file_ids.insert(id);
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(entry.identity.entity_pk()) {
+                if let Some(id) = single_entity_pk_value(&key.entity_pk) {
                     directory_ids.insert(id);
                 }
             }
             _ => {}
         }
     }
-    if diff.entries.is_empty() {
-        return Ok(Vec::new());
-    }
     if matches!(kind, FilesystemWorkingDiffKind::Directory) && directory_ids.is_empty() {
         return Ok(Vec::new());
     }
 
     let load_all_files = !directory_ids.is_empty();
-    let before = load_logical_snapshot(tracked, checkpoint_id, &file_ids, load_all_files).await?;
-    let after = load_logical_snapshot(tracked, head_id, &file_ids, load_all_files).await?;
+    let before =
+        load_logical_snapshot(historical, checkpoint_id, &file_ids, load_all_files).await?;
+    let after = load_logical_snapshot(historical, head_id, &file_ids, load_all_files).await?;
     let (before_entries, after_entries) = match kind {
         FilesystemWorkingDiffKind::File => (&before.files, &after.files),
         FilesystemWorkingDiffKind::Directory => (&before.directories, &after.directories),
@@ -332,7 +339,7 @@ fn single_entity_pk_value(entity_pk: &EntityPk) -> Option<String> {
 }
 
 async fn load_logical_snapshot<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     selected_file_ids: &BTreeSet<String>,
     load_all_files: bool,
@@ -352,7 +359,7 @@ where
         Vec::new()
     } else {
         scan_descriptors::<S, FileDescriptor>(
-            tracked,
+            historical,
             commit_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
             file_entity_pks,
@@ -361,14 +368,14 @@ where
     };
     let directories = if load_all_files {
         scan_descriptors::<S, DirectoryDescriptor>(
-            tracked,
+            historical,
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             Vec::new(),
         )
         .await?
     } else {
-        load_ancestor_directories(tracked, commit_id, &files).await?
+        load_ancestor_directories(historical, commit_id, &files).await?
     };
 
     let directory_by_id = directories
@@ -403,7 +410,7 @@ where
 }
 
 async fn load_ancestor_directories<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     files: &[FileDescriptor],
 ) -> Result<Vec<DirectoryDescriptor>, LixError>
@@ -425,7 +432,7 @@ where
             break;
         }
         let loaded = scan_descriptors::<S, DirectoryDescriptor>(
-            tracked,
+            historical,
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             ids.iter()
@@ -454,7 +461,7 @@ fn filesystem_descriptor_entity_pk(id: &str, kind: &str) -> Result<EntityPk, Lix
 }
 
 async fn scan_descriptors<S, T>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     schema_key: &str,
     entity_pks: Vec<EntityPk>,
@@ -463,28 +470,21 @@ where
     S: StorageAdapterRead,
     T: for<'de> Deserialize<'de>,
 {
-    let batch = tracked
-        .scan_batch_at_commit(
+    let rows = historical
+        .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
             commit_id,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![schema_key.to_string()],
-                    entity_pks,
-                    include_tombstones: false,
-                    ..TrackedStateFilter::default()
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_string()],
-                },
-                ..TrackedStateScanRequest::default()
-            },
-        )
+            "working diff snapshot",
+        )?)
         .await?;
-    batch
-        .iter()
-        .filter_map(|row| row.snapshot_content())
+    rows.into_iter()
+        .filter(|row| {
+            !row.deleted
+                && row.key.schema_key == schema_key
+                && (entity_pks.is_empty() || entity_pks.contains(&row.key.entity_pk))
+        })
+        .filter_map(|row| row.snapshot_content)
         .map(|snapshot| {
-            serde_json::from_str(snapshot).map_err(|error| {
+            serde_json::from_str(snapshot.as_str()).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("invalid {schema_key} snapshot JSON: {error}"),
@@ -492,6 +492,22 @@ where
             })
         })
         .collect()
+}
+
+fn historical_rows_differ(
+    before: Option<&HistoricalStateRow>,
+    after: Option<&HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (None, None) => false,
+        (Some(left), Some(right)) => {
+            left.deleted != right.deleted
+                || left.snapshot_content != right.snapshot_content
+                || left.metadata != right.metadata
+                || left.key != right.key
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+    }
 }
 
 fn resolve_directory_path(
