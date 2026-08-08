@@ -11,8 +11,9 @@ anchor is the approved six-domain oracle v3 head
 33aa59975808099dfb5e9ca675a1633d713dccf3. The expected RED is preserved:
 the superseded tracked_state/context.rs and tracked_state/diff.rs remain in
 the unwired source frontier. The deterministic verifier output SHA-256 is
-3f02ee55aec3cc2d5617bee93d31b5113795dff71c30ddd110ebd75a026af65e, and the
-process exit status is 1.
+25ba4b83627211bcf29d1101cb6dee4a06cecc4ebe098d944a45d62080b2b78d, and the
+process exit status is 1. The output includes the exact PLAN assertion
+`24 cases = 6 domains × 4 corruption modes` before the expected residue RED.
 
 The v3 stateful model is the required six-domain corruption contract: all
 malformed, missing, wrong-kind, and identity-substituted selector/root cases

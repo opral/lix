@@ -14,6 +14,8 @@ ORACLE_DIFF="31b9374a14846f5e082d193296f6eb33255e667d5775c041a876077fc7952194"
 ORACLE_PATCH="d4d96f33fa535171d20e32e1b859ee1b58000cb7"
 ORACLE_PACKAGE="f54422520ea2ac7c47427d0e57f95ea6392b990e6e1861a31d6ae7848f509556"
 MANIFEST="$ROOT/test-reports/trackedhead-sql-deletion-plan-b59/MANIFEST.json"
+PLAN="$ROOT/test-reports/trackedhead-sql-deletion-plan-b59/PLAN.md"
+PLAN_CASE_BINDING='24 cases = 6 domains × 4 corruption modes'
 
 cd "$ROOT"
 git rev-parse --is-inside-work-tree >/dev/null
@@ -56,6 +58,12 @@ metadata '"case_count": 24'
 for domain in StateRoot GlobalSelector BranchSelector CommitCatalog ChangeCatalog CheckpointRoot; do
   metadata "\"$domain\""
 done
+if rg -n -F -- "$PLAN_CASE_BINDING" "$PLAN" >/dev/null 2>&1; then
+  say "PLAN_CASE_BINDING=$PLAN_CASE_BINDING"
+else
+  say "MISSING_PLAN_CASE_BINDING $PLAN_CASE_BINDING"
+  status=1
+fi
 
 zero() {
   needle="$1"

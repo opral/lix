@@ -36,6 +36,12 @@ by zero plan, writes, commits, or selector rotations. The oracle is independent
 test/report evidence, not a production dependency; no implementation may
 weaken these cases or add a fallback.
 
+The exact approved case binding is: **24 cases = 6 domains × 4 corruption modes**.
+The six domains are the names above, and the four modes are malformed, missing,
+wrong-kind, and identity-substituted. This equation is part of the acceptance
+contract, not explanatory arithmetic; the source verifier must require this
+literal assertion in this plan as well as the manifest metadata.
+
 ## Sole owner and invariants
 
 The first runnable successor has one caller-owned retained StorageRead and one
