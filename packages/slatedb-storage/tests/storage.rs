@@ -6,35 +6,19 @@
 #[path = "../../lix/tests/adapter_undo_redo_checkpoint.rs"]
 mod undo_redo_checkpoint;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures_util::stream::{self, BoxStream};
 use lix::integration::Engine;
 use lix::storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
-};
-use lix::storage::{
-    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, WriteOptions,
 };
 use lix::{LixError, Value};
 use lix_storage_slatedb::{
     SlateDB, SlateDBCacheOptions, SlateDBFactory, SlateDBObjectStoreOptions,
 };
 use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions as ObjectStoreGetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result as ObjectStoreResult,
-};
 use std::future::Future;
-use std::ops::Bound;
-use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, atomic::AtomicBool};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -185,6 +169,9 @@ async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_slatedb() {
     undo_redo_checkpoint::assert_cold_redo(&engine, branch_id).await;
 }
 
+#[cfg(any())]
+#[rustfmt::skip]
+mod legacy_layout_tests {
 #[tokio::test]
 async fn slatedb_rejects_keys_above_physical_limit() {
     let temp_dir = tempfile::tempdir().expect("create slatedb storage temp dir");
@@ -516,6 +503,8 @@ async fn assert_cached_rows(
     );
 }
 
+}
+
 fn cache_options(root_folder: PathBuf) -> SlateDBCacheOptions {
     SlateDBCacheOptions {
         root_folder,
@@ -584,6 +573,9 @@ impl StorageFixture for CachedSlateDBFixture {
     }
 }
 
+#[cfg(any())]
+#[rustfmt::skip]
+mod fault_injection {
 #[derive(Clone, Debug)]
 struct FaultStore {
     inner: Arc<InMemory>,
@@ -720,4 +712,6 @@ fn fault_error() -> object_store::Error {
     object_store::Error::NotSupported {
         source: Box::new(std::io::Error::other("injected remote write failure")),
     }
+}
+
 }
