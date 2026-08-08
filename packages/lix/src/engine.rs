@@ -21,7 +21,6 @@ use crate::storage_adapter::{Storage, StorageAdapter};
 #[cfg(test)]
 use crate::storage_adapter::{StorageWriteOptions, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
-use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
 use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
@@ -31,7 +30,6 @@ use crate::{LixError, NullableKeyFilter};
 #[expect(missing_debug_implementations)]
 pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
-    tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -115,7 +113,7 @@ where
     pub async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
-        crate::init::initialize(storage, &TrackedStateContext::new()).await
+        crate::init::initialize(storage).await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized storage.
@@ -156,12 +154,8 @@ where
             options.plugin_max_live_stores,
         )?;
 
-        let tracked_state = Arc::new(TrackedStateContext::new());
         let commit_graph = CommitGraphContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
-            tracked_state.as_ref().clone(),
-            commit_graph,
-        ));
+        let live_state = Arc::new(LiveStateContext::new(commit_graph));
         let branch_ctx = Arc::new(BranchContext::new());
         assert_initialized(storage.clone(), live_state.as_ref()).await?;
 
@@ -178,7 +172,6 @@ where
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
-            tracked_state,
             live_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
@@ -240,7 +233,6 @@ where
             active_account_id,
             self.storage(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
@@ -271,7 +263,6 @@ where
             active_account_id,
             self.storage(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),

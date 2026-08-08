@@ -6,7 +6,6 @@ use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
-use crate::tracked_state::TrackedStateContext;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
@@ -192,7 +191,7 @@ async fn untracked_precondition(
 async fn load_key_value_rows(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let rows = LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
+    let rows = LiveStateContext::new(CommitGraphContext::new())
         .reader(read)
         .scan_batch(&LiveStateScanRequest {
             filter: LiveStateFilter {

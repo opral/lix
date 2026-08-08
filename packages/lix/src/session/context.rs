@@ -34,7 +34,6 @@ use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::telemetry::TelemetrySink;
-use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
@@ -135,7 +134,6 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
     pub(super) live_state: Arc<LiveStateContext>,
-    pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
@@ -159,7 +157,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -185,7 +182,6 @@ where
             active_account_id,
             storage,
             live_state,
-            tracked_state,
             binary_cas,
             branch_ctx,
             catalog_context,
@@ -205,7 +201,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -225,7 +220,6 @@ where
             active_account_id,
             storage,
             live_state,
-            tracked_state,
             binary_cas,
             branch_ctx,
             catalog_context,
@@ -245,7 +239,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -263,7 +256,6 @@ where
             active_account_id,
             storage,
             live_state,
-            tracked_state,
             binary_cas,
             branch_ctx,
             catalog_context,
@@ -285,7 +277,6 @@ where
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
@@ -305,7 +296,6 @@ where
             active_account_id: Arc::from(active_account_id),
             storage,
             live_state,
-            tracked_state,
             binary_cas,
             branch_ctx,
             catalog_context,
@@ -534,7 +524,6 @@ where
             self.active_account_id.to_string(),
             self.storage.clone(),
             Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),

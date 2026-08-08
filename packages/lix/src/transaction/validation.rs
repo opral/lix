@@ -3574,6 +3574,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for BatchOnlyConstraintLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn scan_constraint_batch(
             &self,
             _request: &LiveStateScanRequest,
@@ -3757,6 +3764,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
@@ -3938,6 +3952,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for StaticLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
@@ -3966,6 +3987,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for OverlayingStaticLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
@@ -4018,6 +4046,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for StrictEmptyLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
@@ -4039,6 +4074,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for StrictStaticLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
@@ -4067,6 +4109,13 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for CountingStaticLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,

@@ -1514,6 +1514,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LiveStateReader for BatchOnlyLiveStateReader {
+        async fn scan_tracked_batch(
+            &self,
+            request: &crate::live_state::LiveStateScanRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, crate::LixError> {
+            crate::live_state::scan_tracked_batch_via_scan(self, request).await
+        }
+
         async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
