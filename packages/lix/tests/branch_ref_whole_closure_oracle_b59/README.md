@@ -14,6 +14,19 @@ attempts; a forged derived branch-ref authority is rejected; and create,
 switch, advance, delete/retire, retained-view GC, and cold reopen are exercised
 as state transitions rather than token-presence claims.
 
+The direct successor also closes the two read/closure blockers identified on
+the 6eba model. Branch creation first acquires a retained `CoherentView` over
+the staged snapshot and carries its exact nonzero `read_id` through the single
+publication; publication rejects zero, released, or root-mismatched reads for
+creation as well as updates before any mutation. The model now stores the
+selector-catalog object separately from its object-ID set and requires an
+active view and reopen to authenticate the catalog object's canonical ID,
+`selector_catalog` kind, and `selector:global` back-edge. Missing physical or
+catalog records, wrong IDs, wrong kinds, and wrong back-edges fail closed.
+The two new model negatives are source-only in this handoff; the inherited
+13/13 controls remain unchanged and the successor's standalone runtime is
+intentionally unclaimed.
+
 ## Immutable anchor
 
 ```text

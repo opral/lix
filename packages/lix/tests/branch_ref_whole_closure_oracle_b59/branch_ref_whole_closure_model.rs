@@ -113,6 +113,41 @@ impl BranchSelector {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogRoot {
+    object_id: String,
+    kind: String,
+    back_edge: String,
+    auth_fingerprint: String,
+}
+
+impl CatalogRoot {
+    fn new(object_id: &str) -> Self {
+        let kind = "selector_catalog".to_owned();
+        let back_edge = GLOBAL_SELECTOR_KEY.to_owned();
+        let auth_fingerprint = authenticated_fingerprint(&format!(
+            "catalog|id={object_id}|kind={kind}|back_edge={back_edge}"
+        ));
+        Self {
+            object_id: object_id.to_owned(),
+            kind,
+            back_edge,
+            auth_fingerprint,
+        }
+    }
+
+    fn is_authenticated(&self) -> bool {
+        let bytes = format!(
+            "catalog|id={}|kind={}|back_edge={}",
+            self.object_id, self.kind, self.back_edge
+        );
+        self.auth_fingerprint == authenticated_fingerprint(&bytes)
+            && self.object_id == SELECTOR_CATALOG_ROOT
+            && self.kind == "selector_catalog"
+            && self.back_edge == GLOBAL_SELECTOR_KEY
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectorFingerprint {
     global_selector_key: String,
     branch_selector_key: String,
@@ -144,6 +179,7 @@ struct StateFingerprint {
     objects: BTreeSet<String>,
     live_objects: BTreeSet<String>,
     allocations: BTreeSet<String>,
+    catalog_objects: BTreeMap<String, CatalogRoot>,
     selector_fingerprints: BTreeMap<String, SelectorFingerprint>,
     global_epoch: u64,
 }
@@ -207,6 +243,7 @@ struct Repository {
     objects: BTreeSet<String>,
     live_objects: BTreeSet<String>,
     allocations: BTreeSet<String>,
+    catalog_objects: BTreeMap<String, CatalogRoot>,
     derived_branch_refs: BTreeMap<String, String>,
     retired: BTreeSet<String>,
     retained_views: BTreeMap<u64, String>,
@@ -225,6 +262,11 @@ impl Repository {
         let mut objects = BTreeSet::new();
         objects.insert("root-global".into());
         objects.insert(SELECTOR_CATALOG_ROOT.into());
+        let catalog_objects = std::iter::once((
+            SELECTOR_CATALOG_ROOT.to_owned(),
+            CatalogRoot::new(SELECTOR_CATALOG_ROOT),
+        ))
+        .collect();
         let live_objects = objects.clone();
         Self {
             global: Some(GlobalSelector::new("root-global", 1, 1)),
@@ -233,6 +275,7 @@ impl Repository {
             objects,
             live_objects,
             allocations: BTreeSet::new(),
+            catalog_objects,
             derived_branch_refs: BTreeMap::new(),
             retired: BTreeSet::new(),
             retained_views: BTreeMap::new(),
@@ -284,6 +327,7 @@ impl Repository {
             objects: self.objects.clone(),
             live_objects: self.live_objects.clone(),
             allocations: self.allocations.clone(),
+            catalog_objects: self.catalog_objects.clone(),
             selector_fingerprints,
             global_epoch: self.global.as_ref().map_or(0, |selector| selector.epoch),
         }
@@ -305,14 +349,41 @@ impl Repository {
         }
     }
 
+    fn validate_catalog_root(&self, catalog_root: &str) -> Result<(), Failure> {
+        if !self.objects.contains(catalog_root) || !self.live_objects.contains(catalog_root) {
+            return Err(Failure::MissingRoot);
+        }
+        let catalog = self
+            .catalog_objects
+            .get(catalog_root)
+            .ok_or(Failure::MissingRoot)?;
+        if catalog.object_id != catalog_root || !catalog.is_authenticated() {
+            return Err(Failure::CorruptSelector);
+        }
+        Ok(())
+    }
+
     fn create_branch(&mut self, branch: &str, snapshot: &str) -> Result<OperationResult, Failure> {
         validate_branch(branch)?;
         if self.branches.contains_key(branch) || self.retired.contains(branch) {
             return Err(Failure::StaleSelector);
         }
+        let previously_allocated = self.allocations.contains(snapshot);
         self.stage_object(snapshot);
-        let prepared = self.prepare_create_branch(branch, snapshot)?;
-        self.publish(prepared)
+        let view = match self.open_create_view(branch, snapshot) {
+            Ok(view) => view,
+            Err(error) => {
+                if !previously_allocated {
+                    self.allocations.remove(snapshot);
+                }
+                return Err(error);
+            }
+        };
+        let result = self
+            .prepare_create_branch(&view)
+            .and_then(|prepared| self.publish(prepared));
+        self.release_view(&view);
+        result
     }
 
     fn switch_branch(&mut self, branch: &str) -> Result<OperationResult, Failure> {
@@ -341,6 +412,7 @@ impl Repository {
             .cloned()
             .ok_or(Failure::MissingRoot)?;
         self.validate_branch_selector(&selector)?;
+        self.validate_catalog_root(&selector.catalog_root)?;
         if self.cycles.contains(branch)
             || selector.branch != branch
             || !self.objects.contains(&selector.snapshot)
@@ -365,6 +437,32 @@ impl Repository {
         })
     }
 
+    fn open_create_view(&mut self, branch: &str, snapshot: &str) -> Result<CoherentView, Failure> {
+        validate_branch(branch)?;
+        if self.branches.contains_key(branch) || self.retired.contains(branch) {
+            return Err(Failure::StaleSelector);
+        }
+        let global = self.global.clone().ok_or(Failure::MissingRoot)?;
+        self.validate_global(&global)?;
+        self.validate_catalog_root(SELECTOR_CATALOG_ROOT)?;
+        if !self.allocations.contains(snapshot) {
+            return Err(Failure::MissingRoot);
+        }
+        let selector = BranchSelector::new(branch, snapshot, 0);
+        self.validate_branch_selector(&selector)?;
+        let read_id = self.next_read_id;
+        self.next_read_id += 1;
+        self.views += 1;
+        self.read_acquisitions += 1;
+        self.retained_views
+            .insert(read_id, selector.snapshot.clone());
+        Ok(CoherentView {
+            global,
+            branch: selector,
+            read_id,
+        })
+    }
+
     fn release_view(&mut self, view: &CoherentView) {
         self.retained_views.remove(&view.read_id);
     }
@@ -373,30 +471,36 @@ impl Repository {
         self.allocations.insert(object.into());
     }
 
-    fn prepare_create_branch(
-        &self,
-        branch: &str,
-        snapshot: &str,
-    ) -> Result<PreparedPublication, Failure> {
-        validate_branch(branch)?;
-        if self.branches.contains_key(branch) || self.retired.contains(branch) {
+    fn prepare_create_branch(&self, view: &CoherentView) -> Result<PreparedPublication, Failure> {
+        validate_branch(&view.branch.branch)?;
+        self.validate_global(&view.global)?;
+        self.validate_branch_selector(&view.branch)?;
+        self.validate_catalog_root(&view.branch.catalog_root)?;
+        if self.branches.contains_key(&view.branch.branch)
+            || self.retired.contains(&view.branch.branch)
+        {
             return Err(Failure::StaleSelector);
         }
-        if !self.allocations.contains(snapshot) {
-            return Err(Failure::MissingRoot);
+        if self.retained_views.get(&view.read_id) != Some(&view.branch.snapshot)
+            || !self.allocations.contains(&view.branch.snapshot)
+        {
+            return Err(Failure::StaleSelector);
         }
-        let global = self.global.clone().ok_or(Failure::MissingRoot)?;
-        self.validate_global(&global)?;
-        let next_branch = BranchSelector::new(branch, snapshot, 1);
+        let global = view.global.clone();
+        let next_branch = BranchSelector::new(
+            &view.branch.branch,
+            &view.branch.snapshot,
+            view.branch.generation + 1,
+        );
         Ok(PreparedPublication {
             expected_global: global.clone(),
             expected_branch: None,
             next_global: GlobalSelector::new(&global.root, global.epoch + 1, global.generation + 1),
             next_branch: Some(next_branch),
-            staged_objects: std::iter::once(snapshot.into()).collect(),
-            next_active_branch: Some(branch.into()),
-            owner: format!("branch:{branch}"),
-            read_id: 0,
+            staged_objects: std::iter::once(view.branch.snapshot.clone()).collect(),
+            next_active_branch: Some(view.branch.branch.clone()),
+            owner: view.branch.owner.clone(),
+            read_id: view.read_id,
             view_count: 1,
             commit_count: 1,
             selector_cas_count: 2,
@@ -501,12 +605,20 @@ impl Repository {
             }
             _ => {}
         }
+        let expected_read_snapshot = prepared
+            .expected_branch
+            .as_ref()
+            .map(|branch| &branch.snapshot)
+            .or_else(|| prepared.next_branch.as_ref().map(|branch| &branch.snapshot));
+        if prepared.read_id == 0
+            || expected_read_snapshot.is_none()
+            || self.retained_views.get(&prepared.read_id) != expected_read_snapshot
+        {
+            return Err(Failure::StaleSelector);
+        }
         if let Some(expected_branch) = prepared.expected_branch.as_ref() {
             if prepared.owner != expected_branch.owner {
                 return Err(Failure::UnrelatedOwner);
-            }
-            if prepared.read_id == 0 || !self.retained_views.contains_key(&prepared.read_id) {
-                return Err(Failure::StaleSelector);
             }
         } else if prepared.owner
             != prepared
@@ -621,8 +733,10 @@ impl Repository {
         if !self.objects.contains(&global.root) || !self.objects.contains(SELECTOR_CATALOG_ROOT) {
             return Err(Failure::MissingRoot);
         }
+        self.validate_catalog_root(SELECTOR_CATALOG_ROOT)?;
         for (branch, selector) in &self.branches {
             self.validate_branch_selector(selector)?;
+            self.validate_catalog_root(&selector.catalog_root)?;
             if branch != &selector.branch
                 || !self.objects.contains(&selector.snapshot)
                 || selector.catalog_root != SELECTOR_CATALOG_ROOT
@@ -735,17 +849,38 @@ fn fingerprint_covers_state_and_in_flight_allocations() {
 #[test]
 fn one_retained_view_and_one_prepared_publication_one_commit() {
     let mut repository = repository_with_branch();
+    let baseline_views = repository.views;
+    let baseline_reads = repository.read_acquisitions;
     repository.stage_object("root-next");
     let view = repository.open_view(BRANCH_A).unwrap();
     let prepared = repository.prepare_branch(&view, "root-next").unwrap();
     assert_eq!(prepared.read_id, view.read_id);
     assert_eq!(repository.publish(prepared), Ok(OperationResult::Published));
-    assert_eq!(repository.views, 1); // this retained read
-    assert_eq!(repository.read_acquisitions, 1);
+    assert_eq!(repository.views, baseline_views + 1); // this retained read
+    assert_eq!(repository.read_acquisitions, baseline_reads + 1);
     assert_eq!(repository.writes, 2); // create plus advance
     assert_eq!(repository.commits, 2);
     assert!(repository.allocations.is_empty());
     repository.release_view(&view);
+}
+
+#[test]
+fn create_publication_requires_exact_retained_read_ownership() {
+    let mut repository = Repository::bootstrap();
+    repository.stage_object("root-a");
+    let view = repository.open_create_view(BRANCH_A, "root-a").unwrap();
+    let prepared = repository.prepare_create_branch(&view).unwrap();
+    assert_ne!(prepared.read_id, 0);
+
+    let mut zero_read = prepared.clone();
+    zero_read.read_id = 0;
+    assert_eq!(repository.publish(zero_read), Err(Failure::StaleSelector));
+
+    repository.release_view(&view);
+    let writes = repository.writes;
+    assert_eq!(repository.publish(prepared), Err(Failure::StaleSelector));
+    assert_eq!(repository.writes, writes);
+    assert!(repository.branches.is_empty());
 }
 
 #[test]
@@ -815,6 +950,59 @@ fn malformed_identity_missing_root_and_cycle_fail_closed() {
     repository.cycles.insert(BRANCH_B.into());
     assert_eq!(repository.open_view(BRANCH_B), Err(Failure::Cycle));
     assert_eq!(repository.writes, 0); // direct corruption setup is not a publication
+}
+
+#[test]
+fn open_view_rejects_missing_or_substituted_catalog_object() {
+    let mut missing_physical = repository_with_branch();
+    missing_physical.objects.remove(SELECTOR_CATALOG_ROOT);
+    missing_physical.live_objects.remove(SELECTOR_CATALOG_ROOT);
+    assert_eq!(
+        missing_physical.open_view(BRANCH_A),
+        Err(Failure::MissingRoot)
+    );
+
+    let mut missing_catalog_record = repository_with_branch();
+    missing_catalog_record
+        .catalog_objects
+        .remove(SELECTOR_CATALOG_ROOT);
+    assert_eq!(
+        missing_catalog_record.open_view(BRANCH_A),
+        Err(Failure::MissingRoot)
+    );
+
+    let mut wrong_kind = repository_with_branch();
+    wrong_kind
+        .catalog_objects
+        .get_mut(SELECTOR_CATALOG_ROOT)
+        .unwrap()
+        .kind = "branch_snapshot".into();
+    assert_eq!(
+        wrong_kind.open_view(BRANCH_A),
+        Err(Failure::CorruptSelector)
+    );
+
+    let mut wrong_object_id = repository_with_branch();
+    wrong_object_id
+        .catalog_objects
+        .get_mut(SELECTOR_CATALOG_ROOT)
+        .unwrap()
+        .object_id = "catalog:other".into();
+    assert_eq!(
+        wrong_object_id.open_view(BRANCH_A),
+        Err(Failure::CorruptSelector)
+    );
+
+    let mut wrong_back_edge = repository_with_branch();
+    wrong_back_edge
+        .catalog_objects
+        .get_mut(SELECTOR_CATALOG_ROOT)
+        .unwrap()
+        .back_edge = "selector:other".into();
+    assert_eq!(
+        wrong_back_edge.open_view(BRANCH_A),
+        Err(Failure::CorruptSelector)
+    );
 }
 
 #[test]

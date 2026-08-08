@@ -52,10 +52,12 @@ Static checks on this package:
 * `bash -n verify_branch_ref_whole_closure.sh`: PASS
 * `rustfmt --edition 2021 --check branch_ref_whole_closure_model.rs`: PASS
 * `git diff --check`: PASS
-* standalone model `rustc --edition=2021 --test -D warnings`: PASS
-* standalone model runtime: 13/13 PASS, binary SHA-256
+* inherited 482e standalone model `rustc --edition=2021 --test -D warnings`: PASS
+* inherited 482e standalone model runtime: 13/13 PASS, binary SHA-256
   `c8599f55163dd03ea17a480df49bf342a2778c04c0e35d1dafca269773ae023a`,
   log SHA-256 `42d98c0fb0bbc875bf4ea85649d9cd7ce305bcdf674bb307ba682cf9bd6f3f17`
+* direct successor adds create-read ownership and catalog-object negatives;
+  its standalone model compile/runtime is intentionally not claimed here
 * production compilation, adapter tests, and current-main runtime: deliberately
   not run
 
@@ -75,3 +77,16 @@ switch, advance, delete, retire, retained-view release/GC, and cold reopen,
 including malformed/same-size substitutions, missing roots, cycles, and epoch
 gaps. Future adapter commands require the same fingerprints, one retained view,
 and zero backend writes for read/CAS rejection.
+
+## Direct successor correction coverage
+
+The create path now acquires a retained read for the staged snapshot and
+publication checks the exact nonzero read ID and snapshot binding for both
+creation and update. The correction oracle rejects a zero read ID and a
+released create read without changing selector state or write counters.
+`open_view` and `reopen` now require the selector-catalog object to exist and
+to authenticate its canonical object ID, `selector_catalog` kind, and
+`selector:global` back-edge. The correction oracle rejects missing physical
+catalog objects, missing catalog records, wrong object IDs, wrong kinds, and
+wrong back-edges. These are model/source gates only; no production or adapter
+runtime was run for this direct successor.

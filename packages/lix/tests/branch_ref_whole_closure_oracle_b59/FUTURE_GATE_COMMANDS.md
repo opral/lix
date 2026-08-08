@@ -34,8 +34,6 @@ CARGO_TARGET_DIR="$TARGET" CARGO_BUILD_JOBS=2 \
 The candidate-side Cargo test must exercise the same contract as the corrected
 model; the frozen package itself deliberately does not wire a production or
 Cargo target on compiler-red b59.
-the frozen package itself deliberately does not wire a production or Cargo
-target on compiler-red b59.
 
 After compile/no-run green, run one backend cell at a time, in this order:
 
@@ -51,13 +49,20 @@ done
 ```
 
 Each backend must verify one retained-view read and one-commit writes for
-create, switch, advance, delete, retire, undo, redo, checkpoint, and GC. It
+create, switch, advance, delete, retire, undo, redo, checkpoint, and GC. For
+create, the retained read must be acquired before publication and its exact
+nonzero read ID must be accepted; zero, released, or root-mismatched read IDs
+must fail before a backend write. It
 must measure no read-side writes, exact selector CAS failures, and distinguish
 same-owner stale CAS from unrelated-owner CAS without a backend write. Every
 result must include the authenticated global/branch root, generations,
-canonical selector bytes, catalog root, and owner identities. Cold reopen must
-preserve those fingerprints and reject a global selector epoch gap, same-size
-selector substitutions, wrong owner, wrong catalog, missing root, and cycles.
+canonical selector bytes, catalog root, and owner identities. The active read
+and cold reopen must require the catalog-root object to exist and authenticate
+its canonical object ID, `selector_catalog` kind, and `selector:global`
+back-edge; missing, substituted, wrong-kind, and wrong-back-edge catalog
+objects must fail closed. Cold reopen must preserve those fingerprints and
+reject a global selector epoch gap, same-size selector substitutions, wrong
+owner, wrong catalog, missing root, and cycles.
 It must separately assert that a forged or stale `lix_branch_ref` projection
 cannot change the selected branch root and that a second-authority publication
 is rejected before any selector rotation. State fingerprints must include

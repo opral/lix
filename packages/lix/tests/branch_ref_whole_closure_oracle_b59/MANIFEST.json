@@ -1,7 +1,7 @@
 {
   "kind": "test-report-only-branch-ref-whole-closure-oracle",
   "status": "dormant-until-compile-green",
-  "correction": "482e H1 selector-fingerprint/CAS/lifecycle successor",
+  "correction": "6eba direct read-ownership/catalog-authentication successor",
   "anchor": {
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
@@ -68,9 +68,13 @@
   ],
   "model_requirements": [
     "fingerprint active branch, histories, object/liveness/allocation sets",
+    "fingerprint authenticated catalog object identity, kind, and selector back-edge",
     "fingerprint global/branch selector keys, roots, generations, selector bytes, catalog root, auth tags, and owner identities",
+    "acquire one retained read for create-branch and carry its exact nonzero read_id through publication",
+    "reject create publication with zero, released, or root-mismatched read ownership before any write",
     "distinguish same-owner stale CAS from unrelated-owner CAS with no partial write",
     "reject a derived BranchRef/second authority before selector publication",
+    "open_view and reopen require an existing, authenticated selector-catalog object with canonical object ID, kind, and global-selector back-edge",
     "exercise create, switch, advance, delete, retire, retained-view GC, and cold reopen transitions",
     "reopen validates global selector sequence and branch selector bindings",
     "malformed branch identity and branch deletion fail closed",
