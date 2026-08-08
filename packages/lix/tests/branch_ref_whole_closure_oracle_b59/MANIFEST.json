@@ -1,7 +1,7 @@
 {
   "kind": "test-report-only-branch-ref-whole-closure-oracle",
   "status": "dormant-until-compile-green",
-  "correction": "6eba direct read-ownership/catalog-authentication successor",
+  "correction": "882b direct read-closure/liveness successor",
   "anchor": {
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
@@ -69,12 +69,16 @@
   "model_requirements": [
     "fingerprint active branch, histories, object/liveness/allocation sets",
     "fingerprint authenticated catalog object identity, kind, and selector back-edge",
+    "fingerprint retained-read branch/root/global selector ownership fields",
     "fingerprint global/branch selector keys, roots, generations, selector bytes, catalog root, auth tags, and owner identities",
     "acquire one retained read for create-branch and carry its exact nonzero read_id through publication",
-    "reject create publication with zero, released, or root-mismatched read ownership before any write",
+    "bind retained read ownership to branch identity, branch snapshot, global selector key/root/epoch/generation",
+    "reject create or update publication with zero, released, foreign-branch, root-mismatched, or global-mismatched read ownership before any write",
     "distinguish same-owner stale CAS from unrelated-owner CAS with no partial write",
     "reject a derived BranchRef/second authority before selector publication",
     "open_view and reopen require an existing, authenticated selector-catalog object with canonical object ID, kind, and global-selector back-edge",
+    "open_view and reopen require physically present and live global roots, branch snapshots, and catalog closure",
+    "prepare_branch and update publication reject non-live objects and never resurrect them",
     "exercise create, switch, advance, delete, retire, retained-view GC, and cold reopen transitions",
     "reopen validates global selector sequence and branch selector bindings",
     "malformed branch identity and branch deletion fail closed",

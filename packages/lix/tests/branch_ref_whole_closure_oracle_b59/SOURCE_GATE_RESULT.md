@@ -1,4 +1,4 @@
-# b59 source-gate calibration and 482e H1 correction
+# b59 source-gate calibration and BranchRef v3 correction
 
 This is a static calibration result on the immutable b59 anchor. It is not a
 candidate acceptance result and does not claim production compilation or
@@ -78,7 +78,7 @@ including malformed/same-size substitutions, missing roots, cycles, and epoch
 gaps. Future adapter commands require the same fingerprints, one retained view,
 and zero backend writes for read/CAS rejection.
 
-## Direct successor correction coverage
+## Direct v2 successor correction coverage
 
 The create path now acquires a retained read for the staged snapshot and
 publication checks the exact nonzero read ID and snapshot binding for both
@@ -90,3 +90,18 @@ to authenticate its canonical object ID, `selector_catalog` kind, and
 catalog objects, missing catalog records, wrong object IDs, wrong kinds, and
 wrong back-edges. These are model/source gates only; no production or adapter
 runtime was run for this direct successor.
+
+## Direct v3 read-closure correction
+
+This immutable child of `882b13e5c6fb3b0f2ff3d79e7ede7665f7ee0d41` adds a
+retained-read fingerprint covering branch identity, branch selector key and
+snapshot, plus global selector key, root, epoch, and generation. A read from a
+different branch sharing a snapshot, or a branch/global root substitution,
+fails before any write. `open_view` and `reopen` require live global roots;
+reopen also requires live selected branch snapshots and the authenticated live
+catalog closure. `prepare_branch` rejects absent, dead, and staged-only
+objects, while update publication rejects forged non-live/staged replacements
+before mutation and cannot resurrect them. Four discriminating model cases
+cover branch-sharing, root mismatch, global liveness, non-live preparation/
+publication, and reopen closure. The v3 model is source-only here; no compile
+or runtime claim is made.

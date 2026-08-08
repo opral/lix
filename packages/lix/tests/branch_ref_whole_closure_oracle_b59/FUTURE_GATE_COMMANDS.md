@@ -57,14 +57,21 @@ must measure no read-side writes, exact selector CAS failures, and distinguish
 same-owner stale CAS from unrelated-owner CAS without a backend write. Every
 result must include the authenticated global/branch root, generations,
 canonical selector bytes, catalog root, and owner identities. The active read
-and cold reopen must require the catalog-root object to exist and authenticate
+must also bind the retained read to branch identity, branch selector key and
+snapshot, and global selector key, root, epoch, and generation; a different
+branch sharing the same snapshot must fail its CAS. Missing or dead global
+roots must fail before an active view is returned. `prepare_branch` and update
+publication must reject absent, physically present-but-dead, and staged-only
+replacement objects without resurrecting them.
+Cold reopen must require the catalog-root object to exist and authenticate
 its canonical object ID, `selector_catalog` kind, and `selector:global`
 back-edge; missing, substituted, wrong-kind, and wrong-back-edge catalog
 objects must fail closed. Cold reopen must preserve those fingerprints and
 reject a global selector epoch gap, same-size selector substitutions, wrong
-owner, wrong catalog, missing root, and cycles.
+owner, wrong catalog, missing/dead global root, missing/dead branch snapshot,
+and cycles.
 It must separately assert that a forged or stale `lix_branch_ref` projection
 cannot change the selected branch root and that a second-authority publication
 is rejected before any selector rotation. State fingerprints must include
-active branch, histories, object set, live-object set, in-flight allocations,
-and per-branch selector fingerprints.
+retained-read ownership, active branch, histories, object set, live-object set,
+in-flight allocations, and per-branch selector fingerprints.

@@ -27,6 +27,24 @@ The two new model negatives are source-only in this handoff; the inherited
 13/13 controls remain unchanged and the successor's standalone runtime is
 intentionally unclaimed.
 
+## Direct v3 read-closure correction
+
+This successor is based directly on immutable `882b13e5c6fb3b0f2ff3d79e7ede7665f7ee0d41`
+and leaves that v2 object unchanged. A retained read is now a typed fingerprint
+of the branch identity, branch selector key and snapshot, plus the expected
+global selector key, root, epoch, and generation. A read from another branch
+that shares the same snapshot cannot authorize a publication; branch-root and
+global-root substitutions are separate negatives.
+
+`open_view` and `reopen` require the authenticated global root to be physically
+present and live. Reopen additionally requires every selected branch snapshot
+and selector-catalog object to remain physically present and live. `prepare_branch`
+accepts only an already-live object; update publication rejects staged or
+non-live replacements before the mutation plan, so a failed publication cannot
+resurrect a dead object. The catalog ID/kind/back-edge, selector substitution,
+CAS, dual-authority, lifecycle, and no-partial-write controls remain intact.
+The added v3 cases are source-only and no runtime claim is made.
+
 ## Immutable anchor
 
 ```text
