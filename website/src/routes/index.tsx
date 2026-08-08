@@ -13,10 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title =
-      "Lix | A version control system for files and data beyond code";
+    const title = "Lix | Version control system and SQL database in one";
     const description =
-      "Lix is a version control system for files and data beyond code: normal files for tools, SQL rows for apps, and version control for every change.";
+      "AI applications span files, a SQL database, and version control. Lix combines those three requirements in one system, avoiding three separate layers of infrastructure that need to be kept in sync.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
