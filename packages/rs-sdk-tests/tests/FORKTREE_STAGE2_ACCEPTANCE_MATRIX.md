@@ -67,10 +67,12 @@ Its focused full-index SHA-256 is
 its `a12..head` SHA-256 is
 `ad49aa816f4cece010f361f6fadf7f7b59f2003d6e905bd8f44341d613d08f56`,
 and its stable patch ID is `2b57e2e9e23bd79343068a3b237ce20581c56526`.
-It remains non-runnable at 201 errors/8 warnings and 170 residue findings.
-Upload, checkpoint, history, multi-branch, and reachability publication families
-remain independent, so this is a held identity frontier, not readiness
-promotion. The latest approved readiness base remains `54e90dbf...`.
+It remains non-runnable at 201 errors/8 warnings and 170 residue findings and is
+**BLOCKED**: the ordinary lowerer discards deterministic `runtime_functions`,
+so runtime sequence writes and preconditions do not enter the sole transaction
+batch. Upload, checkpoint, history, multi-branch, and reachability publication
+families also remain independent. This is blocked identity evidence, not
+readiness promotion. The latest approved readiness base remains `54e90dbf...`.
 
 The superseded BlobRef predecessor
 `origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at

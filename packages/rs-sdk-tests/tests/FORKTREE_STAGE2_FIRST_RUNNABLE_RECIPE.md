@@ -70,9 +70,9 @@ negative coverage and a valid control without an index, cache, fallback, or
 second serving owner. This approval is source-only: `54e90dbf...` remains
 non-runnable and is not an acceptance-matrix result.
 
-### Held writer milestone
+### Blocked writer milestone
 
-The first ordinary atomic-writer slice is pinned but not approved for readiness:
+The first ordinary atomic-writer slice is pinned and blocked:
 
 - ref `origin/codex/forktree-stage2-milestone5a-ordinary-atomic-writer`;
 - head `5c4cae810324a34c0adbbb5a1a0be5fba5348054`;
@@ -85,9 +85,12 @@ The first ordinary atomic-writer slice is pinned but not approved for readiness:
 - stable patch ID `2b57e2e9e23bd79343068a3b237ce20581c56526`.
 
 Its ordinary single-branch cohort lowers once into the existing sole backend
-commit, but upload/checkpoint/history/multi-branch/reachability publication
-families remain. It is compile-red and has not cleared R2 atomicity or H2
-deletion/residue review. Do not apply artifacts or treat it as a readiness base.
+commit, but discards deterministic `runtime_functions`, so runtime sequence
+writes and preconditions never enter that batch. Upload/checkpoint/history/
+multi-branch/reachability publication families also remain. It is compile-red
+and has not cleared R2 atomicity or H2 deletion/residue review. Do not apply
+artifacts or treat it as a readiness base. A successor must preserve runtime
+writes/preconditions in the sole transaction batch and receive a new R2 review.
 
 ## Eligibility fence
 
