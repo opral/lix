@@ -56,6 +56,13 @@ no defining branch-control file. That is a compiler-cluster input, not proof
 that the old closure is gone. The gate reports both missing definitions and
 all remaining consumers.
 
+The canonical b59 calibration is `required-missing=0`, `legacy-residue=460`,
+`old-closure-paths=4`, `lix-branch-ref-occurrence-files=15`,
+`non-derived-lix-branch-ref-files=4`, and `authority-use-lines=331`. The
+scanner searches from `$ROOT/packages`, so it excludes its own package with
+the committed root-relative glob `!**/lix/tests/branch_ref_whole_closure_oracle_b59/**`.
+The prior 481/343 capture used a non-matching glob and is superseded.
+
 ## Replacement authority contract
 
 * `GlobalSelectorV1` is the sole repository-wide mutable selector. It binds the
@@ -119,6 +126,12 @@ selector read or write source.
 
 No race may publish a root selected from a different view. No corruption case
 may write, rotate a selector, or fall back to the old control/row space.
+
+The direct v3 correction is descended from v2
+`9f45f77955317b8dd64fadb049d85c33ca109bf4` and binds its prior handoff digest
+`288926d43355526489908c84845ba2d30343e97117f04652f0d58754862c128b` in the
+manifest. It changes only this test/report package; no production file or
+Cargo target is added.
 
 ## Explicit exclusions
 

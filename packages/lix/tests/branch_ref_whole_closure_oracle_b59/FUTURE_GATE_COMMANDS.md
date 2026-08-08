@@ -14,7 +14,9 @@ EVIDENCE=/root/repos/evidence-branch-ref-whole-closure
 mkdir -p "$EVIDENCE"
 
 bash "$ORACLE/verify_branch_ref_whole_closure.sh" "$ROOT" "$ANCHOR" \
-  >"$EVIDENCE/source.log" 2>&1
+  >"$EVIDENCE/source.raw.log" 2>&1 || test "$?" -eq 1
+sed "s#${ROOT}#<ROOT>#g" "$EVIDENCE/source.raw.log" \
+  >"$EVIDENCE/source.normalized.log"
 rustc --edition=2021 --test -D warnings \
   "$ORACLE/branch_ref_whole_closure_model.rs" \
   -o "$EVIDENCE/model"
@@ -34,8 +36,6 @@ CARGO_TARGET_DIR="$TARGET" CARGO_BUILD_JOBS=2 \
 The candidate-side Cargo test must exercise the same contract as the corrected
 model; the frozen package itself deliberately does not wire a production or
 Cargo target on compiler-red b59.
-the frozen package itself deliberately does not wire a production or Cargo
-target on compiler-red b59.
 
 After compile/no-run green, run one backend cell at a time, in this order:
 

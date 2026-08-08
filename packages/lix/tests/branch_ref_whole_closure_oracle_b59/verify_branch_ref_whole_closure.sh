@@ -9,6 +9,12 @@ ROOT=${1:?usage: verify_branch_ref_whole_closure.sh ROOT [ANCHOR]}
 ANCHOR=${2:-b59e1f11a51153e0a787a81f0f25bf104d150aaf}
 ROOT=$(cd "$ROOT" && pwd)
 ORACLE_REL=packages/lix/tests/branch_ref_whole_closure_oracle_b59
+# The ripgrep roots below are `$ROOT/packages`, so their glob paths are
+# relative to `packages/`, not to the repository root. Keeping both forms
+# explicit makes the exclusion deterministic and prevents this oracle's own
+# manifest/report text from changing the residue calibration.
+ORACLE_RG_REL=lix/tests/branch_ref_whole_closure_oracle_b59
+ORACLE_RG_EXCLUDE="!**/$ORACLE_RG_REL/**"
 
 if ! git -C "$ROOT" merge-base --is-ancestor "$ANCHOR" HEAD; then
   echo "BLOCKED: candidate is not descended from $ANCHOR" >&2
@@ -65,7 +71,7 @@ for token in "${LEGACY[@]}"; do
   done < <(
     rg -n -F "$token" "$ROOT/packages" \
       -g '*.rs' -g '*.toml' -g '*.json' -g '*.js' -g '*.mjs' -g '*.ts' \
-      -g '!target/**' -g "!$ORACLE_REL/**" | sort || true
+      -g '!target/**' -g "$ORACLE_RG_EXCLUDE" | sort || true
   )
 done
 
@@ -95,7 +101,7 @@ for pattern in "${forbidden_patterns[@]}"; do
   done < <(
     rg -n -F "$pattern" "$ROOT/packages" \
       -g '*.rs' -g '*.toml' -g '*.json' -g '*.js' -g '*.mjs' -g '*.ts' \
-      -g '!target/**' -g "!$ORACLE_REL/**" | sort || true
+      -g '!target/**' -g "$ORACLE_RG_EXCLUDE" | sort || true
   )
 done
 
@@ -114,7 +120,7 @@ while IFS= read -r line; do
 done < <(
   rg -n 'BRANCH_REF_SCHEMA_KEY|branch_ref_stage_row|branch_ref_tombstone_row|stage_branch_head_control|branch_head_control_precondition|BranchHeadControl|BranchRefReader|CachingBranchRefReader' \
     "$ROOT/packages" -g '*.rs' -g '*.toml' -g '*.json' -g '*.js' -g '*.mjs' -g '*.ts' \
-    -g '!target/**' -g "!$ORACLE_REL/**" | sort || true
+    -g '!target/**' -g "$ORACLE_RG_EXCLUDE" | sort || true
 )
 
 projection_files=()

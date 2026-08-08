@@ -1,7 +1,7 @@
 {
   "kind": "test-report-only-branch-ref-whole-closure-oracle",
   "status": "dormant-until-compile-green",
-  "correction": "6eba H1 global selector identity correction oracle",
+  "correction": "6eba H1 global selector identity correction and canonical source calibration",
   "prior_blocker_evidence": {
     "source_log_sha256": "a1fe150858a8f85af1e24e04f1bbc367182b1b5652bd904187b21dec1411d830",
     "model_log_sha256": "c481827a36dacf8168d35791f9ac44ec4992b86604eb2af117165d6713d75044",
@@ -9,23 +9,41 @@
     "classification": "R1 v5 BLOCKER control evidence"
   },
   "corrected_from": {
-    "commit": "6eba1b6f853337985c17cf2ef83fcb3abbccf02c",
-    "tree": "677b645d8e29c2d6ebe07a3494f5a8c2601155ce",
-    "parent": "482e10c88767a426a8b6ed0aff7fad1b43903b1f",
+    "commit": "9f45f77955317b8dd64fadb049d85c33ca109bf4",
+    "tree": "c38c4d60c74bf70994378029ad9e286a83cf2d69",
+    "parent": "ee00381fd95148cd85a4c0940c3c17ee6805aa25",
+    "prior_6eba_commit": "6eba1b6f853337985c17cf2ef83fcb3abbccf02c",
+    "prior_6eba_tree": "677b645d8e29c2d6ebe07a3494f5a8c2601155ce",
+    "prior_6eba_parent": "482e10c88767a426a8b6ed0aff7fad1b43903b1f",
     "blocker_report_sha256": "69ddb8b7024ac436af29ae7efe19fb2bfc2a74a03d4f206f45ceb1cb8e6d35a3",
-    "blocker_manifest_sha256": "8af37ef5dcf992d43e9afa65cdfbc76578763d9db0c33b3fb6f6ee3813ef2072"
+    "blocker_manifest_sha256": "8af37ef5dcf992d43e9afa65cdfbc76578763d9db0c33b3fb6f6ee3813ef2072",
+    "prior_handoff_sha256": "288926d43355526489908c84845ba2d30343e97117f04652f0d58754862c128b"
   },
   "source_calibration": {
     "anchor": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "candidate": "6eba1b6f853337985c17cf2ef83fcb3abbccf02c",
     "required_missing": 0,
-    "legacy_residue": 481,
+    "command": "bash packages/lix/tests/branch_ref_whole_closure_oracle_b59/verify_branch_ref_whole_closure.sh /tmp/branch-ref-selector-correction-v2-review b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "input_root": "/tmp/branch-ref-selector-correction-v2-review",
+    "input_anchor": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "oracle_exclude_glob": "!**/lix/tests/branch_ref_whole_closure_oracle_b59/**",
+    "legacy_residue": 460,
     "old_closure_paths": 4,
     "branch_ref_occurrence_files": 15,
     "non_derived_branch_ref_files": 4,
-    "authority_use_lines": 343,
-    "normalized_log_sha256": "c6fe18db31225530c85f07374be2b93fbd2e343e2959c9a94f7e8521f34712d8",
+    "authority_use_lines": 331,
+    "raw_log_sha256": "aa50ca96ffe94bc3917f2ba065edce9de2aa1843c442ac72fa37aeaf230b7232",
+    "normalized_log_sha256": "34d516017699c2a8cdc39d74ed52a037aa5787fca688d5bac7f4955b8fc0698b",
     "result": "RED"
+  },
+  "model_evidence": {
+    "compile_command": "rustc --edition=2021 --test -D warnings packages/lix/tests/branch_ref_whole_closure_oracle_b59/branch_ref_whole_closure_model.rs -o model",
+    "compile_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "runtime_command": "./model --nocapture --test-threads=1",
+    "runtime_log_sha256": "f3988dddb6163e4da6160c67fee6ae31a7c21541f8c421abefea9955d6c06fc2",
+    "binary_sha256": "26c829ad33572ccc59ad8aecf0be29361220be1c2ead7568de90a00d22176328",
+    "passed": 15,
+    "failed": 0
   },
   "anchor": {
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
