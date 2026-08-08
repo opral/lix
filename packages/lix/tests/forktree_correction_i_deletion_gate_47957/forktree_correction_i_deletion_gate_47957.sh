@@ -131,7 +131,7 @@ check_route_baseline_token() {
     FNR == 1 {next_file=0}
     /^#[[:space:]]*\[cfg\(test\)\]/{next_file=1}
     !next_file{print FILENAME ":" $0}
-  ' "${absolute_route_files[@]}" | rg -o -i -F "$pattern" | wc -l | tr -d ' ')
+  ' "${absolute_route_files[@]}" | { rg -o -i -F "$pattern" || true; } | wc -l | tr -d ' ')
   delta=$((count - expected))
   printf 'ROUTE_DEP token=%s baseline=%s current=%s delta=%+d\n' "$label" "$expected" "$count" "$delta"
   if ((delta > 0)); then
