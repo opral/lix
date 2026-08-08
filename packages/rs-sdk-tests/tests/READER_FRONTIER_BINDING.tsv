@@ -1,0 +1,16 @@
+key	value
+status	blocked-derived-scan-and-legacy-reader
+approved_base_head	d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+approved_base_tree	641654079f60fcd1c9ff9ccbbd06d3edcabe4096
+pending_ref	UNBOUND
+pending_head	9f3c703e953440cde1d60b1511467c4337648c8f
+pending_tree	51a0026c0c3eced6fdaa5e5ed4824111377f086c
+pending_parent	d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+pending_diff_sha256_prefix	6000f34f
+pending_patch_id_prefix	3890dad2
+expected_cargo_errors	185
+expected_cargo_warnings	7
+required_approvals	R2,R4,H4
+required_before_runtime	true
+block_reason	derived/history scans can return empty current-state success; load_exact_batch retains legacy TrackedHead/control reader
+last_approved_base	d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768

@@ -37,6 +37,15 @@ accepting a descendant, and validates the bound R1 checkpoint/GC ref before
 enabling stages 6--7. It still will not run a cell until the candidate is
 explicitly compile-green.
 
+The stage-7 W5/R7 package is immutable but explicitly no-run blocked by
+inherited d6b symbols, so it is bound as report-only evidence rather than a
+runtime pass. The pending reader frontier is
+`9f3c703e953440cde1d60b1511467c4337648c8f` / tree
+`51a0026c0c3eced6fdaa5e5ed4824111377f086c`; it is blocked by derived/history
+empty-success and legacy TrackedHead/control acquisition in `load_exact_batch`.
+Its transport ref is unbound, d6 remains the last approved base, and it cannot
+enable runtime.
+
 The historical artifact comparator remains exact a12
 `a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3`, tree
 `9a705d36392e88d8f5f363b2b23d373deec3321d`; all a12-based artifact diffs are

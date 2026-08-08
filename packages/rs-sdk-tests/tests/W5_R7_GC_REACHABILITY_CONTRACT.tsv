@@ -1,10 +1,23 @@
 key	value
-status	external-report-only
-contract_path	/root/repos/lix-evidence/forktree-w5-r7-gc-reachability-contract/CONTRACT.md
-contract_sha256	9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8
-sums_path	/root/repos/lix-evidence/forktree-w5-r7-gc-reachability-contract/SHA256SUMS
-sums_sha256	cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88
+status	immutable-report-only-no-run-blocked
+ref	refs/heads/codex/forktree-w5-r7-gc-reachability-oracle
+base_head	d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768
+base_tree	641654079f60fcd1c9ff9ccbbd06d3edcabe4096
+base_parent	1f742a382c755399b8a49ab536c4f6dc55fffdd8
+head	6487170dfa11b24411dbbd73e3c003439072df09
+tree	94eefb7de3260a8c8a3217805a5372cb8670157c
+full_index_diff_sha256	b12d49fbb8f991459ca9a9e6513f26f392ce642c9b25e95efc1be44ecb166345
+ordinary_diff_sha256	7bf9e7110c87089bee1e07a7e42a9b9d76381c2f564fffa5566c9ba5b5e0783e
+format_patch_sha256	ebcd9c1be887b8a48a24dac0f85c45203f0aebb48753b6ab09563f7ec95b063f
+patch_id	3b8ef7eeec6cb3b6edbc5f5b1d5226f79615a247
+report_path	/root/repos/lix-evidence/forktree-w5-r7-gc-reachability-oracle/FINAL_REPORT.md
+report_sha256	fd47899844bafc72fb47c254f77c74b91d4d40f43d0bb2a54d043823892b6a35
+manifest_sha256	ea5a278b81d23136e276b29e350752b8c25ce656ba375864362fc2ab0d60ee4c
+residue_count	168
+residue_log_sha256	af5cb87c2e9a7d3d144a50ba018f5d87c336458732dd6756d2d312b8eb71eec6
+standalone_model_binary_sha256	2ad6a3ac8868486357b5bba10b16b0633c8238d89c19c4b1b5eed06abd0c1765
+package_status	cargo-no-run-blocked-inherited-d6b-symbols
 stage	7
 required_semantics	one epoch-fenced authority; 64+suffix and one-debt/no-spin; H/S/C chronology; reader pins; all roots; final-reference reclamation; corruption; cold reopen
 adapters	Memory,RocksDB,SlateDB
-runtime_prerequisite	candidate compile-green and reviewed R5 correction
+runtime_prerequisite	candidate compile-green; W5 package no-run blocker resolved; reviewed R5 correction

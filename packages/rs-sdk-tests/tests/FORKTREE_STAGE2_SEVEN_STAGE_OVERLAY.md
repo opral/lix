@@ -1,7 +1,7 @@
 # ForkTree Stage 2 seven-stage landing overlay
 
 Status: test/report-only, R1-bound, R5 source-approved but transport-pending,
-dormant, and disposable. This package does not
+reader frontier blocked, dormant, and disposable. This package does not
 modify production source, merge artifact branches, or execute a runtime cell.
 The `run` mode is fenced on purpose: it requires an explicitly compile-green
 candidate. `verify` validates the immutable R1 binding, while runtime still
@@ -80,11 +80,17 @@ contract SHA-256 is
 `9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8`; the
 companion `SHA256SUMS` SHA-256 is
 `cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88`.
-The artifact is not mounted on this host, so the binding is identity-only.
+The immutable package is report-only and no-run blocked by inherited d6b
+production symbols. Its exact head is
+`6487170dfa11b24411dbbd73e3c003439072df09`, tree
+`94eefb7de3260a8c8a3217805a5372cb8670157c`, full-index diff
+`b12d49fbb8f991459ca9a9e6513f26f392ce642c9b25e95efc1be44ecb166345`, patch
+`3b8ef7eeec6cb3b6edbc5f5b1d5226f79615a247`, report
+`fd47899844bafc72fb47c254f77c74b91d4d40f43d0bb2a54d043823892b6a35`, and
+manifest `ea5a278b81d23136e276b29e350752b8c25ce656ba375864362fc2ab0d60ee4c`.
 It supplies the one epoch-fenced authority, 64+suffix and one-debt/no-spin,
 H/S/C chronology, reader-pin, complete-root, final-reference, corruption, and
-cold-reopen requirements for stage 7. It does not authorize runtime before a
-compile-green reviewed R5 successor.
+cold-reopen requirements for stage 7, but does not authorize runtime.
 
 ## R5 correction hold
 
@@ -99,9 +105,21 @@ R5 ref/head/tree/report hashes are complete.
 
 ## Overlay scope
 
+## Reader frontier hold
+
+`READER_FRONTIER_BINDING.tsv` records pending reader frontier
+`9f3c703e953440cde1d60b1511467c4337648c8f` / tree
+`51a0026c0c3eced6fdaa5e5ed4824111377f086c`, parent d6b, diff prefix
+`6000f34f`, patch prefix `3890dad2`, and expected compile frontier 185 errors /
+7 warnings. It is blocked because derived/history scans can return empty
+current-state success and `load_exact_batch` still acquires legacy
+TrackedHead/control state. Its transport ref is unbound; d6 remains the last
+approved base, and this frontier remains metadata-only and cannot enable
+runtime.
+
 The overlay consists only of this manifest, its TSV, the R1 binding, the R5
-correction hold, the W5/R7 external contract binding, and the dormant verifier
-script. Materialization creates a disposable detached
+correction hold, the W5/R7 binding, the reader frontier binding, and the dormant
+verifier script. Materialization creates a disposable detached
 candidate worktree and places these files under `.stage2-acceptance-overlay/`;
 it does not patch production paths or copy oracle implementations into them.
 The candidate's own production diff is recorded, not rewritten. Artifact refs

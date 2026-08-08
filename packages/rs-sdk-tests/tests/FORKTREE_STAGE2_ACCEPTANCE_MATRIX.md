@@ -36,7 +36,7 @@ disposable overlay and machine-readable seven-stage order are
 `FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.md`,
 `FORKTREE_STAGE2_SEVEN_STAGE_OVERLAY.tsv`,
 `R1_CHECKPOINT_GC_BINDING.tsv`, `R5_CORRECTED_FRONTIER_BINDING.tsv`,
-`W5_R7_GC_REACHABILITY_CONTRACT.tsv`, and
+`W5_R7_GC_REACHABILITY_CONTRACT.tsv`, `READER_FRONTIER_BINDING.tsv`, and
 `forktree_stage2_seven_stage_overlay.sh`. They are dormant and test/report
 only: no runtime cell may start until a candidate has a reviewed correction
 frontier replacing blocked `1f742...`, is explicitly compile-green, and the R1
@@ -289,9 +289,22 @@ Stage 7 also binds the external W5/R7 reachability contract: contract SHA
 `9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8` and
 companion sums SHA
 `cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88`.
-The contract is report-only and not mounted locally; its one authority,
-epoch/race, reader-pin, root-universe, corruption, cold-reopen, and final
-reference requirements are bound without enabling runtime.
+The immutable W5 package is report-only and no-run blocked by inherited d6b
+symbols: head `6487170dfa11b24411dbbd73e3c003439072df09`, tree
+`94eefb7de3260a8c8a3217805a5372cb8670157c`, report
+`fd47899844bafc72fb47c254f77c74b91d4d40f43d0bb2a54d043823892b6a35`, and
+manifest `ea5a278b81d23136e276b29e350752b8c25ce656ba375864362fc2ab0d60ee4c`.
+Its one authority, epoch/race, reader-pin, root-universe, corruption,
+cold-reopen, and final-reference requirements are bound without enabling
+runtime.
+
+The pending reader frontier above approved d6b is head
+`9f3c703e953440cde1d60b1511467c4337648c8f`, tree
+`51a0026c0c3eced6fdaa5e5ed4824111377f086c`, parent d6b, diff prefix
+`6000f34f`, patch prefix `3890dad2`, expected compile frontier 185/7. It is
+blocked by derived/history empty-success and legacy TrackedHead/control
+acquisition in `load_exact_batch`; d6 remains the last approved base and the
+frontier cannot be promoted or run.
 
 This is the reduced non-negotiable landing gate for the first explicitly
 compile-green immutable candidate. It is test/report-only and does not authorize

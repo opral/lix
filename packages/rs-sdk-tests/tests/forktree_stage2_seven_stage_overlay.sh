@@ -23,6 +23,7 @@ main_head=822c204ce0670969ca71045bc74f9ca25fde8093
 main_tree=fac3f2b713683be17c34515062dd72edc8feed95
 r5_binding="$script_dir/R5_CORRECTED_FRONTIER_BINDING.tsv"
 w5_binding="$script_dir/W5_R7_GC_REACHABILITY_CONTRACT.tsv"
+reader_binding="$script_dir/READER_FRONTIER_BINDING.tsv"
 
 gitc() { git -C "$root" "$@"; }
 sha_file() { sha256sum "$1" | awk '{print $1}'; }
@@ -63,6 +64,7 @@ verify_scope() {
     R1_CHECKPOINT_GC_BINDING.tsv \
     R5_CORRECTED_FRONTIER_BINDING.tsv \
     W5_R7_GC_REACHABILITY_CONTRACT.tsv \
+    READER_FRONTIER_BINDING.tsv \
     forktree_stage2_seven_stage_overlay.sh; do
     [[ "$p" =~ $forbidden ]] && die "overlay scope contains forbidden legacy token in path: $p"
     [[ -f "$script_dir/$p" ]] || die "overlay artifact missing: $p"
@@ -88,6 +90,15 @@ binding_value() {
 r5_value() {
   local key=$1
   awk -F '\t' -v k="$key" '$1==k {print $2}' "$r5_binding"
+}
+
+reader_status() {
+  awk -F '\t' '$1=="status" {print $2}' "$reader_binding"
+}
+
+reader_value() {
+  local key=$1
+  awk -F '\t' -v k="$key" '$1==k {print $2}' "$reader_binding"
 }
 
 verify_r1() {
@@ -169,20 +180,38 @@ verify_r5() {
 }
 
 verify_w5() {
-  local status contract sums path
+  local status ref actual tree
   status=$(awk -F '\t' '$1=="status" {print $2}' "$w5_binding")
-  contract=$(awk -F '\t' '$1=="contract_sha256" {print $2}' "$w5_binding")
-  sums=$(awk -F '\t' '$1=="sums_sha256" {print $2}' "$w5_binding")
-  [[ "$status" == external-report-only ]] || die "W5/R7 status changed unexpectedly"
-  [[ "$contract" == 9b0aa1f080a082685df1cdbd905bbf90064840b9858159f099d394d7ecf1afb8 ]] || die "W5/R7 contract hash mismatch"
-  [[ "$sums" == cea56dd052eb8d64a41bd52feebf5a39623a233d3c8037e0bc5b792e76190e88 ]] || die "W5/R7 sums hash mismatch"
-  path=$(awk -F '\t' '$1=="contract_path" {print $2}' "$w5_binding")
-  if [[ -f "$path" ]]; then
-    [[ "$(sha_file "$path")" == "$contract" ]] || die "mounted W5/R7 contract hash mismatch"
-    note "w5-r7\tPASS\t$contract\tmounted contract verified"
+  ref=$(awk -F '\t' '$1=="ref" {print $2}' "$w5_binding")
+  [[ "$status" == immutable-report-only-no-run-blocked ]] || die "W5/R7 status changed unexpectedly"
+  [[ "$ref" == refs/heads/codex/forktree-w5-r7-gc-reachability-oracle ]] || die "W5/R7 ref mismatch"
+  [[ "$(awk -F '\t' '$1=="base_head" {print $2}' "$w5_binding")" == "d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768" ]] || die "W5/R7 base mismatch"
+  [[ "$(awk -F '\t' '$1=="head" {print $2}' "$w5_binding")" == "6487170dfa11b24411dbbd73e3c003439072df09" ]] || die "W5/R7 head mismatch"
+  [[ "$(awk -F '\t' '$1=="tree" {print $2}' "$w5_binding")" == "94eefb7de3260a8c8a3217805a5372cb8670157c" ]] || die "W5/R7 tree mismatch"
+  [[ "$(awk -F '\t' '$1=="full_index_diff_sha256" {print $2}' "$w5_binding")" == "b12d49fbb8f991459ca9a9e6513f26f392ce642c9b25e95efc1be44ecb166345" ]] || die "W5/R7 full-index mismatch"
+  [[ "$(awk -F '\t' '$1=="patch_id" {print $2}' "$w5_binding")" == "3b8ef7eeec6cb3b6edbc5f5b1d5226f79615a247" ]] || die "W5/R7 patch mismatch"
+  local report_path
+  report_path=$(awk -F '\t' '$1=="report_path" {print $2}' "$w5_binding")
+  if [[ -f "$report_path" ]]; then
+    [[ "$(sha_file "$report_path")" == "fd47899844bafc72fb47c254f77c74b91d4d40f43d0bb2a54d043823892b6a35" ]] || die "W5/R7 report hash mismatch"
+    note "w5-r7\tPASS\t$report_path\timmutable report verified"
   else
-    note "w5-r7\tEXTERNAL\t$contract\tcontract not mounted; identity bound"
+    note "w5-r7\tEXTERNAL\t6487170dfa11b24411dbbd73e3c003439072df09\timmutable no-run-blocked package; report not mounted"
   fi
+}
+
+verify_reader_frontier() {
+  [[ "$(reader_status)" == blocked-derived-scan-and-legacy-reader ]] || die "reader frontier status changed unexpectedly"
+  [[ "$(reader_value approved_base_head)" == "d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768" ]] || die "reader approved-base head mismatch"
+  [[ "$(reader_value approved_base_tree)" == "641654079f60fcd1c9ff9ccbbd06d3edcabe4096" ]] || die "reader approved-base tree mismatch"
+  [[ "$(reader_value pending_ref)" == UNBOUND ]] || die "reader frontier ref must remain unbound"
+  [[ "$(reader_value pending_head)" == "9f3c703e953440cde1d60b1511467c4337648c8f" ]] || die "reader frontier head mismatch"
+  [[ "$(reader_value pending_tree)" == "51a0026c0c3eced6fdaa5e5ed4824111377f086c" ]] || die "reader frontier tree mismatch"
+  [[ "$(reader_value pending_parent)" == "d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768" ]] || die "reader frontier parent mismatch"
+  [[ "$(reader_value pending_diff_sha256_prefix)" == "6000f34f" ]] || die "reader frontier diff prefix mismatch"
+  [[ "$(reader_value pending_patch_id_prefix)" == "3890dad2" ]] || die "reader frontier patch prefix mismatch"
+  [[ "$(reader_value expected_cargo_errors)" == 185 && "$(reader_value expected_cargo_warnings)" == 7 ]] || die "reader frontier expected compile frontier mismatch"
+  note "reader-frontier\tBLOCKED\t9f3c703e953440cde1d60b1511467c4337648c8f\t51a0026c0c3eced6fdaa5e5ed4824111377f086c\tderived/history empty-success and legacy TrackedHead/control reader\tlast-approved=d6b2690afc0fc6a0acccd5c4bef4c171a7aa7768\tno runtime enabled"
 }
 
 print_commands() {
@@ -207,6 +236,7 @@ case "$mode" in
     verify_r1
     verify_r5
     verify_w5
+    verify_reader_frontier
     note "runtime\tDORMANT\tset RUN_RUNTIME=1 only after explicit compile-green immutable approval"
     ;;
   commands)
@@ -225,6 +255,7 @@ case "$mode" in
     cp "$binding" "$overlay/.stage2-acceptance-overlay/"
     cp "$r5_binding" "$overlay/.stage2-acceptance-overlay/"
     cp "$w5_binding" "$overlay/.stage2-acceptance-overlay/"
+    cp "$reader_binding" "$overlay/.stage2-acceptance-overlay/"
     note "materialized\tPASS\t$overlay\tproduction paths unchanged\truntime dormant"
     ;;
   run)
@@ -234,6 +265,7 @@ case "$mode" in
     verify_scope
     [[ "$(r1_status)" == ready ]] || die "R1 immutable checkpoint/GC binding is not ready"
     [[ "$(r5_status)" == ready ]] || die "R5 reviewed correction is not ready"
+    [[ "$(reader_status)" == ready ]] || die "reader frontier review/transport is not ready"
     die "execution handoff requires the exact R1 command fields; use commands after binding"
     ;;
   *) die "unknown mode: $mode (verify|commands|materialize|run)" ;;
