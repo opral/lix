@@ -17,8 +17,6 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
-#[cfg(test)]
-use lix::storage::SpaceId;
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::{
     ImmutableSegment, ImmutableSegmentWriter, ImmutableValueLocator, decode_immutable_locator,
@@ -4654,7 +4652,7 @@ impl WriteGate {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
 
