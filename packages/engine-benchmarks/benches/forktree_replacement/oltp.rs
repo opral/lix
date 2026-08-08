@@ -10,7 +10,10 @@ use std::time::Instant;
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
-use super::model::{ForkTree, Mutation, RelationalValue};
+use super::model::{
+    ForkTree, Mutation, PointReadProfile, PointRoleProfile, RelationalValue,
+    begin_point_read_profile, end_point_read_profile,
+};
 use super::{
     CountingStorage, IoStats, begin_allocation_profile, directory_bytes, end_allocation_profile,
     process_cpu_nanos, process_resident_bytes,
@@ -251,10 +254,16 @@ async fn measure<S: OltpStorage>(
     let peak_before = peak_resident_bytes();
     let cpu_before = process_cpu_nanos();
     begin_allocation_profile();
+    let point_profile_enabled = operation == Operation::PointRead
+        && std::env::var_os("FORKTREE_POINT_ROLE_PROFILE").is_some();
+    if point_profile_enabled {
+        begin_point_read_profile();
+    }
     let started = Instant::now();
     let (result_digest, commits) =
         operation_run(&tree, &race_control, rows, operation, batch_size).await;
     let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let point_profile = point_profile_enabled.then(end_point_read_profile);
     let (alloc_bytes, alloc_calls) = end_allocation_profile();
     let cpu_us = process_cpu_nanos().saturating_sub(cpu_before) as f64 / 1_000.0;
     let rss_after = process_resident_bytes();
@@ -318,6 +327,75 @@ async fn measure<S: OltpStorage>(
         backend.write_bytes,
         backend.commits,
     );
+    if let Some(profile) = point_profile {
+        print_point_profile(S::LABEL, rows, wall_us, cpu_us, alloc_bytes, &profile);
+    }
+}
+
+fn print_point_profile(
+    backend: &str,
+    rows: usize,
+    wall_us: f64,
+    cpu_us: f64,
+    alloc_bytes: u64,
+    profile: &PointReadProfile,
+) {
+    for (role, values) in [
+        ("selector", profile.selector),
+        ("catalog", profile.catalog),
+        ("root_internal", profile.root_internal),
+        ("leaf", profile.leaf),
+        ("value", profile.value),
+    ] {
+        let role_wall_us = values.wall_ns() as f64 / 1_000.0;
+        let role_cpu_us = values.cpu_ns() as f64 / 1_000.0;
+        println!(
+            "forktree_point_role_profile,backend={backend},rows={rows},role={role},wall_us={role_wall_us:.3},wall_ceiling_pct={:.3},cpu_us={role_cpu_us:.3},cpu_ceiling_pct={:.3},alloc_bytes={},alloc_calls={},alloc_ceiling_pct={:.3},backend_wall_us={:.3},backend_cpu_us={:.3},hash_wall_us={:.3},hash_cpu_us={:.3},decode_wall_us={:.3},decode_cpu_us={:.3},backend_calls={},backend_keys={},backend_objects={},backend_bytes={}",
+            role_wall_us / wall_us * 100.0,
+            role_cpu_us / cpu_us * 100.0,
+            values.alloc_bytes,
+            values.alloc_calls,
+            values.alloc_bytes as f64 / alloc_bytes as f64 * 100.0,
+            values.backend_wall_ns as f64 / 1_000.0,
+            values.backend_cpu_ns as f64 / 1_000.0,
+            values.hash_wall_ns as f64 / 1_000.0,
+            values.hash_cpu_ns as f64 / 1_000.0,
+            values.decode_wall_ns as f64 / 1_000.0,
+            values.decode_cpu_ns as f64 / 1_000.0,
+            values.backend_calls,
+            values.backend_keys,
+            values.backend_objects,
+            values.backend_bytes,
+        );
+    }
+    let accounted_wall_ns = point_profile_roles(profile)
+        .map(PointRoleProfile::wall_ns)
+        .sum::<u64>();
+    let accounted_cpu_ns = point_profile_roles(profile)
+        .map(PointRoleProfile::cpu_ns)
+        .sum::<u64>();
+    let accounted_alloc_bytes = point_profile_roles(profile)
+        .map(|role| role.alloc_bytes)
+        .sum::<u64>();
+    println!(
+        "forktree_point_role_profile_total,backend={backend},rows={rows},measured_wall_us={wall_us:.3},accounted_wall_us={:.3},accounted_wall_pct={:.3},measured_cpu_us={cpu_us:.3},accounted_cpu_us={:.3},accounted_cpu_pct={:.3},measured_alloc_bytes={alloc_bytes},accounted_alloc_bytes={accounted_alloc_bytes},accounted_alloc_pct={:.3}",
+        accounted_wall_ns as f64 / 1_000.0,
+        accounted_wall_ns as f64 / 1_000.0 / wall_us * 100.0,
+        accounted_cpu_ns as f64 / 1_000.0,
+        accounted_cpu_ns as f64 / 1_000.0 / cpu_us * 100.0,
+        accounted_alloc_bytes as f64 / alloc_bytes as f64 * 100.0,
+    );
+}
+
+fn point_profile_roles(profile: &PointReadProfile) -> impl Iterator<Item = PointRoleProfile> + '_ {
+    [
+        profile.selector,
+        profile.catalog,
+        profile.root_internal,
+        profile.leaf,
+        profile.value,
+    ]
+    .into_iter()
 }
 
 async fn operation_run<S>(

@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::ops::Bound;
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant as ProfileInstant;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
@@ -275,6 +278,171 @@ impl std::ops::AddAssign for ApplyAccounting {
 #[derive(Clone)]
 pub struct ForkTree<S> {
     storage: S,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PointRoleProfile {
+    pub backend_wall_ns: u64,
+    pub backend_cpu_ns: u64,
+    pub hash_wall_ns: u64,
+    pub hash_cpu_ns: u64,
+    pub decode_wall_ns: u64,
+    pub decode_cpu_ns: u64,
+    pub alloc_bytes: u64,
+    pub alloc_calls: u64,
+    pub backend_calls: u64,
+    pub backend_keys: u64,
+    pub backend_objects: u64,
+    pub backend_bytes: u64,
+}
+
+impl PointRoleProfile {
+    pub fn wall_ns(self) -> u64 {
+        self.backend_wall_ns
+            .saturating_add(self.hash_wall_ns)
+            .saturating_add(self.decode_wall_ns)
+    }
+
+    pub fn cpu_ns(self) -> u64 {
+        self.backend_cpu_ns
+            .saturating_add(self.hash_cpu_ns)
+            .saturating_add(self.decode_cpu_ns)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PointReadProfile {
+    pub selector: PointRoleProfile,
+    pub catalog: PointRoleProfile,
+    pub root_internal: PointRoleProfile,
+    pub leaf: PointRoleProfile,
+    pub value: PointRoleProfile,
+}
+
+#[derive(Clone, Copy)]
+enum PointRole {
+    Selector,
+    Catalog,
+    RootInternal,
+    Leaf,
+    Value,
+}
+
+#[derive(Clone, Copy)]
+enum PointStage {
+    Backend,
+    Hash,
+    Decode,
+}
+
+#[derive(Clone, Copy)]
+struct StageMeasurement {
+    wall_ns: u64,
+    cpu_ns: u64,
+    alloc_bytes: u64,
+    alloc_calls: u64,
+}
+
+static POINT_READ_PROFILE: LazyLock<Mutex<Option<PointReadProfile>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub fn begin_point_read_profile() {
+    *POINT_READ_PROFILE.lock().expect("point-read profile mutex") =
+        Some(PointReadProfile::default());
+}
+
+pub fn end_point_read_profile() -> PointReadProfile {
+    POINT_READ_PROFILE
+        .lock()
+        .expect("point-read profile mutex")
+        .take()
+        .expect("point-read profile was not active")
+}
+
+fn point_read_profile_enabled() -> bool {
+    POINT_READ_PROFILE
+        .lock()
+        .expect("point-read profile mutex")
+        .is_some()
+}
+
+fn measure_stage<T>(operation: impl FnOnce() -> T) -> (T, StageMeasurement) {
+    let allocation_before = super::allocation_profile_snapshot();
+    let cpu_before = super::process_cpu_nanos();
+    let started = ProfileInstant::now();
+    let output = operation();
+    let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let cpu_ns = super::process_cpu_nanos().saturating_sub(cpu_before);
+    let allocation_after = super::allocation_profile_snapshot();
+    (
+        output,
+        StageMeasurement {
+            wall_ns,
+            cpu_ns,
+            alloc_bytes: allocation_after.0.saturating_sub(allocation_before.0),
+            alloc_calls: allocation_after.1.saturating_sub(allocation_before.1),
+        },
+    )
+}
+
+async fn measure_async_stage<T>(operation: impl Future<Output = T>) -> (T, StageMeasurement) {
+    let allocation_before = super::allocation_profile_snapshot();
+    let cpu_before = super::process_cpu_nanos();
+    let started = ProfileInstant::now();
+    let output = operation.await;
+    let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let cpu_ns = super::process_cpu_nanos().saturating_sub(cpu_before);
+    let allocation_after = super::allocation_profile_snapshot();
+    (
+        output,
+        StageMeasurement {
+            wall_ns,
+            cpu_ns,
+            alloc_bytes: allocation_after.0.saturating_sub(allocation_before.0),
+            alloc_calls: allocation_after.1.saturating_sub(allocation_before.1),
+        },
+    )
+}
+
+fn record_point_stage(
+    role: PointRole,
+    stage: PointStage,
+    measurement: StageMeasurement,
+    backend_keys: u64,
+    backend_objects: u64,
+    backend_bytes: u64,
+) {
+    let mut profile = POINT_READ_PROFILE.lock().expect("point-read profile mutex");
+    let Some(profile) = profile.as_mut() else {
+        return;
+    };
+    let role = match role {
+        PointRole::Selector => &mut profile.selector,
+        PointRole::Catalog => &mut profile.catalog,
+        PointRole::RootInternal => &mut profile.root_internal,
+        PointRole::Leaf => &mut profile.leaf,
+        PointRole::Value => &mut profile.value,
+    };
+    match stage {
+        PointStage::Backend => {
+            role.backend_wall_ns = role.backend_wall_ns.saturating_add(measurement.wall_ns);
+            role.backend_cpu_ns = role.backend_cpu_ns.saturating_add(measurement.cpu_ns);
+            role.backend_calls = role.backend_calls.saturating_add(1);
+            role.backend_keys = role.backend_keys.saturating_add(backend_keys);
+            role.backend_objects = role.backend_objects.saturating_add(backend_objects);
+            role.backend_bytes = role.backend_bytes.saturating_add(backend_bytes);
+        }
+        PointStage::Hash => {
+            role.hash_wall_ns = role.hash_wall_ns.saturating_add(measurement.wall_ns);
+            role.hash_cpu_ns = role.hash_cpu_ns.saturating_add(measurement.cpu_ns);
+        }
+        PointStage::Decode => {
+            role.decode_wall_ns = role.decode_wall_ns.saturating_add(measurement.wall_ns);
+            role.decode_cpu_ns = role.decode_cpu_ns.saturating_add(measurement.cpu_ns);
+        }
+    }
+    role.alloc_bytes = role.alloc_bytes.saturating_add(measurement.alloc_bytes);
+    role.alloc_calls = role.alloc_calls.saturating_add(measurement.alloc_calls);
 }
 
 #[derive(Clone, Debug)]
@@ -1013,9 +1181,30 @@ where
         branch: &str,
         key: &[u8],
     ) -> Result<Option<RelationalValue>, String> {
+        if point_read_profile_enabled() {
+            return self.read_relational_point_profiled(branch, key).await;
+        }
         let commit = self.load_commit(self.branch_head(branch).await?).await?;
         match self.find_value_optional(commit.root, key).await? {
             Some(value) => self.load_relational_value(value).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn read_relational_point_profiled(
+        &self,
+        branch: &str,
+        key: &[u8],
+    ) -> Result<Option<RelationalValue>, String> {
+        let head = self
+            .load_head_at_key_profiled(&selector_key(BRANCH_PREFIX, branch))
+            .await?;
+        let commit = self.load_commit_profiled(head.commit).await?;
+        match self
+            .find_value_optional_profiled(commit.root, key, true)
+            .await?
+        {
+            Some(value) => self.load_relational_value_profiled(value).await.map(Some),
             None => Ok(None),
         }
     }
@@ -2549,6 +2738,54 @@ where
         })
     }
 
+    fn find_value_optional_profiled<'a>(
+        &'a self,
+        id: ObjectId,
+        key: &'a [u8],
+        root: bool,
+    ) -> BoxFuture<'a, Result<Option<ValueRef>, String>> {
+        Box::pin(async move {
+            let expected_role = if root {
+                PointRole::RootInternal
+            } else {
+                PointRole::Leaf
+            };
+            let bytes = self.load_object_profiled(id, expected_role).await?;
+            let (node, decode) = measure_stage(|| decode_node(&bytes));
+            let node = node?;
+            let actual_role = match &node {
+                Node::Internal(_) => PointRole::RootInternal,
+                Node::Leaf(_) => PointRole::Leaf,
+            };
+            if !matches!(
+                (expected_role, actual_role),
+                (PointRole::RootInternal, PointRole::RootInternal)
+                    | (PointRole::Leaf, PointRole::Leaf)
+            ) {
+                return Err(
+                    "1K point profile expected exactly one internal root above a leaf".to_string(),
+                );
+            }
+            record_point_stage(actual_role, PointStage::Decode, decode, 0, 0, 0);
+            match node {
+                Node::Leaf(rows) => Ok(rows
+                    .binary_search_by(|row| row.key.as_slice().cmp(key))
+                    .ok()
+                    .map(|index| rows[index].value)),
+                Node::Internal(children) => match children
+                    .iter()
+                    .find(|child| key <= child.max_key.as_slice())
+                {
+                    Some(child) => {
+                        self.find_value_optional_profiled(child.id, key, false)
+                            .await
+                    }
+                    None => Ok(None),
+                },
+            }
+        })
+    }
+
     fn collect_range_entries<'a>(
         &'a self,
         id: ObjectId,
@@ -2796,6 +3033,21 @@ where
 
     async fn load_relational_value(&self, value: ValueRef) -> Result<RelationalValue, String> {
         decode_value_pack(&self.load_object(value.pack).await?)?
+            .get(value.index as usize)
+            .cloned()
+            .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
+    }
+
+    async fn load_relational_value_profiled(
+        &self,
+        value: ValueRef,
+    ) -> Result<RelationalValue, String> {
+        let bytes = self
+            .load_object_profiled(value.pack, PointRole::Value)
+            .await?;
+        let (values, decode) = measure_stage(|| decode_value_pack(&bytes));
+        record_point_stage(PointRole::Value, PointStage::Decode, decode, 0, 0, 0);
+        values?
             .get(value.index as usize)
             .cloned()
             .ok_or_else(|| "ForkTree value-pack index is out of bounds".to_string())
@@ -3070,8 +3322,78 @@ where
         })
     }
 
+    async fn load_head_at_key_profiled(&self, selector: &[u8]) -> Result<Head, String> {
+        let (result, backend) = measure_async_stage(async {
+            let keys = [key(selector), key(EPOCH_KEY)];
+            let read = self
+                .storage
+                .begin_read(ReadOptions::default())
+                .await
+                .map_err(storage_error)?;
+            read.get_many(&[GetManyRequest {
+                space: REF_SPACE,
+                keys: &keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .map_err(storage_error)
+        })
+        .await;
+        let result = result?;
+        let backend_objects = result.values.iter().flatten().count() as u64;
+        let backend_bytes = result
+            .values
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                ProjectedValue::FullValue(bytes) => bytes.len() as u64,
+                ProjectedValue::KeyOnly => 0,
+            })
+            .sum();
+        record_point_stage(
+            PointRole::Selector,
+            PointStage::Backend,
+            backend,
+            2,
+            backend_objects,
+            backend_bytes,
+        );
+        let (head, decode) = measure_stage(|| {
+            let mut values = result.values.into_iter();
+            let raw_ref = projected_bytes(
+                &values
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| "missing ForkTree main ref".to_string())?,
+            )?
+            .clone();
+            let raw_epoch = projected_bytes(
+                &values
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| "missing ForkTree epoch".to_string())?,
+            )?
+            .clone();
+            Ok::<_, String>(Head {
+                commit: decode_ref(&raw_ref)?,
+                epoch: decode_epoch(&raw_epoch)?,
+                raw_ref,
+                raw_epoch,
+            })
+        });
+        record_point_stage(PointRole::Selector, PointStage::Decode, decode, 0, 0, 0);
+        head
+    }
+
     async fn load_commit(&self, id: ObjectId) -> Result<Commit, String> {
         decode_commit(&self.load_object(id).await?)
+    }
+
+    async fn load_commit_profiled(&self, id: ObjectId) -> Result<Commit, String> {
+        let bytes = self.load_object_profiled(id, PointRole::Catalog).await?;
+        let (commit, decode) = measure_stage(|| decode_commit(&bytes));
+        record_point_stage(PointRole::Catalog, PointStage::Decode, decode, 0, 0, 0);
+        commit
     }
 
     async fn load_object(&self, id: ObjectId) -> Result<Bytes, String> {
@@ -3079,6 +3401,66 @@ where
             .await?
             .pop()
             .ok_or_else(|| "ForkTree object batch unexpectedly empty".to_string())
+    }
+
+    async fn load_object_profiled(&self, id: ObjectId, role: PointRole) -> Result<Bytes, String> {
+        let ids = [id];
+        let (result, backend) = measure_async_stage(async {
+            let keys = ids
+                .iter()
+                .map(|id| Key(Bytes::copy_from_slice(&id.0)))
+                .collect::<Vec<_>>();
+            let read = self
+                .storage
+                .begin_read(ReadOptions::default())
+                .await
+                .map_err(storage_error)?;
+            read.get_many(&[GetManyRequest {
+                space: OBJECT_SPACE,
+                keys: &keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .map_err(storage_error)
+        })
+        .await;
+        let result = result?;
+        let backend_objects = result.values.iter().flatten().count() as u64;
+        let backend_bytes = result
+            .values
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                ProjectedValue::FullValue(bytes) => bytes.len() as u64,
+                ProjectedValue::KeyOnly => 0,
+            })
+            .sum();
+        record_point_stage(
+            role,
+            PointStage::Backend,
+            backend,
+            1,
+            backend_objects,
+            backend_bytes,
+        );
+        let (bytes, hash) = measure_stage(|| {
+            result
+                .values
+                .into_iter()
+                .zip(ids)
+                .map(|(value, id)| {
+                    let value =
+                        value.ok_or_else(|| format!("missing ForkTree object {}", hex_id(id)))?;
+                    let bytes = projected_bytes(&value)?.clone();
+                    authenticate(id, &bytes)?;
+                    Ok(bytes)
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .pop()
+                .ok_or_else(|| "ForkTree object batch unexpectedly empty".to_string())
+        });
+        record_point_stage(role, PointStage::Hash, hash, 0, 0, 0);
+        bytes
     }
 
     async fn load_objects(&self, ids: &[ObjectId]) -> Result<Vec<Bytes>, String> {
