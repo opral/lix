@@ -50,6 +50,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 libc = "0.2"
 rustc-hash = "2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1.15"
@@ -156,6 +157,12 @@ required-features = ["storage-benches"]
 [[bench]]
 name = "tracked_state_crud"
 path = "benches/tracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "sqlite_oltp_comparator"
+path = "benches/sqlite_oltp_comparator.rs"
 harness = false
 required-features = ["storage-benches"]
 
