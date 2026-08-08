@@ -1,6 +1,7 @@
 {
   "kind": "test-report-only-forktree-migration-oracle",
   "status": "dormant",
+  "oracle_revision": "d47-correction-1",
   "target": {
     "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
     "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
@@ -56,6 +57,12 @@
     "checkpoint_root",
     "idempotency"
   ],
+  "legacy_owner_paths": [
+    "packages/lix/src/tracked_state/context.rs",
+    "packages/lix/src/tracked_state/diff.rs",
+    "packages/lix/src/tracked_state/mod.rs",
+    "packages/lix/src/tracked_state/types.rs"
+  ],
   "forbidden_future_surfaces": [
     "TrackedStateStoreReader",
     "TrackedStateContext",
@@ -68,7 +75,7 @@
     "fallback compatibility rebuild reader or durable cache"
   ],
   "future_gate_order": [
-    "source residue verifier",
+    "source residue verifier (baseline stage is expected RED; candidate stage requires legacy paths absent)",
     "fmt and diff check",
     "standalone pure model",
     "warnings denied candidate no-run",

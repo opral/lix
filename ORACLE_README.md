@@ -5,6 +5,12 @@ This dormant test/report-only package is bound to b59e1f11a51153e0a787a81f0f25bf
 713455a3557907ce705d06f720fcdc4486bddd4a). It contains no production edit,
 compatibility reader, runtime result, or build result.
 
+The correction is stage-aware. The `baseline` source-gate stage expects the
+four legacy tracked-state owner files and returns an intentional RED. The
+`candidate` stage scans only the surviving production closure and requires
+those four paths to be absent; it never requires a path to both exist and be
+deleted.
+
 ## Source map
 
 The exact b59 direct closure is checked by the sibling source verifier.
@@ -32,11 +38,16 @@ deleted after their production callers move.
 
 ## Replacement and semantics
 
-Open one authenticated CoherentView from one retained read. Bind the raw
-global/branch selectors, epoch, state/catalog/checkpoint roots, branch owner,
-and view_id. Historical and current reads, stale reconciliation, transitions,
-checkpoint selection, undo/redo, savepoint decisions, and idempotency checks
-must not open a second reader or consult a cache/fallback/compatibility path.
+Open one authenticated CoherentView from one retained read. Bind immutable
+copies of the raw global/branch selectors, epoch, state/catalog/checkpoint
+roots, branch owner, view_id, and the selected snapshot bytes. Current reads
+must use those captured bytes rather than mutable store maps; external
+publication must leave the old view stable while its later CAS is rejected as
+stale. Historical reads validate the selected commit and roots before reading.
+Same-owner reconciliation is stale when its owner epoch advanced; an
+unrelated-owner change is explicitly distinguishable and does not poison the
+transaction's owner scope. No path may open a second reader or consult a
+cache/fallback/compatibility path.
 
 Classify intent before making a plan. Genuine no-op and unsupported cohorts
 make zero plan, prepare, write, commit, and epoch rotation. Supported work
@@ -47,20 +58,26 @@ must leave selectors, roots, history, rows, and counters unchanged.
 
 NULL is a value; tombstone is suppression; absence falls through from local to
 global. Branch scope, parent generation, CommitId, and ChangeId are
-authenticated identities. Cold reopen must validate the same root graph and
-return the same rows.
+authenticated identities. Missing source/desired commits and malformed or
+missing roots fail closed; they never become digest zero or an implicit
+tombstone. Cold reopen must validate the same root graph and return the same
+rows.
 
 ## Future dormant order
 
 Use candidate-specific targets under /root/repos and cap each cell at 1200
 seconds:
 
-1. verify_tracked_state_transaction_source.sh CANDIDATE b59e1f11a51153e0a787a81f0f25bf104d150aaf
+1. verify_tracked_state_transaction_source.sh /absolute/candidate/worktree b59e1f11a51153e0a787a81f0f25bf104d150aaf candidate
+   (run `/absolute/b59/worktree ... b59... baseline` first to record the expected RED)
 2. cargo fmt --all -- --check and git diff --check
 3. rustc --edition=2021 --test model.rs -o /root/repos/forktree-b59-model-tests
 4. CARGO_TARGET_DIR=/root/repos/target-forktree-b59-memory timeout 1200 cargo test -p lix_tests --test forktree_tracked_state_transaction_oracle memory -- --exact --nocapture --test-threads=1
 5. CARGO_TARGET_DIR=/root/repos/target-forktree-b59-rocks timeout 1200 cargo test -p lix_tests --test forktree_tracked_state_transaction_oracle rocksdb -- --exact --nocapture --test-threads=1
 6. CARGO_TARGET_DIR=/root/repos/target-forktree-b59-slate timeout 1200 cargo test -p lix_tests --test forktree_tracked_state_transaction_oracle slatedb -- --exact --nocapture --test-threads=1
 
-Those adapter commands are dormant recipes only. No current b59 model,
-source gate, no-run, Memory, RocksDB, or SlateDB command was executed.
+The pure model contains 16 focused tests, including captured-view stability
+after external mutation, same-owner stale versus unrelated-owner
+reconciliation, and missing/corrupt transition roots. Those adapter commands
+are dormant recipes only. The current b59 baseline source gate is expected
+RED; no candidate no-run, Memory, RocksDB, or SlateDB command was executed.

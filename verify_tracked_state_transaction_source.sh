@@ -3,10 +3,11 @@ set -euo pipefail
 
 ROOT=${1:-}
 ANCHOR=${2:-b59e1f11a51153e0a787a81f0f25bf104d150aaf}
+STAGE=${3:-candidate}
 LIX="$ROOT/packages/lix/src"
 
-if [[ -z "$ROOT" || ! -e "$ROOT/.git" ]]; then
-  echo "usage: verify_tracked_state_transaction_source.sh ROOT [ANCHOR]" >&2
+if [[ -z "$ROOT" || ! -e "$ROOT/.git" || ( "$STAGE" != "baseline" && "$STAGE" != "candidate" ) ]]; then
+  echo "usage: verify_tracked_state_transaction_source.sh ROOT [ANCHOR] [baseline|candidate]" >&2
   exit 2
 fi
 git -C "$ROOT" merge-base --is-ancestor "$ANCHOR" HEAD
@@ -35,6 +36,9 @@ DIRECT=(
   sql2/providers/filesystem_working_diff.rs
   sql2/providers/entity.rs
   sql2/exec/bound_public_write.rs
+)
+
+LEGACY_OWNER=(
   tracked_state/context.rs
   tracked_state/diff.rs
   tracked_state/mod.rs
@@ -48,11 +52,23 @@ for relative in "${DIRECT[@]}"; do
   }
 done
 
+if [[ "$STAGE" == "baseline" ]]; then
+  for path in "${LEGACY_OWNER[@]}"; do
+    if ! test -e "$LIX/$path"; then
+      echo "baseline expected legacy owner path is absent: $path"
+      exit 1
+    fi
+  done
+  echo "EXPECTED-RED baseline: legacy owner paths are retained for the b59 control"
+  exit 1
+fi
+
 declare -A FORBIDDEN=(
-  [reader-type]='TrackedStateStoreReader|TrackedStateContext'
+  [reader-type]='TrackedStateStoreReader|TrackedStateContext|TrackedStateReader'
+  [legacy-dto]='TrackedStateScanRequest|TrackedStateReadColumns|MaterializedTrackedState|TrackedStateRow'
   [reader-factory]='tracked_state_reader|with_opening_tracked_reader|tracked_state[.]reader[(]|TrackedHeadContext'
   [branch-control]='BranchHeadControlContext|BranchHeadControlCache'
-  [second-authority]='fallback|compatibility|rebuild_reader|reconstruct_reader|cache_as_authority'
+  [second-authority]='fallback|compatibility|rebuild_reader|reconstruct_reader|cache_as_authority|durable_cache'
 )
 
 status=0
@@ -61,20 +77,26 @@ for category in "${!FORBIDDEN[@]}"; do
   while IFS= read -r line; do
     echo "forbidden[$category] $line"
     status=1
-  done < <(rg -n --no-heading -E "$pattern" "${DIRECT[@]/#/$LIX/}" || true)
+  done < <(rg -n --no-heading -e "$pattern" "${DIRECT[@]/#/$LIX/}" || true)
 done
 
 begin_read_elsewhere=0
+begin_read_total=0
 for relative in "${DIRECT[@]}"; do
   file="$LIX/$relative"
-  count=$(rg -n -c --no-heading 'storage[.]begin_read[(]|begin_read[(]' "$file" || true)
+  count=$(rg -o --no-heading 'storage[.]begin_read[(]|begin_read[(]' "$file" | wc -l | tr -d ' ' || true)
   count=${count:-0}
+  begin_read_total=$((begin_read_total + count))
   if [[ "$relative" != "transaction/context.rs" && "$count" != "0" ]]; then
     echo "unowned begin_read in $relative: $count"
     begin_read_elsewhere=1
   fi
 done
 if (( begin_read_elsewhere != 0 )); then
+  status=1
+fi
+if [[ "$STAGE" == "candidate" && "$begin_read_total" != "1" ]]; then
+  echo "candidate requires exactly one opening begin_read, found: $begin_read_total"
   status=1
 fi
 
@@ -98,13 +120,9 @@ for token in "${REQUIRED[@]}"; do
   fi
 done
 
-for path in \
-  tracked_state/context.rs \
-  tracked_state/diff.rs \
-  tracked_state/mod.rs \
-  tracked_state/types.rs; do
+for path in "${LEGACY_OWNER[@]}"; do
   if test -e "$LIX/$path"; then
-    echo "legacy tracked-state owner path still present: $path"
+    echo "candidate legacy tracked-state owner path still present: $path"
     status=1
   fi
 done

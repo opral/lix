@@ -35,10 +35,14 @@ struct View {
     global_selector: Bytes,
     branch_selector: Bytes,
     epoch: u64,
+    owner_id: String,
+    owner_epoch: u64,
     branch_id: String,
     state_root: Bytes,
     catalog_root: Bytes,
     checkpoint_root: Bytes,
+    snapshot: Snapshot,
+    snapshot_bytes: Bytes,
     view_id: Bytes,
 }
 
@@ -87,6 +91,8 @@ enum OpenError {
     MissingRoot,
     RootAuthentication,
     WrongRootKind,
+    MissingSnapshot,
+    SnapshotAuthentication,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +100,8 @@ enum CommitError {
     StaleView,
     WrongOwner,
     ExpectedChangeMismatch,
+    MissingCommit,
+    CorruptHistory,
     FaultAfterObjectStage,
 }
 
@@ -101,6 +109,14 @@ enum CommitError {
 enum ReadError {
     MissingCommit,
     WrongBranch,
+    SnapshotAuthentication,
+    CorruptSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Reconciliation {
+    SameOwnerStable,
+    UnrelatedOwner,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +151,7 @@ struct Store {
     checkpoint_floor: CommitId,
     checkpoint_target: Option<CommitId>,
     redo_target: Option<CommitId>,
+    owner_epochs: BTreeMap<String, u64>,
     fault: Fault,
     counters: Counters,
 }
@@ -158,6 +175,7 @@ impl Store {
             checkpoint_floor: 0,
             checkpoint_target: None,
             redo_target: None,
+            owner_epochs: BTreeMap::from([(branch_id.clone(), 0), ("unrelated".to_owned(), 0)]),
             fault: Fault::None,
             counters: Counters::default(),
         };
@@ -183,14 +201,33 @@ impl Store {
         validate_root(&self.state_root, b"state-root-v1:")?;
         validate_root(&self.catalog_root, b"catalog-root-v1:")?;
         validate_root(&self.checkpoint_root, b"checkpoint-root-v1:")?;
+        let current_commit = self.next_commit.saturating_sub(1);
+        let snapshot = self
+            .history
+            .get(&current_commit)
+            .cloned()
+            .ok_or(OpenError::MissingSnapshot)?;
+        if !snapshot_matches_store(&snapshot, self) {
+            return Err(OpenError::SnapshotAuthentication);
+        }
+        let owner_epoch = self
+            .owner_epochs
+            .get(&self.branch_id)
+            .copied()
+            .ok_or(OpenError::MissingSnapshot)?;
+        let snapshot_bytes = snapshot_bytes(&snapshot);
         Ok(View {
             global_selector: self.global_selector.clone(),
             branch_selector: self.branch_selector.clone(),
             epoch: self.epoch,
+            owner_id: self.branch_id.clone(),
+            owner_epoch,
             branch_id: self.branch_id.clone(),
             state_root: self.state_root.clone(),
             catalog_root: self.catalog_root.clone(),
             checkpoint_root: self.checkpoint_root.clone(),
+            snapshot,
+            snapshot_bytes,
             view_id: view_id(
                 &self.global_selector,
                 &self.branch_selector,
@@ -200,6 +237,25 @@ impl Store {
                 &self.checkpoint_root,
             ),
         })
+    }
+
+    fn reconcile_owner(
+        &self,
+        tx: &Transaction,
+        changed_owner: &str,
+    ) -> Result<Reconciliation, CommitError> {
+        let current_epoch = self
+            .owner_epochs
+            .get(changed_owner)
+            .copied()
+            .ok_or(CommitError::CorruptHistory)?;
+        if changed_owner == tx.view.owner_id {
+            if current_epoch != tx.view.owner_epoch {
+                return Err(CommitError::StaleView);
+            }
+            return Ok(Reconciliation::SameOwnerStable);
+        }
+        Ok(Reconciliation::UnrelatedOwner)
     }
 
     fn begin_transaction(&mut self) -> Result<Transaction, OpenError> {
@@ -216,19 +272,28 @@ impl Store {
     }
 
     fn read_at_view(&self, tx: &Transaction, key: &str) -> Result<Option<Cell>, ReadError> {
-        if tx.view.branch_id != self.branch_id {
-            return Err(ReadError::WrongBranch);
-        }
+        validate_captured_view(tx)?;
         if let Some(cell) = tx.staged.get(key) {
-            return Ok(Some(cell.clone()));
-        }
-        if let Some(cell) = self.branch_rows.get(key) {
             return Ok(match cell {
                 Cell::Tombstone => None,
                 other => Some(other.clone()),
             });
         }
-        Ok(self.global_rows.get(key).cloned())
+        if let Some(cell) = tx.view.snapshot.local.get(key) {
+            return Ok(match cell {
+                Cell::Tombstone => None,
+                other => Some(other.clone()),
+            });
+        }
+        Ok(tx
+            .view
+            .snapshot
+            .global
+            .get(key)
+            .and_then(|cell| match cell {
+                Cell::Tombstone => None,
+                other => Some(other.clone()),
+            }))
     }
 
     fn read_snapshot(
@@ -237,13 +302,12 @@ impl Store {
         commit: CommitId,
         key: &str,
     ) -> Result<Option<Cell>, ReadError> {
-        if tx.view.branch_id != self.branch_id {
-            return Err(ReadError::WrongBranch);
-        }
+        validate_captured_view(tx)?;
         let snapshot = self.history.get(&commit).ok_or(ReadError::MissingCommit)?;
         if snapshot.branch_id != tx.view.branch_id {
             return Err(ReadError::WrongBranch);
         }
+        validate_snapshot_record(snapshot)?;
         if let Some(cell) = snapshot.local.get(key) {
             return Ok(match cell {
                 Cell::Tombstone => None,
@@ -264,6 +328,9 @@ impl Store {
         match self.classify_intent(tx) {
             Intent::Noop | Intent::Unsupported => return Ok(None),
             intent => {
+                if !captured_view_is_valid(&tx.view) {
+                    return Err(CommitError::CorruptHistory);
+                }
                 if tx.view.branch_id != self.branch_id {
                     return Err(CommitError::WrongOwner);
                 }
@@ -343,14 +410,20 @@ impl Store {
                 }
             }
             Intent::UndoRedo { target } => {
-                let target_snapshot = self.history.get(target).ok_or(CommitError::StaleView)?;
+                let target_snapshot = self.history.get(target).ok_or(CommitError::MissingCommit)?;
+                if !valid_snapshot_roots(target_snapshot) {
+                    return Err(CommitError::CorruptHistory);
+                }
                 global = target_snapshot.global.clone();
                 local = target_snapshot.local.clone();
                 self.redo_target = Some(plan.parent);
             }
             Intent::Checkpoint { target } => {
                 if !self.history.contains_key(target) {
-                    return Err(CommitError::StaleView);
+                    return Err(CommitError::MissingCommit);
+                }
+                if !valid_snapshot_roots(self.history.get(target).unwrap()) {
+                    return Err(CommitError::CorruptHistory);
                 }
                 self.checkpoint_floor = self.checkpoint_floor.max(*target);
                 self.checkpoint_target = Some(*target);
@@ -370,6 +443,7 @@ impl Store {
         self.global_selector = selector_bytes("global-selector-v1", self.epoch + 1);
         self.branch_selector = branch_selector_bytes("branch-selector-v1", &self.branch_id, commit);
         self.epoch += 1;
+        *self.owner_epochs.entry(self.branch_id.clone()).or_default() += 1;
         let snapshot = Snapshot {
             commit,
             parent: Some(plan.parent),
@@ -398,6 +472,52 @@ impl Store {
     fn external_epoch_advance(&mut self) {
         self.epoch += 1;
         self.global_selector = selector_bytes("global-selector-v1", self.epoch);
+        *self.owner_epochs.entry(self.branch_id.clone()).or_default() += 1;
+    }
+
+    fn external_unrelated_owner_advance(&mut self) {
+        *self.owner_epochs.entry("unrelated".to_owned()).or_default() += 1;
+    }
+
+    fn external_publish_row(&mut self, key: impl Into<String>, cell: Cell) {
+        let parent = self.next_commit.saturating_sub(1);
+        let commit = self.next_commit;
+        self.branch_rows.insert(key.into(), cell);
+        self.state_root = root_bytes("state-root-v1", commit);
+        self.catalog_root = root_bytes("catalog-root-v1", commit);
+        self.global_selector = selector_bytes("global-selector-v1", self.epoch + 1);
+        self.branch_selector = branch_selector_bytes("branch-selector-v1", &self.branch_id, commit);
+        self.epoch += 1;
+        *self.owner_epochs.entry(self.branch_id.clone()).or_default() += 1;
+        self.history.insert(
+            commit,
+            Snapshot {
+                commit,
+                parent: Some(parent),
+                generation: self
+                    .history
+                    .get(&parent)
+                    .map(|snapshot| snapshot.generation + 1)
+                    .unwrap_or(0),
+                branch_id: self.branch_id.clone(),
+                global: self.global_rows.clone(),
+                local: self.branch_rows.clone(),
+                state_root: self.state_root.clone(),
+                catalog_root: self.catalog_root.clone(),
+                checkpoint_root: self.checkpoint_root.clone(),
+            },
+        );
+        self.next_commit += 1;
+        self.counters.commits += 1;
+        self.counters.writes += 1;
+    }
+
+    fn seed_global_row(&mut self, key: impl Into<String>, cell: Cell) {
+        self.global_rows.insert(key.into(), cell);
+        let current = self.next_commit.saturating_sub(1);
+        if let Some(snapshot) = self.history.get_mut(&current) {
+            snapshot.global = self.global_rows.clone();
+        }
     }
 
     fn corrupt_global_selector(&mut self) {
@@ -406,6 +526,12 @@ impl Store {
 
     fn corrupt_state_root(&mut self) {
         self.state_root = b"missing-object".to_vec();
+    }
+
+    fn corrupt_history_root(&mut self, commit: CommitId) {
+        if let Some(snapshot) = self.history.get_mut(&commit) {
+            snapshot.state_root = b"corrupt-history-root".to_vec();
+        }
     }
 
     fn set_fault(&mut self, fault: Fault) {
@@ -474,19 +600,24 @@ impl Transaction {
         key: &str,
         expected_change: u64,
     ) -> Result<(), CommitError> {
-        let source_cell = store
+        let source_snapshot = store
             .history
             .get(&source)
-            .and_then(|snapshot| snapshot.global.get(key))
-            .map(cell_digest)
-            .unwrap_or(0);
-        if source_cell != expected_change {
-            return Err(CommitError::ExpectedChangeMismatch);
-        }
-        let desired_cell = store
+            .ok_or(CommitError::MissingCommit)?;
+        let desired_snapshot = store
             .history
             .get(&desired)
-            .and_then(|snapshot| snapshot.global.get(key))
+            .ok_or(CommitError::MissingCommit)?;
+        if !valid_snapshot_roots(source_snapshot) || !valid_snapshot_roots(desired_snapshot) {
+            return Err(CommitError::CorruptHistory);
+        }
+        let source_cell = source_snapshot.global.get(key).map(cell_digest);
+        if source_cell != Some(expected_change) {
+            return Err(CommitError::ExpectedChangeMismatch);
+        }
+        let desired_cell = desired_snapshot
+            .global
+            .get(key)
             .cloned()
             .unwrap_or(Cell::Tombstone);
         self.stage(key.to_owned(), desired_cell);
@@ -565,6 +696,50 @@ fn view_id(
     digest.to_be_bytes().to_vec()
 }
 
+fn snapshot_bytes(snapshot: &Snapshot) -> Bytes {
+    format!("{snapshot:?}").into_bytes()
+}
+
+fn valid_snapshot_roots(snapshot: &Snapshot) -> bool {
+    snapshot.state_root.starts_with(b"state-root-v1:")
+        && snapshot.catalog_root.starts_with(b"catalog-root-v1:")
+        && snapshot.checkpoint_root.starts_with(b"checkpoint-root-v1:")
+}
+
+fn snapshot_matches_store(snapshot: &Snapshot, store: &Store) -> bool {
+    snapshot.branch_id == store.branch_id
+        && snapshot.global == store.global_rows
+        && snapshot.local == store.branch_rows
+        && snapshot.state_root == store.state_root
+        && snapshot.catalog_root == store.catalog_root
+        && snapshot.checkpoint_root == store.checkpoint_root
+        && valid_snapshot_roots(snapshot)
+}
+
+fn captured_view_is_valid(view: &View) -> bool {
+    view.snapshot_bytes == snapshot_bytes(&view.snapshot)
+        && view.snapshot.branch_id == view.branch_id
+        && view.snapshot.state_root == view.state_root
+        && view.snapshot.catalog_root == view.catalog_root
+        && view.snapshot.checkpoint_root == view.checkpoint_root
+        && valid_snapshot_roots(&view.snapshot)
+}
+
+fn validate_captured_view(tx: &Transaction) -> Result<(), ReadError> {
+    if !captured_view_is_valid(&tx.view) {
+        return Err(ReadError::SnapshotAuthentication);
+    }
+    Ok(())
+}
+
+fn validate_snapshot_record(snapshot: &Snapshot) -> Result<(), ReadError> {
+    if valid_snapshot_roots(snapshot) {
+        Ok(())
+    } else {
+        Err(ReadError::CorruptSnapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,9 +762,7 @@ mod tests {
     #[test]
     fn branch_global_null_tombstone_and_generation_scope() {
         let mut store = Store::new();
-        store
-            .global_rows
-            .insert("same".to_owned(), Cell::Value(Some("global".to_owned())));
+        store.seed_global_row("same", Cell::Value(Some("global".to_owned())));
         let mut tx = store.begin_transaction().unwrap();
         assert_eq!(
             tx.read(&store, "same").unwrap(),
@@ -657,6 +830,41 @@ mod tests {
     }
 
     #[test]
+    fn captured_view_is_stable_after_external_mutation_and_cas_is_stale() {
+        let mut store = Store::new();
+        store.external_publish_row("a", Cell::Value(Some("old".to_owned())));
+        let mut reader = store.begin_transaction().unwrap();
+        let before_reads = store.counters.begin_reads;
+        store.external_publish_row("a", Cell::Value(Some("new".to_owned())));
+        assert_eq!(
+            reader.read(&store, "a").unwrap(),
+            Some(Cell::Value(Some("old".to_owned())))
+        );
+        reader.stage("a", Cell::Value(Some("attempt".to_owned())));
+        assert_eq!(store.prepare(&reader), Err(CommitError::StaleView));
+        assert_eq!(store.counters.begin_reads, before_reads);
+        assert_eq!(store.counters.writes, 2);
+    }
+
+    #[test]
+    fn reconciliation_distinguishes_same_owner_stale_from_unrelated_owner() {
+        let mut store = Store::new();
+        let same_owner = store.begin_transaction().unwrap();
+        store.external_epoch_advance();
+        assert_eq!(
+            store.reconcile_owner(&same_owner, "main"),
+            Err(CommitError::StaleView)
+        );
+
+        let unrelated_owner = store.begin_transaction().unwrap();
+        store.external_unrelated_owner_advance();
+        assert_eq!(
+            store.reconcile_owner(&unrelated_owner, "unrelated"),
+            Ok(Reconciliation::UnrelatedOwner)
+        );
+    }
+
+    #[test]
     fn idempotency_replay_is_not_second_commit() {
         let mut store = Store::new();
         let mut tx = store.begin_transaction().unwrap();
@@ -715,6 +923,17 @@ mod tests {
             missing_root.begin_view(),
             Err(OpenError::RootAuthentication)
         );
+        let mut absent_root = Store::new();
+        absent_root.state_root.clear();
+        assert_eq!(absent_root.begin_view(), Err(OpenError::MissingRoot));
+
+        let mut tampered_view = Store::new();
+        let mut tx = tampered_view.begin_transaction().unwrap();
+        tx.view.snapshot_bytes.push(0);
+        assert_eq!(
+            tx.read(&tampered_view, "missing"),
+            Err(ReadError::SnapshotAuthentication)
+        );
     }
 
     #[test]
@@ -751,15 +970,38 @@ mod tests {
     #[test]
     fn transition_expected_change_mismatch_is_stale() {
         let mut store = Store::new();
-        store
-            .global_rows
-            .insert("a".to_owned(), Cell::Value(Some("source".to_owned())));
+        store.seed_global_row("a", Cell::Value(Some("source".to_owned())));
         let mut tx = store.begin_transaction().unwrap();
         assert_eq!(
             tx.apply_transition(&store, 0, 0, "a", 999),
             Err(CommitError::ExpectedChangeMismatch)
         );
         assert!(tx.staged.is_empty());
+    }
+
+    #[test]
+    fn missing_transition_commits_and_corrupt_roots_fail_closed() {
+        let mut store = Store::new();
+        let mut tx = store.begin_transaction().unwrap();
+        assert_eq!(
+            tx.apply_transition(&store, 99, 0, "a", 0),
+            Err(CommitError::MissingCommit)
+        );
+        assert_eq!(
+            tx.apply_transition(&store, 0, 99, "a", 0),
+            Err(CommitError::MissingCommit)
+        );
+        assert!(tx.staged.is_empty());
+
+        store.corrupt_history_root(0);
+        assert_eq!(
+            store.read_snapshot(&tx, 0, "a"),
+            Err(ReadError::CorruptSnapshot)
+        );
+        assert_eq!(
+            tx.apply_transition(&store, 0, 0, "a", 0),
+            Err(CommitError::CorruptHistory)
+        );
     }
 
     #[test]
