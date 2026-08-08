@@ -18,9 +18,9 @@ use lix::storage::immutable::validate_immutable_batch;
 use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
-    WriteOptions, WriteStats,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, Storage, StorageError, StorageRead,
+    StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
+    WriteStats,
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
@@ -211,15 +211,15 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
             Precondition::KeyAbsent { space, key } => !key_exists(
                 db,
                 column_family(db, *space),
-                &physical_key(space.id, key).0,
+                &physical_key(space.id(), key).0,
             )?,
             Precondition::KeyPresent { space, key } => key_exists(
                 db,
                 column_family(db, *space),
-                &physical_key(space.id, key).0,
+                &physical_key(space.id(), key).0,
             )?,
             Precondition::KeyValueHashEquals { space, key, hash } => db
-                .get_cf(column_family(db, *space), physical_key(space.id, key).0)
+                .get_cf(column_family(db, *space), physical_key(space.id(), key).0)
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| blake3::hash(&value).as_bytes() == hash),
             Precondition::KeyValueEquals {
@@ -227,11 +227,11 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
                 key,
                 expected,
             } => db
-                .get_cf(column_family(db, *space), physical_key(space.id, key).0)
+                .get_cf(column_family(db, *space), physical_key(space.id(), key).0)
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
             Precondition::RangeEmpty { space, range } => {
-                let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
+                let bounds = EncodedBounds::new(physical_range(space.id(), range.clone()));
                 range_is_empty(db, column_family(db, *space), &bounds)?
             }
             Precondition::BranchEquals { ref_key, expected } => db
@@ -251,7 +251,7 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
 }
 
 fn column_family(db: &DB, space: StorageSpace) -> &ColumnFamily {
-    match space.value_semantics {
+    match space.value_semantics() {
         ValueSemantics::Mutable => mutable_column_family(db),
         ValueSemantics::Immutable => db
             .cf_handle(IMMUTABLE_COLUMN_FAMILY)
@@ -290,14 +290,14 @@ fn range_is_empty(
 
 /// Spaces share the column family for their value semantics and are scoped by
 /// a four-byte big-endian space id prefix within that physical domain.
-fn physical_key(space: SpaceId, key: &Key) -> Key {
+fn physical_key(space: u32, key: &Key) -> Key {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Key(Bytes::from(bytes))
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+fn physical_range(space: u32, range: KeyRange) -> KeyRange {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
         Bound::Included(key) => Bound::Included(physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)),
@@ -306,11 +306,11 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
     KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         ),
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         ),
@@ -330,7 +330,7 @@ impl StorageRead for RocksDBRead<'_> {
                 let physical_keys = request
                     .keys
                     .iter()
-                    .map(|key| physical_key(request.space.id, key))
+                    .map(|key| physical_key(request.space.id(), key))
                     .collect::<Vec<_>>();
                 match request.opts.projection {
                     CoreProjection::KeyOnly => {
@@ -378,7 +378,7 @@ impl StorageRead for RocksDBRead<'_> {
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
+            let bounds = EncodedBounds::new(physical_range(space.id(), range.clone()));
             let mut iterator = self.snapshot.raw_iterator_cf(column_family(self.db, space));
             iterator.seek(&bounds.lower_seek);
             iterator.status().map_err(rocksdb_error)?;
@@ -446,7 +446,7 @@ impl StorageScanSource for RocksDBScanSource<'_> {
 }
 
 fn decode_rocksdb_scan_key(space: StorageSpace, encoded_key: &[u8]) -> Result<Key, StorageError> {
-    if encoded_key.len() < 4 || encoded_key[..4] != space.id.0.to_be_bytes() {
+    if encoded_key.len() < 4 || encoded_key[..4] != space.id().to_be_bytes() {
         return Err(StorageError::Corruption(
             "RocksDB scan key escaped its storage space".to_string(),
         ));
@@ -461,7 +461,7 @@ impl StorageWrite for RocksDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 validate_immutable_batch(&entries)?;
             }
             let max_key_bytes = entries
@@ -472,13 +472,13 @@ impl StorageWrite for RocksDBWrite {
                 .unwrap_or(0);
             let mut physical_key = Vec::with_capacity(max_key_bytes);
             let cf = column_family(&self.inner.db, space);
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             for entry in entries.entries {
                 physical_key.clear();
                 physical_key.extend_from_slice(&space_prefix);
                 physical_key.extend_from_slice(&entry.key.0);
                 let value = stored_value_bytes(entry.value);
-                if space.value_semantics == ValueSemantics::Immutable {
+                if space.value_semantics() == ValueSemantics::Immutable {
                     if let Some(staged) = self.immutable_values.get(physical_key.as_slice()) {
                         if staged != &value {
                             return Err(StorageError::Corruption(
@@ -524,7 +524,7 @@ impl StorageWrite for RocksDBWrite {
             });
             let mut key_bytes = Vec::with_capacity(physical_key_bytes);
             let cf = column_family(&self.inner.db, space);
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             for key in keys {
                 let key_start = key_bytes.len();
                 key_bytes.extend_from_slice(&space_prefix);
@@ -545,7 +545,7 @@ impl StorageWrite for RocksDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             let cf = column_family(&self.inner.db, space);
-            let range = physical_range(space.id, range);
+            let range = physical_range(space.id(), range);
             if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
                 self.batch
                     .delete_range_cf(cf, lower.as_slice(), upper.as_slice());

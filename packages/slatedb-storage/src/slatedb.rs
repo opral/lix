@@ -17,6 +17,8 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
+#[cfg(test)]
+use lix::storage::SpaceId;
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::{
     ImmutableSegment, ImmutableSegmentWriter, ImmutableValueLocator, decode_immutable_locator,
@@ -25,8 +27,8 @@ use lix::storage::immutable::{
 use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, SpaceId,
-    Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, Storage,
+    StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
     ValueSemantics, WriteOptions, WriteStats,
 };
 use object_store::local::LocalFileSystem;
@@ -2668,7 +2670,7 @@ async fn check_preconditions(
                         .filter_map(|(offset, precondition)| match precondition {
                             Precondition::KeyValueHashEquals { space, .. }
                             | Precondition::KeyValueEquals { space, .. }
-                                if space.value_semantics == ValueSemantics::Immutable =>
+                                if space.value_semantics() == ValueSemantics::Immutable =>
                             {
                                 values[offset]
                                     .as_ref()
@@ -2700,7 +2702,7 @@ async fn check_preconditions(
 
                 let matches_precondition = match &preconditions[index] {
                     Precondition::RangeEmpty { space, range } => {
-                        let range = physical_range(space.id, range.clone())?;
+                        let range = physical_range(space.id(), range.clone())?;
                         let bounds = EncodedBounds::new(range.clone());
                         let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
                         let visible_writes =
@@ -2784,7 +2786,9 @@ fn point_precondition_physical_key(
         Precondition::KeyAbsent { space, key }
         | Precondition::KeyPresent { space, key }
         | Precondition::KeyValueHashEquals { space, key, .. }
-        | Precondition::KeyValueEquals { space, key, .. } => physical_key(space.id, key).map(Some),
+        | Precondition::KeyValueEquals { space, key, .. } => {
+            physical_key(space.id(), key).map(Some)
+        }
         Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => Ok(None),
     }
 }
@@ -2823,7 +2827,7 @@ impl StorageRead for SlateDBRead {
             if let [request] = requests
                 && let [key] = request.keys
             {
-                let key = physical_key(request.space.id, key)?;
+                let key = physical_key(request.space.id(), key)?;
                 let snapshot = Arc::clone(&self.snapshot);
                 let durability = self.durability;
                 let mut value = if durability == ReadDurability::Visible {
@@ -2873,7 +2877,7 @@ impl StorageRead for SlateDBRead {
             );
             for request in requests {
                 for key in request.keys {
-                    physical_keys.push(physical_key(request.space.id, key)?);
+                    physical_keys.push(physical_key(request.space.id(), key)?);
                 }
             }
             if physical_keys.is_empty() {
@@ -2962,7 +2966,7 @@ impl StorageRead for SlateDBRead {
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let bounds = EncodedBounds::new(physical_range(space.id, range.clone())?);
+            let bounds = EncodedBounds::new(physical_range(space.id(), range.clone())?);
             let visible_writes = self
                 .publication_view
                 .as_ref()
@@ -3025,7 +3029,7 @@ impl StorageScanSource for SlateDBScanSource {
             self.write_pipeline.terminal_error()?;
             let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
             let projection = self.projection;
-            let space_id = self.space.id;
+            let space_id = self.space.id();
             #[cfg(test)]
             let worker_gate = self.worker_gate.clone();
             let (state, mut chunk) = self
@@ -3211,7 +3215,7 @@ async fn streaming_scan_page(
     mut state: SlateStreamingScanState,
     limit_rows: usize,
     projection: CoreProjection,
-    space_id: SpaceId,
+    space_id: u32,
 ) -> Result<(SlateStreamingScanState, ScanChunk), StorageError> {
     let mut rows = Vec::with_capacity(limit_rows);
     if let Some(row) = state.output_pending.take() {
@@ -3228,8 +3232,7 @@ async fn streaming_scan_page(
     let entries = rows
         .into_iter()
         .map(|(key, value)| {
-            if key.0.len() < SPACE_PREFIX_LEN
-                || key.0[..SPACE_PREFIX_LEN] != space_id.0.to_be_bytes()
+            if key.0.len() < SPACE_PREFIX_LEN || key.0[..SPACE_PREFIX_LEN] != space_id.to_be_bytes()
             {
                 return Err(StorageError::Corruption(format!(
                     "slatedb scan key escaped its storage space: {:?}",
@@ -3297,7 +3300,7 @@ async fn hydrate_immutable_value_gets(
     let mut result_index = 0usize;
     for request in requests {
         for _ in request.keys {
-            if request.space.value_semantics == ValueSemantics::Immutable
+            if request.space.value_semantics() == ValueSemantics::Immutable
                 && request.opts.projection == CoreProjection::FullValue
                 && let Some(Some(ProjectedValue::FullValue(marker))) = results.get(result_index)
             {
@@ -3324,7 +3327,8 @@ async fn hydrate_immutable_value_scan(
     projection: CoreProjection,
     chunk: &mut ScanChunk,
 ) -> Result<(), StorageError> {
-    if space.value_semantics != ValueSemantics::Immutable || projection != CoreProjection::FullValue
+    if space.value_semantics() != ValueSemantics::Immutable
+        || projection != CoreProjection::FullValue
     {
         return Ok(());
     }
@@ -3455,7 +3459,7 @@ impl StorageWrite for SlateDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 let put_entries = entries.entries.len() as u64;
                 let mut segment_writer = ImmutableSegmentWriter::default();
                 let mut written_bytes = 0_u64;
@@ -3464,7 +3468,7 @@ impl StorageWrite for SlateDBWrite {
                     .into_iter()
                     .map(|entry| {
                         Ok((
-                            physical_key(space.id, &entry.key)?,
+                            physical_key(space.id(), &entry.key)?,
                             stored_value_bytes(entry.value),
                         ))
                     })
@@ -3550,7 +3554,7 @@ impl StorageWrite for SlateDBWrite {
                 }
                 total.checked_add(key_len).ok_or(StorageError::InvalidKey)
             })?;
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for entry in &entries.entries {
                 physical_keys.extend_from_slice(&space_prefix);
@@ -3587,7 +3591,7 @@ impl StorageWrite for SlateDBWrite {
                 }
                 total.checked_add(key_len).ok_or(StorageError::InvalidKey)
             })?;
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for key in keys {
                 physical_keys.extend_from_slice(&space_prefix);
@@ -3614,7 +3618,7 @@ impl StorageWrite for SlateDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             self.serialize_publication().await?;
-            let range = physical_range(space.id, range)?;
+            let range = physical_range(space.id(), range)?;
             let bounds = EncodedBounds::new(range.clone());
             if bounds.is_empty() {
                 self.stats.deleted_ranges += 1;
@@ -4417,18 +4421,18 @@ fn db_cache(block_cache_bytes: u64, metadata_cache_bytes: u64) -> Arc<dyn DbCach
     )
 }
 
-fn physical_key(space: SpaceId, key: &Key) -> Result<Key, StorageError> {
+fn physical_key(space: u32, key: &Key) -> Result<Key, StorageError> {
     let len = SPACE_PREFIX_LEN + key.0.len();
     if len > MAX_SLATEDB_KEY_LEN {
         return Err(StorageError::InvalidKey);
     }
     let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Ok(Key(Bytes::from(bytes)))
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageError> {
+fn physical_range(space: u32, range: KeyRange) -> Result<KeyRange, StorageError> {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| -> Result<Bound<Key>, StorageError> {
         Ok(match bound {
             Bound::Included(key) => Bound::Included(physical_key(space, &key)?),
@@ -4439,11 +4443,11 @@ fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageEr
     Ok(KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         )?,
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         )?,
@@ -5647,7 +5651,7 @@ mod tests {
 
         let immutable_directory = directory.path().join(DB_PATH).join(IMMUTABLE_VALUE_PATH);
         let physical_key =
-            physical_key(TEST_IMMUTABLE_SPACE.id, &key).expect("derive physical immutable key");
+            physical_key(TEST_IMMUTABLE_SPACE.id(), &key).expect("derive physical immutable key");
         let (segment_key, encoded_value, _) = immutable_test_segment(physical_key, value.clone());
         let segment_hash: [u8; 32] = segment_key.0.as_ref().try_into().expect("segment hash");
         let stored_path =
@@ -5992,7 +5996,7 @@ mod tests {
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
         let physical_key =
-            physical_key(TEST_IMMUTABLE_SPACE.id, &key).expect("derive physical immutable key");
+            physical_key(TEST_IMMUTABLE_SPACE.id(), &key).expect("derive physical immutable key");
         let (segment_key, encoded_value, _range) =
             immutable_test_segment(physical_key, value.clone());
         let segment_hash: [u8; 32] = segment_key.0.as_ref().try_into().expect("segment hash");
@@ -6315,7 +6319,7 @@ mod tests {
             );
             assert!(
                 db.manifest()
-                    .segment(&space.id.0.to_be_bytes())
+                    .segment(&space.id().to_be_bytes())
                     .is_some_and(|segment| !segment.l0().is_empty()),
                 "the row must be isolated in its storage-space segment"
             );
