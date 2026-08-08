@@ -1,0 +1,81 @@
+{
+  "kind": "test-report-only-forktree-migration-oracle",
+  "status": "dormant",
+  "target": {
+    "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+    "parent": "713455a3557907ce705d06f720fcdc4486bddd4a"
+  },
+  "scope": [
+    "transaction opening and retained-read ownership",
+    "stale reconciliation and generation checks",
+    "staged transition and selected-history reads",
+    "checkpoint floor and recovery target",
+    "undo redo savepoint rollback and idempotency",
+    "single ForkTree publication and fail-closed corruption"
+  ],
+  "source_closure": [
+    "packages/lix/src/transaction/context.rs",
+    "packages/lix/src/transaction/context/cohort.rs",
+    "packages/lix/src/transaction/commit.rs",
+    "packages/lix/src/transaction/staging.rs",
+    "packages/lix/src/transaction/stale_commit.rs",
+    "packages/lix/src/transaction/validation.rs",
+    "packages/lix/src/transaction/types.rs",
+    "packages/lix/src/transaction/normalization.rs",
+    "packages/lix/src/session/context.rs",
+    "packages/lix/src/session/execute.rs",
+    "packages/lix/src/session/checkpoint.rs",
+    "packages/lix/src/session/undo_redo.rs",
+    "packages/lix/src/session/idempotency.rs",
+    "packages/lix/src/session/merge/analysis.rs",
+    "packages/lix/src/session/merge/branch.rs",
+    "packages/lix/src/sql2/providers/checkpoint.rs",
+    "packages/lix/src/sql2/providers/diff.rs",
+    "packages/lix/src/sql2/providers/working_diff.rs",
+    "packages/lix/src/sql2/providers/directory_history.rs",
+    "packages/lix/src/sql2/providers/file_history.rs",
+    "packages/lix/src/sql2/providers/filesystem_working_diff.rs",
+    "packages/lix/src/sql2/providers/entity.rs",
+    "packages/lix/src/sql2/exec/bound_public_write.rs",
+    "packages/lix/src/tracked_state/context.rs",
+    "packages/lix/src/tracked_state/diff.rs",
+    "packages/lix/src/tracked_state/mod.rs",
+    "packages/lix/src/tracked_state/types.rs"
+  ],
+  "required_future_tokens": [
+    "CoherentView",
+    "open_coherent_view",
+    "view_id",
+    "PreparedPublication",
+    "into_storage_plan",
+    "prepare_write_set",
+    "commit",
+    "state_point",
+    "state_range",
+    "checkpoint_root",
+    "idempotency"
+  ],
+  "forbidden_future_surfaces": [
+    "TrackedStateStoreReader",
+    "TrackedStateContext",
+    "tracked_state_reader",
+    "with_opening_tracked_reader",
+    "TrackedHeadContext",
+    "BranchHeadControlContext",
+    "BranchHeadControlCache",
+    "legacy tracked-state owner modules and spaces",
+    "fallback compatibility rebuild reader or durable cache"
+  ],
+  "future_gate_order": [
+    "source residue verifier",
+    "fmt and diff check",
+    "standalone pure model",
+    "warnings denied candidate no-run",
+    "Memory lifecycle",
+    "RocksDB lifecycle",
+    "SlateDB lifecycle"
+  ],
+  "runtime_claimed": false,
+  "production_edits": false
+}
