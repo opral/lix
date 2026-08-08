@@ -87,7 +87,7 @@ wrapper-specific paths are absent.
 - `forktree_branch_migration_source_gate.sh`
   - SHA-256: `8ee5007c6a843025f8478ab7cdf92355fc9cf21a2ed9c2b54dbb5bea0c9eccdb`
 - this report
-  - SHA-256: `5e0341995a7a78f4c1f154c310a77a2ba9a30aaa5d591da9dc3999e9dd91db87`
+  - SHA-256: supplied in the immutable handoff below
 
 The prior frozen negative compile probes for deleted control APIs remain
 bound through the parent oracle. The future branch migration candidate must
