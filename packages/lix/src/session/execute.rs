@@ -9894,6 +9894,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_branch_update_reads_global_overlay_through_one_forktree_view() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('overlay-key', 'before')",
+                &[],
+            )
+            .await
+            .expect("the seed row should commit");
+
+        let updated = session
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'overlay-key'",
+                &[],
+            )
+            .await
+            .expect("the active-branch update should resolve the global overlay");
+        assert_eq!(updated.rows_affected(), 1);
+
+        let result = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'overlay-key'",
+                &[],
+            )
+            .await
+            .expect("the updated row should remain readable");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("value should be JSON"),
+            serde_json::json!("after")
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_transaction_parameter_updates_reset_membership_on_descending_keys() {
         let session = open_session().await;
         for key in ["parameter-a", "parameter-z"] {
