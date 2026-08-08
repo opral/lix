@@ -207,7 +207,9 @@ impl ProfileStorage {
 
 fn profile_storage(profile: StorageProfile) -> ProfileStorage {
     match profile.storage() {
-        RawProfileStorage::RocksDB { storage, _dir: dir } => ProfileStorage::RocksDB {
+        RawProfileStorage::RocksDB {
+            storage, _dir: dir, ..
+        } => ProfileStorage::RocksDB {
             storage: StorageAdapter::new(storage),
             _dir: dir,
         },

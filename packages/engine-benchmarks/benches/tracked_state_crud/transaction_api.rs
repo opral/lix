@@ -31,12 +31,16 @@ pub(crate) async fn empty_fixture(
 ) -> TransactionFixture {
     let rows = bench_rows(rows);
     match profile.storage() {
-        ProfileStorage::RocksDB { storage, _dir: dir } => TransactionFixture::RocksDB {
+        ProfileStorage::RocksDB {
+            storage, _dir: dir, ..
+        } => TransactionFixture::RocksDB {
             fixture: BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
             _dir: dir,
         },
         #[cfg(feature = "slatedb")]
-        ProfileStorage::SlateDB { storage, _dir: dir } => TransactionFixture::SlateDB {
+        ProfileStorage::SlateDB {
+            storage, _dir: dir, ..
+        } => TransactionFixture::SlateDB {
             fixture: BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
             _dir: dir,
         },
