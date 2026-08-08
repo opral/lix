@@ -123,6 +123,10 @@ required-features = ["storage-benches", "slatedb"]
 name = "tpch_overlay_helpers"
 path = "tests/tpch_overlay_helpers.rs"
 
+[[test]]
+name = "forktree_mixed_tracked_untracked_oracle"
+path = "tests/forktree_mixed_tracked_untracked_oracle.rs"
+
 [[bench]]
 name = "storage_v2"
 path = "benches/storage_v2.rs"
