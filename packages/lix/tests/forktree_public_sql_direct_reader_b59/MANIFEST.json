@@ -1,0 +1,91 @@
+{
+  "kind": "test-report-only-public-sql-direct-reader",
+  "status": "dormant-until-compile-green",
+  "target": {
+    "commit": "b59e1f11a51153e0a787a81f0f25bf104d150aaf",
+    "tree": "700fd04d21bc40c05425c9fc9e10d65c9e1eda24",
+    "parent": "713455a3557907ce705d06f720fcdc4486bddd4a"
+  },
+  "oracle_source": {
+    "ref": "origin/codex/forktree-public-sql-acceptance-oracle",
+    "commit": "1d3d87ac506f670e0b28bb9c87c1f399c0900911",
+    "tree": "118fe79888f2df061a06067542ce003c205f8625"
+  },
+  "scope": [
+    "source inventory",
+    "path-aware residue gate",
+    "pure public-semantics model",
+    "future Memory/RocksDB/SlateDB commands"
+  ],
+  "forbidden_production_changes": true,
+  "runtime_claimed": false,
+  "direct_reader_required_symbols": [
+    "ForkTreeReadFacade",
+    "scan_forktree_operation",
+    "scan_view",
+    "load_exact_batch",
+    "EntitySnapshotReader",
+    "EntityProjectionDecoder",
+    "EntityPk",
+    "state_point",
+    "state_range"
+  ],
+  "direct_reader_paths": [
+    "packages/lix/src/live_state/context.rs",
+    "packages/lix/src/live_state/forktree_reader.rs",
+    "packages/lix/src/live_state/visibility.rs",
+    "packages/lix/src/sql2/entity_batch.rs",
+    "packages/lix/src/sql2/providers/entity.rs",
+    "packages/lix/src/sql2/entity_projection.rs",
+    "packages/lix/src/sql2/catalog/entity_surface.rs",
+    "packages/lix/src/entity_pk.rs",
+    "packages/lix/src/session/context.rs"
+  ],
+  "deferred_physical_paths": [
+    "packages/lix/src/live_state/entity_columnar.rs",
+    "packages/lix/src/sql2/entity_columnar_layout.rs",
+    "packages/lix/src/sql2/exec/bound_public_write.rs",
+    "packages/lix/src/gc.rs",
+    "packages/lix/src/session/execute.rs",
+    "packages/lix/src/tracked_state/types.rs"
+  ],
+  "forbidden_direct_reader_tokens": [
+    "TrackedHeadContext",
+    "TrackedStateStoreReader",
+    "BranchHeadControl",
+    "plan_direct_entity_columnar_scan",
+    "EntityColumnarLayoutCache",
+    "EntityColumnarOverlayRow",
+    "EntityColumnarWriteSets",
+    "RowGroupManifest",
+    "RowGroupSetId",
+    "ColumnarRowGroup",
+    "columnar_row_group::",
+    "sql2::entity_columnar_layout",
+    "live_state::entity_columnar",
+    "independent begin_read",
+    "fallback reader",
+    "compatibility reader"
+  ],
+  "future_gate_order": [
+    "verify_direct_reader_source.sh",
+    "cargo fmt --all -- --check",
+    "git diff --check",
+    "rustc standalone pure model -D warnings",
+    "cargo clippy package test -D warnings",
+    "cargo test package --no-run",
+    "Memory",
+    "RocksDB",
+    "SlateDB"
+  ],
+  "semantic_requirements": [
+    "typed EntityPk arity and component kind",
+    "canonical lowercase UUID parse for stored and requested PKs",
+    "branch-local override over global",
+    "local tombstone suppresses global",
+    "NULL is a value",
+    "canonical identity ordering before projection and LIMIT",
+    "malformed/missing/wrong-kind fail closed",
+    "no row-group fallback/cache/second authority"
+  ]
+}
