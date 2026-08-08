@@ -297,3 +297,7 @@ harness = false
 name = "registered_entity_returning"
 path = "benches/registered_entity_returning.rs"
 harness = false
+[[test]]
+name = "forktree_stage2_scalar_sql_acceptance"
+path = "tests/forktree_stage2_scalar_sql_acceptance.rs"
+required-features = ["storage-benches", "slatedb"]
