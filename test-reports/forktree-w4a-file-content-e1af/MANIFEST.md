@@ -1,50 +1,32 @@
-# W4a file-content correction manifest
+# W4a v3 file-content correction manifest
 
-TEST/REPORT-ONLY direct successor of immutable 3e9a7f2c611a1bbad12fd271ca7a43332a4fe1c5.
+TEST/REPORT-ONLY direct successor of immutable
+`f2f4c41bd3a64187f8288ca0396fd364a1f2f8fe`.
 
 No production source, adapter, PR, or merge changes are present. The package
-freezes the exact e1af RED baseline and a candidate-parametric structural
-GREEN verifier plus a warnings-denied pure model.
-
-## Immutable baseline
-
-- commit: e1af471b9ab0f598dafa7c2ddec7867667c81740
-- tree: bfa0d271a723da8250ab76ada16fda90926f1099
-- parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
+freezes the exact e1af RED baseline, a candidate-parametric source verifier
+with executable negative fixtures, and a warnings-denied persisted-state
+model.
 
 ## Package artifacts
 
-SHA256SUMS covers every listed artifact below; entries are regenerated only
-after the final package content is frozen.
+SHA256SUMS covers every listed artifact below; the index is regenerated only
+after final content is frozen and is intentionally not self-listed.
 
 | file | SHA-256 |
 |---|---|
-| W4A_FILE_CONTENT_READINESS_E1AF.md | e0d772acc409682c15ad19369696b84cbe990557d501bc66493b2e37e4637542 |
-| verify_w4a_source.sh | c8831e9aa2b02882e37d83eb765afa0baf8570e738efa63dbf87b9367e561801 |
-| w4a_file_content_model.rs | 01e31e297262e810706f249aeb070b9f8ee011999176fe764e6ce13c6fadffb7 |
-| MODEL_RUN.log | 54fba877eb4351b8955fd1b14e485006859b7b6ff25ebc89d4adeb1cf50af59b |
-| SOURCE_RED.log | 05041181ccd76fcc137c0c4c7161fae4231aec8410c7defb220c755d69e1ea50 |
-| SOURCE_GREEN.log | 28a6b3b15b3a9dd82e92d7aebb4b18c8dae46bbf50ff20f58a884774f07ec73d |
+| W4A_FILE_CONTENT_READINESS_E1AF.md | 7d1f6331482ab9af462830ecea8bb0101cb1f718f1a7c4d6976477b1bf092f54 |
+| verify_w4a_source.sh | a3fecaf2d1baf96164faab94620684462d58d96344e86ec3955b5e63876ead78 |
+| w4a_file_content_model.rs | ea103b6716304a82115738f7785cdea671657752283ea60ff68b1e092640c138 |
+| MODEL_RUN.log | 558bff56ab77f03e073771ec30436747aa2376df10ef138ca4fc5c5ee30ada08 |
+| SOURCE_RED.log | ac461bec69f0992379c159f9d12dc3fd5ac5ab0d588aeb0f050a68333b29adce |
+| SOURCE_GREEN.log | e8f0493f055c1c7bfb8a3ed575fd640621c406f950973fe02b8e2919a2547a32 |
 
-SHA256SUMS itself is the checksum index and is intentionally not self-listed.
+## Acceptance summary
 
-## Required acceptance properties
-
-- private owner BlobId is derived from authenticated ordered manifest/chunks;
-  it is compared to retained-read row identity before payload bytes;
-- no caller-supplied BlobId argument, generic storage writer, durable cache or
-  index, alternate authority, fallback, or second publication;
-- one non-copy retained read/view is argument-bound through one publication,
-  storage plan, prepare, and commit;
-- stale/rollback, unchanged-chunk reuse, corruption/reopen, and W5 handoff
-  remain covered;
-- exact e1af RED, genuine candidate-parametric GREEN, and rustc `-D warnings`
-  model evidence are included.
-
-## Gate status
-
-- baseline source verifier: RED, expected exit 1
-- candidate verifier self-test: GREEN
-- pure model: 9/9, warnings denied
-- Memory/RocksDB/SlateDB production runtime: UNRUN by scope
-- production source/build/PR/merge: untouched
+- exact e1af source calibration: RED;
+- candidate source-positive gate: GREEN;
+- source-negative fixtures: 10/10 rejected;
+- warnings-denied persisted model: 13/13;
+- production/adapters/runtime/performance: UNRUN by scope;
+- production source/build/PR/merge: untouched.

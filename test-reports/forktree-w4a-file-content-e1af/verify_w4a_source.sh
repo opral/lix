@@ -141,6 +141,10 @@ is_allowed_path() {
 
 candidate_scope() {
   local candidate_root=$1 base_commit=$2 candidate_commit=$3
+  git -C "$candidate_root" merge-base --is-ancestor "$base_commit" "$candidate_commit" || {
+    echo "CANDIDATE-BLOCKER candidate is not descended from the exact anchor"
+    return 1
+  }
   mapfile -t changed < <(git -C "$candidate_root" diff --name-only "$base_commit" "$candidate_commit")
   ((${#changed[@]} > 0)) ||
     die "candidate has no source diff from base"
@@ -181,7 +185,7 @@ candidate_direct_writer_scan() {
   local path
   for path in "${paths[@]}"; do
     [[ -f "$path" ]] || continue
-    if rg -n -e 'begin_read[(]' \
+    if rg -ni -e 'begin_read[(]' \
       -e 'begin_write[(]' \
       -e 'prepare_write_set[(]' \
       -e 'StorageWrite' \
@@ -224,17 +228,22 @@ candidate_blob_authority_scan() {
   rg -n '^[[:space:]]*fn[[:space:]]+from_ordered_manifest[[:space:]]*[(]' "$publication_rs" "$blob_rs" >/dev/null ||
     { echo "CANDIDATE-BLOCKER canonical ordered BlobId derivation missing"; return 1; }
 
-  local auth_line derive_line compare_line bytes_line
+  local auth_line derive_line compare_line bytes_line row_line
   auth_line=$(printf '%s\n' "$prep_body" | rg -n 'authenticate_ordered_chunks' | head -n1 | cut -d: -f1 || true)
   derive_line=$(printf '%s\n' "$prep_body" | rg -n 'owner_blob_id[[:space:]]*=.*from_ordered_manifest' | head -n1 | cut -d: -f1 || true)
   compare_line=$(printf '%s\n' "$prep_body" | rg -n 'row_blob_id.*(!=|==).*owner_blob_id|owner_blob_id.*(!=|==).*row_blob_id' | head -n1 | cut -d: -f1 || true)
-  bytes_line=$(printf '%s\n' "$prep_body" | rg -n 'read_authenticated_range|read_payload_bytes|payload_bytes|read_range' | head -n1 | cut -d: -f1 || true)
+  bytes_line=$(printf '%s\n' "$prep_body" | rg -n 'read_authenticated_range[[:space:]]*[(]' | head -n1 | cut -d: -f1 || true)
   [[ -n "$auth_line" && -n "$derive_line" && -n "$compare_line" && -n "$bytes_line" ]] ||
     { echo "CANDIDATE-BLOCKER authenticated derive/row compare/payload sequence missing"; return 1; }
   ((auth_line < derive_line && derive_line < compare_line && compare_line < bytes_line)) ||
     { echo "CANDIDATE-BLOCKER row identity is not checked before payload bytes"; return 1; }
-  printf '%s\n' "$prep_body" | rg -n 'read[^\n]*(row_identity|row_blob_id)|(row_identity|row_blob_id)[^\n]*read' >/dev/null ||
-    { echo "CANDIDATE-BLOCKER row identity is not sourced from the retained read"; return 1; }
+  row_line=$(printf '%s\n' "$prep_body" | rg -n 'let[[:space:]]+row_blob_id[[:space:]]*=' | head -n1 || true)
+  printf '%s\n' "$row_line" | rg -q '=[[:space:]]*read[.]row_identity[[:space:]]*;' ||
+    { echo "CANDIDATE-BLOCKER row identity is not the exact retained-read identity"; return 1; }
+  if printf '%s\n' "$prep_body" | rg -n 'read_(full|all)_payload|load_(full|all)_payload|read_payload_bytes|payload_bytes_all|read_all' >/dev/null; then
+    echo "CANDIDATE-BLOCKER file publication requests an unbounded/full payload"
+    return 1
+  fi
 
   for token in BlobManifestV1 BlobChunkV1 CoherentView ReadLease PreparedPublication; do
     printf '%s\n' "$closure" | rg -Fq "$token" ||
@@ -334,7 +343,7 @@ candidate_green() {
 }
 
 self_test() {
-  local temp base candidate
+  local temp base candidate fixture fixture_candidate output
   temp=$(mktemp -d "${TMPDIR:-/tmp}/w4a-source-green.XXXXXX")
   trap 'rm -rf "$temp"' RETURN
   mkdir -p "$temp/packages/lix/src/transaction" \
@@ -414,6 +423,92 @@ EOF
   git -C "$temp" commit -qm candidate
   candidate=$(git -C "$temp" rev-parse HEAD)
   W4A_SELF_TEST=1 "$0" "$temp" "$base" "$temp" "$candidate"
+
+  make_fixture() {
+    fixture=$(mktemp -d "${TMPDIR:-/tmp}/w4a-source-negative.XXXXXX")
+    git -C "$temp" archive "$candidate" | tar -x -C "$fixture"
+    cp -a "$temp/.git" "$fixture/.git"
+    git -C "$fixture" reset --mixed "$candidate" >/dev/null
+  }
+
+  expect_blocker() {
+    local label=$1
+    if output=$(W4A_SELF_TEST=1 "$0" "$fixture" "$base" "$fixture" "$fixture_candidate" 2>&1); then
+      printf 'NEGATIVE-BLOCKER %s unexpectedly accepted\n%s\n' "$label" "$output"
+      return 1
+    fi
+    printf 'NEGATIVE-PASS %s\n' "$label"
+  }
+
+  make_fixture
+  perl -0pi -e 's/fn prepare_file_content\(\n    read:/fn prepare_file_content(\n    blob_id: BlobId,\n    read:/' "$fixture/packages/lix/src/forktree/publication.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-caller-blob-id
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker caller-supplied-BlobId
+
+  make_fixture
+  sed -i 's/let row_blob_id = read.row_identity;/let other_read = read; let row_blob_id = other_read.row_identity;/' \
+    "$fixture/packages/lix/src/forktree/publication.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-swapped-row-read
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker swapped-row-read-identity
+
+  make_fixture
+  sed -i '/authenticate_ordered_chunks/i\    let _bytes = read_authenticated_range(read)?;' \
+    "$fixture/packages/lix/src/forktree/publication.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-validation-after-bytes
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker validation-after-byte-request
+
+  make_fixture
+  sed -i 's/read_authenticated_range/read_full_payload/g' \
+    "$fixture/packages/lix/src/forktree/publication.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-full-payload
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker copied-or-full-payload-range
+
+  make_fixture
+  printf '\nstruct FileContentCache;\nstruct BlobIndex;\nstruct AlternateAuthority;\nstruct LegacyWriter;\n' >> \
+    "$fixture/packages/lix/src/forktree/blob.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-alternate-authority
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker alternate-writer-cache-index-authority
+
+  make_fixture
+  sed -i '/let commit_read = storage.begin_read()/a\    let second_read = storage.begin_read().await?;' \
+    "$fixture/packages/lix/src/transaction/context.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-second-read
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker second-read-view
+
+  make_fixture
+  sed -i '/let (writes, _) = prepared_forktree_plan.into_storage_plan()/a\    let _second_plan = prepared_forktree_plan.into_storage_plan()?;' \
+    "$fixture/packages/lix/src/transaction/context.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-second-plan
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker second-plan-commit
+
+  make_fixture
+  sed -i 's/prepare_forktree_publication_with_parent_heads(commit_read)/prepare_forktree_publication_with_parent_heads(other_read)/' \
+    "$fixture/packages/lix/src/transaction/context.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-mismatched-read-argument
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker mismatched-read-argument
+
+  make_fixture
+  mkdir -p "$fixture/packages/lix/src/sql2/providers"
+  printf '\nfn legacy_fallback_reader() {}\nfn compatibility_writer() {}\n' >> \
+    "$fixture/packages/lix/src/sql2/providers/file.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-fallback-compat
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker fallback-compatibility-route
+
+  make_fixture
+  mkdir -p "$fixture/packages/lix/src/transaction"
+  printf 'fn forbidden_escape() {}\n' > "$fixture/packages/lix/src/transaction/forbidden.rs"
+  git -C "$fixture" add . && git -C "$fixture" commit -qm negative-scope-escape
+  fixture_candidate=$(git -C "$fixture" rev-parse HEAD)
+  expect_blocker production-path-scope-escape
 }
 
 if [[ ${1:-} == "--self-test" ]]; then

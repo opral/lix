@@ -12,4 +12,4 @@ BASE-PASS-04 no direct PreparedPublication commit symbol
 244:            && crate::binary_cas::kv::try_stage_blob_write_reusing_same_length_splice(
 BASE-RED-06 stale Binary CAS KV owner references remain
 BASE-SOURCE-RESULT=RED
-EXIT_STATUS=1
+exit=1 (expected)

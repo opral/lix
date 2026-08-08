@@ -1,16 +1,20 @@
 $ rustfmt --edition 2021 --check test-reports/forktree-w4a-file-content-e1af/w4a_file_content_model.rs
-$ rustc --edition=2021 -D warnings --test test-reports/forktree-w4a-file-content-e1af/w4a_file_content_model.rs -o w4a-model-v2
-$ ./w4a-model-v2 --test-threads=1
+$ rustc --edition=2021 -D warnings --test test-reports/forktree-w4a-file-content-e1af/w4a_file_content_model.rs -o w4a-model-v3
+$ ./w4a-model-v3 --test-threads=1
 
-running 9 tests
+running 13 tests
+test branch_history_checkpoint_and_upload_roots_hold_65_entry_window ... ok
+test cold_reopen_and_partial_range_have_zero_mutation_on_corruption ... ok
+test cold_reopen_rejects_missing_wrong_kind_hash_order_duplicate_and_row_corruption ... ok
 test idempotency_conflict_is_atomic_after_authenticated_owner_derivation ... ok
 test malformed_size_and_chunk_identity_fail_without_partial_state ... ok
 test missing_root_fails_cold_reopen_and_w5_final_reference_handoff ... ok
 test one_noncopy_view_binds_one_operation_and_rejects_legacy_writers ... ok
-test partial_read_is_range_bounded_and_authenticates_visited_chunks ... ok
+test partial_read_is_range_bounded_and_authenticates_visited_chunks_before_output ... ok
 test same_size_substitution_fails_before_publication ... ok
+test shared_chunks_survive_until_the_exact_final_reference ... ok
 test sixty_four_mib_layout_reuses_sixty_three_unchanged_one_mib_chunks ... ok
 test stale_and_idempotency_conflicts_are_atomic ... ok
 test valid_write_is_one_view_one_plan_one_commit_and_reopens ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s

@@ -5,3 +5,13 @@ CANDIDATE-PASS-02 one read -> one publication -> one plan -> one prepare -> one 
 CANDIDATE-PASS-03 private BlobId derives from authenticated ordered closure before payload bytes
 CANDIDATE-PASS-04 non-copy read/lease identity is argument-bound
 CANDIDATE-GREEN-RESULT=GREEN
+NEGATIVE-PASS caller-supplied-BlobId
+NEGATIVE-PASS swapped-row-read-identity
+NEGATIVE-PASS validation-after-byte-request
+NEGATIVE-PASS copied-or-full-payload-range
+NEGATIVE-PASS alternate-writer-cache-index-authority
+NEGATIVE-PASS second-read-view
+NEGATIVE-PASS second-plan-commit
+NEGATIVE-PASS mismatched-read-argument
+NEGATIVE-PASS fallback-compatibility-route
+NEGATIVE-PASS production-path-scope-escape
