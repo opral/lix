@@ -102,6 +102,11 @@ async fn authenticated_control_commit_reachability<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    let recovery_refs = load_recovery_refs(store)
+        .await?
+        .into_iter()
+        .map(|recovery| (recovery.branch_id.clone(), recovery))
+        .collect::<BTreeMap<_, _>>();
     let projections = controls
         .iter()
         .map(|(branch_id, control)| (branch_id.clone(), control.tracked_reachability()))
@@ -123,11 +128,27 @@ where
                 format!("branch '{branch_id}' has no authenticated history head"),
             )
         })?;
-        let floor = projection.serving_checkpoint_commit_id;
+        let serving_checkpoint_floor = projection.serving_checkpoint_commit_id;
+        let recovered_undo_floor = match recovery_refs.get(branch_id) {
+            Some(recovery) => {
+                if serving_checkpoint_floor != Some(recovery.checkpoint_commit_id) {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "branch '{branch_id}' recovery checkpoint does not match its serving control"
+                        ),
+                    ));
+                }
+                recovery
+                    .interval_has_commits
+                    .then_some(recovery.recovered_head_commit_id)
+            }
+            None => None,
+        };
         let mut graph = CommitGraphContext::new().reader(store);
         let mut current = head;
         let mut visited = BTreeSet::new();
-        while Some(current) != floor {
+        while Some(current) != serving_checkpoint_floor && Some(current) != recovered_undo_floor {
             if !visited.insert(current) {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -145,7 +166,9 @@ where
                 )
             })?;
             let Some(parent) = node.parent_commit_ids.first().copied() else {
-                let Some(checkpoint) = floor else { break };
+                let Some(checkpoint) = serving_checkpoint_floor else {
+                    break;
+                };
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
@@ -199,6 +222,15 @@ impl CheckpointGcState {
     pub(crate) fn mark_collected(&mut self) {
         self.last_gc_sequence = self.checkpoint_sequence;
         self.collectible_interval_count = 0;
+    }
+
+    /// Keeps one scheduler token for an authenticated queue suffix whose head
+    /// could not advance. The queue remains the exact retirement authority;
+    /// this state only delays the next bounded retry instead of spinning on
+    /// every checkpoint.
+    pub(crate) fn reschedule_pending_reachability(&mut self) {
+        self.last_gc_sequence = self.checkpoint_sequence.saturating_sub(1);
+        self.collectible_interval_count = 1;
     }
 }
 
@@ -1807,6 +1839,13 @@ pub(crate) struct RepositoryGcPlan {
     pub(crate) changelog: GcPlan,
     pub(crate) sweep: RepositoryGcSweep,
     pub(crate) profile: RepositoryGcProfile,
+    /// True only when this authenticated sweep consumed the complete
+    /// reachability queue snapshot. A bounded prefix or blocked head remains
+    /// durable collection debt and must keep checkpoint GC scheduled.
+    pub(crate) reachability_queue_drained: bool,
+    /// True only when this sweep moved the authenticated queue head. A caller
+    /// may immediately continue another bounded pass only on strict progress.
+    pub(crate) reachability_queue_advanced: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2415,6 +2454,8 @@ where
                 tracked_root_stage_us: 0,
                 total_us: elapsed_micros(started),
             },
+            reachability_queue_drained: true,
+            reachability_queue_advanced: false,
         });
     }
 
@@ -2572,7 +2613,8 @@ where
         }
     }
 
-    if consumed_through > queue_head {
+    let reachability_queue_advanced = consumed_through > queue_head;
+    if reachability_queue_advanced {
         consumed_through = consumed_through
             .min(queue_head.saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64))
             .min(next_queue.tail_sequence.saturating_add(1));
@@ -2598,6 +2640,7 @@ where
         writes.seal_changelog_gc();
     }
 
+    let reachability_queue_drained = next_queue.head_sequence == 0;
     preconditions.extend(staged_preconditions);
     Ok(RepositoryGcPlan {
         changelog: GcPlan {
@@ -2630,6 +2673,8 @@ where
             tracked_root_stage_us: 0,
             total_us: elapsed_micros(started),
         },
+        reachability_queue_drained,
+        reachability_queue_advanced,
     })
 }
 
@@ -2800,6 +2845,8 @@ where
             tracked_root_stage_us,
             total_us: elapsed_micros(total_started),
         },
+        reachability_queue_drained: true,
+        reachability_queue_advanced: false,
     })
 }
 
@@ -3751,6 +3798,74 @@ mod tests {
             !reachability
                 .chronology_roots
                 .contains(&untracked_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_bridge_separates_first_parent_undo_floor_from_serving_checkpoint() {
+        let timestamp = LixTimestamp::expect_parse(
+            "branch bridge reachability timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        let recovered = replay_commit_record("branch-bridge-recovered", 0, None, timestamp);
+        let checkpoint = replay_commit_record("branch-bridge-checkpoint", 0, None, timestamp);
+        let mut source = replay_commit_record(
+            "branch-bridge-source",
+            1,
+            Some(recovered.commit_id),
+            timestamp,
+        );
+        source.parent_commit_ids.push(checkpoint.commit_id);
+        let branch_id = "01920000-0000-7000-8000-0000000005a1";
+        let controls = vec![(
+            branch_id.to_owned(),
+            BranchHeadControl {
+                head_commit_id: source.commit_id,
+                tracked_generation: source.commit_id,
+                untracked_generation: source.commit_id,
+                current_state_revision: 1,
+                working_diff_checkpoint_commit_id: Some(checkpoint.commit_id),
+                created_at: timestamp,
+                updated_at: timestamp,
+                ref_change_id: ChangeId::for_test_label("branch-bridge-ref"),
+                schema_presence_bloom: [0; 4],
+            },
+        )];
+
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_recovery_ref_rotation(
+            &mut writes,
+            &super::CheckpointRecoveryRef {
+                branch_id: branch_id.to_owned(),
+                recovered_head_commit_id: recovered.commit_id,
+                checkpoint_commit_id: checkpoint.commit_id,
+                interval_has_commits: true,
+            },
+        )
+        .expect("branch bridge recovery context should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[checkpoint.clone(), recovered.clone(), source.clone()],
+            &[],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch bridge reachability read should open");
+        let reachability = authenticated_control_commit_reachability(&read, &controls)
+            .await
+            .expect("serving checkpoint need not be the first-parent undo floor");
+        assert_eq!(
+            reachability.chronology_roots,
+            BTreeSet::from([source.commit_id, checkpoint.commit_id])
+        );
+        assert_eq!(
+            reachability.history_dependencies,
+            BTreeSet::from([recovered.commit_id])
         );
     }
 
@@ -6178,6 +6293,14 @@ mod tests {
             super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
                 .await
                 .expect("full-queue repository sweep should stage");
+        assert!(
+            !plan.reachability_queue_drained,
+            "a bounded sweep must preserve collection debt for authenticated batches beyond its window"
+        );
+        assert!(
+            plan.reachability_queue_advanced,
+            "the bounded pass must report strict queue-head progress"
+        );
         assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
         storage
             .commit_write_set(

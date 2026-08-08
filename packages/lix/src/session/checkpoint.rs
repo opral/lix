@@ -306,6 +306,17 @@ mod tests {
     }
 
     #[test]
+    fn blocked_reachability_suffix_reschedules_without_checkpoint_spin() {
+        let mut pending = state(CHECKPOINT_GC_MIN_AGE, 0);
+        assert!(checkpoint_gc_due(pending).expect("initial queue debt should be due"));
+        pending.reschedule_pending_reachability();
+        assert_eq!(pending.collectible_interval_count, 1);
+        assert!(!checkpoint_gc_due(pending).expect("blocked queue debt should be rescheduled"));
+        pending.checkpoint_sequence += CHECKPOINT_GC_MIN_AGE - 1;
+        assert!(checkpoint_gc_due(pending).expect("rescheduled queue debt should become due"));
+    }
+
+    #[test]
     fn sweep_count_stays_sublinear_through_ten_thousand_checkpoints() {
         let mut state = CheckpointGcState::default();
         let mut sweep_count = 0;

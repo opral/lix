@@ -36,7 +36,11 @@ where
         let mut preconditions = Vec::new();
         let plan =
             stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions).await?;
-        gc_state.mark_collected();
+        if plan.reachability_queue_drained {
+            gc_state.mark_collected();
+        } else if !plan.reachability_queue_advanced {
+            gc_state.reschedule_pending_reachability();
+        }
         stage_checkpoint_gc_state(&mut writes, &gc_state)?;
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
@@ -65,25 +69,36 @@ where
     /// atomic write as a successful sweep, so every later checkpoint retries
     /// while collection remains due.
     pub(super) async fn collect_checkpoint_garbage_best_effort(&self) {
-        match self.collect_checkpoint_garbage().await {
-            Ok(Some(plan)) => {
-                tracing::debug!(
-                    swept_commits = plan.changelog.sweep.commits.len(),
-                    swept_changes = plan.changelog.sweep.changes.len(),
-                    swept_tracked_roots = plan.sweep.tracked_commit_roots.len(),
-                    root_discovery_us = plan.profile.root_discovery_us,
-                    changelog_us = plan.profile.changelog_us,
-                    tracked_root_stage_us = plan.profile.tracked_root_stage_us,
-                    gc_total_us = plan.profile.total_us,
-                    "completed post-checkpoint garbage collection"
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "post-checkpoint garbage collection failed; checkpoint remains committed"
-                );
+        loop {
+            match self.collect_checkpoint_garbage().await {
+                Ok(Some(plan)) => {
+                    let continue_with_next_bounded_prefix =
+                        !plan.reachability_queue_drained && plan.reachability_queue_advanced;
+                    tracing::debug!(
+                        swept_commits = plan.changelog.sweep.commits.len(),
+                        swept_changes = plan.changelog.sweep.changes.len(),
+                        swept_tracked_roots = plan.sweep.tracked_commit_roots.len(),
+                        root_discovery_us = plan.profile.root_discovery_us,
+                        changelog_us = plan.profile.changelog_us,
+                        tracked_root_stage_us = plan.profile.tracked_root_stage_us,
+                        gc_total_us = plan.profile.total_us,
+                        reachability_queue_drained = plan.reachability_queue_drained,
+                        reachability_queue_advanced = plan.reachability_queue_advanced,
+                        "completed post-checkpoint garbage collection"
+                    );
+                    if continue_with_next_bounded_prefix {
+                        continue;
+                    }
+                    return;
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "post-checkpoint garbage collection failed; checkpoint remains committed"
+                    );
+                    return;
+                }
             }
         }
     }
