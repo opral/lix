@@ -1,0 +1,13 @@
+case	surface	row_or_corruption	expectation	reads	plans	writes	commits	rotations	fallbacks
+valid-value	all-four	Value+one-matching-BlobRef+payload	Value	1	0	0	0	0	0
+valid-tombstone	all-four	Tombstone+zero-BlobRefs	Deletion	1	0	0	0	0	0
+wrong-view	all-four	retained-view-id-mismatch	FailClosed(ViewMismatch)	1	0	0	0	0	0
+missing-blobref	all-four	Value+zero-BlobRefs	FailClosed(MissingRow)	1	0	0	0	0	0
+duplicate-blobref	all-four	Value+two-BlobRefs	FailClosed(DuplicateBlobRef)	1	0	0	0	0	0
+blob-identity-substitution	all-four	BlobRef.file_id!=row.file_id	FailClosed(BlobIdentityMismatch)	1	0	0	0	0	0
+blob-wrong-kind	all-four	empty/noncanonical-BlobId	FailClosed(WrongKind)	1	0	0	0	0	0
+malformed-file-row	all-four	invalid-required-row-encoding	FailClosed(MalformedRow)	1	0	0	0	0	0
+malformed-blobref	all-four	BlobRef.kind=Malformed	FailClosed(MalformedRow)	1	0	0	0	0	0
+missing-payload	all-four	BlobRef.payload=None	FailClosed(MissingPayload)	1	0	0	0	0	0
+payload-digest-substitution	all-four	BlobRef.digest!=payload-digest	FailClosed(PayloadDigestMismatch)	1	0	0	0	0	0
+null-file-row	all-four	Null	FailClosed(MissingRow)	1	0	0	0	0	0

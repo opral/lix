@@ -1,0 +1,50 @@
+PASS	provenance	baseline=cd91b9b90f7f468158b4df154adbed9551eb5d60 head=cd91b9b90f7f468158b4df154adbed9551eb5d60
+PASS	path-present	packages/lix/src/session/checkpoint.rs
+PASS	path-present	packages/lix/src/sql2/providers/checkpoint.rs
+PASS	path-present	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+PASS	path-present	packages/lix/src/sql2/providers/working_diff.rs
+PASS	no-local-forktree-facade	packages/lix/src/session/checkpoint.rs
+PASS	no-local-begin-read	packages/lix/src/session/checkpoint.rs
+RED	local-forktree-facade	packages/lix/src/sql2/providers/checkpoint.rs
+PASS	no-local-begin-read	packages/lix/src/sql2/providers/checkpoint.rs
+RED	local-forktree-facade	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+PASS	no-local-begin-read	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+RED	local-forktree-facade	packages/lix/src/sql2/providers/working_diff.rs
+PASS	no-local-begin-read	packages/lix/src/sql2/providers/working_diff.rs
+PASS	no-legacy-BranchHeadControlContext	packages/lix/src/session/checkpoint.rs
+PASS	no-legacy-TrackedHeadContext	packages/lix/src/session/checkpoint.rs
+PASS	no-legacy-TrackedStateStoreReader	packages/lix/src/session/checkpoint.rs
+PASS	no-legacy-TrackedStateContext	packages/lix/src/session/checkpoint.rs
+RED	legacy-working_diff_at_head	packages/lix/src/session/checkpoint.rs
+RED	legacy-BranchHeadControlContext	packages/lix/src/sql2/providers/working_diff.rs
+RED	legacy-TrackedHeadContext	packages/lix/src/sql2/providers/working_diff.rs
+PASS	no-legacy-TrackedStateStoreReader	packages/lix/src/sql2/providers/working_diff.rs
+RED	legacy-TrackedStateContext	packages/lix/src/sql2/providers/working_diff.rs
+PASS	no-legacy-working_diff_at_head	packages/lix/src/sql2/providers/working_diff.rs
+RED	legacy-BranchHeadControlContext	packages/lix/src/transaction/context.rs
+RED	legacy-TrackedHeadContext	packages/lix/src/transaction/context.rs
+RED	legacy-TrackedStateStoreReader	packages/lix/src/transaction/context.rs
+RED	legacy-TrackedStateContext	packages/lix/src/transaction/context.rs
+RED	legacy-working_diff_at_head	packages/lix/src/transaction/context.rs
+RED	missing-caller-owned-history-source	packages/lix/src/sql2/providers/checkpoint.rs
+RED	store-extracted-for-history	packages/lix/src/sql2/providers/checkpoint.rs
+RED	missing-caller-owned-history-source	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+RED	store-extracted-for-history	packages/lix/src/sql2/providers/filesystem_working_diff.rs
+RED	missing-caller-owned-history-source	packages/lix/src/sql2/providers/working_diff.rs
+RED	store-extracted-for-history	packages/lix/src/sql2/providers/working_diff.rs
+PASS	checkpoint-retained-forktree-view	packages/lix/src/session/checkpoint.rs
+PASS	preserved-historical-check	record.commit_id != reachable.commit.commit_id
+PASS	preserved-historical-check	row.commit_id != certified_commit_id
+PASS	preserved-historical-check	cycle encountered
+PASS	preserved-historical-check	references missing parent
+PASS	preserved-historical-check	BlobId::from_hex
+PASS	preserved-historical-check	load_bytes_many
+PASS	preserved-historical-check	directory parent cycle
+PASS	preserved-historical-check	missing from the authenticated history root
+RED	permissive-file-materialization	|| Some(Vec::new())
+RED	permissive-file-materialization	blob_bytes.get(blob_hash).cloned().flatten()
+PASS	required-file-failure-contract	exactly one blob reference
+RED	missing-file-failure-contract	missing authenticated blob payload
+RED	missing-file-failure-contract	blob reference count
+RED
+exit_status=1
