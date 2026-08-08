@@ -25,6 +25,24 @@ identical to the candidate. If an artifact needs a candidate-facing facade,
 the facade must already be present in the candidate; the reviewer must not
 adapt the test, widen visibility, or restore a legacy API to make it compile.
 
+## First-runnable readiness
+
+Approved topology milestone
+`origin/codex/forktree-stage2-milestone3e-topology-owned-reader` is frozen at
+`af7899f41c489fe763ce1a64c5468083570979e2`, tree
+`da097bd739b50629ea39b155d4fa9efc870654e0`, parent
+`2e0cea1b91558179e6ed90847bc8b04b23de246f`. Its parent delta has canonical
+full-index SHA-256
+`942d05f6c92f89e6c32c3b706c82c4e506e498263b5798c92eb2af607a219587`
+and patch ID `6ed511438fe08387ea40a5b6861f7db9f3544764`. This is an approved
+topology-ownership frontier only; it remains non-runnable and receives no
+artifact application or build.
+
+The next eligible candidate must be an explicitly compile-green immutable
+blob/SPI head on this accepted lineage, unless the coordinator names a
+replacement lineage. The disposable preflight/application procedure is frozen
+in `FORKTREE_STAGE2_FIRST_RUNNABLE_RECIPE.md`.
+
 Frozen artifact identities and independently reproduced canonical full-index
 binary diff SHA-256 values are:
 
