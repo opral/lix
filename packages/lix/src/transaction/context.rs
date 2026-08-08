@@ -47,8 +47,8 @@ use crate::filesystem::{
 use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
-    CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_gc_state,
-    load_recovery_ref,
+    CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef,
+    load_checkpoint_publication_state,
 };
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
@@ -7056,9 +7056,7 @@ where
         branch_id: &str,
     ) -> Result<(Option<CheckpointRecoveryRef>, CheckpointGcState), LixError> {
         let read = self.opening_read();
-        let recovery_ref = load_recovery_ref(&read, branch_id).await?;
-        let gc_state = load_checkpoint_gc_state(&read).await?;
-        Ok((recovery_ref, gc_state))
+        load_checkpoint_publication_state(&read, branch_id).await
     }
 
     /// Creates a branch-ref reader scoped to this write transaction.
