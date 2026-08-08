@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+use crate::binary_cas::BlobId;
 use crate::storage::StorageError;
 
 use super::codec::{
@@ -625,6 +626,10 @@ impl BlobChunkV1 {
 pub(crate) struct BlobManifestV1 {
     pub(crate) logical_bytes: u64,
     pub(crate) ordered_chunks: Vec<BlobChunkRefV1>,
+    /// Integrity-bound copy of the canonical public identity. The selected
+    /// state row remains the sole serving owner; this field is only compared
+    /// with that row before payload access and is never independently keyed.
+    pub(super) canonical_blob_id: BlobId,
     pub(crate) content_digest: [u8; 32],
 }
 
@@ -640,6 +645,7 @@ impl BlobManifestV1 {
                 encode_id(encoder, chunk.chunk_object_id);
                 encoder.u64(chunk.declared_len);
             }
+            encoder.fixed(self.canonical_blob_id.as_bytes());
             encoder.fixed(&self.content_digest);
             Ok(())
         })
@@ -660,6 +666,7 @@ impl BlobManifestV1 {
         let value = Self {
             logical_bytes,
             ordered_chunks,
+            canonical_blob_id: BlobId::from_bytes(decoder.fixed()?),
             content_digest: decoder.fixed()?,
         };
         decoder.finish()?;

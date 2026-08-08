@@ -18,6 +18,63 @@ use super::object::ObjectId;
 use super::tree::{ReceiptTreeRoot, scan_page_on_read, validate_receipt_root_on_read};
 use super::view::{CoherentView, SELECTOR_SPACE, load_object_bytes, load_object_map};
 
+const CANONICAL_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Computes the existing public fixed-chunk BlobId while upload completion is
+/// already authenticating payload bytes. Memory is one canonical chunk plus
+/// O(chunk-count) hashes; the result is copied into the manifest only as an
+/// integrity claim checked against the selected state owner.
+#[derive(Default)]
+struct CanonicalBlobIdBuilder {
+    total_size: u64,
+    pending: Vec<u8>,
+    chunks: Vec<(crate::binary_cas::ChunkHash, u64)>,
+}
+
+impl CanonicalBlobIdBuilder {
+    fn update(&mut self, mut bytes: &[u8]) -> Result<(), StorageError> {
+        self.total_size = self
+            .total_size
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| corruption("blob fragment length exceeds u64"))?,
+            )
+            .ok_or_else(|| corruption("blob length overflows u64"))?;
+        while !bytes.is_empty() {
+            let remaining = CANONICAL_BLOB_CHUNK_BYTES - self.pending.len();
+            let take = remaining.min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.pending.len() == CANONICAL_BLOB_CHUNK_BYTES {
+                self.chunks.push((
+                    crate::binary_cas::ChunkHash::from_content(&self.pending),
+                    CANONICAL_BLOB_CHUNK_BYTES as u64,
+                ));
+                self.pending.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> crate::binary_cas::BlobId {
+        if self.total_size <= CANONICAL_BLOB_CHUNK_BYTES as u64 {
+            let hash = self
+                .chunks
+                .first()
+                .map(|(hash, _)| *hash)
+                .unwrap_or_else(|| crate::binary_cas::ChunkHash::from_content(&self.pending));
+            return crate::binary_cas::BlobId::from_single_chunk(hash);
+        }
+        if !self.pending.is_empty() {
+            self.chunks.push((
+                crate::binary_cas::ChunkHash::from_content(&self.pending),
+                self.pending.len() as u64,
+            ));
+        }
+        crate::binary_cas::BlobId::from_chunks(self.total_size, self.chunks)
+    }
+}
+
 /// A public blob identity bound to one immutable manifest by an authenticated
 /// state-tree row. Fields stay owner-private so sibling subsystems cannot
 /// construct an object-space capability or substitute a manifest ID.
@@ -139,6 +196,12 @@ where
 {
     validate_blob_ref_views(view_id, view_instance_id, refs.iter())?;
     let manifests = load_manifests(read, refs).await?;
+    for reference in refs {
+        validate_manifest_owner(
+            required_manifest(&manifests, reference.manifest_object_id)?,
+            reference,
+        )?;
+    }
     let chunks = load_required_chunks(
         read,
         manifests.values().flat_map(|manifest| {
@@ -152,7 +215,6 @@ where
     let mut entries = Vec::with_capacity(refs.len());
     for reference in refs {
         let manifest = required_manifest(&manifests, reference.manifest_object_id)?;
-        validate_manifest_owner(manifest, reference)?;
         let capacity = usize::try_from(manifest.logical_bytes)
             .map_err(|_| corruption("blob payload length cannot be represented by this process"))?;
         let mut bytes = Vec::with_capacity(capacity);
@@ -326,6 +388,12 @@ fn validate_manifest_owner(
         )
         .into());
     }
+    if manifest.canonical_blob_id != reference.semantic_id {
+        return Err(corruption(
+            "blob-reference owner identity does not match its authenticated manifest",
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -457,6 +525,7 @@ where
     validate_receipt_root_on_read(receipt_root, view.read()).await?;
     let mut ordered_chunks = Vec::new();
     let mut final_hasher = blake3::Hasher::new();
+    let mut semantic_id_builder = CanonicalBlobIdBuilder::default();
     let mut next_offset = 0_u64;
     let mut part_count = 0_u64;
     let mut start_after: Option<Vec<u8>> = None;
@@ -496,8 +565,14 @@ where
             }
             let mut part_hasher = blake3::Hasher::new();
             for chunk_ref in &part.ordered_chunks {
-                authenticate_chunk(view.read(), chunk_ref, &mut part_hasher, &mut final_hasher)
-                    .await?;
+                authenticate_chunk(
+                    view.read(),
+                    chunk_ref,
+                    &mut part_hasher,
+                    &mut final_hasher,
+                    &mut semantic_id_builder,
+                )
+                .await?;
             }
             if part_hasher.finalize().as_bytes() != &part.part_digest {
                 return Err(corruption("upload part digest does not match its chunks"));
@@ -533,6 +608,7 @@ where
     let manifest = BlobManifestV1 {
         logical_bytes: next_offset,
         ordered_chunks,
+        canonical_blob_id: semantic_id_builder.finish(),
         content_digest,
     };
     let _ = manifest.encode()?;
@@ -638,6 +714,7 @@ async fn authenticate_chunk<R>(
     chunk_ref: &BlobChunkRefV1,
     part_hasher: &mut blake3::Hasher,
     final_hasher: &mut blake3::Hasher,
+    semantic_id_builder: &mut CanonicalBlobIdBuilder,
 ) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -651,5 +728,24 @@ where
     }
     part_hasher.update(&chunk.bytes);
     final_hasher.update(&chunk.bytes);
+    semantic_id_builder.update(&chunk.bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod canonical_blob_id_tests {
+    use super::CanonicalBlobIdBuilder;
+
+    #[test]
+    fn streaming_identity_matches_complete_multi_chunk_content() {
+        let payload = vec![0x5a; 2 * 1024 * 1024 + 17];
+        let mut builder = CanonicalBlobIdBuilder::default();
+        for fragment in payload.chunks(333_333) {
+            builder.update(fragment).expect("streaming identity update");
+        }
+        assert_eq!(
+            builder.finish(),
+            crate::binary_cas::BlobId::from_content(&payload)
+        );
+    }
 }

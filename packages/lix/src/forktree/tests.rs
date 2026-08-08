@@ -61,6 +61,20 @@ fn topology_cache_is_private_and_inseparable_from_its_storage_read() {
     assert!(!facade.contains("load_commit_topology_batch"));
 }
 
+#[test]
+fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
+    let model = include_str!("model.rs");
+    let blob = include_str!("blob.rs");
+    let facade = include_str!("mod.rs");
+    assert!(model.contains("pub(super) canonical_blob_id: BlobId"));
+    assert!(!model.contains("pub(crate) canonical_blob_id"));
+    assert!(!facade.contains("canonical_blob_id"));
+    assert!(blob.contains("canonical_blob_id: semantic_id_builder.finish()"));
+    assert!(blob.contains("manifest.canonical_blob_id != reference.semantic_id"));
+    assert!(!blob.contains("BTreeMap<crate::binary_cas::BlobId"));
+    assert!(!blob.contains("fn canonical_blob_id"));
+}
+
 fn content_id(byte: u8) -> ObjectId {
     ObjectId::from_bytes([byte; 32])
 }
@@ -2197,6 +2211,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     let manifest = BlobManifestV1 {
         logical_bytes: 4,
         ordered_chunks: upload.part.ordered_chunks.clone(),
+        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"data"),
         content_digest: *blake3::hash(b"data").as_bytes(),
     };
     let (manifest_id, _) = manifest.encode().expect("manifest");
@@ -2216,12 +2231,66 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     );
     let (mismatched_owner_key, mismatched_owner) =
         blob_ref_state_entry("mismatched", blob_id, 5, 0x70, manifest_id);
+
+    // A valid multi-chunk manifest must not be transplantable beneath a
+    // same-size state owner carrying another public BlobId. The manifest's
+    // canonical semantic identity is authenticated before range chunks are
+    // selected, so this check remains O(chunk metadata + visited payload).
+    const FIXED_CHUNK_BYTES: usize = 1024 * 1024;
+    let owner_payload = vec![b'a'; FIXED_CHUNK_BYTES + 1];
+    let transplanted_payload = vec![b'b'; FIXED_CHUNK_BYTES + 1];
+    let owner_blob_id = crate::binary_cas::BlobId::from_content(&owner_payload);
+    let transplanted_blob_id = crate::binary_cas::BlobId::from_content(&transplanted_payload);
+    assert_ne!(owner_blob_id, transplanted_blob_id);
+    let transplanted_chunks = [
+        BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(&transplanted_payload[..FIXED_CHUNK_BYTES]),
+        },
+        BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(&transplanted_payload[FIXED_CHUNK_BYTES..]),
+        },
+    ];
+    let transplanted_chunk_refs = transplanted_chunks
+        .iter()
+        .map(|chunk| {
+            let (chunk_object_id, _) = chunk.encode().expect("transplanted chunk");
+            BlobChunkRefV1 {
+                chunk_object_id,
+                declared_len: chunk.bytes.len() as u64,
+            }
+        })
+        .collect::<Vec<_>>();
+    let transplanted_manifest = BlobManifestV1 {
+        logical_bytes: transplanted_payload.len() as u64,
+        ordered_chunks: transplanted_chunk_refs,
+        canonical_blob_id: transplanted_blob_id,
+        content_digest: *blake3::hash(&transplanted_payload).as_bytes(),
+    };
+    let (transplanted_manifest_id, _) = transplanted_manifest
+        .encode()
+        .expect("transplanted manifest");
+    let (transplanted_owner_key, transplanted_owner) = blob_ref_state_entry(
+        "transplanted",
+        owner_blob_id,
+        owner_payload.len() as u64,
+        0x70,
+        transplanted_manifest_id,
+    );
+    let (valid_multichunk_key, valid_multichunk_owner) = blob_ref_state_entry(
+        "valid-multichunk",
+        transplanted_blob_id,
+        transplanted_payload.len() as u64,
+        0x70,
+        transplanted_manifest_id,
+    );
     let state_edit = edit_state_tree(
         view.branch_snapshot().local_state_root,
         vec![
             StateTreeMutation::insert(key.clone(), value),
             StateTreeMutation::insert(wrong_owner_key.clone(), wrong_owner),
             StateTreeMutation::insert(mismatched_owner_key.clone(), mismatched_owner),
+            StateTreeMutation::insert(transplanted_owner_key.clone(), transplanted_owner),
+            StateTreeMutation::insert(valid_multichunk_key.clone(), valid_multichunk_owner),
         ],
         view.read(),
     )
@@ -2229,6 +2298,14 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     .expect("state edit");
     let transition = branch_transition(&view, state_edit, 0x70).await;
     let mut publish = PreparedPublication::from_branch_view(&view).expect("completion publication");
+    for chunk in &transplanted_chunks {
+        publish
+            .stage_blob_chunk(chunk)
+            .expect("stage transplanted chunk");
+    }
+    publish
+        .stage_blob_manifest(&transplanted_manifest)
+        .expect("stage transplanted manifest");
     assert_eq!(
         publish
             .publish_completed_upload(&view, completion, transition)
@@ -2270,6 +2347,46 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
             .await
             .is_err(),
         "a transplanted manifest with mismatched owner size must fail closed"
+    );
+    let transplanted_owner = state_point(&reopened, &transplanted_owner_key, false)
+        .await
+        .expect("transplanted owner state")
+        .expect("transplanted owner row");
+    let transplanted_ref = reopened
+        .bind_blob(&transplanted_owner)
+        .expect("authenticated same-size transplanted owner edge");
+    assert!(
+        reopened
+            .load_blob_ranges_many(&[(transplanted_ref, 0..1)])
+            .await
+            .is_err(),
+        "a same-size multi-chunk manifest transplant must fail before range output"
+    );
+    assert!(
+        reopened
+            .load_blob_bytes_many(&[transplanted_ref])
+            .await
+            .is_err(),
+        "a same-size multi-chunk manifest transplant must fail before full output"
+    );
+    let valid_multichunk_owner = state_point(&reopened, &valid_multichunk_key, false)
+        .await
+        .expect("valid multi-chunk state")
+        .expect("valid multi-chunk row");
+    let valid_multichunk_ref = reopened
+        .bind_blob(&valid_multichunk_owner)
+        .expect("valid multi-chunk owner edge");
+    let valid_multichunk_range = reopened
+        .load_blob_ranges_many(&[(valid_multichunk_ref, 0..1)])
+        .await
+        .expect("bounded valid multi-chunk range")
+        .into_vec();
+    assert_eq!(
+        valid_multichunk_range[0]
+            .as_ref()
+            .expect("valid multi-chunk range value")
+            .bytes,
+        b"b"
     );
     let same_selectors_different_read = open_coherent_view(&storage, seed.branch_id)
         .await
@@ -2542,6 +2659,7 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     let manifest = BlobManifestV1 {
         logical_bytes: 4,
         ordered_chunks: upload.part.ordered_chunks.clone(),
+        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"data"),
         content_digest: *blake3::hash(b"data").as_bytes(),
     };
     let (manifest_id, _) = manifest.encode().expect("manifest");
@@ -2700,6 +2818,7 @@ async fn untracked_and_real_shared_chunk_roots_release_only_at_final_reference()
             },
             shared_reference.clone(),
         ],
+        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"oneshared"),
         content_digest: *blake3::hash(b"oneshared").as_bytes(),
     };
     let second = BlobManifestV1 {
@@ -2711,6 +2830,7 @@ async fn untracked_and_real_shared_chunk_roots_release_only_at_final_reference()
             },
             shared_reference,
         ],
+        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"twoshared"),
         content_digest: *blake3::hash(b"twoshared").as_bytes(),
     };
     let first_id = publish_untracked_manifest(
