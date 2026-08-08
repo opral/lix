@@ -888,7 +888,6 @@ mod tests {
     use crate::storage::Memory;
 
     #[tokio::test]
-    #[ignore = "repository initialization is deferred until transaction-owned ForkTree publication is lowered"]
     async fn public_upload_race_preserves_one_authenticated_winner_and_reopens() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
@@ -927,7 +926,7 @@ mod tests {
         );
         assert!(
             left_result.is_ok() ^ right_result.is_ok(),
-            "one receipt publication must win and the conflicting stale publication must fail"
+            "one receipt publication must win and the conflicting stale publication must fail: left={left_result:?} right={right_result:?}"
         );
         let expected = if left_result.is_ok() {
             left_bytes
@@ -976,6 +975,216 @@ mod tests {
             .await
             .expect_err("conflicting completed-part replay must fail closed");
         assert_eq!(mismatch.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
+    async fn public_multipart_upload_reopens_and_preserves_shared_final_references() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("test repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("test repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("upload session should open");
+        let part_size = FILE_UPLOAD_PART_BYTES as u64;
+        let total_size = part_size * 2 + 7;
+        let first = vec![0x11; FILE_UPLOAD_PART_BYTES];
+        let second = vec![0x22; FILE_UPLOAD_PART_BYTES];
+        let tail = vec![0x33; 7];
+
+        assert!(
+            !session
+                .upsert_file_content_part(
+                    "multipart-a".to_owned(),
+                    "/media/multipart-a.bin".to_owned(),
+                    0,
+                    total_size,
+                    first.clone().into(),
+                )
+                .await
+                .expect("first multipart part should publish")
+                .finalized
+        );
+        assert!(
+            !session
+                .upsert_file_content_part(
+                    "multipart-a".to_owned(),
+                    "/media/multipart-a.bin".to_owned(),
+                    part_size,
+                    total_size,
+                    second.clone().into(),
+                )
+                .await
+                .expect("second multipart part should publish")
+                .finalized
+        );
+        assert!(
+            session
+                .upsert_file_content_part(
+                    "multipart-a".to_owned(),
+                    "/media/multipart-a.bin".to_owned(),
+                    part_size * 2,
+                    total_size,
+                    tail.clone().into(),
+                )
+                .await
+                .expect("final multipart part should publish")
+                .finalized
+        );
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        expected.extend_from_slice(&tail);
+        let content = session
+            .read_file_content("/media/multipart-a.bin".to_owned(), None)
+            .await
+            .expect("published multipart file should read")
+            .expect("published multipart file should exist")
+            .into_content();
+        assert_eq!(content.as_ref(), expected.as_slice());
+
+        let reopened = Engine::new(storage.clone())
+            .await
+            .expect("multipart repository should cold reopen");
+        let reopened_session = reopened
+            .open_workspace_session()
+            .await
+            .expect("reopened upload session should open");
+        let reopened_content = reopened_session
+            .read_file_content("/media/multipart-a.bin".to_owned(), None)
+            .await
+            .expect("reopened multipart file should read")
+            .expect("reopened multipart file should exist")
+            .into_content();
+        assert_eq!(reopened_content.as_ref(), expected.as_slice());
+
+        reopened_session
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[crate::Value::Text("/media/multipart-a.bin".to_owned())],
+            )
+            .await
+            .expect("final file reference deletion should publish");
+        assert!(
+            reopened_session
+                .read_file_content("/media/multipart-a.bin".to_owned(), None)
+                .await
+                .expect("deleted final reference should be readable as absence")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_upload_rejects_active_receipt_size_conflict() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("test repository should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("test repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("upload session should open");
+        let part = vec![0x44; FILE_UPLOAD_PART_BYTES];
+        session
+            .upsert_file_content_part(
+                "active-size-conflict".to_owned(),
+                "/media/active-size-conflict.bin".to_owned(),
+                0,
+                (FILE_UPLOAD_PART_BYTES * 2) as u64,
+                part.clone().into(),
+            )
+            .await
+            .expect("initial active receipt should publish");
+        let error = session
+            .upsert_file_content_part(
+                "active-size-conflict".to_owned(),
+                "/media/active-size-conflict.bin".to_owned(),
+                0,
+                (FILE_UPLOAD_PART_BYTES * 3) as u64,
+                part.into(),
+            )
+            .await
+            .expect_err("active receipt size conflict must fail closed");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
+    async fn public_shared_chunk_survives_first_reference_and_releases_after_last() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("test repository should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("test repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("upload session should open");
+        let shared = vec![0x55; FILE_UPLOAD_PART_BYTES];
+        for (upload_id, path) in [
+            ("shared-a", "/media/shared-a.bin"),
+            ("shared-b", "/media/shared-b.bin"),
+        ] {
+            session
+                .upsert_file_content_part(
+                    upload_id.to_owned(),
+                    path.to_owned(),
+                    0,
+                    FILE_UPLOAD_PART_BYTES as u64,
+                    shared.clone().into(),
+                )
+                .await
+                .expect("shared chunk upload should finalize");
+        }
+        assert_eq!(
+            session
+                .read_file_content("/media/shared-a.bin".to_owned(), None)
+                .await
+                .expect("first shared reference should read")
+                .expect("first shared reference should exist")
+                .into_content()
+                .as_ref(),
+            shared.as_slice()
+        );
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[crate::Value::Text("/media/shared-a.bin".to_owned())],
+            )
+            .await
+            .expect("first shared reference deletion should publish");
+        assert_eq!(
+            session
+                .read_file_content("/media/shared-b.bin".to_owned(), None)
+                .await
+                .expect("shared chunk must survive first reference release")
+                .expect("second shared reference should still exist")
+                .into_content()
+                .as_ref(),
+            shared.as_slice()
+        );
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[crate::Value::Text("/media/shared-b.bin".to_owned())],
+            )
+            .await
+            .expect("last shared reference deletion should publish");
+        assert!(
+            session
+                .read_file_content("/media/shared-b.bin".to_owned(), None)
+                .await
+                .expect("released final reference should be readable as absence")
+                .is_none()
+        );
     }
 
     #[test]
