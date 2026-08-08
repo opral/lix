@@ -1,0 +1,19 @@
+Standalone model qualification only; no Lix or adapter target was built or
+run.
+
+Command:
+  timeout 1200s rustc --edition=2024 --test -D warnings undo_transition_oracle.rs -o /tmp/w1b3-undo-transition-oracle-e1af
+  timeout 1200s /tmp/w1b3-undo-transition-oracle-e1af --nocapture
+
+Binary SHA-256:
+  4646b7f072a114752f7f27bebb116512b1d5f9187dd544b12fb113cd2b812019
+
+Result:
+  running 5 tests
+  checkpoint_floor_and_merge_or_root_history_fail_closed ... ok
+  cold_reopen_preserves_history_and_transition_identity ... ok
+  read_poisoning_and_missing_history_fail_closed ... ok
+  typed_transition_is_atomic_and_rejects_identity_or_stale_errors ... ok
+  undo_and_redo_preserve_exact_inverse_state_identity ... ok
+
+  test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out

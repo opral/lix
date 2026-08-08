@@ -1,0 +1,8 @@
+ANCHOR PASS target=e1af471b9ab0f598dafa7c2ddec7867667c81740 anchor=e1af471b9ab0f598dafa7c2ddec7867667c81740
+SCOPE PASS changed_source=<none>
+RED-1 undo/redo still opens or uses the legacy tracked-state reader
+RED-2 undo/redo still opens a fresh commit-graph reader
+RED-3 undo/redo lacks the retained ForkTree facade anchor
+RED-4 typed transitions still reload through the legacy tracked-state reader
+EXPECTED-RED predicates=4 target=e1af471b9ab0f598dafa7c2ddec7867667c81740
+verifier exit: 1 (intentional RED)
