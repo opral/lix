@@ -79,35 +79,40 @@ function_index() {
 
 scope_paths() {
   if (( fixture )); then
-    find "$root/packages/lix/src" -type f -printf 'packages/lix/src/%P\n' 2>/dev/null | sort
+    find "$root" -type f -printf '%P\n' 2>/dev/null | sort
   else
-    git -C "$root" diff --name-only "$anchor" "$target" -- packages/lix/src
+    git -C "$root" diff --name-only "$anchor" "$target"
   fi
 }
 
 bad_scope_path() {
-  case "$1" in
-    packages/lix/src/transaction/context.rs|packages/lix/src/transaction/context/cohort.rs|packages/lix/src/transaction/stale_commit.rs|packages/lix/src/forktree/view.rs|packages/lix/src/forktree/serving.rs|packages/lix/src/forktree/tests.rs) return 1 ;;
-    *) return 0 ;;
-  esac
+  if (( fixture )); then
+    case "$1" in
+      runtime.rs|packages/lix/src/transaction/context.rs|packages/lix/src/transaction/context/cohort.rs|packages/lix/src/transaction/stale_commit.rs|packages/lix/src/forktree/view.rs|packages/lix/src/forktree/serving.rs|packages/lix/src/forktree/tests.rs) return 1 ;;
+      *) return 0 ;;
+    esac
+  else
+    case "$1" in
+      test-reports/w1b2-stale-reconciliation-e1af/*|packages/lix/src/transaction/context.rs|packages/lix/src/transaction/context/cohort.rs|packages/lix/src/transaction/stale_commit.rs|packages/lix/src/forktree/view.rs|packages/lix/src/forktree/serving.rs|packages/lix/src/forktree/tests.rs) return 1 ;;
+      *) return 0 ;;
+    esac
+  fi
 }
 
-bad_scope=$(scope_paths | awk '
-  $0 == "packages/lix/src/transaction/context.rs" ||
-  $0 == "packages/lix/src/transaction/context/cohort.rs" ||
-  $0 == "packages/lix/src/transaction/stale_commit.rs" ||
-  $0 == "packages/lix/src/forktree/view.rs" ||
-  $0 == "packages/lix/src/forktree/serving.rs" ||
-  $0 == "packages/lix/src/forktree/tests.rs" { next }
-  { print; exit }
-')
+bad_scope=''
+while IFS= read -r path; do
+  if bad_scope_path "$path"; then
+    bad_scope=$path
+    break
+  fi
+done < <(scope_paths)
 if [[ -n "$bad_scope" ]]; then
   echo "RED-SCOPE forbidden production path: $bad_scope"
   exit 1
 fi
 
 if (( fixture )); then
-  echo "FIXTURE SCOPE PASS allowlist=6"
+  echo "FIXTURE SCOPE PASS allowlist=6+runtime"
 else
   changed_source=$(scope_paths)
   echo "ANCHOR PASS target=$target anchor=$anchor"
@@ -151,9 +156,9 @@ cohort=packages/lix/src/transaction/context/cohort.rs
 view=packages/lix/src/forktree/view.rs
 stale=packages/lix/src/transaction/stale_commit.rs
 commit_body=$(extract_function "$context" commit_prepared)
-commit_facades=$(printf '%s\n' "$commit_body" | rg -F -c -- 'forktree_read_facade' || true)
+commit_facades=$(printf '%s\n' "$commit_body" | rg -F -c -- 'ForkTreeReadFacade::new(&self.opening_read)' || true)
 [[ "${commit_facades:-0}" == 1 ]] || green_error 'commit_prepared must construct exactly one opening-read facade'
-if [[ "$commit_body" == *'begin_read('* || "$commit_body" == *'read_store('* || "$commit_body" == *'.clone()'* ]]; then
+if [[ "$commit_body" == *'begin_read('* || "$commit_body" == *'read_store('* || "$commit_body" == *'facade.clone('* || "$commit_body" != *'validate_complete_plan(&writes)'* || "$commit_body" != *'atomic_commit.commit(&self.opening_read, plan)'* ]]; then
   green_error 'commit_prepared contains a second read, raw extraction, or facade clone'
 fi
 check_reader_function() {
@@ -210,7 +215,40 @@ require_function_pattern "$view" load_semantic_row load_semantic_row 'semantic r
 if ! has_source "$view" 'pub(crate) struct ForkTreeReadFacade'; then
   green_error 'ForkTreeReadFacade declaration is absent'
 fi
-if ! function_has "$stale" classify_stale_commit 'return'; then
+if (( fixture )); then
+  runtime="runtime.rs"
+  for required in \
+    'struct OpeningStorageRead' \
+    "struct ForkTreeReadFacade<'read>" \
+    "read: &'read OpeningStorageRead" \
+    'std::ptr::eq' \
+    'expected_write_count' \
+    'struct AtomicCommit' \
+    'self.commits' \
+    'for write in writes' \
+    'idempotent_count' \
+    'DuplicateOperation' \
+    'selector_id' \
+    'commit_id'; do
+    has_source "$runtime" "$required" || green_error "runtime fixture missing $required"
+  done
+  if source_at "$runtime" | rg -n -P -- 'StorageAdapterRead|JsonStoreReader|tracked_state|load_projected|fallback_|retry_|reader_cache|alternate_authority|begin_read\(' >/dev/null; then
+    green_error 'runtime fixture names a forbidden raw/legacy/second authority'
+  fi
+  runtime_bin=$(mktemp)
+  runtime_log=$(mktemp)
+  trap 'rm -f "$runtime_bin" "$runtime_log"' EXIT
+  if ! rustc --edition=2024 --test -D warnings "$root/$runtime" -o "$runtime_bin"; then
+    green_error 'runtime fixture does not compile with warnings denied'
+  elif ! "$runtime_bin" --nocapture >"$runtime_log" 2>&1; then
+    green_error 'runtime fixture tests are not green'
+  elif ! rg -F 'test result: ok. 9 passed; 0 failed' "$runtime_log" >/dev/null; then
+    green_error 'runtime fixture did not run all nine executable controls'
+  else
+    echo 'RUNTIME GREEN tests=9'
+  fi
+fi
+if ! function_has "$stale" classify_stale_commit 'StaleDecision'; then
   green_error 'pure stale classifier is absent'
 fi
 

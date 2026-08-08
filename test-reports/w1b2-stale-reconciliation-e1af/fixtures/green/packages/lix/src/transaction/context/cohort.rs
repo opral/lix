@@ -1,12 +1,12 @@
-use super::{ForkTreeReadFacade, PreparedWrite};
+use crate::forktree::view::ForkTreeReadFacade;
 
-pub async fn reconcile_cohort_files(facade: &ForkTreeReadFacade) -> Result<(), ()> {
-    facade.load_semantic_row("cohort-file");
-    load_cohort_plugin_groups(facade).await
+pub async fn reconcile_cohort_files(facade: &ForkTreeReadFacade<'_>) -> Result<(), ()> {
+    facade.load_semantic_row("file-a");
+    load_cohort_plugin_groups(facade);
+    Ok(())
 }
 
-async fn load_cohort_plugin_groups(facade: &ForkTreeReadFacade) -> Result<(), ()> {
-    let _ = PreparedWrite { rank: 2 };
-    facade.load_owner_proof("cohort-file", 4, "change-cohort");
-    Ok(())
+fn load_cohort_plugin_groups(facade: &ForkTreeReadFacade<'_>) {
+    facade.load_owner_proof("file-a", 4, "change-a");
+    facade.load_registry_proof(4, "change-a");
 }

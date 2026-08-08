@@ -2,8 +2,10 @@
 
 ## Immutable boundary
 
-This direct successor is based on immutable W1b-2 correction head
-`8b44e8cbd226e8820498e7c5c8e02d291c34abb8` and remains TEST/REPORT-only.
+This direct successor is based directly on blocked W1b-2 correction head
+`7d71c5c381a2ab1eb049d955258d20291bc3a611` (tree
+`c1d688ecff0be0e68d41436b54db21eadd45cd38`), whose parent is
+`8b44e8cbd226e8820498e7c5c8e02d291c34abb8`, and remains TEST/REPORT-only.
 It changes no `packages/lix/src` file, Cargo manifest, adapter, PR, or main
 branch. The production semantic anchor is exact e1af:
 
@@ -32,14 +34,16 @@ timeout 1200s test-reports/w1b2-stale-reconciliation-e1af/verify_source_contract
   --fixture test-reports/w1b2-stale-reconciliation-e1af/fixtures/green
 ```
 
-Production mode resolves the target commit, compares every changed production
-path from exact e1af to the six-path allowlist, and scopes each legacy RED to
-the named function body. It does not treat a file-wide token or empty diff as
-GREEN. The exact anchor still reports the five original legacy-reader REDs.
+Production mode resolves the target commit, checks exact e1af ancestry, and
+compares every changed workspace path (including Cargo and report paths) to
+the six-path production/package allowlist. Any production or Cargo escape is
+RED. Each legacy RED is scoped to the named function body; an empty diff is
+not treated as GREEN. The exact anchor still reports the five original
+legacy-reader REDs.
 
-Fixture mode scans an actual six-path source tree; it is not a list of
-self-declared booleans. Its GREEN predicates are argument-aware and
-function-scoped:
+Fixture mode scans an actual six-path source tree plus a separately compiled
+runtime fixture; it is not a list of self-declared booleans. Its GREEN
+predicates are argument-aware and function-scoped:
 
 - `commit_prepared` constructs exactly one facade from the opening read and
   contains no nested `begin_read`, raw `read_store`, or facade clone.
@@ -53,6 +57,10 @@ function-scoped:
 - the ForkTree facade exposes owner-proof, registry-proof, and semantic-row
   operations; all six allowed paths are scanned for legacy reader, raw read,
   fallback/retry, cache, and alternate-authority identifiers.
+- `runtime.rs` binds `OpeningStorageRead` by pointer identity, rejects a
+  swapped view, validates complete plan count/digest/order, authenticates all
+  writes, walks every idempotency operation, and records exactly one atomic
+  commit. It runs nine executable controls under `rustc -D warnings`.
 
 This fixture is a verifier calibration, not a production candidate. A future
 production head must pass the same structural predicates against its actual
@@ -74,6 +82,9 @@ source and retain the exact e1af RED control.
 - deterministic multi-write rank ordering and immutable current state, proving
   no partial reconciliation/publication;
 - NULL, tombstone, absent, and JSON values.
+- selector and commit identity substitution, cross-bound registry/plugin
+  identity, mixed replay mismatch, duplicate operation, second commit, and
+  second facade/read controls.
 
 `negative_reconciliation_fixtures.rs` includes the model and adds explicit
 second-read, forged revision/change-ID, idempotency mismatch, and reversed
@@ -96,7 +107,7 @@ both streams hash `9afe7f764ef6bea1d914329e3ad0fded3bc59207d20696480dc76f457b22f
 The GREEN fixture exits 0 with:
 
 ```text
-FIXTURE SCOPE PASS allowlist=6
+FIXTURE SCOPE PASS allowlist=6+runtime
 PASS_FUNCTION=owner/registry authentication
 PASS_FUNCTION=deterministic multi-write ordering
 PASS_FUNCTION=write rank binding
@@ -105,6 +116,7 @@ PASS_FUNCTION=owner proof operation
 PASS_FUNCTION=registry proof operation
 PASS_FUNCTION=semantic row operation
 RESULT=GREEN candidate-parametric structural predicates pass
+RUNTIME GREEN tests=9
 ```
 
 Rust model commands, all bounded to 1200 seconds:
@@ -115,13 +127,18 @@ timeout 1200s rustfmt --edition 2024 --check \
   test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs
 timeout 1200s rustc --edition=2024 --test -D warnings \
   test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs \
-  -o /tmp/w1b2-v2-model
-timeout 1200s /tmp/w1b2-v2-model --nocapture
+  -o /tmp/w1b2-v3-model
+timeout 1200s /tmp/w1b2-v3-model --nocapture
 timeout 1200s rustc --edition=2024 --test -D warnings \
   test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs \
-  -o /tmp/w1b2-v2-negative
-timeout 1200s /tmp/w1b2-v2-negative --nocapture
+  -o /tmp/w1b2-v3-negative
+timeout 1200s /tmp/w1b2-v3-negative --nocapture
+timeout 1200s rustc --edition=2024 --test -D warnings \
+  test-reports/w1b2-stale-reconciliation-e1af/fixtures/green/runtime.rs \
+  -o /tmp/w1b2-v3-green
+timeout 1200s /tmp/w1b2-v3-green --nocapture
 ```
 
-Both model binaries and the negative fixture compile with warnings denied and
-all tests pass. No production Cargo or adapter test is run by this package.
+The stateful model has 11 passing tests, the negative runner has 15, and the
+executable plan/commit fixture has 9. All compile with warnings denied. No
+production Cargo, adapter, or runtime test is run by this package.

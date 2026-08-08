@@ -3,22 +3,29 @@ W1b-2 corrected stateful model run
 Commands:
   timeout 1200s rustfmt --edition 2024 --check \
     test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs \
-    test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs
+    test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs \
+    test-reports/w1b2-stale-reconciliation-e1af/fixtures/green/runtime.rs
   timeout 1200s rustc --edition=2024 --test -D warnings \
     test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs \
-    -o /tmp/w1b2-v2-model
-  timeout 1200s /tmp/w1b2-v2-model --nocapture
+    -o /tmp/w1b2-v3-model
+  timeout 1200s /tmp/w1b2-v3-model --nocapture
   timeout 1200s rustc --edition=2024 --test -D warnings \
     test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs \
-    -o /tmp/w1b2-v2-negative
-  timeout 1200s /tmp/w1b2-v2-negative --nocapture
+    -o /tmp/w1b2-v3-negative
+  timeout 1200s /tmp/w1b2-v3-negative --nocapture
+  timeout 1200s rustc --edition=2024 --test -D warnings \
+    test-reports/w1b2-stale-reconciliation-e1af/fixtures/green/runtime.rs \
+    -o /tmp/w1b2-v3-green
+  timeout 1200s /tmp/w1b2-v3-green --nocapture
 
 Results:
   rustfmt --check: PASS
-  stateful model: 9 passed, 0 failed
-  negative fixture runner: 13 passed, 0 failed
+  stateful model: 11 passed, 0 failed
+  negative fixture runner: 15 passed, 0 failed
+  executable plan/commit fixture: 9 passed, 0 failed
   all rustc commands used -D warnings and exited 0
 
 Binary SHA-256:
-  model   cc1c644ca5a2cb762273973288866afa6f93583b01d9498bec1b2ea5e24a0ee1
-  negative ef404be4f450472d04b763300c753809e16fdabf50ca919279644a68e8e49f7b
+  model   426d3074e996e37f1683148c632dadd475fe2e3bb1a16beb5e8fa8ebc0f62917
+  negative 65794ca79e0f2af598a7c2d4fe980df49cd0e807851c9282954b2e469f0598c9
+  green   d6419eb627144422b11e77b71ce6a9bfd627cf5647d7cf7ea01543374ffd68b0

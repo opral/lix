@@ -22,6 +22,8 @@ enum Proof {
         generation: String,
         revision: u64,
         change_id: String,
+        selector_id: String,
+        commit_id: String,
     },
     Missing,
     Malformed,
@@ -39,6 +41,8 @@ enum RegistryProof {
         change_id: String,
         plugin_key: String,
         generation: String,
+        selector_id: String,
+        commit_id: String,
     },
     Missing,
     Malformed,
@@ -61,6 +65,8 @@ struct ViewTrace {
 struct Snapshot {
     active_head: String,
     global_head: String,
+    selector_id: String,
+    commit_id: String,
     revision: u64,
     owners: BTreeMap<String, Proof>,
     registry: RegistryProof,
@@ -78,6 +84,8 @@ struct PreparedWrite {
     rank: (u64, String),
     base_revision: u64,
     base_change_id: String,
+    base_selector_id: String,
+    base_commit_id: String,
 }
 
 impl PreparedWrite {
@@ -137,6 +145,8 @@ fn valid_owner<'a>(
     file_id: &str,
     expected_revision: u64,
     expected_change_id: &str,
+    expected_selector_id: &str,
+    expected_commit_id: &str,
 ) -> Result<(&'a str, &'a str), Corruption> {
     match proof {
         Proof::Valid {
@@ -145,9 +155,13 @@ fn valid_owner<'a>(
             generation,
             revision,
             change_id,
+            selector_id,
+            commit_id,
         } if actual_file == file_id
             && *revision == expected_revision
-            && change_id == expected_change_id =>
+            && change_id == expected_change_id
+            && selector_id == expected_selector_id
+            && commit_id == expected_commit_id =>
         {
             Ok((plugin_key.as_str(), generation.as_str()))
         }
@@ -159,6 +173,8 @@ fn valid_registry<'a>(
     registry: &'a RegistryProof,
     expected_revision: u64,
     expected_change_id: &str,
+    expected_selector_id: &str,
+    expected_commit_id: &str,
 ) -> Result<(&'a str, &'a str), Corruption> {
     match registry {
         RegistryProof::Valid {
@@ -166,7 +182,13 @@ fn valid_registry<'a>(
             change_id,
             plugin_key,
             generation,
-        } if *revision == expected_revision && change_id == expected_change_id => {
+            selector_id,
+            commit_id,
+        } if *revision == expected_revision
+            && change_id == expected_change_id
+            && selector_id == expected_selector_id
+            && commit_id == expected_commit_id =>
+        {
             Ok((plugin_key.as_str(), generation.as_str()))
         }
         _ => Err(Corruption::RegistryProof),
@@ -180,7 +202,20 @@ fn authenticate_write(
 ) -> Result<(), Corruption> {
     let expected_opening_change = format!("change-{}", opening.revision);
     let expected_current_change = format!("change-{}", current.revision);
-    if write.base_revision != opening.revision || write.base_change_id != expected_opening_change {
+    let expected_opening_commit = format!("commit-{}", opening.revision);
+    let expected_current_commit = format!("commit-{}", current.revision);
+    if opening.selector_id != "selector-1"
+        || current.selector_id != opening.selector_id
+        || opening.commit_id != expected_opening_commit
+        || current.commit_id != expected_current_commit
+    {
+        return Err(Corruption::RegistryProof);
+    }
+    if write.base_revision != opening.revision
+        || write.base_change_id != expected_opening_change
+        || write.base_selector_id != opening.selector_id
+        || write.base_commit_id != opening.commit_id
+    {
         return Err(Corruption::OwnerProof);
     }
     let opening_owner = opening
@@ -196,23 +231,56 @@ fn authenticate_write(
         &write.file_id,
         opening.revision,
         &expected_opening_change,
+        &opening.selector_id,
+        &opening.commit_id,
     )?;
+    let (opening_plugin, opening_generation) = valid_registry(
+        &opening.registry,
+        opening.revision,
+        &expected_opening_change,
+        &opening.selector_id,
+        &opening.commit_id,
+    )?;
+    let (owner_plugin, owner_generation) = valid_owner(
+        opening_owner,
+        &write.file_id,
+        opening.revision,
+        &expected_opening_change,
+        &opening.selector_id,
+        &opening.commit_id,
+    )?;
+    if opening_plugin != owner_plugin || opening_generation != owner_generation {
+        return Err(Corruption::RegistryProof);
+    }
+    if current.selector_id != opening.selector_id {
+        return Err(Corruption::RegistryProof);
+    }
     valid_owner(
         current_owner,
         &write.file_id,
         current.revision,
         &expected_current_change,
+        &current.selector_id,
+        &current.commit_id,
     )?;
-    valid_registry(
-        &opening.registry,
-        opening.revision,
-        &expected_opening_change,
-    )?;
-    valid_registry(
+    let (current_plugin, current_generation) = valid_registry(
         &current.registry,
         current.revision,
         &expected_current_change,
+        &current.selector_id,
+        &current.commit_id,
     )?;
+    let (owner_plugin, owner_generation) = valid_owner(
+        current_owner,
+        &write.file_id,
+        current.revision,
+        &expected_current_change,
+        &current.selector_id,
+        &current.commit_id,
+    )?;
+    if current_plugin != owner_plugin || current_generation != owner_generation {
+        return Err(Corruption::RegistryProof);
+    }
     Ok(())
 }
 
@@ -234,13 +302,24 @@ fn reconcile(
     for write in &ordered {
         authenticate_write(opening, current, write)?;
     }
+    let mut idempotent_count = 0;
+    let mut missing_count = 0;
     for write in &ordered {
         if let Some(existing) = current.idempotency.get(&write.operation_id) {
             if existing == &write.fingerprint() {
-                return Ok(Ok(Outcome::Idempotent));
+                idempotent_count += 1;
+                continue;
             }
             return Ok(Err(Conflict::IdempotencyMismatch));
+        } else {
+            missing_count += 1;
         }
+    }
+    if idempotent_count > 0 && missing_count > 0 {
+        return Ok(Err(Conflict::IdempotencyMismatch));
+    }
+    if idempotent_count == ordered.len() {
+        return Ok(Ok(Outcome::Idempotent));
     }
     if opening.revision == current.revision {
         return Ok(Ok(Outcome::Direct));
@@ -267,12 +346,16 @@ fn reconcile(
             file_id,
             opening.revision,
             &format!("change-{}", opening.revision),
+            &opening.selector_id,
+            &opening.commit_id,
         )?;
         let (current_plugin, current_generation) = valid_owner(
             current_owner,
             file_id,
             current.revision,
             &format!("change-{}", current.revision),
+            &current.selector_id,
+            &current.commit_id,
         )?;
         if opening_plugin != current_plugin || opening_generation != current_generation {
             return Ok(Err(Conflict::OwnerIdentityChanged));
@@ -281,6 +364,8 @@ fn reconcile(
             &current.registry,
             current.revision,
             &format!("change-{}", current.revision),
+            &current.selector_id,
+            &current.commit_id,
         )?;
         if registry_plugin != current_plugin || registry_generation != current_generation {
             return Ok(Err(Conflict::OwnerIdentityChanged));
@@ -294,35 +379,68 @@ fn reconcile(
     }))
 }
 
-fn proof(file_id: &str, plugin_key: &str, generation: &str, revision: u64) -> Proof {
+fn proof(
+    file_id: &str,
+    plugin_key: &str,
+    generation: &str,
+    revision: u64,
+    selector_id: &str,
+    commit_id: &str,
+) -> Proof {
     Proof::Valid {
         file_id: file_id.into(),
         plugin_key: plugin_key.into(),
         generation: generation.into(),
         revision,
         change_id: format!("change-{revision}"),
+        selector_id: selector_id.into(),
+        commit_id: commit_id.into(),
     }
 }
 
-fn registry(plugin_key: &str, generation: &str, revision: u64) -> RegistryProof {
+fn registry(
+    plugin_key: &str,
+    generation: &str,
+    revision: u64,
+    selector_id: &str,
+    commit_id: &str,
+) -> RegistryProof {
     RegistryProof::Valid {
         revision,
         change_id: format!("change-{revision}"),
         plugin_key: plugin_key.into(),
         generation: generation.into(),
+        selector_id: selector_id.into(),
+        commit_id: commit_id.into(),
     }
 }
 
 fn snapshot(revision: u64) -> Snapshot {
+    let commit_id = format!("commit-{revision}");
     Snapshot {
         active_head: "branch-head".into(),
         global_head: "global-head".into(),
+        selector_id: "selector-1".into(),
+        commit_id: commit_id.clone(),
         revision,
         owners: BTreeMap::from([(
             "file-a".into(),
-            proof("file-a", "plugin-a", "generation-a", revision),
+            proof(
+                "file-a",
+                "plugin-a",
+                "generation-a",
+                revision,
+                "selector-1",
+                &commit_id,
+            ),
         )]),
-        registry: registry("plugin-a", "generation-a", revision),
+        registry: registry(
+            "plugin-a",
+            "generation-a",
+            revision,
+            "selector-1",
+            &commit_id,
+        ),
         changed_keys: BTreeSet::new(),
         idempotency: BTreeMap::new(),
         view: ViewTrace {
@@ -361,6 +479,8 @@ fn write_with_rank(
         rank: (rank, operation_id.into()),
         base_revision: 1,
         base_change_id: "change-1".into(),
+        base_selector_id: "selector-1".into(),
+        base_commit_id: "commit-1".into(),
     }
 }
 
@@ -409,15 +529,21 @@ fn owner_generation_or_registry_substitution_conflicts() {
     current.changed_keys.insert(("file-a".into(), "row".into()));
     current.owners.insert(
         "file-a".into(),
-        proof("file-a", "plugin-a", "generation-b", 2),
+        proof(
+            "file-a",
+            "plugin-a",
+            "generation-b",
+            2,
+            "selector-1",
+            "commit-2",
+        ),
     );
     let result = reconcile(
         &opening,
         &current,
         &[write("op-a", "file-a", "row", Value::Null)],
-    )
-    .expect("valid authority");
-    assert_eq!(result, Err(Conflict::OwnerIdentityChanged));
+    );
+    assert_eq!(result, Err(Corruption::RegistryProof));
 }
 
 #[test]
@@ -436,6 +562,55 @@ fn idempotency_is_exact_replay_and_mismatch_is_conflict() {
     assert_eq!(
         reconcile(&opening, &current, std::slice::from_ref(&write_b)),
         Ok(Err(Conflict::IdempotencyMismatch))
+    );
+}
+
+#[test]
+fn multi_write_idempotency_checks_every_operation_before_replay() {
+    let opening = snapshot(1);
+    let low = write_with_rank("op-low", "file-a", "row-a", Value::Null, 1);
+    let high = write_with_rank("op-high", "file-a", "row-b", Value::Json("high".into()), 2);
+    let mut current = current_snapshot(2);
+    current
+        .idempotency
+        .insert("op-low".into(), low.fingerprint());
+    current
+        .idempotency
+        .insert("op-high".into(), "different-payload".into());
+    assert_eq!(
+        reconcile(&opening, &current, &[high.clone(), low.clone()]),
+        Ok(Err(Conflict::IdempotencyMismatch))
+    );
+
+    let mut all_match = current_snapshot(2);
+    all_match
+        .idempotency
+        .insert("op-low".into(), low.fingerprint());
+    all_match
+        .idempotency
+        .insert("op-high".into(), high.fingerprint());
+    assert_eq!(
+        reconcile(&opening, &all_match, &[low, high]),
+        Ok(Ok(Outcome::Idempotent))
+    );
+}
+
+#[test]
+fn selector_and_commit_identity_substitution_fails_before_reconciliation() {
+    let opening = snapshot(1);
+    let write = write("op-a", "file-a", "row", Value::Json("a".into()));
+    let mut selector_forged = current_snapshot(2);
+    selector_forged.selector_id = "selector-forged".into();
+    assert_eq!(
+        reconcile(&opening, &selector_forged, std::slice::from_ref(&write)),
+        Err(Corruption::RegistryProof)
+    );
+
+    let mut commit_forged = current_snapshot(2);
+    commit_forged.commit_id = "commit-forged".into();
+    assert_eq!(
+        reconcile(&opening, &commit_forged, std::slice::from_ref(&write)),
+        Err(Corruption::RegistryProof)
     );
 }
 

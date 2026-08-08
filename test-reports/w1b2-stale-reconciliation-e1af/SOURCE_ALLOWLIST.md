@@ -2,7 +2,9 @@
 
 Any future production candidate replacing the stale transaction/plugin/cohort
 reader may change only these existing paths. The package itself changes none
-of them.
+of them. The verifier scans the complete candidate diff, not only
+`packages/lix/src`; any Cargo, production, or other workspace escape is
+rejected.
 
     packages/lix/src/transaction/context.rs
     packages/lix/src/transaction/context/cohort.rs

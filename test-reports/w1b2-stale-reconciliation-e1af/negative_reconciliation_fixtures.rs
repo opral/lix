@@ -33,6 +33,8 @@ mod model {
                 generation: "generation-a".into(),
                 revision: 99,
                 change_id: "forged-change".into(),
+                selector_id: "selector-1".into(),
+                commit_id: "commit-99".into(),
             },
         );
         assert_eq!(

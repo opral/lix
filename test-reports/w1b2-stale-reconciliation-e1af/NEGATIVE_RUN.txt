@@ -1,11 +1,13 @@
 Negative fixture command:
-  timeout 1200s /tmp/w1b2-v2-negative --nocapture
+  timeout 1200s /tmp/w1b2-v3-negative --nocapture
 
 Result:
-  13 passed; 0 failed; 0 ignored; 0 measured
-  Covers the model's 9 tests plus second-begin-read, forged
+  15 passed; 0 failed; 0 ignored; 0 measured
+  Covers the model's 11 tests plus second-begin-read, forged
   revision/change-id, idempotency payload mismatch, and reversed-order
-  negative controls.
+  negative controls. Multi-write replay inspects all operations before
+  success, and registry/plugin identity is cross-bound on unrelated-owner
+  paths.
 
 Binary SHA-256:
-  ef404be4f450472d04b763300c753809e16fdabf50ca919279644a68e8e49f7b
+  65794ca79e0f2af598a7c2d4fe980df49cd0e807851c9282954b2e469f0598c9

@@ -4,7 +4,7 @@ Command:
 
 Exit: 0
 
-FIXTURE SCOPE PASS allowlist=6
+FIXTURE SCOPE PASS allowlist=6+runtime
 PASS_FUNCTION=owner/registry authentication
 PASS_FUNCTION=deterministic multi-write ordering
 PASS_FUNCTION=write rank binding
@@ -12,7 +12,8 @@ PASS_FUNCTION=complete-plan validation
 PASS_FUNCTION=owner proof operation
 PASS_FUNCTION=registry proof operation
 PASS_FUNCTION=semantic row operation
+RUNTIME GREEN tests=9
 RESULT=GREEN candidate-parametric structural predicates pass
 
 Output SHA-256:
-  b2484c1aa26a61e82bc0cba60b172e2c16ba57fa67d219cb09432623afd414ea
+  80ce60a0d34fabf5be805dcf0406fc8156ffda6232115a7898ca92ab399b3815
