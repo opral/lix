@@ -4,8 +4,8 @@ Status: frozen test/report-only preparation for the first immutable runnable
 Stage 2 head. No candidate artifact has been applied and no build has run.
 
 The verifier worktree carries ten-row acceptance-matrix readiness successor
-`c7674c6d0dd5b995f10a016e281e5106b703de50`, tree
-`62329238fb6a7b35c9d4bda61ee93e464ecda16d`. At creation the workspace
+`d6bb712a8205263c344db0b9ea41f92bba0add52`, tree
+`8bf0baf0f4e7d8246b9a5ab368fec6114b01b512`. At creation the workspace
 filesystem had 49 GiB available. Cargo targets and databases will remain under
 this workspace filesystem and every future cell is capped at 20 minutes.
 
@@ -62,8 +62,10 @@ machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 Ryzen-V has not advertised a first runnable immutable SPI head. The latest
 approved BlobRef milestone remains non-runnable, so the next candidate must be
 an explicitly compile-green writer/SPI descendant of
-`54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`. Until then this worktree remains
-provenance-only.
+`54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`. Ordinary commit lowering alone
+does not qualify it: readiness also requires independent R2 atomicity approval,
+H2 deletion/residue approval, and zero independent transaction/upload/GC
+ForkTree publication points. Until then this worktree remains provenance-only.
 
 On the first runnable immutable head:
 
