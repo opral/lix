@@ -288,6 +288,19 @@ struct StaleConflictPayload {
     metadata: Option<SharedStr>,
 }
 
+fn checkpoint_marker_identity_matches_branch(
+    entity_pk: &EntityPk,
+    branch_id: &str,
+) -> Result<bool, LixError> {
+    let expected = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("checkpoint branch id '{branch_id}' is not a canonical UUID: {error}"),
+        )
+    })?;
+    Ok(entity_pk == &expected)
+}
+
 struct StaleSemanticConflict {
     key: TrackedStateKey,
     base: Option<StaleConflictPayload>,
@@ -1429,14 +1442,21 @@ where
             let checkpoint_delta = tracked
                 .commit_delta_values_for_schemas(checkpoint_commit_id, &marker_schemas)
                 .await?;
-            let owns_checkpoint_marker = checkpoint_delta.iter().any(|row| {
+            let mut owns_checkpoint_marker = false;
+            for row in checkpoint_delta.iter() {
                 let key = row.key_ref();
-                !row.value().deleted
+                if !row.value().deleted
                     && key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY
                     && key.file_id.is_none()
-                    && key.entity_pk.as_single_string().ok()
-                        == Some(replacement.checkpoint_branch_id.as_str())
-            });
+                    && checkpoint_marker_identity_matches_branch(
+                        key.entity_pk,
+                        &replacement.checkpoint_branch_id,
+                    )?
+                {
+                    owns_checkpoint_marker = true;
+                    break;
+                }
+            }
             if !owns_checkpoint_marker {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -11798,6 +11818,46 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn checkpoint_marker_owner_requires_exact_typed_uuid_identity() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000f2";
+        let valid = EntityPk::uuid_from_canonical(BRANCH_ID).expect("valid branch UUID");
+        assert!(
+            checkpoint_marker_identity_matches_branch(&valid, BRANCH_ID)
+                .expect("valid marker identity should compare")
+        );
+
+        let wrong_uuid = EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000f3")
+            .expect("wrong UUID fixture should parse");
+        assert!(
+            !checkpoint_marker_identity_matches_branch(&wrong_uuid, BRANCH_ID)
+                .expect("wrong UUID should compare without coercion")
+        );
+
+        let wrong_type = EntityPk::single(BRANCH_ID);
+        assert!(
+            !checkpoint_marker_identity_matches_branch(&wrong_type, BRANCH_ID)
+                .expect("string identity should compare without coercion")
+        );
+
+        let composite = EntityPk::from_external_parts(
+            vec![BRANCH_ID.to_owned(), "extra".to_owned()],
+            &[
+                crate::entity_pk::EntityPkComponentType::Uuid,
+                crate::entity_pk::EntityPkComponentType::String,
+            ],
+        )
+        .expect("composite fixture should parse");
+        assert!(
+            !checkpoint_marker_identity_matches_branch(&composite, BRANCH_ID)
+                .expect("composite identity should compare without coercion")
+        );
+        assert!(
+            checkpoint_marker_identity_matches_branch(&valid, "not-a-canonical-uuid").is_err(),
+            "malformed expected branch authority must fail closed"
+        );
+    }
 
     #[test]
     fn semantic_conflict_limits_scale_host_owned_records_but_not_bytes_or_deadline() {
