@@ -153,6 +153,9 @@ verify_readiness_ref writer5a codex/forktree-stage2-milestone5a-ordinary-atomic-
 verify_blob_oid writer5a packages/lix/src/forktree/publication.rs 853079b1b4ac0a89b507e34b0221d5038f89e054
 verify_blob_oid writer5a packages/lix/src/transaction/commit.rs b6e5b977c6777f986565dd1bfe3d3edac066cf24
 verify_blob_oid writer5a packages/lix/src/transaction/context.rs 74f482d6e2345e781b929d047bfea71486111f16
+verify_readiness_ref writer5a2 codex/forktree-stage2-milestone5a2-runtime-intent a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737 d8326da2b1d38bd51b8ac7229d00684a6865bce2 5c4cae810324a34c0adbbb5a1a0be5fba5348054 a81dd0af7154b86f663ca786bcd0470c6cd4af01a1fada0eea3ac6696a709e8c a12b76c8690130df5f9cb44a51e9cf3a3bcdb6b3 8192c4f2409f11fedbab14e3553f98fa7f09887afd7745ad351aa72e5c87b87c readiness-static
+verify_blob_oid writer5a2 packages/lix/src/transaction/commit.rs cfc40fa496ddcdc9ea920b3b6c17d19978e1ea0c
+verify_blob_oid writer5a2 packages/lix/src/transaction/context.rs 3a7c27fa922cda832d2bf89f5942b0981e444126
 
 verify_file sql packages/rs-sdk-tests/tests/forktree_stage2_sql_dml.rs b410b717f45d68e928e93dcf1332de2895db0246202e9ba9a6e5bc10b416c6bb
 verify_file sql packages/rs-sdk-tests/tests/FORKTREE_STAGE2_SQL_DML_ORACLE.md 1867643051628903232c3cbe8f4ae2c1e2655b7cbb0b044ec1046acf35947e22
@@ -187,4 +190,9 @@ printf 'external\tpointread\tNOTE\tREPORT.md\tb86db402ec0bf9b25ca619564edb82a420
 printf 'external\tpointread\tNOTE\tSHA256SUMS\tcacbcee8f7b80a627f96dd8b7d6d55beef0fe2a2f7228f0290b488ae7717a888\tnot embedded in ref; author reports 3/3 verify\n'
 printf 'external\tpointread\tNOTE\tstage2_point_read_oracle-025c3b394ec8760c\tead3dae2ad74b349ef116b1e3ff9265a20a09f90f24dbdb2e32542c4cd5c8c1a\tbench binary; rebuild on candidate\n'
 printf 'external\tolap\tNOTE\tprovenance-report\te78821631888e8a8810df78e9bdffbe31c8a8124227c5ad0c3b549a6e60795a4\tnot embedded in ref\n'
-printf 'summary\tall\tPASS\t10 acceptance refs; latest approved readiness=54e90dbf; 2 blocked frontiers\t27 embedded files; 11 readiness-source blobs\tno artifacts applied\n'
+printf 'scanner\tresidue\tPASS\tnormalized-166-record-set\t86010e7dad821c8cc89858dcbf1a55cb9a234ea2eeab6d43ef08247e4ede61aa\tsource=f71e91fcbccbb7d6df676a95e9d747725856b77f7e3177ec42f12ca8b28736cc; frozen-binary=40d02e20dd2cbd1334a8c0eddccce9c16e012200707d8488e136415a89483066\n'
+printf 'presentation\tresidue\tNOTE\tbaseline-stdout\t6f4013daca11867c9e07fab14b741c1650515eed473f87c12377e3421db8c42b\t166 records + footer + LF\n'
+printf 'presentation\tresidue\tNOTE\taudit-stdout-plus-stderr\t3891a48613e5d6ebd3d0ab2780aed13c6dd0236f1c2ff343320dd73fb2158a0d\tsame stdout + expected terminal audit stderr; reconciliation-report=1f90f530b02743ffda50b56646499759119e69590a11f0b3eabe4a71b9b3a251\n'
+printf 'external\tp0-w1a\tNOTE\tmanifest\t73cd9f5d4de76b618d3f483e957755271f81cfb503d48a63c4d4cdddbbfc2dc6\tnot mounted; contract=cfd25a6064aa1c5fd3ad06558c43f79c2169ac88f7b80bd9dab05a90f739d249; cases=77af0924a86cf023a2924075507545b52035739e8c5bfc33accc080e8f4a9b17\n'
+printf 'external\tp0-w1a\tNOTE\tverifier\t35dfbedc0373f5292d96d9e0ab2feafbc11b3f35618adcaa2d5c921514304550\tfreeze-report=77a0762582364b3c77ca78720e8feca9c2b44c3cbdf40b4a91037ca704064e8e\n'
+printf 'summary\tall\tPASS\t10 acceptance refs; latest source/static readiness=a1cf8f7f; 2 blocked frontiers\t27 embedded files; 13 readiness-source blobs\tno artifacts applied; non-runnable\n'

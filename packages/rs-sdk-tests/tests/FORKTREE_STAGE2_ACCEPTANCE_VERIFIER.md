@@ -45,12 +45,21 @@ diffs and all five changed source blob IDs. This object remains immutable blocke
 evidence: same-size manifest identity substitution is not rejected by its range
 path.
 
-The latest approved readiness base is the two-reviewer source-approved successor
+The approved reader base is the two-reviewer source-approved successor
 `54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`, tree
 `5a8da9f8b11d83bf8216e266beaf4042cee84068`, parent `08f8dd5c...`.
 The verifier reproduces its focused and `a12` lineage diffs and all three changed
 source blob IDs. It remains non-runnable and does not authorize a build or
 artifact application.
+
+The latest source/static-approved readiness base is the narrow 5A2 successor
+`a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737`, tree
+`d8326da2b1d38bd51b8ac7229d00684a6865bce2`, parent `5c4cae81...`.
+The verifier reproduces its focused and `a12` lineage diffs and its two changed
+transaction blob IDs. Static approval covers intent-before-view/plan,
+unsupported-cohort zero-write rejection, true empty no-op behavior, and runtime
+state in the sole ForkTree plan. It remains compile-red/non-runnable and does
+not authorize an artifact application or runtime claim.
 
 The later ordinary-writer milestone
 `5c4cae810324a34c0adbbb5a1a0be5fba5348054`, tree
@@ -62,47 +71,61 @@ preserving no-op behavior. It also remains compile-red and retains independent
 upload/checkpoint/history/multi-branch/reachability publication families, so it
 does not supersede `54e90dbf...` as readiness base.
 
-No 5A residue count is canonical. The author handoff's 170/`ae4250...` lacks a
-bound scanner identity, while R2's frozen-oracle 166/`3891a486...` is a
-different provenance. A successor must replay baseline and candidate with one
-exact scanner source/binary hash before residue can contribute to readiness.
+The scanner discrepancy is resolved. Exact scanner ref `1dbbf3d...`, source
+SHA `f71e91fc...`, and frozen binary SHA `40d02e20...` produce the same 166
+semantic records for 5A and 5A2. The canonical sorted finding-only stream SHA is
+`86010e7dad821c8cc89858dcbf1a55cb9a234ea2eeab6d43ef08247e4ede61aa`.
+Raw baseline stdout SHA `6f4013da...` includes the footer and final LF; audit
+stdout+stderr SHA `3891a486...` adds only the expected terminal audit error.
+The scanner acceptance identity is the source/binary plus normalized semantic
+set, not the redirection-dependent presentation. Independent reconciliation
+report SHA is `1f90f530b02743ffda50b56646499759119e69590a11f0b3eabe4a71b9b3a251`.
 
-Result: PASS for 10/10 acceptance refs, latest approved readiness
-`54e90dbf...`, two retained blocked frontiers, 11/11 readiness source blobs, and
+The externally frozen P0+W1a package is also provenance-bound: manifest
+`73cd9f5d...`, contract `cfd25a60...`, cases `77af0924...`, verifier
+`35dfbedc...`, and freeze report `77a07625...`. It is the first source gate for
+the next runnable candidate. It must remove direct publication commit entry
+points and prove ordered single-branch history/selected members use exactly one
+read, plan, prepare, and commit before any residue or runtime artifact is run.
+
+Result: PASS for 10/10 acceptance refs, latest source/static readiness
+`a1cf8f7f...`, two retained blocked frontiers, 13/13 readiness source blobs, and
 27/27 embedded acceptance files. The frozen
 machine-readable output is FORKTREE_STAGE2_ACCEPTANCE_REF_VERIFICATION.tsv.
 
 ## Runnable-head boundary
 
 Ryzen-V has not advertised a first runnable immutable SPI head. The latest
-approved BlobRef milestone remains non-runnable, so the next candidate must be
+approved 5A2 milestone remains non-runnable, so the next candidate must be
 an explicitly compile-green writer/SPI descendant of
-`54e90dbf2bcf55c74de0be6ea4b217dc02cec89c`. Ordinary commit lowering alone
+`a1cf8f7fd55ac21ef7e5bfe7f385c49d99140737`. Ordinary commit lowering alone
 does not qualify it: readiness also requires independent R2 atomicity approval,
 H2 deletion/residue approval, and zero independent transaction/upload/GC
 ForkTree publication points. Until then this worktree remains provenance-only.
 
 On the first runnable immutable head:
 
-1. create a fresh detached candidate worktree and isolated target;
-2. materialize only exact test/report files, never merge their historical
+1. run the frozen P0+W1a source gate and stop unless direct publication commit
+   is unnameable and W1a uses one read/plan/prepare/commit;
+2. create a fresh detached candidate worktree and isolated target;
+3. materialize only exact test/report files, never merge their historical
    branches wholesale;
-3. run fmt/diff and the static residue/facade/CLI/cursor gate;
-4. stop on any nonzero legacy authority;
-5. run the production-bound 65-row delete on RocksDB, then SlateDB;
-6. bind and source-map the actual public point/BlobRef seam, then run the 1K
+4. run fmt/diff and the static residue/facade/CLI/cursor gate;
+5. stop on any nonzero legacy authority;
+6. run the production-bound 65-row delete on RocksDB, then SlateDB;
+7. bind and source-map the actual public point/BlobRef seam, then run the 1K
    point-read gate on RocksDB and SlateDB; require the frozen counts/digest,
    cold reopen, four fail-closed corruption cases, greater than 10% meaningful
    paired improvement, and no critical regression greater than 5%;
-7. stop before SQL and 10K/50K scaling if the point gate fails;
-8. run SQL RocksDB then SlateDB;
-9. run checkpoint RocksDB then SlateDB;
-10. run no-lease and sealed GC/publication RocksDB then SlateDB;
-11. run OLAP 10K RocksDB/SlateDB plus corruption, then 50K RocksDB/SlateDB,
+8. stop before SQL and 10K/50K scaling if the point gate fails;
+9. run SQL RocksDB then SlateDB;
+10. run checkpoint RocksDB then SlateDB;
+11. run no-lease and sealed GC/publication RocksDB then SlateDB;
+12. run OLAP 10K RocksDB/SlateDB plus corruption, then 50K RocksDB/SlateDB,
     then 500K RocksDB/SlateDB; a SlateDB six-versus-five or twelve-versus-ten
     physical-object residual hard-blocks without the exact narrow hash-bound
     manager waiver;
-12. only then run broader version-control and multimedia gates.
+13. only then run broader version-control and multimedia gates.
 
 A pass by the detached delete benchmark model is not production acceptance.
 The delete sequence must be bound to the production ForkTree owner. Likewise,
