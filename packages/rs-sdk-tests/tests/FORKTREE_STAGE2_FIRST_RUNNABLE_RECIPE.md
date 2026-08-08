@@ -21,6 +21,35 @@ The independently approved topology milestone is:
 This approval covers the one-`StorageRead` topology owner/cache contract. It
 does not make the head runnable and is not an acceptance-matrix result.
 
+### Blocked BlobRef frontier
+
+The next immutable reader milestone was inspected but is not approved:
+
+- ref `origin/codex/forktree-stage2-milestone4-blobref-owned-view`;
+- head `08f8dd5cf20842f79996fae9eb7b0924f074a084`;
+- tree `19c8706d6bc3d1dbe9217b4f8386b19c66f027a8`;
+- parent `af7899f41c489fe763ce1a64c5468083570979e2`;
+- parent-to-head full-index SHA-256
+  `d7217fafa02e3c50a6c10b7e3a7a0985697b4ba82beb1ba896d2cf636f34d71f`;
+- `a12..head` full-index SHA-256
+  `2a06b554cea5f28a24117dfb52c3e24be9ddc408bbb59405ea66b051b73ddb47`;
+- stable patch ID `472848104c8fd79ddb3d1d7a4aa96b6a0690a703`.
+
+The exact source review blocks range reads because the authenticated row's
+semantic `BlobId` is not bound to the selected manifest on the range path.
+`validate_manifest_owner` checks only logical size; a different valid manifest
+with the same size can supply authenticated range bytes under the wrong public
+blob identity. Full reads detect the mismatch only after complete
+materialization. A corrected milestone must authenticate a canonical semantic
+BlobId in the manifest (or equivalent canonical identity material), compare it
+with the row ID before full or range publication, and add a same-size
+manifest-substitution fail-closed test. The existing mismatched-size test is
+insufficient. No compatibility or fallback path is permitted.
+
+`af7899f41c489fe763ce1a64c5468083570979e2` therefore remains the last
+approved readiness frontier. `08f8dd5cf20842f79996fae9eb7b0924f074a084`
+is identity-pinned blocker evidence only.
+
 ## Eligibility fence
 
 The integrator may start only after the coordinator advertises an immutable
@@ -30,8 +59,10 @@ ref, exact head and tree as compile-green. Before creating a worktree:
 2. require its commit and tree to equal the advertised values;
 3. require `af7899f41c489fe763ce1a64c5468083570979e2` to be an ancestor, unless the
    coordinator explicitly names a replacement accepted lineage;
-4. run the frozen ten-ref verifier and require every identity/file check green;
-5. check disk, then create a fresh detached disposable worktree and isolated
+4. require the BlobRef same-size manifest-substitution blocker above to be
+   closed by immutable source and focused fail-closed evidence;
+5. run the frozen ten-ref verifier and require every identity/file check green;
+6. check disk, then create a fresh detached disposable worktree and isolated
    Cargo target outside Ryzen-V's production worktree.
 
 Example read-only preflight, with values supplied by the future handoff:

@@ -43,6 +43,15 @@ blob/SPI head on this accepted lineage, unless the coordinator names a
 replacement lineage. The disposable preflight/application procedure is frozen
 in `FORKTREE_STAGE2_FIRST_RUNNABLE_RECIPE.md`.
 
+Immutable BlobRef milestone
+`origin/codex/forktree-stage2-milestone4-blobref-owned-view` is pinned at
+`08f8dd5cf20842f79996fae9eb7b0924f074a084`, tree
+`19c8706d6bc3d1dbe9217b4f8386b19c66f027a8`, parent `af7899f...`, but is
+**BLOCKED**. Its range path authenticates a manifest and intersecting chunks
+while checking only owner size, so a same-size valid manifest can be
+substituted under a different row `BlobId`. This object is readiness evidence,
+not an executable candidate; `af7899f...` remains the last approved frontier.
+
 Frozen artifact identities and independently reproduced canonical full-index
 binary diff SHA-256 values are:
 
