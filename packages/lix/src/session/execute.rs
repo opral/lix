@@ -1162,8 +1162,9 @@ where
                     Arc::new(self.live_state.reader(read_store.clone()));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-                let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                    Arc::new(self.binary_cas.reader(read_store));
+                let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> = Arc::new(
+                    crate::forktree::blob_reader_on_read(read_store, &active_branch_id)?,
+                );
                 // A raw file download delivers the same bytes as a direct
                 // `lix_file.content` read, so it must acknowledge rendered
                 // plugin state for subsequent collaborative writes.

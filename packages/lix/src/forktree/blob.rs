@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
 
+use crate::binary_cas::BlobDataReader;
 use crate::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, StorageError,
 };
@@ -11,10 +13,11 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::corruption;
 use super::model::{
-    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, CanonicalUploadId, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, upload_binding_digest, upload_selector_key,
+    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, CanonicalBranchId, CanonicalUploadId,
+    UploadPartV1, UploadProgressV1, UploadSelectorV1, upload_binding_digest, upload_selector_key,
 };
 use super::object::ObjectId;
+use super::state::{StateCell, StateKey, UntrackedValue};
 use super::tree::{ReceiptTreeRoot, scan_page_on_read, validate_receipt_root_on_read};
 use super::view::{CoherentView, SELECTOR_SPACE, load_object_bytes, load_object_map};
 
@@ -103,6 +106,172 @@ impl AuthenticatedBlobRef {
     }
 }
 
+/// Blob payload reader backed by the authenticated current ForkTree view.
+///
+/// The generic SQL/file reader supplies only the semantic BlobId, so this
+/// adapter resolves that ID to a state-owned manifest edge on the same
+/// retained StorageRead before loading any object bytes. It never consults a
+/// legacy CAS space or accepts a BlobId as a physical locator.
+pub(crate) struct ForkTreeBlobDataReader<R> {
+    read: R,
+    branch_id: CanonicalBranchId,
+}
+
+pub(crate) fn blob_reader_on_read<R>(
+    read: R,
+    branch_id: &str,
+) -> Result<ForkTreeBlobDataReader<R>, crate::LixError> {
+    let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        crate::LixError::new(
+            crate::LixError::CODE_INVALID_PARAM,
+            format!("branch ID must be a UUID: {error}"),
+        )
+    })?;
+    Ok(ForkTreeBlobDataReader {
+        read,
+        branch_id: CanonicalBranchId::from_bytes(*uuid.as_bytes()),
+    })
+}
+
+impl<R> ForkTreeBlobDataReader<R>
+where
+    R: StorageAdapterRead + Clone,
+{
+    async fn resolve_refs(
+        &self,
+        view: &CoherentView<R>,
+        hashes: &[crate::binary_cas::BlobId],
+    ) -> Result<Vec<AuthenticatedBlobRef>, crate::LixError> {
+        let mut refs = BTreeMap::new();
+        for row in super::serving::state_range(view, None, None, None, true).await? {
+            let key = super::state::decode_state_key(&row.encoded_key)?;
+            if key.schema_key != "lix_binary_blob_ref" {
+                continue;
+            }
+            if matches!(row.value.cell, StateCell::Tombstone | StateCell::Null) {
+                continue;
+            }
+            let reference = view.bind_blob(&row)?;
+            refs.entry(reference.semantic_id()).or_insert(reference);
+        }
+        for (key, value) in view.scan_untracked_rows().await? {
+            if key.schema_key != "lix_binary_blob_ref"
+                || matches!(value.cell, StateCell::Tombstone | StateCell::Null)
+            {
+                continue;
+            }
+            let reference = bind_untracked_blob_ref(view, &key, &value)?;
+            refs.entry(reference.semantic_id()).or_insert(reference);
+        }
+        hashes
+            .iter()
+            .map(|hash| {
+                refs.get(hash).copied().ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "authenticated ForkTree BlobRef for semantic BlobId {} is absent",
+                            hash.to_hex()
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl<R> BlobDataReader for ForkTreeBlobDataReader<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync,
+{
+    async fn load_bytes_many(
+        &self,
+        hashes: &[crate::binary_cas::BlobId],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, crate::LixError> {
+        if hashes.is_empty() {
+            return Ok(crate::binary_cas::BlobBytesBatch::new(Vec::new()));
+        }
+        let view =
+            super::view::open_coherent_view_on_read(self.read.clone(), self.branch_id).await?;
+        let refs = self.resolve_refs(&view, hashes).await?;
+        view.load_blob_bytes_many(&refs).await
+    }
+
+    async fn load_ranges_many(
+        &self,
+        requests: &[(crate::binary_cas::BlobId, Range<u64>)],
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, crate::LixError> {
+        if requests.is_empty() {
+            return Ok(crate::binary_cas::BlobRangeBytesBatch::new(Vec::new()));
+        }
+        let view =
+            super::view::open_coherent_view_on_read(self.read.clone(), self.branch_id).await?;
+        let hashes = requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+        let refs = self.resolve_refs(&view, &hashes).await?;
+        view.load_blob_ranges_many(
+            &refs
+                .into_iter()
+                .zip(requests.iter().map(|(_, range)| range.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+}
+
+fn bind_untracked_blob_ref<R>(
+    view: &CoherentView<R>,
+    key: &StateKey,
+    value: &UntrackedValue,
+) -> Result<AuthenticatedBlobRef, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let owner = match &value.cell {
+        StateCell::Value(owner) => owner,
+        StateCell::Null | StateCell::Tombstone => {
+            return Err(corruption("blob-reference owner has no live semantic value").into());
+        }
+    };
+    bind_blob_owner(
+        &key.schema_key,
+        owner,
+        &value.blob_manifest_object_ids,
+        view.view_id(),
+        view.view_instance_id(),
+    )
+}
+
+fn bind_blob_owner(
+    schema_key: &str,
+    owner: &str,
+    manifest_object_ids: &[ObjectId],
+    view_id: [u8; 32],
+    view_instance_id: u64,
+) -> Result<AuthenticatedBlobRef, crate::LixError> {
+    if schema_key != "lix_binary_blob_ref" {
+        return Err(corruption("authenticated state row is not a blob-reference owner").into());
+    }
+    let owner: BlobRefOwnerValue = serde_json::from_str(owner).map_err(|error| {
+        corruption(format!(
+            "blob-reference owner semantic value is malformed: {error}"
+        ))
+    })?;
+    let semantic_id = crate::binary_cas::BlobId::from_hex(&owner.blob_hash)?;
+    if manifest_object_ids.len() != 1 {
+        return Err(
+            corruption("blob-reference owner must contain exactly one manifest edge").into(),
+        );
+    }
+    Ok(AuthenticatedBlobRef {
+        semantic_id,
+        expected_size: owner.size_bytes,
+        manifest_object_id: manifest_object_ids[0],
+        view_id,
+        view_instance_id,
+    })
+}
+
 fn bind_state_blob_ref(
     row: &super::serving::VisibleStateRow,
     view_id: [u8; 32],
@@ -113,8 +282,8 @@ fn bind_state_blob_ref(
         return Err(corruption("authenticated state row is not a blob-reference owner").into());
     }
     let value = match &row.value.cell {
-        super::state::StateCell::Value(value) => value,
-        super::state::StateCell::Null | super::state::StateCell::Tombstone => {
+        StateCell::Value(value) => value,
+        StateCell::Null | StateCell::Tombstone => {
             return Err(corruption("blob-reference owner has no live semantic value").into());
         }
     };
@@ -166,7 +335,7 @@ where
     /// reads by itself.
     pub(crate) async fn bind_blob_at_state_key(
         &self,
-        key: &super::state::StateKey,
+        key: &StateKey,
     ) -> Result<Option<AuthenticatedBlobRef>, crate::LixError>
     where
         R: Sync,
