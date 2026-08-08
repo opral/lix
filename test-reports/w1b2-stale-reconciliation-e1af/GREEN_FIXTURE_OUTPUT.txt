@@ -1,0 +1,18 @@
+Command:
+  timeout 1200s test-reports/w1b2-stale-reconciliation-e1af/verify_source_contract.sh \
+    --fixture test-reports/w1b2-stale-reconciliation-e1af/fixtures/green
+
+Exit: 0
+
+FIXTURE SCOPE PASS allowlist=6
+PASS_FUNCTION=owner/registry authentication
+PASS_FUNCTION=deterministic multi-write ordering
+PASS_FUNCTION=write rank binding
+PASS_FUNCTION=complete-plan validation
+PASS_FUNCTION=owner proof operation
+PASS_FUNCTION=registry proof operation
+PASS_FUNCTION=semantic row operation
+RESULT=GREEN candidate-parametric structural predicates pass
+
+Output SHA-256:
+  b2484c1aa26a61e82bc0cba60b172e2c16ba57fa67d219cb09432623afd414ea

@@ -1,0 +1,11 @@
+Negative fixture command:
+  timeout 1200s /tmp/w1b2-v2-negative --nocapture
+
+Result:
+  13 passed; 0 failed; 0 ignored; 0 measured
+  Covers the model's 9 tests plus second-begin-read, forged
+  revision/change-id, idempotency payload mismatch, and reversed-order
+  negative controls.
+
+Binary SHA-256:
+  ef404be4f450472d04b763300c753809e16fdabf50ca919279644a68e8e49f7b

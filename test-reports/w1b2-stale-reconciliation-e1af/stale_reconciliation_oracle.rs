@@ -1,8 +1,8 @@
-//! W1b-2 standalone stale transaction/plugin/cohort model.
-//!
-//! Test/report-only: no Lix imports, storage access, actor invocation, or
-//! runtime qualification. Future review may compile this file with
-//! rustc --edition=2024 --test.
+// W1b-2 stateful stale transaction/plugin/cohort correction model.
+//
+// Test/report-only: it has no Lix imports, storage access, actor invocation,
+// or adapter runtime. The model deliberately makes the read/identity and
+// complete-plan invariants executable before any idempotency replay result.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,6 +36,7 @@ enum Proof {
 enum RegistryProof {
     Valid {
         revision: u64,
+        change_id: String,
         plugin_key: String,
         generation: String,
     },
@@ -64,7 +65,7 @@ struct Snapshot {
     owners: BTreeMap<String, Proof>,
     registry: RegistryProof,
     changed_keys: BTreeSet<(String, String)>,
-    idempotency_keys: BTreeSet<String>,
+    idempotency: BTreeMap<String, String>,
     view: ViewTrace,
 }
 
@@ -75,6 +76,14 @@ struct PreparedWrite {
     entity: String,
     value: Value,
     rank: (u64, String),
+    base_revision: u64,
+    base_change_id: String,
+}
+
+impl PreparedWrite {
+    fn fingerprint(&self) -> String {
+        format!("{}|{}|{:?}", self.file_id, self.entity, self.value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +91,7 @@ enum Corruption {
     ReadView,
     OwnerProof,
     RegistryProof,
+    IdempotencyProof,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +99,7 @@ enum Conflict {
     GlobalOwnerOrSchemaChanged,
     BranchMissing,
     OwnerIdentityChanged,
+    IdempotencyMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,10 +111,14 @@ enum Outcome {
 }
 
 fn valid_view(opening: &Snapshot, current: &Snapshot) -> Result<(), Corruption> {
+    let total_begin_reads = opening.view.begin_reads + current.view.begin_reads;
+    let total_reader_instances = opening.view.reader_instances + current.view.reader_instances;
     if opening.view.begin_reads != 1
-        || current.view.begin_reads != 1
+        || current.view.begin_reads != 0
         || opening.view.reader_instances != 1
-        || current.view.reader_instances != 1
+        || current.view.reader_instances != 0
+        || total_begin_reads != 1
+        || total_reader_instances != 1
         || opening.view.view_id != current.view.view_id
         || opening
             .view
@@ -117,27 +132,88 @@ fn valid_view(opening: &Snapshot, current: &Snapshot) -> Result<(), Corruption> 
     Ok(())
 }
 
-fn valid_owner<'a>(proof: &'a Proof, file_id: &str) -> Result<(&'a str, &'a str), Corruption> {
+fn valid_owner<'a>(
+    proof: &'a Proof,
+    file_id: &str,
+    expected_revision: u64,
+    expected_change_id: &str,
+) -> Result<(&'a str, &'a str), Corruption> {
     match proof {
         Proof::Valid {
             file_id: actual_file,
             plugin_key,
             generation,
-            ..
-        } if actual_file == file_id => Ok((plugin_key.as_str(), generation.as_str())),
+            revision,
+            change_id,
+        } if actual_file == file_id
+            && *revision == expected_revision
+            && change_id == expected_change_id =>
+        {
+            Ok((plugin_key.as_str(), generation.as_str()))
+        }
         _ => Err(Corruption::OwnerProof),
     }
 }
 
-fn valid_registry(registry: &RegistryProof) -> Result<(&str, &str), Corruption> {
+fn valid_registry<'a>(
+    registry: &'a RegistryProof,
+    expected_revision: u64,
+    expected_change_id: &str,
+) -> Result<(&'a str, &'a str), Corruption> {
     match registry {
         RegistryProof::Valid {
+            revision,
+            change_id,
             plugin_key,
             generation,
-            ..
-        } => Ok((plugin_key.as_str(), generation.as_str())),
+        } if *revision == expected_revision && change_id == expected_change_id => {
+            Ok((plugin_key.as_str(), generation.as_str()))
+        }
         _ => Err(Corruption::RegistryProof),
     }
+}
+
+fn authenticate_write(
+    opening: &Snapshot,
+    current: &Snapshot,
+    write: &PreparedWrite,
+) -> Result<(), Corruption> {
+    let expected_opening_change = format!("change-{}", opening.revision);
+    let expected_current_change = format!("change-{}", current.revision);
+    if write.base_revision != opening.revision || write.base_change_id != expected_opening_change {
+        return Err(Corruption::OwnerProof);
+    }
+    let opening_owner = opening
+        .owners
+        .get(&write.file_id)
+        .ok_or(Corruption::OwnerProof)?;
+    let current_owner = current
+        .owners
+        .get(&write.file_id)
+        .ok_or(Corruption::OwnerProof)?;
+    valid_owner(
+        opening_owner,
+        &write.file_id,
+        opening.revision,
+        &expected_opening_change,
+    )?;
+    valid_owner(
+        current_owner,
+        &write.file_id,
+        current.revision,
+        &expected_current_change,
+    )?;
+    valid_registry(
+        &opening.registry,
+        opening.revision,
+        &expected_opening_change,
+    )?;
+    valid_registry(
+        &current.registry,
+        current.revision,
+        &expected_current_change,
+    )?;
+    Ok(())
 }
 
 fn reconcile(
@@ -146,23 +222,32 @@ fn reconcile(
     writes: &[PreparedWrite],
 ) -> Result<Result<Outcome, Conflict>, Corruption> {
     valid_view(opening, current)?;
-    for write in writes {
-        if current.idempotency_keys.contains(&write.operation_id) {
-            return Ok(Ok(Outcome::Idempotent));
-        }
-    }
     if opening.active_head.is_empty() || current.active_head.is_empty() {
         return Ok(Err(Conflict::BranchMissing));
     }
     if opening.global_head != current.global_head {
         return Ok(Err(Conflict::GlobalOwnerOrSchemaChanged));
     }
+
+    let mut ordered = writes.to_vec();
+    ordered.sort_by_key(|write| write.rank.clone());
+    for write in &ordered {
+        authenticate_write(opening, current, write)?;
+    }
+    for write in &ordered {
+        if let Some(existing) = current.idempotency.get(&write.operation_id) {
+            if existing == &write.fingerprint() {
+                return Ok(Ok(Outcome::Idempotent));
+            }
+            return Ok(Err(Conflict::IdempotencyMismatch));
+        }
+    }
     if opening.revision == current.revision {
         return Ok(Ok(Outcome::Direct));
     }
 
     let mut overlapping_files = BTreeSet::new();
-    for write in writes {
+    for write in &ordered {
         if current
             .changed_keys
             .contains(&(write.file_id.clone(), write.entity.clone()))
@@ -177,18 +262,32 @@ fn reconcile(
     for file_id in &overlapping_files {
         let opening_owner = opening.owners.get(file_id).ok_or(Corruption::OwnerProof)?;
         let current_owner = current.owners.get(file_id).ok_or(Corruption::OwnerProof)?;
-        let (opening_plugin, opening_generation) = valid_owner(opening_owner, file_id)?;
-        let (current_plugin, current_generation) = valid_owner(current_owner, file_id)?;
+        let (opening_plugin, opening_generation) = valid_owner(
+            opening_owner,
+            file_id,
+            opening.revision,
+            &format!("change-{}", opening.revision),
+        )?;
+        let (current_plugin, current_generation) = valid_owner(
+            current_owner,
+            file_id,
+            current.revision,
+            &format!("change-{}", current.revision),
+        )?;
         if opening_plugin != current_plugin || opening_generation != current_generation {
             return Ok(Err(Conflict::OwnerIdentityChanged));
         }
-        let (registry_plugin, registry_generation) = valid_registry(&current.registry)?;
+        let (registry_plugin, registry_generation) = valid_registry(
+            &current.registry,
+            current.revision,
+            &format!("change-{}", current.revision),
+        )?;
         if registry_plugin != current_plugin || registry_generation != current_generation {
             return Ok(Err(Conflict::OwnerIdentityChanged));
         }
     }
 
-    let write = writes.first().ok_or(Corruption::OwnerProof)?;
+    let write = ordered.first().ok_or(Corruption::IdempotencyProof)?;
     Ok(Ok(Outcome::Reconciled {
         operation_id: write.operation_id.clone(),
         value: write.value.clone(),
@@ -208,6 +307,7 @@ fn proof(file_id: &str, plugin_key: &str, generation: &str, revision: u64) -> Pr
 fn registry(plugin_key: &str, generation: &str, revision: u64) -> RegistryProof {
     RegistryProof::Valid {
         revision,
+        change_id: format!("change-{revision}"),
         plugin_key: plugin_key.into(),
         generation: generation.into(),
     }
@@ -224,7 +324,7 @@ fn snapshot(revision: u64) -> Snapshot {
         )]),
         registry: registry("plugin-a", "generation-a", revision),
         changed_keys: BTreeSet::new(),
-        idempotency_keys: BTreeSet::new(),
+        idempotency: BTreeMap::new(),
         view: ViewTrace {
             view_id: 11,
             begin_reads: 1,
@@ -234,20 +334,40 @@ fn snapshot(revision: u64) -> Snapshot {
     }
 }
 
+fn current_snapshot(revision: u64) -> Snapshot {
+    let mut current = snapshot(revision);
+    current.view.begin_reads = 0;
+    current.view.reader_instances = 0;
+    current.view.events = vec![(11, "same-retained-read/current-observation".into())];
+    current
+}
+
 fn write(operation_id: &str, file_id: &str, entity: &str, value: Value) -> PreparedWrite {
+    write_with_rank(operation_id, file_id, entity, value, 1)
+}
+
+fn write_with_rank(
+    operation_id: &str,
+    file_id: &str,
+    entity: &str,
+    value: Value,
+    rank: u64,
+) -> PreparedWrite {
     PreparedWrite {
         operation_id: operation_id.into(),
         file_id: file_id.into(),
         entity: entity.into(),
         value,
-        rank: (1, operation_id.into()),
+        rank: (rank, operation_id.into()),
+        base_revision: 1,
+        base_change_id: "change-1".into(),
     }
 }
 
 #[test]
 fn unrelated_owner_change_succeeds_without_reconciliation() {
     let opening = snapshot(1);
-    let mut current = snapshot(2);
+    let mut current = current_snapshot(2);
     current
         .changed_keys
         .insert(("other-file".into(), "row".into()));
@@ -263,8 +383,9 @@ fn unrelated_owner_change_succeeds_without_reconciliation() {
 #[test]
 fn same_owner_stale_change_is_deterministically_reconciled() {
     let opening = snapshot(1);
-    let mut current = snapshot(2);
+    let mut current = current_snapshot(2);
     current.changed_keys.insert(("file-a".into(), "row".into()));
+    let before = current.clone();
     let result = reconcile(
         &opening,
         &current,
@@ -278,12 +399,13 @@ fn same_owner_stale_change_is_deterministically_reconciled() {
             value: Value::Json("a".into()),
         })
     );
+    assert_eq!(current, before);
 }
 
 #[test]
 fn owner_generation_or_registry_substitution_conflicts() {
     let opening = snapshot(1);
-    let mut current = snapshot(2);
+    let mut current = current_snapshot(2);
     current.changed_keys.insert(("file-a".into(), "row".into()));
     current.owners.insert(
         "file-a".into(),
@@ -299,17 +421,22 @@ fn owner_generation_or_registry_substitution_conflicts() {
 }
 
 #[test]
-fn idempotency_is_a_terminal_success_without_duplicate_write() {
+fn idempotency_is_exact_replay_and_mismatch_is_conflict() {
     let opening = snapshot(1);
-    let mut current = snapshot(2);
-    current.idempotency_keys.insert("op-a".into());
-    let result = reconcile(
-        &opening,
-        &current,
-        &[write("op-a", "file-a", "row", Value::Tombstone)],
-    )
-    .expect("valid authority");
-    assert_eq!(result, Ok(Outcome::Idempotent));
+    let write_a = write("op-a", "file-a", "row", Value::Tombstone);
+    let mut current = current_snapshot(2);
+    current
+        .idempotency
+        .insert("op-a".into(), write_a.fingerprint());
+    assert_eq!(
+        reconcile(&opening, &current, std::slice::from_ref(&write_a)),
+        Ok(Ok(Outcome::Idempotent))
+    );
+    let write_b = write("op-a", "file-a", "row", Value::Json("different".into()));
+    assert_eq!(
+        reconcile(&opening, &current, std::slice::from_ref(&write_b)),
+        Ok(Err(Conflict::IdempotencyMismatch))
+    );
 }
 
 #[test]
@@ -324,7 +451,7 @@ fn missing_malformed_wrong_kind_and_identity_proofs_fail_closed() {
             actual_file: "file-b".into(),
         },
     ] {
-        let mut current = snapshot(2);
+        let mut current = current_snapshot(2);
         current.changed_keys.insert(("file-a".into(), "row".into()));
         current.owners.insert("file-a".into(), bad);
         assert_eq!(
@@ -350,7 +477,7 @@ fn missing_malformed_wrong_kind_and_identity_registry_fails_closed() {
             actual: "plugin-b".into(),
         },
     ] {
-        let mut current = snapshot(2);
+        let mut current = current_snapshot(2);
         current.changed_keys.insert(("file-a".into(), "row".into()));
         current.registry = bad;
         assert_eq!(
@@ -365,9 +492,45 @@ fn missing_malformed_wrong_kind_and_identity_registry_fails_closed() {
 }
 
 #[test]
+fn corruption_is_authenticated_before_idempotency_replay() {
+    let opening = snapshot(1);
+    let write_a = write("op-a", "file-a", "row", Value::Tombstone);
+    let mut current = current_snapshot(2);
+    current
+        .idempotency
+        .insert("op-a".into(), write_a.fingerprint());
+    current.owners.insert("file-a".into(), Proof::Malformed);
+    assert_eq!(
+        reconcile(&opening, &current, &[write_a]),
+        Err(Corruption::OwnerProof)
+    );
+}
+
+#[test]
+fn multi_write_order_is_deterministic_and_has_no_partial_publication() {
+    let opening = snapshot(1);
+    let mut current = current_snapshot(2);
+    current.changed_keys.insert(("file-a".into(), "row".into()));
+    let low = write_with_rank("op-low", "file-a", "row", Value::Null, 1);
+    let high = write_with_rank("op-high", "file-a", "row", Value::Json("high".into()), 2);
+    let before = current.clone();
+    let forward = reconcile(&opening, &current, &[high.clone(), low.clone()]);
+    let reverse = reconcile(&opening, &current, &[low, high]);
+    assert_eq!(forward, reverse);
+    assert_eq!(
+        forward,
+        Ok(Ok(Outcome::Reconciled {
+            operation_id: "op-low".into(),
+            value: Value::Null,
+        }))
+    );
+    assert_eq!(current, before);
+}
+
+#[test]
 fn separate_reader_or_cross_view_events_fail_closed() {
     let opening = snapshot(1);
-    let mut current = snapshot(2);
+    let mut current = current_snapshot(2);
     current.view.view_id = 12;
     current
         .changed_keys

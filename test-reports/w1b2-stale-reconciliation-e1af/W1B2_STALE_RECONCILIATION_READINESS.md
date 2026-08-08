@@ -1,188 +1,127 @@
-# W1b-2 stale transaction/plugin/cohort readiness package — exact e1af
+# W1b-2 stale reconciliation correction — test/report-only readiness
 
-Status: test/report-only, frozen for independent review. No production edit,
-Cargo build, adapter runtime, benchmark, PR, or merge was performed. The
-standalone model correction gate is the only executed build/runtime artifact.
+## Immutable boundary
 
-## Pinned source and scope
+This direct successor is based on immutable W1b-2 correction head
+`8b44e8cbd226e8820498e7c5c8e02d291c34abb8` and remains TEST/REPORT-only.
+It changes no `packages/lix/src` file, Cargo manifest, adapter, PR, or main
+branch. The production semantic anchor is exact e1af:
 
-- Anchor commit: e1af471b9ab0f598dafa7c2ddec7867667c81740
-- Anchor tree: bfa0d271a723da8250ab76ada16fda90926f1099
-- Anchor parent: b484e20d845aee3f8137bfa3496f9b3cd0e8cd35
-- Source worktree: /tmp/lix-w1b2-stale-reconciliation-e1af
-- Exact production allowlist: SOURCE_ALLOWLIST.md
-- Package-only path: test-reports/w1b2-stale-reconciliation-e1af/
+```text
+e1af471b9ab0f598dafa7c2ddec7867667c81740
+tree bfa0d271a723da8250ab76ada16fda90926f1099
+```
 
-This is W1b-2 only. Merge analysis/W1b-1, W1a/changelog,
-undo/redo, typed transitions, checkpoint/history, working-diff,
-selector/BranchRef, writer/publication, GC, CAS/blob layout, and W3-W5 are
-explicitly excluded.
+The exact five-RED e1af control in `EXPECTED_RED.txt` is preserved byte for
+byte. The package does not claim production approval; the GREEN fixture only
+proves that the verifier can distinguish a structurally corrected source
+shape from the exact baseline.
 
-## Current e1af call chain
+## Candidate-parametric source verifier
 
-Commit-time reconciliation begins at:
+`verify_source_contract.sh` has two modes:
 
-    Transaction::commit_prepared
-      transaction/context.rs:1476-1527
-      -> begin_read once at the commit boundary
-      -> replace transaction.opening_read with the current coherent read
-      -> reconcile_stale_disjoint_writes
+```sh
+# Exact production-anchor RED calibration.
+timeout 1200s test-reports/w1b2-stale-reconciliation-e1af/verify_source_contract.sh \
+  "$PWD" e1af471b9ab0f598dafa7c2ddec7867667c81740 \
+  e1af471b9ab0f598dafa7c2ddec7867667c81740
 
-The stale dispatcher is:
+# Hermetic structural GREEN calibration.
+timeout 1200s test-reports/w1b2-stale-reconciliation-e1af/verify_source_contract.sh \
+  --fixture test-reports/w1b2-stale-reconciliation-e1af/fixtures/green
+```
 
-    reconcile_stale_disjoint_writes
-      transaction/context.rs:750-940
-      -> load current global/active branch heads through branch_ref_reader(read)
-      -> reject unsupported untracked/global/multi-branch/checkpoint cohorts
-      -> hydrate ordered mutation predecessors
-      -> tracked_state.reader(read):842
-      -> changed_identities_in_first_parent_interval
-         or tracked.diff_commits(opening_head,current_head)
-      -> classify_stale_commit: transaction/stale_commit.rs:34-100
-      -> direct/revalidate, plugin reconcile, or unsafe conflict
+Production mode resolves the target commit, compares every changed production
+path from exact e1af to the six-path allowlist, and scopes each legacy RED to
+the named function body. It does not treat a file-wide token or empty diff as
+GREEN. The exact anchor still reports the five original legacy-reader REDs.
 
-The plugin reconciliation chain is:
+Fixture mode scans an actual six-path source tree; it is not a list of
+self-declared booleans. Its GREEN predicates are argument-aware and
+function-scoped:
 
-    reconcile_stale_plugin_writes
-      transaction/context.rs:942-1268
-      -> tracked_state.reader(read):978
-      -> base/current plugin-owner rows
-      -> base/current global plugin-registry row
-      -> registry JSON and owner/version/schema-key validation
-      -> filesystem_path_index active-branch path binding
-      -> candidate base/current semantic rows
-      -> ConflictRank deterministic ordering
-      -> resolve_plugin_conflicts
-      -> replay complete per-file replacement batches
+- `commit_prepared` constructs exactly one facade from the opening read and
+  contains no nested `begin_read`, raw `read_store`, or facade clone.
+- stale-disjoint, stale-plugin, cohort, and cohort-owner functions receive a
+  `facade` argument and perform direct `facade.` operations; legacy reader and
+  projected-batch calls are rejected inside those bodies.
+- owner/registry authentication is present before the idempotency-key check
+  and `Outcome::Idempotent` terminal return.
+- plugin reconciliation sorts by write rank, validates the complete plan, and
+  retains the pure stale classifier.
+- the ForkTree facade exposes owner-proof, registry-proof, and semantic-row
+  operations; all six allowed paths are scanned for legacy reader, raw read,
+  fallback/retry, cache, and alternate-authority identifiers.
 
-The cohort chain is:
+This fixture is a verifier calibration, not a production candidate. A future
+production head must pass the same structural predicates against its actual
+source and retain the exact e1af RED control.
 
-    commit_merged_cohort
-      transaction/context/cohort.rs:136-242
-      -> reconcile_cohort_files:327-500
-      -> load_cohort_plugin_groups:549-658
-      -> tracked readers at 386 and 572
-      -> base rows, owner rows, registry, path identity
-      -> deterministic frontier pairing and plugin resolution
-      -> one consolidated semantic replacement per file
-      -> existing transaction writer
+## Stateful model contract
 
-The pure classifier in stale_commit.rs must remain semantic authority for
-overlap classification. W1b-2 replaces only the historical reads feeding it;
-it does not redesign the classifier, actor resolver, idempotency writer, or
-commit publication.
+`stale_reconciliation_oracle.rs` now binds:
 
-## One retained-read authority contract
-
-The future candidate must use one transaction-owned
-ForkTreeReadFacade/CoherentView over the exact current coherent read supplied
-by the commit boundary. That owner must cover:
-
-1. active/global selector and branch-head observations;
-2. opening/current commit identity and generation chronology;
-3. file-owner rows and plugin registry rows;
-4. plugin key, schema-key set, archive-generation, revision/change identity;
-5. candidate base/current semantic rows and authenticated payloads;
-6. path/descriptors, deterministic conflict inputs, and terminal replay
-   staging decisions.
-
-The transaction-opening owner may be borrowed by branch-bound descriptors, but
-no reconciliation helper may begin, refresh, clone, extract, replace, or
-cross-use a read. The required invariant is one retained view/read identity
-for the reconciliation operation, not a detached cache. A single commit
-boundary read is allowed; nested helper reads are not.
-
-Forbidden paths are raw HistoryQuerySource/JsonStoreReader access, a
-detached TrackedStateStoreReader, a second CommitGraphReader, a fallback or
-retry authority, a durable cache/index, a second plugin-owner projection, or
-compatibility/dual behavior. Decoded owner/registry/row values are ephemeral
-terminal inputs only.
-
-## Required stale semantics
-
-The future candidate must preserve:
-
+- file owner, plugin key, generation, revision, and change ID;
+- registry plugin/generation, revision, and change ID;
+- exactly one opening read/view (`begin_reads=1`, current observations zero)
+  with one reader instance and one view identity;
 - same-owner stale overlap versus unrelated-owner success;
-- global schema/plugin-state change as a typed transaction conflict;
-- missing active branch as branch-not-found, not empty success;
-- owner file_id, plugin key, schema-key set, archive generation, revision, and
-  change_id binding;
-- registry owner/generation agreement and invalid JSON as typed invalid-plugin;
-- base/current semantic row identity, payload, NULL, tombstone, and absence;
-- deterministic ConflictRank and plugin conflict ordering;
-- ordinary INSERT revalidation and unsafe non-plugin overlap behavior;
-- complete-set journal predecessor certification;
-- idempotency replay as one terminal success with no duplicate publication;
-- one consolidated per-file replay batch and the existing one-commit writer;
-- missing, malformed, wrong-kind, identity-substituted, or corrupt catalog,
-  owner, registry, row, path, or payload authority failing closed before
-  partial reconciliation.
+- exact idempotency fingerprint replay versus idempotency mismatch conflict,
+  with owner/registry authentication before replay;
+- missing, malformed, wrong-kind, file-identity, registry-identity,
+  revision, and change-ID corruption;
+- deterministic multi-write rank ordering and immutable current state, proving
+  no partial reconciliation/publication;
+- NULL, tombstone, absent, and JSON values.
 
-The model's read trace rejects multiple begin events, multiple reader
-instances, or cross-view event identities. stale_reconciliation_oracle.rs is
-not a production implementation; the correction gate compiles it with
-warnings denied and runs its deterministic tests, while making no Cargo or
-adapter qualification claim.
+`negative_reconciliation_fixtures.rs` includes the model and adds explicit
+second-read, forged revision/change-ID, idempotency mismatch, and reversed
+input-order controls.
 
-## Expected exact-e1af RED calibration
+## Exact scope
 
-verify_source_contract.sh is source-only and intentionally exits 1 on exact
-e1af. It must identify:
+Future production changes remain limited to the six paths in
+`SOURCE_ALLOWLIST.md`. W1a/W1b-1, W1b-3/W1b-4, merge analysis,
+undo/redo/checkpoint/history, working-diff, changelog, selectors/BranchRef,
+writer/publication, GC, CAS/blob, storage adapters, W3-W5, compatibility,
+fallback, retry, cache, second reader, and alternate authority remain outside
+this package.
 
-1. stale disjoint reconciliation's legacy tracked-state reader;
-2. stale plugin reconciliation's legacy tracked-state reader;
-3. cohort reconciliation's legacy tracked-state reader;
-4. cohort owner/version discovery through legacy projected batch loading;
-5. plugin owner/version/revision discovery through legacy projected batch
-   loading.
+## Reproduced results
 
-Opening retained ForkTree facade, pure stale classifier, commit boundary, and
-deterministic plugin resolver are positive controls. EXPECTED_RED.txt captures
-the exact output. This is a readiness RED only; no compiler or adapter result
-is inferred.
+The exact baseline source verifier exits 1 with the committed five-RED output;
+both streams hash `9afe7f764ef6bea1d914329e3ad0fded3bc59207d20696480dc76f457b22f7d0`.
 
-## Compiler-driven deletion order
+The GREEN fixture exits 0 with:
 
-1. Add or verify the smallest ForkTree authenticated owner/version/revision,
-   exact-row, registry, and payload operations. Do not touch merge analysis or
-   delete the shared legacy reader while W1b-3 still needs it.
-2. Convert reconcile_stale_disjoint_writes to borrow the one retained facade;
-   preserve branch-head/global-head checks and classify_stale_commit.
-3. Convert stale plugin owner/registry/row/path reads and preserve the
-   deterministic resolver, actor retirement, and complete per-file replay.
-4. Convert cohort group loading and frontier replay over the same operation
-   view; preserve one consolidated batch and the existing writer.
-5. Only after compiler reachability proves no W1b-2 caller remains, remove
-   W1b-2-specific reader plumbing. Do not remove the shared
-   TrackedStateStoreReader itself until W1b-1, W1b-3, and later cohorts are
-   independently closed.
+```text
+FIXTURE SCOPE PASS allowlist=6
+PASS_FUNCTION=owner/registry authentication
+PASS_FUNCTION=deterministic multi-write ordering
+PASS_FUNCTION=write rank binding
+PASS_FUNCTION=complete-plan validation
+PASS_FUNCTION=owner proof operation
+PASS_FUNCTION=registry proof operation
+PASS_FUNCTION=semantic row operation
+RESULT=GREEN candidate-parametric structural predicates pass
+```
 
-## Future commands, each capped at 1200 seconds
+Rust model commands, all bounded to 1200 seconds:
 
-Run only on an immutable candidate after the source/compiler gate:
+```sh
+timeout 1200s rustfmt --edition 2024 --check \
+  test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs \
+  test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs
+timeout 1200s rustc --edition=2024 --test -D warnings \
+  test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs \
+  -o /tmp/w1b2-v2-model
+timeout 1200s /tmp/w1b2-v2-model --nocapture
+timeout 1200s rustc --edition=2024 --test -D warnings \
+  test-reports/w1b2-stale-reconciliation-e1af/negative_reconciliation_fixtures.rs \
+  -o /tmp/w1b2-v2-negative
+timeout 1200s /tmp/w1b2-v2-negative --nocapture
+```
 
-    timeout 1200s test-reports/w1b2-stale-reconciliation-e1af/verify_source_contract.sh "$PWD" HEAD e1af471b9ab0f598dafa7c2ddec7867667c81740
-
-    timeout 1200s rustc --edition=2024 --test -D warnings test-reports/w1b2-stale-reconciliation-e1af/stale_reconciliation_oracle.rs -o /tmp/w1b2-stale-reconciliation-oracle
-    timeout 1200s /tmp/w1b2-stale-reconciliation-oracle
-
-    timeout 1200s cargo test -p lix stale_commit --lib
-    timeout 1200s cargo test -p lix reconcile_stale --lib
-    timeout 1200s cargo test -p lix cohort --lib
-    timeout 1200s cargo test -p lix --lib --features slatedb reconcile_stale
-
-The future adapter order is Memory/default, exact RocksDB, then SlateDB.
-Focused controls must include same-owner stale conflict, unrelated-owner
-success, global/plugin-generation change, owner/registry/path corruption,
-NULL/tombstone/absence, deterministic repeated resolution, idempotency replay,
-cohort consolidation, cold reopen, and zero second reads. No broad matrix is
-authorized before the source/compiler gate passes.
-
-## Review boundary
-
-This is a readiness package, not production approval. A future candidate is
-blocked by any source path outside the allowlist, merge/W1a/W1b-3+ widening,
-second read/view, raw or detached reader, cache/index/fallback/compatibility
-authority, changed writer/publication semantics, partial corruption success,
-nondeterministic plugin resolution, duplicate idempotency publication, or
-loss of same-owner versus unrelated-owner discrimination.
+Both model binaries and the negative fixture compile with warnings denied and
+all tests pass. No production Cargo or adapter test is run by this package.
