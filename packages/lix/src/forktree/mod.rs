@@ -28,11 +28,11 @@ pub(crate) use object::ObjectId;
 pub(crate) use publication::{BranchStateTransition, PreparedPublication, SelectorExpectation};
 pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_gc};
 pub(crate) use serving::{
-    CatalogPage, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree,
+    CatalogPage, CommitTopology, StateSource, StateTreeMutation, VisibleStateRow, edit_state_tree,
     load_branch_head, load_change, load_change_records, load_commit, load_commit_member_records,
-    load_commit_records, page_changes, page_commits, put_change_catalog_entries,
-    put_commit_catalog_entries, scan_branch_heads, scan_change_records, scan_commit_records,
-    state_point, state_range,
+    load_commit_records, load_commit_topologies, page_changes, page_commits,
+    put_change_catalog_entries, put_commit_catalog_entries, scan_branch_heads, scan_change_records,
+    scan_commit_records, scan_commit_topologies, state_point, state_range,
 };
 pub(crate) use state::{
     StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef, UntrackedValueRef,
@@ -84,6 +84,7 @@ const _: () = {
             PreparedPublication,
             SelectorExpectation,
             CatalogPage<(CommitId, CommitObjectV1)>,
+            CommitTopology,
             StateSource,
             StateTreeMutation,
             VisibleStateRow,
@@ -111,9 +112,11 @@ const _: () = {
         let _ = load_branch_head::<R>;
         let _ = load_commit::<R>;
         let _ = load_commit_records::<R>;
+        let _ = load_commit_topologies::<R>;
         let _ = load_commit_member_records::<R>;
         let _ = load_change_records::<R>;
         let _ = scan_commit_records::<R>;
+        let _ = scan_commit_topologies::<R>;
         let _ = scan_change_records::<R>;
         let _ = page_changes::<R>;
         let _ = page_commits::<R>;

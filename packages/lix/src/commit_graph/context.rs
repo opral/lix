@@ -11,10 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::LixError;
-use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
-    CommitScanRequest,
-};
+use crate::changelog::{ChangeId, ChangeRecord, CommitId, CommitRecord};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
@@ -111,11 +108,12 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         if !uncached_ids.is_empty() {
-            let records = crate::forktree::load_commit_records(&self.store, &uncached_ids).await?;
-            let batch = ExactBatch::try_new("ForkTree commit graph", &uncached_ids, records)?;
-            for (commit_id, record) in batch {
+            let topologies =
+                crate::forktree::load_commit_topologies(&self.store, &uncached_ids).await?;
+            let batch = ExactBatch::try_new("ForkTree commit graph", &uncached_ids, topologies)?;
+            for (commit_id, topology) in batch {
                 self.node_cache
-                    .insert(*commit_id, record.map(commit_graph_node_from_record));
+                    .insert(*commit_id, topology.map(commit_graph_node_from_topology));
             }
         }
         let nodes = commit_ids
@@ -131,24 +129,23 @@ where
     /// graph facts themselves, not reachability from a particular branch head.
     pub(crate) async fn all_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
         let mut commits = Vec::new();
-        let mut start_after = None::<String>;
+        let mut start_after = None;
         loop {
-            let mut reader = ChangelogContext::new().reader(&self.store);
-            let scan = reader
-                .scan_commits(CommitScanRequest {
-                    start_after: start_after.as_deref(),
-                    limit: Some(1024),
-                })
-                .await?;
-            for record in scan.entries {
-                let node = commit_graph_node_from_record(record);
+            let page =
+                crate::forktree::scan_commit_topologies(&self.store, start_after, 1024).await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for topology in page {
+                let node = commit_graph_node_from_topology(topology);
                 self.node_cache.insert(node.commit_id, Some(node.clone()));
                 commits.push(node);
             }
-            let Some(next) = scan.next_start_after else {
+            if page_len < 1024 {
                 break;
-            };
-            start_after = Some(next.to_string());
+            }
+            start_after = commits.last().map(|node| node.commit_id);
         }
         Ok(commits)
     }
@@ -366,7 +363,17 @@ where
 
             let node = &reachable.commit;
             if may_include_commits {
-                let canonical_change = canonical_commit_change(node);
+                let records = crate::forktree::load_commit_records(
+                    &self.store,
+                    std::slice::from_ref(&node.commit_id),
+                )
+                .await?;
+                let record = records
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| missing_commit_graph_error(&node.commit_id))?;
+                let canonical_change = canonical_commit_change(&record);
                 if seen_changes.insert(history_change_identity(&canonical_change))
                     && change_matches_history_request(&canonical_change, request)
                 {
@@ -606,14 +613,11 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
     }
 }
 
-fn commit_graph_node_from_record(record: CommitRecord) -> CommitGraphNode {
+fn commit_graph_node_from_topology(topology: crate::forktree::CommitTopology) -> CommitGraphNode {
     CommitGraphNode {
-        commit_id: record.commit_id,
-        change_id: record.change_id,
-        account_id: record.account_id,
-        generation: record.generation,
-        parent_commit_ids: record.parent_commit_ids,
-        created_at: record.created_at,
+        commit_id: topology.commit_id,
+        generation: topology.generation,
+        parent_commit_ids: topology.parent_commit_ids,
     }
 }
 
@@ -704,19 +708,20 @@ fn history_change_identity(
     )
 }
 
-pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChange {
-    let snapshot_content = crate::changelog::commit_row_snapshot_json(&node.commit_id.to_string())
-        .expect("lix_commit snapshot serialization should not fail");
+pub(crate) fn canonical_commit_change(record: &CommitRecord) -> CommitGraphChange {
+    let snapshot_content =
+        crate::changelog::commit_row_snapshot_json(&record.commit_id.to_string())
+            .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
-        id: node.change_id,
-        account_id: node.account_id.clone(),
-        entity_pk: EntityPk::uuid_from_canonical(&node.commit_id.to_string())
+        id: record.change_id,
+        account_id: record.account_id.clone(),
+        entity_pk: EntityPk::uuid_from_canonical(&record.commit_id.to_string())
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
-        created_at: node.created_at,
+        created_at: record.created_at,
         origin_key: None,
     }
 }
@@ -725,7 +730,6 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::changelog::{
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
@@ -734,55 +738,14 @@ mod tests {
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
-    use crate::storage::{
-        BeginScanOptions, GetManyResult, KeyRange, ScanCursor, StorageError, StorageRead,
-    };
     use crate::storage_adapter::{
-        Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageKey,
-        StorageReadOptions, StorageWriteOptions,
+        Memory, Storage, StorageAdapter, StorageKey, StorageReadOptions, StorageWriteOptions,
     };
     use crate::tracked_state::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
         TrackedStateCommitDeltaRef, TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
         stage_commit_state_manifest,
     };
-
-    #[derive(Clone)]
-    struct CountingMemoryRead {
-        inner: MemoryRead,
-        change_get_many_calls: Arc<AtomicUsize>,
-        member_segment_get_many_calls: Arc<AtomicUsize>,
-    }
-
-    impl StorageRead for CountingMemoryRead {
-        async fn get_many(
-            &self,
-            requests: &[crate::storage::GetManyRequest<'_>],
-        ) -> Result<GetManyResult, StorageError> {
-            if requests
-                .iter()
-                .any(|request| request.space == crate::changelog::CHANGE_SPACE)
-            {
-                self.change_get_many_calls.fetch_add(1, Ordering::Relaxed);
-            }
-            if requests.iter().any(|request| {
-                request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE
-            }) {
-                self.member_segment_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.get_many(requests).await
-        }
-
-        async fn begin_scan(
-            &self,
-            space: crate::storage::StorageSpace,
-            range: KeyRange,
-            opts: BeginScanOptions,
-        ) -> Result<ScanCursor<'_>, StorageError> {
-            self.inner.begin_scan(space, range, opts).await
-        }
-    }
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -1074,68 +1037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_history_reuses_canonical_changes_across_requests() {
-        let memory = Memory::new();
-        let storage = StorageAdapter::new(memory.clone());
-        append_changes(
-            &storage,
-            &[
-                entity_change("change-root", "entity-root", "test_schema", "{}"),
-                entity_change("change-head", "entity-head", "test_schema", "{}"),
-                commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
-                commit_change(
-                    "commit-head-change",
-                    "commit-head",
-                    &["change-head"],
-                    &["commit-root"],
-                ),
-            ],
-        )
-        .await;
-
-        let change_get_many_calls = Arc::new(AtomicUsize::new(0));
-        let member_segment_get_many_calls = Arc::new(AtomicUsize::new(0));
-        let read = memory
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(StorageAdapterReadScope::new(CountingMemoryRead {
-            inner: read,
-            change_get_many_calls: Arc::clone(&change_get_many_calls),
-            member_segment_get_many_calls,
-        }));
-        let request = CommitGraphChangeHistoryRequest {
-            schema_keys: vec!["test_schema".to_string()],
-            include_tombstones: true,
-            ..CommitGraphChangeHistoryRequest::default()
-        };
-        let commit_head = commit_id("commit-head");
-
-        let first = reader
-            .change_history_from_commit(&commit_head, &request)
-            .await
-            .expect("first history should resolve");
-        let calls_after_first = change_get_many_calls.load(Ordering::Relaxed);
-        assert_eq!(
-            calls_after_first, 0,
-            "packed commit members retain their payloads without global change reads"
-        );
-
-        let second = reader
-            .change_history_from_commit(&commit_head, &request)
-            .await
-            .expect("second history should resolve");
-        assert_eq!(second, first);
-        assert!(Arc::ptr_eq(&first.reachable_nodes, &second.reachable_nodes));
-        assert_eq!(
-            change_get_many_calls.load(Ordering::Relaxed),
-            calls_after_first,
-            "a pinned reader should reuse previously loaded canonical changes",
-        );
-    }
-
-    #[tokio::test]
     async fn schema_sliced_history_caches_full_selected_tombstone_identity() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = commit_id("selected-tombstone-cache");
@@ -1306,96 +1207,6 @@ mod tests {
             .expect("identity-filtered selected tombstone should load");
         assert_eq!(entity_history.entries.len(), 1);
         assert_eq!(entity_history.entries[0].change.entity_pk, alpha_second_pk);
-    }
-
-    #[tokio::test]
-    async fn topology_reads_do_not_load_commit_member_payloads() {
-        let memory = Memory::new();
-        let storage = StorageAdapter::new(memory.clone());
-        append_changes(
-            &storage,
-            &[
-                entity_change("change-root", "entity-root", "test_schema", "{}"),
-                entity_change("change-head", "entity-head", "test_schema", "{}"),
-                commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
-                commit_change(
-                    "commit-head-change",
-                    "commit-head",
-                    &["change-head"],
-                    &["commit-root"],
-                ),
-            ],
-        )
-        .await;
-
-        let member_segment_get_many_calls = Arc::new(AtomicUsize::new(0));
-        let read = memory
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut reader =
-            CommitGraphContext::new().reader(StorageAdapterReadScope::new(CountingMemoryRead {
-                inner: read,
-                change_get_many_calls: Arc::new(AtomicUsize::new(0)),
-                member_segment_get_many_calls: Arc::clone(&member_segment_get_many_calls),
-            }));
-        let head = commit_id("commit-head");
-        let root = commit_id("commit-root");
-
-        reader
-            .load_node(&head)
-            .await
-            .expect("node load should succeed");
-        reader
-            .reachable_nodes(&head)
-            .await
-            .expect("topology walk should succeed");
-        reader
-            .best_common_ancestors(&head, &root)
-            .await
-            .expect("ancestor walk should succeed");
-        reader.all_nodes().await.expect("node scan should succeed");
-        assert_eq!(
-            member_segment_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "topology APIs must never touch commit member storage",
-        );
-
-        let commit_history = reader
-            .change_history_from_commit(
-                &head,
-                &CommitGraphChangeHistoryRequest {
-                    schema_keys: vec![super::COMMIT_SCHEMA_KEY.to_string()],
-                    include_tombstones: true,
-                    ..CommitGraphChangeHistoryRequest::default()
-                },
-            )
-            .await
-            .expect("commit-only history should derive node changes");
-        assert_eq!(commit_history.entries.len(), 2);
-        assert_eq!(
-            member_segment_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "commit-only history must not hydrate unrelated member payloads",
-        );
-
-        let history = reader
-            .change_history_from_commit(
-                &head,
-                &CommitGraphChangeHistoryRequest {
-                    schema_keys: vec!["test_schema".to_string()],
-                    include_tombstones: true,
-                    ..CommitGraphChangeHistoryRequest::default()
-                },
-            )
-            .await
-            .expect("history should hydrate requested payloads");
-        assert_eq!(history.entries.len(), 2);
-        assert_eq!(
-            member_segment_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "these tiny commit inventories are inline in their authority manifests",
-        );
     }
 
     #[tokio::test]

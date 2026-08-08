@@ -6,9 +6,9 @@ use bytes::Bytes;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage::{
-    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
-    MemoryRead, MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, Storage,
-    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    BeginScanOptions, CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key,
+    KeyRange, Memory, MemoryRead, MemoryWrite, PutBatch, PutEntry, ReadOptions, ScanCursor,
+    Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageAdapterReadScope};
 
@@ -36,9 +36,10 @@ use super::{
     SnapshotTargetV1, StateCell, StateCellRef, StateKeyRef, StateSource, StateTreeMutation,
     StateValueRef, UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1,
     UploadSelectorV1, VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree,
-    encode_state_key, encode_state_value, load_change, load_commit, open_coherent_view,
-    page_changes, page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_range,
+    encode_state_key, encode_state_value, load_change, load_commit, load_commit_member_records,
+    load_commit_topologies, open_coherent_view, page_changes, page_commits,
+    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -730,6 +731,41 @@ struct CountingRead {
     inner: MemoryRead,
 }
 
+struct TopologyCountingRead {
+    inner: StorageAdapterReadScope<MemoryRead>,
+    forbidden_member: ObjectId,
+    member_object_reads: Arc<AtomicUsize>,
+}
+
+impl StorageAdapterRead for TopologyCountingRead {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        let member_key = self.forbidden_member.as_bytes();
+        if requests.iter().any(|request| {
+            request.space == OBJECT_SPACE
+                && request.keys.iter().any(|key| key.0.as_ref() == member_key)
+        }) {
+            self.member_object_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: crate::storage::StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.inner.begin_scan(space, range, opts)
+    }
+}
+
 impl StorageRead for CountingRead {
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.inner.snapshot_cache_key()
@@ -742,13 +778,13 @@ impl StorageRead for CountingRead {
         self.inner.get_many(requests)
     }
 
-    fn scan(
+    fn begin_scan(
         &self,
         space: crate::storage::StorageSpace,
         range: KeyRange,
-        options: ScanOptions,
-    ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
-        self.inner.scan(space, range, options)
+        options: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.inner.begin_scan(space, range, options)
     }
 }
 
@@ -924,6 +960,72 @@ async fn coherent_open_uses_one_read_and_visited_edges_fail_closed() {
         .await
         .expect("bounded open does not traverse an unrelated catalog member");
     assert!(load_change(&view, seed.semantic_change_id).await.is_err());
+}
+
+#[tokio::test]
+async fn commit_topology_never_hydrates_member_changes_and_member_history_fails_closed() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let member_object_reads = Arc::new(AtomicUsize::new(0));
+    let read = TopologyCountingRead {
+        inner: StorageAdapterReadScope::new(
+            storage
+                .begin_read(ReadOptions::default())
+                .await
+                .expect("topology read"),
+        ),
+        forbidden_member: seed.semantic_change_object_id,
+        member_object_reads: Arc::clone(&member_object_reads),
+    };
+    let public_id = public_commit_id(0x20);
+    assert_eq!(
+        load_commit_topologies(&read, &[public_id])
+            .await
+            .expect("topology")
+            .into_iter()
+            .next()
+            .flatten(),
+        Some(super::CommitTopology {
+            commit_id: public_id,
+            parent_commit_ids: Vec::new(),
+            generation: 1,
+        })
+    );
+    assert_eq!(member_object_reads.load(Ordering::Relaxed), 0);
+    drop(read);
+
+    let mut corrupt = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("corruption write");
+    corrupt
+        .delete_many(
+            OBJECT_SPACE,
+            &[Key(Bytes::copy_from_slice(
+                seed.semantic_change_object_id.as_bytes(),
+            ))],
+        )
+        .await
+        .expect("delete member");
+    corrupt.commit().await.expect("commit corruption");
+
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("post-corruption read"),
+    );
+    assert!(
+        load_commit_topologies(&read, &[public_id])
+            .await
+            .expect("member corruption remains latent for topology")
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some()
+    );
+    assert!(load_commit_member_records(&read, public_id).await.is_err());
 }
 
 #[tokio::test]

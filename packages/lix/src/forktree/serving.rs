@@ -115,6 +115,15 @@ pub(crate) struct CatalogPage<T> {
     pub(crate) resume_token: Option<Vec<u8>>,
 }
 
+/// The complete authenticated input required by commit-DAG algorithms. It
+/// deliberately contains no semantic Change identity or payload metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitTopology {
+    pub(crate) commit_id: crate::changelog::CommitId,
+    pub(crate) parent_commit_ids: Vec<crate::changelog::CommitId>,
+    pub(crate) generation: u64,
+}
+
 /// Loads one authenticated moving branch head through the ForkTree selector
 /// owner. Missing selectors are ordinary branch absence; malformed selectors,
 /// snapshots, and selected commit edges fail closed.
@@ -265,15 +274,9 @@ where
         let entry = CommitCatalogEntry::decode(&value)?;
         let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
         let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
-        records.push(Some(
-            semantic_commit_record(
-                read,
-                repository.change_catalog_root,
-                entry.commit_object_id,
-                commit,
-            )
-            .await?,
-        ));
+        let topology =
+            validate_commit_topology(read, repository.commit_catalog_root, id, &commit).await?;
+        records.push(Some(semantic_commit_record(commit, &topology)?));
     }
     Ok(records)
 }
@@ -314,17 +317,85 @@ where
         if commit.commit_id != id {
             return Err(corruption("CommitCatalog key does not match Commit object").into());
         }
-        records.push(
-            semantic_commit_record(
-                read,
-                repository.change_catalog_root,
-                entry.commit_object_id,
-                commit,
-            )
-            .await?,
-        );
+        let topology =
+            validate_commit_topology(read, repository.commit_catalog_root, id, &commit).await?;
+        records.push(semantic_commit_record(commit, &topology)?);
     }
     Ok(records)
+}
+
+/// Loads exact authenticated commit-DAG topology and nothing else. No Change
+/// object, ChangeCatalog entry, member payload, or semantic Commit metadata is
+/// decoded by this path.
+pub(crate) async fn load_commit_topologies<R>(
+    read: &R,
+    ids: &[crate::changelog::CommitId],
+) -> Result<Vec<Option<CommitTopology>>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let repository = load_repository_root(read).await?;
+    let mut topologies = Vec::with_capacity(ids.len());
+    for id in ids {
+        let catalog_id = CommitId::from_bytes(*id.as_uuid().as_bytes());
+        let Some(value) = lookup_on_read(
+            repository.commit_catalog_root,
+            "commit",
+            catalog_id.as_bytes(),
+            read,
+        )
+        .await?
+        else {
+            topologies.push(None);
+            continue;
+        };
+        let entry = CommitCatalogEntry::decode(&value)?;
+        let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+        topologies.push(Some(
+            validate_commit_topology(read, repository.commit_catalog_root, catalog_id, &commit)
+                .await?,
+        ));
+    }
+    Ok(topologies)
+}
+
+pub(crate) async fn scan_commit_topologies<R>(
+    read: &R,
+    start_after: Option<crate::changelog::CommitId>,
+    limit: usize,
+) -> Result<Vec<CommitTopology>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let repository = load_repository_root(read).await?;
+    let start_after = start_after.map(|id| id.as_uuid().as_bytes().to_vec());
+    let rows = scan_page_on_read(
+        repository.commit_catalog_root,
+        "commit",
+        start_after.as_deref(),
+        limit.min(CATALOG_SCAN_PAGE_ROWS),
+        read,
+    )
+    .await?;
+    let mut topologies = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        let id = CommitId::from_bytes(
+            key.as_slice()
+                .try_into()
+                .map_err(|_| corruption("CommitCatalog key is not a raw UUID"))?,
+        );
+        let entry = CommitCatalogEntry::decode(&value)?;
+        let bytes = super::view::load_object_bytes(read, entry.commit_object_id).await?;
+        let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+        topologies.push(
+            validate_commit_topology(read, repository.commit_catalog_root, id, &commit).await?,
+        );
+    }
+    Ok(topologies)
 }
 
 pub(crate) async fn load_change_records<R>(
@@ -471,37 +542,81 @@ where
     Ok(RepositoryRootV1::decode(selector.repository_root, &bytes)?)
 }
 
-async fn semantic_commit_record<R>(
-    read: &R,
-    change_catalog_root: ObjectId,
-    object_id: ObjectId,
+fn semantic_commit_record(
     commit: CommitObjectV1,
-) -> Result<crate::changelog::CommitRecord, crate::LixError>
+    topology: &CommitTopology,
+) -> Result<crate::changelog::CommitRecord, crate::LixError> {
+    let record = crate::changelog::decode_forktree_commit_payload(&commit.metadata)?;
+    if record.commit_id != topology.commit_id || record.generation != topology.generation {
+        return Err(corruption("Commit semantic payload disagrees with its envelope").into());
+    }
+    if record.parent_commit_ids != topology.parent_commit_ids {
+        return Err(corruption("Commit semantic parents disagree with topology edges").into());
+    }
+    Ok(record)
+}
+
+async fn validate_commit_topology<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    catalog_id: CommitId,
+    commit: &CommitObjectV1,
+) -> Result<CommitTopology, crate::LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    validate_retained_commit(read, change_catalog_root, object_id, &commit).await?;
-    let record = crate::changelog::decode_forktree_commit_payload(&commit.metadata)?;
-    let commit_id =
-        crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*commit.commit_id.as_bytes()));
-    if record.commit_id != commit_id || record.generation != commit.generation {
-        return Err(corruption("Commit semantic payload disagrees with its envelope").into());
+    if commit.commit_id != catalog_id {
+        return Err(corruption("CommitCatalog key does not match Commit object").into());
     }
-    if record.parent_commit_ids.len() != commit.parent_commit_object_ids.len() {
-        return Err(corruption("Commit semantic parent count disagrees with its edges").into());
-    }
-    for (expected, object_id) in record
-        .parent_commit_ids
+    let mut unique_parent_objects = BTreeSet::new();
+    if commit
+        .parent_commit_object_ids
         .iter()
-        .zip(&commit.parent_commit_object_ids)
+        .any(|id| !unique_parent_objects.insert(*id))
     {
-        let bytes = super::view::load_object_bytes(read, *object_id).await?;
-        let parent = CommitObjectV1::decode(*object_id, &bytes)?;
-        if parent.commit_id.as_bytes() != expected.as_uuid().as_bytes() {
-            return Err(corruption("Commit semantic parent ID disagrees with its edge").into());
-        }
+        return Err(corruption("Commit topology contains duplicate parent object edges").into());
     }
-    Ok(record)
+    let parent_objects =
+        super::view::load_object_map(read, commit.parent_commit_object_ids.iter().copied()).await?;
+    let mut parent_commit_ids = Vec::with_capacity(commit.parent_commit_object_ids.len());
+    let mut unique_parent_ids = BTreeSet::new();
+    for parent_object_id in &commit.parent_commit_object_ids {
+        let bytes = parent_objects.get(parent_object_id).ok_or_else(|| {
+            corruption(format!("Commit parent object {parent_object_id} is absent"))
+        })?;
+        let parent = CommitObjectV1::decode(*parent_object_id, bytes)?;
+        if parent.generation >= commit.generation {
+            return Err(corruption(
+                "Commit parent generation is not strictly earlier than its child",
+            )
+            .into());
+        }
+        if !unique_parent_ids.insert(parent.commit_id) {
+            return Err(corruption("Commit topology contains duplicate parent CommitIds").into());
+        }
+        let catalog_value = lookup_on_read(
+            commit_catalog_root,
+            "commit",
+            parent.commit_id.as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("Commit parent has no CommitCatalog back-edge"))?;
+        let catalog_entry = CommitCatalogEntry::decode(&catalog_value)?;
+        if catalog_entry.commit_object_id != *parent_object_id {
+            return Err(corruption("Commit parent CommitCatalog back-edge is invalid").into());
+        }
+        parent_commit_ids.push(crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+            *parent.commit_id.as_bytes(),
+        )));
+    }
+    Ok(CommitTopology {
+        commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+            *commit.commit_id.as_bytes(),
+        )),
+        parent_commit_ids,
+        generation: commit.generation,
+    })
 }
 
 async fn semantic_change_record<R>(
