@@ -95,6 +95,7 @@ enum Error {
     WrongKind,
     Substitution,
     RootPinned,
+    PersistedMismatch,
 }
 
 impl fmt::Display for Error {
@@ -120,6 +121,7 @@ impl RootGraph {
         let recovery = GraphObject::seal(ObjectKind::Payload, "recovery-alias", Vec::new(), 0);
         let undo = GraphObject::seal(ObjectKind::Payload, "undo-root", Vec::new(), 0);
         let plugin = GraphObject::seal(ObjectKind::Payload, "plugin-registry", Vec::new(), 0);
+        let unreachable = GraphObject::seal(ObjectKind::Payload, "unreachable-debt", Vec::new(), 0);
         let mut objects = BTreeMap::new();
         for object in [
             h0,
@@ -131,6 +133,7 @@ impl RootGraph {
             recovery.clone(),
             undo.clone(),
             plugin.clone(),
+            unreachable,
         ] {
             objects.insert(object.id.clone(), object);
         }
@@ -185,6 +188,19 @@ impl RootGraph {
                 &mut reachable,
             )?;
         }
+        Ok(reachable)
+    }
+
+    fn authenticate_selected_root(&self, root: RootClass) -> Result<BTreeSet<String>, Error> {
+        let id = self.selectors.get(&root).ok_or(Error::MissingRoot)?.clone();
+        let mut visiting = BTreeSet::new();
+        let mut reachable = BTreeSet::new();
+        self.walk(
+            &id,
+            Self::expected_kind(root),
+            &mut visiting,
+            &mut reachable,
+        )?;
         Ok(reachable)
     }
 
@@ -319,6 +335,7 @@ struct CoherentRead {
     fence: Fence,
     selectors: BTreeMap<RootClass, String>,
     selector_digest: String,
+    reachable: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,6 +348,7 @@ struct ReopenedState {
     object_count: usize,
     object_digest: String,
     selector_digest: String,
+    state_tag: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -344,6 +362,7 @@ struct Authority {
     calls: u32,
     reclaimed: usize,
     begin_reads: u64,
+    pinned_objects: BTreeMap<String, BTreeSet<u64>>,
 }
 
 impl Authority {
@@ -363,6 +382,7 @@ impl Authority {
             calls: 0,
             reclaimed: 0,
             begin_reads: 0,
+            pinned_objects: BTreeMap::new(),
         }
     }
 
@@ -415,6 +435,9 @@ impl Authority {
 
     fn commit_gc(&mut self, plan: GcPlan) -> Result<(), Error> {
         self.check_fence(plan.owner, plan.expected)?;
+        if self.pinned_objects.contains_key(&plan.object) {
+            return Err(Error::RootPinned);
+        }
         self.graph.remove_unselected(&plan.object)?;
         self.fence.epoch += 1;
         self.fence.progress += 1;
@@ -422,17 +445,39 @@ impl Authority {
         Ok(())
     }
 
-    fn begin_read(&mut self, owner: u64) -> Result<CoherentRead, Error> {
+    fn begin_read(&mut self, owner: u64, root: RootClass) -> Result<CoherentRead, Error> {
         if owner != self.fence.owner {
             return Err(Error::OwnerMismatch);
         }
+        let reachable = self.graph.authenticate_selected_root(root)?;
         self.begin_reads += 1;
         Ok(CoherentRead {
             id: self.begin_reads,
             fence: self.fence,
             selectors: self.graph.selectors.clone(),
             selector_digest: self.graph.selector_digest(),
+            reachable,
         })
+    }
+
+    fn pin_read(&mut self, view_id: u64, objects: &BTreeSet<String>) {
+        for object in objects {
+            self.pinned_objects
+                .entry(object.clone())
+                .or_default()
+                .insert(view_id);
+        }
+    }
+
+    fn unpin_read(&mut self, view_id: u64, objects: &BTreeSet<String>) {
+        for object in objects {
+            if let Some(owners) = self.pinned_objects.get_mut(object) {
+                owners.remove(&view_id);
+                if owners.is_empty() {
+                    self.pinned_objects.remove(object);
+                }
+            }
+        }
     }
 
     fn process_page(&mut self, max_entries: usize) -> Result<PageResult, Error> {
@@ -459,8 +504,13 @@ impl Authority {
             .map(|entry| entry.object.clone())
             .collect();
         for object in &object_ids {
-            if self.graph.is_selected(object) || !self.graph.objects.contains_key(object) {
+            if self.graph.is_selected(object)
+                || self.pinned_objects.contains_key(object)
+                || !self.graph.objects.contains_key(object)
+            {
                 return Err(if self.graph.is_selected(object) {
+                    Error::RootPinned
+                } else if self.pinned_objects.contains_key(object) {
                     Error::RootPinned
                 } else {
                     Error::MissingObject
@@ -491,8 +541,18 @@ impl Authority {
     }
 
     fn persist(&self) -> String {
+        let state_tag = Self::state_tag(
+            self.fence,
+            self.queue_head,
+            self.queue_tail,
+            self.calls,
+            self.reclaimed,
+            self.graph.objects.len(),
+            &self.graph.object_digest(),
+            &self.graph.selector_digest(),
+        );
         format!(
-            "owner={}|epoch={}|progress={}|selector={}|head={}|tail={}|calls={}|reclaimed={}|objects={}|object_digest={}|selector_digest={}",
+            "owner={}|epoch={}|progress={}|selector={}|head={}|tail={}|calls={}|reclaimed={}|objects={}|object_digest={}|selector_digest={}|state_tag={}",
             self.fence.owner,
             self.fence.epoch,
             self.fence.progress,
@@ -504,12 +564,39 @@ impl Authority {
             self.graph.objects.len(),
             self.graph.object_digest(),
             self.graph.selector_digest(),
+            state_tag,
         )
     }
 
-    fn reopen(encoded: &str) -> Result<ReopenedState, Error> {
+    fn state_tag(
+        fence: Fence,
+        queue_head: usize,
+        queue_tail: usize,
+        calls: u32,
+        reclaimed: usize,
+        object_count: usize,
+        object_digest: &str,
+        selector_digest: &str,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            fence.owner,
+            fence.epoch,
+            fence.progress,
+            fence.selector,
+            queue_head,
+            queue_tail,
+            calls,
+            reclaimed,
+            object_count,
+            object_digest,
+            selector_digest,
+        )
+    }
+
+    fn reopen(encoded: &str, graph: &RootGraph) -> Result<ReopenedState, Error> {
         let fields: Vec<&str> = encoded.split('|').collect();
-        if fields.len() != 11 {
+        if fields.len() != 12 {
             return Err(Error::Malformed);
         }
         let value = |index: usize, key: &str| -> Result<&str, Error> {
@@ -534,13 +621,38 @@ impl Authority {
             .map_err(|_| Error::Malformed)?;
         let object_digest = value(9, "object_digest=")?.to_owned();
         let selector_digest = value(10, "selector_digest=")?.to_owned();
+        let state_tag = value(11, "state_tag=")?.to_owned();
         if owner == 0
             || queue_head > queue_tail
             || object_count == 0
             || object_digest.is_empty()
             || selector_digest.is_empty()
+            || state_tag.is_empty()
         {
             return Err(Error::Malformed);
+        }
+        graph.validate()?;
+        if object_count != graph.objects.len()
+            || object_digest != graph.object_digest()
+            || selector_digest != graph.selector_digest()
+            || state_tag
+                != Self::state_tag(
+                    Fence {
+                        owner,
+                        epoch,
+                        progress,
+                        selector,
+                    },
+                    queue_head,
+                    queue_tail,
+                    calls,
+                    reclaimed,
+                    object_count,
+                    &object_digest,
+                    &selector_digest,
+                )
+        {
+            return Err(Error::PersistedMismatch);
         }
         Ok(ReopenedState {
             fence: Fence {
@@ -556,6 +668,7 @@ impl Authority {
             object_count,
             object_digest,
             selector_digest,
+            state_tag,
         })
     }
 }
@@ -586,7 +699,7 @@ enum Resume {
 struct ReaderModel {
     next_view: u64,
     views: BTreeMap<u64, View>,
-    pinned_roots: BTreeSet<String>,
+    pinned_roots: BTreeMap<String, BTreeSet<u64>>,
 }
 
 impl ReaderModel {
@@ -594,12 +707,12 @@ impl ReaderModel {
         Self {
             next_view: 0,
             views: BTreeMap::new(),
-            pinned_roots: BTreeSet::new(),
+            pinned_roots: BTreeMap::new(),
         }
     }
 
     fn begin_read(&mut self, authority: &mut Authority, root: RootClass) -> Result<View, Error> {
-        let read = authority.begin_read(OWNER)?;
+        let read = authority.begin_read(OWNER, root)?;
         let root_id = read
             .selectors
             .get(&root)
@@ -613,9 +726,22 @@ impl ReaderModel {
             valid: true,
             last_key: None,
         };
-        self.pinned_roots.insert(root_id);
+        self.pinned_roots
+            .entry(root_id)
+            .or_default()
+            .insert(view.id);
+        authority.pin_read(view.id, &view.read.reachable);
         self.views.insert(view.id, view.clone());
         Ok(view)
+    }
+
+    fn unpin(&mut self, root_id: &str, view_id: u64) {
+        if let Some(owners) = self.pinned_roots.get_mut(root_id) {
+            owners.remove(&view_id);
+            if owners.is_empty() {
+                self.pinned_roots.remove(root_id);
+            }
+        }
     }
 
     fn cursor(view: &View, after: Option<String>) -> Cursor {
@@ -633,12 +759,30 @@ impl ReaderModel {
         }
     }
 
-    fn fail_page(&mut self, view_id: u64, delivered: &str) -> Result<(), Error> {
+    fn fail_page(
+        &mut self,
+        authority: &mut Authority,
+        view_id: u64,
+        delivered: &str,
+    ) -> Result<(), Error> {
         let view = self.views.get_mut(&view_id).ok_or(Error::ReadExpired)?;
         view.valid = false;
         view.last_key = Some(delivered.to_owned());
-        self.pinned_roots.remove(&view.root_id);
+        let root_id = view.root_id.clone();
+        let reachable = view.read.reachable.clone();
+        self.unpin(&root_id, view_id);
+        authority.unpin_read(view_id, &reachable);
         Err(Error::Malformed)
+    }
+
+    fn close(&mut self, authority: &mut Authority, view_id: u64) -> Result<(), Error> {
+        let view = self.views.get_mut(&view_id).ok_or(Error::ReadExpired)?;
+        view.valid = false;
+        let root_id = view.root_id.clone();
+        let reachable = view.read.reachable.clone();
+        self.unpin(&root_id, view_id);
+        authority.unpin_read(view_id, &reachable);
+        Ok(())
     }
 
     fn resume(&self, cursor: &Cursor) -> Result<Resume, Error> {
@@ -708,7 +852,9 @@ fn w5_r7_object_selector_plane_and_h_s_c_chronology_are_authenticated() {
 #[test]
 fn w5_r7_coherent_read_and_owner_bound_cas_are_exact() {
     let mut authority = authority_with_queue(0, false);
-    let read = authority.begin_read(OWNER).expect("one coherent read");
+    let read = authority
+        .begin_read(OWNER, RootClass::Checkpoint)
+        .expect("one coherent read");
     assert_eq!(authority.begin_reads, 1);
     assert_eq!(read.fence, authority.fence);
     assert_eq!(read.selector_digest, authority.graph.selector_digest());
@@ -857,6 +1003,7 @@ fn w5_r7_all_root_classes_release_shared_and_final_references() {
     let shared = graph.selectors[&RootClass::Upload].clone();
     let final_reference = graph.selectors[&RootClass::FinalReference].clone();
     assert!(graph.validate().is_ok());
+    assert_eq!(graph.reclaim_unreachable().unwrap(), 1);
 
     graph.drop_selector(RootClass::BranchControl);
     assert!(graph.validate().unwrap().contains(&shared));
@@ -875,15 +1022,29 @@ fn w5_r7_all_root_classes_release_shared_and_final_references() {
 fn w5_r7_pinned_view_poison_and_authenticated_excluded_restart() {
     let mut authority = authority_with_queue(0, false);
     let mut readers = ReaderModel::new();
-    let view = readers
+    let first = readers
         .begin_read(&mut authority, RootClass::Checkpoint)
         .unwrap();
-    let start = ReaderModel::cursor(&view, None);
+    let second = readers
+        .begin_read(&mut authority, RootClass::Checkpoint)
+        .unwrap();
+    let start = ReaderModel::cursor(&first, None);
     assert_eq!(readers.resume(&start), Ok(Resume::Start));
-    assert!(readers.pinned_roots.contains(&view.root_id));
-    assert_eq!(readers.fail_page(view.id, "row-09"), Err(Error::Malformed));
-    assert!(!readers.pinned_roots.contains(&view.root_id));
+    assert_eq!(
+        readers.pinned_roots[&first.root_id],
+        BTreeSet::from([first.id, second.id])
+    );
+    assert_eq!(
+        readers.fail_page(&mut authority, first.id, "row-09"),
+        Err(Error::Malformed)
+    );
+    assert_eq!(
+        readers.pinned_roots[&second.root_id],
+        BTreeSet::from([second.id])
+    );
     assert_eq!(readers.resume(&start), Err(Error::ReadExpired));
+    let second_cursor = ReaderModel::cursor(&second, None);
+    assert_eq!(readers.resume(&second_cursor), Ok(Resume::Start));
 
     let fresh = readers
         .begin_read(&mut authority, RootClass::Checkpoint)
@@ -896,7 +1057,126 @@ fn w5_r7_pinned_view_poison_and_authenticated_excluded_restart() {
     let mut forged = continuation.clone();
     forged.root_id = "substituted-root".to_owned();
     assert_eq!(readers.resume(&forged), Err(Error::ReadExpired));
-    assert_eq!(authority.begin_reads, 2);
+    readers.close(&mut authority, second.id).unwrap();
+    assert_eq!(
+        readers.pinned_roots[&fresh.root_id],
+        BTreeSet::from([fresh.id])
+    );
+    readers.close(&mut authority, fresh.id).unwrap();
+    assert!(readers.pinned_roots.is_empty());
+    assert_eq!(authority.begin_reads, 3);
+}
+
+#[test]
+fn w5_r7_transitive_h_s_c_closure_stays_pinned_across_publication_and_gc() {
+    let mut authority = authority_with_queue(0, false);
+    let mut readers = ReaderModel::new();
+    let view = readers
+        .begin_read(&mut authority, RootClass::Checkpoint)
+        .unwrap();
+    let history_head = authority.graph.selectors[&RootClass::History].clone();
+    let history_parent = authority.graph.objects[&history_head].parents[0].clone();
+    let serving = authority.graph.selectors[&RootClass::Serving].clone();
+    let checkpoint = authority.graph.selectors[&RootClass::Checkpoint].clone();
+    assert!(view.read.reachable.contains(&history_head));
+    assert!(view.read.reachable.contains(&history_parent));
+    assert!(view.read.reachable.contains(&serving));
+    assert!(view.read.reachable.contains(&checkpoint));
+    for object in [&history_head, &history_parent, &serving, &checkpoint] {
+        assert_eq!(authority.pinned_objects[object], BTreeSet::from([view.id]));
+    }
+
+    let replacement = GraphObject::seal(
+        ObjectKind::Serving,
+        "serving-2",
+        vec![history_head.clone()],
+        2,
+    );
+    let publication = authority
+        .prepare_publication(OWNER, RootClass::Serving, replacement)
+        .unwrap();
+    assert_eq!(authority.commit_publication(publication), Ok(()));
+    let retire_old_serving = authority.prepare_gc(OWNER, serving.clone()).unwrap();
+    assert_eq!(
+        authority.commit_gc(retire_old_serving),
+        Err(Error::RootPinned)
+    );
+    assert!(authority.graph.objects.contains_key(&serving));
+
+    readers.close(&mut authority, view.id).unwrap();
+    let retire_old_serving = authority.prepare_gc(OWNER, serving.clone()).unwrap();
+    assert_eq!(authority.commit_gc(retire_old_serving), Ok(()));
+    assert!(!authority.graph.objects.contains_key(&serving));
+}
+
+#[test]
+fn w5_r7_h_s_c_reachability_is_transitive_and_selective() {
+    let mut graph = RootGraph::fixture();
+    let history_head = graph.selectors[&RootClass::History].clone();
+    let history_parent = graph.objects[&history_head].parents[0].clone();
+    let serving = graph.selectors[&RootClass::Serving].clone();
+    let checkpoint = graph.selectors[&RootClass::Checkpoint].clone();
+    let reachable = graph.validate().unwrap();
+    for object in [&history_head, &history_parent, &serving, &checkpoint] {
+        assert!(reachable.contains(object));
+    }
+    assert!(reachable.len() < graph.objects.len());
+    assert_eq!(graph.reclaim_unreachable().unwrap(), 1);
+
+    graph.drop_selector(RootClass::Checkpoint);
+    assert_eq!(graph.reclaim_unreachable().unwrap(), 1);
+    assert!(!graph.objects.contains_key(&checkpoint));
+    graph.drop_selector(RootClass::Serving);
+    assert_eq!(graph.reclaim_unreachable().unwrap(), 1);
+    assert!(!graph.objects.contains_key(&serving));
+    graph.drop_selector(RootClass::History);
+    assert_eq!(graph.reclaim_unreachable().unwrap(), 2);
+    assert!(!graph.objects.contains_key(&history_head));
+    assert!(!graph.objects.contains_key(&history_parent));
+}
+
+#[test]
+fn w5_r7_begin_read_authenticates_selected_root_before_pinning() {
+    let mut missing = authority_with_queue(0, false);
+    missing.graph.drop_selector(RootClass::Checkpoint);
+    let mut missing_readers = ReaderModel::new();
+    assert_eq!(
+        missing_readers.begin_read(&mut missing, RootClass::Checkpoint),
+        Err(Error::MissingRoot)
+    );
+    assert!(missing_readers.pinned_roots.is_empty());
+    assert_eq!(missing.begin_reads, 0);
+
+    let mut wrong_kind = authority_with_queue(0, false);
+    let checkpoint_id = wrong_kind.graph.selectors[&RootClass::Checkpoint].clone();
+    wrong_kind
+        .graph
+        .objects
+        .get_mut(&checkpoint_id)
+        .unwrap()
+        .kind = ObjectKind::Payload;
+    let mut wrong_kind_readers = ReaderModel::new();
+    assert_eq!(
+        wrong_kind_readers.begin_read(&mut wrong_kind, RootClass::Checkpoint),
+        Err(Error::WrongKind)
+    );
+    assert!(wrong_kind_readers.pinned_roots.is_empty());
+    assert_eq!(wrong_kind.begin_reads, 0);
+
+    let mut substituted = authority_with_queue(0, false);
+    let checkpoint_id = substituted.graph.selectors[&RootClass::Checkpoint].clone();
+    let history_id = substituted.graph.selectors[&RootClass::History].clone();
+    substituted.graph.objects.insert(
+        checkpoint_id.clone(),
+        GraphObject::seal(ObjectKind::Checkpoint, "replacement", vec![history_id], 3),
+    );
+    let mut substituted_readers = ReaderModel::new();
+    assert_eq!(
+        substituted_readers.begin_read(&mut substituted, RootClass::Checkpoint),
+        Err(Error::Substitution)
+    );
+    assert!(substituted_readers.pinned_roots.is_empty());
+    assert_eq!(substituted.begin_reads, 0);
 }
 
 #[test]
@@ -949,7 +1229,7 @@ fn w5_r7_cold_reopen_preserves_authenticated_authority_and_queue() {
     let mut authority = authority_with_queue(2, false);
     authority.process_page(1).unwrap();
     let encoded = authority.persist();
-    let recovered = Authority::reopen(&encoded).unwrap();
+    let recovered = Authority::reopen(&encoded, &authority.graph).unwrap();
     assert_eq!(recovered.fence, authority.fence);
     assert_eq!(recovered.queue_head, authority.queue_head);
     assert_eq!(recovered.queue_tail, authority.queue_tail);
@@ -958,6 +1238,49 @@ fn w5_r7_cold_reopen_preserves_authenticated_authority_and_queue() {
     assert_eq!(recovered.object_count, authority.graph.objects.len());
     assert_eq!(recovered.object_digest, authority.graph.object_digest());
     assert_eq!(recovered.selector_digest, authority.graph.selector_digest());
-    assert!(Authority::reopen(&encoded.replace("progress=1", "progress=oops")).is_err());
-    assert!(Authority::reopen("owner=7|epoch=1").is_err());
+    assert_eq!(
+        recovered.state_tag,
+        Authority::state_tag(
+            authority.fence,
+            authority.queue_head,
+            authority.queue_tail,
+            authority.calls,
+            authority.reclaimed,
+            authority.graph.objects.len(),
+            &authority.graph.object_digest(),
+            &authority.graph.selector_digest(),
+        )
+    );
+    assert_eq!(
+        Authority::reopen(
+            &encoded.replace("object_digest=", "object_digest=forged-"),
+            &authority.graph,
+        ),
+        Err(Error::PersistedMismatch)
+    );
+    assert_eq!(
+        Authority::reopen(
+            &encoded.replace("selector_digest=", "selector_digest=forged-"),
+            &authority.graph,
+        ),
+        Err(Error::PersistedMismatch)
+    );
+    assert_eq!(
+        Authority::reopen(
+            &encoded.replace("state_tag=", "state_tag=forged-"),
+            &authority.graph,
+        ),
+        Err(Error::PersistedMismatch)
+    );
+    assert_eq!(
+        Authority::reopen(
+            &encoded.replace("progress=1", "progress=oops"),
+            &authority.graph
+        ),
+        Err(Error::Malformed)
+    );
+    assert_eq!(
+        Authority::reopen("owner=7|epoch=1", &authority.graph),
+        Err(Error::Malformed)
+    );
 }
