@@ -560,7 +560,7 @@ where
             },
         },
     ));
-    change_entries.sort_unstable_by_key(|(change_id, _)| *change_id);
+    let change_entries = order_unique_change_catalog_entries(change_entries)?;
     let change_catalog_edit = view
         .put_change_catalog_entries(view.repository_root().change_catalog_root, &change_entries)
         .await?;
@@ -1076,7 +1076,7 @@ where
             },
         },
     ));
-    fresh_owner_rows.sort_unstable_by_key(|(change_id, _)| *change_id);
+    let fresh_owner_rows = order_unique_change_catalog_entries(fresh_owner_rows)?;
     let change_catalog_edit = view
         .put_change_catalog_entries(
             view.repository_root().change_catalog_root,
@@ -1396,6 +1396,25 @@ fn sort_state_mutations(mutations: &mut Vec<StateTreeMutation>) -> Result<(), Li
     Ok(())
 }
 
+/// Build the authenticated catalog input from semantic identities before it
+/// reaches catalog encoding. The catalog key is the ChangeId, so duplicate
+/// identities are an invalid publication even when their payloads compare
+/// equal. Member/result order is owned by the commit object vectors and is
+/// intentionally left untouched here.
+fn order_unique_change_catalog_entries(
+    entries: Vec<(ForkTreeChangeId, ChangeCatalogEntry)>,
+) -> Result<Vec<(ForkTreeChangeId, ChangeCatalogEntry)>, LixError> {
+    let mut ordered = BTreeMap::new();
+    for (change_id, entry) in entries {
+        if ordered.insert(change_id, entry).is_some() {
+            return Err(writer_error(
+                "transaction publication contains duplicate ChangeId identities",
+            ));
+        }
+    }
+    Ok(ordered.into_iter().collect())
+}
+
 fn next_ordered_commit_generation(
     parent_generation: Option<u64>,
     selected_source_generation: Option<u64>,
@@ -1532,5 +1551,40 @@ mod intent_tests {
         let error = sort_state_mutations(&mut mutations)
             .expect_err("duplicate authenticated state keys must fail closed");
         assert!(error.message.contains("duplicate encoded keys"));
+    }
+
+    #[test]
+    fn catalog_entries_are_ordered_by_unique_change_identity() {
+        let entry = ChangeCatalogEntry {
+            change_object_id: ObjectId::from_bytes([1; 32]),
+            owner: ChangeCatalogOwner::CommitMember {
+                commit_object_id: ObjectId::from_bytes([2; 32]),
+                ordinal: 0,
+            },
+        };
+        let first = ForkTreeChangeId::from_bytes([1; 16]);
+        let second = ForkTreeChangeId::from_bytes([2; 16]);
+        let ordered = order_unique_change_catalog_entries(vec![(second, entry), (first, entry)])
+            .expect("unique catalog identities");
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn catalog_entries_reject_duplicate_change_identity_before_encoding() {
+        let entry = ChangeCatalogEntry {
+            change_object_id: ObjectId::from_bytes([1; 32]),
+            owner: ChangeCatalogOwner::CommitMember {
+                commit_object_id: ObjectId::from_bytes([2; 32]),
+                ordinal: 0,
+            },
+        };
+        let change_id = ForkTreeChangeId::from_bytes([3; 16]);
+        let error =
+            order_unique_change_catalog_entries(vec![(change_id, entry), (change_id, entry)])
+                .expect_err("duplicate catalog identity");
+        assert!(error.message.contains("duplicate ChangeId identities"));
     }
 }
