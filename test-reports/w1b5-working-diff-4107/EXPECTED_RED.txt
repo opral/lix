@@ -1,0 +1,24 @@
+# Exact 4107 calibration
+
+Target: 4107bef177c00694574b4fc65d6bb209239ee877
+Tree: 9f3ff98a6745daae54102a7754036ef1ced111dd
+
+The source gate is expected to fail on this approved pre-cut source. RED
+predicates are reported by stable label and are not approval evidence. The
+candidate gate must remain parametric for a future commit/ref and must accept
+only the positive structural fixture while rejecting all negative fixtures.
+
+Independent exact-4107 replay produced 12 RED findings:
+
+1. SQL working-diff output has no authenticated ascending ordering.
+2. SQL working-diff still selects heads through BranchRefReader/selected_heads.
+3. Filesystem working-diff output has no authenticated ascending ordering.
+4. Filesystem working-diff still selects heads through BranchRefReader/selected_heads.
+5. Checkpoint provider output has no authenticated ascending ordering.
+6. Checkpoint provider still selects heads through BranchRefReader/selected_heads.
+7. Filesystem working-diff has no BlobRef/BlobId identity seam.
+8. Filesystem working-diff has no authenticated blob-payload seam.
+9. gc.rs retains current-layout TrackedHead/BranchHeadControl ownership.
+10. init.rs retains current-layout TrackedHead/BranchHeadControl ownership.
+11. live_state/context.rs retains current-layout TrackedHead/BranchHeadControl ownership.
+12. transaction/context.rs retains the TrackedStateStoreReader factory/callback.
