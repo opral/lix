@@ -192,12 +192,11 @@ where
         .iter()
         .map(|commit| commit.commit_id)
         .collect::<Vec<_>>();
-    for record in graph_reader
-        .load_commit_records(&commit_ids)
-        .await?
-        .into_iter()
-        .flatten()
-    {
+    let records = require_commit_records(
+        &commit_ids,
+        graph_reader.load_commit_records(&commit_ids).await?,
+    )?;
+    for record in records {
         changes.push(LixChangeRow::DerivedCommit(
             crate::commit_graph::canonical_commit_change(&record),
         ));
@@ -207,6 +206,47 @@ where
         changes.truncate(limit);
     }
     Ok(changes)
+}
+
+fn require_commit_records(
+    expected_commit_ids: &[CommitId],
+    records: Vec<Option<crate::changelog::CommitRecord>>,
+) -> Result<Vec<crate::changelog::CommitRecord>, LixError> {
+    if records.len() != expected_commit_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "CommitCatalog enumeration returned {} records for {} requested commits",
+                records.len(),
+                expected_commit_ids.len()
+            ),
+        ));
+    }
+    expected_commit_ids
+        .iter()
+        .copied()
+        .zip(records)
+        .map(|(expected_commit_id, record)| {
+            let record = record.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "CommitCatalog enumeration omitted authenticated commit '{expected_commit_id}'"
+                    ),
+                )
+            })?;
+            if record.commit_id != expected_commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "CommitCatalog enumeration returned commit '{}' for requested '{}'",
+                        record.commit_id, expected_commit_id
+                    ),
+                ));
+            }
+            Ok(record)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -400,7 +440,10 @@ mod tests {
     use datafusion::arrow::datatypes::Schema;
     use datafusion::logical_expr::{Expr, col, lit};
 
-    use super::{ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema};
+    use super::{
+        ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema,
+        require_commit_records,
+    };
 
     #[test]
     fn identity_projection_skips_json_payloads() {
@@ -444,5 +487,40 @@ mod tests {
             change_scan_route(&[col("schema_key").eq(lit("example"))]),
             ChangeScanRoute::All
         ));
+    }
+
+    #[test]
+    fn commit_catalog_missing_or_reordered_records_fail_closed() {
+        let first_id = crate::changelog::CommitId::for_test_label("catalog-first");
+        let second_id = crate::changelog::CommitId::for_test_label("catalog-second");
+        let record = |commit_id| crate::changelog::CommitRecord {
+            format_version: 2,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            change_id: crate::changelog::ChangeId::for_test_label("catalog-change"),
+            account_id: "test".to_owned(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "catalog test timestamp",
+                "2026-05-12T00:00:00Z",
+            ),
+        };
+        let expected = [first_id, second_id];
+
+        assert!(require_commit_records(&expected, vec![Some(record(first_id)), None]).is_err());
+        assert!(
+            require_commit_records(
+                &expected,
+                vec![Some(record(first_id)), Some(record(first_id))],
+            )
+            .is_err()
+        );
+        assert!(
+            require_commit_records(
+                &expected,
+                vec![Some(record(second_id)), Some(record(first_id))],
+            )
+            .is_err()
+        );
     }
 }
