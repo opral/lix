@@ -187,6 +187,10 @@ where
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
 
+    for checkpoint in &prepared_writes.checkpoint_publications {
+        crate::gc::stage_checkpoint_publication(&mut publication, checkpoint)?;
+    }
+
     let runtime_entity_pk = runtime_checkpoint
         .map(|_| crate::entity_pk::EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY));
 
@@ -1065,7 +1069,11 @@ fn classify_publication_intent(
     prepared: &PreparedWriteSet,
     runtime_checkpoint: Option<RuntimeSequenceCheckpoint>,
 ) -> Result<PublicationIntent, LixError> {
-    reject_not_yet_lowered_cohorts(prepared)?;
+    if !prepared.file_content_writes.is_empty() {
+        return Err(writer_error(
+            "file payload publication requires the ForkTree receipt/manifest lowering slice",
+        ));
+    }
 
     // Commit intent is independent of current-state row count. Inspect every
     // semantic owner before opening a view or constructing a publication, so
@@ -1177,20 +1185,6 @@ fn classify_publication_intent(
         branch_id: canonical_branch_id(&branch_id)?,
         semantic_commit: has_commit_intent,
     })
-}
-
-fn reject_not_yet_lowered_cohorts(prepared: &PreparedWriteSet) -> Result<(), LixError> {
-    if !prepared.file_content_writes.is_empty() {
-        return Err(writer_error(
-            "file payload publication requires the ForkTree receipt/manifest lowering slice",
-        ));
-    }
-    if !prepared.checkpoint_publications.is_empty() {
-        return Err(writer_error(
-            "checkpoint publication requires the ForkTree snapshot-root lowering slice",
-        ));
-    }
-    Ok(())
 }
 
 fn sole_publication_branch(
