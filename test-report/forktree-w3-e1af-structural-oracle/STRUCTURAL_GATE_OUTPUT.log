@@ -1,7 +1,16 @@
-SELF_TEST
+SELF_TEST_V2
 PASS negative_second_read
 PASS negative_second_publication
 PASS negative_second_commit
+PASS negative_copied_read
+PASS negative_swapped_view
+PASS negative_fresh_facade
+PASS negative_wrong_selector
+PASS negative_wrong_owner
+PASS negative_wrong_epoch
+PASS negative_partial_plan
+PASS negative_raw_writer
+PASS negative_fallback_cache
 PASS positive_one_operation
 cluster_W3-01	LOWERED
 cluster_W3-02	LOWERED
@@ -24,6 +33,15 @@ E1AF_BASE_AS_CANDIDATE_CONTROL
 PASS negative_second_read
 PASS negative_second_publication
 PASS negative_second_commit
+PASS negative_copied_read
+PASS negative_swapped_view
+PASS negative_fresh_facade
+PASS negative_wrong_selector
+PASS negative_wrong_owner
+PASS negative_wrong_epoch
+PASS negative_partial_plan
+PASS negative_raw_writer
+PASS negative_fallback_cache
 PASS positive_one_operation
 baseline_legacy_control_generation	58
 baseline_checkpoint_history	1139

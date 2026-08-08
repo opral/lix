@@ -1,9 +1,10 @@
 # W3 e1af structural and GC contract oracle
 
-Status: **TEST/REPORT-ONLY CORRECTION SUCCESSOR**. This package directly embeds
-the complete W3 map and diagnostics and adds a candidate-parametric source
-scope/ownership gate plus the pure GC model gate. It makes no production
-change and has no compiler, adapter, or production-runtime result.
+Status: **TEST/REPORT-ONLY V2 CORRECTION**. This direct successor keeps the
+complete W3 map, diagnostics, and exact e1af RED control, while replacing the
+operation proof with argument-aware structural checks and a stateful lifecycle
+model. It makes no production change and has no compiler, adapter, or
+production-runtime result.
 
 ## Immutable anchor
 
@@ -46,10 +47,11 @@ new appearance.
 The operation source gate checks an actual Rust function graph containing:
 
 ```text
-one caller-owned `read` argument -> one open_coherent_view_on_read(read)
-  -> one CoherentView / one PreparedPublication
-one PreparedForkTreePlan::into_storage_plan lowering with no I/O
-one transaction commit_write_set -> one prepare_write_set -> one commit
+one caller-owned `read` argument -> one open_coherent_view_on_read(read, selector)
+  -> one typed CoherentView / one PreparedPublication
+one selector/owner/epoch CAS binding, then one complete
+  publication.into_storage_plan(metadata, idempotency)
+one transaction commit_write_set -> one prepare_write_set(plan) -> one commit
 ```
 
 The selected publication function must pass its owned read to the coherent
@@ -62,8 +64,13 @@ first plan/I/O token. Otherwise the gate is RED. GREEN is emitted only after
 all identity, path, baseline, authority-delta, graph, cluster, fixture, map,
 and diagnostics checks pass.
 
-The positive and three negative operation fixtures are consumed by the same
-executable gate functions. Run the parser/fixture GREEN proof independently:
+The positive and twelve negative operation fixtures are consumed by the same
+executable gate functions. They discriminate copied/swapped/fresh reads and
+views, selector/owner/epoch substitution, incomplete metadata/idempotency
+plans, duplicate reads/publications/commits, raw stores, and cache/fallback/
+compatibility readers. Call arguments are matched against the owned names;
+token counts alone cannot make a negative fixture pass. Run the parser/fixture
+GREEN proof independently:
 
 ```sh
 PYTHONWARNINGS=error python3 -W error \
@@ -72,9 +79,10 @@ PYTHONWARNINGS=error python3 -W error \
 ```
 
 The self-test runs all 14 cluster checks as `LOWERED`. The current e1af source
-is expected to be RED because its 14 clusters retain legacy authorities; that
-RED is now candidate-parametric and distinct from the accepted synthetic GREEN
-self-test.
+remains the exact 14-cluster RED control because its clusters retain legacy
+authorities; non-control candidates additionally have to satisfy the
+structural operation graph. The accepted synthetic GREEN self-test is distinct
+from that e1af control.
 
 ## Pure 65-entry GC model
 
@@ -85,7 +93,16 @@ self-test.
   not reclaim the suffix prematurely;
 - releasing the safe-point debt advances once, drains, and clears the debt;
 - a further call is an idempotent drained no-op; and
-- the one epoch/progress fence changes only on an advancing GC publication.
+- the one epoch/progress fence changes only on an advancing GC publication;
+- first-parent generation/order and checkpoint floors, with missing, duplicate,
+  cyclic, non-increasing, and absent roots failing closed;
+- one atomic publication across branch-first/GC-first races, no-op,
+  savepoint/rollback, same-owner stale, and unrelated-owner current epochs;
+- authenticated transitive checkpoint/recovery/upload/final roots, shared
+  object retention, owner+view pins, wrong-owner release, and final-reference
+  reclamation; and
+- poisoned cancellation/malformed cursors, explicit exclusive-key restart,
+  authenticated reopen, and zero partial state changes on rejection.
 
 The model is not a production runtime and was run only as a standalone pure
 model gate.
@@ -118,7 +135,11 @@ PYTHONWARNINGS=error python3 -W error \
 cargo fmt --all -- --check
 git diff --check <exact-base>..<exact-head>
 
-# pure/Memory contract target
+# pure model contract target
+timeout 1200 python3 -W error \
+  test-report/forktree-w3-e1af-structural-oracle/w3_65_gc_model.py
+
+# Memory contract target
 CARGO_TARGET_DIR=<memory-target> CARGO_BUILD_JOBS=2 timeout 1200 \
   cargo test -p lix_benchmarks --test forktree_stage2_gc_publication_acceptance \
   --features storage-benches,rocksdb,slatedb -- \
@@ -138,3 +159,13 @@ FORKTREE_W5_R7_BACKEND=slatedb CARGO_TARGET_DIR=<slate-target> \
   --features storage-benches,rocksdb,slatedb -- \
   --nocapture --test-threads=1
 ```
+
+## V2 correction scope
+
+Only files under this report package are changed by this successor. The
+production source remains the exact e1af anchor and the e1af source gate stays
+RED with the frozen 14-cluster output. The v2 package gate is intentionally
+candidate-parametric: it accepts only a descended candidate whose permitted
+source paths pass the typed operation graph and whose retained legacy clusters
+either disappear or return a typed failure before any plan/I/O. No production
+compile or adapter runtime is implied by a green package/model self-test.

@@ -1,8 +1,18 @@
-fn operation() {
-    let view = begin_read();
-    let publication = PreparedPublication::new(view);
-    let other = PreparedPublication::new(view);
-    let plan = publication.into_storage_plan();
+fn operation<R>(
+    read: &R,
+    selector: SelectorExpect,
+    owner: OwnerId,
+    epoch: u64,
+    metadata: Metadata,
+    idempotency: Idempotency,
+) {
+    let view: CoherentView<R> = open_coherent_view_on_read(read, selector).await;
+    let publication: PreparedPublication =
+        PreparedPublication::from_view(&view, selector, owner, epoch);
+    let other: PreparedPublication =
+        PreparedPublication::from_view(&view, selector, owner, epoch);
+    publication.bind_selector_epoch_owner_cas(selector, owner, epoch);
+    let plan = publication.into_storage_plan(metadata, idempotency);
     let prepared = prepare_write_set(plan);
-    prepared_commit.commit();
+    prepared.commit();
 }

@@ -4,6 +4,11 @@
 This is a TEST/REPORT-only verifier.  It never compiles or runs Lix.  The
 frozen e1af counts are a baseline: a candidate may lower them or fail closed,
 but may not introduce a new legacy authority or increase any count.
+
+The operation checks intentionally parse function bodies and call arguments,
+not token presence alone.  The accepted fixture is a small typed-shape model
+of the required production seam; the negative fixtures mutate one ownership,
+authority, CAS, plan, or call-count invariant at a time.
 """
 
 from __future__ import annotations
@@ -76,6 +81,12 @@ PLAN_TOKENS = (
 )
 FAIL_CLOSED_RE = re.compile(
     r"return\s+(?:Err\b|Err\s*\()|\b(?:Unsupported|Corrupt|Missing|Invalid)(?:Error)?\b"
+)
+CALL_RE = re.compile(r"(?P<name>[A-Za-z_][\w:]*)(?:\s*::\s*[A-Za-z_]\w*)?\s*\((?P<args>.*?)\)", re.S)
+RAW_OR_SECOND_AUTHORITY_RE = re.compile(
+    r"\b(?:RawStore|StorageWrite|LegacyReader|FallbackReader|CompatibilityReader|"
+    r"AlternateReader|SecondaryReader|ReadCache|ViewCache|legacy_reader|"
+    r"fallback_reader|compatibility_reader|alternate_reader|secondary_reader)\b"
 )
 
 
@@ -242,6 +253,39 @@ def verify_embedded_artifacts(package: Path) -> tuple[dict[str, list[str]], list
     return clusters, paths
 
 
+def verify_sums(package: Path) -> list[str]:
+    sums_path = package / "SHA256SUMS"
+    errors: list[str] = []
+    listed: set[str] = set()
+    for row in sums_path.read_text(encoding="utf-8").splitlines():
+        if not row.strip():
+            continue
+        fields = row.split("  ", 1)
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+            errors.append(f"malformed SHA256SUMS row: {row}")
+            continue
+        relative_path = fields[1]
+        listed.add(relative_path)
+        file_path = package / relative_path
+        if not file_path.is_file():
+            errors.append(f"SHA256SUMS names missing file: {relative_path}")
+            continue
+        actual = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        if actual != fields[0]:
+            errors.append(f"SHA256SUMS mismatch {relative_path}: {actual}")
+    expected = {
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*")
+        if path.is_file() and path.name != "SHA256SUMS" and ".git" not in path.parts
+    }
+    if listed != expected:
+        errors.append(
+            f"SHA256SUMS coverage mismatch: missing={sorted(expected - listed)}, "
+            f"extra={sorted(listed - expected)}"
+        )
+    return errors
+
+
 def changed_paths(root: Path, base_commit: str, candidate_commit: str) -> list[str]:
     result = run_git(
         root,
@@ -327,20 +371,98 @@ def call_count(text: str, pattern: str) -> int:
     return len(re.findall(pattern, text))
 
 
-def operation_fixture_errors(text: str, label: str) -> list[str]:
-    expected = {
-        "begin_read": (r"\bbegin_read\s*\(", 1),
-        "publication": (r"\bPreparedPublication::new\s*\(", 1),
-        "plan": (r"\.into_storage_plan\s*\(", 1),
-        "prepare": (r"\bprepare_write_set\s*\(", 1),
-        "commit": (r"\bprepared_commit\.commit\s*\(", 1),
-    }
-    errors = []
-    for name, (pattern, wanted) in expected.items():
-        actual = call_count(text, pattern)
-        if actual != wanted:
-            errors.append(f"{label}: {name} count {actual}, expected {wanted}")
+def call_arguments(text: str, qualified_name: str) -> list[str]:
+    """Return shallow call argument strings for one qualified call name.
+
+    The fixtures deliberately keep call arguments flat.  Matching the actual
+    argument text is what prevents a copied/swapped read or selector from
+    passing a count-only check.
+    """
+    escaped = re.escape(qualified_name).replace(r"\:", r"\s*:\s*")
+    pattern = re.compile(rf"{escaped}\s*\(([^()]*)\)", re.S)
+    return [match.group(1).strip() for match in pattern.finditer(text)]
+
+
+def exact_call_errors(text: str, label: str) -> list[str]:
+    errors: list[str] = []
+
+    reads = call_arguments(text, "open_coherent_view_on_read")
+    if len(reads) != 1:
+        errors.append(f"{label}: expected one open_coherent_view_on_read, got {len(reads)}")
+    elif not re.match(r"^&?\s*read\s*,\s*selector\s*$", reads[0].replace("\n", " ")):
+        errors.append(f"{label}: coherent view is not opened from exact caller read+selector")
+
+    publications = call_arguments(text, "PreparedPublication::from_view")
+    if len(publications) != 1:
+        errors.append(f"{label}: expected one PreparedPublication::from_view, got {len(publications)}")
+    elif publications[0].replace("\n", " ") != "&view, selector, owner, epoch":
+        errors.append(f"{label}: publication does not bind exact view/selector/owner/epoch")
+
+    cas = call_arguments(text, "publication.bind_selector_epoch_owner_cas")
+    if len(cas) != 1:
+        errors.append(f"{label}: expected one selector/epoch/owner CAS binding, got {len(cas)}")
+    elif cas[0].replace("\n", " ") != "selector, owner, epoch":
+        errors.append(f"{label}: CAS does not bind exact selector/owner/epoch")
+
+    plans = call_arguments(text, "publication.into_storage_plan")
+    if len(plans) != 1:
+        errors.append(f"{label}: expected one complete publication lowering, got {len(plans)}")
+    elif plans[0].replace("\n", " ") != "metadata, idempotency":
+        errors.append(f"{label}: plan is not complete metadata+idempotency lowering")
+
+    prepares = call_arguments(text, "prepare_write_set")
+    if len(prepares) != 1:
+        errors.append(f"{label}: expected one prepare_write_set, got {len(prepares)}")
+    elif prepares[0].strip() != "plan":
+        errors.append(f"{label}: prepare_write_set does not consume exact complete plan")
+
+    commits = re.findall(r"\bprepared\s*\.\s*commit\s*\(\s*\)", text)
+    if len(commits) != 1:
+        errors.append(f"{label}: expected one prepared.commit(), got {len(commits)}")
+
+    if re.search(r"\b(?:copied|cloned|other|fresh|swapped)_(?:read|view|selector|owner|epoch)\b", text):
+        errors.append(f"{label}: copied/swapped/fresh authority alias")
+    if re.search(r"\b(?:read|view|selector|owner|epoch)\s*\.\s*(?:clone|to_owned)\s*\(", text):
+        errors.append(f"{label}: caller-owned authority was cloned")
+    if RAW_OR_SECOND_AUTHORITY_RE.search(text):
+        errors.append(f"{label}: raw/second reader-writer/cache/fallback authority")
+    if re.search(r"\b(?:begin_write|raw_store\.|legacy_|fallback_|compatibility_|alternate_|secondary_)", text):
+        errors.append(f"{label}: forbidden alternate writer/reader/fallback seam")
     return errors
+
+
+def publication_call_errors(text: str, label: str) -> list[str]:
+    errors: list[str] = []
+    reads = call_arguments(text, "open_coherent_view_on_read")
+    if len(reads) != 1:
+        errors.append(f"{label}: expected one open_coherent_view_on_read, got {len(reads)}")
+    elif not re.match(r"^&?\s*read\s*,\s*selector\s*$", reads[0].replace("\n", " ")):
+        errors.append(f"{label}: coherent view is not opened from exact caller read+selector")
+    publications = call_arguments(text, "PreparedPublication::from_view")
+    if len(publications) != 1:
+        errors.append(f"{label}: expected one PreparedPublication::from_view, got {len(publications)}")
+    elif publications[0].replace("\n", " ") != "&view, selector, owner, epoch":
+        errors.append(f"{label}: publication does not bind exact view/selector/owner/epoch")
+    cas = call_arguments(text, "publication.bind_selector_epoch_owner_cas")
+    if len(cas) != 1:
+        errors.append(f"{label}: expected one selector/epoch/owner CAS binding, got {len(cas)}")
+    elif cas[0].replace("\n", " ") != "selector, owner, epoch":
+        errors.append(f"{label}: CAS does not bind exact selector/owner/epoch")
+    if "CoherentView" not in text:
+        errors.append(f"{label}: missing typed CoherentView binding")
+    if "PreparedPublication" not in text:
+        errors.append(f"{label}: missing typed PreparedPublication binding")
+    if re.search(r"\b(?:read|view|selector|owner|epoch)\s*\.\s*(?:clone|to_owned)\s*\(", text):
+        errors.append(f"{label}: caller-owned authority was cloned")
+    if re.search(r"\b(?:copied|cloned|other|fresh|swapped)_(?:read|view|selector|owner|epoch)\b", text):
+        errors.append(f"{label}: copied/swapped/fresh authority alias")
+    if RAW_OR_SECOND_AUTHORITY_RE.search(text):
+        errors.append(f"{label}: raw/second reader-writer/cache/fallback authority")
+    return errors
+
+
+def operation_fixture_errors(text: str, label: str) -> list[str]:
+    return exact_call_errors(text, label)
 
 
 def fixture_errors(package: Path) -> list[str]:
@@ -351,6 +473,15 @@ def fixture_errors(package: Path) -> list[str]:
         "second_read": fixture_dir / "second_read.rs",
         "second_publication": fixture_dir / "second_publication.rs",
         "second_commit": fixture_dir / "second_commit.rs",
+        "copied_read": fixture_dir / "copied_read.rs",
+        "swapped_view": fixture_dir / "swapped_view.rs",
+        "fresh_facade": fixture_dir / "fresh_facade.rs",
+        "wrong_selector": fixture_dir / "wrong_selector.rs",
+        "wrong_owner": fixture_dir / "wrong_owner.rs",
+        "wrong_epoch": fixture_dir / "wrong_epoch.rs",
+        "partial_plan": fixture_dir / "partial_plan.rs",
+        "raw_writer": fixture_dir / "raw_writer.rs",
+        "fallback_cache": fixture_dir / "fallback_cache.rs",
     }
     if not positive.is_file():
         errors.append("missing positive operation fixture")
@@ -373,15 +504,68 @@ def first_plan_position(text: str) -> int | None:
     return min(positions) if positions else None
 
 
+def rust_code_only(text: str) -> str:
+    """Erase comments and string/character literals before authority checks."""
+    output: list[str] = []
+    index = 0
+    block_comment = False
+    line_comment = False
+    quote: str | None = None
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+                output.append(char)
+            else:
+                output.append(" ")
+        elif block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                output.extend((" ", " "))
+                index += 1
+            else:
+                output.append("\n" if char == "\n" else " ")
+        elif quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            output.append("\n" if char == "\n" else " ")
+        elif char == "/" and next_char == "/":
+            line_comment = True
+            output.extend((" ", " "))
+            index += 1
+        elif char == "/" and next_char == "*":
+            block_comment = True
+            output.extend((" ", " "))
+            index += 1
+        elif char in ('"', "'"):
+            quote = char
+            output.append(" ")
+        else:
+            output.append(char)
+        index += 1
+    return "".join(output)
+
+
 def explicitly_fails_closed_before_plan(text: str) -> bool:
-    close = FAIL_CLOSED_RE.search(text)
+    code = rust_code_only(text)
+    close = FAIL_CLOSED_RE.search(code)
     if close is None:
         return False
-    plan = first_plan_position(text)
+    plan = first_plan_position(code)
     return plan is None or close.start() < plan
 
 
 def legacy_hits(text: str) -> list[str]:
+    # Keep the historical e1af cluster calibration byte-for-byte comparable.
+    # The acceptance decision is structural in operation_source_errors and
+    # explicitly-fails-closed bodies; this list is only the frozen RED report.
     return [label for label, pattern in LEGACY_AUTHORITIES.items() if re.search(pattern, text)]
 
 
@@ -403,22 +587,24 @@ def operation_source_errors(files: dict[str, str]) -> list[str]:
         body = function.body
         if not re.search(r"\bread\s*:\s*", function.header):
             errors.append("publication root does not receive a caller-owned read")
-        if call_count(body, r"\bopen_coherent_view_on_read\s*\(") != 1:
-            errors.append("publication root must open exactly one coherent view")
-        if not re.search(r"open_coherent_view_on_read\s*\(\s*read\b", body):
-            errors.append("publication root does not pass its owned read to the view")
-        if call_count(body, r"\bPreparedPublication::from_[A-Za-z_]+\s*\(") != 1:
-            errors.append("publication root must construct exactly one PreparedPublication")
-        if not re.search(r"PreparedPublication::from_[A-Za-z_]+\s*\(\s*&?view\b", body):
-            errors.append("publication is not derived from the caller-owned CoherentView")
+        errors.extend(publication_call_errors(body, "publication root"))
         for token in (".begin_read(", "StorageAdapterReadScope::new", "begin_write(", ".commit("):
             if token in body:
                 errors.append(f"publication root contains an independent {token} authority")
+        if "CoherentView" not in body:
+            errors.append("publication root does not bind a typed CoherentView")
+        if "PreparedPublication" not in body:
+            errors.append("publication root does not bind a typed PreparedPublication")
         if "PreparedForkTreePlan::Publication" not in body:
             errors.append("publication root does not return the prepared ForkTree plan")
 
     lowering = [function for function in functions if function.name == "into_storage_plan"]
-    if not any("publication.into_storage_plan" in function.body for function in lowering):
+    if not any(
+        len(call_arguments(function.body, "publication.into_storage_plan")) == 1
+        and call_arguments(function.body, "publication.into_storage_plan")[0].replace("\n", " ")
+        == "metadata, idempotency"
+        for function in lowering
+    ):
         errors.append("no PreparedPublication::into_storage_plan lowering seam")
     for function in lowering:
         if any(token in function.body for token in (".begin_read(", "begin_write(", ".commit(")):
@@ -433,10 +619,14 @@ def operation_source_errors(files: dict[str, str]) -> list[str]:
             errors.append("transaction commit does not prepare exactly once")
         if call_count(body, r"\bprepared\s*\.commit\s*\(") != 1:
             errors.append("transaction commit does not commit exactly once")
-        if "begin_read(" in body:
+        if "begin_read(" in body or "open_coherent_view_on_read" in body:
             errors.append("transaction prepare/commit body acquires an independent read")
         if "PreparedPublication::" in body:
             errors.append("transaction prepare/commit body constructs a second publication")
+        if "metadata" not in body or "idempotency" not in body:
+            errors.append("transaction prepare/commit body omits metadata/idempotency plan inputs")
+        if RAW_OR_SECOND_AUTHORITY_RE.search(body):
+            errors.append("transaction prepare/commit body contains raw/second authority")
     return errors
 
 
@@ -511,25 +701,38 @@ def candidate_semantic_errors(
         if candidate_count > baseline:
             errors.append(f"candidate {label} exceeds frozen e1af baseline: {candidate_count}>{baseline}")
         print(f"candidate_{label}\tbase={base_count}\tcandidate={candidate_count}")
-    errors.extend(operation_source_errors(candidate_files))
+    # The exact e1af source is the frozen 14-cluster RED control.  Its old
+    # operation shape is intentionally not reclassified into extra findings;
+    # every non-control candidate must pass the structural operation graph.
+    if candidate_commit != BASELINE_COMMIT:
+        errors.extend(operation_source_errors(candidate_files))
     errors.extend(cluster_errors(candidate_files, clusters))
     return errors, candidate_files
 
 
 def self_test(clusters: dict[str, list[str]]) -> list[str]:
     accepted_commit_source = """
-    async fn prepare_forktree_publication_with_parent_heads<R>(read: R) {
-        let view = open_coherent_view_on_read(read, branch).await;
-        let publication = PreparedPublication::from_branch_view(&view);
+    async fn prepare_forktree_publication_with_parent_heads<R>(
+        read: &R, selector: SelectorExpect, owner: OwnerId, epoch: u64
+    ) {
+        let view: CoherentView<R> = open_coherent_view_on_read(read, selector).await;
+        let publication: PreparedPublication =
+            PreparedPublication::from_view(&view, selector, owner, epoch);
+        publication.bind_selector_epoch_owner_cas(selector, owner, epoch);
         PreparedForkTreePlan::Publication(publication)
     }
     impl PreparedForkTreePlan {
-        fn into_storage_plan(self) { publication.into_storage_plan(); }
+        fn into_storage_plan(self, metadata: Metadata, idempotency: Idempotency) {
+            publication.into_storage_plan(metadata, idempotency);
+        }
     }
     """
     accepted_storage_source = """
-    async fn commit_write_set(&self, write_set: StorageWriteSet) {
-        let prepared = self.prepare_write_set(write_set).await;
+    async fn commit_write_set(
+        &self, plan: PreparedForkTreePlan, metadata: Metadata, idempotency: Idempotency
+    ) {
+        let plan = plan.into_storage_plan(metadata, idempotency);
+        let prepared = self.prepare_write_set(plan).await;
         prepared.commit().await;
     }
     """
@@ -565,6 +768,7 @@ def main(argv: list[str]) -> int:
     errors: list[str] = []
     try:
         clusters, allowed_source_paths = verify_embedded_artifacts(package)
+        errors.extend(verify_sums(package))
         errors.extend(fixture_errors(package))
         errors.extend(self_test(clusters) if args.self_test else [])
         if not all((args.base_root, args.base_commit, args.candidate_root, args.candidate_commit)):
