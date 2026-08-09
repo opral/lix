@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Test/report-only source gate for the R4 composition closure.  The current
-# candidate intentionally leaves R4-owned blob/publication/session/splice
-# callers untouched; pass those paths explicitly after R4 composes them.  The
-# gate is deliberately scoped to the canonical manifest/tree/reachability
-# closure and to BlobManifestV1 fixture literals, so UploadPartV1's legitimate
-# ordered chunk list is not mistaken for a flat durable manifest authority.
+# Source gate for the composed Merkle reader/writer closure. The gate is
+# deliberately aware that UploadPartV1's ordered chunk list is a transient
+# receipt, not a durable BlobManifest authority.
 
 root=${1:?usage: $0 <lix-repository-root>}
 cd "$root"
@@ -66,5 +63,35 @@ for path in "$merkle" "$reachability"; do
     exit 1
   fi
 done
+
+# Final production composition: file blob readers/publication may retain
+# UploadPartV1's receipt-local ordered chunks, but no durable BlobManifest
+# traversal, flat identity builder, whole-base witness, or retired splice
+# authenticator may remain.
+production_closure=(
+  packages/lix/src/forktree/blob.rs
+  packages/lix/src/forktree/publication.rs
+  packages/lix/src/forktree/view.rs
+  packages/lix/src/transaction/commit.rs
+  packages/lix/src/transaction/context.rs
+  packages/lix/src/transaction/staging.rs
+  packages/lix/src/transaction/types.rs
+  packages/lix/src/session/execute.rs
+  packages/lix/src/binary_cas/types.rs
+  packages/lix/src/sql2/providers/file.rs
+  packages/lix/src/sql2/providers/file_history.rs
+)
+for path in "${production_closure[@]}"; do
+  test -f "$path" || { echo "missing production closure path: $path" >&2; exit 1; }
+done
+if grep -En 'manifest\.ordered_chunks|manifest\.content_digest|from_authenticated_chunks|authenticate_blob_for_splice|CanonicalBlobIdBuilder|base_sha256\(|result_sha256\(' "${production_closure[@]}"; then
+  echo "legacy flat blob authority remains in production composition" >&2
+  exit 1
+fi
+
+if grep -REn 'BlobId::from_content|BlobId::from_chunks|BlobId::from_single_chunk|fixed manifest v3' packages/lix/src; then
+  echo "retired flat/fixed BlobId constructor remains in the production workspace" >&2
+  exit 1
+fi
 
 echo "PASS: canonical Merkle manifest/root fixture and reachability closure"

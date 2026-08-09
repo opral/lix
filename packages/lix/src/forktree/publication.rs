@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
-use sha2::{Digest as _, Sha256};
 
 use crate::RequestBlobSpliceProvenance;
-use crate::binary_cas::{BlobId, BlobPayload, BlobSameLengthSplice};
+use crate::binary_cas::{BlobPayload, BlobSameLengthSplice};
 use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
@@ -12,11 +11,11 @@ use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 use super::blob::{AuthenticatedBlobRef, CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
-    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
-    ChangeCatalogEntry, ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1,
-    UploadSelectorV1, branch_selector_key, gc_progress_selector_key, global_selector_key,
-    snapshot_selector_key, upload_selector_key,
+    BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
+    ChangeCatalogOwner, ChangeObjectV1, CommitObjectV1, GlobalSelectorV1, RepositoryRootV1,
+    SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    branch_selector_key, gc_progress_selector_key, global_selector_key, snapshot_selector_key,
+    upload_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
@@ -79,38 +78,6 @@ pub(crate) struct PreparedPublication {
     object_deletes: BTreeSet<ObjectId>,
     untracked_puts: BTreeMap<Bytes, Bytes>,
     untracked_deletes: BTreeSet<Bytes>,
-}
-
-fn sha256_lower_hex(bytes: &[u8]) -> String {
-    lower_hex(&Sha256::digest(bytes))
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(HEX[usize::from(byte >> 4)]),
-                char::from(HEX[usize::from(byte & 0x0f)]),
-            ]
-        })
-        .collect()
-}
-
-/// A publication-local proof that a fixed-width successor was derived from
-/// one authenticated BlobRef owner and its immutable base manifest. The
-/// receipt never becomes durable: the successor manifest and its exact StateKey
-/// edge are committed by the surrounding transaction plan.
-#[derive(Debug)]
-struct AuthenticatedBlobSpliceReceipt {
-    state_key: StateKey,
-    base_manifest_object_id: ObjectId,
-    base_blob_id: BlobId,
-    changed_chunks: Vec<BlobChunkRefV1>,
-    successor_manifest_object_id: ObjectId,
-    successor_manifest: BlobManifestV1,
-    final_blob_id: BlobId,
 }
 
 impl PreparedPublication {
@@ -313,6 +280,10 @@ impl PreparedPublication {
             self.stage_blob_chunk(chunk)?;
         }
         if let Some(manifest) = &prepared.complete_manifest {
+            let merkle_objects = prepared.complete_merkle_objects.as_ref().ok_or_else(|| {
+                corruption("completed upload manifest has no Merkle object closure")
+            })?;
+            self.stage_immutable_objects(merkle_objects)?;
             self.stage_blob_manifest(manifest)?;
             if let Some(raw_selector) = prepared.raw_selector {
                 let selector = UploadSelectorV1::decode(&raw_selector)?;
@@ -405,6 +376,25 @@ impl PreparedPublication {
 
     fn stage_encoded_object(&mut self, id: ObjectId, bytes: Bytes) -> Result<(), StorageError> {
         self.object_puts.insert(id, bytes)
+    }
+
+    fn stage_immutable_objects(
+        &mut self,
+        objects: &ImmutableObjectSet,
+    ) -> Result<(), StorageError> {
+        for (id, bytes) in objects.iter() {
+            self.stage_encoded_object(id, bytes.clone())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn stage_blob_merkle_build_for_test(
+        &mut self,
+        build: &super::merkle::BlobMerkleTreeBuild,
+    ) -> Result<ObjectId, StorageError> {
+        self.stage_immutable_objects(&build.objects)?;
+        self.stage_blob_manifest(&build.manifest)
     }
 
     fn stage_object_set(&mut self, objects: ImmutableObjectSet) -> Result<(), StorageError> {
@@ -609,6 +599,16 @@ impl PreparedPublication {
         Ok(id)
     }
 
+    pub(crate) fn staged_blob_manifest(
+        &self,
+        id: ObjectId,
+    ) -> Result<Option<BlobManifestV1>, StorageError> {
+        self.object_puts
+            .get(id)
+            .map(|bytes| BlobManifestV1::decode(id, bytes))
+            .transpose()
+    }
+
     /// Lowers an inline file payload into the same authenticated object set as
     /// every other ForkTree blob publication. The returned manifest identity
     /// is later attached to the exact `lix_binary_blob_ref` state row; no
@@ -617,38 +617,21 @@ impl PreparedPublication {
         &mut self,
         bytes: &[u8],
     ) -> Result<ObjectId, StorageError> {
-        if bytes.is_empty() {
-            return Err(corruption(
-                "empty inline payload has no blob manifest; omit its BlobRef row",
-            ));
-        }
-        let mut semantic_id_builder = super::blob::CanonicalBlobIdBuilder::default();
-        let mut content_digest = blake3::Hasher::new();
-        let mut ordered_chunks = Vec::with_capacity(
+        let chunks = if bytes.is_empty() {
+            vec![BlobChunkV1 {
+                bytes: Bytes::new(),
+            }]
+        } else {
             bytes
-                .len()
-                .div_ceil(super::blob::CANONICAL_BLOB_CHUNK_BYTES),
-        );
-        for chunk_bytes in bytes.chunks(super::blob::CANONICAL_BLOB_CHUNK_BYTES) {
-            semantic_id_builder.update_fixed_chunk(chunk_bytes)?;
-            content_digest.update(chunk_bytes);
-            let chunk = BlobChunkV1 {
-                bytes: Bytes::copy_from_slice(chunk_bytes),
-            };
-            let (chunk_object_id, encoded) = chunk.encode()?;
-            self.stage_encoded_object(chunk_object_id, encoded)?;
-            ordered_chunks.push(BlobChunkRefV1 {
-                chunk_object_id,
-                declared_len: chunk_bytes.len() as u64,
-            });
-        }
-        let manifest = BlobManifestV1::from_authenticated_chunks(
-            bytes.len() as u64,
-            ordered_chunks,
-            semantic_id_builder.finish(),
-            *content_digest.finalize().as_bytes(),
-        );
-        self.stage_blob_manifest(&manifest)
+                .chunks(super::blob::CANONICAL_BLOB_CHUNK_BYTES)
+                .map(|chunk| BlobChunkV1 {
+                    bytes: Bytes::copy_from_slice(chunk),
+                })
+                .collect::<Vec<_>>()
+        };
+        let build = super::merkle::build_blob_merkle_tree(&chunks)?;
+        self.stage_immutable_objects(&build.objects)?;
+        self.stage_blob_manifest(&build.manifest)
     }
 
     /// Authenticates a fixed-width successor against the exact BlobRef
@@ -695,6 +678,11 @@ impl PreparedPublication {
             .await
             .map_err(|error| StorageError::Corruption(error.to_string()))?
             .ok_or_else(|| corruption("request blob splice base owner is absent"))?;
+        if provenance.base_blob_id() != reference.semantic_id() {
+            return Err(corruption(
+                "request blob splice base identity does not match its StateKey owner",
+            ));
+        }
         let base_len = usize::try_from(reference.expected_size())
             .map_err(|_| corruption("request blob splice base length is invalid"))?;
         let prefix = provenance.prefix_bytes();
@@ -714,21 +702,6 @@ impl PreparedPublication {
                 "request blob splice is not a same-length fixed-width replacement",
             ));
         }
-        let base_sha256 = view
-            .authenticate_blob_for_splice(
-                &reference,
-                payload.bytes(),
-                prefix,
-                replacement_len,
-                suffix,
-            )
-            .await
-            .map_err(|error| StorageError::Corruption(error.to_string()))?;
-        if lower_hex(&base_sha256) != provenance.base_sha256() {
-            return Err(corruption(
-                "request blob splice base digest is not bound to its authenticated StateKey",
-            ));
-        }
         let insert_end = prefix + insert.len();
         if payload.bytes().get(prefix..insert_end) != Some(insert)
             || insert_end != base_len - suffix
@@ -737,11 +710,10 @@ impl PreparedPublication {
                 "request blob splice bytes do not match its authenticated base",
             ));
         }
-        if sha256_lower_hex(payload.bytes()) != provenance.result_sha256() {
-            return Err(corruption(
-                "request blob splice result digest is not bound to its payload",
-            ));
-        }
+        // SHA-256 remains transport metadata. The canonical Merkle identity
+        // derived from those verified bytes was matched to the exact
+        // StateKey-selected BlobRef above; the proof below binds that owner to
+        // its manifest root without a backend whole-file witness pass.
         let splice = BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
         self.stage_verified_inline_blob_splice_bound(view, state_key, payload, splice, reference)
             .await
@@ -782,94 +754,58 @@ impl PreparedPublication {
                 "verified blob splice base manifest is not bound to its BlobRef owner",
             ));
         }
-        let expected_chunk_count = payload
-            .len()
-            .div_ceil(super::blob::CANONICAL_BLOB_CHUNK_BYTES);
-        if base_manifest.ordered_chunks.len() != expected_chunk_count {
+        let byte_range = splice.offset as u64..splice_end as u64;
+        let leaf_range = super::merkle::leaf_range_for_bytes(&base_manifest, byte_range)?;
+        let proof = view
+            .load_blob_merkle_proof(base_manifest, state_key, leaf_range.clone())
+            .await?;
+        let proof_start = leaf_range.start * super::model::BLOB_MERKLE_CHUNK_BYTES;
+        let proof_end = (leaf_range.end * super::model::BLOB_MERKLE_CHUNK_BYTES)
+            .min(base_manifest.logical_bytes);
+        let authenticated = super::merkle::materialize_blob_merkle_range(
+            &proof,
+            state_key,
+            base_manifest,
+            proof_start..proof_end,
+        )?;
+        let prefix_len = splice.offset - proof_start as usize;
+        let suffix_start = splice_end - proof_start as usize;
+        let payload_start = proof_start as usize;
+        let payload_end = proof_end as usize;
+        if authenticated[..prefix_len] != payload.bytes()[payload_start..splice.offset]
+            || authenticated[suffix_start..] != payload.bytes()[splice_end..payload_end]
+        {
             return Err(corruption(
-                "verified blob splice base manifest is not canonical fixed-chunk layout",
+                "verified blob splice unchanged bytes do not match its authenticated proof",
             ));
         }
-        let mut ordered_chunks = Vec::with_capacity(expected_chunk_count);
-        let mut changed_chunks = Vec::new();
-        for (index, base_chunk) in base_manifest.ordered_chunks.iter().enumerate() {
-            let start = index * super::blob::CANONICAL_BLOB_CHUNK_BYTES;
+        let mut replacements = BTreeMap::new();
+        for ordinal in leaf_range.clone() {
+            let start = ordinal as usize * super::blob::CANONICAL_BLOB_CHUNK_BYTES;
             let end = start
                 .saturating_add(super::blob::CANONICAL_BLOB_CHUNK_BYTES)
                 .min(payload.len());
-            let expected_len = end.saturating_sub(start) as u64;
-            if base_chunk.declared_len != expected_len {
-                return Err(corruption(
-                    "verified blob splice base manifest has a noncanonical chunk length",
-                ));
-            }
-            if start < splice_end && splice.offset < end {
-                let chunk = BlobChunkV1 {
+            replacements.insert(
+                ordinal,
+                BlobChunkV1 {
                     bytes: Bytes::copy_from_slice(&payload.bytes()[start..end]),
-                };
-                let chunk_object_id = self.stage_blob_chunk(&chunk)?;
-                let chunk_ref = BlobChunkRefV1 {
-                    chunk_object_id,
-                    declared_len: expected_len,
-                };
-                changed_chunks.push(chunk_ref.clone());
-                ordered_chunks.push(chunk_ref);
-            } else {
-                ordered_chunks.push(base_chunk.clone());
-            }
+                },
+            );
         }
-        if changed_chunks.is_empty() {
-            return Err(corruption(
-                "verified blob splice does not intersect a canonical chunk",
-            ));
-        }
-        let final_blob_id = payload
-            .hash()
-            .ok_or_else(|| corruption("verified blob splice has no final BlobId"))?;
-        let content_digest = payload
-            .content_digest()
-            .ok_or_else(|| corruption("verified blob splice has no final content digest"))?;
-        let successor_manifest = BlobManifestV1::from_authenticated_chunks(
-            payload.len() as u64,
-            ordered_chunks,
-            final_blob_id,
-            content_digest,
-        );
-        let successor_manifest_object_id = successor_manifest.encode()?.0;
-        let receipt = AuthenticatedBlobSpliceReceipt {
-            state_key: state_key.clone(),
-            base_manifest_object_id,
-            base_blob_id: splice.base_blob_hash,
-            changed_chunks,
-            successor_manifest_object_id,
-            successor_manifest,
-            final_blob_id,
-        };
-        if receipt.state_key != *state_key
-            || receipt.base_manifest_object_id != base_manifest_object_id
-            || receipt.base_blob_id != splice.base_blob_hash
-            || receipt.successor_manifest.canonical_blob_id != receipt.final_blob_id
-            || receipt.successor_manifest_object_id != receipt.successor_manifest.encode()?.0
-        {
-            return Err(corruption(
-                "verified blob splice receipt is not bound to its authenticated identities",
-            ));
-        }
-        if receipt
-            .changed_chunks
-            .iter()
-            .any(|chunk| !receipt.successor_manifest.ordered_chunks.contains(chunk))
-        {
-            return Err(corruption(
-                "verified blob splice receipt changed chunk is absent from its successor manifest",
-            ));
-        }
+        let successor = super::merkle::build_blob_merkle_successor(
+            &proof,
+            state_key,
+            base_manifest,
+            leaf_range,
+            &replacements,
+        )?;
+        self.stage_immutable_objects(&successor.objects)?;
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_verified_inline_blob_splice(
-            receipt.changed_chunks.len(),
-            expected_chunk_count,
+            replacements.len(),
+            base_manifest.leaf_count as usize,
         );
-        self.stage_blob_manifest(&receipt.successor_manifest)
+        self.stage_blob_manifest(&successor.manifest)
     }
 
     /// Lowers one large JSON value into an authenticated ForkTree payload
@@ -1579,6 +1515,7 @@ impl PreparedPublication {
                 "completed blob manifest is absent from the published state edit",
             ));
         }
+        self.stage_immutable_objects(&completion.merkle_objects)?;
         self.stage_blob_manifest(&completion.manifest)?;
         self.delete_upload_selector(&completion.selector, completion.raw_upload_selector)?;
         self.publish_state_transition(view, transition).await?;

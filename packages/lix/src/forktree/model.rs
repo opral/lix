@@ -1176,11 +1176,10 @@ impl BlobManifestV1 {
     }
 
     fn validate(&self) -> Result<(), StorageError> {
-        if self.logical_bytes == 0
-            || self.leaf_count == 0
+        if self.leaf_count == 0
             || self.root_object_id == ObjectId::ZERO
             || self.chunk_bytes != BLOB_MERKLE_CHUNK_BYTES
-            || self.leaf_count != self.logical_bytes.div_ceil(self.chunk_bytes)
+            || self.leaf_count != self.logical_bytes.div_ceil(self.chunk_bytes).max(1)
             || (self.leaf_count == 1) != (self.root_height == 0)
             || (self.leaf_count > 1 && self.root_height == 0)
         {

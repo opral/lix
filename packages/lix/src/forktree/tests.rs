@@ -44,8 +44,8 @@ use super::{
     VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key,
     encode_state_value, load_change, load_commit, load_commit_member_records,
     load_commit_topologies, open_coherent_view, page_changes, page_commits,
-    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
-    state_range,
+    prepare_upload_completion, prepare_upload_part, put_change_catalog_entries,
+    put_commit_catalog_entries, state_point, state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -154,8 +154,8 @@ fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     assert!(merkle.contains("BlobManifestV1::from_merkle_root"));
     assert!(merkle.contains("canonical_merkle_blob_id"));
     assert!(reachability.contains("authenticated_merkle_edges"));
-    assert!(!merkle.contains("BlobId::from_content"));
-    assert!(!merkle.contains("BlobId::from_chunks"));
+    assert!(!merkle.contains("BlobId::from_canonical_content"));
+    assert!(!merkle.contains(concat!("BlobId::from_", "chunks")));
     let manifest_reachability = reachability
         .split_once("ObjectDomain::BlobManifest =>")
         .and_then(|(_, rest)| rest.split_once("ObjectDomain::BlobMerkleLeafV1"))
@@ -2373,6 +2373,91 @@ fn receipt_declared_size_digest_and_aggregate_corruption_fail_closed() {
 }
 
 #[tokio::test]
+async fn multipart_completion_missing_prior_child_fails_before_manifest_publication() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let upload_id = CanonicalUploadId::new("missing-prior-child").expect("upload ID");
+    let chunk_bytes = usize::try_from(BLOB_MERKLE_CHUNK_BYTES).expect("chunk size fits usize");
+    let part_bytes = chunk_bytes * 16;
+    let total_size = part_bytes as u64 + 1;
+    let first = vec![0x41; part_bytes];
+    let tail = [0x42];
+    let binding = UploadBindingRef {
+        repository_identity: b"repository",
+        path: b"/missing-prior-child.bin",
+        payload_domain: b"file",
+        declared_total_size: total_size,
+        declared_final_hash: None,
+    };
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("first-part view");
+    let first_part = prepare_upload_part(&view, upload_id.clone(), binding, 0, 0, &first)
+        .await
+        .expect("first part preparation");
+    let missing_child_id = first_part.chunks[0].encode().expect("first chunk").0;
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("first part");
+    publication
+        .publish_upload_part(first_part)
+        .expect("stage first part closure");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("publish first part");
+
+    let expected_manifest_id = {
+        let chunks = first
+            .chunks(chunk_bytes)
+            .map(|bytes| BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(bytes),
+            })
+            .chain(std::iter::once(BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(&tail),
+            }))
+            .collect::<Vec<_>>();
+        build_blob_merkle_tree(&chunks)
+            .expect("expected Merkle closure")
+            .manifest
+            .encode()
+            .expect("expected manifest")
+            .0
+    };
+
+    let mut deletion = StorageWriteSet::new();
+    deletion.delete(OBJECT_SPACE, missing_child_id.as_bytes().to_vec());
+    commit_write_set_for_test(deletion, &storage).await;
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("completion view");
+    let error = prepare_upload_part(
+        &view,
+        upload_id.clone(),
+        binding,
+        1,
+        part_bytes as u64,
+        &tail,
+    )
+    .await
+    .expect_err("missing prior child must reject completion");
+    assert!(error.to_string().contains("absent"));
+    assert!(
+        view.load_selector_value(&upload_selector_key(&upload_id).expect("selector key"))
+            .await
+            .expect("selector lookup")
+            .is_some(),
+        "failed completion must retain the open upload selector"
+    );
+    drop(view);
+    assert!(
+        !object_present(&storage, expected_manifest_id).await,
+        "failed completion must not publish a partial manifest"
+    );
+}
+
+#[tokio::test]
 async fn upload_publication_and_sweep_are_epoch_fenced_in_both_orders() {
     let seed = build_seed();
     let upload = make_upload();
@@ -2985,12 +3070,11 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
             bytes: Bytes::copy_from_slice(&transplanted_payload[FIXED_CHUNK_BYTES..]),
         },
     ];
-    let owner_manifest = build_blob_merkle_tree(&owner_chunks)
-        .expect("owner Merkle manifest")
-        .manifest;
-    let transplanted_manifest = build_blob_merkle_tree(&transplanted_chunks)
-        .expect("transplanted Merkle manifest")
-        .manifest;
+    let owner_build = build_blob_merkle_tree(&owner_chunks).expect("owner Merkle manifest");
+    let owner_manifest = owner_build.manifest;
+    let transplanted_build =
+        build_blob_merkle_tree(&transplanted_chunks).expect("transplanted Merkle manifest");
+    let transplanted_manifest = transplanted_build.manifest;
     let owner_blob_id = owner_manifest.canonical_blob_id;
     let transplanted_blob_id = transplanted_manifest.canonical_blob_id;
     assert_ne!(owner_blob_id, transplanted_blob_id);
@@ -3026,14 +3110,9 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     .expect("state edit");
     let transition = branch_transition(&view, state_edit, 0x70).await;
     let mut publish = PreparedPublication::from_branch_view(&view).expect("completion publication");
-    for chunk in &transplanted_chunks {
-        publish
-            .stage_blob_chunk(chunk)
-            .expect("stage transplanted chunk");
-    }
     publish
-        .stage_blob_manifest(&transplanted_manifest)
-        .expect("stage transplanted manifest");
+        .stage_blob_merkle_build_for_test(&transplanted_build)
+        .expect("stage transplanted Merkle closure");
     assert_eq!(
         publish
             .publish_completed_upload(&view, completion, transition)
@@ -3087,7 +3166,7 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
         .expect("authenticated same-size transplanted owner edge");
     assert!(
         reopened
-            .load_blob_ranges_many(&[(transplanted_ref, 0..1)])
+            .load_blob_ranges_many(&[(transplanted_ref.clone(), 0..1)])
             .await
             .is_err(),
         "a same-size multi-chunk manifest transplant must fail before range output"
@@ -3127,14 +3206,14 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     );
     assert!(
         same_selectors_different_read
-            .load_blob_bytes_many(&[blob_ref])
+            .load_blob_bytes_many(&[blob_ref.clone()])
             .await
             .is_err(),
         "an authenticated blob edge must not detach from its selecting StorageRead"
     );
     assert_eq!(
         reopened
-            .load_blob_bytes_many(&[blob_ref])
+            .load_blob_bytes_many(&[blob_ref.clone()])
             .await
             .expect("full blob read")
             .into_vec(),
@@ -3199,12 +3278,12 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     let wrong_chunk = BlobChunkV1 {
         bytes: Bytes::copy_from_slice(wrong_payload),
     };
-    let valid_manifest = single_leaf_manifest_for_test(&valid_chunk)
-        .expect("valid duplicate manifest")
-        .0;
-    let wrong_manifest = single_leaf_manifest_for_test(&wrong_chunk)
-        .expect("wrong duplicate manifest")
-        .0;
+    let valid_build = build_blob_merkle_tree(std::slice::from_ref(&valid_chunk))
+        .expect("valid duplicate manifest");
+    let valid_manifest = valid_build.manifest;
+    let wrong_build = build_blob_merkle_tree(std::slice::from_ref(&wrong_chunk))
+        .expect("wrong duplicate manifest");
+    let wrong_manifest = wrong_build.manifest;
     let semantic_id = valid_manifest.canonical_blob_id;
     // This is the exact duplicate-owner trap: the wrong row claims the
     // selected owner's semantic ID while pointing at different authenticated
@@ -3261,17 +3340,11 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
     let transition = branch_transition(&view, state_edit, 0x70).await;
     let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
     publication
-        .stage_blob_chunk(&valid_chunk)
-        .expect("stage valid duplicate chunk");
+        .stage_blob_merkle_build_for_test(&valid_build)
+        .expect("stage valid duplicate Merkle closure");
     publication
-        .stage_blob_chunk(&wrong_chunk)
-        .expect("stage wrong duplicate chunk");
-    publication
-        .stage_blob_manifest(&valid_manifest)
-        .expect("stage valid duplicate manifest");
-    publication
-        .stage_blob_manifest(&wrong_manifest)
-        .expect("stage wrong duplicate manifest");
+        .stage_blob_merkle_build_for_test(&wrong_build)
+        .expect("stage wrong duplicate Merkle closure");
     publication
         .publish_state_transition(&view, transition)
         .await
@@ -3330,20 +3403,18 @@ async fn publish_untracked_manifest(
     storage: &Memory,
     seed: &SeedData,
     primary_key: &str,
-    manifest: &BlobManifestV1,
-    chunks: &[BlobChunkV1],
+    build: &super::merkle::BlobMerkleTreeBuild,
 ) -> ObjectId {
     let view = open_coherent_view(storage, seed.branch_id)
         .await
         .expect("untracked view");
-    let (manifest_id, _) = manifest.encode().expect("manifest");
+    let (manifest_id, _) = build.manifest.encode().expect("manifest");
     let entity_pk = EntityPk::single(primary_key);
     let roots = [manifest_id];
     let mut publication = PreparedPublication::from_global_epoch(&view).expect("untracked put");
-    for chunk in chunks {
-        publication.stage_blob_chunk(chunk).expect("chunk");
-    }
-    publication.stage_blob_manifest(manifest).expect("manifest");
+    publication
+        .stage_blob_merkle_build_for_test(build)
+        .expect("Merkle closure");
     publication
         .put_untracked_row(
             seed.branch_id,
@@ -3681,27 +3752,11 @@ async fn untracked_and_real_shared_chunk_roots_release_only_at_final_reference()
     let (first_unique_id, _) = first_unique.encode().expect("first unique");
     let (second_unique_id, _) = second_unique.encode().expect("second unique");
     let first = build_blob_merkle_tree(&[first_unique.clone(), shared.clone()])
-        .expect("first shared Merkle manifest")
-        .manifest;
+        .expect("first shared Merkle manifest");
     let second = build_blob_merkle_tree(&[second_unique.clone(), shared.clone()])
-        .expect("second shared Merkle manifest")
-        .manifest;
-    let first_id = publish_untracked_manifest(
-        &storage,
-        &seed,
-        "one",
-        &first,
-        &[first_unique.clone(), shared.clone()],
-    )
-    .await;
-    let second_id = publish_untracked_manifest(
-        &storage,
-        &seed,
-        "two",
-        &second,
-        &[second_unique.clone(), shared.clone()],
-    )
-    .await;
+        .expect("second shared Merkle manifest");
+    let first_id = publish_untracked_manifest(&storage, &seed, "one", &first).await;
+    let second_id = publish_untracked_manifest(&storage, &seed, "two", &second).await;
     assert_ne!(first_id, second_id);
     sweep(&storage, seed.branch_id).await;
     assert!(object_present(&storage, shared_id).await);

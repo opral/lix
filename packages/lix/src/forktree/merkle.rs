@@ -5,6 +5,7 @@ use bytes::Bytes;
 
 use crate::binary_cas::BlobId;
 use crate::storage::StorageError;
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::blob::CANONICAL_BLOB_CHUNK_BYTES;
 use super::codec::{Encoder, corruption, keyed_hash};
@@ -18,6 +19,7 @@ use super::object::{
 };
 use super::state::{StateKey, StateKeyRef, encode_state_key};
 use super::tree::ImmutableObjectSet;
+use super::view::load_object_bytes;
 
 const MERKLE_STATE_BINDING_DOMAIN: &str = "lix forktree blob merkle state binding v1";
 const MAX_PROOF_DEPTH: usize = 128;
@@ -132,8 +134,11 @@ impl BlobMerkleProofV1 {
 pub(crate) fn build_blob_merkle_tree(
     chunks: &[BlobChunkV1],
 ) -> Result<BlobMerkleTreeBuild, StorageError> {
-    if chunks.is_empty() || chunks.iter().any(|chunk| chunk.bytes.is_empty()) {
-        return Err(corruption("Merkle layout requires non-empty chunks"));
+    if chunks.is_empty() || (chunks.len() != 1 && chunks.iter().any(|chunk| chunk.bytes.is_empty()))
+    {
+        return Err(corruption(
+            "Merkle layout requires canonical fixed-width chunks",
+        ));
     }
     if chunks.len() > u64::MAX as usize {
         return Err(corruption("Merkle layout has too many chunks"));
@@ -146,16 +151,58 @@ pub(crate) fn build_blob_merkle_tree(
     })?;
     validate_fixed_chunk_layout(logical_bytes, chunks)?;
 
+    let mut chunk_claims = Vec::with_capacity(chunks.len());
+    let mut chunk_objects = ImmutableObjectSet::default();
+    for chunk in chunks {
+        let (chunk_object_id, chunk_bytes) = chunk.encode()?;
+        chunk_objects.insert(chunk_object_id, chunk_bytes)?;
+        chunk_claims.push((
+            super::model::BlobChunkRefV1 {
+                chunk_object_id,
+                declared_len: chunk.bytes.len() as u64,
+            },
+            *blake3::hash(&chunk.bytes).as_bytes(),
+        ));
+    }
+    let mut build = build_blob_merkle_tree_from_chunk_claims(logical_bytes, &chunk_claims)?;
+    build.objects.extend(chunk_objects)?;
+    Ok(build)
+}
+
+/// Builds the canonical leaf/internal closure from already authenticated
+/// upload chunks. Chunk payload objects remain owned by the upload receipt and
+/// are not copied into memory a second time.
+pub(crate) fn build_blob_merkle_tree_from_chunk_claims(
+    logical_bytes: u64,
+    chunks: &[(super::model::BlobChunkRefV1, [u8; 32])],
+) -> Result<BlobMerkleTreeBuild, StorageError> {
+    if chunks.is_empty() {
+        return Err(corruption("Merkle layout requires at least one leaf"));
+    }
+    let expected_count = logical_bytes
+        .div_ceil(CANONICAL_BLOB_CHUNK_BYTES as u64)
+        .max(1);
+    if expected_count != chunks.len() as u64 {
+        return Err(corruption("Merkle leaves are not canonical fixed chunks"));
+    }
     let mut objects = ImmutableObjectSet::default();
     let mut leaves = Vec::with_capacity(chunks.len());
-    for (ordinal, chunk) in chunks.iter().enumerate() {
-        let (chunk_object_id, chunk_bytes) = chunk.encode()?;
-        objects.insert(chunk_object_id, chunk_bytes)?;
+    for (ordinal, (chunk, chunk_digest)) in chunks.iter().enumerate() {
+        let expected_len = if ordinal + 1 == chunks.len() {
+            logical_bytes - ordinal as u64 * CANONICAL_BLOB_CHUNK_BYTES as u64
+        } else {
+            CANONICAL_BLOB_CHUNK_BYTES as u64
+        };
+        if chunk.chunk_object_id == ObjectId::ZERO || chunk.declared_len != expected_len {
+            return Err(corruption(
+                "Merkle chunk length or identity is not canonically positioned",
+            ));
+        }
         let leaf = BlobMerkleLeafV1 {
             ordinal: ordinal as u64,
-            chunk_object_id,
-            declared_len: chunk.bytes.len() as u64,
-            chunk_digest: *blake3::hash(&chunk.bytes).as_bytes(),
+            chunk_object_id: chunk.chunk_object_id,
+            declared_len: chunk.declared_len,
+            chunk_digest: *chunk_digest,
         };
         let (leaf_object_id, leaf_bytes) = encode_leaf(&leaf)?;
         objects.insert(leaf_object_id, leaf_bytes)?;
@@ -176,6 +223,26 @@ pub(crate) fn build_blob_merkle_tree(
         root.height,
     );
     Ok(BlobMerkleTreeBuild { manifest, objects })
+}
+
+/// Computes the sole canonical blob identity from complete content. This is
+/// used by transaction-local semantic rows that must name an inline payload
+/// before publication; the durable reader still authorizes only the
+/// StateKey-bound manifest root and never looks content up by this value.
+pub(crate) fn canonical_blob_id_for_content(content: &[u8]) -> Result<BlobId, StorageError> {
+    let chunks = if content.is_empty() {
+        vec![BlobChunkV1 {
+            bytes: Bytes::new(),
+        }]
+    } else {
+        content
+            .chunks(CANONICAL_BLOB_CHUNK_BYTES)
+            .map(|chunk| BlobChunkV1 {
+                bytes: Bytes::copy_from_slice(chunk),
+            })
+            .collect()
+    };
+    Ok(build_blob_merkle_tree(&chunks)?.manifest.canonical_blob_id)
 }
 
 /// Builds the smallest authenticated Merkle fixture for unit tests.  The
@@ -202,6 +269,169 @@ pub(crate) fn single_leaf_manifest_for_test(
         leaf_object_id,
         leaf_bytes,
     ))
+}
+
+/// Loads an exact ordinal proof from one retained storage read. Only selected
+/// leaves, their chunk objects, and sibling proof nodes are retained.
+pub(crate) async fn load_blob_merkle_range_proof<R>(
+    read: &R,
+    manifest: BlobManifestV1,
+    state_key: &StateKey,
+    requested_range: Range<u64>,
+) -> Result<BlobMerkleProofV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    validate_requested_range(&manifest, &requested_range)?;
+    let mut objects = ImmutableObjectSet::default();
+    // Operation-local read coalescing only: bytes never outlive this proof and
+    // are still authenticated at every typed edge below.
+    let mut loaded = BTreeMap::<ObjectId, Bytes>::new();
+    let mut paths = Vec::with_capacity((requested_range.end - requested_range.start) as usize);
+    for ordinal in requested_range.clone() {
+        let mut node_id = manifest.root_object_id;
+        let mut expected_ref = BlobMerkleNodeRefV1 {
+            object_id: manifest.root_object_id,
+            height: manifest.root_height,
+            first_ordinal: 0,
+            leaf_count: manifest.leaf_count,
+            logical_bytes: manifest.logical_bytes,
+        };
+        let mut steps = Vec::new();
+        loop {
+            let node_bytes = load_proof_object(read, &mut loaded, node_id).await?;
+            let node = decode_node(node_id, &node_bytes)?;
+            let summary = node.summary(node_id);
+            if summary.as_ref() != expected_ref {
+                return Err(corruption(
+                    "Merkle node does not match its authenticated parent summary",
+                ));
+            }
+            match node {
+                DecodedNode::Leaf(leaf) => {
+                    if leaf.ordinal != ordinal {
+                        return Err(corruption("Merkle leaf ordinal is not canonical"));
+                    }
+                    objects.insert(node_id, node_bytes)?;
+                    let chunk_bytes =
+                        load_proof_object(read, &mut loaded, leaf.chunk_object_id).await?;
+                    objects.insert(leaf.chunk_object_id, chunk_bytes)?;
+                    paths.push(BlobMerkleProofPathV1 {
+                        leaf_object_id: node_id,
+                        leaf_ordinal: ordinal,
+                        steps,
+                    });
+                    break;
+                }
+                DecodedNode::Internal(internal) => {
+                    let in_left = ordinal >= internal.left.first_ordinal
+                        && ordinal < internal.left.first_ordinal + internal.left.leaf_count;
+                    let in_right = ordinal >= internal.right.first_ordinal
+                        && ordinal < internal.right.first_ordinal + internal.right.leaf_count;
+                    if in_left == in_right {
+                        return Err(corruption(
+                            "Merkle ordinal is not covered by exactly one child",
+                        ));
+                    }
+                    let (child, sibling, sibling_is_left) = if in_left {
+                        (internal.left, internal.right, false)
+                    } else {
+                        (internal.right, internal.left, true)
+                    };
+                    let sibling_bytes =
+                        load_proof_object(read, &mut loaded, sibling.object_id).await?;
+                    let sibling_node = decode_node(sibling.object_id, &sibling_bytes)?;
+                    if sibling_node.summary(sibling.object_id).as_ref() != sibling {
+                        return Err(corruption(
+                            "Merkle sibling does not match its authenticated parent summary",
+                        ));
+                    }
+                    objects.insert(sibling.object_id, sibling_bytes)?;
+                    steps.push(BlobMerkleProofStepV1 {
+                        parent_object_id: node_id,
+                        sibling_object_id: sibling.object_id,
+                        sibling_is_left,
+                    });
+                    node_id = child.object_id;
+                    expected_ref = child;
+                }
+            }
+        }
+    }
+    let proof = BlobMerkleProofV1 {
+        manifest,
+        requested_range: requested_range.clone(),
+        state_binding: state_binding(state_key, &manifest),
+        paths,
+        objects,
+    };
+    verify_blob_merkle_range(&proof, state_key, manifest, requested_range)?;
+    Ok(proof)
+}
+
+async fn load_proof_object<R>(
+    read: &R,
+    loaded: &mut BTreeMap<ObjectId, Bytes>,
+    id: ObjectId,
+) -> Result<Bytes, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(bytes) = loaded.get(&id) {
+        return Ok(bytes.clone());
+    }
+    let bytes = load_object_bytes(read, id).await?;
+    loaded.insert(id, bytes.clone());
+    Ok(bytes)
+}
+
+pub(crate) fn leaf_range_for_bytes(
+    manifest: &BlobManifestV1,
+    requested: Range<u64>,
+) -> Result<Range<u64>, StorageError> {
+    if manifest.logical_bytes == 0 && requested == (0..0) && manifest.leaf_count == 1 {
+        return Ok(0..1);
+    }
+    if requested.start >= requested.end || requested.end > manifest.logical_bytes {
+        return Err(corruption("Merkle byte range is invalid"));
+    }
+    let chunk_bytes = u64::from(BLOB_MERKLE_CHUNK_BYTES);
+    Ok(requested.start / chunk_bytes..requested.end.div_ceil(chunk_bytes))
+}
+
+pub(crate) fn materialize_blob_merkle_range(
+    proof: &BlobMerkleProofV1,
+    state_key: &StateKey,
+    manifest: BlobManifestV1,
+    requested: Range<u64>,
+) -> Result<Vec<u8>, StorageError> {
+    let leaf_range = leaf_range_for_bytes(&manifest, requested.clone())?;
+    verify_blob_merkle_range(proof, state_key, manifest, leaf_range)?;
+    let mut output = Vec::with_capacity((requested.end - requested.start) as usize);
+    for path in &proof.paths {
+        let leaf = decode_leaf(
+            path.leaf_object_id,
+            proof
+                .objects
+                .get(path.leaf_object_id)
+                .ok_or_else(|| corruption("Merkle materialization leaf is missing"))?,
+        )?;
+        let chunk = BlobChunkV1::decode_borrowed(
+            leaf.chunk_object_id,
+            proof
+                .objects
+                .get(leaf.chunk_object_id)
+                .ok_or_else(|| corruption("Merkle materialization chunk is missing"))?,
+        )?;
+        let chunk_start = leaf.ordinal * u64::from(BLOB_MERKLE_CHUNK_BYTES);
+        let start = requested.start.saturating_sub(chunk_start) as usize;
+        let end = (requested.end.min(chunk_start + leaf.declared_len) - chunk_start) as usize;
+        output.extend_from_slice(&chunk[start..end]);
+    }
+    if output.len() as u64 != requested.end - requested.start {
+        return Err(corruption("Merkle materialized byte range is incomplete"));
+    }
+    Ok(output)
 }
 
 /// Creates a proof for an exact half-open range of leaf ordinals. The proof
@@ -273,6 +503,10 @@ pub(crate) fn verify_blob_merkle_range(
     if proof.paths.len() != (requested_range.end - requested_range.start) as usize {
         return Err(corruption("Merkle proof omits a requested leaf"));
     }
+    let canonical_empty_request = expected_manifest.logical_bytes == 0
+        && expected_manifest.leaf_count == 1
+        && expected_manifest.root_height == 0
+        && requested_range == (0..1);
 
     let mut seen_ordinals = BTreeSet::new();
     let mut verified_root = None;
@@ -289,6 +523,16 @@ pub(crate) fn verify_blob_merkle_range(
         let leaf = decode_leaf(path.leaf_object_id, leaf_bytes)?;
         if leaf.ordinal != path.leaf_ordinal {
             return Err(corruption("Merkle proof leaf ordinal is not object-bound"));
+        }
+        if leaf.declared_len == 0
+            && !(canonical_empty_request
+                && leaf.ordinal == 0
+                && path.steps.is_empty()
+                && path.leaf_object_id == expected_manifest.root_object_id)
+        {
+            return Err(corruption(
+                "zero-length Merkle leaf is not the canonical empty root",
+            ));
         }
         let chunk_bytes = proof
             .objects
@@ -374,6 +618,27 @@ pub(crate) fn derive_blob_merkle_successor_id(
     requested_range: Range<u64>,
     replacements: &BTreeMap<u64, BlobChunkV1>,
 ) -> Result<BlobId, StorageError> {
+    Ok(build_blob_merkle_successor(
+        proof,
+        state_key,
+        expected_manifest,
+        requested_range,
+        replacements,
+    )?
+    .manifest
+    .canonical_blob_id)
+}
+
+/// Builds only changed chunks/leaves and path-copied internal nodes for a
+/// fixed-width successor. Unchanged subtrees remain authenticated sibling
+/// edges and are never materialized or republished.
+pub(crate) fn build_blob_merkle_successor(
+    proof: &BlobMerkleProofV1,
+    state_key: &StateKey,
+    expected_manifest: BlobManifestV1,
+    requested_range: Range<u64>,
+    replacements: &BTreeMap<u64, BlobChunkV1>,
+) -> Result<BlobMerkleTreeBuild, StorageError> {
     verify_blob_merkle_range(proof, state_key, expected_manifest, requested_range.clone())?;
     if replacements.len() != (requested_range.end - requested_range.start) as usize
         || replacements.keys().copied().ne(requested_range.clone())
@@ -384,6 +649,7 @@ pub(crate) fn derive_blob_merkle_successor_id(
     }
 
     let mut updates = BTreeMap::<ObjectId, NodeSummary>::new();
+    let mut objects = ImmutableObjectSet::default();
     for path in &proof.paths {
         let leaf_bytes = proof
             .objects
@@ -398,14 +664,16 @@ pub(crate) fn derive_blob_merkle_successor_id(
                 "Merkle successor changes a fixed-width leaf length",
             ));
         }
-        let (chunk_object_id, _) = replacement.encode()?;
+        let (chunk_object_id, chunk_bytes) = replacement.encode()?;
+        objects.insert(chunk_object_id, chunk_bytes)?;
         let new_leaf = BlobMerkleLeafV1 {
             ordinal: old_leaf.ordinal,
             chunk_object_id,
             declared_len: old_leaf.declared_len,
             chunk_digest: *blake3::hash(&replacement.bytes).as_bytes(),
         };
-        let (new_leaf_object_id, _) = encode_leaf(&new_leaf)?;
+        let (new_leaf_object_id, new_leaf_bytes) = encode_leaf(&new_leaf)?;
+        objects.insert(new_leaf_object_id, new_leaf_bytes)?;
         let mut current = NodeSummary {
             object_id: new_leaf_object_id,
             height: 0,
@@ -431,6 +699,7 @@ pub(crate) fn derive_blob_merkle_successor_id(
                 (current, sibling_summary)
             };
             let parent = encode_internal(left, right)?;
+            objects.insert(parent.object_id, parent.bytes.clone())?;
             current = NodeSummary {
                 object_id: parent.object_id,
                 height: parent.value.height,
@@ -456,14 +725,25 @@ pub(crate) fn derive_blob_merkle_successor_id(
     {
         return Err(corruption("Merkle successor root summary is invalid"));
     }
-    Ok(canonical_blob_id_from_summary(root))
+    let manifest = BlobManifestV1::from_merkle_root(
+        root.logical_bytes,
+        root.leaf_count,
+        root.object_id,
+        root.height,
+    );
+    if manifest.canonical_blob_id != canonical_blob_id_from_summary(root) {
+        return Err(corruption("Merkle successor identity is inconsistent"));
+    }
+    Ok(BlobMerkleTreeBuild { manifest, objects })
 }
 
 fn validate_fixed_chunk_layout(
     logical_bytes: u64,
     chunks: &[BlobChunkV1],
 ) -> Result<(), StorageError> {
-    let expected_count = logical_bytes.div_ceil(CANONICAL_BLOB_CHUNK_BYTES as u64);
+    let expected_count = logical_bytes
+        .div_ceil(CANONICAL_BLOB_CHUNK_BYTES as u64)
+        .max(1);
     if expected_count != chunks.len() as u64 {
         return Err(corruption("Merkle leaves are not canonical fixed chunks"));
     }
@@ -554,7 +834,11 @@ fn encode_internal(left: NodeSummary, right: NodeSummary) -> Result<EncodedInter
 }
 
 fn encode_leaf(value: &BlobMerkleLeafV1) -> Result<(ObjectId, Bytes), StorageError> {
-    if value.chunk_object_id == ObjectId::ZERO || value.declared_len == 0 {
+    // The canonical empty blob is represented by one ordinal-zero leaf whose
+    // authenticated chunk is empty. Any later zero-length leaf is impossible
+    // under the fixed geometry and is rejected here; root verification binds
+    // the sole exception to logical_bytes=0 and leaf_count=1.
+    if value.chunk_object_id == ObjectId::ZERO || (value.declared_len == 0 && value.ordinal != 0) {
         return Err(corruption("Merkle leaf has an invalid child"));
     }
     encode_object(ObjectDomain::BlobMerkleLeafV1, |encoder| {
@@ -575,7 +859,7 @@ fn decode_leaf(id: ObjectId, bytes: &[u8]) -> Result<BlobMerkleLeafV1, StorageEr
         chunk_digest: decoder.fixed()?,
     };
     decoder.finish()?;
-    if value.chunk_object_id == ObjectId::ZERO || value.declared_len == 0 {
+    if value.chunk_object_id == ObjectId::ZERO || (value.declared_len == 0 && value.ordinal != 0) {
         return Err(corruption("Merkle leaf has an invalid child"));
     }
     Ok(value)
@@ -778,7 +1062,6 @@ fn validate_requested_range(
         || requested_range.end > manifest.leaf_count
         || manifest.root_object_id == ObjectId::ZERO
         || manifest.leaf_count == 0
-        || manifest.logical_bytes == 0
     {
         return Err(corruption("Merkle requested range or manifest is invalid"));
     }
@@ -817,6 +1100,60 @@ mod tests {
                 bytes: Bytes::from(vec![ordinal as u8 + 1; CANONICAL_BLOB_CHUNK_BYTES]),
             })
             .collect()
+    }
+
+    #[test]
+    fn empty_blob_has_one_canonical_authenticated_leaf() {
+        let build = build_blob_merkle_tree(&[BlobChunkV1 {
+            bytes: Bytes::new(),
+        }])
+        .unwrap();
+        assert_eq!(build.manifest.logical_bytes, 0);
+        assert_eq!(build.manifest.leaf_count, 1);
+        assert_eq!(build.manifest.root_height, 0);
+        let (manifest_id, manifest_bytes) = build.manifest.encode().unwrap();
+        assert_eq!(
+            BlobManifestV1::decode(manifest_id, &manifest_bytes).unwrap(),
+            build.manifest,
+            "cold manifest decode must preserve the sole empty geometry"
+        );
+        assert_eq!(
+            build.manifest.canonical_blob_id,
+            canonical_blob_id_for_content(b"").unwrap()
+        );
+        let key = state_key();
+        let proof = prove_blob_merkle_range(&build, &key, 0..1).unwrap();
+        verify_blob_merkle_range(&proof, &key, build.manifest, 0..1).unwrap();
+        assert_eq!(
+            materialize_blob_merkle_range(&proof, &key, build.manifest, 0..0).unwrap(),
+            Vec::<u8>::new()
+        );
+
+        assert!(
+            build_blob_merkle_tree(&[
+                BlobChunkV1 {
+                    bytes: Bytes::new(),
+                },
+                BlobChunkV1 {
+                    bytes: Bytes::new(),
+                },
+            ])
+            .is_err(),
+            "multiple empty leaves must not encode an alternate empty blob"
+        );
+        let nonempty = build_blob_merkle_tree(&[BlobChunkV1 {
+            bytes: Bytes::from_static(b"x"),
+        }])
+        .unwrap();
+        let mut substituted = nonempty.clone();
+        substituted.manifest =
+            BlobManifestV1::from_merkle_root(0, 1, nonempty.manifest.root_object_id, 0);
+        let substituted_proof = prove_blob_merkle_range(&substituted, &key, 0..1).unwrap();
+        assert!(
+            verify_blob_merkle_range(&substituted_proof, &key, substituted.manifest, 0..1,)
+                .is_err(),
+            "a non-empty leaf cannot substitute for the canonical empty root"
+        );
     }
 
     #[test]

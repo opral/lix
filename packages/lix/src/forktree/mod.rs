@@ -24,7 +24,7 @@ pub(crate) use blob::{
 };
 pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use merkle::{
-    BlobMerkleProofV1, BlobMerkleTreeBuild, build_blob_merkle_tree,
+    BlobMerkleProofV1, BlobMerkleTreeBuild, build_blob_merkle_tree, canonical_blob_id_for_content,
     derive_blob_merkle_successor_id, prove_blob_merkle_range, verify_blob_merkle_range,
 };
 pub(crate) use model::{
@@ -130,6 +130,7 @@ const _: () = {
         let _ = prepare_upload_completion::<R>;
         let _ = BLOB_MERKLE_CHUNK_BYTES;
         let _ = build_blob_merkle_tree;
+        let _ = canonical_blob_id_for_content;
         let _ = derive_blob_merkle_successor_id;
         let _ = prove_blob_merkle_range;
         let _ = verify_blob_merkle_range;

@@ -2802,7 +2802,7 @@ impl TransactionWriteBuffer {
             };
             let hash = write
                 .blob_hash()
-                .unwrap_or_else(|| BlobId::from_content(data));
+                .unwrap_or_else(|| BlobId::from_canonical_content(data));
             if let Some(bytes) = requested.get_mut(&hash)
                 && bytes.is_none()
             {
@@ -2815,7 +2815,7 @@ impl TransactionWriteBuffer {
             for payload in write.auxiliary_payloads() {
                 let hash = payload
                     .hash()
-                    .unwrap_or_else(|| BlobId::from_content(payload.bytes()));
+                    .unwrap_or_else(|| BlobId::from_canonical_content(payload.bytes()));
                 if let Some(bytes) = requested.get_mut(&hash)
                     && bytes.is_none()
                 {
@@ -2865,7 +2865,7 @@ impl TransactionWriteBuffer {
             };
             let actual = write
                 .blob_hash()
-                .unwrap_or_else(|| BlobId::from_content(data));
+                .unwrap_or_else(|| BlobId::from_canonical_content(data));
             if actual != expected {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
@@ -5487,9 +5487,9 @@ mod tests {
             })
             .expect("file payloads should stage");
 
-        let auxiliary_hash = BlobId::from_content(b"requested-auxiliary");
-        let missing_hash = BlobId::from_content(b"missing");
-        let main_hash = BlobId::from_content(b"requested-main");
+        let auxiliary_hash = BlobId::from_canonical_content(b"requested-auxiliary");
+        let missing_hash = BlobId::from_canonical_content(b"missing");
+        let main_hash = BlobId::from_canonical_content(b"requested-main");
         let loaded = staged_writes
             .load_staged_file_bytes_many(&[auxiliary_hash, missing_hash, main_hash, auxiliary_hash])
             .expect("staged payload lookup should succeed")
