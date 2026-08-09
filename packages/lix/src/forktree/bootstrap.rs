@@ -27,7 +27,8 @@ use crate::storage_adapter::{
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
     ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    HotObjectPackEntry, HotObjectPackV1, RepositoryRootV1, branch_selector_key,
+    global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::state::{
@@ -334,12 +335,55 @@ where
     objects
         .insert(repository_id, repository_bytes)
         .map_err(LixError::from)?;
+    let global_selector = GlobalSelectorV1 {
+        repository_root: repository_id,
+        epoch: 1,
+        selector_generation: 1,
+    };
+    let global_selector_bytes = global_selector.encode().map_err(LixError::from)?;
+    let pack_entries = objects
+        .iter()
+        .map(|(object_id, bytes)| {
+            let domain = super::object::authenticate_object_domain(object_id, bytes)?;
+            if !super::object::hot_packable_object(object_id, bytes)? {
+                return Ok(None);
+            }
+            Ok(Some(HotObjectPackEntry {
+                object_id,
+                domain,
+                bytes: bytes.clone(),
+            }))
+        })
+        .collect::<Result<Vec<_>, crate::storage::StorageError>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let pack_id_for = |branch_id| {
+        HotObjectPackV1 {
+            branch_id,
+            repository_root_id: repository_id,
+            epoch: 1,
+            view_id: super::view::derive_pack_view_id(repository_id, branch_id, 1),
+            base_pack_object_id: None,
+            entries: pack_entries.clone(),
+        }
+        .encode()
+    };
+    let (global_pack_id, global_pack_bytes) = pack_id_for(global_branch).map_err(LixError::from)?;
+    let (main_pack_id, main_pack_bytes) = pack_id_for(main_branch_id).map_err(LixError::from)?;
+    objects
+        .insert(global_pack_id, global_pack_bytes)
+        .map_err(LixError::from)?;
+    objects
+        .insert(main_pack_id, main_pack_bytes)
+        .map_err(LixError::from)?;
     let global_snapshot = BranchSnapshotV1 {
         branch_id: global_branch,
         local_state_root: local_state.root.object_id,
         semantic_head_commit_object_id: commit_object_id,
         latest_ref_change_object_id: Some(global_ref_object_id),
         historical_global_state_root: global_state.root.object_id,
+        hot_pack_object_id: global_pack_id,
     };
     let main_snapshot = BranchSnapshotV1 {
         branch_id: main_branch_id,
@@ -347,6 +391,7 @@ where
         semantic_head_commit_object_id: commit_object_id,
         latest_ref_change_object_id: Some(main_ref_object_id),
         historical_global_state_root: global_state.root.object_id,
+        hot_pack_object_id: main_pack_id,
     };
     let (global_snapshot_id, global_snapshot_bytes) =
         global_snapshot.encode().map_err(LixError::from)?;
@@ -366,14 +411,7 @@ where
     writes.put(
         SELECTOR_SPACE,
         global_selector_storage_key.clone(),
-        GlobalSelectorV1 {
-            repository_root: repository_id,
-            epoch: 1,
-            selector_generation: 1,
-        }
-        .encode()
-        .map_err(LixError::from)?
-        .to_vec(),
+        global_selector_bytes.to_vec(),
     );
     let global_branch_selector_storage_key = branch_selector_key(global_branch).to_vec();
     let main_branch_selector_storage_key = branch_selector_key(main_branch_id).to_vec();

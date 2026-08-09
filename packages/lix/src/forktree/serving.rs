@@ -269,6 +269,8 @@ pub(crate) struct CatalogTreeEdit {
     copied_nodes: usize,
     pub(crate) commit_entries: BTreeMap<CommitId, CommitCatalogEntry>,
     pub(crate) change_entries: BTreeMap<ChangeId, ChangeCatalogEntry>,
+    pub(super) retired_commit_ids: BTreeSet<CommitId>,
+    pub(super) retired_change_ids: BTreeSet<ChangeId>,
     pub(super) objects: ImmutableObjectSet,
 }
 
@@ -2176,7 +2178,9 @@ where
             key: id.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
-    edit_catalog(root, "commit", &mutations, read).await
+    let mut edit = edit_catalog(root, "commit", &mutations, read).await?;
+    edit.retired_commit_ids = ids.iter().copied().collect();
+    Ok(edit)
 }
 
 pub(crate) async fn retire_change_catalog_entries<R>(
@@ -2193,7 +2197,9 @@ where
             key: id.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
-    edit_catalog(root, "change", &mutations, read).await
+    let mut edit = edit_catalog(root, "change", &mutations, read).await?;
+    edit.retired_change_ids = ids.iter().copied().collect();
+    Ok(edit)
 }
 
 pub(crate) async fn load_commit<R>(
@@ -2436,6 +2442,8 @@ where
         copied_nodes: edit.copied_nodes,
         commit_entries: BTreeMap::new(),
         change_entries: BTreeMap::new(),
+        retired_commit_ids: BTreeSet::new(),
+        retired_change_ids: BTreeSet::new(),
         objects: edit.objects,
     })
 }
@@ -2573,7 +2581,11 @@ where
     };
     let value = lookup_on_read(change_catalog_root, "change", change_id.as_bytes(), read)
         .await?
-        .ok_or_else(|| corruption("retained RefChange has no ChangeCatalog owner"))?;
+        .ok_or_else(|| {
+            corruption(format!(
+                "retained RefChange {change_id:?} object {ref_object_id} has no ChangeCatalog owner in root {change_catalog_root}"
+            ))
+        })?;
     let entry = ChangeCatalogEntry::decode(&value)?;
     if entry.change_object_id != ref_object_id
         || entry.owner

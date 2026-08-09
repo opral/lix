@@ -137,6 +137,8 @@ async fn run(
         let baseline_sqlite = sqlite_fixture.read_all_public_result();
         assert_same_digest("baseline", &baseline_lix, &baseline_sqlite);
 
+        lix::storage_adapter::reset_storage_adapter_read_counters();
+
         let (lix_result, lix_elapsed) = if verify_only {
             (run_lix(&lix_fixture, operation).await, None)
         } else if matches!(operation, Operation::UpdateOne)
@@ -159,16 +161,22 @@ async fn run(
         };
         assert_same_digest("operation", &lix_result, &sqlite_result);
 
+        let read_counters = lix::storage_adapter::storage_adapter_read_counters();
+
         let final_lix = lix_fixture.read_all_result().await;
         let final_sqlite = sqlite_fixture.read_all_public_result();
         assert_same_digest("final", &final_lix, &final_sqlite);
 
         println!(
-            "sample={sample} verified=true operation_digest={} final_digest={} lix_wall_us={} sqlite_wall_us={}",
+            "sample={sample} verified=true operation_digest={} final_digest={} lix_wall_us={} sqlite_wall_us={} adapter_get_many_calls={} adapter_requested_keys={} adapter_returned_values={} adapter_returned_bytes={}",
             digest(&lix_result),
             digest(&final_lix),
             lix_elapsed.map_or(0, |value| value.as_micros()),
             sqlite_elapsed.map_or(0, |value| value.as_micros()),
+            read_counters.get_many_calls,
+            read_counters.requested_keys,
+            read_counters.returned_values,
+            read_counters.returned_bytes,
         );
     }
 }

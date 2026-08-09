@@ -44,6 +44,10 @@ pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
+#[cfg(feature = "storage-benches")]
+pub use read_scope::{
+    StorageAdapterReadCounters, reset_storage_adapter_read_counters, storage_adapter_read_counters,
+};
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };

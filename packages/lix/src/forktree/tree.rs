@@ -1555,6 +1555,10 @@ fn decode_node(id: ObjectId, bytes: &[u8]) -> Result<Node, StorageError> {
     })
 }
 
+pub(super) fn is_serving_tree_node(id: ObjectId, bytes: &[u8]) -> Result<bool, StorageError> {
+    Ok(!matches!(decode_node(id, bytes)?.kind, TreeKind::Receipt))
+}
+
 fn encode_summary(encoder: &mut Encoder, summary: TreeSummary) {
     encoder.u64(summary.entry_count);
     encoder.u64(summary.logical_bytes);
