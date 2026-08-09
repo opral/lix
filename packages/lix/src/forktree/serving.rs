@@ -16,6 +16,7 @@ use super::model::{
 use super::object::ObjectId;
 use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
+    encode_state_key,
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
@@ -28,10 +29,8 @@ const BRANCH_SELECTOR_PREFIX: &[u8] = b"branch/";
 const BRANCH_SCAN_PAGE_ROWS: usize = 256;
 const CATALOG_SCAN_PAGE_ROWS: usize = 1024;
 
-/// Loads a commit's complete authenticated member closure. Small commits keep
-/// the original inline representation; larger commits resolve the immutable
-/// CommitMemberPageV1 chain while checking commit identity, contiguous
-/// ordinals, cycles, and duplicate Change object identities.
+/// Loads a commit's complete authenticated member closure from its mandatory
+/// byte-bounded change-page chain.
 pub(crate) async fn load_commit_members<R>(
     read: &R,
     commit: &CommitObjectV1,
@@ -39,20 +38,20 @@ pub(crate) async fn load_commit_members<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let Some(mut page_id) = commit.member_page_root else {
+    if commit.member_page_object_ids.is_empty() {
         return Ok(commit.members.clone());
-    };
+    }
     if !commit.members.is_empty() {
         return Err(corruption("paged commit carries an inline member closure"));
     }
     let mut members = Vec::new();
-    let mut visited = BTreeSet::new();
-    loop {
-        if !visited.insert(page_id) {
-            return Err(corruption("commit member page chain contains a cycle"));
-        }
-        let bytes = super::view::load_object_bytes(read, page_id).await?;
-        let page = super::model::CommitMemberPageV1::decode(page_id, &bytes)?;
+    let pages =
+        super::view::load_object_map(read, commit.member_page_object_ids.iter().copied()).await?;
+    for page_id in &commit.member_page_object_ids {
+        let bytes = pages
+            .get(page_id)
+            .ok_or_else(|| corruption("commit change page is absent"))?;
+        let page = super::model::CommitChangePageV2::decode(*page_id, bytes)?;
         if page.commit_id != commit.commit_id
             || page.start_ordinal
                 != u32::try_from(members.len())
@@ -63,20 +62,104 @@ where
             ));
         }
         members.extend(page.members);
-        match page.next_page_object_id {
-            Some(next) => page_id = next,
-            None => break,
-        }
     }
     let mut unique_changes = BTreeSet::new();
     for member in &members {
-        if !unique_changes.insert(member.change_object_id()) {
-            return Err(corruption(
-                "commit member page chain repeats a change object",
-            ));
+        if !unique_changes.insert(member.change_id()) {
+            return Err(corruption("commit member page chain repeats a ChangeId"));
         }
     }
     Ok(members)
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSemanticMember {
+    change_id: ChangeId,
+    payload: Vec<u8>,
+    global: bool,
+    updated_at: crate::common::LixTimestamp,
+    blob_manifest_object_ids: Vec<ObjectId>,
+}
+
+async fn resolve_semantic_member<R>(
+    read: &R,
+    member: &CommitMemberV1,
+) -> Result<ResolvedSemanticMember, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let expected_change_id = member.change_id();
+    let mut current = member.clone();
+    let mut visited = BTreeSet::new();
+    loop {
+        match current {
+            CommitMemberV1::Introduced {
+                change_id,
+                payload,
+                global,
+                updated_at,
+                blob_manifest_object_ids,
+            } => {
+                if change_id != expected_change_id {
+                    return Err(corruption(
+                        "selected member source changes its authenticated ChangeId",
+                    ));
+                }
+                return Ok(ResolvedSemanticMember {
+                    change_id,
+                    payload,
+                    global,
+                    updated_at,
+                    blob_manifest_object_ids,
+                });
+            }
+            CommitMemberV1::Selected {
+                change_id,
+                source_commit_object_id,
+                source_ordinal,
+            } => {
+                if change_id != expected_change_id
+                    || !visited.insert((source_commit_object_id, source_ordinal))
+                {
+                    return Err(corruption(
+                        "selected member source is cyclic or changes its ChangeId",
+                    ));
+                }
+                let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
+                let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
+                current = load_commit_members(read, &source)
+                    .await?
+                    .get(source_ordinal as usize)
+                    .cloned()
+                    .ok_or_else(|| corruption("selected member source ordinal is absent"))?;
+            }
+        }
+    }
+}
+
+async fn semantic_change_for_member<R>(
+    read: &R,
+    member: &CommitMemberV1,
+) -> Result<ChangeObjectV1, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let resolved = resolve_semantic_member(read, member).await?;
+    Ok(ChangeObjectV1::Semantic {
+        change_id: resolved.change_id,
+        payload: resolved.payload,
+        json_payload_object_ids: Vec::new(),
+    })
+}
+
+async fn semantic_change_for_member_on_view<R>(
+    view: &CoherentView<R>,
+    member: &CommitMemberV1,
+) -> Result<ChangeObjectV1, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    semantic_change_for_member(view.retained_read(), member).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,18 +188,59 @@ impl Eq for VisibleStateRow {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StateTreeMutation {
-    Insert { key: Vec<u8>, value: Vec<u8> },
-    Update { key: Vec<u8>, value: Vec<u8> },
-    Remove { key: Vec<u8> },
+    Insert {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        audit: Option<StateMutationAudit>,
+    },
+    Update {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        audit: Option<StateMutationAudit>,
+    },
+    Remove {
+        key: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StateMutationAudit {
+    pub(crate) commit_id: [u8; 16],
+    pub(crate) tombstone: bool,
+    pub(crate) blob_manifest_object_ids: Vec<ObjectId>,
 }
 
 impl StateTreeMutation {
     pub(crate) fn insert(key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self::Insert { key, value }
+        Self::Insert {
+            key,
+            value,
+            audit: None,
+        }
     }
 
     pub(crate) fn update(key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self::Update { key, value }
+        Self::Update {
+            key,
+            value,
+            audit: None,
+        }
+    }
+
+    pub(crate) fn insert_bound(key: Vec<u8>, value: Vec<u8>, audit: StateMutationAudit) -> Self {
+        Self::Insert {
+            key,
+            value,
+            audit: Some(audit),
+        }
+    }
+
+    pub(crate) fn update_bound(key: Vec<u8>, value: Vec<u8>, audit: StateMutationAudit) -> Self {
+        Self::Update {
+            key,
+            value,
+            audit: Some(audit),
+        }
     }
 
     pub(crate) fn remove(key: Vec<u8>) -> Self {
@@ -125,8 +249,8 @@ impl StateTreeMutation {
 
     fn into_ordered(self) -> OrderedTreeMutation {
         match self {
-            Self::Insert { key, value } => OrderedTreeMutation::Insert { key, value },
-            Self::Update { key, value } => OrderedTreeMutation::Update { key, value },
+            Self::Insert { key, value, .. } => OrderedTreeMutation::Insert { key, value },
+            Self::Update { key, value, .. } => OrderedTreeMutation::Update { key, value },
             Self::Remove { key } => OrderedTreeMutation::Delete { key },
         }
     }
@@ -482,20 +606,18 @@ where
         let value =
             value.ok_or_else(|| corruption("retained RefChange has no ChangeCatalog owner"))?;
         let entry = ChangeCatalogEntry::decode(&value)?;
-        if entry.change_object_id != *ref_id
-            || entry.owner
-                != (ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id: *ref_id,
-                    branch_id: match change {
-                        ChangeObjectV1::BranchRef { branch_id, .. } => *branch_id,
-                        ChangeObjectV1::Semantic { .. } => {
-                            return Err(corruption(
-                                "RefChange chronology reached a semantic Change",
-                            )
-                            .into());
-                        }
-                    },
-                })
+        if entry.owner
+            != (ChangeCatalogOwner::BranchRef {
+                ref_change_object_id: *ref_id,
+                branch_id: match change {
+                    ChangeObjectV1::BranchRef { branch_id, .. } => *branch_id,
+                    ChangeObjectV1::Semantic { .. } => {
+                        return Err(
+                            corruption("RefChange chronology reached a semantic Change").into()
+                        );
+                    }
+                },
+            })
         {
             return Err(corruption(
                 "retained RefChange disagrees with its ChangeCatalog owner/back-edge",
@@ -1123,11 +1245,8 @@ where
     .await?;
     let members = load_commit_members(read, &commit).await?;
     let mut records = Vec::with_capacity(members.len());
-    for (ordinal, member) in members.iter().copied().enumerate() {
-        let change_object_id = member.change_object_id();
-        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
-        let change_id = change.change_id();
+    for (ordinal, member) in members.iter().enumerate() {
+        let change_id = member.change_id();
         let value = lookup_on_read(
             repository.change_catalog_root,
             "change",
@@ -1143,7 +1262,7 @@ where
             commit_object_id,
             commit.generation,
             ordinal,
-            member,
+            member.clone(),
             entry,
         )
         .await?;
@@ -1469,47 +1588,45 @@ async fn semantic_change_record<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let bytes = super::view::load_object_bytes(read, entry.change_object_id).await?;
-    let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
-    if change.change_id() != id {
-        return Err(corruption("ChangeCatalog key does not match Change object").into());
-    }
-    match (entry.owner, &change) {
-        (
-            ChangeCatalogOwner::CommitMember {
-                commit_object_id,
-                ordinal,
-            },
-            ChangeObjectV1::Semantic { .. },
-        ) => {
+    let change = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
             let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
             let members = load_commit_members(read, &commit).await?;
-            if members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(entry.change_object_id))
-            {
+            let member = members
+                .get(ordinal as usize)
+                .ok_or_else(|| corruption("ChangeCatalog owner ordinal is absent"))?;
+            if member.change_id() != id || member.source().is_some() {
                 return Err(corruption("ChangeCatalog owner/ordinal back-edge is invalid").into());
             }
+            semantic_change_for_member(read, member).await?
         }
-        (
-            ChangeCatalogOwner::BranchRef {
-                ref_change_object_id,
-                branch_id,
-            },
-            ChangeObjectV1::BranchRef {
+        ChangeCatalogOwner::BranchRef {
+            ref_change_object_id,
+            branch_id,
+        } => {
+            let bytes = super::view::load_object_bytes(read, ref_change_object_id).await?;
+            let change = ChangeObjectV1::decode(ref_change_object_id, &bytes)?;
+            let ChangeObjectV1::BranchRef {
                 branch_id: object_branch,
                 ..
-            },
-        ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
-            validate_retained_ref_change(
-                read,
-                change_catalog_root,
-                entry.change_object_id,
-                &change,
-            )
-            .await?;
+            } = &change
+            else {
+                return Err(corruption("branch-ref catalog owner names semantic payload").into());
+            };
+            if branch_id != *object_branch {
+                return Err(corruption("ChangeCatalog branch owner/back-edge is invalid").into());
+            }
+            validate_retained_ref_change(read, change_catalog_root, ref_change_object_id, &change)
+                .await?;
+            change
         }
-        _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid").into()),
+    };
+    if change.change_id() != id {
+        return Err(corruption("ChangeCatalog key does not match embedded ChangeId").into());
     }
     let (payload, json_payload_object_ids, is_empty_ref_payload) = match change {
         ChangeObjectV1::Semantic {
@@ -1587,11 +1704,6 @@ pub(super) async fn validate_member_catalog_owner<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    if entry.change_object_id != member.change_object_id() {
-        return Err(corruption(
-            "commit membership edge disagrees with ChangeCatalog object identity",
-        ));
-    }
     let canonical_owner = match entry.owner {
         ChangeCatalogOwner::CommitMember {
             commit_object_id,
@@ -1607,8 +1719,11 @@ where
             )
             .await?;
             let introduction_members = load_commit_members(read, &introduction).await?;
-            if introduction_members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(member.change_object_id()))
+            let introduction_member = introduction_members
+                .get(ordinal as usize)
+                .ok_or_else(|| corruption("ChangeCatalog introduction ordinal is absent"))?;
+            if introduction_member.change_id() != member.change_id()
+                || introduction_member.source().is_some()
             {
                 return Err(corruption(
                     "ChangeCatalog canonical introduction owner/ordinal is invalid",
@@ -1650,8 +1765,8 @@ where
             let source_members = load_commit_members(read, &source_commit).await?;
             if source_members
                 .get(source_ordinal as usize)
-                .map(|source| source.change_object_id())
-                != Some(member.change_object_id())
+                .map(CommitMemberV1::change_id)
+                != Some(member.change_id())
             {
                 return Err(corruption(
                     "selected membership source commit/ordinal back-edge is invalid",
@@ -1675,13 +1790,11 @@ where
         .ok_or_else(|| corruption("selected source commit is absent from CommitCatalog"))?;
     let (source_commit_object_id, _) = source.encode()?;
     let source_members = view.load_commit_members(&source).await?;
-    for (source_ordinal, source_member) in source_members.iter().copied().enumerate() {
-        let change_object_id = source_member.change_object_id();
-        let bytes = view.load_object_bytes(change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
-        if change.change_id() != change_id {
+    for (source_ordinal, source_member) in source_members.iter().enumerate() {
+        if source_member.change_id() != change_id {
             continue;
         }
+        let change = semantic_change_for_member_on_view(view, source_member).await?;
         let value = view
             .lookup_tree_value(
                 view.repository_root().change_catalog_root,
@@ -1696,13 +1809,13 @@ where
             source_commit_object_id,
             source.generation,
             source_ordinal,
-            source_member,
+            source_member.clone(),
             entry,
         )
         .await?;
         return Ok((
             CommitMemberV1::selected(
-                change_object_id,
+                change_id,
                 source_commit_object_id,
                 u32::try_from(source_ordinal)
                     .map_err(|_| corruption("selected source ordinal exceeds u32"))?,
@@ -1816,18 +1929,13 @@ where
         Some(root) => lookup_many_on_read(root, "state", keys, read).await?,
         None => vec![None; keys.len()],
     };
-    let mut local = Vec::with_capacity(local_encoded.len());
     let mut missing_by_key = BTreeMap::<Vec<u8>, Vec<usize>>::new();
-    for (slot, encoded) in local_encoded.into_iter().enumerate() {
-        match encoded {
-            Some(encoded) => local.push(Some(decode_state_value_storage(&encoded)?)),
-            None => {
-                local.push(None);
-                missing_by_key
-                    .entry(keys[slot].clone())
-                    .or_default()
-                    .push(slot);
-            }
+    for (slot, encoded) in local_encoded.iter().enumerate() {
+        if encoded.is_none() {
+            missing_by_key
+                .entry(keys[slot].clone())
+                .or_default()
+                .push(slot);
         }
     }
     let global_keys = missing_by_key.keys().cloned().collect::<Vec<_>>();
@@ -1839,27 +1947,132 @@ where
         }
     }
 
-    local
+    let selected = local_encoded
         .into_iter()
         .enumerate()
         .map(|(slot, local)| {
-            if let Some(value) = local {
-                return if value.cell.deleted() && !include_tombstone {
-                    Ok(None)
-                } else {
-                    Ok(Some((value, StateSource::Branch)))
-                };
+            local
+                .map(|encoded| (keys[slot].clone(), encoded, StateSource::Branch))
+                .or_else(|| {
+                    global_by_slot
+                        .remove(&slot)
+                        .flatten()
+                        .map(|encoded| (keys[slot].clone(), encoded, StateSource::Global))
+                })
+        })
+        .collect::<Vec<_>>();
+    let resolved = resolve_state_values_on_read(read, &selected).await?;
+    resolved
+        .into_iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some((value, StateSource::Global)) if matches!(value.cell, StateCell::Tombstone) => {
+                Err(corruption("global state tree contains a tombstone"))
             }
-            let Some(encoded) = global_by_slot.remove(&slot).flatten() else {
-                return Ok(None);
-            };
-            let value = decode_state_value_storage(&encoded)?;
-            if matches!(value.cell, StateCell::Tombstone) {
-                return Err(corruption("global state tree contains a tombstone"));
-            }
-            Ok(Some((value, StateSource::Global)))
+            Some((value, _)) if value.cell.deleted() && !include_tombstone => Ok(None),
+            value => Ok(value),
         })
         .collect()
+}
+
+async fn resolve_state_values_on_read<R>(
+    read: &R,
+    selected: &[Option<(Vec<u8>, Vec<u8>, StateSource)>],
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut refs = Vec::with_capacity(selected.len());
+    let mut page_ids = BTreeSet::new();
+    for row in selected {
+        let value_ref = row
+            .as_ref()
+            .map(|(_, encoded, _)| decode_state_value_storage(encoded))
+            .transpose()?;
+        if let Some(value_ref) = value_ref {
+            page_ids.insert(value_ref.page_object_id);
+        }
+        refs.push(value_ref);
+    }
+    let pages = super::view::load_object_map(read, page_ids).await?;
+    let mut decoded_pages = BTreeMap::new();
+    for (id, bytes) in pages {
+        decoded_pages.insert(id, super::model::CommitChangePageV2::decode(id, &bytes)?);
+    }
+
+    let mut output = Vec::with_capacity(selected.len());
+    for (row, value_ref) in selected.iter().zip(refs) {
+        let (Some((encoded_key, _, source)), Some(value_ref)) = (row, value_ref) else {
+            output.push(None);
+            continue;
+        };
+        let page = decoded_pages
+            .get(&value_ref.page_object_id)
+            .ok_or_else(|| corruption("state value page is absent"))?;
+        let member = page
+            .members
+            .get(value_ref.page_ordinal as usize)
+            .ok_or_else(|| corruption("state value page ordinal is absent"))?;
+        let resolved = resolve_semantic_member(read, member).await?;
+        let expected_global = *source == StateSource::Global;
+        if resolved.global != expected_global {
+            return Err(corruption(
+                "state value page domain differs from its state root",
+            ));
+        }
+        let public_change_id =
+            crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(*resolved.change_id.as_bytes()));
+        let record =
+            crate::changelog::decode_forktree_change_payload(&resolved.payload, public_change_id)
+                .map_err(|error| corruption(error.to_string()))?;
+        if encode_state_key(super::state::StateKeyRef {
+            schema_key: &record.schema_key,
+            file_id: record.file_id.as_deref(),
+            entity_pk: &record.entity_pk,
+        }) != *encoded_key
+        {
+            return Err(corruption(
+                "state value page identity differs from its state key",
+            ));
+        }
+        let cell = match record.snapshot {
+            crate::json_store::JsonSlot::None => StateCell::Tombstone,
+            crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
+                StateCell::Null
+            }
+            crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
+            crate::json_store::JsonSlot::Ref(_)
+            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
+                return Err(corruption(
+                    "state value page contains an out-of-page JSON reference",
+                ));
+            }
+        };
+        let metadata = match record.metadata {
+            crate::json_store::JsonSlot::None => None,
+            crate::json_store::JsonSlot::Inline(value) => Some(value),
+            crate::json_store::JsonSlot::Ref(_)
+            | crate::json_store::JsonSlot::ForkTreeObject(_) => {
+                return Err(corruption("state value page contains out-of-page metadata"));
+            }
+        };
+        output.push(Some((
+            StateValue {
+                change_id: public_change_id,
+                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
+                    *page.commit_id.as_bytes(),
+                )),
+                created_at: record.created_at,
+                updated_at: resolved.updated_at,
+                cell,
+                metadata: metadata.map(Into::into),
+                origin_key: record.origin_key,
+                blob_manifest_object_ids: resolved.blob_manifest_object_ids,
+            },
+            *source,
+        )));
+    }
+    Ok(output)
 }
 
 pub(crate) async fn state_range<R>(
@@ -1931,8 +2144,15 @@ pub(crate) async fn state_range_on_roots<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let page_size = limit.unwrap_or(64).clamp(1, 64);
-    let mut output = Vec::new();
+    // This is an internal authenticated merge, not a public pagination
+    // boundary.  A 64-row page repeatedly descended the same immutable tree
+    // (sixteen times for the common 1K entity scan), dominating broad reads
+    // after semantic payloads moved into compact change pages.  Keep the
+    // working set bounded while amortizing one tree proof across a useful
+    // OLTP batch.
+    const STATE_RANGE_PAGE_SIZE: usize = 4_096;
+    let page_size = STATE_RANGE_PAGE_SIZE;
+    let mut selected = Vec::new();
     let mut global_cursor = None;
     let mut local_cursor = None;
     let mut global = std::collections::VecDeque::new();
@@ -1940,9 +2160,6 @@ where
     let mut global_done = false;
     let mut local_done = local_state_root.is_none();
     loop {
-        if limit.is_some_and(|limit| output.len() >= limit) {
-            break;
-        }
         if global.is_empty() && !global_done {
             let page = scan_bounded_page_on_read(
                 global_state_root,
@@ -1995,7 +2212,20 @@ where
             let (key, value) = global.pop_front().expect("front global state row");
             (key, value, StateSource::Global)
         };
-        let value = decode_state_value_storage(&encoded)?;
+        selected.push(Some((key, encoded, source)));
+    }
+    let values = resolve_state_values_on_read(read, &selected).await?;
+    let mut output = Vec::with_capacity(values.len());
+    for (selected, value) in selected.into_iter().zip(values) {
+        let Some((key, _, source)) = selected else {
+            continue;
+        };
+        let Some((value, resolved_source)) = value else {
+            return Err(corruption("selected state leaf did not resolve"));
+        };
+        if source != resolved_source {
+            return Err(corruption("state range source changed during resolution"));
+        }
         if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
             return Err(corruption("global state tree contains a tombstone"));
         }
@@ -2003,6 +2233,9 @@ where
             continue;
         }
         output.push((key, value, source));
+        if limit.is_some_and(|limit| output.len() >= limit) {
+            break;
+        }
     }
     Ok(output)
 }
@@ -2088,21 +2321,23 @@ where
     let mut wrote_tombstone = false;
     let mut written_commit_ids = BTreeSet::new();
     for mutation in &mutations {
-        let (key, value) = match mutation {
-            StateTreeMutation::Insert { key, value } | StateTreeMutation::Update { key, value } => {
-                (key, Some(value))
-            }
-            StateTreeMutation::Remove { key } => (key, None),
+        let (key, value, audit) = match mutation {
+            StateTreeMutation::Insert { key, value, audit }
+            | StateTreeMutation::Update { key, value, audit } => (key, Some(value), audit.as_ref()),
+            StateTreeMutation::Remove { key } => (key, None, None),
         };
         decode_state_key(key).map_err(|error| corruption(error.to_string()))?;
         if let Some(value) = value {
-            let value = decode_state_value_storage(value)?;
-            wrote_tombstone |= value.cell.deleted();
-            written_commit_ids.insert(*value.commit_id.as_uuid().as_bytes());
+            let _ = decode_state_value_storage(value)?;
+        }
+        if let Some(audit) = audit {
+            wrote_tombstone |= audit.tombstone;
+            written_commit_ids.insert(audit.commit_id);
             added_blob_roots.extend(
-                value
+                audit
                     .blob_manifest_object_ids
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|object_id| (object_id, ())),
             );
         }
@@ -2494,50 +2729,55 @@ async fn validate_change_entry<R>(
 where
     R: StorageAdapterRead,
 {
-    let bytes = view.load_object_bytes(entry.change_object_id).await?;
-    let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
-    if change.change_id() != id {
-        return Err(corruption(
-            "ChangeCatalog key does not match embedded ChangeId",
-        ));
-    }
-    match (entry.owner, &change) {
-        (
-            ChangeCatalogOwner::CommitMember {
-                commit_object_id,
-                ordinal,
-            },
-            ChangeObjectV1::Semantic { .. },
-        ) => {
+    let change = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
             let bytes = view.load_object_bytes(commit_object_id).await?;
             let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
             let members = view.load_commit_members(&commit).await?;
-            if members.get(ordinal as usize)
-                != Some(&CommitMemberV1::introduced(entry.change_object_id))
-            {
+            let member = members
+                .get(ordinal as usize)
+                .ok_or_else(|| corruption("ChangeCatalog owner ordinal is absent"))?;
+            if member.change_id() != id || member.source().is_some() {
                 return Err(corruption(
                     "ChangeCatalog commit owner does not point back at its ordinal member",
                 ));
             }
+            semantic_change_for_member_on_view(view, member).await?
         }
-        (
-            ChangeCatalogOwner::BranchRef {
-                ref_change_object_id,
-                branch_id,
-            },
-            ChangeObjectV1::BranchRef {
+        ChangeCatalogOwner::BranchRef {
+            ref_change_object_id,
+            branch_id,
+        } => {
+            let bytes = view.load_object_bytes(ref_change_object_id).await?;
+            let change = ChangeObjectV1::decode(ref_change_object_id, &bytes)?;
+            let ChangeObjectV1::BranchRef {
                 branch_id: object_branch,
                 ..
-            },
-        ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {
+            } = &change
+            else {
+                return Err(corruption("branch-ref owner names semantic payload"));
+            };
+            if branch_id != *object_branch {
+                return Err(corruption(
+                    "ChangeCatalog branch owner/back-edge is invalid",
+                ));
+            }
             view.validate_retained_ref_change(
                 view.repository_root().change_catalog_root,
-                entry.change_object_id,
+                ref_change_object_id,
                 &change,
             )
             .await?;
+            change
         }
-        _ => return Err(corruption("ChangeCatalog owner kind/back-edge is invalid")),
+    };
+    if change.change_id() != id {
+        return Err(corruption(
+            "ChangeCatalog key does not match embedded ChangeId",
+        ));
     }
     Ok(change)
 }
@@ -2565,13 +2805,8 @@ where
         }
     }
     let members = load_commit_members(read, commit).await?;
-    for (ordinal, member) in members.iter().copied().enumerate() {
-        let change_object_id = member.change_object_id();
-        let bytes = super::view::load_object_bytes(read, change_object_id).await?;
-        let change = ChangeObjectV1::decode(change_object_id, &bytes)?;
-        if !matches!(change, ChangeObjectV1::Semantic { .. }) {
-            return Err(corruption("commit member edge names a RefChange object"));
-        }
+    for (ordinal, member) in members.iter().enumerate() {
+        let change = semantic_change_for_member(read, member).await?;
         let value = lookup_on_read(
             change_catalog_root,
             "change",
@@ -2587,7 +2822,7 @@ where
             commit_object_id,
             commit.generation,
             ordinal,
-            member,
+            member.clone(),
             entry,
         )
         .await?;
@@ -2621,12 +2856,11 @@ where
         .await?
         .ok_or_else(|| corruption("retained RefChange has no ChangeCatalog owner"))?;
     let entry = ChangeCatalogEntry::decode(&value)?;
-    if entry.change_object_id != ref_object_id
-        || entry.owner
-            != (ChangeCatalogOwner::BranchRef {
-                ref_change_object_id: ref_object_id,
-                branch_id: *branch_id,
-            })
+    if entry.owner
+        != (ChangeCatalogOwner::BranchRef {
+            ref_change_object_id: ref_object_id,
+            branch_id: *branch_id,
+        })
     {
         return Err(corruption(
             "retained RefChange disagrees with its ChangeCatalog owner/back-edge",
@@ -2672,6 +2906,6 @@ where
     Ok(())
 }
 
-fn decode_state_value_storage(bytes: &[u8]) -> Result<StateValue, StorageError> {
+fn decode_state_value_storage(bytes: &[u8]) -> Result<super::state::StateValueRef, StorageError> {
     decode_state_value(bytes).map_err(|error| corruption(error.to_string()))
 }

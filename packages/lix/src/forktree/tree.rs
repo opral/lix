@@ -224,12 +224,7 @@ pub(super) fn ordered_tree_edges(
                     TreeKind::State => {
                         let value = super::state::decode_state_value(&entry.value)
                             .map_err(|error| corruption(error.to_string()))?;
-                        object_ids.extend(
-                            value
-                                .blob_manifest_object_ids
-                                .into_iter()
-                                .map(|id| (id, ObjectDomain::BlobManifest)),
-                        );
+                        object_ids.push((value.page_object_id, ObjectDomain::CommitChangePageV2));
                     }
                     TreeKind::CommitCatalog => {
                         let key = CommitId::from_bytes(
@@ -252,26 +247,20 @@ pub(super) fn ordered_tree_edges(
                                 .map_err(|_| corruption("ChangeCatalog key is not a UUID"))?,
                         );
                         let value = ChangeCatalogEntry::decode(&entry.value)?;
-                        let change_domain = match value.owner {
+                        match value.owner {
                             ChangeCatalogOwner::CommitMember {
                                 commit_object_id, ..
                             } => {
                                 object_ids.push((commit_object_id, ObjectDomain::Commit));
-                                ObjectDomain::SemanticChange
                             }
                             ChangeCatalogOwner::BranchRef {
                                 ref_change_object_id,
                                 ..
                             } => {
-                                if ref_change_object_id != value.change_object_id {
-                                    return Err(corruption(
-                                        "branch-ref catalog owner does not equal its Change object",
-                                    ));
-                                }
-                                ObjectDomain::BranchRefChange
+                                object_ids
+                                    .push((ref_change_object_id, ObjectDomain::BranchRefChange));
                             }
-                        };
-                        object_ids.push((value.change_object_id, change_domain));
+                        }
                         change_entries.push((key, value));
                     }
                     TreeKind::Receipt | TreeKind::Retention => {
@@ -1140,48 +1129,47 @@ pub(super) fn validate_change_catalog_back_edge(
     entry: ChangeCatalogEntry,
     load: impl Fn(ObjectId) -> Result<Bytes, StorageError>,
 ) -> Result<ChangeObjectV1, StorageError> {
-    let change = ChangeObjectV1::decode(entry.change_object_id, &load(entry.change_object_id)?)?;
-    if change.change_id() != key {
-        return Err(corruption(
-            "ChangeCatalog key does not match embedded ChangeId",
-        ));
-    }
-    match (entry.owner, &change) {
-        (
-            ChangeCatalogOwner::CommitMember {
-                commit_object_id,
-                ordinal,
-            },
-            ChangeObjectV1::Semantic { .. },
-        ) => {
+    let change = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
             let commit = CommitObjectV1::decode(commit_object_id, &load(commit_object_id)?)?;
             let members = commit.load_members_with(&load)?;
             let member = members
                 .get(ordinal as usize)
                 .ok_or_else(|| corruption("ChangeCatalog commit ordinal is out of bounds"))?;
-            if *member != super::model::CommitMemberV1::introduced(entry.change_object_id) {
+            let super::model::CommitMemberV1::Introduced {
+                change_id, payload, ..
+            } = member
+            else {
                 return Err(corruption(
-                    "ChangeCatalog commit ordinal does not point back to its Change object",
+                    "ChangeCatalog canonical owner points to a selected member",
                 ));
+            };
+            ChangeObjectV1::Semantic {
+                change_id: *change_id,
+                payload: payload.clone(),
+                json_payload_object_ids: Vec::new(),
             }
         }
-        (
-            ChangeCatalogOwner::BranchRef {
-                ref_change_object_id,
-                branch_id,
-            },
-            ChangeObjectV1::BranchRef {
+        ChangeCatalogOwner::BranchRef {
+            ref_change_object_id,
+            branch_id,
+        } => {
+            let change =
+                ChangeObjectV1::decode(ref_change_object_id, &load(ref_change_object_id)?)?;
+            let ChangeObjectV1::BranchRef {
                 branch_id: object_branch_id,
                 before_semantic_head_commit_object_id,
                 after_semantic_head_commit_object_id,
                 ..
-            },
-        ) => {
-            if ref_change_object_id != entry.change_object_id {
+            } = &change
+            else {
                 return Err(corruption(
-                    "ChangeCatalog branch-ref owner does not equal its Change object",
+                    "branch-ref catalog owner names semantic payload",
                 ));
-            }
+            };
             if branch_id != *object_branch_id {
                 return Err(corruption(
                     "ChangeCatalog branch id does not match its RefChange object",
@@ -1192,17 +1180,13 @@ pub(super) fn validate_change_catalog_back_edge(
             {
                 return Err(corruption("RefChange has no before or after target"));
             }
+            change
         }
-        (ChangeCatalogOwner::CommitMember { .. }, ChangeObjectV1::BranchRef { .. }) => {
-            return Err(corruption(
-                "branch-ref Change object has commit-member catalog ownership",
-            ));
-        }
-        (ChangeCatalogOwner::BranchRef { .. }, ChangeObjectV1::Semantic { .. }) => {
-            return Err(corruption(
-                "semantic Change object has branch-ref catalog ownership",
-            ));
-        }
+    };
+    if change.change_id() != key {
+        return Err(corruption(
+            "ChangeCatalog key does not match embedded ChangeId",
+        ));
     }
     Ok(change)
 }

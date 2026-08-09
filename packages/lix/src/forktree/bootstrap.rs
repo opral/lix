@@ -26,8 +26,8 @@ use crate::storage_adapter::{
 
 use super::model::{
     BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1,
+    CommitObjectV1, GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::state::{
@@ -46,8 +46,8 @@ const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 
 struct SeedRow {
     key: Vec<u8>,
-    value: Vec<u8>,
     change_id: ChangelogChangeId,
+    local_change_id: ChangelogChangeId,
     schema_key: String,
     entity_pk: EntityPk,
     file_id: Option<String>,
@@ -96,27 +96,17 @@ where
      -> Result<(), LixError> {
         let change_uuid = functions.call_uuid_v7();
         let change_id = ChangelogChangeId::new(change_uuid);
-        let snapshot_text = snapshot.to_string();
-        let snapshot = JsonSlot::Inline(snapshot_text.clone().into());
+        let local_change_id = ChangelogChangeId::new(functions.call_uuid_v7());
+        let snapshot = JsonSlot::Inline(snapshot.to_string().into());
         let key = encode_state_key(StateKeyRef {
             schema_key,
             file_id,
             entity_pk: &entity_pk,
         });
-        let value = encode_state_value(StateValueRef {
-            change_id,
-            commit_id: initial_commit,
-            created_at: timestamp,
-            updated_at: timestamp,
-            cell: StateCellRef::Value(&snapshot_text),
-            metadata: None,
-            origin_key: None,
-            blob_manifest_object_ids: &[],
-        })?;
         rows.push(SeedRow {
             key,
-            value,
             change_id,
+            local_change_id,
             schema_key: schema_key.to_owned(),
             entity_pk,
             file_id: file_id.map(str::to_owned),
@@ -182,16 +172,74 @@ where
     )?;
 
     rows.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut semantic_members = Vec::with_capacity(rows.len() * 2);
+    let mut changes = Vec::with_capacity(rows.len() * 2);
+    for global in [true, false] {
+        for row in &rows {
+            let public_change_id = if global {
+                row.change_id
+            } else {
+                row.local_change_id
+            };
+            let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+                format_version: 2,
+                change_id: public_change_id,
+                account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+                schema_key: row.schema_key.clone(),
+                entity_pk: row.entity_pk.clone(),
+                file_id: row.file_id.clone(),
+                snapshot: row.snapshot.clone(),
+                metadata: row.metadata.clone(),
+                created_at: timestamp,
+                origin_key: None,
+            })?;
+            let change_id =
+                super::model::ChangeId::from_bytes(*public_change_id.as_uuid().as_bytes());
+            semantic_members.push(CommitMemberV1::introduced(
+                change_id,
+                payload,
+                global,
+                timestamp,
+                Vec::new(),
+            ));
+            changes.push(change_id);
+        }
+    }
+
+    let member_pages = CommitChangePageV2::encode_pages(model_commit, &semantic_members)
+        .map_err(LixError::from)?;
     let global_entries = rows
         .iter()
-        .map(|row| (row.key.clone(), row.value.clone()))
-        .collect::<Vec<_>>();
+        .zip(&member_pages.member_locations[..rows.len()])
+        .map(|(row, location)| {
+            Ok((
+                row.key.clone(),
+                encode_state_value(StateValueRef {
+                    page_object_id: location.page_object_id,
+                    page_ordinal: location.page_ordinal,
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let local_entries = rows
+        .iter()
+        .zip(&member_pages.member_locations[rows.len()..])
+        .map(|(row, location)| {
+            Ok((
+                row.key.clone(),
+                encode_state_value(StateValueRef {
+                    page_object_id: location.page_object_id,
+                    page_ordinal: location.page_ordinal,
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
     let global_state = build_state_tree(&global_entries).map_err(LixError::from)?;
     // Seed the first workspace branch with the same authenticated tracked
     // rows.  Global rows remain available to the global view, while the
     // branch-local copy gives ordinary branch-scoped catalog queries their
     // exact branch identity instead of forcing them through a global owner.
-    let local_state = build_state_tree(&global_entries).map_err(LixError::from)?;
+    let local_state = build_state_tree(&local_entries).map_err(LixError::from)?;
     let retention = build_retention_tree(&[]).map_err(LixError::from)?;
 
     let mut objects = ImmutableObjectSet::default();
@@ -202,31 +250,10 @@ where
         .extend(local_state.objects)
         .map_err(LixError::from)?;
     objects.extend(retention.objects).map_err(LixError::from)?;
-
-    let mut semantic_members = Vec::with_capacity(rows.len());
-    let mut changes = Vec::with_capacity(rows.len() + 2);
-    for row in &rows {
-        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
-            format_version: 2,
-            change_id: row.change_id,
-            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
-            schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
-            file_id: row.file_id.clone(),
-            snapshot: row.snapshot.clone(),
-            metadata: row.metadata.clone(),
-            created_at: timestamp,
-            origin_key: None,
-        })?;
-        let change = ChangeObjectV1::Semantic {
-            change_id: super::model::ChangeId::from_bytes(*row.change_id.as_uuid().as_bytes()),
-            payload,
-            json_payload_object_ids: Vec::new(),
-        };
-        let (object_id, bytes) = change.encode().map_err(LixError::from)?;
-        objects.insert(object_id, bytes).map_err(LixError::from)?;
-        semantic_members.push(CommitMemberV1::introduced(object_id));
-        changes.push((row.change_id, object_id));
+    for (page_id, page_bytes) in &member_pages.objects {
+        objects
+            .insert(*page_id, page_bytes.clone())
+            .map_err(LixError::from)?;
     }
 
     let mut commit = CommitObjectV1 {
@@ -234,7 +261,7 @@ where
         generation: 1,
         parent_commit_object_ids: Vec::new(),
         members: semantic_members,
-        member_page_root: None,
+        member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
         global_state_root: global_state.root.object_id,
         local_state_root: local_state.root.object_id,
         metadata: crate::changelog::encode_forktree_commit_payload(
@@ -249,12 +276,7 @@ where
             },
         )?,
     };
-    let member_pages = commit.prepare_member_pages().map_err(LixError::from)?;
-    for (page_id, page_bytes) in member_pages {
-        objects
-            .insert(page_id, page_bytes)
-            .map_err(LixError::from)?;
-    }
+    let _ = commit.prepare_member_pages().map_err(LixError::from)?;
     let (commit_object_id, commit_bytes) = commit.encode().map_err(LixError::from)?;
     objects
         .insert(commit_object_id, commit_bytes)
@@ -287,11 +309,10 @@ where
     let mut change_catalog_entries = changes
         .iter()
         .enumerate()
-        .map(|(ordinal, (change_id, object_id))| {
+        .map(|(ordinal, change_id)| {
             (
-                super::model::ChangeId::from_bytes(*change_id.as_uuid().as_bytes()),
+                *change_id,
                 ChangeCatalogEntry {
-                    change_object_id: *object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: u32::try_from(ordinal).expect("bootstrap ordinal fits u32"),
@@ -303,7 +324,6 @@ where
             (
                 *change_id,
                 ChangeCatalogEntry {
-                    change_object_id: *object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: *object_id,
                         branch_id: if *change_id == global_ref_id {

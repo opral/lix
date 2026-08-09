@@ -23,69 +23,14 @@ use crate::transaction::types::{PreparedStateRowRef, StageJson};
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
+    CommitChangePageV2, CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
-    StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
-    encode_state_key, encode_state_value, load_commit, load_commit_summary,
+    StateKeyRef, StateMutationAudit, StateSource, StateTreeMutation, StateValueRef,
+    UntrackedValueRef, encode_state_key, encode_state_value, load_commit, load_commit_summary,
     open_coherent_view_on_read, select_historical_commit_member, state_point, state_points,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
-
-/// Converts transaction JSON into the representation owned by a ForkTree
-/// change. Small values retain their inline semantics; large values are
-/// staged as authenticated immutable objects before the change envelope is
-/// encoded. A ForkTree change never persists a legacy JsonRef.
-fn stage_forktree_json_slot(
-    publication: &mut PreparedPublication,
-    value: Option<&StageJson>,
-) -> Result<JsonSlot, LixError> {
-    let Some(value) = value else {
-        return Ok(JsonSlot::None);
-    };
-    if value.is_inline() {
-        return Ok(JsonSlot::Inline(value.normalized().into()));
-    }
-    let object_id = publication
-        .stage_json_payload(value.normalized())
-        .map_err(LixError::from)?;
-    Ok(JsonSlot::ForkTreeObject(*object_id.as_bytes()))
-}
-
-fn stage_forktree_json_text(
-    publication: &mut PreparedPublication,
-    value: Option<&str>,
-) -> Result<JsonSlot, LixError> {
-    let Some(value) = value else {
-        return Ok(JsonSlot::None);
-    };
-    if value.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
-        return Ok(JsonSlot::Inline(value.into()));
-    }
-    let object_id = publication
-        .stage_json_payload(value)
-        .map_err(LixError::from)?;
-    Ok(JsonSlot::ForkTreeObject(*object_id.as_bytes()))
-}
-
-fn json_payload_object_ids(
-    snapshot: &JsonSlot,
-    metadata: &JsonSlot,
-) -> Result<Vec<ObjectId>, LixError> {
-    let mut ids = Vec::new();
-    for slot in [snapshot, metadata] {
-        match slot {
-            JsonSlot::ForkTreeObject(bytes) => ids.push(ObjectId::from_bytes(*bytes)),
-            JsonSlot::Ref(_) => {
-                return Err(writer_error(
-                    "ForkTree change contains an unlowered JSON side-plane reference",
-                ));
-            }
-            JsonSlot::None | JsonSlot::Inline(_) => {}
-        }
-    }
-    Ok(ids)
-}
 
 /// Complete result of classifying one transaction's currently supported
 /// ForkTree publication intent.
@@ -413,8 +358,8 @@ where
             "ForkTree predecessor lookup returned the wrong slot count",
         ));
     }
-    let mut changes = Vec::with_capacity(tracked_rows.len().saturating_add(1));
-    let mut state_mutations = Vec::with_capacity(tracked_rows.len());
+    let mut members = Vec::with_capacity(tracked_rows.len());
+    let mut pending_rows = Vec::with_capacity(tracked_rows.len());
     for ((row, key), previous) in tracked_rows
         .into_iter()
         .zip(tracked_keys)
@@ -432,9 +377,12 @@ where
             .change_id
             .ok_or_else(|| writer_error("tracked row has no change identity"))?;
         let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
-        let snapshot = stage_forktree_json_text(&mut publication, canonical_snapshot.as_deref())?;
-        let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
-        let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;
+        let snapshot = canonical_snapshot
+            .as_deref()
+            .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
+        let metadata = row.metadata.map_or(JsonSlot::None, |value| {
+            JsonSlot::Inline(value.normalized().into())
+        });
         let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
             format_version: 2,
             change_id,
@@ -447,39 +395,41 @@ where
             created_at: row.created_at,
             origin_key: row.origin_key.map(ToString::to_string),
         })?;
-        changes.push(ChangeObjectV1::Semantic {
-            change_id: forktree_change_id(change_id),
+        let blob_manifest_object_ids =
+            blob_manifest_object_ids_for_row(row, &prepared_blob_manifests)?;
+        members.push(CommitMemberV1::introduced(
+            forktree_change_id(change_id),
             payload,
-            json_payload_object_ids,
-        });
-
+            global,
+            row.updated_at,
+            blob_manifest_object_ids.clone(),
+        ));
+        pending_rows.push((row, key, previous, blob_manifest_object_ids));
+    }
+    let member_pages = CommitChangePageV2::encode_pages(forktree_commit_id(commit_id), &members)?;
+    let mut state_mutations = Vec::with_capacity(pending_rows.len());
+    for ((row, key, previous, blob_manifest_object_ids), location) in
+        pending_rows.into_iter().zip(&member_pages.member_locations)
+    {
         let mutation = if global && row.snapshot.is_none() {
             StateTreeMutation::remove(key)
         } else {
-            let cell = match canonical_snapshot.as_deref() {
-                Some(value) => StateCellRef::Value(value),
-                None => StateCellRef::Tombstone,
-            };
             let encoded = encode_state_value(StateValueRef {
-                change_id,
-                commit_id,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-                cell,
-                metadata: row.metadata.map(|value| value.normalized()),
-                origin_key: row.origin_key.map(|value| value.as_str()),
-                blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
-                    row,
-                    &prepared_blob_manifests,
-                )?,
+                page_object_id: location.page_object_id,
+                page_ordinal: location.page_ordinal,
             })?;
+            let audit = StateMutationAudit {
+                commit_id: *commit_id.as_uuid().as_bytes(),
+                tombstone: row.snapshot.is_none(),
+                blob_manifest_object_ids,
+            };
             let exists_at_target_root = previous
                 .as_ref()
                 .is_some_and(|value| global || value.source == StateSource::Branch);
             if exists_at_target_root {
-                StateTreeMutation::update(key, encoded)
+                StateTreeMutation::update_bound(key, encoded, audit)
             } else {
-                StateTreeMutation::insert(key, encoded)
+                StateTreeMutation::insert_bound(key, encoded, audit)
             }
         };
         state_mutations.push(mutation);
@@ -531,13 +481,10 @@ where
         .checked_add(1)
         .ok_or_else(|| writer_error("commit generation overflows u64"))?;
 
-    let mut encoded_semantic_changes = Vec::with_capacity(changes.len());
-    let mut member_object_ids = Vec::with_capacity(changes.len());
-    for change in &changes {
-        let (object_id, _) = change.encode()?;
-        member_object_ids.push(object_id);
-        encoded_semantic_changes.push((change.change_id(), object_id));
-    }
+    let semantic_change_ids = members
+        .iter()
+        .map(CommitMemberV1::change_id)
+        .collect::<Vec<_>>();
     let global_state_root = if global {
         state_edit.root
     } else {
@@ -561,11 +508,8 @@ where
         commit_id: forktree_commit_id(commit_id),
         generation,
         parent_commit_object_ids: parent_object_ids,
-        members: member_object_ids
-            .into_iter()
-            .map(CommitMemberV1::introduced)
-            .collect(),
-        member_page_root: None,
+        members,
+        member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
         global_state_root,
         local_state_root,
         metadata: crate::changelog::encode_forktree_commit_payload(&commit_record)?,
@@ -604,7 +548,7 @@ where
         json_payload_object_ids: Vec::new(),
     };
     let (ref_object_id, _) = ref_change.encode()?;
-    changes.push(ref_change);
+    let changes = vec![ref_change];
 
     let commit_catalog_edit = view
         .put_commit_catalog_entries(
@@ -617,11 +561,10 @@ where
         .await?;
     let mut change_entries = Vec::with_capacity(catalog_order.len());
     for index in catalog_order {
-        if let Some((change_id, change_object_id)) = encoded_semantic_changes.get(index) {
+        if let Some(change_id) = semantic_change_ids.get(index) {
             change_entries.push((
                 *change_id,
                 ChangeCatalogEntry {
-                    change_object_id: *change_object_id,
                     owner: ChangeCatalogOwner::CommitMember {
                         commit_object_id,
                         ordinal: u32::try_from(index)
@@ -630,11 +573,10 @@ where
                 },
             ));
         } else {
-            debug_assert_eq!(index, encoded_semantic_changes.len());
+            debug_assert_eq!(index, semantic_change_ids.len());
             change_entries.push((
                 forktree_change_id(change_refs.branch_ref_change_id),
                 ChangeCatalogEntry {
-                    change_object_id: ref_object_id,
                     owner: ChangeCatalogOwner::BranchRef {
                         ref_change_object_id: ref_object_id,
                         branch_id: publication_branch_id,
@@ -790,9 +732,21 @@ struct OrderedCommitDraft {
 struct OrderedCommitContent {
     draft: OrderedCommitDraft,
     mutations: Vec<StateTreeMutation>,
-    fresh_changes: Vec<ChangeObjectV1>,
     members: Vec<CommitMemberV1>,
+    member_page_object_ids: Vec<ObjectId>,
     max_selected_source_generation: Option<u64>,
+}
+
+enum PendingStateMutation {
+    Remove {
+        key: Vec<u8>,
+    },
+    Put {
+        key: Vec<u8>,
+        existed: bool,
+        tombstone: bool,
+        blob_manifest_object_ids: Vec<ObjectId>,
+    },
 }
 
 async fn prepare_ordered_single_branch_history<R>(
@@ -924,8 +878,7 @@ where
     let mut contents = Vec::with_capacity(drafts.len());
     for draft in drafts {
         let mut seen_identities = BTreeSet::<Vec<u8>>::new();
-        let mut mutations = Vec::new();
-        let mut fresh_changes = Vec::new();
+        let mut pending_mutations = Vec::new();
         let mut members = Vec::new();
         let mut max_selected_source_generation: Option<u64> = None;
         let fresh_rows = prepared
@@ -966,10 +919,12 @@ where
                 ));
             }
             let canonical_snapshot = canonical_snapshot_for_row(row, &prepared_blob_manifests)?;
-            let snapshot =
-                stage_forktree_json_text(&mut publication, canonical_snapshot.as_deref())?;
-            let metadata = stage_forktree_json_slot(&mut publication, row.metadata)?;
-            let json_payload_object_ids = json_payload_object_ids(&snapshot, &metadata)?;
+            let snapshot = canonical_snapshot
+                .as_deref()
+                .map_or(JsonSlot::None, |value| JsonSlot::Inline(value.into()));
+            let metadata = row.metadata.map_or(JsonSlot::None, |value| {
+                JsonSlot::Inline(value.normalized().into())
+            });
             let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
                 format_version: 2,
                 change_id,
@@ -982,14 +937,15 @@ where
                 created_at: row.created_at,
                 origin_key: row.origin_key.map(ToString::to_string),
             })?;
-            let change = ChangeObjectV1::Semantic {
-                change_id: forktree_change_id(change_id),
+            let blob_manifest_object_ids =
+                blob_manifest_object_ids_for_row(row, &prepared_blob_manifests)?;
+            members.push(CommitMemberV1::introduced(
+                forktree_change_id(change_id),
                 payload,
-                json_payload_object_ids,
-            };
-            let (change_object_id, _) = change.encode()?;
-            members.push(CommitMemberV1::introduced(change_object_id));
-            fresh_changes.push(change);
+                row.global,
+                row.updated_at,
+                blob_manifest_object_ids.clone(),
+            ));
 
             let existed = match touched_presence.get(&key) {
                 Some(existed) => *existed,
@@ -1000,31 +956,17 @@ where
             };
             let mutation = if row.global && row.snapshot.is_none() {
                 touched_presence.insert(key.clone(), false);
-                StateTreeMutation::remove(key)
+                PendingStateMutation::Remove { key }
             } else {
-                let encoded = encode_state_value(StateValueRef {
-                    change_id,
-                    commit_id: draft.commit_id,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    cell: canonical_snapshot
-                        .as_deref()
-                        .map_or(StateCellRef::Tombstone, StateCellRef::Value),
-                    metadata: row.metadata.map(|value| value.normalized()),
-                    origin_key: row.origin_key.map(|value| value.as_str()),
-                    blob_manifest_object_ids: &blob_manifest_object_ids_for_row(
-                        row,
-                        &prepared_blob_manifests,
-                    )?,
-                })?;
                 touched_presence.insert(key.clone(), true);
-                if existed {
-                    StateTreeMutation::update(key, encoded)
-                } else {
-                    StateTreeMutation::insert(key, encoded)
+                PendingStateMutation::Put {
+                    key,
+                    existed,
+                    tombstone: row.snapshot.is_none(),
+                    blob_manifest_object_ids,
                 }
             };
-            mutations.push(mutation);
+            pending_mutations.push(mutation);
         }
 
         for batch in &draft.selected_change_batches {
@@ -1106,41 +1048,62 @@ where
                 };
                 let mutation = if selected_global && selected.deleted {
                     touched_presence.insert(identity.clone(), false);
-                    StateTreeMutation::remove(identity)
+                    PendingStateMutation::Remove { key: identity }
                 } else {
-                    let cell = match &source_value.cell {
-                        crate::forktree::StateCell::Value(value) => {
-                            StateCellRef::Value(value.as_ref())
-                        }
-                        crate::forktree::StateCell::Null => StateCellRef::Null,
-                        crate::forktree::StateCell::Tombstone => StateCellRef::Tombstone,
-                    };
-                    let encoded = encode_state_value(StateValueRef {
-                        change_id: selected.change_id,
-                        commit_id: draft.commit_id,
-                        created_at: source_value.created_at,
-                        updated_at: source_value.updated_at,
-                        cell,
-                        metadata: source_value.metadata.as_deref(),
-                        origin_key: source_value.origin_key.as_deref(),
-                        blob_manifest_object_ids: &source_value.blob_manifest_object_ids,
-                    })?;
                     touched_presence.insert(identity.clone(), true);
-                    if existed {
-                        StateTreeMutation::update(identity, encoded)
-                    } else {
-                        StateTreeMutation::insert(identity, encoded)
+                    PendingStateMutation::Put {
+                        key: identity,
+                        existed,
+                        tombstone: selected.deleted,
+                        blob_manifest_object_ids: source_value.blob_manifest_object_ids.clone(),
                     }
                 };
-                mutations.push(mutation);
+                pending_mutations.push(mutation);
                 members.push(member);
             }
         }
+        let member_pages =
+            CommitChangePageV2::encode_pages(forktree_commit_id(draft.commit_id), &members)?;
+        if member_pages.member_locations.len() != pending_mutations.len() {
+            return Err(writer_error(
+                "ordered history state mutations differ from commit membership",
+            ));
+        }
+        let mutations = pending_mutations
+            .into_iter()
+            .zip(&member_pages.member_locations)
+            .map(|(pending, location)| {
+                Ok(match pending {
+                    PendingStateMutation::Remove { key } => StateTreeMutation::remove(key),
+                    PendingStateMutation::Put {
+                        key,
+                        existed,
+                        tombstone,
+                        blob_manifest_object_ids,
+                    } => {
+                        let encoded = encode_state_value(StateValueRef {
+                            page_object_id: location.page_object_id,
+                            page_ordinal: location.page_ordinal,
+                        })?;
+                        let audit = StateMutationAudit {
+                            commit_id: *draft.commit_id.as_uuid().as_bytes(),
+                            tombstone,
+                            blob_manifest_object_ids,
+                        };
+                        if existed {
+                            StateTreeMutation::update_bound(key, encoded, audit)
+                        } else {
+                            StateTreeMutation::insert_bound(key, encoded, audit)
+                        }
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
         contents.push(OrderedCommitContent {
             draft,
             mutations,
-            fresh_changes,
             members,
+            member_page_object_ids: member_pages.objects.iter().map(|(id, _)| *id).collect(),
             max_selected_source_generation,
         });
     }
@@ -1167,7 +1130,6 @@ where
     let mut staged_commits = BTreeMap::<CommitId, (ObjectId, CommitObjectV1)>::new();
     let mut semantic_commits = Vec::with_capacity(contents.len());
     let mut commit_entries = Vec::with_capacity(contents.len());
-    let mut fresh_changes = Vec::new();
     let mut fresh_owner_rows = Vec::new();
     for (content, state_edit) in contents.iter().zip(&state_edits) {
         let mut generation = None::<u64>;
@@ -1213,7 +1175,7 @@ where
             generation,
             parent_commit_object_ids: parent_object_ids,
             members: content.members.clone(),
-            member_page_root: None,
+            member_page_object_ids: content.member_page_object_ids.clone(),
             global_state_root,
             local_state_root,
             metadata: crate::changelog::encode_forktree_commit_payload(&record)?,
@@ -1222,20 +1184,19 @@ where
         let (commit_object_id, _) = commit.encode()?;
         staged_commits.insert(content.draft.commit_id, (commit_object_id, commit.clone()));
         commit_entries.push((commit.commit_id, CommitCatalogEntry { commit_object_id }));
-        for (ordinal, change) in content.fresh_changes.iter().enumerate() {
-            let (change_object_id, _) = change.encode()?;
-            fresh_owner_rows.push((
-                change.change_id(),
-                ChangeCatalogEntry {
-                    change_object_id,
-                    owner: ChangeCatalogOwner::CommitMember {
-                        commit_object_id,
-                        ordinal: u32::try_from(ordinal)
-                            .map_err(|_| writer_error("ordered member ordinal exceeds u32"))?,
+        for (ordinal, member) in content.members.iter().enumerate() {
+            if member.source().is_none() {
+                fresh_owner_rows.push((
+                    member.change_id(),
+                    ChangeCatalogEntry {
+                        owner: ChangeCatalogOwner::CommitMember {
+                            commit_object_id,
+                            ordinal: u32::try_from(ordinal)
+                                .map_err(|_| writer_error("ordered member ordinal exceeds u32"))?,
+                        },
                     },
-                },
-            ));
-            fresh_changes.push(change.clone());
+                ));
+            }
         }
         semantic_commits.push(commit);
     }
@@ -1288,7 +1249,6 @@ where
     fresh_owner_rows.push((
         branch_ref_change.change_id(),
         ChangeCatalogEntry {
-            change_object_id: ref_object_id,
             owner: ChangeCatalogOwner::BranchRef {
                 ref_change_object_id: ref_object_id,
                 branch_id: view.branch_id(),
@@ -1317,7 +1277,7 @@ where
         commit_catalog_edit,
         change_catalog_edit,
         semantic_commits,
-        fresh_changes,
+        fresh_changes: Vec::new(),
         branch_ref_change,
         branch_snapshot: BranchSnapshotV1 {
             branch_id: view.branch_id(),

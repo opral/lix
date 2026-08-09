@@ -20,7 +20,7 @@ use super::gc_index::{
 use super::merkle::authenticated_merkle_edges;
 use super::model::{
     BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberPageV1,
+    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitId,
     CommitObjectV1, GcEdgeCursorV1, GcLiveBranchEntryV1, GcMarkEntryV2, GcPhaseV2,
     GcProgressSelectorV2, GcProgressV2, GcQueueEntryV1, GlobalSelectorV1, RepositoryRootV1,
     SnapshotSelectorV1, SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
@@ -995,53 +995,33 @@ where
                     .copied()
                     .map(|id| typed(id, ObjectDomain::Commit)),
             );
-            if let Some(page_root) = value.member_page_root {
-                edges.push(typed(page_root, ObjectDomain::CommitMemberPageV1));
-            }
-            let members = super::serving::load_commit_members(read, &value).await?;
-            for member in members {
-                edges.push(typed(
-                    member.change_object_id(),
-                    ObjectDomain::SemanticChange,
-                ));
-                if let Some((source_commit_object_id, _)) = member.source() {
-                    edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
-                }
-            }
+            edges.extend(
+                value
+                    .member_page_object_ids
+                    .iter()
+                    .copied()
+                    .map(|id| typed(id, ObjectDomain::CommitChangePageV2)),
+            );
             edges.extend([
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
                 typed(value.local_state_root, ObjectDomain::OrderedTreeNode),
             ]);
         }
-        ObjectDomain::CommitMemberPageV1 => {
-            let page = CommitMemberPageV1::decode(id, bytes)?;
+        ObjectDomain::CommitChangePageV2 => {
+            let page = CommitChangePageV2::decode(id, bytes)?;
             for member in page.members {
-                edges.push(typed(
-                    member.change_object_id(),
-                    ObjectDomain::SemanticChange,
-                ));
+                if let Some((_, _, _, blob_manifest_object_ids)) = member.introduced_payload() {
+                    edges.extend(
+                        blob_manifest_object_ids
+                            .iter()
+                            .copied()
+                            .map(|id| typed(id, ObjectDomain::BlobManifest)),
+                    );
+                }
                 if let Some((source_commit_object_id, _)) = member.source() {
                     edges.push(typed(source_commit_object_id, ObjectDomain::Commit));
                 }
             }
-            if let Some(next) = page.next_page_object_id {
-                edges.push(typed(next, ObjectDomain::CommitMemberPageV1));
-            }
-        }
-        ObjectDomain::SemanticChange => {
-            let change = ChangeObjectV1::decode(id, bytes)?;
-            let ChangeObjectV1::Semantic {
-                json_payload_object_ids,
-                ..
-            } = change
-            else {
-                return Err(corruption("semantic Change decoded as another domain"));
-            };
-            edges.extend(
-                json_payload_object_ids
-                    .into_iter()
-                    .map(|id| typed(id, ObjectDomain::BlobChunk)),
-            );
         }
         ObjectDomain::BranchRefChange => {
             let change = ChangeObjectV1::decode(id, bytes)?;
@@ -1241,43 +1221,43 @@ where
         }
     }
     for (key, entry) in changes {
-        let bytes = load_object_bytes(read, entry.change_object_id).await?;
-        let change = ChangeObjectV1::decode(entry.change_object_id, &bytes)?;
-        if change.change_id() != *key {
-            return Err(corruption("ChangeCatalog key/object identity mismatch"));
-        }
-        match (entry.owner, &change) {
-            (
-                ChangeCatalogOwner::CommitMember {
-                    commit_object_id,
-                    ordinal,
-                },
-                ChangeObjectV1::Semantic { .. },
-            ) => {
+        match entry.owner {
+            ChangeCatalogOwner::CommitMember {
+                commit_object_id,
+                ordinal,
+            } => {
                 let bytes = load_object_bytes(read, commit_object_id).await?;
                 let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
                 let members = super::serving::load_commit_members(read, &commit).await?;
-                if members.get(ordinal as usize)
-                    != Some(&super::model::CommitMemberV1::introduced(
-                        entry.change_object_id,
-                    ))
-                {
+                let member = members
+                    .get(ordinal as usize)
+                    .ok_or_else(|| corruption("ChangeCatalog commit ordinal is absent"))?;
+                if member.change_id() != *key || member.source().is_some() {
                     return Err(corruption(
                         "ChangeCatalog commit ordinal back-edge mismatch",
                     ));
                 }
             }
-            (
-                ChangeCatalogOwner::BranchRef {
-                    ref_change_object_id,
-                    branch_id,
-                },
-                ChangeObjectV1::BranchRef {
+            ChangeCatalogOwner::BranchRef {
+                ref_change_object_id,
+                branch_id,
+            } => {
+                let bytes = load_object_bytes(read, ref_change_object_id).await?;
+                let change = ChangeObjectV1::decode(ref_change_object_id, &bytes)?;
+                let ChangeObjectV1::BranchRef {
+                    change_id,
                     branch_id: object_branch,
                     ..
-                },
-            ) if ref_change_object_id == entry.change_object_id && branch_id == *object_branch => {}
-            _ => return Err(corruption("ChangeCatalog owner/back-edge mismatch")),
+                } = change
+                else {
+                    return Err(corruption(
+                        "branch-ref catalog owner names semantic payload",
+                    ));
+                };
+                if change_id != *key || branch_id != object_branch {
+                    return Err(corruption("ChangeCatalog owner/back-edge mismatch"));
+                }
+            }
         }
     }
     Ok(())

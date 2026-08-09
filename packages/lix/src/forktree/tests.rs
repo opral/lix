@@ -923,7 +923,7 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
     let (key, _) = state_entry("typed-key", StateCellRef::Null, 7, &[]);
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
-    assert!(super::encode_state_prefix("app.row", Some("file")).len() < key.len());
+    assert!(super::encode_state_entity_prefix("app.row", &entity_pk).len() < key.len());
     assert!(build_state_tree(&[(b"opaque".to_vec(), b"opaque".to_vec())]).is_err());
 }
 

@@ -15,7 +15,7 @@ use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, state_points, state_range,
+    encode_state_entity_prefix, encode_state_key, state_points, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -106,7 +106,23 @@ where
             "current ForkTree reader view does not match requested branch",
         ));
     }
-    let rows = state_range(&view, None, None, None, true).await?;
+    let rows = if let [schema_key] = request.filter.schema_keys.as_slice()
+        && !request.filter.entity_pks.is_empty()
+    {
+        let mut unique_pks = request.filter.entity_pks.clone();
+        unique_pks.sort();
+        unique_pks.dedup();
+        let mut rows = Vec::new();
+        for entity_pk in unique_pks {
+            let lower = encode_state_entity_prefix(schema_key, &entity_pk);
+            let upper = strict_prefix_successor(&lower);
+            rows.extend(state_range(view, Some(&lower), upper.as_deref(), None, true).await?);
+        }
+        rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+        rows
+    } else {
+        state_range(view, None, None, None, true).await?
+    };
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
         let key = decode_state_key(&row.encoded_key)?;
@@ -154,6 +170,18 @@ where
         }
     }
     Ok(MaterializedLiveStateBatch::from_rows(output))
+}
+
+fn strict_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for index in (0..upper.len()).rev() {
+        if upper[index] != u8::MAX {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            return Some(upper);
+        }
+    }
+    None
 }
 
 /// Resolves the complete current logical overlay while borrowing the one view

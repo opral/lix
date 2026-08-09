@@ -43,7 +43,6 @@ pub(super) enum ObjectDomain {
     RepositoryRoot = 1,
     BranchSnapshot = 2,
     Commit = 3,
-    SemanticChange = 4,
     BranchRefChange = 5,
     OrderedTreeNode = 6,
     UploadPart = 7,
@@ -56,9 +55,9 @@ pub(super) enum ObjectDomain {
     GcRadixNodeV1 = 14,
     GcQueuePackV1 = 15,
     GcLiveBranchPackV1 = 16,
-    CommitMemberPageV1 = 17,
     BlobMerkleLeafV1 = 18,
     BlobMerkleInternalV1 = 19,
+    CommitChangePageV2 = 20,
 }
 
 impl ObjectDomain {
@@ -67,7 +66,6 @@ impl ObjectDomain {
             1 => Ok(Self::RepositoryRoot),
             2 => Ok(Self::BranchSnapshot),
             3 => Ok(Self::Commit),
-            4 => Ok(Self::SemanticChange),
             5 => Ok(Self::BranchRefChange),
             6 => Ok(Self::OrderedTreeNode),
             7 => Ok(Self::UploadPart),
@@ -80,9 +78,9 @@ impl ObjectDomain {
             14 => Ok(Self::GcRadixNodeV1),
             15 => Ok(Self::GcQueuePackV1),
             16 => Ok(Self::GcLiveBranchPackV1),
-            17 => Ok(Self::CommitMemberPageV1),
             18 => Ok(Self::BlobMerkleLeafV1),
             19 => Ok(Self::BlobMerkleInternalV1),
+            20 => Ok(Self::CommitChangePageV2),
             _ => Err(corruption(format!("unknown object domain {value}"))),
         }
     }
