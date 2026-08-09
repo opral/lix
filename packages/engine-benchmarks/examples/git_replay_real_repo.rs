@@ -479,13 +479,15 @@ fn lfs_pointer_paths(repo: &Path, commit: &str) -> Result<Vec<String>, String> {
             &listing,
         ));
     }
+    let prefix = format!("{commit}:");
     listing
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .map(|path| {
-            String::from_utf8(path.to_vec())
-                .map_err(|_| format!("Git LFS pointer path in {commit} is not UTF-8"))
+            let path = String::from_utf8(path.to_vec())
+                .map_err(|_| format!("Git LFS pointer path in {commit} is not UTF-8"))?;
+            Ok(path.strip_prefix(&prefix).unwrap_or(&path).to_owned())
         })
         .collect()
 }
@@ -562,13 +564,15 @@ fn collect_local_lfs_objects_recursive(
             || !components[2]
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || components[0] != components[2][..2]
+            || components[1] != components[2][2..4]
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected local LFS object path {}", entry_path.display()),
             ));
         }
-        let oid = format!("{}{}{}", components[0], components[1], components[2]);
+        let oid = components[2].clone();
         if objects.insert(oid.clone(), entry_path).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
