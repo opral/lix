@@ -16,7 +16,7 @@ use crate::common::NullableKeyFilter;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, encode_state_prefix, state_point, state_range,
+    encode_state_key, encode_state_prefix, encode_state_schema_prefix, state_point, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -159,6 +159,24 @@ where
                         .await?,
                 );
             }
+        }
+        rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+        rows
+    } else if !request.filter.schema_keys.is_empty()
+        && (request.filter.file_ids.is_empty()
+            || request
+                .filter
+                .file_ids
+                .iter()
+                .all(|file_id| matches!(file_id, NullableKeyFilter::Any)))
+    {
+        let mut rows = Vec::new();
+        for schema_key in &request.filter.schema_keys {
+            let lower = encode_state_schema_prefix(schema_key);
+            let upper = exclusive_prefix_end(&lower);
+            rows.extend(
+                state_range(&view, Some(lower.as_slice()), upper.as_deref(), None, true).await?,
+            );
         }
         rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
         rows

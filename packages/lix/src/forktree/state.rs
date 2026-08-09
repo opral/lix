@@ -209,6 +209,12 @@ pub(crate) fn encode_state_prefix(schema_key: &str, file_id: Option<&str>) -> Ve
     output
 }
 
+pub(crate) fn encode_state_schema_prefix(schema_key: &str) -> Vec<u8> {
+    let mut output = Vec::with_capacity(schema_key.len() + 2);
+    write_key_string(&mut output, schema_key, KEY_PART_FINAL);
+    output
+}
+
 pub(crate) fn decode_state_key(bytes: &[u8]) -> Result<StateKey, LixError> {
     let mut offset = 0_usize;
     let (schema_key, terminator) = read_key_string(bytes, &mut offset, "state schema key")?;

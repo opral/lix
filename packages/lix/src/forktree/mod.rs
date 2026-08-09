@@ -46,8 +46,8 @@ pub(crate) use serving::{
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
     UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
-    encode_state_key, encode_state_prefix, encode_state_value, encode_untracked_key,
-    encode_untracked_value,
+    encode_state_key, encode_state_prefix, encode_state_schema_prefix, encode_state_value,
+    encode_untracked_key, encode_untracked_value,
 };
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
