@@ -1110,19 +1110,12 @@ where
         }
         ObjectDomain::BlobManifest => {
             let value = BlobManifestV1::decode(id, bytes)?;
-            validate_chunk_sequence(
-                read,
-                &value.ordered_chunks,
-                value.content_digest,
-                "blob manifest",
-            )
-            .await?;
-            edges.extend(
-                value
-                    .ordered_chunks
-                    .into_iter()
-                    .map(|chunk| typed(chunk.chunk_object_id, ObjectDomain::BlobChunk)),
-            );
+            let root_domain = if value.leaf_count == 1 {
+                ObjectDomain::BlobMerkleLeafV1
+            } else {
+                ObjectDomain::BlobMerkleInternalV1
+            };
+            edges.push(typed(value.root_object_id, root_domain));
         }
         ObjectDomain::BlobMerkleLeafV1 => {
             edges.extend(
