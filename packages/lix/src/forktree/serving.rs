@@ -2093,6 +2093,107 @@ where
     Ok(Some(commit))
 }
 
+/// Loads the authenticated commit envelope needed to publish a child commit.
+/// Publication needs the selected parent's catalog/object identity, generation,
+/// roots, and immediate parent topology; it does not consume the parent's
+/// semantic member payloads. Keep that full member/change closure on the
+/// history-serving path, while this writer boundary validates the same
+/// envelope and catalog/back-edge contracts without materializing N members.
+pub(crate) async fn load_commit_for_publication<R>(
+    view: &CoherentView<R>,
+    id: CommitId,
+) -> Result<Option<(ObjectId, CommitObjectV1)>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let Some(value) = lookup_on_read(
+        view.repository_root().commit_catalog_root,
+        "commit",
+        id.as_bytes(),
+        view.storage_read(),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let entry = CommitCatalogEntry::decode(&value)?;
+    let bytes = view.load_object_bytes(entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != id {
+        return Err(corruption(
+            "CommitCatalog key does not match embedded CommitId",
+        ));
+    }
+    validate_commit_catalog_identity(
+        view.storage_read(),
+        view.repository_root().commit_catalog_root,
+        entry.commit_object_id,
+        &commit,
+    )
+    .await?;
+    validate_publication_parent_edges(
+        view.storage_read(),
+        view.repository_root().commit_catalog_root,
+        &commit,
+    )
+    .await?;
+    Ok(Some((entry.commit_object_id, commit)))
+}
+
+async fn validate_publication_parent_edges<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut unique_parent_objects = BTreeSet::new();
+    if commit
+        .parent_commit_object_ids
+        .iter()
+        .any(|id| !unique_parent_objects.insert(*id))
+    {
+        return Err(corruption(
+            "publication parent envelope contains duplicate parent object edges",
+        ));
+    }
+    let parent_objects =
+        super::view::load_object_map(read, commit.parent_commit_object_ids.iter().copied()).await?;
+    let mut unique_parent_ids = BTreeSet::new();
+    for parent_object_id in &commit.parent_commit_object_ids {
+        let bytes = parent_objects
+            .get(parent_object_id)
+            .ok_or_else(|| corruption("publication parent object is absent"))?;
+        let parent = CommitObjectV1::decode(*parent_object_id, bytes)?;
+        if parent.generation >= commit.generation {
+            return Err(corruption(
+                "publication parent generation is not strictly earlier",
+            ));
+        }
+        if !unique_parent_ids.insert(parent.commit_id) {
+            return Err(corruption(
+                "publication parent envelope contains duplicate parent CommitIds",
+            ));
+        }
+        let catalog_value = lookup_on_read(
+            commit_catalog_root,
+            "commit",
+            parent.commit_id.as_bytes(),
+            read,
+        )
+        .await?
+        .ok_or_else(|| corruption("publication parent has no CommitCatalog back-edge"))?;
+        let catalog_entry = CommitCatalogEntry::decode(&catalog_value)?;
+        if catalog_entry.commit_object_id != *parent_object_id {
+            return Err(corruption(
+                "publication parent CommitCatalog back-edge is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn load_change<R>(
     view: &CoherentView<R>,
     id: ChangeId,
