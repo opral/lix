@@ -492,15 +492,6 @@ where
             .await
     }
 
-    pub(super) async fn authenticate_chunk(
-        &self,
-        chunk_ref: &super::model::BlobChunkRefV1,
-        part_hasher: &mut blake3::Hasher,
-        final_hasher: &mut blake3::Hasher,
-    ) -> Result<[u8; 32], StorageError> {
-        super::blob::authenticate_chunk(&self.read, chunk_ref, part_hasher, final_hasher).await
-    }
-
     pub(super) async fn load_blob_bytes_many_on_view(
         &self,
         refs: &[super::blob::AuthenticatedBlobRef],

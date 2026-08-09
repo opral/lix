@@ -975,30 +975,62 @@ where
     parts.insert(new_part.part_number, new_part.clone());
     let mut next_offset = 0_u64;
     let mut chunk_claims = Vec::new();
+    // Completion remains on one retained view. Reuse only the immediately
+    // repeated authenticated chunk; the one-entry bound keeps retained
+    // payload bytes independent of the number of receipt parts.
+    let mut authenticated_chunk: Option<(ObjectId, Bytes, [u8; 32])> = None;
     for (_, part) in parts {
         if part.byte_offset != next_offset {
             return Err(corruption("upload parts are not contiguous at completion"));
         }
         let mut part_digest = blake3::Hasher::new();
         for chunk_ref in &part.ordered_chunks {
-            let bytes = if part.part_number == new_part.part_number {
-                new_chunks
+            let (bytes, chunk_digest) = if part.part_number == new_part.part_number {
+                let bytes = new_chunks
                     .iter()
                     .find_map(|chunk| {
                         chunk.encode().ok().and_then(|(id, _)| {
                             (id == chunk_ref.chunk_object_id).then_some(chunk.bytes.clone())
                         })
                     })
-                    .ok_or_else(|| corruption("new upload chunk is absent"))?
+                    .ok_or_else(|| corruption("new upload chunk is absent"))?;
+                if bytes.len() as u64 != chunk_ref.declared_len {
+                    return Err(corruption("upload chunk length does not match its receipt"));
+                }
+                let digest = *blake3::hash(&bytes).as_bytes();
+                (bytes, digest)
+            } else if let Some((cached_id, cached_bytes, cached_digest)) =
+                authenticated_chunk.as_ref()
+            {
+                if *cached_id == chunk_ref.chunk_object_id {
+                    if cached_bytes.len() as u64 != chunk_ref.declared_len {
+                        return Err(corruption("reused upload chunk length is invalid"));
+                    }
+                    (cached_bytes.clone(), *cached_digest)
+                } else {
+                    let bytes = view.load_object_bytes(chunk_ref.chunk_object_id).await?;
+                    let chunk = BlobChunkV1::decode(chunk_ref.chunk_object_id, &bytes)?;
+                    if chunk.bytes.len() as u64 != chunk_ref.declared_len {
+                        return Err(corruption("upload chunk length does not match its receipt"));
+                    }
+                    let digest = *blake3::hash(&chunk.bytes).as_bytes();
+                    authenticated_chunk =
+                        Some((chunk_ref.chunk_object_id, chunk.bytes.clone(), digest));
+                    (chunk.bytes, digest)
+                }
             } else {
                 let bytes = view.load_object_bytes(chunk_ref.chunk_object_id).await?;
-                BlobChunkV1::decode(chunk_ref.chunk_object_id, &bytes)?.bytes
+                let chunk = BlobChunkV1::decode(chunk_ref.chunk_object_id, &bytes)?;
+                if chunk.bytes.len() as u64 != chunk_ref.declared_len {
+                    return Err(corruption("upload chunk length does not match its receipt"));
+                }
+                let digest = *blake3::hash(&chunk.bytes).as_bytes();
+                authenticated_chunk =
+                    Some((chunk_ref.chunk_object_id, chunk.bytes.clone(), digest));
+                (chunk.bytes, digest)
             };
-            if bytes.len() as u64 != chunk_ref.declared_len {
-                return Err(corruption("upload chunk length does not match its receipt"));
-            }
             part_digest.update(&bytes);
-            chunk_claims.push((chunk_ref.clone(), *blake3::hash(&bytes).as_bytes()));
+            chunk_claims.push((chunk_ref.clone(), chunk_digest));
         }
         if part_digest.finalize().as_bytes() != &part.part_digest {
             return Err(corruption("upload part digest does not match its chunks"));
@@ -1074,6 +1106,11 @@ where
     };
     view.validate_receipt_root(receipt_root).await?;
     let mut chunk_claims = Vec::new();
+    // A completion stays on one retained view, so an already authenticated
+    // chunk object can be reused for repeated receipt references in this
+    // operation. This is an ephemeral validation cache only: it is neither
+    // persisted nor consulted by another view or publication.
+    let mut authenticated_chunk: Option<(ObjectId, Bytes, [u8; 32])> = None;
     let mut final_hasher = blake3::Hasher::new();
     let mut next_offset = 0_u64;
     let mut part_count = 0_u64;
@@ -1114,9 +1151,50 @@ where
             }
             let mut part_hasher = blake3::Hasher::new();
             for chunk_ref in &part.ordered_chunks {
-                let chunk_digest = view
-                    .authenticate_chunk(chunk_ref, &mut part_hasher, &mut final_hasher)
-                    .await?;
+                let (chunk_bytes, chunk_digest) =
+                    if let Some((cached_id, chunk_bytes, chunk_digest)) =
+                        authenticated_chunk.as_ref()
+                    {
+                        if *cached_id == chunk_ref.chunk_object_id {
+                            if chunk_bytes.len() as u64 != chunk_ref.declared_len {
+                                return Err(corruption(
+                                    "reused upload chunk declared length is invalid",
+                                ));
+                            }
+                            (chunk_bytes.clone(), *chunk_digest)
+                        } else {
+                            let chunk_bytes =
+                                view.load_object_bytes(chunk_ref.chunk_object_id).await?;
+                            let chunk =
+                                BlobChunkV1::decode(chunk_ref.chunk_object_id, &chunk_bytes)?;
+                            if chunk.bytes.len() as u64 != chunk_ref.declared_len {
+                                return Err(corruption(
+                                    "upload chunk bytes do not match declared length",
+                                ));
+                            }
+                            let chunk_digest = *blake3::hash(&chunk.bytes).as_bytes();
+                            authenticated_chunk = Some((
+                                chunk_ref.chunk_object_id,
+                                chunk.bytes.clone(),
+                                chunk_digest,
+                            ));
+                            (chunk.bytes, chunk_digest)
+                        }
+                    } else {
+                        let chunk_bytes = view.load_object_bytes(chunk_ref.chunk_object_id).await?;
+                        let chunk = BlobChunkV1::decode(chunk_ref.chunk_object_id, &chunk_bytes)?;
+                        if chunk.bytes.len() as u64 != chunk_ref.declared_len {
+                            return Err(corruption(
+                                "upload chunk bytes do not match declared length",
+                            ));
+                        }
+                        let chunk_digest = *blake3::hash(&chunk.bytes).as_bytes();
+                        authenticated_chunk =
+                            Some((chunk_ref.chunk_object_id, chunk.bytes.clone(), chunk_digest));
+                        (chunk.bytes, chunk_digest)
+                    };
+                part_hasher.update(&chunk_bytes);
+                final_hasher.update(&chunk_bytes);
                 chunk_claims.push((chunk_ref.clone(), chunk_digest));
             }
             if part_hasher.finalize().as_bytes() != &part.part_digest {
@@ -1247,27 +1325,6 @@ where
         ));
     }
     Ok(())
-}
-
-pub(super) async fn authenticate_chunk<R>(
-    read: &R,
-    chunk_ref: &BlobChunkRefV1,
-    part_hasher: &mut blake3::Hasher,
-    final_hasher: &mut blake3::Hasher,
-) -> Result<[u8; 32], StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let chunk_bytes = load_object_bytes(read, chunk_ref.chunk_object_id).await?;
-    let chunk = BlobChunkV1::decode(chunk_ref.chunk_object_id, &chunk_bytes)?;
-    if chunk.bytes.len() as u64 != chunk_ref.declared_len {
-        return Err(corruption(
-            "upload chunk bytes do not match declared length",
-        ));
-    }
-    part_hasher.update(&chunk.bytes);
-    final_hasher.update(&chunk.bytes);
-    Ok(*blake3::hash(&chunk.bytes).as_bytes())
 }
 
 #[cfg(test)]
