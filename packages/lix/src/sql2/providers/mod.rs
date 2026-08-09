@@ -49,7 +49,8 @@ pub(crate) use file::{
     execute_exact_lix_file_read, execute_exact_lix_file_root_listing,
     execute_fast_lix_file_content_update_by_id,
     execute_fast_lix_file_content_update_by_id_with_metadata, execute_fast_lix_file_id_path_writes,
-    execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
+    execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_id_path_write,
+    execute_fast_lix_file_prepared_path_write,
 };
 #[cfg(test)]
 pub(crate) use filesystem_working_diff::filesystem_working_diff_schema;

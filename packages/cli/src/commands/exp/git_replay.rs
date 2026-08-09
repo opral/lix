@@ -3,14 +3,14 @@ use crate::db;
 use crate::error::CliError;
 use lix::storage::Storage;
 use lix::wasm::WasmTransitionCounters;
-use lix::{Lix, PreparedDmlParameterBatch, Value, open_lix};
+use lix::{Lix, LixTransaction, PreparedDmlParameterBatch, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -115,6 +115,35 @@ struct PreparedBatch {
     deletes: Vec<String>,
     inserts: Vec<WriteRow>,
     updates: Vec<WriteRow>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedWriteRow {
+    id: String,
+    path: String,
+    blob_oid: String,
+    status: char,
+    git_mode: String,
+    git_oid: String,
+}
+
+#[derive(Debug, Default)]
+struct PlannedBatch {
+    deletes: Vec<String>,
+    inserts: Vec<PlannedWriteRow>,
+    updates: Vec<PlannedWriteRow>,
+}
+
+#[derive(Debug, Default)]
+struct ReplayExecutionTotals {
+    read_blobs_ms: f64,
+    prepare_ms: f64,
+    build_sql_ms: f64,
+    execute_ms: f64,
+    logical_statement_count: usize,
+    physical_execution_groups: usize,
+    sql_chars: usize,
+    blob_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -439,43 +468,31 @@ where
         phase_totals.read_diff_ms += read_diff_ms;
         changed_paths += changes.len();
 
-        let read_blobs_started = Instant::now();
-        let wanted_blob_ids = collect_wanted_blob_ids(&changes);
-        let blob_by_oid = blob_reader.read_blobs(&wanted_blob_ids)?;
-        let read_blobs_ms = duration_to_ms(read_blobs_started.elapsed());
-        phase_totals.read_blobs_ms += read_blobs_ms;
-
         let prepare_started = Instant::now();
-        let prepared = prepare_commit_changes(&mut state, &changes, &blob_by_oid)?;
-        let prepare_ms = duration_to_ms(prepare_started.elapsed());
-        phase_totals.prepare_ms += prepare_ms;
+        let planned = plan_commit_changes(&mut state, &changes)?;
+        let plan_ms = duration_to_ms(prepare_started.elapsed());
 
-        let mut prepared = prepared;
-        let blob_bytes = prepared_blob_bytes(&prepared);
-        let inserts = prepared.inserts.len();
-        let updates = prepared.updates.len();
-        let deletes = prepared.deletes.len();
-        let is_marker_only = prepared.deletes.is_empty()
-            && prepared.inserts.is_empty()
-            && prepared.updates.is_empty();
-
-        let build_sql_started = Instant::now();
-        let mut statements =
-            build_replay_commit_statements(&mut prepared, DEFAULT_INSERT_BATCH_ROWS);
-        statements.push(git_replay_marker_statement(commit));
-        let build_sql_ms = duration_to_ms(build_sql_started.elapsed());
-        phase_totals.build_sql_ms += build_sql_ms;
-
-        let logical_statement_count = statements.len();
-        let sql_chars = total_statement_sql_chars(&statements);
+        let inserts = planned.inserts.len();
+        let updates = planned.updates.len();
+        let deletes = planned.deletes.len();
+        let is_marker_only =
+            planned.deletes.is_empty() && planned.inserts.is_empty() && planned.updates.is_empty();
         if is_marker_only {
             marker_only += 1;
         }
         lix.reset_plugin_transition_counters();
-        let execute_started = Instant::now();
-        let physical_execution_groups =
-            execute_statements_as_transaction(&lix, &mut statements, commit_sha)?;
-        let execute_ms = duration_to_ms(execute_started.elapsed());
+        let execution = execute_replay_commit_bounded(&lix, &mut blob_reader, commit, planned)?;
+        let read_blobs_ms = execution.read_blobs_ms;
+        let prepare_ms = plan_ms + execution.prepare_ms;
+        let build_sql_ms = execution.build_sql_ms;
+        let execute_ms = execution.execute_ms;
+        let logical_statement_count = execution.logical_statement_count;
+        let physical_execution_groups = execution.physical_execution_groups;
+        let sql_chars = execution.sql_chars;
+        let blob_bytes = execution.blob_bytes;
+        phase_totals.read_blobs_ms += read_blobs_ms;
+        phase_totals.prepare_ms += prepare_ms;
+        phase_totals.build_sql_ms += build_sql_ms;
         let plugin_counters = lix.plugin_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
         applied += 1;
@@ -641,6 +658,25 @@ where
             "failed to begin replay transaction {commit_sha}: {error}"
         ))
     })?;
+    let physical_execution_groups =
+        execute_statements_in_transaction(&mut transaction, statements, commit_sha)?;
+    db::block_on(transaction.commit()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to commit replay transaction {commit_sha}: {error}"
+        ))
+    })?;
+
+    Ok(physical_execution_groups)
+}
+
+fn execute_statements_in_transaction<StorageImpl>(
+    transaction: &mut LixTransaction<StorageImpl>,
+    statements: &mut [SqlStatement],
+    commit_sha: &str,
+) -> Result<usize, CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let mut index = 0;
     let mut physical_execution_groups = 0usize;
     while index < statements.len() {
@@ -688,13 +724,183 @@ where
         }
         index = end;
     }
-    db::block_on(transaction.commit()).map_err(|error| {
+    Ok(physical_execution_groups)
+}
+
+fn execute_replay_commit_bounded<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    blob_reader: &mut GitBlobReader,
+    commit: &ReplayCommit,
+    planned: PlannedBatch,
+) -> Result<ReplayExecutionTotals, CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut transaction = db::block_on(lix.begin_transaction()).map_err(|error| {
         CliError::msg(format!(
-            "failed to commit replay transaction {commit_sha}: {error}"
+            "failed to begin replay transaction {}: {error}",
+            commit.sha
         ))
     })?;
+    let mut totals = ReplayExecutionTotals::default();
 
-    Ok(physical_execution_groups)
+    let mut delete_batch = PreparedBatch {
+        deletes: planned.deletes,
+        ..PreparedBatch::default()
+    };
+    let build_started = Instant::now();
+    let mut delete_statements = build_replay_commit_statements(&mut delete_batch, 0);
+    totals.build_sql_ms += duration_to_ms(build_started.elapsed());
+    totals.logical_statement_count += delete_statements.len();
+    totals.sql_chars += total_statement_sql_chars(&delete_statements);
+    if !delete_statements.is_empty() {
+        let execute_started = Instant::now();
+        totals.physical_execution_groups += execute_statements_in_transaction(
+            &mut transaction,
+            &mut delete_statements,
+            &commit.sha,
+        )?;
+        totals.execute_ms += duration_to_ms(execute_started.elapsed());
+    }
+
+    execute_planned_rows_with_prepared_receipts(
+        &mut transaction,
+        blob_reader,
+        &planned.inserts,
+        true,
+        &commit.sha,
+        &mut totals,
+    )?;
+    execute_planned_rows_with_prepared_receipts(
+        &mut transaction,
+        blob_reader,
+        &planned.updates,
+        false,
+        &commit.sha,
+        &mut totals,
+    )?;
+
+    let build_started = Instant::now();
+    let mut marker_statements = vec![git_replay_marker_statement(commit)];
+    totals.build_sql_ms += duration_to_ms(build_started.elapsed());
+    totals.logical_statement_count += marker_statements.len();
+    totals.sql_chars += total_statement_sql_chars(&marker_statements);
+    let execute_started = Instant::now();
+    totals.physical_execution_groups +=
+        execute_statements_in_transaction(&mut transaction, &mut marker_statements, &commit.sha)?;
+    totals.execute_ms += duration_to_ms(execute_started.elapsed());
+
+    let commit_started = Instant::now();
+    db::block_on(transaction.commit()).map_err(|error| {
+        CliError::msg(format!(
+            "failed to commit replay transaction {}: {error}",
+            commit.sha
+        ))
+    })?;
+    totals.execute_ms += duration_to_ms(commit_started.elapsed());
+    Ok(totals)
+}
+
+fn execute_planned_rows_with_prepared_receipts<StorageImpl>(
+    transaction: &mut LixTransaction<StorageImpl>,
+    blob_reader: &mut GitBlobReader,
+    rows: &[PlannedWriteRow],
+    inserts: bool,
+    commit_sha: &str,
+    totals: &mut ReplayExecutionTotals,
+) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    for row in rows {
+        let upload_key = format!("git-replay/{commit_sha}/{}", row.id);
+        let mut prepared = None;
+        let mut streamed_bytes = 0_usize;
+        let read_started = Instant::now();
+        blob_reader.read_blob_chunks(&row.blob_oid, |bytes, offset, total_size, final_chunk| {
+            let prepare_started = Instant::now();
+            let next = db::block_on(transaction.stage_prepared_file_content_chunk(
+                upload_key.as_str(),
+                total_size,
+                offset,
+                bytes,
+                final_chunk,
+            ))
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed at commit {commit_sha} while staging prepared blob {}: {error}",
+                    row.blob_oid
+                ))
+            })?;
+            totals.prepare_ms += duration_to_ms(prepare_started.elapsed());
+            streamed_bytes = streamed_bytes.saturating_add(bytes.len());
+            totals.blob_bytes = totals.blob_bytes.saturating_add(bytes.len());
+            prepared = next;
+            Ok(())
+        })?;
+        totals.read_blobs_ms += duration_to_ms(read_started.elapsed());
+
+        let metadata = json!({
+            "git_mode": row.git_mode,
+            "git_oid": row.git_oid,
+        });
+        if let Some(prepared) = prepared {
+            let execute_started = Instant::now();
+            db::block_on(transaction.upsert_prepared_file_content(
+                row.id.clone(),
+                row.path.clone(),
+                prepared,
+                Some(metadata),
+            ))
+            .map_err(|error| {
+                CliError::msg(format!(
+                    "failed at commit {commit_sha} while binding prepared blob {}: {error}",
+                    row.blob_oid
+                ))
+            })?;
+            totals.execute_ms += duration_to_ms(execute_started.elapsed());
+            totals.physical_execution_groups += 1;
+            totals.logical_statement_count += 1;
+        } else if streamed_bytes == 0 {
+            // Empty regular Git blobs have no ForkTree BlobRef. Keep their
+            // ordinary empty value in the same final transaction; no large
+            // payload is retained and the metadata remains identical.
+            let mut batch = if inserts {
+                PreparedBatch {
+                    inserts: vec![WriteRow {
+                        id: row.id.clone(),
+                        path: row.path.clone(),
+                        data: Some(Vec::new()),
+                        git_mode: row.git_mode.clone(),
+                        git_oid: row.git_oid.clone(),
+                    }],
+                    ..PreparedBatch::default()
+                }
+            } else {
+                PreparedBatch {
+                    updates: vec![WriteRow {
+                        id: row.id.clone(),
+                        path: row.path.clone(),
+                        data: Some(Vec::new()),
+                        git_mode: row.git_mode.clone(),
+                        git_oid: row.git_oid.clone(),
+                    }],
+                    ..PreparedBatch::default()
+                }
+            };
+            let mut statements = build_replay_commit_statements(&mut batch, 1);
+            totals.logical_statement_count += statements.len();
+            totals.sql_chars += total_statement_sql_chars(&statements);
+            totals.physical_execution_groups +=
+                execute_statements_in_transaction(transaction, &mut statements, commit_sha)?;
+        } else {
+            return Err(CliError::msg(format!(
+                "prepared blob {} produced no receipt after non-empty streaming",
+                row.blob_oid
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_prepared_replay_shape(sql: &str) -> bool {
@@ -1422,6 +1628,186 @@ impl GitBlobReader {
         Ok(blobs)
     }
 
+    fn read_blob_chunks<F>(&mut self, requested_oid: &str, mut consume: F) -> Result<(), CliError>
+    where
+        F: FnMut(&[u8], u64, u64, bool) -> Result<(), CliError>,
+    {
+        if !is_full_git_oid(requested_oid.as_bytes()) {
+            return Err(CliError::msg(format!(
+                "refusing malformed git blob object id {requested_oid}"
+            )));
+        }
+        self.request_blob_batch(&[requested_oid.to_owned()])?;
+        let mut header = Vec::new();
+        self.stdout
+            .read_until(b'\n', &mut header)
+            .map_err(|source| CliError::io("failed to read git cat-file header", source))?;
+        let header = header.strip_suffix(b"\n").ok_or_else(|| {
+            CliError::msg(format!(
+                "git cat-file output truncated while reading header for {requested_oid}"
+            ))
+        })?;
+        let header = std::str::from_utf8(header).map_err(|_| {
+            CliError::msg(format!(
+                "malformed non-UTF-8 git cat-file header for {requested_oid}"
+            ))
+        })?;
+        let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() == 2 && fields[1] == "missing" {
+            return Err(CliError::msg(format!(
+                "missing blob object in git repository: {}",
+                fields[0]
+            )));
+        }
+        if fields.len() != 3 || fields[0] != requested_oid || fields[1] != "blob" {
+            return Err(CliError::msg(format!(
+                "malformed git cat-file header for {requested_oid}: {header}"
+            )));
+        }
+        let git_size = fields[2].parse::<usize>().map_err(|_| {
+            CliError::msg(format!(
+                "invalid blob size '{}' in git cat-file output for {requested_oid}",
+                fields[2]
+            ))
+        })?;
+        const POINTER_PROBE_BYTES: usize = 16 * 1024;
+        let probe_len = git_size.min(POINTER_PROBE_BYTES);
+        let mut probe = vec![0_u8; probe_len];
+        self.stdout.read_exact(&mut probe).map_err(|source| {
+            CliError::io(
+                "git cat-file output truncated while reading blob probe",
+                source,
+            )
+        })?;
+        let pointer = parse_git_lfs_pointer(&probe)?;
+        if let Some(pointer) = pointer {
+            let mut remaining = git_size.saturating_sub(probe_len);
+            let mut discard = [0_u8; 8192];
+            while remaining > 0 {
+                let take = remaining.min(discard.len());
+                self.stdout
+                    .read_exact(&mut discard[..take])
+                    .map_err(|source| {
+                        CliError::io(
+                            "git cat-file output truncated while draining LFS pointer",
+                            source,
+                        )
+                    })?;
+                remaining -= take;
+            }
+            let mut separator = [0_u8; 1];
+            self.stdout.read_exact(&mut separator).map_err(|source| {
+                CliError::io("git cat-file output truncated after blob", source)
+            })?;
+            if separator != *b"\n" {
+                return Err(CliError::msg(format!(
+                    "malformed git cat-file output: blob {requested_oid} lacks trailing newline"
+                )));
+            }
+            let objects_path = self.git_lfs_objects_path.as_ref().ok_or_else(|| {
+                CliError::msg("Git LFS pointer encountered without an LFS object store")
+            })?;
+            let object_path = objects_path
+                .join(&pointer.oid[..2])
+                .join(&pointer.oid[2..4])
+                .join(&pointer.oid);
+            let mut file = File::open(&object_path).map_err(|source| {
+                CliError::msg(format!(
+                    "Git LFS object {} is unavailable ({source}); fetch every historical object before replay with `git -C {} lfs fetch --all`",
+                    pointer.oid,
+                    self.repo_path.display()
+                ))
+            })?;
+            let mut actual = Sha256::new();
+            let mut total_read = 0_u64;
+            let mut buffer = vec![0_u8; lix::PREPARED_FILE_CONTENT_CHUNK_BYTES];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|source| CliError::io("failed to read Git LFS object", source))?;
+                if read == 0 {
+                    break;
+                }
+                actual.update(&buffer[..read]);
+                let offset = total_read;
+                total_read = total_read.saturating_add(read as u64);
+                consume(
+                    &buffer[..read],
+                    offset,
+                    pointer.size,
+                    total_read == pointer.size,
+                )?;
+            }
+            if total_read != pointer.size {
+                return Err(CliError::msg(format!(
+                    "Git LFS object {} has {} bytes, pointer declares {}",
+                    pointer.oid, total_read, pointer.size
+                )));
+            }
+            let digest = actual.finalize();
+            let actual_oid = sha256_hex(digest.as_slice());
+            if actual_oid != pointer.oid {
+                return Err(CliError::msg(format!(
+                    "Git LFS object {} failed SHA-256 verification (read {actual_oid})",
+                    pointer.oid
+                )));
+            }
+            if self.git_lfs_oids_materialized.insert(pointer.oid) {
+                self.git_lfs_objects_materialized =
+                    self.git_lfs_objects_materialized.saturating_add(1);
+                self.git_lfs_bytes_materialized =
+                    self.git_lfs_bytes_materialized.saturating_add(pointer.size);
+            }
+            return Ok(());
+        }
+
+        let total_size = git_size as u64;
+        let mut offset = 0_u64;
+        let mut pending = probe;
+        let mut buffer = vec![0_u8; lix::PREPARED_FILE_CONTENT_CHUNK_BYTES];
+        loop {
+            while pending.len() >= lix::PREPARED_FILE_CONTENT_CHUNK_BYTES {
+                let chunk = pending
+                    .drain(..lix::PREPARED_FILE_CONTENT_CHUNK_BYTES)
+                    .collect::<Vec<_>>();
+                let chunk_offset = offset;
+                offset += chunk.len() as u64;
+                consume(&chunk, chunk_offset, total_size, offset == total_size)?;
+            }
+            if offset + pending.len() as u64 == total_size {
+                break;
+            }
+            let take =
+                (total_size - offset - pending.len() as u64).min(buffer.len() as u64) as usize;
+            self.stdout
+                .read_exact(&mut buffer[..take])
+                .map_err(|source| {
+                    CliError::io("git cat-file output truncated while streaming blob", source)
+                })?;
+            pending.extend_from_slice(&buffer[..take]);
+        }
+        if !pending.is_empty() {
+            let chunk_offset = offset;
+            offset += pending.len() as u64;
+            consume(&pending, chunk_offset, total_size, offset == total_size)?;
+        }
+        if offset != total_size {
+            return Err(CliError::msg(format!(
+                "git blob {requested_oid} ended at {offset} bytes, expected {total_size}"
+            )));
+        }
+        let mut separator = [0_u8; 1];
+        self.stdout
+            .read_exact(&mut separator)
+            .map_err(|source| CliError::io("git cat-file output truncated after blob", source))?;
+        if separator != *b"\n" {
+            return Err(CliError::msg(format!(
+                "malformed git cat-file output: blob {requested_oid} lacks trailing newline"
+            )));
+        }
+        Ok(())
+    }
+
     fn request_blob_batch(&mut self, blob_ids: &[String]) -> Result<(), CliError> {
         let stdin = self
             .stdin
@@ -1747,9 +2133,49 @@ fn prepare_commit_changes(
     changes: &[Change],
     blob_by_oid: &HashMap<String, Vec<u8>>,
 ) -> Result<PreparedBatch, CliError> {
+    let planned = plan_commit_changes(state, changes)?;
+    let materialize = |row: PlannedWriteRow| -> Result<WriteRow, CliError> {
+        let data = Some(
+            blob_by_oid
+                .get(&row.blob_oid)
+                .ok_or_else(|| {
+                    CliError::msg(format!(
+                        "missing blob {} while applying {} {}",
+                        row.blob_oid, row.status, row.path
+                    ))
+                })?
+                .clone(),
+        );
+        Ok(WriteRow {
+            id: row.id,
+            path: row.path,
+            data,
+            git_mode: row.git_mode,
+            git_oid: row.git_oid,
+        })
+    };
+    Ok(PreparedBatch {
+        deletes: planned.deletes,
+        inserts: planned
+            .inserts
+            .into_iter()
+            .map(&materialize)
+            .collect::<Result<Vec<_>, _>>()?,
+        updates: planned
+            .updates
+            .into_iter()
+            .map(materialize)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn plan_commit_changes(
+    state: &mut ReplayState,
+    changes: &[Change],
+) -> Result<PlannedBatch, CliError> {
     let mut delete_ids = BTreeSet::<String>::new();
-    let mut inserts_by_id = BTreeMap::<String, WriteRow>::new();
-    let mut updates_by_id = BTreeMap::<String, WriteRow>::new();
+    let mut inserts_by_id = BTreeMap::<String, PlannedWriteRow>::new();
+    let mut updates_by_id = BTreeMap::<String, PlannedWriteRow>::new();
 
     for change in changes {
         let status = normalize_status(change.status);
@@ -1786,24 +2212,11 @@ fn prepare_commit_changes(
         };
 
         let target = resolve_write_target(state, change)?;
-        let data = Some(
-            blob_by_oid
-                .get(&change.new_oid)
-                .ok_or_else(|| {
-                    CliError::msg(format!(
-                        "missing blob {} while applying {} {}",
-                        change.new_oid,
-                        status,
-                        new_path.lix_path()
-                    ))
-                })?
-                .clone(),
-        );
-
-        let row = WriteRow {
+        let row = PlannedWriteRow {
             id: target.id.clone(),
             path: new_path.lix_path(),
-            data,
+            blob_oid: change.new_oid.clone(),
+            status,
             git_mode: change.new_mode.clone(),
             git_oid: change.new_oid.clone(),
         };
@@ -1827,7 +2240,7 @@ fn prepare_commit_changes(
         updates_by_id.insert(row.id.clone(), row);
     }
 
-    Ok(PreparedBatch {
+    Ok(PlannedBatch {
         deletes: delete_ids.into_iter().collect(),
         inserts: inserts_by_id.into_values().collect(),
         updates: updates_by_id.into_values().collect(),

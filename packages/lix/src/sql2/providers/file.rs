@@ -2710,7 +2710,29 @@ pub(crate) async fn execute_fast_lix_file_prepared_path_write(
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
         vec![(None, path, FileContent::PreparedCas(receipt), None, None)],
-        FastLixFilePathWriteConflict::UpdateContent,
+        FastLixFilePathWriteConflict::UpdateContentAndMetadata,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn execute_fast_lix_file_prepared_id_path_write(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    id: String,
+    path: String,
+    receipt: crate::binary_cas::BlobWriteReceipt,
+    metadata: Option<TransactionJson>,
+) -> Result<Option<u64>, LixError> {
+    execute_fast_lix_file_id_path_writes_inner(
+        ctx,
+        vec![(
+            Some(id),
+            path,
+            FileContent::PreparedCas(receipt),
+            metadata,
+            None,
+        )],
+        FastLixFilePathWriteConflict::IdUpdateContentAndMetadata,
         None,
     )
     .await

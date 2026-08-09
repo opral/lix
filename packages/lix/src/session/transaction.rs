@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use crate::LixError;
 #[cfg(test)]
 use crate::transaction::CommitBoundaryGuard;
+use crate::transaction::types::TransactionJson;
 use crate::transaction::{
     CommitBoundaryState, Transaction, TransactionCommitBoundary,
     open_transaction_with_runtime_boundary,
@@ -113,6 +114,45 @@ impl<StorageImpl> SessionTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) async fn stage_prepared_blob_chunk(
+        &mut self,
+        upload_key: &str,
+        total_size: u64,
+        offset: u64,
+        content: &[u8],
+        final_chunk: bool,
+    ) -> Result<Option<crate::binary_cas::BlobWriteReceipt>, LixError> {
+        self.transaction_mut()?
+            .stage_prepared_blob_chunk(upload_key, total_size, offset, content, final_chunk)
+            .await
+    }
+
+    pub(crate) async fn upsert_prepared_file_content(
+        &mut self,
+        id: String,
+        path: String,
+        receipt: crate::binary_cas::BlobWriteReceipt,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<u64, LixError> {
+        let metadata = metadata
+            .map(|value| TransactionJson::from_value(value, "prepared file metadata"))
+            .transpose()?;
+        crate::sql2::execute_fast_lix_file_prepared_id_path_write(
+            self.transaction_mut()?,
+            id,
+            path,
+            receipt,
+            metadata,
+        )
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "prepared file content path was not handled by the ForkTree owner",
+            )
+        })
+    }
+
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<StorageImpl>, LixError> {
         self.ensure_session_open()?;
         self.transaction

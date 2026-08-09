@@ -19,6 +19,9 @@ use crate::client_state::ClientState;
 use crate::engine::{Engine, EngineOptions};
 use crate::session::SessionContext;
 
+/// Maximum payload accepted by one receipt-only prepared file chunk.
+pub const PREPARED_FILE_CONTENT_CHUNK_BYTES: usize = crate::forktree::PREPARED_BLOB_CHUNK_BYTES;
+
 /// Configures a Lix workspace session before it is opened.
 ///
 /// The default builder opens an in-memory Lix. Configure a persistent adapter
@@ -524,10 +527,60 @@ where
     inner: lix::SessionTransaction<StorageImpl>,
 }
 
+/// An authenticated immutable blob manifest prepared outside the final
+/// semantic transaction. The payload objects are intentionally unreferenced
+/// until this receipt is consumed by `upsert_prepared_file_content`.
+#[derive(Debug)]
+pub struct PreparedFileContent {
+    receipt: crate::binary_cas::BlobWriteReceipt,
+}
+
 impl<StorageImpl> LixTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Appends one canonical 1 MiB-or-smaller chunk to a receipt-only blob
+    /// upload. Chunk objects are durably staged by the immutable ForkTree
+    /// owner; only hashes and manifest edges remain in this transaction.
+    pub async fn stage_prepared_file_content_chunk(
+        &mut self,
+        upload_key: impl Into<String>,
+        total_size: u64,
+        offset: u64,
+        content: impl Into<Blob>,
+        final_chunk: bool,
+    ) -> Result<Option<PreparedFileContent>, LixError> {
+        let upload_key = upload_key.into();
+        let content = content.into();
+        let receipt = self
+            .inner
+            .stage_prepared_blob_chunk(
+                &upload_key,
+                total_size,
+                offset,
+                content.as_ref(),
+                final_chunk,
+            )
+            .await?;
+        Ok(receipt.map(|receipt| PreparedFileContent { receipt }))
+    }
+
+    /// Stages the visible file/blob-ref and plugin rows using the prepared
+    /// authenticated receipt. This remains part of the caller's one final
+    /// semantic transaction; failure leaves only reclaimable unreferenced
+    /// immutable objects.
+    pub async fn upsert_prepared_file_content(
+        &mut self,
+        id: impl Into<String>,
+        path: impl Into<String>,
+        prepared: PreparedFileContent,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<u64, LixError> {
+        self.inner
+            .upsert_prepared_file_content(id.into(), path.into(), prepared.receipt, metadata)
+            .await
+    }
+
     /// Executes one SQL statement inside this transaction.
     ///
     /// Writes are staged until `commit()`. Reads use the transaction overlay,
