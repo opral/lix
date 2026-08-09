@@ -347,14 +347,14 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        let marker_schema = crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY;
         let rows = scan_facade(
             self,
             &LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
-                    schema_keys: vec![
-                        crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
-                    ],
+                    schema_keys: vec![marker_schema.to_owned(), scope.schema_key.to_owned()],
                     branch_ids: vec![branch_id.to_owned()],
+                    untracked: Some(false),
                     include_tombstones: true,
                     ..Default::default()
                 },
@@ -363,9 +363,25 @@ where
         )
         .await?;
         let expected_scope = crate::collection_generation::collection_scope_key(scope);
+        let mut marker = None;
         for row in rows.iter() {
-            if row.entity_pk() != &EntityPk::single(&expected_scope) || row.file_id().is_some() {
+            if row.schema_key() != marker_schema
+                || row.entity_pk() != &EntityPk::single(&expected_scope)
+                || row.file_id().is_some()
+            {
                 continue;
+            }
+            if marker.is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "collection generation has duplicate authenticated marker rows",
+                ));
+            }
+            if row.global() || row.untracked() || row.branch_id() != branch_id {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "collection generation marker has the wrong authenticated branch",
+                ));
             }
             if row.deleted() || row.snapshot_content().is_none() {
                 return Ok(None);
@@ -411,14 +427,69 @@ where
                     "collection generation row is missing its authenticated commit identity",
                 )
             })?;
-            return Ok(Some(crate::collection_generation::CollectionGeneration {
-                active_generation,
-                live_count,
-                ordered_identity_digest: None,
-            }));
+            marker = Some((active_generation, live_count));
         }
-        Ok(None)
+        let Some((active_generation, live_count)) = marker else {
+            return Ok(None);
+        };
+        let ordered_identity_digest = authenticated_ordered_generation_digest(
+            &rows,
+            branch_id,
+            scope,
+            active_generation,
+            live_count,
+        )?;
+        Ok(Some(crate::collection_generation::CollectionGeneration {
+            active_generation,
+            live_count,
+            ordered_identity_digest,
+        }))
     }
+}
+
+fn authenticated_ordered_generation_digest(
+    rows: &MaterializedLiveStateBatch,
+    branch_id: &str,
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+    active_generation: crate::changelog::CommitId,
+    live_count: u64,
+) -> Result<Option<[u8; 32]>, LixError> {
+    if live_count == 0 || live_count == crate::collection_generation::DEFERRED_LIVE_COUNT {
+        return Ok(None);
+    }
+    let mut identities = Vec::new();
+    for row in rows.iter() {
+        if row.schema_key() != scope.schema_key || row.file_id() != scope.file_id {
+            continue;
+        }
+        if row.global()
+            || row.untracked()
+            || row.branch_id() != branch_id
+            || row.deleted()
+            || row.snapshot_content().is_none()
+            || row.commit_id() != Some(active_generation)
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "collection generation member has invalid authenticated identity",
+            ));
+        }
+        identities.push(row.entity_pk());
+    }
+    if identities.len() != usize::try_from(live_count).unwrap_or(usize::MAX) {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "collection generation live_count does not match authenticated members",
+        ));
+    }
+    crate::collection_generation::ordered_single_string_identity_digest(identities.into_iter())
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "collection generation member identity is not an ordered single string",
+            )
+        })
+        .map(Some)
 }
 
 async fn load_exact_view<R>(
@@ -767,6 +838,59 @@ mod tests {
             untracked,
             branch_id: branch_id.into(),
         }
+    }
+
+    fn generation_member(entity_pk: &str) -> MaterializedLiveStateRow {
+        let mut row = row("branch", entity_pk, Some(entity_pk), false, false, false);
+        row.schema_key = "entity".to_owned();
+        row.commit_id = Some(CommitId::for_test_label("generation"));
+        row
+    }
+
+    #[test]
+    fn ordered_generation_digest_binds_members_and_order() {
+        let rows = MaterializedLiveStateBatch::from_rows(vec![
+            generation_member("a"),
+            generation_member("b"),
+        ]);
+        let digest = authenticated_ordered_generation_digest(
+            &rows,
+            "branch",
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: "entity",
+                file_id: None,
+            },
+            CommitId::for_test_label("generation"),
+            2,
+        )
+        .expect("authenticated generation digest")
+        .expect("non-empty generation has digest");
+        assert_eq!(
+            digest,
+            crate::collection_generation::ordered_single_string_identity_digest(
+                rows.iter().map(|row| row.entity_pk()),
+            )
+            .expect("single-string identities")
+        );
+    }
+
+    #[test]
+    fn ordered_generation_digest_rejects_wrong_member_identity() {
+        let mut substituted = generation_member("a");
+        substituted.commit_id = Some(CommitId::for_test_label("other-generation"));
+        let rows = MaterializedLiveStateBatch::from_rows(vec![substituted]);
+        let error = authenticated_ordered_generation_digest(
+            &rows,
+            "branch",
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: "entity",
+                file_id: None,
+            },
+            CommitId::for_test_label("generation"),
+            1,
+        )
+        .expect_err("substituted generation member must fail closed");
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
     }
 
     #[test]
