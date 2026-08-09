@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
+use crate::binary_cas::{BlobId, BlobPayload, BlobSameLengthSplice};
 use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
@@ -18,7 +19,7 @@ use super::model::{
 use super::object::{OBJECT_SPACE, ObjectId};
 use super::serving::{CatalogTreeEdit, StateTreeEdit};
 use super::state::{
-    StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
+    StateKey, StateKeyRef, UNTRACKED_ROW_SPACE, UntrackedValueRef, encode_untracked_key,
     encode_untracked_value,
 };
 use super::tree::{ImmutableObjectSet, ReceiptTreeEdit};
@@ -76,6 +77,21 @@ pub(crate) struct PreparedPublication {
     object_deletes: BTreeSet<ObjectId>,
     untracked_puts: BTreeMap<Bytes, Bytes>,
     untracked_deletes: BTreeSet<Bytes>,
+}
+
+/// A publication-local proof that a fixed-width successor was derived from
+/// one authenticated BlobRef owner and its immutable base manifest. The
+/// receipt never becomes durable: the successor manifest and its exact StateKey
+/// edge are committed by the surrounding transaction plan.
+#[derive(Debug)]
+struct AuthenticatedBlobSpliceReceipt {
+    state_key: StateKey,
+    base_manifest_object_id: ObjectId,
+    base_blob_id: BlobId,
+    changed_chunks: Vec<BlobChunkRefV1>,
+    successor_manifest_object_id: ObjectId,
+    successor_manifest: BlobManifestV1,
+    final_blob_id: BlobId,
 }
 
 impl PreparedPublication {
@@ -587,8 +603,16 @@ impl PreparedPublication {
                 "empty inline payload has no blob manifest; omit its BlobRef row",
             ));
         }
-        let mut ordered_chunks = Vec::with_capacity(bytes.len().div_ceil(1024 * 1024));
-        for chunk_bytes in bytes.chunks(1024 * 1024) {
+        let mut semantic_id_builder = super::blob::CanonicalBlobIdBuilder::default();
+        let mut content_digest = blake3::Hasher::new();
+        let mut ordered_chunks = Vec::with_capacity(
+            bytes
+                .len()
+                .div_ceil(super::blob::CANONICAL_BLOB_CHUNK_BYTES),
+        );
+        for chunk_bytes in bytes.chunks(super::blob::CANONICAL_BLOB_CHUNK_BYTES) {
+            semantic_id_builder.update_fixed_chunk(chunk_bytes)?;
+            content_digest.update(chunk_bytes);
             let chunk = BlobChunkV1 {
                 bytes: Bytes::copy_from_slice(chunk_bytes),
             };
@@ -602,10 +626,139 @@ impl PreparedPublication {
         let manifest = BlobManifestV1::from_authenticated_chunks(
             bytes.len() as u64,
             ordered_chunks,
-            crate::binary_cas::BlobId::from_content(bytes),
-            *blake3::hash(bytes).as_bytes(),
+            semantic_id_builder.finish(),
+            *content_digest.finalize().as_bytes(),
         );
         self.stage_blob_manifest(&manifest)
+    }
+
+    /// Authenticates a fixed-width successor against the exact BlobRef
+    /// StateKey selected by `view`, then stages only chunks intersecting the
+    /// verified edit. Unchanged chunk references are copied from the
+    /// authenticated base manifest; no payload or second storage read is used
+    /// for those chunks.
+    pub(crate) async fn stage_verified_inline_blob_splice<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        payload: &BlobPayload,
+        splice: BlobSameLengthSplice,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        let reference = view
+            .bind_blob_at_state_key(state_key)
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .ok_or_else(|| corruption("verified blob splice base owner is absent"))?;
+        if reference.semantic_id() != splice.base_blob_hash {
+            return Err(corruption(
+                "verified blob splice base identity does not match its StateKey owner",
+            ));
+        }
+        if reference.expected_size() != payload.len() as u64 {
+            return Err(corruption(
+                "verified blob splice changes the authenticated base length",
+            ));
+        }
+        let splice_end = splice
+            .end()
+            .filter(|end| splice.length != 0 && *end <= payload.len())
+            .ok_or_else(|| corruption("verified blob splice range is invalid"))?;
+        let base_manifest_object_id = reference.manifest_object_id();
+        let base_manifest_bytes = view.load_object_bytes(base_manifest_object_id).await?;
+        let base_manifest = BlobManifestV1::decode(base_manifest_object_id, &base_manifest_bytes)?;
+        if base_manifest.logical_bytes != payload.len() as u64
+            || base_manifest.canonical_blob_id != splice.base_blob_hash
+        {
+            return Err(corruption(
+                "verified blob splice base manifest is not bound to its BlobRef owner",
+            ));
+        }
+        let expected_chunk_count = payload
+            .len()
+            .div_ceil(super::blob::CANONICAL_BLOB_CHUNK_BYTES);
+        if base_manifest.ordered_chunks.len() != expected_chunk_count {
+            return Err(corruption(
+                "verified blob splice base manifest is not canonical fixed-chunk layout",
+            ));
+        }
+        let mut ordered_chunks = Vec::with_capacity(expected_chunk_count);
+        let mut changed_chunks = Vec::new();
+        for (index, base_chunk) in base_manifest.ordered_chunks.iter().enumerate() {
+            let start = index * super::blob::CANONICAL_BLOB_CHUNK_BYTES;
+            let end = start
+                .saturating_add(super::blob::CANONICAL_BLOB_CHUNK_BYTES)
+                .min(payload.len());
+            let expected_len = end.saturating_sub(start) as u64;
+            if base_chunk.declared_len != expected_len {
+                return Err(corruption(
+                    "verified blob splice base manifest has a noncanonical chunk length",
+                ));
+            }
+            if start < splice_end && splice.offset < end {
+                let chunk = BlobChunkV1 {
+                    bytes: Bytes::copy_from_slice(&payload.bytes()[start..end]),
+                };
+                let chunk_object_id = self.stage_blob_chunk(&chunk)?;
+                let chunk_ref = BlobChunkRefV1 {
+                    chunk_object_id,
+                    declared_len: expected_len,
+                };
+                changed_chunks.push(chunk_ref.clone());
+                ordered_chunks.push(chunk_ref);
+            } else {
+                ordered_chunks.push(base_chunk.clone());
+            }
+        }
+        if changed_chunks.is_empty() {
+            return Err(corruption(
+                "verified blob splice does not intersect a canonical chunk",
+            ));
+        }
+        let final_blob_id = payload
+            .hash()
+            .ok_or_else(|| corruption("verified blob splice has no final BlobId"))?;
+        let content_digest = payload
+            .content_digest()
+            .ok_or_else(|| corruption("verified blob splice has no final content digest"))?;
+        let successor_manifest = BlobManifestV1::from_authenticated_chunks(
+            payload.len() as u64,
+            ordered_chunks,
+            final_blob_id,
+            content_digest,
+        );
+        let successor_manifest_object_id = successor_manifest.encode()?.0;
+        let receipt = AuthenticatedBlobSpliceReceipt {
+            state_key: state_key.clone(),
+            base_manifest_object_id,
+            base_blob_id: splice.base_blob_hash,
+            changed_chunks,
+            successor_manifest_object_id,
+            successor_manifest,
+            final_blob_id,
+        };
+        if receipt.state_key != *state_key
+            || receipt.base_manifest_object_id != base_manifest_object_id
+            || receipt.base_blob_id != splice.base_blob_hash
+            || receipt.successor_manifest.canonical_blob_id != receipt.final_blob_id
+            || receipt.successor_manifest_object_id != receipt.successor_manifest.encode()?.0
+        {
+            return Err(corruption(
+                "verified blob splice receipt is not bound to its authenticated identities",
+            ));
+        }
+        if receipt
+            .changed_chunks
+            .iter()
+            .any(|chunk| !receipt.successor_manifest.ordered_chunks.contains(chunk))
+        {
+            return Err(corruption(
+                "verified blob splice receipt changed chunk is absent from its successor manifest",
+            ));
+        }
+        self.stage_blob_manifest(&receipt.successor_manifest)
     }
 
     /// Lowers one large JSON value into an authenticated ForkTree payload

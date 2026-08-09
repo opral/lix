@@ -89,6 +89,26 @@ impl BlobId {
     }
 }
 
+fn blob_identity_and_content_digest(content: &[u8]) -> (BlobId, [u8; 32]) {
+    let mut content_digest = blake3::Hasher::new();
+    let mut chunks = Vec::with_capacity(content.len().div_ceil(MEDIA_CHUNK_BYTES));
+    for chunk in content.chunks(MEDIA_CHUNK_BYTES) {
+        content_digest.update(chunk);
+        chunks.push((ChunkHash::from_content(chunk), chunk.len() as u64));
+    }
+    let blob_id = if content.len() <= MEDIA_CHUNK_BYTES {
+        BlobId::from_single_chunk(
+            chunks
+                .first()
+                .map(|(hash, _)| *hash)
+                .expect("non-empty blob has one canonical chunk"),
+        )
+    } else {
+        BlobId::from_chunks(content.len() as u64, chunks)
+    };
+    (blob_id, *content_digest.finalize().as_bytes())
+}
+
 /// The raw content hash of one immutable CAS chunk.
 ///
 /// A `ChunkHash` can equal a small blob's `BlobId` byte-for-byte, but it is
@@ -141,19 +161,33 @@ impl BlobSameLengthSplice {
             length,
         }
     }
+
+    pub(crate) fn end(self) -> Option<usize> {
+        self.offset.checked_add(self.length)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
     hash: Option<BlobId>,
+    content_digest: Option<[u8; 32]>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let hash = (!bytes.is_empty()).then(|| BlobId::from_content(&bytes));
-        Self { bytes, hash }
+        let (hash, content_digest) = if bytes.is_empty() {
+            (None, None)
+        } else {
+            let (hash, content_digest) = blob_identity_and_content_digest(&bytes);
+            (Some(hash), Some(content_digest))
+        };
+        Self {
+            bytes,
+            hash,
+            content_digest,
+        }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -166,6 +200,10 @@ impl BlobPayload {
 
     pub(crate) fn hash(&self) -> Option<BlobId> {
         self.hash
+    }
+
+    pub(crate) fn content_digest(&self) -> Option<[u8; 32]> {
+        self.content_digest
     }
 
     pub(crate) fn len(&self) -> usize {
