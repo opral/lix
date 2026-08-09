@@ -8,8 +8,8 @@ pub(crate) mod visibility;
 pub(crate) use context::{BranchHeadControlCache, LiveStateContext};
 pub(crate) use derived::is_derived_schema;
 pub(crate) use forktree_reader::{
-    load_exact_batch as load_forktree_exact_batch, load_exact_facade as load_forktree_exact_facade,
-    scan_facade as scan_forktree_facade, scan_view as scan_forktree_view,
+    load_exact_facade as load_forktree_exact_facade, scan_facade as scan_forktree_facade,
+    scan_view as scan_forktree_view,
 };
 #[cfg(test)]
 pub(crate) use reader::load_exact_batch_via_scan_for_test;

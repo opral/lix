@@ -15,7 +15,7 @@ use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, open_coherent_view_on_read, state_point, state_range,
+    encode_state_key, state_point, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -303,26 +303,6 @@ where
         }
     }
     Ok(MaterializedLiveStateBatch::from_rows(rows))
-}
-
-/// Loads correlated current-state identities from one authenticated
-/// selector/root view. This deliberately has no scan-scope or legacy
-/// tracked-head fallback: unsupported derived, untracked, and multi-branch
-/// requests fail before a view is opened.
-pub(crate) async fn load_exact_batch<S>(
-    read: &S,
-    request: &LiveStateExactBatchRequest,
-) -> Result<MaterializedLiveStateExactBatch, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    validate_exact_request(request)?;
-    if request.rows.is_empty() {
-        return Ok(MaterializedLiveStateExactBatch::default());
-    }
-    let branch_id = parse_branch_id(&request.rows[0].branch_id)?;
-    let view = open_coherent_view_on_read(read, branch_id).await?;
-    load_exact_view(&view, request).await
 }
 
 /// Loads correlated current-state identities from a view borrowed from an
@@ -748,13 +728,9 @@ mod tests {
     }
 
     #[test]
-    fn exact_rejects_history_and_untracked_before_view_acquisition() {
+    fn exact_rejects_history_before_view_acquisition() {
         assert!(validate_exact_request(&exact("lix_commit")).is_err());
         assert!(validate_exact_request(&exact("lix_commit_edge")).is_err());
-
-        let mut untracked = exact("app.schema");
-        untracked.untracked = Some(true);
-        assert!(validate_exact_request(&untracked).is_err());
     }
 
     #[test]
