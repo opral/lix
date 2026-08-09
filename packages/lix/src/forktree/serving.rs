@@ -17,9 +17,9 @@ use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
 };
 use super::tree::{
-    ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
+    ImmutableObjectSet, OrderedTreeMutation, OrderedTreeRangeCursor, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    scan_page_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1578,6 +1578,26 @@ where
         .collect())
 }
 
+pub(crate) fn state_range_cursor<'a, R>(
+    view: &'a CoherentView<R>,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    include_tombstones: bool,
+) -> Result<StateRangeCursor<'a, R>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let (global_root, local_root) = current_state_roots(view);
+    state_range_cursor_on_roots(
+        global_root,
+        local_root,
+        view.retained_read(),
+        lower,
+        upper,
+        include_tombstones,
+    )
+}
+
 /// The global branch has no branch-local overlay. Bootstrap intentionally
 /// retains the same authenticated state root in the selected global snapshot,
 /// so treating that root as a local branch would relabel global rows and make
@@ -1615,80 +1635,108 @@ pub(crate) async fn state_range_on_roots<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let page_size = limit.unwrap_or(64).clamp(1, 64);
-    let mut output = Vec::new();
-    let mut global_cursor = None;
-    let mut local_cursor = None;
-    let mut global = std::collections::VecDeque::new();
-    let mut local = std::collections::VecDeque::new();
-    let mut global_done = false;
-    let mut local_done = local_state_root.is_none();
-    loop {
-        if limit.is_some_and(|limit| output.len() >= limit) {
+    let mut cursor = state_range_cursor_on_roots(
+        global_state_root,
+        local_state_root,
+        read,
+        lower,
+        upper,
+        include_tombstones,
+    )?;
+    let mut output = Vec::with_capacity(limit.map_or(64, |limit| limit.min(64)));
+    while limit.is_none_or(|limit| output.len() < limit) {
+        let Some(row) = cursor.next().await? else {
             break;
-        }
-        if global.is_empty() && !global_done {
-            let page = scan_bounded_page_on_read(
-                global_state_root,
-                "state",
-                lower,
-                upper,
-                global_cursor.as_deref(),
-                page_size,
-                read,
-            )
-            .await?;
-            global_done = page.len() < page_size;
-            global_cursor = page.last().map(|(key, _)| key.clone());
-            global.extend(page);
-        }
-        if local.is_empty() && !local_done {
-            let page = scan_bounded_page_on_read(
-                local_state_root.expect("local state root is present while scanning"),
-                "state",
-                lower,
-                upper,
-                local_cursor.as_deref(),
-                page_size,
-                read,
-            )
-            .await?;
-            local_done = page.len() < page_size;
-            local_cursor = page.last().map(|(key, _)| key.clone());
-            local.extend(page);
-        }
-        if global.is_empty() && local.is_empty() {
-            break;
-        }
-        let take_local = match (global.front(), local.front()) {
-            (None, Some(_)) => true,
-            (Some(_), None) => false,
-            (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
-            (None, None) => break,
         };
-        let (key, encoded, source) = if take_local {
-            let (key, value) = local.pop_front().expect("front local state row");
-            if global
-                .front()
-                .is_some_and(|(global_key, _)| *global_key == key)
-            {
-                global.pop_front();
-            }
-            (key, value, StateSource::Branch)
-        } else {
-            let (key, value) = global.pop_front().expect("front global state row");
-            (key, value, StateSource::Global)
-        };
-        let value = decode_state_value_storage(&encoded)?;
-        if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
-            return Err(corruption("global state tree contains a tombstone"));
-        }
-        if value.cell.deleted() && !include_tombstones {
-            continue;
-        }
-        output.push((key, value, source));
+        output.push(row);
     }
     Ok(output)
+}
+
+pub(crate) fn state_range_cursor_on_roots<'a, R>(
+    global_state_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    read: &'a R,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+    include_tombstones: bool,
+) -> Result<StateRangeCursor<'a, R>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    Ok(StateRangeCursor {
+        global: OrderedTreeRangeCursor::new(global_state_root, "state", lower, upper, read)?,
+        local: local_state_root
+            .map(|root| OrderedTreeRangeCursor::new(root, "state", lower, upper, read))
+            .transpose()?,
+        global_next: None,
+        local_next: None,
+        include_tombstones,
+        finished: false,
+    })
+}
+
+pub(crate) struct StateRangeCursor<'a, R: ?Sized> {
+    global: OrderedTreeRangeCursor<'a, R>,
+    local: Option<OrderedTreeRangeCursor<'a, R>>,
+    global_next: Option<(Vec<u8>, Vec<u8>)>,
+    local_next: Option<(Vec<u8>, Vec<u8>)>,
+    include_tombstones: bool,
+    finished: bool,
+}
+
+impl<'a, R> StateRangeCursor<'a, R>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    pub(crate) async fn next(
+        &mut self,
+    ) -> Result<Option<(Vec<u8>, StateValue, StateSource)>, StorageError> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            if self.global_next.is_none() {
+                self.global_next = self.global.next().await?;
+            }
+            if let Some(local) = self.local.as_mut() {
+                if self.local_next.is_none() {
+                    self.local_next = local.next().await?;
+                }
+            }
+            let take_local = match (&self.global_next, &self.local_next) {
+                (None, None) => {
+                    self.finished = true;
+                    return Ok(None);
+                }
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
+            };
+            let (key, encoded, source) = if take_local {
+                let (key, encoded) = self.local_next.take().expect("local row is present");
+                if self
+                    .global_next
+                    .as_ref()
+                    .is_some_and(|(global_key, _)| *global_key == key)
+                {
+                    self.global_next = None;
+                }
+                (key, encoded, StateSource::Branch)
+            } else {
+                let (key, encoded) = self.global_next.take().expect("global row is present");
+                (key, encoded, StateSource::Global)
+            };
+            let value = decode_state_value_storage(&encoded)?;
+            if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
+                return Err(corruption("global state tree contains a tombstone"));
+            }
+            if value.cell.deleted() && !self.include_tombstones {
+                continue;
+            }
+            return Ok(Some((key, value, source)));
+        }
+    }
 }
 
 /// Loads the complete authenticated state overlay for one historical commit.

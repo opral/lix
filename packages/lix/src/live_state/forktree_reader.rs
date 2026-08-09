@@ -6,7 +6,6 @@
 //! lanes that still need a separate owner instead of falling back to a
 //! deleted current-layout reader.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,13 +14,14 @@ use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, state_points, state_range,
+    encode_state_key, state_points, state_range_cursor,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
-    MaterializedLiveStateRow,
+    MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
+use crate::storage::{ProjectedValue, ReadEntry, ScanCursor};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::derived::is_derived_schema;
@@ -106,10 +106,10 @@ where
             "current ForkTree reader view does not match requested branch",
         ));
     }
-    let rows = state_range(&view, None, None, None, true).await?;
-    let mut output = Vec::with_capacity(rows.len());
-    for row in rows {
-        let key = decode_state_key(&row.encoded_key)?;
+    let mut cursor = state_range_cursor(&view, None, None, true)?;
+    let mut output = Vec::with_capacity(request.limit.map_or(64, |limit| limit.min(64)));
+    while let Some((encoded_key, value, source)) = cursor.next().await? {
+        let key = decode_state_key(&encoded_key)?;
         if !request.filter.schema_keys.is_empty()
             && !request
                 .filter
@@ -136,14 +136,15 @@ where
         {
             continue;
         }
-        if row.value.cell.deleted() && !request.filter.include_tombstones {
+        if value.cell.deleted() && !request.filter.include_tombstones {
             continue;
         }
-        let branch_owner = match row.source {
+        let branch_owner = match source {
             StateSource::Global | StateSource::Branch => branch_id_text(branch_id),
         };
-        output.push(materialize_row(
-            row,
+        output.push(materialize_state_value(
+            value,
+            source,
             key.entity_pk,
             key.schema_key,
             key.file_id,
@@ -170,17 +171,326 @@ where
     if request.limit == Some(0) {
         return Ok(MaterializedLiveStateBatch::default());
     }
-    let mut candidate_request = request.clone();
-    candidate_request.filter.include_tombstones = true;
-    candidate_request.limit = None;
-    let tracked = scan_tracked_view(view, &candidate_request).await?;
-    let untracked = scan_untracked_view(view, &candidate_request).await?;
-    merge_current_overlay(
-        tracked,
-        untracked,
-        request.filter.include_tombstones,
-        request.limit,
-    )
+    let [branch_id] = request.filter.branch_ids.as_slice() else {
+        return Err(unsupported("current ForkTree reader requires one branch"));
+    };
+    if !request.filter.constraints.is_empty()
+        || !matches!(request.filter.rows, LiveStateRowFilter::All)
+    {
+        return Err(unsupported(
+            "current ForkTree reader does not yet own this scan lane",
+        ));
+    }
+    let branch_id = parse_branch_id(branch_id)?;
+    if view.branch_id() != branch_id {
+        return Err(unsupported(
+            "current ForkTree reader view does not match requested branch",
+        ));
+    }
+    let mut cursor = CurrentOverlayCursor::new(view).await?;
+    let mut output = MaterializedLiveStateBatchBuilder::with_capacity(
+        request.limit.map_or(64, |limit| limit.min(64)),
+    );
+    while let Some(row) = cursor.next().await? {
+        let (key, materialized) = match row {
+            CurrentOverlayRow::Tracked {
+                encoded_key,
+                value,
+                source,
+            } => {
+                let key = decode_state_key(&encoded_key)?;
+                let materialized = materialize_state_value(
+                    value,
+                    source,
+                    key.entity_pk.clone(),
+                    key.schema_key.clone(),
+                    key.file_id.clone(),
+                    branch_id_text(branch_id),
+                );
+                (key, materialized)
+            }
+            CurrentOverlayRow::Untracked { key, owner, value } => {
+                let materialized = materialize_untracked_row(
+                    value,
+                    key.entity_pk.clone(),
+                    key.schema_key.clone(),
+                    key.file_id.clone(),
+                    branch_id_text(owner),
+                    owner == global_branch_id(),
+                );
+                (key, materialized)
+            }
+        };
+        if !request.filter.schema_keys.is_empty()
+            && !request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema| schema == &key.schema_key)
+        {
+            continue;
+        }
+        if !request.filter.entity_pks.is_empty()
+            && !request
+                .filter
+                .entity_pks
+                .iter()
+                .any(|entity| entity == &key.entity_pk)
+        {
+            continue;
+        }
+        if !request
+            .filter
+            .file_ids
+            .iter()
+            .all(|filter| filter.matches(key.file_id.as_ref()))
+        {
+            continue;
+        }
+        if materialized.deleted && !request.filter.include_tombstones {
+            continue;
+        }
+        output.push_owned(materialized);
+        if request.limit.is_some_and(|limit| output.len() >= limit) {
+            break;
+        }
+    }
+    Ok(output.finish())
+}
+
+struct UntrackedOwnerCursor<'a> {
+    owner: CanonicalBranchId,
+    cursor: ScanCursor<'a>,
+    page: Vec<ReadEntry>,
+    index: usize,
+    has_more: bool,
+}
+
+impl<'a> UntrackedOwnerCursor<'a> {
+    fn new(owner: CanonicalBranchId, cursor: ScanCursor<'a>) -> Self {
+        Self {
+            owner,
+            cursor,
+            page: Vec::new(),
+            index: 0,
+            has_more: true,
+        }
+    }
+
+    async fn next(
+        &mut self,
+    ) -> Result<
+        Option<(
+            Vec<u8>,
+            CanonicalBranchId,
+            crate::forktree::StateKey,
+            crate::forktree::UntrackedValue,
+        )>,
+        LixError,
+    > {
+        loop {
+            if self.index == self.page.len() {
+                if !self.has_more {
+                    return Ok(None);
+                }
+                let chunk = self.cursor.next_page(256).await?;
+                self.page = chunk.entries;
+                self.index = 0;
+                self.has_more = chunk.has_more;
+                if self.page.is_empty() && !self.has_more {
+                    return Ok(None);
+                }
+            }
+            let entry = self.page[self.index].clone();
+            self.index += 1;
+            let (owner, key) = crate::forktree::decode_untracked_key(&entry.key.0)?;
+            if owner != self.owner {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "ForkTree untracked owner range returned a row for another owner",
+                ));
+            }
+            let value = match entry.value {
+                ProjectedValue::FullValue(bytes) => {
+                    crate::forktree::decode_untracked_value(&bytes)?
+                }
+                ProjectedValue::KeyOnly => {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "ForkTree untracked scan returned key-only data",
+                    ));
+                }
+            };
+            let encoded_key = encode_state_key(StateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            return Ok(Some((encoded_key, owner, key, value)));
+        }
+    }
+}
+
+struct UntrackedOverlayCursor<'a> {
+    local: UntrackedOwnerCursor<'a>,
+    global: Option<UntrackedOwnerCursor<'a>>,
+    local_next: Option<(
+        Vec<u8>,
+        CanonicalBranchId,
+        crate::forktree::StateKey,
+        crate::forktree::UntrackedValue,
+    )>,
+    global_next: Option<(
+        Vec<u8>,
+        CanonicalBranchId,
+        crate::forktree::StateKey,
+        crate::forktree::UntrackedValue,
+    )>,
+}
+
+impl<'a> UntrackedOverlayCursor<'a> {
+    async fn new<R>(view: &'a crate::forktree::CoherentView<R>) -> Result<Self, LixError>
+    where
+        R: StorageAdapterRead,
+    {
+        let branch = view.branch_id();
+        let local =
+            UntrackedOwnerCursor::new(branch, view.begin_untracked_owner_scan(branch).await?);
+        let global = if branch == global_branch_id() {
+            None
+        } else {
+            let owner = global_branch_id();
+            Some(UntrackedOwnerCursor::new(
+                owner,
+                view.begin_untracked_owner_scan(owner).await?,
+            ))
+        };
+        Ok(Self {
+            local,
+            global,
+            local_next: None,
+            global_next: None,
+        })
+    }
+
+    async fn next(
+        &mut self,
+    ) -> Result<
+        Option<(
+            Vec<u8>,
+            CanonicalBranchId,
+            crate::forktree::StateKey,
+            crate::forktree::UntrackedValue,
+        )>,
+        LixError,
+    > {
+        if self.local_next.is_none() {
+            self.local_next = self.local.next().await?;
+        }
+        if let Some(global) = self.global.as_mut() {
+            if self.global_next.is_none() {
+                self.global_next = global.next().await?;
+            }
+        }
+        let take_local = match (&self.local_next, &self.global_next) {
+            (None, None) => return Ok(None),
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+            (Some((local_key, ..)), Some((global_key, ..))) => local_key <= global_key,
+        };
+        if take_local {
+            let row = self.local_next.take().expect("local row is present");
+            if self
+                .global_next
+                .as_ref()
+                .is_some_and(|(global_key, ..)| global_key == &row.0)
+            {
+                self.global_next = None;
+            }
+            Ok(Some(row))
+        } else {
+            Ok(self.global_next.take())
+        }
+    }
+}
+
+enum CurrentOverlayRow {
+    Tracked {
+        encoded_key: Vec<u8>,
+        value: crate::forktree::StateValue,
+        source: StateSource,
+    },
+    Untracked {
+        key: crate::forktree::StateKey,
+        owner: CanonicalBranchId,
+        value: crate::forktree::UntrackedValue,
+    },
+}
+
+struct CurrentOverlayCursor<'a, R: ?Sized> {
+    tracked: crate::forktree::StateRangeCursor<'a, R>,
+    untracked: UntrackedOverlayCursor<'a>,
+    tracked_next: Option<(Vec<u8>, crate::forktree::StateValue, StateSource)>,
+    untracked_next: Option<(
+        Vec<u8>,
+        CanonicalBranchId,
+        crate::forktree::StateKey,
+        crate::forktree::UntrackedValue,
+    )>,
+}
+
+impl<'a, R> CurrentOverlayCursor<'a, R>
+where
+    R: StorageAdapterRead,
+{
+    async fn new(view: &'a crate::forktree::CoherentView<R>) -> Result<Self, LixError> {
+        Ok(Self {
+            tracked: state_range_cursor(view, None, None, true)?,
+            untracked: UntrackedOverlayCursor::new(view).await?,
+            tracked_next: None,
+            untracked_next: None,
+        })
+    }
+
+    async fn next(&mut self) -> Result<Option<CurrentOverlayRow>, LixError> {
+        if self.tracked_next.is_none() {
+            self.tracked_next = self.tracked.next().await?;
+        }
+        if self.untracked_next.is_none() {
+            self.untracked_next = self.untracked.next().await?;
+        }
+        let take_untracked = match (&self.tracked_next, &self.untracked_next) {
+            (None, None) => return Ok(None),
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some((tracked_key, ..)), Some((untracked_key, ..))) => untracked_key <= tracked_key,
+        };
+        if take_untracked {
+            let row = self
+                .untracked_next
+                .take()
+                .expect("untracked row is present");
+            if self
+                .tracked_next
+                .as_ref()
+                .is_some_and(|(tracked_key, ..)| tracked_key == &row.0)
+            {
+                self.tracked_next = None;
+            }
+            Ok(Some(CurrentOverlayRow::Untracked {
+                key: row.2,
+                owner: row.1,
+                value: row.3,
+            }))
+        } else {
+            let row = self.tracked_next.take().expect("tracked row is present");
+            Ok(Some(CurrentOverlayRow::Tracked {
+                encoded_key: row.0,
+                value: row.1,
+                source: row.2,
+            }))
+        }
+    }
 }
 
 fn merge_current_overlay(
@@ -189,42 +499,64 @@ fn merge_current_overlay(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
-    let mut by_key = BTreeMap::new();
-    let mut tracked_keys = BTreeSet::new();
-    for row in tracked.into_rows() {
-        let key = encode_row_key(&row);
-        if !tracked_keys.insert(key.clone()) {
-            return Err(overlay_corruption("tracked"));
-        }
-        by_key.insert(key, row);
+    let tracked_keys = (0..tracked.len())
+        .map(|index| encode_row_key_ref(tracked.row(index)))
+        .collect::<Vec<_>>();
+    let untracked_keys = (0..untracked.len())
+        .map(|index| encode_row_key_ref(untracked.row(index)))
+        .collect::<Vec<_>>();
+    if tracked_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(overlay_corruption("tracked"));
     }
-    let mut untracked_keys = BTreeSet::new();
-    for row in untracked.into_rows() {
-        let key = encode_row_key(&row);
-        if !untracked_keys.insert(key.clone()) {
-            return Err(overlay_corruption("untracked"));
-        }
-        by_key.insert(key, row);
+    if untracked_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(overlay_corruption("untracked"));
     }
-
-    let mut output = Vec::with_capacity(limit.unwrap_or(by_key.len()).min(by_key.len()));
-    for row in by_key.into_values() {
-        if row.deleted && !include_tombstones {
-            continue;
-        }
-        output.push(row);
+    let mut tracked_index = 0;
+    let mut untracked_index = 0;
+    let mut output =
+        MaterializedLiveStateBatchBuilder::with_capacity(limit.map_or(64, |limit| limit.min(64)));
+    while tracked_index < tracked.len() || untracked_index < untracked.len() {
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
+        let take_untracked = match (
+            tracked_keys.get(tracked_index),
+            untracked_keys.get(untracked_index),
+        ) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(tracked_key), Some(untracked_key)) => untracked_key <= tracked_key,
+            (None, None) => break,
+        };
+        let row = if take_untracked {
+            let row = untracked.row(untracked_index);
+            let key = &untracked_keys[untracked_index];
+            untracked_index += 1;
+            if tracked_keys
+                .get(tracked_index)
+                .is_some_and(|tracked_key| tracked_key == key)
+            {
+                tracked_index += 1;
+            }
+            row
+        } else {
+            let row = tracked.row(tracked_index);
+            tracked_index += 1;
+            row
+        };
+        if row.deleted() && !include_tombstones {
+            continue;
+        }
+        output.push_ref(row, None);
     }
-    Ok(MaterializedLiveStateBatch::from_rows(output))
+    Ok(output.finish())
 }
 
-fn encode_row_key(row: &MaterializedLiveStateRow) -> Vec<u8> {
+fn encode_row_key_ref(row: MaterializedLiveStateRowRef<'_>) -> Vec<u8> {
     encode_state_key(StateKeyRef {
-        schema_key: &row.schema_key,
-        file_id: row.file_id.as_deref(),
-        entity_pk: &row.entity_pk,
+        schema_key: row.schema_key(),
+        file_id: row.file_id(),
+        entity_pk: row.entity_pk(),
     })
 }
 
@@ -257,9 +589,11 @@ where
             "current ForkTree untracked view does not match requested branch",
         ));
     }
-    let owner_rows = merge_untracked_overlay_rows(view, view.scan_untracked_overlay_rows().await?)?;
-    let mut rows = Vec::new();
-    for (_encoded_key, (owner, key, value)) in owner_rows {
+    let mut output = MaterializedLiveStateBatchBuilder::with_capacity(
+        request.limit.map_or(64, |limit| limit.min(64)),
+    );
+    let mut cursor = UntrackedOverlayCursor::new(view).await?;
+    while let Some((_encoded_key, owner, key, value)) = cursor.next().await? {
         if !request.filter.schema_keys.is_empty()
             && !request
                 .filter
@@ -290,7 +624,7 @@ where
             continue;
         }
         let owner_is_global = owner.as_bytes() == global_branch_id().as_bytes();
-        rows.push(materialize_untracked_row(
+        output.push_owned(materialize_untracked_row(
             value,
             key.entity_pk,
             key.schema_key,
@@ -298,11 +632,11 @@ where
             branch_id_text(owner),
             owner_is_global,
         ));
-        if request.limit.is_some_and(|limit| rows.len() >= limit) {
+        if request.limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
     }
-    Ok(MaterializedLiveStateBatch::from_rows(rows))
+    Ok(output.finish())
 }
 
 /// Loads correlated current-state identities from a view borrowed from an
@@ -596,47 +930,6 @@ fn global_branch_id() -> CanonicalBranchId {
     CanonicalBranchId::from_bytes(*uuid.as_bytes())
 }
 
-fn merge_untracked_overlay_rows(
-    view: &crate::forktree::CoherentView<impl StorageAdapterRead>,
-    rows: Vec<(
-        CanonicalBranchId,
-        crate::forktree::StateKey,
-        crate::forktree::UntrackedValue,
-    )>,
-) -> Result<
-    BTreeMap<
-        Vec<u8>,
-        (
-            CanonicalBranchId,
-            crate::forktree::StateKey,
-            crate::forktree::UntrackedValue,
-        ),
-    >,
-    LixError,
-> {
-    let branch_id = view.branch_id();
-    let global_id = global_branch_id();
-    let mut selected = BTreeMap::new();
-    for (owner, key, value) in rows {
-        let encoded_key = encode_state_key(StateKeyRef {
-            schema_key: &key.schema_key,
-            file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
-        });
-        if let Some((existing_owner, _, _)) = selected.get(&encoded_key) {
-            if *existing_owner == owner {
-                return Err(overlay_corruption("untracked"));
-            }
-            if owner != branch_id {
-                debug_assert_eq!(owner, global_id);
-                continue;
-            }
-        }
-        selected.insert(encoded_key, (owner, key, value));
-    }
-    Ok(selected)
-}
-
 fn validate_exact_request(request: &LiveStateExactBatchRequest) -> Result<(), LixError> {
     let Some(first) = request.rows.first() else {
         return Ok(());
@@ -674,6 +967,36 @@ fn parse_branch_id(value: &str) -> Result<CanonicalBranchId, LixError> {
 
 fn branch_id_text(branch_id: CanonicalBranchId) -> String {
     uuid::Uuid::from_bytes(*branch_id.as_bytes()).to_string()
+}
+
+fn materialize_state_value(
+    value: crate::forktree::StateValue,
+    source: StateSource,
+    entity_pk: EntityPk,
+    schema_key: String,
+    file_id: Option<String>,
+    branch_id: String,
+) -> MaterializedLiveStateRow {
+    let deleted = value.cell.deleted();
+    let snapshot_content = match &value.cell {
+        StateCell::Value(value) => Some(value.clone()),
+        StateCell::Null | StateCell::Tombstone => None,
+    };
+    MaterializedLiveStateRow {
+        entity_pk,
+        schema_key,
+        file_id,
+        snapshot_content,
+        metadata: value.metadata,
+        deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        global: matches!(source, StateSource::Global),
+        change_id: Some(value.change_id),
+        commit_id: Some(value.commit_id),
+        untracked: false,
+        branch_id: Arc::from(branch_id),
+    }
 }
 
 fn materialize_row(
@@ -923,8 +1246,8 @@ mod tests {
     #[test]
     fn combined_overlay_tombstone_masks_value_but_null_remains_visible() {
         let tracked = MaterializedLiveStateBatch::from_rows(vec![
-            row("branch", "null", None, false, false, false),
             row("branch", "deleted", Some("old"), false, false, false),
+            row("branch", "null", None, false, false, false),
         ]);
         let untracked = MaterializedLiveStateBatch::from_rows(vec![row(
             "branch", "deleted", None, true, false, true,

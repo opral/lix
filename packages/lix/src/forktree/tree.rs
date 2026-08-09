@@ -887,51 +887,126 @@ pub(super) async fn scan_range_on_read<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    if lower.zip(upper).is_some_and(|(lower, upper)| lower > upper) {
-        return Err(corruption("ordered-tree range bounds are inverted"));
-    }
-    let kind = parse_kind(expected_kind)?;
+    let mut cursor = OrderedTreeRangeCursor::new(root, expected_kind, lower, upper, read)?;
     let mut output = Vec::new();
-    let mut frontier = vec![(root, None)];
-    while let Some((id, expected)) = frontier.pop() {
-        if limit.is_some_and(|limit| output.len() >= limit) {
+    while limit.is_none_or(|limit| output.len() < limit) {
+        let Some(row) = cursor.next().await? else {
             break;
-        }
-        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
-        validate_loaded_node(id, &node, kind, expected.as_ref())?;
-        match node.body {
-            NodeBody::Leaf(entries) => {
-                for entry in entries {
-                    if lower.is_some_and(|lower| entry.key.as_slice() < lower) {
-                        continue;
-                    }
-                    if upper.is_some_and(|upper| entry.key.as_slice() >= upper) {
-                        break;
-                    }
-                    output.push((entry.key, entry.value));
-                    if limit.is_some_and(|limit| output.len() >= limit) {
-                        break;
-                    }
-                }
-            }
-            NodeBody::Internal(children) => {
-                let first = lower.map_or(0, |lower| child_index(&children, lower));
-                let last = upper.map_or(children.len() - 1, |upper| child_index(&children, upper));
-                for child in children
-                    .into_iter()
-                    .take(last.saturating_add(1))
-                    .skip(first)
-                    .rev()
-                {
-                    frontier.push((child.id, Some(child)));
-                }
-            }
-        }
-    }
-    if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-        return Err(corruption("ordered-tree range is not globally ordered"));
+        };
+        output.push(row);
     }
     Ok(output)
+}
+
+/// One authenticated, forward-only ordered-tree range cursor. Traversal state
+/// borrows the caller's retained read and never restarts at the root after a
+/// caller stops at a visible LIMIT.
+pub(super) struct OrderedTreeRangeCursor<'a, R: ?Sized> {
+    read: &'a R,
+    kind: TreeKind,
+    lower: Option<Vec<u8>>,
+    upper: Option<Vec<u8>>,
+    frontier: Vec<(ObjectId, Option<NodeRef>)>,
+    leaf: Option<(Vec<LeafEntry>, usize)>,
+    last_key: Option<Vec<u8>>,
+    finished: bool,
+}
+
+impl<'a, R> OrderedTreeRangeCursor<'a, R>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    pub(super) fn new(
+        root: ObjectId,
+        expected_kind: &'static str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        read: &'a R,
+    ) -> Result<Self, StorageError> {
+        if lower.zip(upper).is_some_and(|(lower, upper)| lower > upper) {
+            return Err(corruption("ordered-tree range bounds are inverted"));
+        }
+        Ok(Self {
+            read,
+            kind: parse_kind(expected_kind)?,
+            lower: lower.map(ToOwned::to_owned),
+            upper: upper.map(ToOwned::to_owned),
+            frontier: vec![(root, None)],
+            leaf: None,
+            last_key: None,
+            finished: false,
+        })
+    }
+
+    pub(super) async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, StorageError> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            if let Some((entries, index)) = self.leaf.as_mut() {
+                while *index < entries.len() {
+                    let entry = &entries[*index];
+                    *index += 1;
+                    if self
+                        .lower
+                        .as_deref()
+                        .is_some_and(|lower| entry.key.as_slice() < lower)
+                    {
+                        continue;
+                    }
+                    if self
+                        .upper
+                        .as_deref()
+                        .is_some_and(|upper| entry.key.as_slice() >= upper)
+                    {
+                        self.finished = true;
+                        return Ok(None);
+                    }
+                    if self
+                        .last_key
+                        .as_deref()
+                        .is_some_and(|last| last >= entry.key.as_slice())
+                    {
+                        return Err(corruption("ordered-tree range is not globally ordered"));
+                    }
+                    self.last_key = Some(entry.key.clone());
+                    return Ok(Some((entry.key.clone(), entry.value.clone())));
+                }
+                self.leaf = None;
+            }
+
+            let Some((id, expected)) = self.frontier.pop() else {
+                self.finished = true;
+                return Ok(None);
+            };
+            let node = decode_node(id, &load_object_on_read(self.read, id).await?)?;
+            validate_loaded_node(id, &node, self.kind, expected.as_ref())?;
+            match node.body {
+                NodeBody::Leaf(entries) => self.leaf = Some((entries, 0)),
+                NodeBody::Internal(children) => {
+                    if children.is_empty() {
+                        return Err(corruption("ordered-tree internal node has no children"));
+                    }
+                    let first = self
+                        .lower
+                        .as_deref()
+                        .map_or(0, |lower| child_index(&children, lower));
+                    let last = self
+                        .upper
+                        .as_deref()
+                        .map_or(children.len() - 1, |upper| child_index(&children, upper));
+                    for child in children
+                        .into_iter()
+                        .take(last.saturating_add(1))
+                        .skip(first)
+                        .rev()
+                    {
+                        self.frontier.push((child.id, Some(child)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn insert_receipt_part(
