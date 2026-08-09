@@ -23,9 +23,10 @@ use lix_storage_slatedb::SlateDB;
 use sha2::{Digest, Sha256};
 
 const SIZE: usize = 64 * 1024 * 1024;
+const CANONICAL_CHUNK_BYTES: usize = 1024 * 1024;
 const APPEND_SIZE: usize = SIZE + 1024 * 1024;
-const EDIT_START: usize = SIZE / 2 + 12_345;
-const EDIT_LEN: usize = 4 * 1024;
+const EDIT_START: usize = SIZE / 2;
+const EDIT_LEN: usize = 1024 * 1024;
 const PATH: &str = "/media/foreground.mov";
 const BRANCH_ID: &str = "01980000-0000-7000-8000-000000000064";
 
@@ -378,7 +379,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     assert_eq!(digest(first.content()), digest(&base));
     drop(first);
     let range = timed(
-        &format!("{label}/middle_range_4k"),
+        &format!("{label}/middle_range_1m"),
         &counted,
         &path,
         session.read_file_content(
@@ -404,6 +405,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .expect("authenticated middle splice");
     let before_update = active_commit(&session).await;
+    lix::storage_bench::begin_verified_inline_blob_splice_accounting();
     let _updated = timed(
         &format!("{label}/middle_overwrite_1m"),
         &counted,
@@ -423,6 +425,27 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     )
     .await
     .expect("overwrite");
+    let splice_accounting = lix::storage_bench::take_verified_inline_blob_splice_accounting();
+    assert_eq!(
+        splice_accounting.calls, 1,
+        "SQL update must consume verified splice"
+    );
+    assert_eq!(splice_accounting.changed_chunks, 1);
+    assert_eq!(
+        splice_accounting.total_chunks,
+        (SIZE / CANONICAL_CHUNK_BYTES) as u64
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "verified_splice",
+            "label": format!("{label}/middle_overwrite_1m"),
+            "calls": splice_accounting.calls,
+            "changed_chunks": splice_accounting.changed_chunks,
+            "unchanged_chunks": splice_accounting.total_chunks - splice_accounting.changed_chunks,
+            "total_chunks": splice_accounting.total_chunks,
+        })
+    );
     let after_update = active_commit(&session).await;
     let diff_sql =
         format!("SELECT COUNT(*) AS entries FROM lix_diff('{before_update}', '{after_update}')");
@@ -435,6 +458,48 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .expect("updated file");
     assert_eq!(digest(updated.content()), digest(&edited));
     drop(updated);
+
+    // A same-size provenance packet from another base must fail at the
+    // publication owner before selector/manifest writes. This is both the
+    // wrong-base and rollback control for the SQL route; the current content
+    // must remain visible and its commit identity must not advance.
+    let wrong_base = payload(SIZE, 0x9abc);
+    let wrong_result = edited_payload(&wrong_base);
+    let wrong_result_blob: lix::Blob = wrong_result.clone().into();
+    let wrong_provenance = RequestBlobSpliceProvenance::new_validated(
+        &wrong_base,
+        &wrong_result_blob,
+        &sha256_hex(&wrong_base),
+        &sha256_hex(&wrong_result_blob),
+        EDIT_START,
+        SIZE - EDIT_START - EDIT_LEN,
+        vec![0xa5; EDIT_LEN],
+    )
+    .expect("wrong-base control provenance");
+    let before_rejected = active_commit(&session).await;
+    let rejected = session
+        .execute_with_options_and_metadata(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[Value::Blob(wrong_result_blob), Value::Text(file_id.clone())],
+            ExecuteOptions::default(),
+            ExecuteStatementMetadata {
+                parameter_blob_splices: vec![Some(wrong_provenance), None],
+                ..ExecuteStatementMetadata::default()
+            },
+        )
+        .await;
+    assert!(
+        rejected.is_err(),
+        "transplanted same-size base must fail closed"
+    );
+    assert_eq!(active_commit(&session).await, before_rejected);
+    let preserved = session
+        .read_file_content(PATH.to_owned(), None)
+        .await
+        .expect("read after rejected splice")
+        .expect("file after rejected splice");
+    assert_eq!(digest(preserved.content()), digest(&edited));
+    drop(preserved);
 
     let _append = timed(
         &format!("{label}/append_1m"),
