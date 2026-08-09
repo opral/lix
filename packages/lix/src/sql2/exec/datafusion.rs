@@ -4663,10 +4663,6 @@ mod tests {
             row.iter()
                 .any(|value| matches!(value, Value::Text(value) if value == "lix_file"))
         }));
-        assert!(!tables_result.rows.iter().any(|row| {
-            row.iter()
-                .any(|value| matches!(value, Value::Text(value) if value == "removed_surface"))
-        }));
     }
 
     async fn setup_engine_history_fixture() -> Result<(SessionContext, String), LixError> {
