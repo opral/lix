@@ -470,7 +470,7 @@ fn x_lix_entity_views_is_rejected() {
     let schema = json!({
         "type": "object",
         "x-lix-key": "mock",
-        "x-lix-entity-views": ["removed_surface"],
+        "x-lix-entity-views": ["lix_file"],
         "properties": {
             "name": { "type": "string" }
         },

@@ -331,15 +331,7 @@ mod tests {
                 "title": { "type": "string", "title": "Title" },
                 "author_id": { "type": "string" },
             },
-            "required": [
-                "id",
-                "isbn",
-                "title",
-                "author_id",
-                "target_entity_pk",
-                "target_schema_key",
-                "target_file_id"
-            ],
+            "required": ["id", "isbn", "title", "author_id"],
             "additionalProperties": false
         })
     }
@@ -441,14 +433,7 @@ mod tests {
     fn rejects_required_set_shrink() {
         let previous = base_schema();
         let mut next = base_schema();
-        next["required"] = json!([
-            "id",
-            "isbn",
-            "author_id",
-            "target_entity_pk",
-            "target_schema_key",
-            "target_file_id"
-        ]);
+        next["required"] = json!(["id", "isbn", "author_id"]);
 
         let error = validate_schema_amendment(&previous, &next)
             .expect_err("required properties must be frozen");
