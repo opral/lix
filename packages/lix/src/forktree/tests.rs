@@ -3812,18 +3812,27 @@ async fn retained_commit_validation_reuses_one_1k_member_closure_and_keeps_corru
             .await
             .expect("1k closure read"),
     );
-    let closure_loads = super::serving::validate_retained_commit_counted(
-        &read,
-        commit_catalog.root.object_id,
-        change_catalog.root.object_id,
-        commit_object_id,
-        &commit,
-    )
-    .await
-    .expect("1k retained commit validates");
+    let (closure_loads, node_decodes, node_cache_hits) =
+        super::serving::validate_retained_commit_node_counts(
+            &read,
+            commit_catalog.root.object_id,
+            change_catalog.root.object_id,
+            commit_object_id,
+            &commit,
+        )
+        .await
+        .expect("1k retained commit validates");
     assert_eq!(
         closure_loads, 1,
         "one retained validation loads one closure"
+    );
+    assert!(
+        node_cache_hits >= MEMBER_COUNT,
+        "one retained validation reuses authenticated tree nodes across members"
+    );
+    assert!(
+        node_decodes < MEMBER_COUNT / 4,
+        "read-local cache avoids decoding one catalog path per member"
     );
 
     let mut corrupted_entries = change_entries;

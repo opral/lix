@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -457,6 +458,95 @@ where
             }
         }
     }
+}
+
+/// Authenticated ordered-tree lookup using a cache owned by one retained read
+/// operation. Cache entries are inserted only after the immutable object hash,
+/// domain, and node encoding have validated. Parent-edge and tree-kind checks
+/// remain on every traversal, including cache hits.
+pub(super) async fn lookup_on_read_with_cache<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    key: &[u8],
+    read: &R,
+    cache: &mut ReadLocalNodeCache,
+) -> Result<Option<Vec<u8>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let kind = parse_kind(expected_kind)?;
+    let mut current = root;
+    let mut expected: Option<NodeRef> = None;
+    loop {
+        let node = load_decoded_node_on_read(read, current, cache).await?;
+        validate_loaded_node(current, &node, kind, expected.as_ref())?;
+        match &node.body {
+            NodeBody::Leaf(entries) => {
+                return Ok(entries
+                    .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+                    .ok()
+                    .map(|index| entries[index].value.clone()));
+            }
+            NodeBody::Internal(children) => {
+                let index = child_index(&children, key);
+                expected = Some(children[index].clone());
+                current = children[index].id;
+            }
+        }
+    }
+}
+
+/// Read-local authenticated ordered-tree node state. This is deliberately not
+/// attached to `CoherentView` or any storage adapter: callers must explicitly
+/// own the cache for the operation that owns the retained read.
+#[derive(Default)]
+pub(super) struct ReadLocalNodeCache {
+    nodes: BTreeMap<ObjectId, Arc<Node>>,
+    #[cfg(test)]
+    decodes: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct ReadLocalNodeCacheStats {
+    pub(super) decodes: usize,
+    pub(super) hits: usize,
+}
+
+#[cfg(test)]
+impl ReadLocalNodeCache {
+    pub(super) fn stats(&self) -> ReadLocalNodeCacheStats {
+        ReadLocalNodeCacheStats {
+            decodes: self.decodes,
+            hits: self.hits,
+        }
+    }
+}
+
+async fn load_decoded_node_on_read<R>(
+    read: &R,
+    id: ObjectId,
+    cache: &mut ReadLocalNodeCache,
+) -> Result<Arc<Node>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if let Some(node) = cache.nodes.get(&id) {
+        #[cfg(test)]
+        {
+            cache.hits += 1;
+        }
+        return Ok(Arc::clone(node));
+    }
+    let node = Arc::new(decode_node(id, &load_object_on_read(read, id).await?)?);
+    cache.nodes.insert(id, Arc::clone(&node));
+    #[cfg(test)]
+    {
+        cache.decodes += 1;
+    }
+    Ok(node)
 }
 
 pub(super) async fn validate_root_on_read<R>(

@@ -17,8 +17,9 @@ use super::state::{
     HistoricalStateRow, StateCell, StateValue, decode_state_key, decode_state_value,
 };
 use super::tree::{
-    ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    ImmutableObjectSet, OrderedTreeMutation, ReadLocalNodeCache, apply_ordered_mutations,
+    lookup_on_read, lookup_on_read_with_cache, scan_bounded_page_on_read, scan_page_on_read,
+    validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1124,11 +1125,32 @@ async fn validate_commit_catalog_identity<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let catalog_value = lookup_on_read(
+    validate_commit_catalog_identity_with_cache(
+        read,
+        commit_catalog_root,
+        commit_object_id,
+        commit,
+        &mut ReadLocalNodeCache::default(),
+    )
+    .await
+}
+
+async fn validate_commit_catalog_identity_with_cache<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+    tree_node_cache: &mut ReadLocalNodeCache,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let catalog_value = lookup_on_read_with_cache(
         commit_catalog_root,
         "commit",
         commit.commit_id.as_bytes(),
         read,
+        tree_node_cache,
     )
     .await?
     .ok_or_else(|| corruption("Commit object has no authoritative CommitCatalog entry"))?;
@@ -1170,6 +1192,7 @@ where
 #[derive(Default)]
 struct MemberClosureCache {
     entries: BTreeMap<ObjectId, Vec<CommitMemberV1>>,
+    tree_nodes: ReadLocalNodeCache,
     #[cfg(test)]
     loads: usize,
 }
@@ -1237,11 +1260,12 @@ where
         } => {
             let bytes = super::view::load_object_bytes(read, commit_object_id).await?;
             let introduction = CommitObjectV1::decode(commit_object_id, &bytes)?;
-            validate_commit_catalog_identity(
+            validate_commit_catalog_identity_with_cache(
                 read,
                 commit_catalog_root,
                 commit_object_id,
                 &introduction,
+                &mut member_closure_cache.tree_nodes,
             )
             .await?;
             load_member_closure_cached(read, commit_object_id, &introduction, member_closure_cache)
@@ -1277,11 +1301,12 @@ where
         Some((source_commit_object_id, source_ordinal)) => {
             let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
             let source_commit = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
-            validate_commit_catalog_identity(
+            validate_commit_catalog_identity_with_cache(
                 read,
                 commit_catalog_root,
                 source_commit_object_id,
                 &source_commit,
+                &mut member_closure_cache.tree_nodes,
             )
             .await?;
             if source_commit.generation >= target_generation {
@@ -2167,6 +2192,35 @@ where
     Ok(member_closure_cache.loads)
 }
 
+#[cfg(test)]
+pub(super) async fn validate_retained_commit_node_counts<R>(
+    read: &R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+) -> Result<(usize, usize, usize), StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut member_closure_cache = MemberClosureCache::default();
+    validate_retained_commit_with_cache(
+        read,
+        commit_catalog_root,
+        change_catalog_root,
+        commit_object_id,
+        commit,
+        &mut member_closure_cache,
+    )
+    .await?;
+    let node_stats = member_closure_cache.tree_nodes.stats();
+    Ok((
+        member_closure_cache.loads,
+        node_stats.decodes,
+        node_stats.hits,
+    ))
+}
+
 async fn validate_retained_commit_with_cache<R>(
     read: &R,
     commit_catalog_root: ObjectId,
@@ -2198,11 +2252,12 @@ where
         if !matches!(change, ChangeObjectV1::Semantic { .. }) {
             return Err(corruption("commit member edge names a RefChange object"));
         }
-        let value = lookup_on_read(
+        let value = lookup_on_read_with_cache(
             change_catalog_root,
             "change",
             change.change_id().as_bytes(),
             read,
+            &mut member_closure_cache.tree_nodes,
         )
         .await?
         .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
