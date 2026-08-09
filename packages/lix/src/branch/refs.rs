@@ -157,4 +157,28 @@ where
                 .collect(),
         )
     }
+
+    async fn load_head_metadata_batch(
+        &self,
+        branch_ids: &[String],
+    ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, LixError> {
+        Ok(
+            crate::forktree::load_branch_heads_with_metadata(&self.store, Some(branch_ids))
+                .await?
+                .into_iter()
+                .map(|row| {
+                    (
+                        BranchHead {
+                            branch_id: row.branch_id,
+                            commit_id: row.head_commit_id,
+                        },
+                        BranchRefMetadata {
+                            change_id: row.change_id,
+                            updated_at: row.updated_at,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
 }

@@ -52,4 +52,19 @@ pub(crate) trait BranchRefReader: Send + Sync {
             "authenticated branch metadata batch is unavailable",
         ))
     }
+
+    /// Returns authenticated branch metadata for exactly the requested
+    /// selectors in one operation-owned batch. Missing selectors are omitted
+    /// from the result so callers can preserve requested order while
+    /// fail-closing on any absent branch; implementations must not widen this
+    /// into a scan-all or a sequence of point reads.
+    async fn load_head_metadata_batch(
+        &self,
+        _branch_ids: &[String],
+    ) -> Result<Vec<(BranchHead, BranchRefMetadata)>, crate::LixError> {
+        Err(crate::LixError::new(
+            crate::LixError::CODE_STORAGE_ERROR,
+            "requested authenticated branch metadata batch is unavailable",
+        ))
+    }
 }
