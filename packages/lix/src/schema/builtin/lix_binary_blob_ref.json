@@ -19,6 +19,35 @@
       "type": "integer",
       "minimum": 0,
       "description": "Logical uncompressed file size in bytes for the referenced binary payload."
+    },
+    "plugin_checkpoint": {
+      "type": "object",
+      "description": "Authenticated durable WASM plugin checkpoint for this file owner.",
+      "properties": {
+        "generation": {
+          "type": "string",
+          "description": "Monotonic plugin generation selected for this BlobRef."
+        },
+        "semantic_root": {
+          "type": "string",
+          "description": "Authenticated semantic root associated with the plugin checkpoint."
+        },
+        "runtime": {
+          "type": "string",
+          "description": "URL-safe base64 encoded runtime checkpoint bytes."
+        },
+        "authority": {
+          "type": "string",
+          "description": "URL-safe base64 encoded checkpoint authority bytes."
+        }
+      },
+      "required": [
+        "generation",
+        "semantic_root",
+        "runtime",
+        "authority"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [

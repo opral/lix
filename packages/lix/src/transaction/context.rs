@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
+use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobId};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
     BranchReferenceRole,
@@ -40,13 +40,14 @@ use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    BlobRefPluginCheckpoint, BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache,
-    FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
-    FilesystemRowContext, load_path_index_revision,
+    BlobRefPluginCheckpoint, BlobRefRowInput, FileDescriptorWriteIntent, FilesystemPathIndex,
+    FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    FilesystemPathKind, FilesystemRowContext, append_blob_ref_tombstone_row,
+    load_path_index_revision,
 };
 use crate::forktree::{
-    CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow, PreparedPublication, StateKey,
-    UploadBindingRef, prepare_upload_part,
+    AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow,
+    PreparedPublication, StateKey, UploadBindingRef, prepare_upload_part,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
@@ -77,9 +78,10 @@ use crate::plugin::{
     host_entity_with_lazy_snapshot, is_plugin_storage_path, is_reservation_key,
     local_mutation_identity, materialize_keyless_creates, plugin_archive_file_id_matches,
     plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
-    plugin_state_live_state_projection, require_existing_id_authorities, reservation_tombstone_row,
-    reserve_create_row, transport_splice_preserves_prefix_exclusion,
-    transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
+    plugin_state_live_state_projection, plugin_storage_wasm_file_id,
+    require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
+    transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
+    validate_create_changes, validate_create_reservation,
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
@@ -249,6 +251,25 @@ fn state_key_from_tracked(key: &TrackedStateKey) -> StateKey {
         schema_key: key.schema_key.clone(),
         file_id: key.file_id.clone(),
         entity_pk: key.entity_pk.clone(),
+    }
+}
+
+fn plugin_wasm_state_key(_branch_id: &str, plugin_key: &str) -> StateKey {
+    let file_id = plugin_storage_wasm_file_id(plugin_key);
+    StateKey {
+        schema_key: BLOB_REF_SCHEMA_KEY.to_owned(),
+        file_id: Some(file_id.clone()),
+        entity_pk: EntityPk::uuid_from_canonical(&file_id)
+            .expect("deterministic plugin WASM owner ID is a UUID"),
+    }
+}
+
+fn plugin_materialization_state_key(file_id: &str) -> StateKey {
+    StateKey {
+        schema_key: BLOB_REF_SCHEMA_KEY.to_owned(),
+        file_id: Some(file_id.to_owned()),
+        entity_pk: EntityPk::uuid_from_canonical(file_id)
+            .expect("plugin materialization owner ID is a UUID"),
     }
 }
 
@@ -583,6 +604,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+    pending_plugin_wasm_by_owner: BTreeMap<(String, String), (BlobId, Vec<u8>)>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
@@ -664,6 +686,7 @@ pub(crate) struct SqlStatementCheckpoint {
     staged_writes: TransactionWriteBufferCheckpoint,
     filesystem_path_index_epoch: usize,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+    pending_plugin_wasm_by_owner: BTreeMap<(String, String), (BlobId, Vec<u8>)>,
     trust_filesystem_planner: bool,
 }
 
@@ -1589,6 +1612,7 @@ where
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
+                    pending_plugin_wasm_by_owner: BTreeMap::new(),
                     pending_plugin_actor_publications: Vec::new(),
                     plugin_generation_read_guard: None,
                     plugin_generation_upgrade_guard: None,
@@ -1970,6 +1994,7 @@ where
             staged_writes: self.staged_writes.checkpoint()?,
             filesystem_path_index_epoch: self.filesystem_path_index_epoch.load(Ordering::SeqCst),
             pending_file_view_mutations: self.pending_file_view_mutations.clone(),
+            pending_plugin_wasm_by_owner: self.pending_plugin_wasm_by_owner.clone(),
             trust_filesystem_planner: self.trust_filesystem_planner,
         })
     }
@@ -1984,6 +2009,7 @@ where
             staged_writes,
             filesystem_path_index_epoch,
             pending_file_view_mutations,
+            pending_plugin_wasm_by_owner,
             trust_filesystem_planner,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
@@ -1993,6 +2019,7 @@ where
         // than cloning potentially large indexes solely for this error path.
         self.filesystem_path_index_cache.clear();
         self.pending_file_view_mutations = pending_file_view_mutations;
+        self.pending_plugin_wasm_by_owner = pending_plugin_wasm_by_owner;
         self.trust_filesystem_planner = trust_filesystem_planner;
         // A failed statement may have chained a predecessor actor successor.
         // Its prior document can no longer be restored byte-for-byte, so
@@ -2388,27 +2415,29 @@ where
         {
             Some(factory) => factory,
             None => {
-                let read = SharedStorageAdapterRead::new(
-                    self.storage
-                        .begin_read(StorageReadOptions::default())
-                        .await?,
-                );
-                let reader = self.binary_cas.reader(read);
-                let wasm = load_transaction_blob_bytes(&reader, &self.staged_writes, &[wasm_hash])
-                    .await?
-                    .into_vec()
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!(
-                                "plugin registry references missing WASM blob '{}'",
-                                wasm_hash.to_hex()
-                            ),
-                        )
-                    })?;
+                let read = self.opening_read();
+                let wasm_key = plugin_wasm_state_key(&self.active_branch_id, plugin.key());
+                let wasm = load_transaction_authenticated_plugin_bytes(
+                    &read,
+                    &self.active_branch_id,
+                    &self.staged_writes,
+                    &self.pending_plugin_wasm_by_owner,
+                    &[(wasm_key, wasm_hash)],
+                )
+                .await?
+                .into_vec()
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "plugin registry references missing WASM blob '{}'",
+                            wasm_hash.to_hex()
+                        ),
+                    )
+                })?;
                 let installed = plugin.to_installed_plugin(wasm)?;
                 self.plugin_host
                     .load_or_compile_factory(&installed)
@@ -2525,11 +2554,7 @@ where
         let cache = self.plugin_host.actor_cache();
         let _cold_open_guard = cache.cold_open_guard().await;
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let base = self.live_state.reader(read.clone());
         let file_key = PluginFileWriteKey {
             branch_id: actor_key.branch_id.clone(),
@@ -2631,11 +2656,12 @@ where
             plugin_entity_authorities_from_live_batch(plugin, &rows, &entity_ordinals);
         let entity_count = entity_ordinals.len();
         let VisibleMaterializationBytes::Blob { hash } = materialization.bytes;
-        let base_blob_reader = self.binary_cas.reader(read);
-        let materialized_bytes: crate::Blob = load_transaction_blob_bytes(
-            &base_blob_reader,
+        let materialized_bytes: crate::Blob = load_transaction_authenticated_plugin_bytes(
+            &read,
+            &actor_key.branch_id,
             &self.staged_writes,
-            &[hash],
+            &self.pending_plugin_wasm_by_owner,
+            &[(plugin_materialization_state_key(&actor_key.file_id), hash)],
         )
         .await?
         .into_vec()
@@ -3258,6 +3284,9 @@ where
         let mut current_install_schema_definitions =
             BTreeMap::<PluginLifecycleKey, BTreeMap<String, JsonValue>>::new();
         let mut current_install_wasm = BTreeMap::<BlobId, Vec<u8>>::new();
+        let mut current_install_plugin_wasm =
+            BTreeMap::<(String, String), (BlobId, Vec<u8>)>::new();
+        let mut wasm_owner_payloads = Vec::<TransactionFileContent>::new();
         let mut branch_ids = BTreeSet::<String>::new();
 
         // Parse each archive exactly once. The original ZIP remains the file
@@ -3337,6 +3366,47 @@ where
             {
                 return Err(duplicate_plugin_lifecycle_mutation());
             }
+            let wasm_file_id = plugin_storage_wasm_file_id(&lifecycle_key.plugin_key);
+            FileDescriptorWriteIntent {
+                id: Some(wasm_file_id.clone()),
+                directory_id: None,
+                name: format!("{}.wasm", lifecycle_key.plugin_key),
+                context: FilesystemRowContext {
+                    branch_id: write.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                },
+            }
+            .append_to(rows);
+            BlobRefRowInput {
+                file_id: wasm_file_id.clone(),
+                blob_hash: parsed.wasm_hash,
+                size_bytes: parsed.wasm_bytes.len() as u64,
+                plugin_checkpoint: None,
+                context: FilesystemRowContext {
+                    branch_id: write.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                },
+            }
+            .append_to(rows)?;
+            // Keep the extracted component as an independently published
+            // payload. The BlobRef row above is its sole durable owner; the
+            // archive's auxiliary-payload side channel is intentionally not a
+            // second, hash-only authority.
+            wasm_owner_payloads.push(TransactionFileContent::new(
+                wasm_file_id.clone(),
+                None,
+                None,
+                write.branch_id.clone(),
+                false,
+                false,
+                crate::transaction::types::FileContent::inline(parsed.wasm_bytes.clone()),
+            ));
             let schema_definitions = schema_rows
                 .iter()
                 .map(|row| {
@@ -3369,7 +3439,14 @@ where
             current_install_wasm
                 .entry(parsed.wasm_hash)
                 .or_insert_with(|| parsed.wasm_bytes.clone());
-            write.add_auxiliary_payload(parsed.wasm_bytes);
+            current_install_plugin_wasm.insert(
+                (write.branch_id.clone(), lifecycle_key.plugin_key.clone()),
+                (parsed.wasm_hash, parsed.wasm_bytes.clone()),
+            );
+            self.pending_plugin_wasm_by_owner.insert(
+                (write.branch_id.clone(), wasm_file_id),
+                (parsed.wasm_hash, parsed.wasm_bytes.clone()),
+            );
             lifecycle_schema_keys.extend(std::iter::repeat_n(
                 lifecycle_key.clone(),
                 schema_rows.len(),
@@ -3377,6 +3454,7 @@ where
             lifecycle_schema_rows.append(schema_rows);
             branch_ids.insert(write.branch_id.clone());
         }
+        file_content.extend(wasm_owner_payloads);
 
         // A canonical archive descriptor tombstone is the uninstall signal.
         // Other descriptor tombstones are ownership cleanup candidates.
@@ -3643,6 +3721,20 @@ where
                 }
                 None => {
                     registry.remove(&key.plugin_key)?;
+                    let wasm_file_id = plugin_storage_wasm_file_id(&key.plugin_key);
+                    append_blob_ref_tombstone_row(
+                        rows,
+                        wasm_file_id.clone(),
+                        FilesystemRowContext {
+                            branch_id: key.branch_id.clone(),
+                            global: false,
+                            untracked: false,
+                            file_id: None,
+                            metadata: None,
+                        },
+                    );
+                    self.pending_plugin_wasm_by_owner
+                        .remove(&(key.branch_id.clone(), wasm_file_id));
                 }
             }
             changed_registry_branches.insert(key.branch_id);
@@ -3675,12 +3767,11 @@ where
             ));
         }
         if !generation_upgrades.is_empty() {
-            let base_blob_reader = self.binary_cas.reader(read.clone());
             preflight_owned_generation_upgrades(
                 &self.plugin_host,
                 &base,
                 &staged,
-                &base_blob_reader,
+                &read,
                 &self.staged_writes,
                 &generation_upgrades,
                 &current_install_wasm,
@@ -4254,34 +4345,46 @@ where
         }
 
         let mut wasm_by_hash = current_install_wasm;
-        let mut missing_hashes = Vec::<BlobId>::new();
-        for entry in cold_entries.values() {
+        for (key, entry) in &cold_entries {
             let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
-            if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
-                missing_hashes.push(hash);
-            }
-        }
-        if !missing_hashes.is_empty() {
-            let base_blob_reader = self.binary_cas.reader(read.clone());
-            let loaded = load_transaction_blob_bytes(
-                &base_blob_reader,
-                &self.staged_writes,
-                &missing_hashes,
-            )
-            .await?
-            .into_vec();
-            for (hash, bytes) in missing_hashes.into_iter().zip(loaded) {
-                let bytes = bytes.ok_or_else(|| {
-                    LixError::new(
+            if let Some((installed_hash, bytes)) =
+                current_install_plugin_wasm.get(&(key.branch_id.clone(), entry.key().to_owned()))
+            {
+                if *installed_hash != hash || BlobId::from_content(bytes) != hash {
+                    return Err(LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "plugin registry references missing WASM blob '{}'",
-                            hash.to_hex()
+                            "staged plugin '{}' WASM owner identity does not match its registry entry",
+                            entry.key()
                         ),
-                    )
-                })?;
-                wasm_by_hash.insert(hash, bytes);
+                    ));
+                }
+                wasm_by_hash.insert(hash, bytes.clone());
+                continue;
             }
+            let wasm_key = plugin_wasm_state_key(&key.branch_id, entry.key());
+            let bytes = load_transaction_authenticated_plugin_bytes(
+                &read,
+                &key.branch_id,
+                &self.staged_writes,
+                &self.pending_plugin_wasm_by_owner,
+                &[(wasm_key, hash)],
+            )
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "plugin registry references missing WASM blob '{}'",
+                        hash.to_hex()
+                    ),
+                )
+            })?;
+            wasm_by_hash.insert(hash, bytes);
         }
         for (key, entry) in cold_entries {
             let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
@@ -4877,10 +4980,17 @@ where
                                 let VisibleMaterializationBytes::Blob { hash } =
                                     visible_materialization.bytes;
                                 let before_bytes: crate::Blob =
-                                        load_transaction_blob_bytes(
-                                            &self.binary_cas.reader(read.clone()),
+                                        load_transaction_authenticated_plugin_bytes(
+                                            &read,
+                                            &actor_key.branch_id,
                                             &self.staged_writes,
-                                            &[hash],
+                                            &self.pending_plugin_wasm_by_owner,
+                                            &[(
+                                                plugin_materialization_state_key(
+                                                    &actor_key.file_id,
+                                                ),
+                                                hash,
+                                            )],
                                         )
                                         .await?
                                         .into_vec()
@@ -8089,39 +8199,87 @@ where
     }
 }
 
-async fn load_transaction_blob_bytes(
-    base: &dyn BlobDataReader,
+/// Loads plugin WASM and materialized component payloads through their exact
+/// authenticated BlobRef owners.  Staged bytes are still allowed before the
+/// transaction is published, but their semantic BlobId is checked against
+/// the caller-owned StateKey request and committed bytes are resolved only by
+/// the retained ForkTree read.  The old hash-only BinaryCas reader is not a
+/// valid plugin payload source.
+async fn load_transaction_authenticated_plugin_bytes<R>(
+    read: &SharedStorageAdapterRead<R>,
+    branch_id: &str,
     staged_writes: &TransactionWriteBuffer,
-    hashes: &[BlobId],
-) -> Result<BlobBytesBatch, LixError> {
-    let mut entries = staged_writes
-        .load_staged_file_bytes_many(hashes)?
-        .into_vec();
-    let mut missing_indices = Vec::new();
-    let mut missing_hashes = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.is_none() {
-            missing_indices.push(index);
-            missing_hashes.push(hashes[index]);
+    pending_plugin_wasm_by_owner: &BTreeMap<(String, String), (BlobId, Vec<u8>)>,
+    requests: &[(StateKey, BlobId)],
+) -> Result<BlobBytesBatch, LixError>
+where
+    R: crate::storage_adapter::StorageRead,
+{
+    if requests.is_empty() {
+        return Ok(BlobBytesBatch::new(Vec::new()));
+    }
+    let mut entries = vec![None; requests.len()];
+    let mut missing = Vec::new();
+    for (index, (key, expected)) in requests.iter().enumerate() {
+        let staged = key
+            .file_id
+            .as_deref()
+            .map(|file_id| {
+                staged_writes.load_staged_file_bytes_for_owner(branch_id, file_id, *expected)
+            })
+            .transpose()?
+            .flatten();
+        if let Some(bytes) = staged {
+            if BlobId::from_content(&bytes) != *expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload does not match its authenticated BlobRef identity",
+                ));
+            }
+            entries[index] = Some(bytes);
+        } else if let Some(file_id) = key.file_id.as_deref()
+            && let Some((actual, bytes)) =
+                pending_plugin_wasm_by_owner.get(&(branch_id.to_owned(), file_id.to_owned()))
+        {
+            if *actual != *expected || BlobId::from_content(bytes) != *expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload owner does not match its authenticated BlobRef identity",
+                ));
+            }
+            entries[index] = Some(bytes.clone());
+        } else {
+            missing.push((index, requests[index].0.clone(), *expected));
         }
     }
-    if missing_hashes.is_empty() {
-        return Ok(BlobBytesBatch::new(entries));
-    }
-
-    let base_entries = base.load_bytes_many(&missing_hashes).await?.into_vec();
-    if base_entries.len() != missing_indices.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "transaction blob read expected {} fallback rows, got {}",
-                missing_indices.len(),
-                base_entries.len()
-            ),
-        ));
-    }
-    for (index, entry) in missing_indices.into_iter().zip(base_entries) {
-        entries[index] = entry;
+    if !missing.is_empty() {
+        let reader = crate::forktree::blob_reader_on_read(read.clone(), branch_id)?;
+        let keys = missing
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let fetched = reader.load_bytes_for_rows(&keys).await?.into_vec();
+        if fetched.len() != missing.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "authenticated plugin payload batch length mismatch",
+            ));
+        }
+        for ((index, _, expected), bytes) in missing.into_iter().zip(fetched) {
+            let bytes = bytes.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "authenticated plugin BlobRef owner has no payload",
+                )
+            })?;
+            if BlobId::from_content(&bytes) != expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "authenticated plugin BlobRef payload identity does not match the requested owner",
+                ));
+            }
+            entries[index] = Some(bytes);
+        }
     }
     Ok(BlobBytesBatch::new(entries))
 }
@@ -9344,16 +9502,6 @@ where
             self.opening_read(),
             &self.active_branch_id,
         )?))
-    }
-
-    async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self.binary_cas.reader(read);
-        load_transaction_blob_bytes(&base, &self.staged_writes, hashes).await
     }
 
     async fn scan_live_state_batch(
@@ -11296,16 +11444,19 @@ struct DurableBlobCheckpointSnapshot {
     authority: String,
 }
 
-async fn preflight_owned_generation_upgrades(
+async fn preflight_owned_generation_upgrades<R>(
     host: &PluginRuntimeHost,
     base: &dyn LiveStateReader,
     staged: &impl StagedLiveStateRows,
-    base_blob_reader: &dyn BlobDataReader,
+    read: &SharedStorageAdapterRead<R>,
     staged_writes: &TransactionWriteBuffer,
     upgrades: &[PluginGenerationUpgrade],
     install_wasm: &BTreeMap<BlobId, Vec<u8>>,
     install_schema_definitions: &BTreeMap<PluginLifecycleKey, BTreeMap<String, JsonValue>>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: crate::storage_adapter::StorageRead,
+{
     let branch_ids = upgrades
         .iter()
         .map(|upgrade| upgrade.branch_id.clone())
@@ -11640,12 +11791,13 @@ async fn preflight_owned_generation_upgrades(
             }
         }
 
-        let hashes = owners
+        let requests = owners
             .iter()
             .map(|owner| {
                 materialized_hash_by_file
                     .get(owner.file_id())
                     .copied()
+                    .map(|hash| (plugin_materialization_state_key(owner.file_id()), hash))
                     .ok_or_else(|| {
                         plugin_upgrade_error(
                             upgrade,
@@ -11658,10 +11810,15 @@ async fn preflight_owned_generation_upgrades(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let materialized_bytes =
-            load_transaction_blob_bytes(base_blob_reader, staged_writes, &hashes)
-                .await?
-                .into_vec();
+        let materialized_bytes = load_transaction_authenticated_plugin_bytes(
+            read,
+            &upgrade.branch_id,
+            staged_writes,
+            &BTreeMap::new(),
+            &requests,
+        )
+        .await?
+        .into_vec();
         if materialized_bytes.len() != owners.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

@@ -1,31 +1,27 @@
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use async_trait::async_trait;
 
 use crate::LixError;
-use crate::binary_cas::{
-    BlobBytesBatch, BlobChunkReceipt, BlobId, BlobLayout, BlobPayload, BlobRangeBytes,
-    BlobRangeBytesBatch, BlobWriteReceipt,
-};
+use crate::binary_cas::{BlobChunkReceipt, BlobId, BlobLayout, BlobPayload, BlobWriteReceipt};
 use crate::forktree::{BlobChunkV1, BlobManifestV1, OBJECT_SPACE, ObjectId};
 use crate::storage::{CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 
-fn blob_owner_not_lowered() -> LixError {
-    LixError::new(
-        LixError::CODE_UNSUPPORTED_SQL,
-        "BlobId-only binary-CAS access is not lowered; resolve an authenticated ForkTree BlobRef",
-    )
-}
-
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
-    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
+    async fn load_bytes_many(
+        &self,
+        hashes: &[BlobId],
+    ) -> Result<crate::binary_cas::BlobBytesBatch, LixError>;
 
+    #[cfg(test)]
     async fn load_ranges_many(
         &self,
         requests: &[(BlobId, std::ops::Range<u64>)],
-    ) -> Result<BlobRangeBytesBatch, LixError> {
+    ) -> Result<crate::binary_cas::BlobRangeBytesBatch, LixError> {
         let hashes = requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
         let values = self.load_bytes_many(&hashes).await?.into_vec();
         let entries = values
@@ -37,14 +33,15 @@ pub(crate) trait BlobDataReader: Send + Sync {
                     .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(BlobRangeBytesBatch::new(entries))
+        Ok(crate::binary_cas::BlobRangeBytesBatch::new(entries))
     }
 }
 
+#[cfg(test)]
 fn materialize_blob_range(
     bytes: Vec<u8>,
     requested: std::ops::Range<u64>,
-) -> Result<BlobRangeBytes, LixError> {
+) -> Result<crate::binary_cas::BlobRangeBytes, LixError> {
     let total_size = u64::try_from(bytes.len()).map_err(|_| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -70,7 +67,7 @@ fn materialize_blob_range(
             "binary CAS range is too large",
         )
     })?;
-    Ok(BlobRangeBytes {
+    Ok(crate::binary_cas::BlobRangeBytes {
         bytes: bytes[start..end].to_vec(),
         total_size,
         range,
@@ -89,13 +86,6 @@ impl BinaryCasContext {
         Self
     }
 
-    pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
-    where
-        S: StorageAdapterRead,
-    {
-        BinaryCasStoreReader { _store: store }
-    }
-
     pub(crate) fn writer_skipping_existing_chunks<'a, S>(
         &self,
         store: &'a S,
@@ -109,20 +99,6 @@ impl BinaryCasContext {
             writes,
             staged_objects: BTreeMap::new(),
         }
-    }
-}
-
-pub(crate) struct BinaryCasStoreReader<S> {
-    _store: S,
-}
-
-#[async_trait]
-impl<S> BlobDataReader for BinaryCasStoreReader<S>
-where
-    S: StorageAdapterRead + Send + Sync,
-{
-    async fn load_bytes_many(&self, _hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        Err(blob_owner_not_lowered())
     }
 }
 

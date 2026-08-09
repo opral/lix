@@ -473,6 +473,17 @@ where
     Ok(crate::binary_cas::BlobBytesBatch::new(entries))
 }
 
+/// Extracts the semantic identity from one authenticated historical BlobRef
+/// owner without turning its BlobId into a physical lookup key.  GC uses this
+/// only after the exact historical state key and manifest edge have passed the
+/// same owner validation as payload reads.
+pub(crate) fn historical_blob_semantic_id(
+    key: &StateKey,
+    value: &super::state::StateValue,
+) -> Result<crate::binary_cas::BlobId, crate::LixError> {
+    Ok(bind_historical_state_blob_ref(key, value)?.semantic_id)
+}
+
 #[derive(Clone, Copy)]
 struct HistoricalAuthenticatedBlobRef {
     semantic_id: crate::binary_cas::BlobId,
