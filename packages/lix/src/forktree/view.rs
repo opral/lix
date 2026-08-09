@@ -41,6 +41,7 @@ pub(crate) struct CoherentView<R> {
     branch_selector: BranchSelectorV1,
     repository_root: RepositoryRootV1,
     branch_snapshot: BranchSnapshotV1,
+    semantic_head_commit: CommitObjectV1,
     view_id: [u8; 32],
     view_instance_id: u64,
 }
@@ -83,6 +84,12 @@ where
 
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshotV1 {
         self.branch_snapshot
+    }
+
+    /// Returns the selected semantic head authenticated while the retained
+    /// view was opened. Callers must not reload it through a second view.
+    pub(crate) fn semantic_head_commit(&self) -> &CommitObjectV1 {
+        &self.semantic_head_commit
     }
 
     #[cfg(test)]
@@ -1139,6 +1146,21 @@ pub(crate) async fn open_coherent_view_on_read<R>(
 where
     R: StorageAdapterRead,
 {
+    open_coherent_view_if_present_on_read(read, branch_id)
+        .await?
+        .ok_or_else(|| corruption("requested branch selector is absent"))
+}
+
+/// Opens the authenticated view without turning a missing branch selector
+/// into an error. This is used by branch-head lookup so the selector, roots,
+/// and selected head are acquired/authenticated by one retained read.
+pub(super) async fn open_coherent_view_if_present_on_read<R>(
+    read: R,
+    branch_id: CanonicalBranchId,
+) -> Result<Option<CoherentView<R>>, StorageError>
+where
+    R: StorageAdapterRead,
+{
     let selector_keys = [
         Key(global_selector_key()),
         Key(branch_selector_key(branch_id)),
@@ -1160,10 +1182,17 @@ where
     let mut values = loaded.values.into_iter();
     let raw_global_selector =
         projected_required(values.next().flatten(), "global selector is absent")?;
-    let raw_branch_selector = projected_required(
-        values.next().flatten(),
-        "requested branch selector is absent",
-    )?;
+    let Some(raw_branch_selector) = values.next().flatten() else {
+        return Ok(None);
+    };
+    let raw_branch_selector = match raw_branch_selector {
+        ProjectedValue::FullValue(bytes) => bytes,
+        ProjectedValue::KeyOnly => {
+            return Err(corruption(
+                "branch selector point read returned key-only data",
+            ));
+        }
+    };
     let global_selector = GlobalSelectorV1::decode(&raw_global_selector)?;
     let branch_selector = BranchSelectorV1::decode(&raw_branch_selector)?;
     if branch_selector.branch_id != branch_id {
@@ -1214,7 +1243,7 @@ where
             "branch snapshot does not match the selected branch id",
         ));
     }
-    authenticate_selected_graph(
+    let semantic_head_commit = authenticate_selected_graph(
         &read,
         global_selector.repository_root,
         branch_selector.branch_snapshot_object_id,
@@ -1228,7 +1257,7 @@ where
             current.checked_add(1)
         })
         .map_err(|_| corruption("coherent view instance identifier space is exhausted"))?;
-    Ok(CoherentView {
+    Ok(Some(CoherentView {
         read,
         branch_id,
         raw_global_selector,
@@ -1237,9 +1266,10 @@ where
         branch_selector,
         repository_root,
         branch_snapshot,
+        semantic_head_commit,
         view_id,
         view_instance_id,
-    })
+    }))
 }
 
 pub(super) async fn load_object_bytes(
@@ -1268,7 +1298,7 @@ async fn authenticate_selected_graph<R>(
     _branch_snapshot_id: ObjectId,
     repository: RepositoryRootV1,
     branch: BranchSnapshotV1,
-) -> Result<(), StorageError>
+) -> Result<CommitObjectV1, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1345,7 +1375,7 @@ where
         &change,
     )
     .await?;
-    Ok(())
+    Ok(head)
 }
 
 pub(super) async fn load_object_map<R>(

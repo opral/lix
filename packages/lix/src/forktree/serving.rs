@@ -8,9 +8,9 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::codec::corruption;
 use super::model::{
-    BranchSelectorV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId,
-    ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, GlobalSelectorV1,
-    RepositoryRootV1, branch_selector_key, global_selector_key,
+    BranchSelectorV1, BranchSnapshotV1, CanonicalBranchId, ChangeCatalogEntry, ChangeCatalogOwner,
+    ChangeId, ChangeObjectV1, CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1,
+    GlobalSelectorV1, RepositoryRootV1, branch_selector_key, global_selector_key,
 };
 use super::object::ObjectId;
 use super::state::{
@@ -250,36 +250,13 @@ where
     R: StorageAdapterRead + ?Sized,
 {
     let branch_id = canonical_branch_id(branch_id)?;
-    let selector_key = branch_selector_key(branch_id);
-    let keys = [Key(selector_key.clone())];
-    let loaded = read
-        .get_many(&[GetManyRequest {
-            space: SELECTOR_SPACE,
-            keys: &keys,
-            opts: GetOptions {
-                projection: CoreProjection::FullValue,
-            },
-        }])
-        .await?;
-    let Some(value) = loaded.values.into_iter().next().flatten() else {
+    let Some(view) = super::view::open_coherent_view_if_present_on_read(read, branch_id).await?
+    else {
         return Ok(None);
     };
-    let bytes = match value {
-        ProjectedValue::FullValue(bytes) => bytes,
-        ProjectedValue::KeyOnly => {
-            return Err(crate::LixError::new(
-                crate::LixError::CODE_INTERNAL_ERROR,
-                "ForkTree branch selector point read returned key-only data",
-            ));
-        }
-    };
-    let selector = BranchSelectorV1::decode(&bytes)?;
-    if selector.branch_id != branch_id || branch_selector_key(selector.branch_id) != selector_key {
-        return Err(
-            corruption("ForkTree branch selector key and embedded branch ID differ").into(),
-        );
-    }
-    selected_head_commit_id(read, branch_id).await.map(Some)
+    Ok(Some(crate::changelog::CommitId::new(
+        uuid::Uuid::from_bytes(*view.semantic_head_commit().commit_id.as_bytes()),
+    )))
 }
 
 /// Loads the authenticated semantic identity of a moving branch selector.
@@ -338,9 +315,9 @@ where
     ))
 }
 
-/// Scans every authenticated branch selector in one coherent read view.
-/// Selector enumeration is storage-streaming and retains only one page plus
-/// the output branch-head list.
+/// Scans every authenticated branch selector through one retained read.
+/// Selector enumeration is followed by batched repository/snapshot and
+/// selected head/ref object reads; no branch opens a second coherent view.
 pub(crate) async fn scan_branch_heads<R>(
     read: &R,
 ) -> Result<Vec<(String, crate::changelog::CommitId)>, crate::LixError>
@@ -361,7 +338,7 @@ where
             },
         )
         .await?;
-    let mut heads = Vec::new();
+    let mut selectors = Vec::new();
     loop {
         let page = cursor.next_page(BRANCH_SCAN_PAGE_ROWS).await?;
         for entry in page.entries {
@@ -381,13 +358,152 @@ where
                 )
                 .into());
             }
-            let branch_text = uuid::Uuid::from_bytes(*selector.branch_id.as_bytes()).to_string();
-            let commit_id = selected_head_commit_id(read, selector.branch_id).await?;
-            heads.push((branch_text, commit_id));
+            selectors.push(selector);
         }
         if !page.has_more {
             break;
         }
+    }
+
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_key = Key(global_selector_key());
+    let global = read
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: std::slice::from_ref(&global_key),
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    let raw_global = match global.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(bytes)) => bytes,
+        Some(ProjectedValue::KeyOnly) => {
+            return Err(corruption("ForkTree global selector scan returned key-only data").into());
+        }
+        None => return Err(corruption("ForkTree global selector is absent").into()),
+    };
+    let global_selector = GlobalSelectorV1::decode(&raw_global)?;
+
+    let mut root_ids = Vec::with_capacity(selectors.len() + 1);
+    root_ids.push(global_selector.repository_root);
+    root_ids.extend(
+        selectors
+            .iter()
+            .map(|selector| selector.branch_snapshot_object_id),
+    );
+    root_ids.sort_unstable();
+    root_ids.dedup();
+    let roots = super::view::load_object_map(read, root_ids).await?;
+    let repository_root = RepositoryRootV1::decode(
+        global_selector.repository_root,
+        scan_required_object(&roots, global_selector.repository_root)?,
+    )?;
+    let mut branch_snapshots = Vec::with_capacity(selectors.len());
+    let mut selected_ids = Vec::with_capacity(selectors.len() * 2);
+    for selector in &selectors {
+        let snapshot = BranchSnapshotV1::decode(
+            selector.branch_snapshot_object_id,
+            scan_required_object(&roots, selector.branch_snapshot_object_id)?,
+        )?;
+        if snapshot.branch_id != selector.branch_id {
+            return Err(corruption("ForkTree branch selector and snapshot IDs differ").into());
+        }
+        selected_ids.push(snapshot.semantic_head_commit_object_id);
+        selected_ids.extend(snapshot.latest_ref_change_object_id);
+        branch_snapshots.push(snapshot);
+    }
+
+    let mut authenticated_root_ids = vec![
+        repository_root.global_state_root,
+        repository_root.commit_catalog_root,
+        repository_root.change_catalog_root,
+        repository_root.retention_policy_root,
+    ];
+    authenticated_root_ids.extend(branch_snapshots.iter().flat_map(|snapshot| {
+        [
+            snapshot.local_state_root,
+            snapshot.historical_global_state_root,
+        ]
+    }));
+    authenticated_root_ids.sort_unstable();
+    authenticated_root_ids.dedup();
+    let authenticated_roots = super::view::load_object_map(read, authenticated_root_ids).await?;
+    for (id, kind) in [
+        (repository_root.global_state_root, "state"),
+        (repository_root.commit_catalog_root, "commit"),
+        (repository_root.change_catalog_root, "change"),
+        (repository_root.retention_policy_root, "retention"),
+    ] {
+        super::tree::validate_root_bytes(
+            id,
+            kind,
+            scan_required_object(&authenticated_roots, id)?,
+        )?;
+    }
+    for snapshot in &branch_snapshots {
+        for (id, kind) in [
+            (snapshot.local_state_root, "state"),
+            (snapshot.historical_global_state_root, "state"),
+        ] {
+            super::tree::validate_root_bytes(
+                id,
+                kind,
+                scan_required_object(&authenticated_roots, id)?,
+            )?;
+        }
+    }
+
+    selected_ids.sort_unstable();
+    selected_ids.dedup();
+    let selected_objects = super::view::load_object_map(read, selected_ids).await?;
+
+    let mut heads = Vec::with_capacity(branch_snapshots.len());
+    for snapshot in branch_snapshots {
+        let head = CommitObjectV1::decode(
+            snapshot.semantic_head_commit_object_id,
+            scan_required_object(&selected_objects, snapshot.semantic_head_commit_object_id)?,
+        )?;
+        if head.global_state_root != snapshot.historical_global_state_root
+            || head.local_state_root != snapshot.local_state_root
+        {
+            return Err(
+                corruption("selected semantic head does not authenticate branch roots").into(),
+            );
+        }
+        let ref_id = snapshot.latest_ref_change_object_id.ok_or_else(|| {
+            corruption("branch snapshot has no authenticated latest RefChange edge")
+        })?;
+        let change =
+            ChangeObjectV1::decode(ref_id, scan_required_object(&selected_objects, ref_id)?)?;
+        let ChangeObjectV1::BranchRef {
+            branch_id,
+            after_semantic_head_commit_object_id,
+            ..
+        } = change
+        else {
+            return Err(corruption(
+                "branch snapshot latest ref-change edge names a semantic Change",
+            )
+            .into());
+        };
+        if branch_id != snapshot.branch_id
+            || after_semantic_head_commit_object_id != Some(snapshot.semantic_head_commit_object_id)
+        {
+            return Err(corruption(
+                "branch snapshot latest ref-change does not match its branch/head",
+            )
+            .into());
+        }
+        validate_retained_ref_change(read, repository_root.change_catalog_root, ref_id, &change)
+            .await?;
+        heads.push((
+            uuid::Uuid::from_bytes(*snapshot.branch_id.as_bytes()).to_string(),
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*head.commit_id.as_bytes())),
+        ));
     }
     Ok(heads)
 }
@@ -402,20 +518,13 @@ fn canonical_branch_id(branch_id: &str) -> Result<CanonicalBranchId, crate::LixE
     Ok(CanonicalBranchId::from_bytes(*id.as_bytes()))
 }
 
-async fn selected_head_commit_id<R>(
-    read: &R,
-    branch_id: CanonicalBranchId,
-) -> Result<crate::changelog::CommitId, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    let view = open_coherent_view_on_read(read, branch_id).await?;
-    let selected_id = view.branch_snapshot().semantic_head_commit_object_id;
-    let bytes = view.load_object_bytes(selected_id).await?;
-    let commit = CommitObjectV1::decode(selected_id, &bytes)?;
-    Ok(crate::changelog::CommitId::new(uuid::Uuid::from_bytes(
-        *commit.commit_id.as_bytes(),
-    )))
+fn scan_required_object(
+    objects: &BTreeMap<ObjectId, bytes::Bytes>,
+    id: ObjectId,
+) -> Result<&bytes::Bytes, StorageError> {
+    objects
+        .get(&id)
+        .ok_or_else(|| corruption(format!("selected scan object {id} is absent")))
 }
 
 /// Loads exact public commit facts from the single authenticated
