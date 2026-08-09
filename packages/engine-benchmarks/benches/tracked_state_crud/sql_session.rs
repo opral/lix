@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{fmt::Write as _, ops::Range};
+use std::{fmt::Write as _, ops::Range, path::PathBuf};
 
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
@@ -7,7 +7,9 @@ use lix::{ExecuteBatchStatement, ExecuteResult, PreparedDmlParameterBatch, Value
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
-use crate::storage::{ProfileStorage, RocksDB, StorageProfile};
+use crate::storage::{
+    BackendIoCounters, BackendIoSnapshot, ProfileStorage, RocksDB, StorageProfile,
+};
 use crate::workload::{UpdateWorkloadRow, WorkloadRow, sql_string};
 
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
@@ -194,6 +196,9 @@ pub(crate) enum SqlFixture {
 
 pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     session: SessionContext<StorageImpl>,
+    storage: StorageImpl,
+    reopen_path: PathBuf,
+    backend_counters: BackendIoCounters,
     /// Number of tracked fixture rows. In mixed mode the untracked probe
     /// replaces one of the requested rows rather than adding a 10,001st row.
     row_count: usize,
@@ -243,22 +248,36 @@ async fn empty_fixture_with_shape(
     );
     let untracked_fixture = profile_untracked_fixture();
     match profile.storage() {
-        ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
+        ProfileStorage::RocksDB {
+            storage,
+            _dir: dir,
+            backend_counters,
+        } => SqlFixture::RocksDB(fixture_for_session(
+            storage.clone(),
             prepare_session(storage).await,
+            dir.path().join("bench.rocksdb"),
             rows,
             read_many_by_pk_count,
             untracked_fixture,
             shape,
             dir,
+            backend_counters,
         )),
         #[cfg(feature = "slatedb")]
-        ProfileStorage::SlateDB { storage, _dir: dir } => SqlFixture::SlateDB(fixture_for_session(
+        ProfileStorage::SlateDB {
+            storage,
+            _dir: dir,
+            backend_counters,
+        } => SqlFixture::SlateDB(fixture_for_session(
+            storage.clone(),
             prepare_session(storage).await,
+            dir.path().join("bench.slatedb"),
             rows,
             read_many_by_pk_count,
             untracked_fixture,
             shape,
             dir,
+            backend_counters,
         )),
     }
 }
@@ -381,6 +400,25 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.insert_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.insert_all().await,
+        }
+    }
+
+    /// Inserts the CRUD fixture rows into the same `json_pointer` relation
+    /// used by the comparator's reads. The ordinary benchmark insert path
+    /// intentionally targets `tracked_crud_insert`, which is a separate
+    /// benchmark schema and therefore cannot be paired with the comparator's
+    /// `json_pointer` digest.
+    pub(crate) async fn insert_json_pointer_all(&self) -> usize {
+        match self {
+            Self::RocksDB(fixture) => {
+                fixture.seed_rows().await;
+                fixture.row_count
+            }
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => {
+                fixture.seed_rows().await;
+                fixture.row_count
+            }
         }
     }
 
@@ -621,6 +659,108 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.delete_one_by_pk().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.delete_one_by_pk().await,
+        }
+    }
+
+    pub(crate) async fn flush_settle(&self) {
+        match self {
+            Self::RocksDB(fixture) => fixture
+                .storage
+                .flush()
+                .expect("flush RocksDB comparator fixture"),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture
+                .storage
+                .flush()
+                .await
+                .expect("flush SlateDB comparator fixture"),
+        }
+    }
+
+    pub(crate) fn backend_io_snapshot(&self) -> Option<BackendIoSnapshot> {
+        match self {
+            Self::RocksDB(fixture) => fixture.backend_counters.snapshot(),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.backend_counters.snapshot(),
+        }
+    }
+
+    pub(crate) fn settled_disk_bytes(&self) -> u64 {
+        match self {
+            Self::RocksDB(fixture) => directory_bytes(fixture._dir.path()),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => directory_bytes(fixture._dir.path()),
+        }
+    }
+
+    pub(crate) async fn cold_reopen_read_all_result(
+        self,
+    ) -> (ExecuteResult, Option<BackendIoSnapshot>) {
+        match self {
+            Self::RocksDB(fixture) => {
+                let GenericSqlFixture {
+                    session,
+                    storage,
+                    reopen_path,
+                    _dir: dir,
+                    ..
+                } = fixture;
+                drop(session);
+                drop(storage);
+                let storage =
+                    RocksDB::open(&reopen_path).expect("cold reopen RocksDB comparator fixture");
+                let engine = Engine::new(storage)
+                    .await
+                    .expect("open reopened RocksDB comparator engine");
+                let session = engine
+                    .open_workspace_session()
+                    .await
+                    .expect("open reopened RocksDB comparator session");
+                let result = execute(
+                    &session,
+                    "SELECT path, value FROM json_pointer ORDER BY path",
+                )
+                .await;
+                drop(session);
+                drop(engine);
+                drop(dir);
+                (result, None)
+            }
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => {
+                let GenericSqlFixture {
+                    session,
+                    storage,
+                    reopen_path,
+                    backend_counters,
+                    _dir: dir,
+                    ..
+                } = fixture;
+                drop(session);
+                drop(storage);
+                let BackendIoCounters::SlateDB(counters) = &backend_counters else {
+                    unreachable!("SlateDB comparator must expose IO counters")
+                };
+                let storage = SlateDB::open_with_io_counters(&reopen_path, counters.clone())
+                    .expect("cold reopen SlateDB comparator fixture");
+                let engine = Engine::new(storage)
+                    .await
+                    .expect("open reopened SlateDB comparator engine");
+                let session = engine
+                    .open_workspace_session()
+                    .await
+                    .expect("open reopened SlateDB comparator session");
+                let result = execute(
+                    &session,
+                    "SELECT path, value FROM json_pointer ORDER BY path",
+                )
+                .await;
+                let snapshot = backend_counters.snapshot();
+                drop(session);
+                drop(engine);
+                drop(dir);
+                (result, snapshot)
+            }
         }
     }
 }
@@ -1168,15 +1308,18 @@ where
 }
 
 fn fixture_for_session<StorageImpl>(
+    storage: StorageImpl,
     session: SessionContext<StorageImpl>,
+    reopen_path: PathBuf,
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
     untracked_fixture: UntrackedFixture,
     shape: FixtureShape,
     dir: tempfile::TempDir,
+    backend_counters: BackendIoCounters,
 ) -> GenericSqlFixture<StorageImpl>
 where
-    StorageImpl: Storage,
+    StorageImpl: Storage + Clone,
 {
     let tracked_rows = if untracked_fixture == UntrackedFixture::OneReadManyMember {
         // The untracked probe occupies one selected identity, so keep the
@@ -1196,6 +1339,9 @@ where
     let mid = tracked_rows.len() / 2;
     GenericSqlFixture {
         session,
+        storage,
+        reopen_path,
+        backend_counters,
         row_count: tracked_rows.len(),
         visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
         untracked_fixture,
@@ -1838,6 +1984,23 @@ where
         .execute(sql, &[])
         .await
         .expect("execute tracked-state crud SQL")
+}
+
+fn directory_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                directory_bytes(&path)
+            } else {
+                entry.metadata().map_or(0, |metadata| metadata.len())
+            }
+        })
+        .sum()
 }
 
 fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {

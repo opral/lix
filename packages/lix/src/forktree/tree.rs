@@ -96,6 +96,15 @@ struct Node {
     body: NodeBody,
 }
 
+/// Operation-local decoded ordered-tree nodes. The owner of this cache is a
+/// retained-read authentication context; it is never persisted or shared
+/// across operations. Each node is still decoded and validated before it is
+/// admitted, and callers continue to validate the parent edge on every walk.
+#[derive(Default)]
+pub(super) struct OrderedTreeReadCache {
+    nodes: BTreeMap<ObjectId, Node>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OrderedTreeRoot {
     pub(crate) object_id: ObjectId,
@@ -452,6 +461,45 @@ where
             }
             NodeBody::Internal(children) => {
                 let index = child_index(&children, key);
+                expected = Some(children[index].clone());
+                current = children[index].id;
+            }
+        }
+    }
+}
+
+pub(super) async fn lookup_on_read_with_cache<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    key: &[u8],
+    read: &R,
+    cache: &mut OrderedTreeReadCache,
+) -> Result<Option<Vec<u8>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let kind = parse_kind(expected_kind)?;
+    let mut current = root;
+    let mut expected: Option<NodeRef> = None;
+    loop {
+        if !cache.nodes.contains_key(&current) {
+            let node = decode_node(current, &load_object_on_read(read, current).await?)?;
+            cache.nodes.insert(current, node);
+        }
+        let node = cache
+            .nodes
+            .get(&current)
+            .expect("ordered-tree cache inserted the current node");
+        validate_loaded_node(current, node, kind, expected.as_ref())?;
+        match &node.body {
+            NodeBody::Leaf(entries) => {
+                return Ok(entries
+                    .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+                    .ok()
+                    .map(|index| entries[index].value.clone()));
+            }
+            NodeBody::Internal(children) => {
+                let index = child_index(children, key);
                 expected = Some(children[index].clone());
                 current = children[index].id;
             }

@@ -1470,7 +1470,9 @@ where
 
 #[cfg(test)]
 mod canonical_blob_id_tests {
-    use super::{CanonicalBlobIdBuilder, bind_historical_state_blob_ref};
+    use super::{
+        CANONICAL_BLOB_CHUNK_BYTES, CanonicalBlobIdBuilder, bind_historical_state_blob_ref,
+    };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::forktree::ObjectId;

@@ -387,6 +387,36 @@ where
         super::serving::load_commit_members(&self.read, commit).await
     }
 
+    pub(super) async fn load_authenticated_member_closure(
+        &self,
+        commit_catalog_root: ObjectId,
+        commit_object_id: ObjectId,
+        commit: &CommitObjectV1,
+    ) -> Result<super::serving::AuthenticatedMemberClosure<'_, R>, StorageError> {
+        super::serving::load_authenticated_member_closure(
+            &self.read,
+            commit_catalog_root,
+            commit_object_id,
+            commit,
+        )
+        .await
+    }
+
+    pub(super) async fn validate_commit_catalog_identity(
+        &self,
+        commit_catalog_root: ObjectId,
+        commit_object_id: ObjectId,
+        commit: &CommitObjectV1,
+    ) -> Result<(), StorageError> {
+        super::serving::validate_commit_catalog_identity(
+            &self.read,
+            commit_catalog_root,
+            commit_object_id,
+            commit,
+        )
+        .await
+    }
+
     pub(crate) async fn scan_tree_page(
         &self,
         root: ObjectId,
@@ -415,6 +445,30 @@ where
             target_ordinal,
             member,
             entry,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn validate_member_catalog_owner_with_context(
+        &self,
+        commit_catalog_root: ObjectId,
+        target_commit_object_id: ObjectId,
+        target_generation: u64,
+        target_ordinal: usize,
+        member: super::model::CommitMemberV1,
+        entry: ChangeCatalogEntry,
+        context: Option<&super::serving::AuthenticatedMemberClosure<'_, R>>,
+    ) -> Result<(), StorageError> {
+        super::serving::validate_member_catalog_owner(
+            &self.read,
+            commit_catalog_root,
+            target_commit_object_id,
+            target_generation,
+            target_ordinal,
+            member,
+            entry,
+            context,
         )
         .await
     }
