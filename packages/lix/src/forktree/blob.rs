@@ -145,6 +145,10 @@ impl AuthenticatedBlobRef {
     pub(crate) fn expected_size(self) -> u64 {
         self.expected_size
     }
+
+    pub(crate) fn manifest_object_id(self) -> ObjectId {
+        self.manifest_object_id
+    }
 }
 
 /// Blob payload reader backed by the authenticated current ForkTree view.

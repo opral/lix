@@ -13,6 +13,7 @@ use crate::LixError;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::changelog::{ChangeRecord, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonSlot;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::transaction::staging::{BranchRefPublicationIntent, PreparedWriteSet};
@@ -22,7 +23,7 @@ use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
     CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
-    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
+    OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef, StateKey,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
     encode_state_key, encode_state_value, load_commit, open_coherent_view_on_read,
     select_historical_commit_member, state_point,
@@ -233,7 +234,8 @@ where
     let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
     let mut publication = PreparedPublication::from_branch_view(&view)?;
-    let prepared_blob_manifests = prepared_blob_manifest_ids(&mut publication, &prepared_writes)?;
+    let prepared_blob_manifests =
+        prepared_blob_manifest_ids(&mut publication, &view, &prepared_writes).await?;
     let branch_ref_intents = prepared_writes.branch_ref_intents.clone();
 
     for checkpoint in &prepared_writes.checkpoint_publications {
@@ -1449,18 +1451,44 @@ fn classify_publication_intent(
 
 type PreparedBlobManifestMap = BTreeMap<(String, String, bool, bool), ObjectId>;
 
-fn prepared_blob_manifest_ids(
+async fn prepared_blob_manifest_ids<R>(
     publication: &mut PreparedPublication,
+    view: &crate::forktree::CoherentView<R>,
     prepared: &PreparedWriteSet,
-) -> Result<PreparedBlobManifestMap, LixError> {
+) -> Result<PreparedBlobManifestMap, LixError>
+where
+    R: StorageAdapterRead + Sync,
+{
     let mut manifests = PreparedBlobManifestMap::new();
     for write in &prepared.file_content_writes {
         let manifest = if let Some(receipt) = write.prepared_cas_receipt() {
             ObjectId::from_bytes(receipt.manifest_object_id)
         } else if let Some(payload) = write.inline_payload() {
-            publication
-                .stage_inline_blob_payload(payload.bytes())
-                .map_err(LixError::from)?
+            if let Some(splice) = write.same_length_blob_splice() {
+                if write.untracked {
+                    return Err(writer_error(
+                        "verified blob splice cannot target an untracked file owner",
+                    ));
+                }
+                let file_id = &write.file_id;
+                let state_key = StateKey {
+                    schema_key: "lix_binary_blob_ref".to_owned(),
+                    file_id: Some(file_id.clone()),
+                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                        writer_error(format!(
+                            "verified blob splice file identity is not a canonical UUID: {error}"
+                        ))
+                    })?,
+                };
+                publication
+                    .stage_verified_inline_blob_splice(view, &state_key, payload, splice)
+                    .await
+                    .map_err(LixError::from)?
+            } else {
+                publication
+                    .stage_inline_blob_payload(payload.bytes())
+                    .map_err(LixError::from)?
+            }
         } else {
             return Err(writer_error(
                 "file payload is missing an authenticated ForkTree blob representation",
