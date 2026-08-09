@@ -547,11 +547,11 @@ fn bind_historical_state_blob_ref(
         .file_id
         .as_deref()
         .ok_or_else(|| corruption("historical blob-reference owner has no file identity"))?;
-    let entity_id = key
-        .entity_pk
-        .as_single_string()
-        .map_err(|_| corruption("historical blob-reference owner has a non-scalar identity"))?;
-    if entity_id != file_id {
+    let expected_entity_pk =
+        crate::entity_pk::EntityPk::uuid_from_canonical(file_id).map_err(|_| {
+            corruption("historical blob-reference owner file identity is not a canonical UUID")
+        })?;
+    if key.entity_pk != expected_entity_pk {
         return Err(corruption("historical blob-reference key identity is inconsistent").into());
     }
     let snapshot = match &value.cell {
@@ -1519,7 +1519,7 @@ mod canonical_blob_id_tests {
         StateKey {
             schema_key: "lix_binary_blob_ref".to_owned(),
             file_id: Some(id.to_owned()),
-            entity_pk: EntityPk::single(id),
+            entity_pk: EntityPk::uuid_from_canonical(id).expect("canonical historical blob id"),
         }
     }
 
@@ -1561,7 +1561,7 @@ mod canonical_blob_id_tests {
                 .to_string()
                 .into(),
         );
-        assert!(bind_historical_state_blob_ref(&key(id), &value(id, live, 1)).is_ok());
+        assert!(bind_historical_state_blob_ref(&key(id), &value(id, live.clone(), 1)).is_ok());
 
         let substituted = StateCell::Value(
             serde_json::json!({
@@ -1581,5 +1581,19 @@ mod canonical_blob_id_tests {
             bind_historical_state_blob_ref(&key(id), &value(id, StateCell::Value("{}".into()), 2))
                 .is_err()
         );
+
+        let wrong_typed_key = StateKey {
+            schema_key: "lix_binary_blob_ref".to_owned(),
+            file_id: Some(id.to_owned()),
+            entity_pk: EntityPk::single(id),
+        };
+        assert!(bind_historical_state_blob_ref(&wrong_typed_key, &value(id, live, 1)).is_err());
+
+        let missing_id = StateCell::Value(
+            serde_json::json!({"blob_hash": hash, "size_bytes": 7})
+                .to_string()
+                .into(),
+        );
+        assert!(bind_historical_state_blob_ref(&key(id), &value(id, missing_id, 1)).is_err());
     }
 }
