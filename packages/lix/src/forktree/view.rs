@@ -354,6 +354,16 @@ where
         super::serving::load_commit_member_records(&self.read, commit_id).await
     }
 
+    pub(crate) async fn load_commit_member_sources(
+        &self,
+        commit_id: crate::changelog::CommitId,
+    ) -> Result<
+        Option<Vec<(crate::changelog::CommitId, crate::changelog::ChangeRecord)>>,
+        crate::LixError,
+    > {
+        super::serving::load_commit_member_sources(&self.read, commit_id).await
+    }
+
     pub(crate) async fn load_change_records(
         &self,
         ids: &[crate::changelog::ChangeId],

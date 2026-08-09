@@ -711,6 +711,26 @@ pub(crate) async fn load_commit_member_records<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
+    Ok(load_commit_member_sources(read, commit_id)
+        .await?
+        .map(|members| members.into_iter().map(|(_, record)| record).collect()))
+}
+
+/// Loads authenticated commit members together with the commit that
+/// introduced each Change.  A selected member is a legitimate semantic
+/// dependency even when that source commit is not a first-parent ancestor of
+/// the compacting checkpoint.  The member/catalog/source back-edges are
+/// validated before this relation is exposed to history consumers.
+pub(crate) async fn load_commit_member_sources<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+) -> Result<
+    Option<Vec<(crate::changelog::CommitId, crate::changelog::ChangeRecord)>>,
+    crate::LixError,
+>
+where
+    R: StorageAdapterRead + ?Sized,
+{
     let repository = load_repository_root(read).await?;
     let commit_id = CommitId::from_bytes(*commit_id.as_uuid().as_bytes());
     let entry =
@@ -755,9 +775,18 @@ where
             entry,
         )
         .await?;
-        records.push(
+        let source_commit_id = match member.source() {
+            None => commit_id,
+            Some((source_commit_object_id, _)) => {
+                let bytes = super::view::load_object_bytes(read, source_commit_object_id).await?;
+                let source = CommitObjectV1::decode(source_commit_object_id, &bytes)?;
+                source.commit_id
+            }
+        };
+        records.push((
+            crate::changelog::CommitId::new(uuid::Uuid::from_bytes(*source_commit_id.as_bytes())),
             semantic_change_record(read, repository.change_catalog_root, change_id, entry).await?,
-        );
+        ));
     }
     Ok(Some(records))
 }

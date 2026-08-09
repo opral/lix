@@ -8,13 +8,19 @@ use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::changelog::CommitId;
+use crate::changelog::{ChangeId, ChangeRecord, CommitId};
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 
 use super::SqlChangelogQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
 use crate::storage_adapter::StorageAdapterRead;
+
+struct AuthenticatedMemberSource {
+    source_commit_id: CommitId,
+    owner_depth: u32,
+    record: ChangeRecord,
+}
 
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
@@ -426,6 +432,48 @@ where
             (history.entries, reachable_by_id)
         };
 
+        // A compacting checkpoint may carry selected Change members whose
+        // authenticated source commit is not on the checkpoint's first-parent
+        // walk.  Keep that existing member/source edge as the only additional
+        // provenance closure; do not treat an arbitrary state-row commit ID as
+        // reachable merely because it is present in a state root.
+        let mut member_sources_by_change = BTreeMap::<ChangeId, AuthenticatedMemberSource>::new();
+        for (owner_commit_id, (owner_depth, _)) in &reachable_by_id {
+            let members = forktree_reader
+                .load_commit_member_sources(*owner_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "reachable commit '{owner_commit_id}' has no authenticated member closure"
+                        ),
+                    )
+                })?;
+            for (source_commit_id, record) in members {
+                let change_id = record.change_id;
+                if let Some(previous) = member_sources_by_change.get(&change_id) {
+                    if previous.source_commit_id != source_commit_id || previous.record != record {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "authenticated Change '{change_id}' has conflicting source closure"
+                            ),
+                        ));
+                    }
+                } else {
+                    member_sources_by_change.insert(
+                        change_id,
+                        AuthenticatedMemberSource {
+                            source_commit_id,
+                            owner_depth: *owner_depth,
+                            record,
+                        },
+                    );
+                }
+            }
+        }
+
         for entry in entries {
             let change =
                 materialize_located_history_change(&mut forktree_reader, entry.change).await?;
@@ -511,25 +559,127 @@ where
                 .scan_state_rows_at_commit(certified_commit_id)
                 .await?;
             for row in certified_rows {
-                let Some((row_depth, row_commit_created_at)) = reachable_by_id.get(&row.commit_id)
-                else {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "certified historical row references commit '{}' that is not reachable from '{certified_commit_id}'",
-                            row.commit_id
-                        ),
-                    ));
+                let (row_depth, row_commit_created_at, account_id) = if let Some(source) =
+                    member_sources_by_change.get(&row.change_id)
+                {
+                    validate_authenticated_member_row(&forktree_reader, &row, &source.record)
+                        .await?;
+                    if let Some((depth, created_at)) = reachable_by_id.get(&row.commit_id) {
+                        (
+                                *depth,
+                                created_at.clone(),
+                                accounts_by_commit
+                                    .get(&row.commit_id)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        LixError::new(
+                                            LixError::CODE_INTERNAL_ERROR,
+                                            format!(
+                                                "certified historical row commit '{}' has no authenticated account",
+                                                row.commit_id
+                                            ),
+                                        )
+                                    })?,
+                            )
+                    } else if source.source_commit_id == row.commit_id {
+                        let source_commit = forktree_reader
+                            .load_required_commit_record(source.source_commit_id)
+                            .await?;
+                        (
+                            source.owner_depth,
+                            source_commit.created_at.to_string(),
+                            source_commit.account_id,
+                        )
+                    } else {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "certified historical row Change '{}' disagrees with its authenticated source commit",
+                                row.change_id
+                            ),
+                        ));
+                    }
+                } else if let Some((depth, created_at)) = reachable_by_id.get(&row.commit_id) {
+                    (
+                            *depth,
+                            created_at.clone(),
+                            accounts_by_commit.get(&row.commit_id).cloned().ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "certified historical row commit '{}' has no authenticated account",
+                                        row.commit_id
+                                    ),
+                                )
+                            })?,
+                        )
+                } else {
+                    // A compacted state root can retain a row whose source
+                    // commit is not on the public parent walk and was not
+                    // selected again by the current checkpoint. Authenticate
+                    // that row through the source commit's own member/catalog
+                    // closure on this same retained read; this is provenance,
+                    // not an extension of public chronology.
+                    let direct_sources = forktree_reader
+                        .load_commit_member_sources(row.commit_id)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "certified historical row references commit '{}' without an authenticated source closure",
+                                    row.commit_id
+                                ),
+                            )
+                        })?;
+                    let (source_commit_id, source_record) = direct_sources
+                        .into_iter()
+                        .find(|(_, record)| record.change_id == row.change_id)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "certified historical row Change '{}' is absent from its authenticated source commit",
+                                    row.change_id
+                                ),
+                            )
+                        })?;
+                    if source_commit_id != row.commit_id {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "certified historical row Change '{}' has a substituted source commit",
+                                row.change_id
+                            ),
+                        ));
+                    }
+                    let source_commit = forktree_reader
+                        .load_required_commit_record(source_commit_id)
+                        .await?;
+                    validate_authenticated_member_row(&forktree_reader, &row, &source_record)
+                        .await?;
+                    (
+                        reachable_by_id
+                            .get(&certified_commit_id)
+                            .map(|(depth, _)| *depth)
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "certified owner commit '{}' is missing its authenticated depth",
+                                        certified_commit_id
+                                    ),
+                                )
+                            })?,
+                        source_commit.created_at.to_string(),
+                        source_commit.account_id,
+                    )
                 };
                 if !historical_row_matches_request(&row, &request) {
                     continue;
                 }
-                if request
-                    .min_depth
-                    .is_some_and(|minimum| *row_depth < minimum)
-                    || request
-                        .max_depth
-                        .is_some_and(|maximum| *row_depth > maximum)
+                if request.min_depth.is_some_and(|minimum| row_depth < minimum)
+                    || request.max_depth.is_some_and(|maximum| row_depth > maximum)
                 {
                     continue;
                 }
@@ -537,17 +687,6 @@ where
                 if !existing_change_ids.insert(change_id.clone()) {
                     continue;
                 }
-                let account_id = accounts_by_commit.get(&row.commit_id).cloned().ok_or_else(
-                    || {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "certified historical row commit '{}' has no authenticated account",
-                                row.commit_id
-                            ),
-                        )
-                    },
-                )?;
                 rows.push(HistoryEntry {
                     change: MaterializedChange {
                         id: change_id,
@@ -565,13 +704,56 @@ where
                         .commit_created_at
                         .then(|| row_commit_created_at.clone()),
                     as_of_commit_id: as_of_commit_id.to_string(),
-                    depth: *row_depth,
+                    depth: row_depth,
                 });
             }
         }
     }
 
     Ok(rows)
+}
+
+async fn validate_authenticated_member_row(
+    reader: &crate::forktree::ForkTreeReadFacade<impl StorageAdapterRead>,
+    row: &crate::forktree::HistoricalStateRow,
+    record: &ChangeRecord,
+) -> Result<(), LixError> {
+    if record.change_id != row.change_id
+        || record.schema_key != row.key.schema_key
+        || record.entity_pk != row.key.entity_pk
+        || record.file_id != row.key.file_id
+        || record.created_at != row.created_at
+        || record.snapshot.is_none() != row.deleted
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "certified historical row '{}' disagrees with its authenticated Change payload",
+                row.change_id
+            ),
+        ));
+    }
+    let snapshot = reader.load_json_slot(&record.snapshot).await?;
+    if snapshot.as_deref() != row.snapshot_content.as_deref() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "certified historical row '{}' snapshot disagrees with its authenticated Change payload",
+                row.change_id
+            ),
+        ));
+    }
+    let metadata = reader.load_json_slot(&record.metadata).await?;
+    if metadata.as_deref() != row.metadata.as_deref() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "certified historical row '{}' metadata disagrees with its authenticated Change payload",
+                row.change_id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn historical_row_matches_request(
