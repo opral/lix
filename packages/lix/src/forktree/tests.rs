@@ -939,6 +939,27 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
             .cell,
         StateCell::Null
     ));
+    let requested = vec![
+        seed.state_keys[2].clone(),
+        seed.state_keys[0].clone(),
+        seed.state_keys[2].clone(),
+        b"missing".to_vec(),
+    ];
+    let batched = view
+        .state_points(&requested, true)
+        .await
+        .expect("batched points");
+    assert_eq!(batched.len(), requested.len());
+    assert_eq!(batched[0], batched[2]);
+    assert_eq!(
+        batched[0].as_ref().map(|row| row.encoded_key.as_slice()),
+        Some(requested[0].as_slice())
+    );
+    assert_eq!(
+        batched[1].as_ref().map(|row| row.encoded_key.as_slice()),
+        Some(requested[1].as_slice())
+    );
+    assert!(batched[3].is_none());
     let rows = state_range(&view, None, None, Some(3), false)
         .await
         .expect("merged range");

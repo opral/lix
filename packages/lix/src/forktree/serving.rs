@@ -18,8 +18,8 @@ use super::state::{
 };
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
-    apply_ordered_mutations_idempotent_inserts, lookup_on_read, scan_bounded_page_on_read,
-    scan_page_on_read, validate_root_on_read,
+    apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
+    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -1472,6 +1472,81 @@ where
         return Err(corruption("global state tree contains a tombstone"));
     }
     Ok(Some((value, StateSource::Global)))
+}
+
+/// Resolves many current-state identities through one retained ForkTree read.
+/// The ordered-tree traversal batches object loads by level, while the
+/// returned slots stay aligned with the requested keys, including duplicates.
+pub(crate) async fn state_points<R>(
+    view: &CoherentView<R>,
+    keys: &[Vec<u8>],
+    include_tombstone: bool,
+) -> Result<Vec<Option<VisibleStateRow>>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let (global_root, local_root) = current_state_roots(view);
+    let values = view
+        .state_points_at_roots(global_root, local_root, keys, include_tombstone)
+        .await?;
+    Ok(values
+        .into_iter()
+        .zip(keys)
+        .map(|(value, key)| {
+            value.map(|(value, source)| VisibleStateRow {
+                encoded_key: key.clone(),
+                value,
+                source,
+                view_instance_id: view.view_instance_id(),
+            })
+        })
+        .collect())
+}
+
+pub(crate) async fn state_points_on_roots<R>(
+    global_state_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    keys: &[Vec<u8>],
+    include_tombstones: bool,
+    read: &R,
+) -> Result<Vec<Option<(StateValue, StateSource)>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let local_values = match local_state_root {
+        Some(local_root) => lookup_many_on_read(local_root, "state", keys, read).await?,
+        None => vec![None; keys.len()],
+    };
+    let global_values = if local_state_root == Some(global_state_root) {
+        local_values.clone()
+    } else {
+        lookup_many_on_read(global_state_root, "state", keys, read).await?
+    };
+    local_values
+        .into_iter()
+        .zip(global_values)
+        .map(|(local, global)| {
+            if let Some(encoded) = local {
+                let value = decode_state_value_storage(&encoded)?;
+                return if value.cell.deleted() && !include_tombstones {
+                    Ok(None)
+                } else {
+                    Ok(Some((value, StateSource::Branch)))
+                };
+            }
+            let Some(encoded) = global else {
+                return Ok(None);
+            };
+            let value = decode_state_value_storage(&encoded)?;
+            if matches!(value.cell, StateCell::Tombstone) {
+                return Err(corruption("global state tree contains a tombstone"));
+            }
+            Ok(Some((value, StateSource::Global)))
+        })
+        .collect()
 }
 
 pub(crate) async fn state_range<R>(

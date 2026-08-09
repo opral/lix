@@ -15,7 +15,7 @@ use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_key, state_point, state_range,
+    encode_state_key, state_range,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -537,13 +537,29 @@ where
         return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
     }
 
-    for requested in &request.rows {
-        let key = encode_state_key(StateKeyRef {
-            schema_key: &requested.schema_key,
-            file_id: requested.file_id.as_deref(),
-            entity_pk: &requested.entity_pk,
-        });
-        let Some(row) = state_point(&view, &key, request.include_tombstones).await? else {
+    let keys: Vec<Vec<u8>> = request
+        .rows
+        .iter()
+        .map(|requested| {
+            encode_state_key(StateKeyRef {
+                schema_key: &requested.schema_key,
+                file_id: requested.file_id.as_deref(),
+                entity_pk: &requested.entity_pk,
+            })
+        })
+        .collect();
+    let rows = view
+        .state_points(&keys, request.include_tombstones)
+        .await
+        .map_err(LixError::from)?;
+    if rows.len() != request.rows.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "batched exact live-state lookup returned the wrong slot count",
+        ));
+    }
+    for (requested, row) in request.rows.iter().zip(rows) {
+        let Some(row) = row else {
             slots.push(None);
             continue;
         };

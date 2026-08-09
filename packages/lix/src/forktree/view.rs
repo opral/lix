@@ -153,6 +153,32 @@ where
         .await
     }
 
+    pub(crate) async fn state_points(
+        &self,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<super::serving::VisibleStateRow>>, StorageError> {
+        super::serving::state_points(self, keys, include_tombstones).await
+    }
+
+    pub(crate) async fn state_points_at_roots(
+        &self,
+        global_root: ObjectId,
+        local_root: Option<ObjectId>,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<(super::state::StateValue, super::serving::StateSource)>>, StorageError>
+    {
+        super::serving::state_points_on_roots(
+            global_root,
+            local_root,
+            keys,
+            include_tombstones,
+            &self.read,
+        )
+        .await
+    }
+
     /// Scans authenticated untracked rows for this branch without exposing
     /// the underlying storage read to callers outside ForkTree.
     pub(crate) async fn scan_untracked_rows(

@@ -678,6 +678,157 @@ where
     }
 }
 
+/// Looks up many ordered-tree keys through one authenticated traversal. Keys
+/// are deduplicated only for the traversal and expanded back into the exact
+/// caller order, so duplicate request slots retain their point-read
+/// semantics. Each tree level is fetched as one storage request and every
+/// parent edge is validated before its child is used.
+pub(super) async fn lookup_many_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    keys: &[Vec<u8>],
+    read: &R,
+) -> Result<Vec<Option<Vec<u8>>>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let kind = parse_kind(expected_kind)?;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut unique_keys = Vec::<Vec<u8>>::new();
+    let mut requested_unique = Vec::with_capacity(keys.len());
+    let mut unique_by_key = BTreeMap::<Vec<u8>, usize>::new();
+    for key in keys {
+        let unique_index = match unique_by_key.get(key) {
+            Some(index) => *index,
+            None => {
+                let index = unique_keys.len();
+                unique_keys.push(key.clone());
+                unique_by_key.insert(key.clone(), index);
+                index
+            }
+        };
+        requested_unique.push(unique_index);
+    }
+
+    // Each task groups keys routed to one object. The expected references are
+    // retained as a list because an immutable node may be encountered through
+    // more than one authenticated edge; every edge must still be checked.
+    let mut tasks = BTreeMap::<ObjectId, (Vec<NodeRef>, Vec<usize>)>::new();
+    tasks.insert(
+        root,
+        (Vec::new(), (0..unique_keys.len()).collect::<Vec<_>>()),
+    );
+    let mut values = vec![None; unique_keys.len()];
+
+    for _depth in 0..64 {
+        if tasks.is_empty() {
+            break;
+        }
+        let ids = tasks.keys().copied().collect::<Vec<_>>();
+        let objects = load_object_batch_on_read(read, &ids).await?;
+        let current = std::mem::take(&mut tasks);
+        let mut next = BTreeMap::<ObjectId, (Vec<NodeRef>, Vec<usize>)>::new();
+
+        for id in ids {
+            let (expected_refs, key_indices) = current
+                .get(&id)
+                .expect("ordered-tree lookup task was collected from its map");
+            let bytes = objects
+                .get(&id)
+                .ok_or_else(|| corruption("ordered-tree batch object was not returned"))?;
+            let node = decode_node(id, bytes)?;
+            for expected in expected_refs {
+                validate_loaded_node(id, &node, kind, Some(expected))?;
+            }
+            if expected_refs.is_empty() {
+                validate_loaded_node(id, &node, kind, None)?;
+            }
+
+            match &node.body {
+                NodeBody::Leaf(entries) => {
+                    for unique_index in key_indices {
+                        let key = &unique_keys[*unique_index];
+                        values[*unique_index] = entries
+                            .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+                            .ok()
+                            .map(|index| entries[index].value.clone());
+                    }
+                }
+                NodeBody::Internal(children) => {
+                    for unique_index in key_indices {
+                        let index = child_index(children, &unique_keys[*unique_index]);
+                        let child = children.get(index).ok_or_else(|| {
+                            corruption("ordered-tree lookup child index is invalid")
+                        })?;
+                        let task = next
+                            .entry(child.id)
+                            .or_insert_with(|| (Vec::new(), Vec::new()));
+                        task.0.push(child.clone());
+                        task.1.push(*unique_index);
+                    }
+                }
+            }
+        }
+        tasks = next;
+    }
+    if !tasks.is_empty() {
+        return Err(corruption(
+            "ordered-tree lookup exceeded its authenticated depth",
+        ));
+    }
+
+    Ok(requested_unique
+        .into_iter()
+        .map(|unique_index| values[unique_index].clone())
+        .collect())
+}
+
+async fn load_object_batch_on_read<R>(
+    read: &R,
+    ids: &[ObjectId],
+) -> Result<BTreeMap<ObjectId, Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let keys = ids
+        .iter()
+        .map(|id| Key(Bytes::copy_from_slice(id.as_bytes())))
+        .collect::<Vec<_>>();
+    let loaded = read
+        .get_many(&[GetManyRequest {
+            space: super::object::OBJECT_SPACE,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await?;
+    if loaded.values.len() != ids.len() {
+        return Err(corruption(
+            "ordered-tree batch object read returned the wrong slot count",
+        ));
+    }
+    ids.iter()
+        .copied()
+        .zip(loaded.values)
+        .map(|(id, value)| {
+            let bytes = match value {
+                Some(ProjectedValue::FullValue(bytes)) => bytes,
+                Some(ProjectedValue::KeyOnly) => {
+                    return Err(corruption(
+                        "ordered-tree batch object read returned key-only data",
+                    ));
+                }
+                None => return Err(corruption(format!("ordered-tree object {id} is absent"))),
+            };
+            Ok((id, bytes))
+        })
+        .collect()
+}
+
 pub(super) async fn validate_root_on_read<R>(
     root: ObjectId,
     expected_kind: &'static str,
