@@ -1553,11 +1553,13 @@ impl LixFileSpec {
         filters: &[Expr],
         returning: Option<DmlReturning>,
     ) -> Result<PlannedDml> {
+        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
             || assignments.iter().any(|(column_name, expr)| {
-                column_name == "path" || physical_expr_contains_column(expr, "content")
+                (column_name == "path" && !update_columns.data)
+                    || physical_expr_contains_column(expr, "content")
             })
             || returning
                 .as_ref()
@@ -1576,7 +1578,6 @@ impl LixFileSpec {
             .indexed_dml_matches(&request, filters, &target_file_ids)
             .await?;
 
-        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let capture_path_resolver_rows = update_columns.requires_path_resolver()
             && matches!(
                 (&self.branch_binding, &target_file_ids),
