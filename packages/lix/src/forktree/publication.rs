@@ -1056,6 +1056,21 @@ impl PreparedPublication {
     where
         R: StorageAdapterRead,
     {
+        let selector_generation = match &expected {
+            SelectorExpectation::Absent => 1,
+            SelectorExpectation::Equals(raw_selector) => {
+                let previous = SnapshotSelectorV1::decode(raw_selector)?;
+                if previous.role != role || previous.selector_id != selector_id {
+                    return Err(corruption(
+                        "snapshot selector expectation identity does not match its replacement",
+                    ));
+                }
+                previous
+                    .selector_generation
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("snapshot selector generation overflowed"))?
+            }
+        };
         let target = SnapshotTargetV1 {
             role,
             selector_id,
@@ -1069,7 +1084,7 @@ impl PreparedPublication {
                 role,
                 selector_id,
                 target_object_id: target_id,
-                selector_generation: 1,
+                selector_generation,
             },
             expected,
         )?;

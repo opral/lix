@@ -240,7 +240,6 @@ where
     // exact branch identity instead of forcing them through a global owner.
     let local_state = build_state_tree(&local_entries).map_err(LixError::from)?;
 
-
     let mut objects = ImmutableObjectSet::default();
     objects
         .extend(global_state.objects)

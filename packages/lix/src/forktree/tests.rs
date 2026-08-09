@@ -1366,6 +1366,202 @@ fn catalogs_use_one_raw_uuid_tree_and_fail_closed_on_owner_mismatch() {
     );
 }
 
+#[tokio::test]
+async fn path_copy_catalog_put_and_view_bound_resume_are_bounded() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("view");
+    let old_token = page_commits(&view, None, 1)
+        .await
+        .expect("first page")
+        .resume_token
+        .expect("resume token");
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        Vec::new(),
+        view.test_storage_read(),
+    )
+    .await
+    .expect("no-op state edit");
+    let transition = branch_transition(&view, state_edit, 0x60).await;
+    assert!(transition.commit_catalog_edit.copied_nodes() <= 2);
+    assert_eq!(transition.commit_catalog_edit.entry_count(), 2);
+    let mut publication = PreparedPublication::from_branch_view(&view).expect("publication");
+    publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("typed transition");
+    drop(view);
+    commit_publication_for_test(publication, &storage)
+        .await
+        .expect("commit transition");
+    let reopened = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("reopen");
+    assert!(matches!(
+        page_commits(&reopened, Some(&old_token), 1).await,
+        Err(StorageError::InvalidCursor)
+    ));
+    let first: CatalogPage<(CommitId, CommitObjectV1)> =
+        page_commits(&reopened, None, 1).await.expect("page one");
+    let second = page_commits(&reopened, first.resume_token.as_deref(), 1)
+        .await
+        .expect("page two");
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(
+        load_commit(&reopened, CommitId::from_bytes(raw_id(0x60)))
+            .await
+            .expect("load")
+            .expect("new commit")
+            .commit_id,
+        CommitId::from_bytes(raw_id(0x60))
+    );
+    assert!(
+        load_change(&reopened, ChangeId::from_bytes(raw_id(0x61)))
+            .await
+            .expect("change")
+            .is_some()
+    );
+    assert_eq!(
+        page_changes(&reopened, None, 2)
+            .await
+            .expect("changes")
+            .entries
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn recovery_selector_replacement_advances_generation_and_rejects_corruption() {
+    let seed = build_seed();
+    let storage = CrashStorage::new();
+    seed_storage(&storage, &seed).await;
+    let selector_id = SnapshotSelectorId::from_bytes(*seed.branch_id.as_bytes());
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("initial recovery view");
+    let mut first = PreparedPublication::from_global_epoch(&view).expect("initial publication");
+    let first_target = first
+        .publish_current_snapshot_pin(
+            &view,
+            SnapshotRole::Recovery,
+            selector_id,
+            SelectorExpectation::Absent,
+        )
+        .expect("initial recovery selector");
+    drop(view);
+    commit_publication_for_test(first, &storage)
+        .await
+        .expect("initial recovery commit");
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("transition view");
+    let state_edit = edit_state_tree(
+        view.branch_snapshot().local_state_root,
+        Vec::new(),
+        view.test_storage_read(),
+    )
+    .await
+    .expect("no-op transition state");
+    let transition = branch_transition(&view, state_edit, 0x62).await;
+    let mut transition_publication =
+        PreparedPublication::from_branch_view(&view).expect("transition publication");
+    transition_publication
+        .publish_state_transition(&view, transition)
+        .await
+        .expect("branch transition");
+    drop(view);
+    commit_publication_for_test(transition_publication, &storage)
+        .await
+        .expect("transition commit");
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("replacement view");
+    let selector_key = snapshot_selector_key(SnapshotRole::Recovery, selector_id);
+    let loaded = view
+        .test_storage_read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &[Key(selector_key)],
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("recovery selector read");
+    let raw_before = match loaded.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
+        other => panic!("expected recovery selector, got {other:?}"),
+    };
+    let mut replacement =
+        PreparedPublication::from_global_epoch(&view).expect("replacement publication");
+    let replacement_target = replacement
+        .publish_current_snapshot_pin(
+            &view,
+            SnapshotRole::Recovery,
+            selector_id,
+            SelectorExpectation::Equals(raw_before.clone()),
+        )
+        .expect("replacement recovery selector");
+    assert_ne!(first_target, replacement_target);
+    drop(view);
+    commit_publication_for_test(replacement, &storage)
+        .await
+        .expect("replacement commit");
+
+    let reopened = storage.reopen();
+    let view = open_coherent_view(&reopened, seed.branch_id)
+        .await
+        .expect("cold reopen after replacement");
+    let loaded = view
+        .test_storage_read()
+        .get_many(&[GetManyRequest {
+            space: SELECTOR_SPACE,
+            keys: &[Key(snapshot_selector_key(
+                SnapshotRole::Recovery,
+                selector_id,
+            ))],
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("recovery selector after reopen");
+    let raw_after = match loaded.values.as_slice() {
+        [Some(crate::storage::ProjectedValue::FullValue(bytes))] => bytes.clone(),
+        other => panic!("expected recovery selector after reopen, got {other:?}"),
+    };
+    let selector = SnapshotSelectorV1::decode(&raw_after).expect("replacement selector");
+    assert_eq!(selector.selector_generation, 2);
+    assert_eq!(selector.target_object_id, replacement_target);
+
+    let mut corrupted = raw_after.to_vec();
+    *corrupted.last_mut().expect("encoded selector") ^= 1;
+    let mut rejected = PreparedPublication::from_global_epoch(&view).expect("corrupt check");
+    assert!(
+        rejected
+            .publish_current_snapshot_pin(
+                &view,
+                SnapshotRole::Recovery,
+                selector_id,
+                SelectorExpectation::Equals(Bytes::from(corrupted)),
+            )
+            .is_err()
+    );
+    drop(view);
+    open_coherent_view(&reopened, seed.branch_id)
+        .await
+        .expect("corruption rejection leaves repository reopenable");
+}
+
 #[derive(Clone)]
 struct CountingStorage {
     inner: Memory,
