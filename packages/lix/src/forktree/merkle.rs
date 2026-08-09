@@ -178,6 +178,32 @@ pub(crate) fn build_blob_merkle_tree(
     Ok(BlobMerkleTreeBuild { manifest, objects })
 }
 
+/// Builds the smallest authenticated Merkle fixture for unit tests.  The
+/// production builder remains the canonical multi-leaf path; this helper is
+/// intentionally test-only so small corruption controls do not need to carry
+/// a 1 MiB allocation merely to exercise manifest encoding.
+#[cfg(test)]
+pub(crate) fn single_leaf_manifest_for_test(
+    chunk: &BlobChunkV1,
+) -> Result<(BlobManifestV1, ObjectId, Bytes), StorageError> {
+    if chunk.bytes.is_empty() {
+        return Err(corruption("test Merkle fixture requires a non-empty chunk"));
+    }
+    let (chunk_object_id, _) = chunk.encode()?;
+    let leaf = BlobMerkleLeafV1 {
+        ordinal: 0,
+        chunk_object_id,
+        declared_len: chunk.bytes.len() as u64,
+        chunk_digest: *blake3::hash(&chunk.bytes).as_bytes(),
+    };
+    let (leaf_object_id, leaf_bytes) = encode_leaf(&leaf)?;
+    Ok((
+        BlobManifestV1::from_merkle_root(chunk.bytes.len() as u64, 1, leaf_object_id, 0),
+        leaf_object_id,
+        leaf_bytes,
+    ))
+}
+
 /// Creates a proof for an exact half-open range of leaf ordinals. The proof
 /// contains O(K log N) tree objects for K requested leaves and never copies an
 /// unrelated leaf payload.

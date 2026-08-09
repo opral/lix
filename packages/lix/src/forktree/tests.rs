@@ -16,6 +16,7 @@ use crate::storage_adapter::{
     StorageReadOptions, StorageWriteSet, StorageWriteSetError,
 };
 
+use super::merkle::{build_blob_merkle_tree, single_leaf_manifest_for_test};
 use super::model::{
     GcProgressSelectorV2, GcProgressV2, branch_selector_key, gc_progress_selector_key,
     global_selector_key, snapshot_selector_key, upload_binding_digest, upload_selector_key,
@@ -31,19 +32,20 @@ use super::tree::{
 };
 use super::view::SELECTOR_SPACE;
 use super::{
-    BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
-    BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage, ChangeCatalogEntry,
-    ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView, CommitCatalogEntry, CommitId,
-    CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget, GcStepStatus, GlobalSelectorV1,
-    ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit,
-    ReceiptTreeRoot, RepositoryRootV1, SelectorExpectation, SnapshotRole, SnapshotSelectorId,
-    SnapshotSelectorV1, SnapshotTargetV1, StateCell, StateCellRef, StateKey, StateKeyRef,
-    StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
-    UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
-    advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_topologies, open_coherent_view, page_changes,
-    page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_range,
+    BLOB_MERKLE_CHUNK_BYTES, BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1,
+    BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, CanonicalUploadId, CatalogPage,
+    ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1, CoherentView,
+    CommitCatalogEntry, CommitId, CommitMemberV1, CommitObjectV1, ForkTreeReadFacade, GcBudget,
+    GcStepStatus, GlobalSelectorV1, ObjectId, PreparedPublication, RECEIPT_TREE_FANOUT,
+    RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot, RepositoryRootV1,
+    SelectorExpectation, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
+    StateCell, StateCellRef, StateKey, StateKeyRef, StateSource, StateTreeMutation, StateValueRef,
+    UntrackedValueRef, UploadBindingRef, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    VisibleStateRow, abort_corrupt_gc, advance_gc, edit_state_tree, encode_state_key,
+    encode_state_value, load_change, load_commit, load_commit_member_records,
+    load_commit_topologies, open_coherent_view, page_changes, page_commits,
+    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -135,27 +137,32 @@ fn topology_cache_is_private_and_inseparable_from_its_storage_snapshot() {
 #[test]
 fn blob_manifest_identity_is_an_owner_checked_integrity_copy() {
     let model = include_str!("model.rs");
-    let blob = include_str!("blob.rs");
-    let facade = include_str!("mod.rs");
-    let publication = include_str!("publication.rs");
-    assert!(model.contains("pub(super) canonical_blob_id: BlobId"));
-    assert!(!model.contains("pub(crate) canonical_blob_id"));
-    assert!(!facade.contains("canonical_blob_id"));
-    assert!(blob.contains("canonical_blob_id: semantic_id_builder.finish()"));
-    assert!(blob.contains("manifest.canonical_blob_id != semantic_id"));
-    assert!(!blob.contains("BTreeMap<crate::binary_cas::BlobId"));
-    assert!(!blob.contains("fn canonical_blob_id"));
-    let inline = publication
-        .split_once("pub(crate) fn stage_inline_blob_payload")
-        .and_then(|(_, rest)| rest.split_once("pub(crate) fn stage_json_payload"))
+    let merkle = include_str!("merkle.rs");
+    let reachability = include_str!("reachability.rs");
+    let manifest = model
+        .split_once("pub(crate) struct BlobManifestV1")
+        .and_then(|(_, rest)| rest.split_once("pub(crate) struct UploadPartV1"))
         .map(|(body, _)| body)
-        .expect("inline publication body");
-    assert!(inline.contains("semantic_id_builder.update_fixed_chunk(chunk_bytes)"));
-    assert!(inline.contains("content_digest.update(chunk_bytes)"));
-    assert!(inline.contains("semantic_id_builder.finish()"));
-    assert!(inline.contains("content_digest.finalize()"));
-    assert!(!inline.contains("BlobId::from_content(bytes)"));
-    assert!(!inline.contains("blake3::hash(bytes)"));
+        .expect("BlobManifestV1 source section");
+    assert!(manifest.contains("root_object_id: ObjectId"));
+    assert!(manifest.contains("root_height: u32"));
+    assert!(manifest.contains("chunk_bytes: u64"));
+    assert!(manifest.contains("canonical_blob_id: BlobId"));
+    assert!(manifest.contains("canonical_merkle_blob_id"));
+    assert!(!manifest.contains("ordered_chunks: Vec<BlobChunkRefV1>"));
+    assert!(!manifest.contains("content_digest: [u8; 32]"));
+    assert!(merkle.contains("BlobManifestV1::from_merkle_root"));
+    assert!(merkle.contains("canonical_merkle_blob_id"));
+    assert!(reachability.contains("authenticated_merkle_edges"));
+    assert!(!merkle.contains("BlobId::from_content"));
+    assert!(!merkle.contains("BlobId::from_chunks"));
+    let manifest_reachability = reachability
+        .split_once("ObjectDomain::BlobManifest =>")
+        .and_then(|(_, rest)| rest.split_once("ObjectDomain::BlobMerkleLeafV1"))
+        .map(|(body, _)| body)
+        .expect("BlobManifest reachability arm");
+    assert!(!manifest_reachability.contains("ordered_chunks"));
+    assert!(!manifest_reachability.contains("content_digest"));
 }
 
 #[tokio::test]
@@ -2923,14 +2930,11 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     )
     .await
     .expect("completion proof");
-    let manifest = BlobManifestV1 {
-        logical_bytes: 4,
-        ordered_chunks: upload.part.ordered_chunks.clone(),
-        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"data"),
-        content_digest: *blake3::hash(b"data").as_bytes(),
-    };
+    let manifest = single_leaf_manifest_for_test(&upload.chunk)
+        .expect("authenticated upload manifest")
+        .0;
     let (manifest_id, _) = manifest.encode().expect("manifest");
-    let blob_id = crate::binary_cas::BlobId::from_content(b"data");
+    let blob_id = manifest.canonical_blob_id;
     let (key, value) = blob_ref_state_entry(
         "01920000-0000-7000-8000-0000000000a1",
         blob_id,
@@ -2965,9 +2969,14 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
     const FIXED_CHUNK_BYTES: usize = 1024 * 1024;
     let owner_payload = vec![b'a'; FIXED_CHUNK_BYTES + 1];
     let transplanted_payload = vec![b'b'; FIXED_CHUNK_BYTES + 1];
-    let owner_blob_id = crate::binary_cas::BlobId::from_content(&owner_payload);
-    let transplanted_blob_id = crate::binary_cas::BlobId::from_content(&transplanted_payload);
-    assert_ne!(owner_blob_id, transplanted_blob_id);
+    let owner_chunks = [
+        BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(&owner_payload[..FIXED_CHUNK_BYTES]),
+        },
+        BlobChunkV1 {
+            bytes: Bytes::copy_from_slice(&owner_payload[FIXED_CHUNK_BYTES..]),
+        },
+    ];
     let transplanted_chunks = [
         BlobChunkV1 {
             bytes: Bytes::copy_from_slice(&transplanted_payload[..FIXED_CHUNK_BYTES]),
@@ -2976,22 +2985,15 @@ async fn upload_completion_moves_receipt_to_tracked_state_atomically() {
             bytes: Bytes::copy_from_slice(&transplanted_payload[FIXED_CHUNK_BYTES..]),
         },
     ];
-    let transplanted_chunk_refs = transplanted_chunks
-        .iter()
-        .map(|chunk| {
-            let (chunk_object_id, _) = chunk.encode().expect("transplanted chunk");
-            BlobChunkRefV1 {
-                chunk_object_id,
-                declared_len: chunk.bytes.len() as u64,
-            }
-        })
-        .collect::<Vec<_>>();
-    let transplanted_manifest = BlobManifestV1 {
-        logical_bytes: transplanted_payload.len() as u64,
-        ordered_chunks: transplanted_chunk_refs,
-        canonical_blob_id: transplanted_blob_id,
-        content_digest: *blake3::hash(&transplanted_payload).as_bytes(),
-    };
+    let owner_manifest = build_blob_merkle_tree(&owner_chunks)
+        .expect("owner Merkle manifest")
+        .manifest;
+    let transplanted_manifest = build_blob_merkle_tree(&transplanted_chunks)
+        .expect("transplanted Merkle manifest")
+        .manifest;
+    let owner_blob_id = owner_manifest.canonical_blob_id;
+    let transplanted_blob_id = transplanted_manifest.canonical_blob_id;
+    assert_ne!(owner_blob_id, transplanted_blob_id);
     let (transplanted_manifest_id, _) = transplanted_manifest
         .encode()
         .expect("transplanted manifest");
@@ -3191,35 +3193,22 @@ async fn exact_blob_reader_binds_duplicate_blob_ids_to_selected_state_key() {
 
     let valid_payload = b"aaaa";
     let wrong_payload = b"bbbb";
-    let semantic_id = crate::binary_cas::BlobId::from_content(valid_payload);
     let valid_chunk = BlobChunkV1 {
         bytes: Bytes::copy_from_slice(valid_payload),
     };
     let wrong_chunk = BlobChunkV1 {
         bytes: Bytes::copy_from_slice(wrong_payload),
     };
-    let (valid_chunk_id, _) = valid_chunk.encode().expect("valid duplicate chunk");
-    let (wrong_chunk_id, _) = wrong_chunk.encode().expect("wrong duplicate chunk");
-    let valid_manifest = BlobManifestV1 {
-        logical_bytes: valid_payload.len() as u64,
-        ordered_chunks: vec![BlobChunkRefV1 {
-            chunk_object_id: valid_chunk_id,
-            declared_len: valid_payload.len() as u64,
-        }],
-        canonical_blob_id: semantic_id,
-        content_digest: *blake3::hash(valid_payload).as_bytes(),
-    };
-    let wrong_manifest = BlobManifestV1 {
-        logical_bytes: wrong_payload.len() as u64,
-        ordered_chunks: vec![BlobChunkRefV1 {
-            chunk_object_id: wrong_chunk_id,
-            declared_len: wrong_payload.len() as u64,
-        }],
-        // This is the exact duplicate-owner trap: the wrong row claims the
-        // same semantic ID while pointing at different authenticated bytes.
-        canonical_blob_id: semantic_id,
-        content_digest: *blake3::hash(wrong_payload).as_bytes(),
-    };
+    let valid_manifest = single_leaf_manifest_for_test(&valid_chunk)
+        .expect("valid duplicate manifest")
+        .0;
+    let wrong_manifest = single_leaf_manifest_for_test(&wrong_chunk)
+        .expect("wrong duplicate manifest")
+        .0;
+    let semantic_id = valid_manifest.canonical_blob_id;
+    // This is the exact duplicate-owner trap: the wrong row claims the
+    // selected owner's semantic ID while pointing at different authenticated
+    // Merkle leaf/chunk bytes.
     let (valid_manifest_id, _) = valid_manifest.encode().expect("valid duplicate manifest");
     let (wrong_manifest_id, _) = wrong_manifest.encode().expect("wrong duplicate manifest");
     let (wrong_key, wrong_value) = blob_ref_state_entry(
@@ -3534,12 +3523,9 @@ async fn retained_checkpoint_outlives_branch_retirement_then_releases_blob() {
     )
     .await
     .expect("completion");
-    let manifest = BlobManifestV1 {
-        logical_bytes: 4,
-        ordered_chunks: upload.part.ordered_chunks.clone(),
-        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"data"),
-        content_digest: *blake3::hash(b"data").as_bytes(),
-    };
+    let manifest = single_leaf_manifest_for_test(&upload.chunk)
+        .expect("authenticated checkpoint manifest")
+        .0;
     let (manifest_id, _) = manifest.encode().expect("manifest");
     let (key, value) = state_entry(
         "disposable-blob",
@@ -3683,45 +3669,23 @@ async fn untracked_and_real_shared_chunk_roots_release_only_at_final_reference()
     let storage = Memory::new();
     seed_storage(&storage, &seed).await;
     let shared = BlobChunkV1 {
-        bytes: Bytes::from_static(b"shared"),
+        bytes: Bytes::from(vec![b's'; BLOB_MERKLE_CHUNK_BYTES as usize]),
     };
     let first_unique = BlobChunkV1 {
-        bytes: Bytes::from_static(b"one"),
+        bytes: Bytes::from(vec![b'o'; BLOB_MERKLE_CHUNK_BYTES as usize]),
     };
     let second_unique = BlobChunkV1 {
-        bytes: Bytes::from_static(b"two"),
+        bytes: Bytes::from(vec![b't'; BLOB_MERKLE_CHUNK_BYTES as usize]),
     };
     let (shared_id, _) = shared.encode().expect("shared chunk");
     let (first_unique_id, _) = first_unique.encode().expect("first unique");
     let (second_unique_id, _) = second_unique.encode().expect("second unique");
-    let shared_reference = BlobChunkRefV1 {
-        chunk_object_id: shared_id,
-        declared_len: 6,
-    };
-    let first = BlobManifestV1 {
-        logical_bytes: 9,
-        ordered_chunks: vec![
-            BlobChunkRefV1 {
-                chunk_object_id: first_unique_id,
-                declared_len: 3,
-            },
-            shared_reference.clone(),
-        ],
-        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"oneshared"),
-        content_digest: *blake3::hash(b"oneshared").as_bytes(),
-    };
-    let second = BlobManifestV1 {
-        logical_bytes: 9,
-        ordered_chunks: vec![
-            BlobChunkRefV1 {
-                chunk_object_id: second_unique_id,
-                declared_len: 3,
-            },
-            shared_reference,
-        ],
-        canonical_blob_id: crate::binary_cas::BlobId::from_content(b"twoshared"),
-        content_digest: *blake3::hash(b"twoshared").as_bytes(),
-    };
+    let first = build_blob_merkle_tree(&[first_unique.clone(), shared.clone()])
+        .expect("first shared Merkle manifest")
+        .manifest;
+    let second = build_blob_merkle_tree(&[second_unique.clone(), shared.clone()])
+        .expect("second shared Merkle manifest")
+        .manifest;
     let first_id = publish_untracked_manifest(
         &storage,
         &seed,
