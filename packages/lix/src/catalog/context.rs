@@ -129,6 +129,30 @@ impl CatalogContext {
         R: LiveStateReader + ?Sized,
     {
         let catalog_rows = scan_catalog_rows(live_state, domain).await?;
+        self.compiled_catalog_for_rows(&catalog_rows)
+    }
+
+    /// Compiles catalog rows already resolved against a transaction's staged
+    /// overlay. The caller supplies the authenticated domain for each batch;
+    /// the ordinary catalog row/domain checks below remain the sole decoder
+    /// boundary and reject unrelated rows before they become schema facts.
+    pub(crate) fn compiled_catalog_for_materialized_domain_rows(
+        &self,
+        catalog_rows: Vec<(Domain, MaterializedLiveStateBatch)>,
+    ) -> Result<Arc<CatalogSnapshot>, LixError> {
+        let catalog_rows = CatalogRows {
+            domains: catalog_rows
+                .into_iter()
+                .map(|(domain, rows)| CatalogDomainRows { domain, rows })
+                .collect(),
+        };
+        self.compiled_catalog_for_rows(&catalog_rows)
+    }
+
+    fn compiled_catalog_for_rows(
+        &self,
+        catalog_rows: &CatalogRows,
+    ) -> Result<Arc<CatalogSnapshot>, LixError> {
         let mut hasher = blake3::Hasher::new();
         for (schema_domain, row) in catalog_rows.iter() {
             hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
@@ -540,6 +564,40 @@ mod tests {
             !Arc::ptr_eq(&first, &different),
             "different facts must compile a different snapshot"
         );
+    }
+
+    #[test]
+    fn materialized_transaction_catalog_rows_preserve_durability_domains() {
+        let branch_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+        let tracked_domain = Domain::schema_catalog(branch_id, false);
+        let untracked_domain = Domain::schema_catalog(branch_id, true);
+        let mut tracked = registered_schema_row("tracked_schema");
+        tracked.untracked = false;
+        let untracked = registered_schema_row("untracked_schema");
+
+        let tracked_catalog = CatalogContext::new()
+            .compiled_catalog_for_materialized_domain_rows(vec![(
+                tracked_domain.clone(),
+                MaterializedLiveStateBatch::from_rows(vec![tracked.clone(), untracked.clone()]),
+            )])
+            .expect("tracked materialized catalog should compile");
+        assert!(tracked_catalog.contains("tracked_schema"));
+        assert!(!tracked_catalog.contains("untracked_schema"));
+
+        let visible_catalog = CatalogContext::new()
+            .compiled_catalog_for_materialized_domain_rows(vec![
+                (
+                    tracked_domain,
+                    MaterializedLiveStateBatch::from_rows(vec![tracked]),
+                ),
+                (
+                    untracked_domain,
+                    MaterializedLiveStateBatch::from_rows(vec![untracked]),
+                ),
+            ])
+            .expect("untracked-visible materialized catalog should compile");
+        assert!(visible_catalog.contains("tracked_schema"));
+        assert!(visible_catalog.contains("untracked_schema"));
     }
 
     fn catalog_fact(schema_key: &str) -> SchemaCatalogFact {
