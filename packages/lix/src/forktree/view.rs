@@ -684,7 +684,6 @@ where
                     updated_at: value.updated_at,
                     change_id: value.change_id,
                     commit_id: value.commit_id,
-                    blob_manifest_object_ids: value.blob_manifest_object_ids,
                 }
             }));
         }
@@ -1449,7 +1448,6 @@ mod tests {
             snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted,
-            blob_manifest_object_ids: Vec::new(),
         }
     }
 

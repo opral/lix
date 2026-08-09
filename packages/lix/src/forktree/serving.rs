@@ -327,18 +327,6 @@ where
     })
 }
 
-pub(crate) async fn load_branch_ref_change_id<R>(
-    read: &R,
-    branch_id: &str,
-) -> Result<Option<crate::changelog::ChangeId>, crate::LixError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    Ok(Some(
-        load_branch_ref_metadata(read, branch_id).await?.change_id,
-    ))
-}
-
 /// Scans every authenticated branch selector in one coherent read view.
 /// Selector enumeration is storage-streaming and retains only one page plus
 /// the output branch-head list.
@@ -1757,7 +1745,6 @@ where
                 snapshot_content,
                 metadata: value.metadata,
                 deleted,
-                blob_manifest_object_ids: value.blob_manifest_object_ids,
             })
         })
         .collect()
