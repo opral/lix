@@ -470,7 +470,7 @@ fn x_lix_entity_views_is_rejected() {
     let schema = json!({
         "type": "object",
         "x-lix-key": "mock",
-        "x-lix-entity-views": ["lix_state", "lix_state_by_branch"],
+        "x-lix-entity-views": ["removed_surface"],
         "properties": {
             "name": { "type": "string" }
         },
@@ -683,98 +683,6 @@ fn x_lix_foreign_keys_rejects_scope_field() {
 
     let err = validate_lix_schema_definition(&schema).expect_err("scope should be rejected");
     assert!(err.to_string().contains("scope"));
-}
-
-#[test]
-fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "label_assignment",
-        "x-lix-state-foreign-keys": [
-            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
-        ],
-        "x-lix-foreign-keys": [
-            {
-                "properties": ["/label_id"],
-                "references": {
-                    "schemaKey": "lix_label",
-                    "properties": ["/id"]
-                }
-            }
-        ],
-        "properties": {
-            "target_entity_pk": {
-                "type": "array",
-                "items": { "type": "string" },
-                "minItems": 1
-            },
-            "target_schema_key": { "type": "string" },
-            "target_file_id": { "type": ["string", "null"] },
-            "label_id": { "type": "string" }
-        },
-        "required": ["target_entity_pk", "target_schema_key", "target_file_id", "label_id"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "bad_label_assignment",
-        "x-lix-state-foreign-keys": [
-            ["/target_schema_key", "/target_entity_pk", "/target_file_id"]
-        ],
-        "properties": {
-            "target_entity_pk": {
-                "type": "array",
-                "items": { "type": "string" },
-                "minItems": 1
-            },
-            "target_schema_key": { "type": "string" },
-            "target_file_id": { "type": ["string", "null"] }
-        },
-        "required": ["target_entity_pk", "target_schema_key", "target_file_id"],
-        "additionalProperties": false
-    });
-
-    let err =
-        validate_lix_schema_definition(&schema).expect_err("wrong tuple order should be rejected");
-    assert!(
-        err.message.contains("[entity_pk, schema_key, file_id]"),
-        "unexpected error: {err:?}"
-    );
-}
-
-#[test]
-fn x_lix_state_foreign_keys_requires_address_tuple_properties() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "optional_label_assignment",
-        "x-lix-state-foreign-keys": [
-            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
-        ],
-        "properties": {
-            "target_entity_pk": {
-                "type": "array",
-                "items": { "type": "string" },
-                "minItems": 1
-            },
-            "target_schema_key": { "type": "string" },
-            "target_file_id": { "type": ["string", "null"] }
-        },
-        "required": ["target_entity_pk", "target_schema_key"],
-        "additionalProperties": false
-    });
-
-    let err = validate_lix_schema_definition(&schema)
-        .expect_err("state foreign key tuple fields should be required");
-    assert!(
-        err.message.contains("file_id") && err.message.contains("must be required"),
-        "unexpected error: {err:?}"
-    );
 }
 
 #[test]

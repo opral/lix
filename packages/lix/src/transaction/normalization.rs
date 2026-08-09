@@ -188,9 +188,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
     let row = rows.row(row_index);
     validate_normalized_row_content(row, normalized_snapshot.as_ref(), schema_plan)?;
     let requires_transaction_validation = if normalized_snapshot.is_some() {
-        !schema_plan.uniques.is_empty()
-            || !schema_plan.foreign_keys.is_empty()
-            || !schema_plan.state_foreign_keys.is_empty()
+        !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty()
     } else {
         schema_catalog
             .snapshot()
@@ -861,7 +859,6 @@ mod tests {
             "lix",
             "lix_file",
             "lix_key_value_history",
-            "lix_state_history",
             "lix_file_descriptor",
             "lix_plugin_note",
         ] {

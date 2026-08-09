@@ -3582,11 +3582,6 @@ fn assigned_columns_preserve_constraints(
             .iter()
             .flat_map(|foreign_key| &foreign_key.local_properties)
             .any(|path| touches(path))
-        && !schema_plan.state_foreign_keys.iter().any(|foreign_key| {
-            touches(&foreign_key.entity_pk_property)
-                || touches(&foreign_key.schema_key_property)
-                || touches(&foreign_key.file_id_property)
-        })
 }
 
 fn append_entity_update_row<'a>(
