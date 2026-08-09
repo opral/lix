@@ -47,7 +47,9 @@ pub(crate) use context::{
     SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
-pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
+pub(crate) use entity_batch::{
+    CurrentEntitySnapshotReader, EntitySnapshotReader, LiveStateEntitySnapshotReader,
+};
 pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]

@@ -184,7 +184,7 @@ fn derived_surface_reader(
             format!("derived surface '{schema_key}' is missing its ForkTree graph reader"),
         )
     })?;
-    Ok((
+    let derived_live_state: Arc<dyn LiveStateReader> =
         Arc::new(crate::commit_graph::CommitGraphLiveStateReader::new(
             schema_key,
             Arc::clone(commit_graph),
@@ -192,9 +192,11 @@ fn derived_surface_reader(
             Some(Arc::clone(live_state)),
             include_recovery_roots,
             include_retained_nodes,
-        )),
-        None,
-    ))
+        ));
+    let entity_snapshot_reader = Arc::new(crate::sql2::LiveStateEntitySnapshotReader::new(
+        Arc::clone(&derived_live_state),
+    ));
+    Ok((derived_live_state, Some(entity_snapshot_reader)))
 }
 
 pub(crate) async fn register_entity_write_providers(
@@ -297,8 +299,18 @@ impl EntitySpec {
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx));
-        Self::active(spec, live_state, branch_ref, active_branch_id, None)
+        let live_state: Arc<dyn LiveStateReader> =
+            Arc::new(WriteContextLiveStateReader::new(write_ctx));
+        let entity_snapshot_reader = Arc::new(crate::sql2::LiveStateEntitySnapshotReader::new(
+            Arc::clone(&live_state),
+        ));
+        Self::active(
+            spec,
+            live_state,
+            branch_ref,
+            active_branch_id,
+            Some(entity_snapshot_reader),
+        )
     }
 
     fn by_branch(
@@ -323,8 +335,12 @@ impl EntitySpec {
         write_ctx: SqlWriteContext,
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
-        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx));
-        Self::by_branch(spec, live_state, branch_ref, None)
+        let live_state: Arc<dyn LiveStateReader> =
+            Arc::new(WriteContextLiveStateReader::new(write_ctx));
+        let entity_snapshot_reader = Arc::new(crate::sql2::LiveStateEntitySnapshotReader::new(
+            Arc::clone(&live_state),
+        ));
+        Self::by_branch(spec, live_state, branch_ref, Some(entity_snapshot_reader))
     }
 
     /// Plan-time scan derivation shared by `plan_scan` and the unit tests:
@@ -598,10 +614,9 @@ impl TableSpec for EntitySpec {
     ) -> Result<PlannedScan> {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
+        let entity_snapshot_reader = self.entity_snapshot_reader.clone();
         let batch_projection = EntityBatchProjection::for_request(&request);
-        let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters)
-            .then(|| self.entity_snapshot_reader.clone())
-            .flatten();
+        let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters);
         let direct_primary_key_projection =
             direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
         Ok(PlannedScan {
@@ -611,39 +626,47 @@ impl TableSpec for EntitySpec {
                 Arc::clone(&schema),
                 (
                     Arc::clone(&self.spec),
-                    Arc::clone(&self.live_state),
                     schema,
                     request,
                     row_filters,
                     batch_projection,
+                    entity_snapshot_reader,
                     direct_entity_snapshot,
                     direct_primary_key_projection,
                 ),
                 |(
                     spec,
-                    live_state,
                     schema,
                     request,
                     row_filters,
                     batch_projection,
+                    entity_snapshot_reader,
                     direct_entity_snapshot,
                     direct_primary_key_projection,
                 )| async move {
+                    let entity_snapshot_reader = entity_snapshot_reader.ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "entity projection has no authenticated ForkTree capability".into(),
+                        )
+                    })?;
                     if direct_primary_key_projection
-                        && let Some(direct_entity_snapshot) = direct_entity_snapshot.as_ref()
-                        && let Some(entity_pks) = direct_entity_snapshot
+                        && let Some(entity_pks) = entity_snapshot_reader
                             .scan_entity_primary_keys(request.clone())
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
-                    if let Some(direct_entity_snapshot) = direct_entity_snapshot
-                        && let Some(rows) = direct_entity_snapshot
+                    if direct_entity_snapshot {
+                        let rows = entity_snapshot_reader
                             .scan_entity_snapshots(request.clone())
                             .await
                             .map_err(lix_error_to_datafusion_error)?
-                    {
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "ForkTree entity snapshot projection is unavailable for this request".into(),
+                                )
+                            })?;
                         let decoder = EntityProjectionDecoder::new(
                             &spec,
                             schema.fields().iter().map(|field| field.name().as_str()),
@@ -655,10 +678,17 @@ impl TableSpec for EntitySpec {
                         return RecordBatch::try_new(schema, columns)
                             .map_err(DataFusionError::from);
                     }
-                    let rows = live_state
-                        .scan_batch(&request)
+
+                    let rows = entity_snapshot_reader
+                        .scan_entity_rows(request)
                         .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                        .map_err(lix_error_to_datafusion_error)?
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "ForkTree entity row projection is unavailable for this request"
+                                    .into(),
+                            )
+                        })?;
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
