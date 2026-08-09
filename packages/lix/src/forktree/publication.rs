@@ -389,13 +389,13 @@ impl PreparedPublication {
         let current_id = view.hot_pack_object_id();
         let current_bytes = view.load_raw_object_bytes(current_id).await?;
         let current = HotObjectPackV1::decode(current_id, &current_bytes)?;
-        if current.branch_id != branch_id
+        if current.branch_id != view.branch_id()
             || current.repository_root_id != view.global_selector().repository_root
             || current.epoch > view.global_selector().epoch
             || current.view_id
                 != super::view::derive_pack_view_id(
                     current.repository_root_id,
-                    branch_id,
+                    view.branch_id(),
                     view.branch_selector().selector_generation,
                 )
         {
@@ -414,13 +414,13 @@ impl PreparedPublication {
                 .selector_generation
                 .checked_sub(1)
                 .ok_or_else(|| corruption("hot pack base has no predecessor generation"))?;
-            if base.branch_id != branch_id
+            if base.branch_id != view.branch_id()
                 || base.base_pack_object_id.is_some()
                 || base.epoch > current.epoch
                 || base.view_id
                     != super::view::derive_pack_view_id(
                         base.repository_root_id,
-                        branch_id,
+                        view.branch_id(),
                         expected_base_generation,
                     )
             {
@@ -561,12 +561,13 @@ impl PreparedPublication {
         };
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
         self.stage_catalog_edit(change_catalog_edit)?;
-        let repository_root_id = self.stage_repository_root(RepositoryRootV1 {
+        let next_repository_root = RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
-        })?;
+        };
+        let repository_root_id = self.stage_repository_root(next_repository_root)?;
         let pack_id = self
             .stage_hot_pack(view, repository_root_id, branch_id, 1)
             .await?;
