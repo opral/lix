@@ -84,7 +84,7 @@ where
         self.branch_snapshot
     }
 
-    pub(super) fn storage_read(&self) -> &R {
+    pub(crate) fn storage_read(&self) -> &R {
         &self.read
     }
 

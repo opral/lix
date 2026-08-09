@@ -231,6 +231,22 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError>;
 
+    /// Stage a branch-selector publication intent.  This is deliberately
+    /// separate from live-state rows: the transaction lowerer consumes the
+    /// intent while building the single ForkTree publication plan.
+    async fn stage_branch_ref_intent(
+        &mut self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+    ) -> Result<(), LixError> {
+        let _ = (branch_id, commit_id, create);
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "branch selector publication is unavailable in this write context",
+        ))
+    }
+
     async fn stage_parameter_batch_insert(
         &mut self,
         rows: RawWriteBatch,
@@ -479,6 +495,24 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .stage_write(write)
+                .await
+        }
+    }
+
+    pub(crate) async fn stage_branch_ref_intent(
+        &self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+    ) -> Result<(), LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .stage_branch_ref_intent(branch_id, commit_id, create)
                 .await
         }
     }

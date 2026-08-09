@@ -63,6 +63,7 @@ pub(crate) struct TransactionWriteBuffer {
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     intermediate_commits: Mutex<Vec<StagedIntermediateCommit>>,
     file_content_writes: Mutex<Vec<TransactionFileContent>>,
+    branch_ref_intents: Mutex<Vec<BranchRefPublicationIntent>>,
 }
 
 /// A transaction-local statement checkpoint.
@@ -80,6 +81,7 @@ pub(crate) struct TransactionWriteBufferCheckpoint {
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     intermediate_commits: Vec<StagedIntermediateCommit>,
     file_content_writes: Vec<TransactionFileContent>,
+    branch_ref_intents: Vec<BranchRefPublicationIntent>,
 }
 
 /// One immutable, fixed-shape journal chunk produced by typed SQL mutation
@@ -833,6 +835,18 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) intermediate_commits: Vec<StagedIntermediateCommit>,
     pub(crate) file_content_writes: Vec<TransactionFileContent>,
+    pub(crate) branch_ref_intents: Vec<BranchRefPublicationIntent>,
+}
+
+/// Transaction-local branch selector intent. This is deliberately not a
+/// live-state row: selector publication consumes it after the caller-owned
+/// coherent read is opened and lowers it into the same PreparedPublication.
+#[derive(Clone, Debug)]
+pub(crate) struct BranchRefPublicationIntent {
+    pub(crate) branch_id: String,
+    pub(crate) commit_id: Option<CommitId>,
+    pub(crate) create: bool,
+    pub(crate) change_id: ChangeId,
 }
 
 #[derive(Clone)]
@@ -1360,6 +1374,7 @@ impl PreparedWriteSet {
             || !other.checkpoint_publications.is_empty()
             || !other.extra_commit_parents_by_branch.is_empty()
             || !other.intermediate_commits.is_empty()
+            || !other.branch_ref_intents.is_empty()
         {
             return Err(LixError::new(
                 LixError::CODE_TRANSACTION_CONFLICT,
@@ -1532,6 +1547,7 @@ impl TransactionWriteBuffer {
             extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
             intermediate_commits: Mutex::new(Vec::new()),
             file_content_writes: Mutex::new(Vec::new()),
+            branch_ref_intents: Mutex::new(Vec::new()),
         }
     }
 
@@ -1943,6 +1959,12 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged checkpoint publications lock",
             )
         })?;
+        let branch_ref_intents = self.branch_ref_intents.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged branch selector intents lock",
+            )
+        })?;
 
         Ok(TransactionWriteBufferCheckpoint {
             rows: rows.clone(),
@@ -1953,6 +1975,7 @@ impl TransactionWriteBuffer {
             extra_commit_parents_by_branch: extra_commit_parents_by_branch.clone(),
             intermediate_commits: intermediate_commits.clone(),
             file_content_writes: file_content_writes.clone(),
+            branch_ref_intents: branch_ref_intents.clone(),
         })
     }
 
@@ -1972,6 +1995,7 @@ impl TransactionWriteBuffer {
             extra_commit_parents_by_branch,
             intermediate_commits,
             file_content_writes,
+            branch_ref_intents,
         } = checkpoint;
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -2026,6 +2050,12 @@ impl TransactionWriteBuffer {
                     "failed to acquire transaction staged checkpoint publications lock",
                 )
             })?;
+        let mut branch_ref_intents_guard = self.branch_ref_intents.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged branch selector intents lock",
+            )
+        })?;
 
         *rows_guard = rows;
         *ordered_mutations_guard = ordered_mutations;
@@ -2035,6 +2065,7 @@ impl TransactionWriteBuffer {
         *intermediate_commits_guard = intermediate_commits;
         *first_parent_overrides_guard = first_commit_parent_override_by_branch;
         *checkpoint_publications_guard = checkpoint_publications;
+        *branch_ref_intents_guard = branch_ref_intents;
         Ok(())
     }
 
@@ -2491,6 +2522,12 @@ impl TransactionWriteBuffer {
                     "failed to acquire transaction staged checkpoint publications lock",
                 )
             })?;
+        let mut branch_ref_intents_guard = self.branch_ref_intents.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged branch selector intents lock",
+            )
+        })?;
         let (state_rows, insert_selection) = match std::mem::take(&mut *rows_guard) {
             StagedPreparedRows::AppendOnly {
                 rows,
@@ -2547,7 +2584,24 @@ impl TransactionWriteBuffer {
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             intermediate_commits: std::mem::take(&mut *intermediate_commits_guard),
             file_content_writes: std::mem::take(&mut *file_content_guard),
+            branch_ref_intents: std::mem::take(&mut *branch_ref_intents_guard),
         })
+    }
+
+    pub(crate) fn stage_branch_ref_intent(
+        &self,
+        intent: BranchRefPublicationIntent,
+    ) -> Result<(), LixError> {
+        self.branch_ref_intents
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged branch selector intents lock",
+                )
+            })?
+            .push(intent);
+        Ok(())
     }
 
     pub(crate) fn add_checkpoint_publication(
@@ -6223,6 +6277,33 @@ mod tests {
         Arc::new(TransactionWriteBuffer::new(FunctionProviderHandle::shared(
             Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>,
         )))
+    }
+
+    #[test]
+    fn branch_selector_intents_are_rollback_scoped() {
+        let staged = test_staged_writes();
+        staged
+            .stage_branch_ref_intent(BranchRefPublicationIntent {
+                branch_id: "branch-a".into(),
+                commit_id: Some(CommitId::for_test_label("commit-a")),
+                create: false,
+                change_id: ChangeId::for_test_label("change-a"),
+            })
+            .expect("first selector intent");
+        let checkpoint = staged.checkpoint().expect("selector checkpoint");
+        staged
+            .stage_branch_ref_intent(BranchRefPublicationIntent {
+                branch_id: "branch-b".into(),
+                commit_id: None,
+                create: false,
+                change_id: ChangeId::for_test_label("change-b"),
+            })
+            .expect("second selector intent");
+        staged.restore(checkpoint).expect("selector rollback");
+
+        let prepared = staged.drain().expect("drain after selector rollback");
+        assert_eq!(prepared.branch_ref_intents.len(), 1);
+        assert_eq!(prepared.branch_ref_intents[0].branch_id, "branch-a");
     }
 
     #[derive(Default)]

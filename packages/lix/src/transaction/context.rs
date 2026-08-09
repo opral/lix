@@ -24,7 +24,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchLifecycle, BranchOperation, BranchRefReader,
-    BranchReferenceRole, branch_ref_stage_row,
+    BranchReferenceRole,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
@@ -108,8 +108,9 @@ use crate::transaction::normalization::{
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{
-    ImmutableMutationChunkStage, ImmutableMutationJournalChunk, PreparedStateRowOverlay,
-    PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
+    BranchRefPublicationIntent, ImmutableMutationChunkStage, ImmutableMutationJournalChunk,
+    PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
+    TransactionWriteBufferCheckpoint,
 };
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
@@ -7145,23 +7146,32 @@ where
             .collect()
     }
 
-    /// Advances a branch ref without staging tracked rows.
-    ///
-    /// Fast-forward merges use this path because the commit graph already
-    /// contains the source head; the target ref only needs to move to it.
+    /// Stages a moving branch-head intent for the selector publication owner.
+    /// No `lix_branch_ref` live-state row is created; the intent is consumed
+    /// after the transaction's coherent read is retained and lowered into the
+    /// same PreparedPublication and backend commit.
+    pub(crate) fn stage_branch_ref_intent(
+        &mut self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+    ) -> Result<(), LixError> {
+        self.staged_writes
+            .stage_branch_ref_intent(BranchRefPublicationIntent {
+                branch_id: branch_id.to_owned(),
+                commit_id,
+                create,
+                change_id: ChangeId::from(self.functions.call_uuid_v7()),
+            })
+    }
+
+    /// Advances a branch selector without staging tracked rows.
     pub(crate) async fn advance_branch_ref(
         &mut self,
         branch_id: &str,
         commit_id: CommitId,
     ) -> Result<(), LixError> {
-        let mut rows = RawWriteBatch::with_capacity(1);
-        rows.push(branch_ref_stage_row(branch_id, &commit_id));
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows,
-        })
-        .await?;
-        Ok(())
+        self.stage_branch_ref_intent(branch_id, Some(commit_id), false)
     }
 
     pub(crate) fn stage_merge_commit(
@@ -9169,6 +9179,15 @@ where
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
+    }
+
+    async fn stage_branch_ref_intent(
+        &mut self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+    ) -> Result<(), LixError> {
+        self.stage_branch_ref_intent(branch_id, commit_id, create)
     }
 
     async fn stage_parameter_batch_insert(
