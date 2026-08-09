@@ -671,6 +671,30 @@ where
         .await
     }
 
+    pub(crate) async fn state_ranges_at_roots(
+        &self,
+        global_root: ObjectId,
+        local_root: Option<ObjectId>,
+        ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+        include_tombstones: bool,
+    ) -> Result<
+        Vec<(
+            Vec<u8>,
+            super::state::StateValue,
+            super::serving::StateSource,
+        )>,
+        StorageError,
+    > {
+        super::serving::state_ranges_on_roots(
+            global_root,
+            local_root,
+            &self.read,
+            ranges,
+            include_tombstones,
+        )
+        .await
+    }
+
     pub(crate) async fn branch_view(
         &self,
         branch_id: CanonicalBranchId,

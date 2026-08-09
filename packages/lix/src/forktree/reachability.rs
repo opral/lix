@@ -31,7 +31,7 @@ use super::object::{OBJECT_SPACE, ObjectDomain, ObjectId, authenticate_object_do
 use super::publication::PreparedPublication;
 use super::serving::{validate_retained_commit, validate_retained_ref_change};
 use super::state::{UNTRACKED_ROW_SPACE, decode_untracked_key, decode_untracked_value};
-use super::tree::ordered_tree_edges;
+use super::tree::{current_state_value_pack_edges, ordered_tree_edges};
 use super::view::{SELECTOR_SPACE, load_object_bytes};
 
 const SELECTOR_PAGE_ROWS: usize = 256;
@@ -1057,6 +1057,13 @@ where
             validate_catalog_claims(read, &tree.commit_entries, &tree.change_entries).await?;
             edges.extend(
                 tree.object_ids
+                    .into_iter()
+                    .map(|(id, domain)| typed(id, domain)),
+            );
+        }
+        ObjectDomain::CurrentStateValuePackV1 => {
+            edges.extend(
+                current_state_value_pack_edges(id, bytes)?
                     .into_iter()
                     .map(|(id, domain)| typed(id, domain)),
             );

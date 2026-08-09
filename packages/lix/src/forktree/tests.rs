@@ -28,7 +28,7 @@ use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entrie
 use super::tree::{
     ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
     build_state_tree, empty_receipt_tree, insert_receipt_part, lookup, scan_all,
-    validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
+    scan_ranges_on_read, validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
     validate_commit_catalog_back_edge, validate_receipt_tree, validate_upload_progress_tree,
     validate_upload_selector_progress,
 };
@@ -1176,12 +1176,84 @@ fn immutable_objects_and_typed_state_codecs_fail_closed() {
         .objects
         .get(state_tree.root.object_id)
         .expect("state root bytes");
+    let state_edges = super::tree::ordered_tree_edges(state_tree.root.object_id, root_bytes)
+        .expect("state leaf edges")
+        .object_ids;
+    let [(pack_id, super::object::ObjectDomain::CurrentStateValuePackV1)] = state_edges.as_slice()
+    else {
+        panic!("state leaf must name exactly one current-value pack: {state_edges:?}");
+    };
+    let pack_bytes = state_tree
+        .objects
+        .get(*pack_id)
+        .expect("current-value pack bytes");
     assert_eq!(
-        super::tree::ordered_tree_edges(state_tree.root.object_id, root_bytes)
-            .expect("state leaf edges")
-            .object_ids,
+        super::tree::current_state_value_pack_edges(*pack_id, pack_bytes)
+            .expect("current-value pack edges"),
         vec![(manifest, super::object::ObjectDomain::BlobManifest)],
-        "current state leaves own blob-manifest reachability directly"
+        "the authenticated current-value pack owns blob-manifest reachability"
+    );
+    let mut corrupted_pack = pack_bytes.to_vec();
+    *corrupted_pack.last_mut().expect("nonempty value pack") ^= 1;
+    assert!(
+        super::tree::current_state_value_pack_edges(*pack_id, &corrupted_pack).is_err(),
+        "corrupt current-value packs must fail before exposing edges"
+    );
+    let substituted_value = encode_state_value(StateValueRef {
+        change_id,
+        commit_id,
+        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+        cell: StateCellRef::Value("{\"v\":2}"),
+        metadata: Some("{\"m\":2}"),
+        origin_key: Some("origin"),
+        blob_manifest_object_ids: &[manifest],
+    })
+    .expect("same-size substituted state value");
+    assert_eq!(encoded.len(), substituted_value.len());
+    let substituted_tree = build_state_tree(&[(key.clone(), substituted_value)])
+        .expect("same-size substituted state tree");
+    let substituted_root = substituted_tree
+        .objects
+        .get(substituted_tree.root.object_id)
+        .expect("substituted state root");
+    let substituted_pack_id =
+        super::tree::ordered_tree_edges(substituted_tree.root.object_id, substituted_root)
+            .expect("substituted state leaf edges")
+            .object_ids[0]
+            .0;
+    let substituted_pack = substituted_tree
+        .objects
+        .get(substituted_pack_id)
+        .expect("substituted current-value pack");
+    assert!(
+        super::tree::current_state_value_pack_edges(*pack_id, substituted_pack).is_err(),
+        "same-size value packs cannot be substituted across authenticated identities"
+    );
+    assert_eq!(
+        lookup(state_tree.root.object_id, "state", &key, |id| {
+            state_tree
+                .objects
+                .get(id)
+                .cloned()
+                .ok_or(StorageError::InvalidCursor)
+        })
+        .expect("packed state lookup"),
+        Some(encoded.clone())
+    );
+    assert!(
+        lookup(state_tree.root.object_id, "state", &key, |id| {
+            if id == *pack_id {
+                return Err(StorageError::InvalidCursor);
+            }
+            state_tree
+                .objects
+                .get(id)
+                .cloned()
+                .ok_or(StorageError::InvalidCursor)
+        })
+        .is_err(),
+        "missing current-value packs must fail closed without a historical fallback"
     );
     let decoded_key: StateKey = super::decode_state_key(&key).expect("typed key");
     assert_eq!(decoded_key.schema_key, "app.row");
@@ -1274,6 +1346,70 @@ async fn coherent_state_point_and_range_preserve_overlay_semantics() {
     // Both mutations are lowered through one authenticated batch edit; they
     // may share the same copied leaf and ancestor path.
     assert!(edit.copied_nodes() >= 1);
+}
+
+#[tokio::test]
+async fn state_multi_range_skips_unrequested_pack_and_preserves_order() {
+    let rows = (0_u16..130)
+        .map(|index| {
+            state_entry(
+                &format!("row-{index:03}"),
+                StateCellRef::Value("value"),
+                7,
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    let tree = build_state_tree(&rows).expect("packed state tree");
+    let root_bytes = tree
+        .objects
+        .get(tree.root.object_id)
+        .expect("packed state root");
+    let pack_ids = super::tree::ordered_tree_edges(tree.root.object_id, root_bytes)
+        .expect("state root edges")
+        .object_ids
+        .into_iter()
+        .map(|(id, domain)| {
+            assert_eq!(domain, super::object::ObjectDomain::CurrentStateValuePackV1);
+            id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pack_ids.len(), 3, "130 rows must span three value packs");
+
+    let mut available = tree.objects.clone();
+    available.remove(pack_ids[1]);
+    let storage = Memory::new();
+    let read = StorageAdapterReadScope::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("empty backing read"),
+    );
+    let overlay = super::serving::ObjectOverlayRead::new(&read, &available);
+    let ranges = [0_u16, 129]
+        .into_iter()
+        .map(|index| {
+            let lower = super::encode_state_entity_prefix(
+                "app.row",
+                &EntityPk::single(format!("row-{index:03}")),
+            );
+            let mut upper = lower.clone();
+            let index = (0..upper.len())
+                .rev()
+                .find(|&index| upper[index] != u8::MAX)
+                .expect("encoded entity prefix has a strict successor");
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            (lower, Some(upper))
+        })
+        .collect::<Vec<_>>();
+    let selected = scan_ranges_on_read(tree.root.object_id, "state", &ranges, &overlay)
+        .await
+        .expect("sparse authenticated multi-range");
+    assert_eq!(
+        selected.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        vec![&rows[0].0, &rows[129].0]
+    );
 }
 
 #[tokio::test]

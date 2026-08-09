@@ -15,7 +15,7 @@ use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::forktree::{
     CanonicalBranchId, ForkTreeReadFacade, StateCell, StateKeyRef, StateSource, decode_state_key,
-    encode_state_entity_prefix, encode_state_key, state_points, state_range,
+    encode_state_entity_prefix, encode_state_key, state_points, state_range, state_ranges,
 };
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateRowFilter, LiveStateScanRequest,
@@ -112,14 +112,15 @@ where
         let mut unique_pks = request.filter.entity_pks.clone();
         unique_pks.sort();
         unique_pks.dedup();
-        let mut rows = Vec::new();
-        for entity_pk in unique_pks {
-            let lower = encode_state_entity_prefix(schema_key, &entity_pk);
-            let upper = strict_prefix_successor(&lower);
-            rows.extend(state_range(view, Some(&lower), upper.as_deref(), None, true).await?);
-        }
-        rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
-        rows
+        let ranges = unique_pks
+            .into_iter()
+            .map(|entity_pk| {
+                let lower = encode_state_entity_prefix(schema_key, &entity_pk);
+                let upper = strict_prefix_successor(&lower);
+                (lower, upper)
+            })
+            .collect::<Vec<_>>();
+        state_ranges(view, &ranges, true).await?
     } else {
         state_range(view, None, None, None, true).await?
     };

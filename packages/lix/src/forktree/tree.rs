@@ -12,12 +12,17 @@ use super::model::{
     ChangeObjectV1, CommitCatalogEntry, CommitId, CommitObjectV1, UploadPartV1, UploadProgressV1,
     UploadSelectorV1,
 };
-use super::object::{ObjectDomain, ObjectId, decode_id, decode_object, encode_id, encode_object};
+use super::object::{
+    ObjectDomain, ObjectId, authenticate_object_domain, decode_id, decode_object, encode_id,
+    encode_object,
+};
 
 pub(crate) const RECEIPT_TREE_LEAF_ENTRIES: usize = 64;
 pub(crate) const RECEIPT_TREE_FANOUT: usize = 32;
 const CATALOG_TREE_LEAF_ENTRIES: usize = 64;
 const CATALOG_TREE_FANOUT: usize = 32;
+const STATE_TREE_LEAF_ENTRIES: usize = 64;
+const TREE_LEAF_DECODED_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -44,7 +49,8 @@ impl TreeKind {
     fn limits(self) -> (usize, usize) {
         match self {
             Self::Receipt => (RECEIPT_TREE_LEAF_ENTRIES, RECEIPT_TREE_FANOUT),
-            Self::CommitCatalog | Self::ChangeCatalog | Self::State | Self::Retention => {
+            Self::State => (STATE_TREE_LEAF_ENTRIES, CATALOG_TREE_FANOUT),
+            Self::CommitCatalog | Self::ChangeCatalog | Self::Retention => {
                 (CATALOG_TREE_LEAF_ENTRIES, CATALOG_TREE_FANOUT)
             }
         }
@@ -81,6 +87,7 @@ struct NodeRef {
     id: ObjectId,
     max_key: Vec<u8>,
     summary: TreeSummary,
+    state_value_pack: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +101,10 @@ struct Node {
     kind: TreeKind,
     summary: TreeSummary,
     body: NodeBody,
+    /// State leaves keep one compact authenticated value pack rather than
+    /// duplicating current values in every copy-on-write leaf node. Decoded
+    /// leaves are hydrated from this pack only when their values are used.
+    state_value_pack: Option<ObjectId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,25 +223,26 @@ pub(super) fn ordered_tree_edges(
     let mut change_entries = Vec::new();
     match node.body {
         NodeBody::Internal(children) => {
-            object_ids.extend(
-                children
-                    .into_iter()
-                    .map(|child| (child.id, ObjectDomain::OrderedTreeNode)),
-            );
+            object_ids.extend(children.into_iter().map(|child| {
+                (
+                    child.id,
+                    if child.state_value_pack == Some(child.id) {
+                        ObjectDomain::CurrentStateValuePackV1
+                    } else {
+                        ObjectDomain::OrderedTreeNode
+                    },
+                )
+            }));
         }
         NodeBody::Leaf(entries) => {
+            if node.kind == TreeKind::State {
+                return Err(corruption(
+                    "state tree current values are not owned by ordered-node leaves",
+                ));
+            }
             for entry in entries {
                 match node.kind {
-                    TreeKind::State => {
-                        let value = super::state::decode_state_value(&entry.value)
-                            .map_err(|error| corruption(error.to_string()))?;
-                        object_ids.extend(
-                            value
-                                .blob_manifest_object_ids
-                                .into_iter()
-                                .map(|id| (id, ObjectDomain::BlobManifest)),
-                        );
-                    }
+                    TreeKind::State => {}
                     TreeKind::CommitCatalog => {
                         let key = CommitId::from_bytes(
                             entry
@@ -307,6 +319,26 @@ pub(super) fn ordered_tree_edges(
         commit_entries,
         change_entries,
     })
+}
+
+pub(super) fn current_state_value_pack_edges(
+    id: ObjectId,
+    bytes: &[u8],
+) -> Result<Vec<(ObjectId, ObjectDomain)>, StorageError> {
+    let mut edges = Vec::new();
+    for entry in decode_current_state_value_pack(id, bytes)? {
+        let value = super::state::decode_state_value(&entry.value)
+            .map_err(|error| corruption(error.to_string()))?;
+        edges.extend(
+            value
+                .blob_manifest_object_ids
+                .into_iter()
+                .map(|id| (id, ObjectDomain::BlobManifest)),
+        );
+    }
+    edges.sort_unstable_by_key(|(id, domain)| (*id, domain.code()));
+    edges.dedup();
+    Ok(edges)
 }
 
 pub(super) fn empty_receipt_tree() -> Result<ReceiptTreeEdit, StorageError> {
@@ -462,6 +494,14 @@ where
         roots = stage_internal_level(kind, &roots, &mut objects)?;
         copied_nodes = copied_nodes.saturating_add(roots.len());
     }
+    if kind == TreeKind::State
+        && roots
+            .first()
+            .is_some_and(|root| root.state_value_pack.is_some())
+    {
+        roots = vec![stage_internal(kind, &roots, &mut objects)?];
+        copied_nodes = copied_nodes.saturating_add(1);
+    }
     let next_root = roots
         .pop()
         .ok_or_else(|| corruption("ordered-tree batch emitted no root"))?;
@@ -502,7 +542,7 @@ where
             }
             continue;
         }
-        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        let node = load_node_with_pack_on_read(id, expected.as_ref(), read).await?;
         validate_loaded_node(id, &node, kind, expected.as_ref())?;
         if id == root.object_id && node.summary.entry_count != root.entry_count {
             return Err(corruption(
@@ -659,7 +699,7 @@ where
     let mut current = root;
     let mut expected: Option<NodeRef> = None;
     loop {
-        let node = decode_node(current, &load_object_on_read(read, current).await?)?;
+        let node = load_node_with_pack_on_read(current, expected.as_ref(), read).await?;
         validate_loaded_node(current, &node, kind, expected.as_ref())?;
         match node.body {
             NodeBody::Leaf(entries) => {
@@ -701,12 +741,20 @@ where
     while !frontier.is_empty() {
         let ids = frontier.keys().copied().collect::<Vec<_>>();
         let objects = load_objects_many_on_read(read, &ids).await?;
+        let mut decoded = BTreeMap::new();
+        for id in &ids {
+            let bytes = objects
+                .get(id)
+                .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
+            let expected = frontier.get(id).and_then(|(expected, _)| expected.as_ref());
+            let node = decode_tree_object(*id, bytes, kind, expected)?;
+            decoded.insert(*id, node);
+        }
         let mut next = BTreeMap::<ObjectId, (Option<NodeRef>, Vec<usize>)>::new();
         for (id, (expected, slots)) in frontier {
-            let bytes = objects
-                .get(&id)
-                .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
-            let node = decode_node(id, bytes)?;
+            let node = decoded
+                .remove(&id)
+                .ok_or_else(|| corruption(format!("ordered-tree object {id} was not decoded")))?;
             validate_loaded_node(id, &node, kind, expected.as_ref())?;
             match node.body {
                 NodeBody::Leaf(entries) => {
@@ -896,7 +944,7 @@ where
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
-        let node = decode_node(id, &load_object_on_read(read, id).await?)?;
+        let node = load_node_with_pack_on_read(id, expected.as_ref(), read).await?;
         validate_loaded_node(id, &node, kind, expected.as_ref())?;
         match node.body {
             NodeBody::Leaf(entries) => {
@@ -929,6 +977,110 @@ where
     }
     if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(corruption("ordered-tree range is not globally ordered"));
+    }
+    Ok(output)
+}
+
+/// Authenticates a sorted set of disjoint half-open ranges with one shared
+/// traversal per tree level. Subtrees wholly between requested ranges are
+/// never loaded, while shared ancestors and leaves are decoded only once per
+/// authenticated edge.
+pub(super) async fn scan_ranges_on_read<R>(
+    root: ObjectId,
+    expected_kind: &'static str,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+    read: &R,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (index, (lower, upper)) in ranges.iter().enumerate() {
+        if upper.as_ref().is_some_and(|upper| lower >= upper) {
+            return Err(corruption(
+                "ordered-tree multi-range bounds are empty or inverted",
+            ));
+        }
+        if index > 0 {
+            let previous_upper = ranges[index - 1]
+                .1
+                .as_ref()
+                .ok_or_else(|| corruption("unbounded ordered-tree range is not last"))?;
+            if previous_upper > lower {
+                return Err(corruption(
+                    "ordered-tree multi-ranges overlap or are unsorted",
+                ));
+            }
+        }
+    }
+
+    let kind = parse_kind(expected_kind)?;
+    let mut output = Vec::new();
+    let mut frontier = vec![(root, None::<NodeRef>, (0..ranges.len()).collect::<Vec<_>>())];
+    while !frontier.is_empty() {
+        let ids = frontier.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+        let objects = load_objects_many_on_read(read, &ids).await?;
+        let mut next = Vec::new();
+        for (id, expected, range_slots) in frontier {
+            let bytes = objects
+                .get(&id)
+                .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
+            let node = decode_tree_object(id, bytes, kind, expected.as_ref())?;
+            validate_loaded_node(id, &node, kind, expected.as_ref())?;
+            match node.body {
+                NodeBody::Leaf(entries) => {
+                    let mut range_offset = 0usize;
+                    for entry in entries {
+                        while range_offset < range_slots.len()
+                            && ranges[range_slots[range_offset]]
+                                .1
+                                .as_ref()
+                                .is_some_and(|upper| entry.key.as_slice() >= upper.as_slice())
+                        {
+                            range_offset += 1;
+                        }
+                        let Some(&range_index) = range_slots.get(range_offset) else {
+                            break;
+                        };
+                        let (lower, upper) = &ranges[range_index];
+                        if entry.key.as_slice() >= lower.as_slice()
+                            && upper
+                                .as_ref()
+                                .is_none_or(|upper| entry.key.as_slice() < upper.as_slice())
+                        {
+                            output.push((entry.key, entry.value));
+                        }
+                    }
+                }
+                NodeBody::Internal(children) => {
+                    let mut selected = BTreeMap::<usize, Vec<usize>>::new();
+                    for range_index in range_slots {
+                        let (lower, upper) = &ranges[range_index];
+                        let first = child_index(&children, lower);
+                        let last = upper
+                            .as_ref()
+                            .map_or(children.len() - 1, |upper| child_index(&children, upper));
+                        for child_index in first..=last {
+                            selected.entry(child_index).or_default().push(range_index);
+                        }
+                    }
+                    for (child_index, range_slots) in selected {
+                        let child = children.get(child_index).ok_or_else(|| {
+                            corruption("ordered-tree multi-range child index is invalid")
+                        })?;
+                        next.push((child.id, Some(child.clone()), range_slots));
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    if output.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(corruption(
+            "ordered-tree multi-range result is not globally ordered",
+        ));
     }
     Ok(output)
 }
@@ -1044,7 +1196,7 @@ pub(super) fn lookup(
     let mut current = root;
     let mut expected: Option<NodeRef> = None;
     loop {
-        let node = decode_node(current, &load(current)?)?;
+        let node = decode_tree_object(current, &load(current)?, kind, expected.as_ref())?;
         if node.kind != kind {
             return Err(corruption("ordered-tree root has the wrong kind"));
         }
@@ -1083,7 +1235,7 @@ pub(super) fn scan_all(
     let mut output = Vec::new();
     let mut frontier = vec![(root, None)];
     while let Some((id, expected)) = frontier.pop() {
-        let node = decode_node(id, &load(id)?)?;
+        let node = decode_tree_object(id, &load(id)?, kind, expected.as_ref())?;
         if node.kind != kind {
             return Err(corruption("ordered-tree node has the wrong kind"));
         }
@@ -1338,6 +1490,13 @@ fn build_tree(kind: TreeKind, entries: &[LeafEntry]) -> Result<TreeBuild, Storag
     while level.len() > 1 {
         level = stage_internal_level(kind, &level, &mut objects)?;
     }
+    if kind == TreeKind::State
+        && level
+            .first()
+            .is_some_and(|root| root.state_value_pack.is_some())
+    {
+        level = vec![stage_internal(kind, &level, &mut objects)?];
+    }
     let root = level.pop().expect("tree builder always emits a root");
     Ok(TreeBuild {
         root: OrderedTreeRoot {
@@ -1420,6 +1579,15 @@ fn retain_reachable_new_nodes(
             // child, so an old subtree contains no new objects to retain.
             continue;
         };
+        if authenticate_object_domain(id, bytes)? == ObjectDomain::CurrentStateValuePackV1 {
+            if kind != TreeKind::State {
+                return Err(corruption(
+                    "non-state ordered tree reaches a current-value pack",
+                ));
+            }
+            let _ = decode_current_state_value_pack(id, bytes)?;
+            continue;
+        }
         let node = decode_node(id, bytes)?;
         if node.kind != kind {
             return Err(corruption(
@@ -1478,6 +1646,24 @@ where
         )),
         None => Err(corruption(format!("ordered-tree object {id} is absent"))),
     }
+}
+
+async fn load_node_with_pack_on_read<R>(
+    id: ObjectId,
+    expected: Option<&NodeRef>,
+    read: &R,
+) -> Result<Node, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let mut loaded = load_objects_many_on_read(read, &[id]).await?;
+    let bytes = loaded
+        .remove(&id)
+        .ok_or_else(|| corruption(format!("ordered-tree object {id} is absent")))?;
+    if expected.is_some_and(|reference| reference.state_value_pack.is_some()) {
+        return decode_tree_object(id, &bytes, TreeKind::State, expected);
+    }
+    decode_node(id, &bytes)
 }
 
 async fn load_objects_many_on_read<R>(
@@ -1592,10 +1778,23 @@ fn stage_leaf(
 ) -> Result<NodeRef, StorageError> {
     validate_entries(kind, entries)?;
     let summary = summary_from_entries(kind, entries)?;
+    if kind == TreeKind::State {
+        let (id, bytes) = encode_current_state_value_pack(entries)?;
+        objects.insert(id, bytes)?;
+        return Ok(NodeRef {
+            id,
+            max_key: entries
+                .last()
+                .map_or_else(Vec::new, |entry| entry.key.clone()),
+            summary,
+            state_value_pack: Some(id),
+        });
+    }
     let (id, bytes) = encode_node(&Node {
         kind,
         summary,
         body: NodeBody::Leaf(entries.to_vec()),
+        state_value_pack: None,
     })?;
     objects.insert(id, bytes)?;
     Ok(NodeRef {
@@ -1604,6 +1803,7 @@ fn stage_leaf(
             .last()
             .map_or_else(Vec::new, |entry| entry.key.clone()),
         summary,
+        state_value_pack: None,
     })
 }
 
@@ -1618,6 +1818,7 @@ fn stage_internal(
         kind,
         summary,
         body: NodeBody::Internal(children.to_vec()),
+        state_value_pack: None,
     })?;
     objects.insert(id, bytes)?;
     Ok(NodeRef {
@@ -1628,13 +1829,149 @@ fn stage_internal(
             .max_key
             .clone(),
         summary,
+        state_value_pack: None,
     })
+}
+
+fn encode_current_state_value_pack(
+    entries: &[LeafEntry],
+) -> Result<(ObjectId, Bytes), StorageError> {
+    let mut body = Encoder::default();
+    let mut previous_key: &[u8] = &[];
+    let mut previous_value: &[u8] = &[];
+    for entry in entries {
+        if entry.receipt.is_some() {
+            return Err(corruption("state value pack contains a receipt summary"));
+        }
+        let shared_key = common_prefix_len(previous_key, &entry.key);
+        body.u32(
+            u32::try_from(shared_key)
+                .map_err(|_| corruption("state value pack key prefix exceeds u32"))?,
+        );
+        body.bytes(&entry.key[shared_key..])?;
+        let shared_value = common_prefix_len(previous_value, &entry.value);
+        body.u32(
+            u32::try_from(shared_value)
+                .map_err(|_| corruption("state value pack value prefix exceeds u32"))?,
+        );
+        body.bytes(&entry.value[shared_value..])?;
+        previous_key = &entry.key;
+        previous_value = &entry.value;
+    }
+    let body = body.into_vec();
+    if body.len() > TREE_LEAF_DECODED_MAX_BYTES {
+        return Err(corruption(
+            "state value pack decoded body exceeds its bound",
+        ));
+    }
+    let compressed = crate::compression::compress_zstd_level_1(&body)
+        .map_err(|error| corruption(format!("state value pack compression failed: {error}")))?;
+    encode_object(ObjectDomain::CurrentStateValuePackV1, |encoder| {
+        encoder.u32(
+            u32::try_from(entries.len())
+                .map_err(|_| corruption("state value pack count exceeds u32"))?,
+        );
+        encoder.u32(
+            u32::try_from(body.len())
+                .map_err(|_| corruption("state value pack decoded length exceeds u32"))?,
+        );
+        encoder.bytes(&compressed)?;
+        Ok(())
+    })
+}
+
+fn decode_current_state_value_pack(
+    id: ObjectId,
+    bytes: &[u8],
+) -> Result<Vec<LeafEntry>, StorageError> {
+    let mut decoder = decode_object(id, ObjectDomain::CurrentStateValuePackV1, bytes)?;
+    let count = decoder.usize("state value pack count")?;
+    if count > STATE_TREE_LEAF_ENTRIES {
+        return Err(corruption("state value pack count is invalid"));
+    }
+    let decoded_len = decoder.usize("state value pack decoded length")?;
+    if decoded_len > TREE_LEAF_DECODED_MAX_BYTES {
+        return Err(corruption("state value pack decoded length is invalid"));
+    }
+    let compressed = decoder.bytes("compressed state value pack")?;
+    decoder.finish()?;
+    let decoded = crate::compression::decompress_zstd(&compressed, decoded_len)
+        .map_err(|error| corruption(format!("state value pack decompression failed: {error}")))?;
+    if decoded.len() != decoded_len {
+        return Err(corruption(
+            "state value pack decoded length is inconsistent",
+        ));
+    }
+    let mut body = Decoder::after_prefix(&decoded, &[])?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let previous_key = entries
+            .last()
+            .map_or(&[][..], |entry: &LeafEntry| entry.key.as_slice());
+        let shared_key = body.usize("state value pack key prefix")?;
+        let key_suffix = body.bytes("state value pack key suffix")?;
+        if !prefix_delta_is_canonical(previous_key, shared_key, &key_suffix) {
+            return Err(corruption("state value pack key prefix is non-canonical"));
+        }
+        let mut key = previous_key[..shared_key].to_vec();
+        key.extend_from_slice(&key_suffix);
+
+        let previous_value = entries
+            .last()
+            .map_or(&[][..], |entry: &LeafEntry| entry.value.as_slice());
+        let shared_value = body.usize("state value pack value prefix")?;
+        let value_suffix = body.bytes("state value pack value suffix")?;
+        if !prefix_delta_is_canonical(previous_value, shared_value, &value_suffix) {
+            return Err(corruption("state value pack value prefix is non-canonical"));
+        }
+        let mut value = previous_value[..shared_value].to_vec();
+        value.extend_from_slice(&value_suffix);
+        super::state::decode_state_key(&key).map_err(|error| corruption(error.to_string()))?;
+        super::state::decode_state_value(&value).map_err(|error| corruption(error.to_string()))?;
+        entries.push(LeafEntry {
+            key,
+            value,
+            receipt: None,
+        });
+    }
+    body.finish()?;
+    validate_entries(TreeKind::State, &entries)?;
+    Ok(entries)
+}
+
+fn decode_tree_object(
+    id: ObjectId,
+    bytes: &[u8],
+    kind: TreeKind,
+    expected: Option<&NodeRef>,
+) -> Result<Node, StorageError> {
+    if let Some(pack_id) = expected.and_then(|reference| reference.state_value_pack) {
+        if kind != TreeKind::State || id != pack_id {
+            return Err(corruption(
+                "ordered-tree current-value pack edge has the wrong identity or kind",
+            ));
+        }
+        let entries = decode_current_state_value_pack(id, bytes)?;
+        let summary = summary_from_entries(TreeKind::State, &entries)?;
+        return Ok(Node {
+            kind: TreeKind::State,
+            summary,
+            body: NodeBody::Leaf(entries),
+            state_value_pack: Some(id),
+        });
+    }
+    decode_node(id, bytes)
 }
 
 fn encode_node(node: &Node) -> Result<(ObjectId, Bytes), StorageError> {
     encode_object(ObjectDomain::OrderedTreeNode, |encoder| {
         encoder.u8(node.kind as u8);
         match &node.body {
+            NodeBody::Leaf(_) if node.kind == TreeKind::State => {
+                return Err(corruption(
+                    "state tree leaves must be current-value pack objects",
+                ));
+            }
             NodeBody::Leaf(entries) => {
                 encoder.u8(0);
                 encode_summary(encoder, node.summary);
@@ -1656,6 +1993,11 @@ fn encode_node(node: &Node) -> Result<(ObjectId, Bytes), StorageError> {
                 }
             }
             NodeBody::Internal(children) => {
+                if node.state_value_pack.is_some() {
+                    return Err(corruption(
+                        "ordered-tree internal node names a current-value pack",
+                    ));
+                }
                 encoder.u8(1);
                 encode_summary(encoder, node.summary);
                 encoder.u32(
@@ -1675,6 +2017,19 @@ fn encode_node(node: &Node) -> Result<(ObjectId, Bytes), StorageError> {
                     );
                     encoder.bytes(&child.max_key[shared..])?;
                     encode_id(encoder, child.id);
+                    if node.kind == TreeKind::State {
+                        match child.state_value_pack {
+                            Some(pack_id) => {
+                                if pack_id != child.id {
+                                    return Err(corruption(
+                                        "state-pack child edge does not match its object id",
+                                    ));
+                                }
+                                encoder.u8(1);
+                            }
+                            None => encoder.u8(0),
+                        }
+                    }
                     encode_summary(encoder, child.summary);
                     previous_key = &child.max_key;
                 }
@@ -1690,8 +2045,13 @@ fn decode_node(id: ObjectId, bytes: &[u8]) -> Result<Node, StorageError> {
     let body_tag = decoder.u8()?;
     let encoded_summary = decode_summary(&mut decoder)?;
     let count = decoder.usize("tree item count")?;
-    let body = match body_tag {
+    let (body, state_value_pack) = match body_tag {
         0 => {
+            if kind == TreeKind::State {
+                return Err(corruption(
+                    "state tree leaf uses the superseded inline-value geometry",
+                ));
+            }
             if count > kind.limits().0 || count > decoder.remaining() / 9 {
                 return Err(corruption("tree leaf count is invalid"));
             }
@@ -1722,7 +2082,7 @@ fn decode_node(id: ObjectId, bytes: &[u8]) -> Result<Node, StorageError> {
             if actual_summary != encoded_summary {
                 return Err(corruption("tree leaf aggregate is invalid"));
             }
-            NodeBody::Leaf(entries)
+            (NodeBody::Leaf(entries), None)
         }
         1 => {
             if count == 0 || count > kind.limits().1 || count > decoder.remaining() / 85 {
@@ -1740,18 +2100,42 @@ fn decode_node(id: ObjectId, bytes: &[u8]) -> Result<Node, StorageError> {
                 }
                 let mut max_key = previous[..shared].to_vec();
                 max_key.extend_from_slice(&suffix);
+                let child_id = decode_id(&mut decoder)?;
+                let state_value_pack = if kind == TreeKind::State {
+                    match decoder.u8()? {
+                        0 => None,
+                        1 => Some(child_id),
+                        tag => {
+                            return Err(corruption(format!(
+                                "tree child state-pack tag {tag} is invalid"
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
                 children.push(NodeRef {
-                    id: decode_id(&mut decoder)?,
+                    id: child_id,
                     max_key,
+                    state_value_pack,
                     summary: decode_summary(&mut decoder)?,
                 });
             }
             validate_children(&children)?;
+            if children.iter().any(|child| {
+                child
+                    .state_value_pack
+                    .is_some_and(|pack_id| kind != TreeKind::State || pack_id != child.id)
+            }) {
+                return Err(corruption(
+                    "ordered-tree child has an invalid current-value pack edge",
+                ));
+            }
             let actual_summary = summary_from_children(kind, &children)?;
             if actual_summary != encoded_summary {
                 return Err(corruption("tree internal aggregate is invalid"));
             }
-            NodeBody::Internal(children)
+            (NodeBody::Internal(children), None)
         }
         tag => return Err(corruption(format!("unknown tree body tag {tag}"))),
     };
@@ -1760,7 +2144,23 @@ fn decode_node(id: ObjectId, bytes: &[u8]) -> Result<Node, StorageError> {
         kind,
         summary: encoded_summary,
         body,
+        state_value_pack,
     })
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn prefix_delta_is_canonical(previous: &[u8], shared: usize, suffix: &[u8]) -> bool {
+    shared <= previous.len()
+        && (shared == previous.len()
+            || suffix
+                .first()
+                .is_none_or(|first| *first != previous[shared]))
 }
 
 fn encode_summary(encoder: &mut Encoder, summary: TreeSummary) {
@@ -2046,6 +2446,7 @@ fn node_ref(id: ObjectId, node: &Node) -> NodeRef {
                 .map_or_else(Vec::new, |child| child.max_key.clone()),
         },
         summary: node.summary,
+        state_value_pack: node.state_value_pack,
     }
 }
 

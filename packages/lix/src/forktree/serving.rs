@@ -20,7 +20,7 @@ use super::state::{
 use super::tree::{
     ImmutableObjectSet, OrderedTreeMutation, apply_ordered_mutations,
     apply_ordered_mutations_idempotent_inserts, lookup_many_on_read, lookup_on_read,
-    scan_bounded_page_on_read, scan_page_on_read, validate_root_on_read,
+    scan_bounded_page_on_read, scan_page_on_read, scan_ranges_on_read, validate_root_on_read,
 };
 use super::view::{CoherentView, SELECTOR_SPACE, open_coherent_view_on_read};
 
@@ -2011,6 +2011,29 @@ where
         .collect())
 }
 
+pub(crate) async fn state_ranges<R>(
+    view: &CoherentView<R>,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+    include_tombstones: bool,
+) -> Result<Vec<VisibleStateRow>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let (global_root, local_root) = current_state_roots(view);
+    let rows = view
+        .state_ranges_at_roots(global_root, local_root, ranges, include_tombstones)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(encoded_key, value, source)| VisibleStateRow {
+            encoded_key,
+            value,
+            source,
+            view_instance_id: view.view_instance_id(),
+        })
+        .collect())
+}
+
 /// The global branch has no branch-local overlay. Bootstrap intentionally
 /// retains the same authenticated state root in the selected global snapshot,
 /// so treating that root as a local branch would relabel global rows and make
@@ -2140,6 +2163,71 @@ where
         if limit.is_some_and(|limit| output.len() >= limit) {
             break;
         }
+    }
+    Ok(output)
+}
+
+pub(crate) async fn state_ranges_on_roots<R>(
+    global_state_root: ObjectId,
+    local_state_root: Option<ObjectId>,
+    read: &R,
+    ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+    include_tombstones: bool,
+) -> Result<Vec<(Vec<u8>, StateValue, StateSource)>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let global = scan_ranges_on_read(global_state_root, "state", ranges, read).await?;
+    let local = match local_state_root {
+        Some(root) => scan_ranges_on_read(root, "state", ranges, read).await?,
+        None => Vec::new(),
+    };
+    let mut global = std::collections::VecDeque::from(global);
+    let mut local = std::collections::VecDeque::from(local);
+    let mut selected = Vec::with_capacity(global.len().saturating_add(local.len()));
+    while !global.is_empty() || !local.is_empty() {
+        let take_local = match (global.front(), local.front()) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some((global_key, _)), Some((local_key, _))) => local_key <= global_key,
+            (None, None) => break,
+        };
+        let (key, encoded, source) = if take_local {
+            let (key, value) = local.pop_front().expect("front local state row");
+            if global
+                .front()
+                .is_some_and(|(global_key, _)| *global_key == key)
+            {
+                global.pop_front();
+            }
+            (key, value, StateSource::Branch)
+        } else {
+            let (key, value) = global.pop_front().expect("front global state row");
+            (key, value, StateSource::Global)
+        };
+        selected.push(Some((key, encoded, source)));
+    }
+    let values = resolve_state_values_on_read(read, &selected).await?;
+    let mut output = Vec::with_capacity(values.len());
+    for (selected, value) in selected.into_iter().zip(values) {
+        let Some((key, _, source)) = selected else {
+            continue;
+        };
+        let Some((value, resolved_source)) = value else {
+            return Err(corruption("selected state leaf did not resolve"));
+        };
+        if source != resolved_source {
+            return Err(corruption(
+                "state multi-range source changed during resolution",
+            ));
+        }
+        if source == StateSource::Global && matches!(value.cell, StateCell::Tombstone) {
+            return Err(corruption("global state tree contains a tombstone"));
+        }
+        if value.cell.deleted() && !include_tombstones {
+            continue;
+        }
+        output.push((key, value, source));
     }
     Ok(output)
 }
