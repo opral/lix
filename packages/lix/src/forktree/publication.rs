@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 
+use crate::RequestBlobSpliceProvenance;
 use crate::binary_cas::{BlobId, BlobPayload, BlobSameLengthSplice};
 use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
 
-use super::blob::{CompletedUpload, PreparedUploadPart};
+use super::blob::{AuthenticatedBlobRef, CompletedUpload, PreparedUploadPart};
 use super::codec::corruption;
 use super::model::{
     BlobChunkRefV1, BlobChunkV1, BlobManifestV1, BranchSelectorV1, BranchSnapshotV1,
@@ -77,6 +79,19 @@ pub(crate) struct PreparedPublication {
     object_deletes: BTreeSet<ObjectId>,
     untracked_puts: BTreeMap<Bytes, Bytes>,
     untracked_deletes: BTreeSet<Bytes>,
+}
+
+fn sha256_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    Sha256::digest(bytes)
+        .iter()
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect()
 }
 
 /// A publication-local proof that a fixed-width successor was derived from
@@ -652,6 +667,91 @@ impl PreparedPublication {
             .await
             .map_err(|error| StorageError::Corruption(error.to_string()))?
             .ok_or_else(|| corruption("verified blob splice base owner is absent"))?;
+        self.stage_verified_inline_blob_splice_bound(view, state_key, payload, splice, reference)
+            .await
+    }
+
+    /// Promotes SQL's transport-side splice proof at the publication owner.
+    /// The proof is re-bound to the exact BlobRef StateKey on this retained
+    /// coherent view, and the authenticated base payload is checked against
+    /// the transport digest and exact prefix/insert/suffix bytes before the
+    /// fixed-chunk writer is allowed to copy unchanged manifest edges.
+    pub(crate) async fn stage_verified_request_blob_splice<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        payload: &BlobPayload,
+        provenance: &RequestBlobSpliceProvenance,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        let reference = view
+            .bind_blob_at_state_key(state_key)
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .ok_or_else(|| corruption("request blob splice base owner is absent"))?;
+        let base = view
+            .load_blob_bytes_many(std::slice::from_ref(&reference))
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| corruption("request blob splice base payload is absent"))?;
+        if sha256_lower_hex(&base) != provenance.base_sha256() {
+            return Err(corruption(
+                "request blob splice base digest is not bound to its authenticated StateKey",
+            ));
+        }
+        let prefix = provenance.prefix_bytes();
+        let suffix = provenance.suffix_bytes();
+        if prefix > base.len()
+            || suffix > base.len().saturating_sub(prefix)
+            || prefix
+                .checked_add(suffix)
+                .is_none_or(|bound| bound >= base.len())
+        {
+            return Err(corruption("request blob splice bounds are invalid"));
+        }
+        let replacement_len = base.len() - prefix - suffix;
+        let insert = provenance.insert();
+        if insert.len() != replacement_len || payload.len() != base.len() {
+            return Err(corruption(
+                "request blob splice is not a same-length fixed-width replacement",
+            ));
+        }
+        let insert_end = prefix + insert.len();
+        if payload.bytes().get(..prefix) != base.get(..prefix)
+            || payload.bytes().get(prefix..insert_end) != Some(insert)
+            || payload.bytes().get(insert_end..) != base.get(base.len() - suffix..)
+        {
+            return Err(corruption(
+                "request blob splice bytes do not match its authenticated base",
+            ));
+        }
+        if sha256_lower_hex(payload.bytes()) != provenance.result_sha256() {
+            return Err(corruption(
+                "request blob splice result digest is not bound to its payload",
+            ));
+        }
+        let splice = BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
+        self.stage_verified_inline_blob_splice_bound(view, state_key, payload, splice, reference)
+            .await
+    }
+
+    async fn stage_verified_inline_blob_splice_bound<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        payload: &BlobPayload,
+        splice: BlobSameLengthSplice,
+        reference: AuthenticatedBlobRef,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
         if reference.semantic_id() != splice.base_blob_hash {
             return Err(corruption(
                 "verified blob splice base identity does not match its StateKey owner",
@@ -758,6 +858,11 @@ impl PreparedPublication {
                 "verified blob splice receipt changed chunk is absent from its successor manifest",
             ));
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_verified_inline_blob_splice(
+            receipt.changed_chunks.len(),
+            expected_chunk_count,
+        );
         self.stage_blob_manifest(&receipt.successor_manifest)
     }
 

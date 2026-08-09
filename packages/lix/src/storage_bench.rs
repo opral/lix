@@ -18,6 +18,12 @@ static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static VERIFIED_INLINE_BLOB_SPLICE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static VERIFIED_INLINE_BLOB_SPLICE_CHANGED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "storage-benches")]
+static VERIFIED_INLINE_BLOB_SPLICE_TOTAL_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
 /// Matched transaction ownership counters used by the CRUD profile.  These
 /// counters are deliberately disabled unless the profile enables them, so the
@@ -201,6 +207,40 @@ pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
         chunk_payload_hash_bytes: MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES.swap(0, Ordering::Relaxed),
         segment_identity_hash_bytes: IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES
             .swap(0, Ordering::Relaxed),
+    }
+}
+
+/// Feature-gated publication accounting for the public SQL/file splice route.
+/// It exists only for the benchmark qualification and never participates in
+/// authority or publication decisions.
+#[cfg(feature = "storage-benches")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifiedInlineBlobSpliceAccounting {
+    pub calls: u64,
+    pub changed_chunks: u64,
+    pub total_chunks: u64,
+}
+
+#[cfg(feature = "storage-benches")]
+pub fn begin_verified_inline_blob_splice_accounting() {
+    VERIFIED_INLINE_BLOB_SPLICE_CALLS.store(0, Ordering::Relaxed);
+    VERIFIED_INLINE_BLOB_SPLICE_CHANGED_CHUNKS.store(0, Ordering::Relaxed);
+    VERIFIED_INLINE_BLOB_SPLICE_TOTAL_CHUNKS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_verified_inline_blob_splice(changed_chunks: usize, total_chunks: usize) {
+    VERIFIED_INLINE_BLOB_SPLICE_CALLS.fetch_add(1, Ordering::Relaxed);
+    VERIFIED_INLINE_BLOB_SPLICE_CHANGED_CHUNKS.fetch_add(changed_chunks as u64, Ordering::Relaxed);
+    VERIFIED_INLINE_BLOB_SPLICE_TOTAL_CHUNKS.fetch_add(total_chunks as u64, Ordering::Relaxed);
+}
+
+#[cfg(feature = "storage-benches")]
+pub fn take_verified_inline_blob_splice_accounting() -> VerifiedInlineBlobSpliceAccounting {
+    VerifiedInlineBlobSpliceAccounting {
+        calls: VERIFIED_INLINE_BLOB_SPLICE_CALLS.swap(0, Ordering::Relaxed),
+        changed_chunks: VERIFIED_INLINE_BLOB_SPLICE_CHANGED_CHUNKS.swap(0, Ordering::Relaxed),
+        total_chunks: VERIFIED_INLINE_BLOB_SPLICE_TOTAL_CHUNKS.swap(0, Ordering::Relaxed),
     }
 }
 
