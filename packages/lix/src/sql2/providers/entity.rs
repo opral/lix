@@ -172,7 +172,10 @@ fn derived_surface_reader(
     ),
     LixError,
 > {
-    if !matches!(schema_key, "lix_commit" | "lix_commit_edge") {
+    if !matches!(
+        schema_key,
+        "lix_commit" | "lix_commit_edge" | crate::branch::BRANCH_REF_SCHEMA_KEY
+    ) {
         return Ok((Arc::clone(live_state), entity_snapshot_reader.clone()));
     }
     let commit_graph = commit_graph.as_ref().ok_or_else(|| {
