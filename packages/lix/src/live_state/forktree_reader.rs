@@ -341,6 +341,84 @@ where
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         load_exact_facade(self, request).await
     }
+
+    async fn collection_generation(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        let rows = scan_facade(
+            self,
+            &LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec![
+                        crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+                    ],
+                    branch_ids: vec![branch_id.to_owned()],
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await?;
+        let expected_scope = crate::collection_generation::collection_scope_key(scope);
+        for row in rows.iter() {
+            if row.entity_pk() != &EntityPk::single(&expected_scope) || row.file_id().is_some() {
+                continue;
+            }
+            if row.deleted() || row.snapshot_content().is_none() {
+                return Ok(None);
+            }
+            let snapshot = serde_json::from_str::<serde_json::Value>(
+                row.snapshot_content()
+                    .expect("checked collection generation snapshot")
+                    .as_str(),
+            )
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("collection generation row is malformed: {error}"),
+                )
+            })?;
+            if snapshot
+                .get("scope_key")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_scope.as_str())
+                || snapshot
+                    .get("schema_key")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(scope.schema_key)
+                || snapshot.get("file_id").and_then(serde_json::Value::as_str) != scope.file_id
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "collection generation row identity does not match its requested scope",
+                ));
+            }
+            let live_count = snapshot
+                .get("live_count")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "collection generation row is missing live_count",
+                    )
+                })?;
+            let active_generation = row.commit_id().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "collection generation row is missing its authenticated commit identity",
+                )
+            })?;
+            return Ok(Some(crate::collection_generation::CollectionGeneration {
+                active_generation,
+                live_count,
+                ordered_identity_digest: None,
+            }));
+        }
+        Ok(None)
+    }
 }
 
 async fn load_exact_view<R>(

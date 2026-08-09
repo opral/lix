@@ -6686,11 +6686,10 @@ where
             return Err(error.clone());
         }
         let generation_seed = None;
+        let forktree = self.forktree_read_facade();
         let mut complete_generation = resolve_prepared_mutation_collection_generation(
             generation_seed,
-            self.opening_read(),
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.branch_head_control_cache),
+            &forktree,
             self.active_branch_id.clone(),
         )
         .await?
@@ -6748,12 +6747,11 @@ where
     pub(crate) async fn flush_prepared_mutations_for_read(&mut self) -> Result<(), LixError> {
         self.flush_mutation_journal().await?;
         let generation_seed = None;
+        let forktree = self.forktree_read_facade();
         let Some((schema_key, (live_count, ordered_identity_digest))) =
             resolve_prepared_mutation_collection_generation(
                 generation_seed,
-                self.opening_read(),
-                Arc::clone(&self.live_state),
-                Arc::clone(&self.branch_head_control_cache),
+                &forktree,
                 self.active_branch_id.clone(),
             )
             .await?
@@ -7910,9 +7908,7 @@ async fn opening_parent_complete_lifecycle_created_at(
 
 async fn resolve_prepared_mutation_collection_generation(
     seed: Option<(String, Option<(u64, [u8; 32])>)>,
-    read: impl StorageAdapterRead + Send,
-    live_state: Arc<LiveStateContext>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
     branch_id: String,
 ) -> Result<Option<(String, (u64, [u8; 32]))>, LixError> {
     let Some((schema_key, generation)) = seed else {
@@ -7921,8 +7917,7 @@ async fn resolve_prepared_mutation_collection_generation(
     if let Some(generation) = generation {
         return Ok(Some((schema_key, generation)));
     }
-    let base = live_state.transaction_reader(read, branch_head_control_cache);
-    let generation = base
+    let generation = forktree
         .collection_generation(
             &branch_id,
             crate::collection_generation::CollectionScopeRef {
@@ -8519,6 +8514,49 @@ mod transaction_validation_reader_tests {
         assert!(exact.contains("overlay_load_exact_batch(&forktree"));
         assert!(!exact.contains("transaction_reader("));
         assert!(!exact.contains("begin_read("));
+    }
+
+    #[test]
+    fn collection_generation_uses_the_retained_forktree_owner() {
+        let source = include_str!("context.rs");
+        let resolver_start = source
+            .find("async fn resolve_prepared_mutation_collection_generation")
+            .expect("collection-generation resolver");
+        let resolver_end = source[resolver_start..]
+            .find("async fn load_opening_exact_live_state_batch")
+            .map(|offset| resolver_start + offset)
+            .expect("collection-generation resolver end");
+        let resolver = &source[resolver_start..resolver_end];
+        assert!(resolver.contains("ForkTreeReadFacade<impl StorageAdapterRead + 'static>"));
+        assert!(resolver.contains("forktree\n        .collection_generation("));
+        assert!(!resolver.contains("transaction_reader("));
+        assert!(!resolver.contains("LiveStateContext"));
+        assert!(!resolver.contains("BranchHeadControlCache"));
+
+        let loader_start = source
+            .rfind("async fn load_collection_generation(")
+            .expect("transaction collection-generation loader");
+        let loader_end = source[loader_start..]
+            .find("async fn load_exact_collection_live_count")
+            .map(|offset| loader_start + offset)
+            .expect("transaction collection-generation loader end");
+        let loader = &source[loader_start..loader_end];
+        assert!(loader.contains("let forktree = self.forktree_read_facade()"));
+        assert!(loader.contains("forktree.collection_generation("));
+        assert!(!loader.contains("live_state.reader("));
+
+        let reader_source = include_str!("../live_state/forktree_reader.rs");
+        let reader_start = reader_source
+            .find("async fn collection_generation(")
+            .expect("ForkTree collection-generation reader");
+        let reader_end = reader_source[reader_start..]
+            .find("async fn load_exact_view")
+            .map(|offset| reader_start + offset)
+            .expect("ForkTree collection-generation reader end");
+        let reader = &reader_source[reader_start..reader_end];
+        assert!(reader.contains("scan_facade("));
+        assert!(reader.contains("include_tombstones: true"));
+        assert!(!reader.contains("LiveStateStoreReader"));
     }
 }
 
@@ -9164,8 +9202,8 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        let reader = self.live_state.reader(self.opening_read());
-        reader.collection_generation(branch_id, scope).await
+        let forktree = self.forktree_read_facade();
+        forktree.collection_generation(branch_id, scope).await
     }
 
     async fn load_exact_collection_live_count(
