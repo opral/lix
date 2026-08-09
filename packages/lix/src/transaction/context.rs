@@ -949,12 +949,6 @@ where
         self.opening_read.clone()
     }
 
-    pub(crate) fn opening_read_for_forktree(
-        &self,
-    ) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
-        self.opening_read()
-    }
-
     /// Clones the opaque ForkTree operation owner created from this
     /// transaction's already-retained opening read. This does not acquire or
     /// refresh a storage read and does not expose the underlying handle.
