@@ -347,6 +347,14 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn retained_read_identity_pair(&self) -> bool {
+        let raw_control_read = &self.read;
+        let packed_read = self.packed_read();
+        packed_read.identity() == self.read_identity()
+            && packed_read.snapshot_cache_key() == raw_control_read.snapshot_cache_key()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_storage_read(&self) -> &R {
         &self.read
     }

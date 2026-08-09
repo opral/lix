@@ -296,6 +296,7 @@ async fn authenticated_member_closure_rejects_wrong_read_and_commit_context() {
     .await
     .expect("load authenticated member closure");
     let packed = view.test_packed_read();
+    assert!(view.retained_read_identity_pair());
     assert_eq!(packed.identity(), view.read_identity());
     let mut mismatched_packed_identity = packed.identity();
     mismatched_packed_identity.view_instance_id = mismatched_packed_identity
