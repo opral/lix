@@ -51,17 +51,6 @@ where
         }
         Ok(Self { requested, values })
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.requested.len()
-    }
-
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&K, Option<&V>)> {
-        self.requested
-            .iter()
-            .zip(&self.values)
-            .map(|(key, value)| (key, value.as_ref()))
-    }
 }
 
 impl<'keys, K, V> IntoIterator for ExactBatch<'keys, K, V> {
