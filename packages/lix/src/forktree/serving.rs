@@ -1786,6 +1786,43 @@ where
         }
     }
 
+    // A changed key may come from only one overlay root. The unchanged root
+    // therefore contributes no diff tuple, but it can still provide the
+    // visible counterpart (for example, a global row hidden by a new local
+    // override). Resolve only those missing endpoint/root cells by point
+    // lookup on this same retained read; never rescan either endpoint.
+    for (encoded_key, (global_before, global_after, local_before, local_after)) in roots.iter_mut()
+    {
+        if global_before.is_none() {
+            *global_before = load_state_value_from_root(
+                before_commit.global_state_root,
+                encoded_key,
+                true,
+                read,
+            )
+            .await?;
+        }
+        if global_after.is_none() {
+            *global_after =
+                load_state_value_from_root(after_commit.global_state_root, encoded_key, true, read)
+                    .await?;
+        }
+        if local_before.is_none() {
+            *local_before = load_state_value_from_root(
+                before_commit.local_state_root,
+                encoded_key,
+                false,
+                read,
+            )
+            .await?;
+        }
+        if local_after.is_none() {
+            *local_after =
+                load_state_value_from_root(after_commit.local_state_root, encoded_key, false, read)
+                    .await?;
+        }
+    }
+
     let mut rows =
         BTreeMap::<Vec<u8>, (Option<HistoricalStateRow>, Option<HistoricalStateRow>)>::new();
     for (encoded_key, (global_before, global_after, local_before, local_after)) in roots {
@@ -1899,6 +1936,25 @@ fn historical_state_row(
     }
 }
 
+async fn load_state_value_from_root<R>(
+    root: ObjectId,
+    encoded_key: &[u8],
+    is_global: bool,
+    read: &R,
+) -> Result<Option<StateValue>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let Some(encoded_value) = lookup_on_read(root, "state", encoded_key, read).await? else {
+        return Ok(None);
+    };
+    let value = decode_state_value_storage(&encoded_value)?;
+    if is_global && matches!(value.cell, StateCell::Tombstone) {
+        return Err(corruption("global state tree contains a tombstone"));
+    }
+    Ok(Some(value))
+}
+
 fn historical_state_payloads_differ(
     before: Option<&HistoricalStateRow>,
     after: Option<&HistoricalStateRow>,
@@ -1927,8 +1983,6 @@ fn historical_state_content_differ(
                 || left.deleted != right.deleted
                 || left.snapshot_content != right.snapshot_content
                 || left.metadata != right.metadata
-                || (left.created_at == right.created_at
-                    && (left.change_id != right.change_id || left.commit_id != right.commit_id))
         }
         (Some(_), None) | (None, Some(_)) => true,
         (None, None) => false,

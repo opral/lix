@@ -740,6 +740,10 @@ where
 {
     Box::pin(async move {
         if before_id == after_id {
+            let bytes = load_object_on_read(read, before_id).await?;
+            let node = decode_node(before_id, &bytes)?;
+            validate_loaded_node(before_id, &node, kind, before_expected.as_ref())?;
+            validate_loaded_node(after_id, &node, kind, after_expected.as_ref())?;
             return Ok(());
         }
         let before = decode_node(before_id, &load_object_on_read(read, before_id).await?)?;
@@ -2348,4 +2352,22 @@ fn parse_kind(value: &str) -> Result<TreeKind, StorageError> {
         "retention" => Ok(TreeKind::Retention),
         _ => Err(corruption(format!("unknown tree lookup kind {value}"))),
     }
+}
+
+#[cfg(test)]
+pub(super) fn rewrite_first_internal_child_summary_for_test(
+    id: ObjectId,
+    bytes: &[u8],
+) -> Result<(ObjectId, Bytes), StorageError> {
+    let mut node = decode_node(id, bytes)?;
+    let NodeBody::Internal(children) = &mut node.body else {
+        return Err(corruption("test tree root is not internal"));
+    };
+    children[0].summary.logical_bytes = children[0]
+        .summary
+        .logical_bytes
+        .checked_add(1)
+        .ok_or_else(|| corruption("test child summary overflow"))?;
+    node.summary = summary_from_children(node.kind, children)?;
+    encode_node(&node)
 }
