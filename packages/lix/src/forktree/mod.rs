@@ -43,18 +43,18 @@ pub(crate) use reachability::{GcBudget, GcStepStatus, abort_corrupt_gc, advance_
 pub(crate) use serving::{
     CatalogPage, CommitTopology, CommitTopologyReader, StateRangeCursor, StateSource,
     StateTreeMutation, VisibleStateRow, edit_state_tree, edit_state_tree_sequence,
-    load_branch_head, load_branch_ref_change_id, load_branch_ref_metadata, load_change,
-    load_change_records, load_commit, load_commit_member_records, load_commit_member_sources,
-    load_commit_records, load_commit_summary, load_commit_topologies, page_changes, page_commits,
-    put_change_catalog_entries, put_commit_catalog_entries, scan_branch_heads, scan_change_records,
-    scan_commit_records, scan_commit_topologies, select_historical_commit_member, state_point,
-    state_point_on_read, state_points, state_range, state_range_cursor,
+    load_branch_head, load_branch_ref_metadata, load_change, load_change_records, load_commit,
+    load_commit_member_records, load_commit_records, load_commit_summary, load_commit_topologies,
+    page_changes, page_commits, put_change_catalog_entries, put_commit_catalog_entries,
+    scan_branch_heads, scan_change_records, scan_commit_records, scan_commit_topologies,
+    select_historical_commit_member, state_point, state_point_on_read, state_points, state_range,
+    state_range_cursor,
 };
 pub(crate) use state::{
     HistoricalStateRow, StateCell, StateCellRef, StateKey, StateKeyRef, StateValue, StateValueRef,
     UNTRACKED_ROW_SPACE, UntrackedValue, UntrackedValueRef, decode_state_key, decode_state_value,
-    encode_state_key, encode_state_prefix, encode_state_value, encode_untracked_key,
-    encode_untracked_value,
+    decode_untracked_key, decode_untracked_value, encode_state_key, encode_state_prefix,
+    encode_state_value, encode_untracked_key, encode_untracked_value,
 };
 pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,

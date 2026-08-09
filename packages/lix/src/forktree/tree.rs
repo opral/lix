@@ -838,46 +838,6 @@ where
     Ok(rows)
 }
 
-pub(super) async fn scan_bounded_page_on_read<R>(
-    root: ObjectId,
-    expected_kind: &'static str,
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-    start_after: Option<&[u8]>,
-    page_size: usize,
-    read: &R,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>
-where
-    R: StorageAdapterRead + ?Sized,
-{
-    if page_size == 0 {
-        return Err(corruption("ordered-tree page size must be nonzero"));
-    }
-    let effective_lower = match (lower, start_after) {
-        (Some(lower), Some(start)) => Some(lower.max(start)),
-        (Some(lower), None) => Some(lower),
-        (None, Some(start)) => Some(start),
-        (None, None) => None,
-    };
-    let requested = page_size
-        .checked_add(usize::from(start_after.is_some()))
-        .ok_or_else(|| corruption("ordered-tree page size overflows usize"))?;
-    let mut rows = scan_range_on_read(
-        root,
-        expected_kind,
-        effective_lower,
-        upper,
-        Some(requested),
-        read,
-    )
-    .await?;
-    if let Some(start_after) = start_after {
-        rows.retain(|(key, _)| key.as_slice() > start_after);
-    }
-    rows.truncate(page_size);
-    Ok(rows)
-}
-
 /// Authenticates and returns an ordered half-open range. Work is proportional
 /// to visited tree blocks plus returned key/value bytes; unrelated subtrees
 /// whose authenticated separator is below the lower bound are skipped.
