@@ -803,7 +803,7 @@ where
         &self,
         objects: ImmutableObjectSet,
     ) -> Result<(), LixError> {
-        if objects.is_empty() {
+        if objects.iter().next().is_none() {
             return Ok(());
         }
         let mut writes = StorageWriteSet::with_capacity(objects.iter().count(), 1);

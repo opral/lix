@@ -19,8 +19,8 @@ mod view;
 
 pub(crate) use blob::{
     AuthenticatedBlobReader, AuthenticatedBlobRef, PREPARED_BLOB_CHUNK_BYTES, PreparedBlobUpload,
-    PreparedUploadPart, UploadBindingRef, blob_reader_on_read, historical_blob_semantic_id,
-    prepare_upload_completion, prepare_upload_part,
+    PreparedUploadPart, UploadBindingRef, blob_reader_on_read, prepare_upload_completion,
+    prepare_upload_part,
 };
 pub(crate) use bootstrap::initialize_empty_repository;
 pub(crate) use model::{
@@ -30,7 +30,7 @@ pub(crate) use model::{
     RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1, SnapshotTargetV1,
     UploadPartV1, UploadProgressV1, UploadSelectorV1,
 };
-pub(crate) use object::ObjectId;
+pub(crate) use object::{OBJECT_SPACE, ObjectId};
 pub(crate) use publication::{
     BranchStateTransition, OrderedBranchHistoryTransition, PreparedPublication, SelectorExpectation,
 };
