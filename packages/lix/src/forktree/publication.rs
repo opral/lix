@@ -363,6 +363,26 @@ impl PreparedPublication {
         }
     }
 
+    /// Replaces an earlier value for the same selector within this one
+    /// publication. The original selector expectation remains the sole CAS
+    /// fence; this is used when a later root rotation must rebind an
+    /// intermediate selector value already staged in the same plan.
+    fn replace_staged_selector(
+        &mut self,
+        key: Bytes,
+        value: Bytes,
+        expected: SelectorExpectation,
+    ) -> Result<(), StorageError> {
+        if key == global_selector_key() || self.selector_deletes.contains(&key) {
+            return Err(corruption(
+                "publication has an invalid selector replacement",
+            ));
+        }
+        self.expect_selector(key.clone(), expected)?;
+        self.selector_puts.insert(key, value);
+        Ok(())
+    }
+
     fn delete_selector(&mut self, key: Bytes, expected: Bytes) -> Result<(), StorageError> {
         if key == global_selector_key() || self.selector_puts.contains_key(&key) {
             return Err(corruption("publication has an invalid selector delete"));
@@ -404,7 +424,11 @@ impl PreparedPublication {
             ));
         }
         let mut entries = BTreeMap::new();
-        let compact = current.base_pack_object_id.is_some();
+        // A pack copied to a newly-created branch cannot retain a base pack
+        // owned by the source branch. Flatten it in this same publication so
+        // the new branch's selector has a branch-authenticated one-generation
+        // closure from the outset.
+        let compact = current.base_pack_object_id.is_some() || branch_id != view.branch_id();
         let mut base_pack_object_id = None;
         if let Some(base_id) = current.base_pack_object_id {
             let base_bytes = view.load_raw_object_bytes(base_id).await?;
@@ -574,6 +598,26 @@ impl PreparedPublication {
         let mut branch_snapshot = branch_snapshot;
         branch_snapshot.hot_pack_object_id = pack_id;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        let no_retired_commits = BTreeSet::new();
+        let no_retired_changes = BTreeSet::new();
+        self.rebind_surviving_branch_packs(
+            view,
+            repository_root_id,
+            next_repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            Some(branch_id),
+        )
+        .await?;
+        self.rebind_retained_snapshot_packs(
+            view,
+            repository_root_id,
+            next_repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            None,
+        )
+        .await?;
         self.put_branch_selector(
             BranchSelectorV1 {
                 branch_id,
@@ -582,6 +626,23 @@ impl PreparedPublication {
             },
             SelectorExpectation::Absent,
         )?;
+        let selector_key = branch_selector_key(branch_id);
+        let staged_selector = self
+            .selector_puts
+            .get(&selector_key)
+            .cloned()
+            .ok_or_else(|| corruption("new branch selector was not staged"))?;
+        self.rebind_staged_branch_pack(
+            view,
+            repository_root_id,
+            next_repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            selector_key,
+            staged_selector,
+            SelectorExpectation::Absent,
+        )
+        .await?;
         Ok(snapshot_id)
     }
 
@@ -654,12 +715,13 @@ impl PreparedPublication {
         let next_change_catalog_root = change_catalog_edit.root;
         self.stage_catalog_edit(change_catalog_edit)?;
         self.stage_encoded_object(ref_object_id, ref_bytes)?;
-        let repository_root_id = self.stage_repository_root(RepositoryRootV1 {
+        let next_repository_root = RepositoryRootV1 {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
             retention_policy_root: base_repository_root.retention_policy_root,
-        })?;
+        };
+        let repository_root_id = self.stage_repository_root(next_repository_root)?;
         let selector_generation = view
             .branch_selector()
             .selector_generation
@@ -676,6 +738,26 @@ impl PreparedPublication {
         let mut branch_snapshot = branch_snapshot;
         branch_snapshot.hot_pack_object_id = pack_id;
         let snapshot_id = self.stage_branch_snapshot(branch_snapshot)?;
+        let no_retired_commits = BTreeSet::new();
+        let no_retired_changes = BTreeSet::new();
+        self.rebind_surviving_branch_packs(
+            view,
+            repository_root_id,
+            next_repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            Some(view.branch_id()),
+        )
+        .await?;
+        self.rebind_retained_snapshot_packs(
+            view,
+            repository_root_id,
+            next_repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            None,
+        )
+        .await?;
         self.put_branch_selector(
             BranchSelectorV1 {
                 branch_id: view.branch_id(),
@@ -1206,7 +1288,25 @@ impl PreparedPublication {
             None,
         )
         .await?;
-        self.install_branch_selector(view, snapshot_id)
+        self.install_branch_selector(view, snapshot_id)?;
+        let selector_key = branch_selector_key(view.branch_id());
+        let staged_selector = self
+            .selector_puts
+            .get(&selector_key)
+            .cloned()
+            .ok_or_else(|| corruption("state transition branch selector was not staged"))?;
+        self.rebind_staged_branch_pack(
+            view,
+            repository_root_id,
+            repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            selector_key,
+            staged_selector,
+            SelectorExpectation::Equals(view.raw_branch_selector().clone()),
+        )
+        .await?;
+        Ok(snapshot_id)
     }
 
     pub(crate) async fn publish_ordered_branch_history<R>(
@@ -1505,7 +1605,25 @@ impl PreparedPublication {
             None,
         )
         .await?;
-        self.install_branch_selector(view, snapshot_id)
+        self.install_branch_selector(view, snapshot_id)?;
+        let selector_key = branch_selector_key(view.branch_id());
+        let staged_selector = self
+            .selector_puts
+            .get(&selector_key)
+            .cloned()
+            .ok_or_else(|| corruption("ordered history branch selector was not staged"))?;
+        self.rebind_staged_branch_pack(
+            view,
+            repository_root_id,
+            repository_root,
+            &no_retired_commits,
+            &no_retired_changes,
+            selector_key,
+            staged_selector,
+            SelectorExpectation::Equals(view.raw_branch_selector().clone()),
+        )
+        .await?;
+        Ok(snapshot_id)
     }
 
     /// Atomically moves reachability from one open receipt to a state-rooted
@@ -1756,6 +1874,46 @@ impl PreparedPublication {
         Ok(closure)
     }
 
+    async fn add_authenticated_tree_closure_entries<R>(
+        &self,
+        read: &R,
+        closure: &BTreeSet<ObjectId>,
+        entries: &mut BTreeMap<ObjectId, HotObjectPackEntry>,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead + ?Sized,
+    {
+        for object_id in closure {
+            let bytes = match self.object_puts.get(*object_id) {
+                Some(bytes) => bytes.clone(),
+                None => super::view::load_object_bytes(read, *object_id).await?,
+            };
+            let domain = super::object::authenticate_object_domain(*object_id, &bytes)?;
+            if domain != ObjectDomain::OrderedTreeNode
+                || !super::object::hot_packable_object(*object_id, &bytes)?
+            {
+                return Err(corruption(
+                    "authenticated ordered-tree closure contains a non-packable object",
+                ));
+            }
+            let entry = HotObjectPackEntry {
+                object_id: *object_id,
+                domain,
+                bytes,
+            };
+            if let Some(existing) = entries.get(object_id) {
+                if existing.bytes != entry.bytes {
+                    return Err(corruption(
+                        "authenticated ordered-tree closure assigns new bytes to an object",
+                    ));
+                }
+            } else {
+                entries.insert(*object_id, entry);
+            }
+        }
+        Ok(())
+    }
+
     async fn rebind_surviving_branch_packs<R>(
         &mut self,
         view: &CoherentView<R>,
@@ -1783,15 +1941,22 @@ impl PreparedPublication {
                 },
             )
             .await?;
+        let mut stored_selector_keys = BTreeSet::new();
         loop {
             let page = cursor.next_page(256).await?;
             for entry in page.entries {
-                let raw_selector = match entry.value {
+                stored_selector_keys.insert(entry.key.0.clone());
+                let stored_raw_selector = match entry.value {
                     ProjectedValue::FullValue(bytes) => bytes,
                     ProjectedValue::KeyOnly => {
                         return Err(corruption("branch selector rebind returned key-only data"));
                     }
                 };
+                let raw_selector = self
+                    .selector_puts
+                    .get(&entry.key.0)
+                    .cloned()
+                    .unwrap_or_else(|| stored_raw_selector.clone());
                 let selector = BranchSelectorV1::decode(&raw_selector)?;
                 if entry.key.0 != branch_selector_key(selector.branch_id) {
                     return Err(corruption(
@@ -1801,9 +1966,14 @@ impl PreparedPublication {
                 if skip_branch == Some(selector.branch_id) {
                     continue;
                 }
-                let snapshot_bytes =
-                    super::view::load_object_bytes(read, selector.branch_snapshot_object_id)
-                        .await?;
+                let snapshot_bytes = match self.object_puts.get(selector.branch_snapshot_object_id)
+                {
+                    Some(bytes) => bytes.clone(),
+                    None => {
+                        super::view::load_object_bytes(read, selector.branch_snapshot_object_id)
+                            .await?
+                    }
+                };
                 let snapshot =
                     BranchSnapshotV1::decode(selector.branch_snapshot_object_id, &snapshot_bytes)?;
                 if snapshot.branch_id != selector.branch_id {
@@ -1811,8 +1981,12 @@ impl PreparedPublication {
                         "surviving branch snapshot identity is not authenticated",
                     ));
                 }
-                let pack_bytes =
-                    super::view::load_object_bytes(read, snapshot.hot_pack_object_id).await?;
+                let pack_bytes = match self.object_puts.get(snapshot.hot_pack_object_id) {
+                    Some(bytes) => bytes.clone(),
+                    None => {
+                        super::view::load_object_bytes(read, snapshot.hot_pack_object_id).await?
+                    }
+                };
                 let pack = HotObjectPackV1::decode(snapshot.hot_pack_object_id, &pack_bytes)?;
                 if pack.branch_id != selector.branch_id {
                     return Err(corruption(
@@ -1821,7 +1995,10 @@ impl PreparedPublication {
                 }
                 let mut entries = BTreeMap::new();
                 if let Some(base_id) = pack.base_pack_object_id {
-                    let base_bytes = super::view::load_object_bytes(read, base_id).await?;
+                    let base_bytes = match self.object_puts.get(base_id) {
+                        Some(bytes) => bytes.clone(),
+                        None => super::view::load_object_bytes(read, base_id).await?,
+                    };
                     let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
                     if base.branch_id != selector.branch_id || base.base_pack_object_id.is_some() {
                         return Err(corruption(
@@ -1839,6 +2016,7 @@ impl PreparedPublication {
                         return Err(corruption("surviving branch hot pack repeats an object"));
                     }
                 }
+                let existing_pack_object_ids = entries.keys().copied().collect::<BTreeSet<_>>();
                 let tree_closure = self
                     .authenticated_ordered_tree_closure(
                         read,
@@ -1851,6 +2029,8 @@ impl PreparedPublication {
                             snapshot.historical_global_state_root,
                         ],
                     )
+                    .await?;
+                self.add_authenticated_tree_closure_entries(read, &tree_closure, &mut entries)
                     .await?;
                 for (object_id, bytes) in self.object_puts.iter() {
                     let domain = super::object::authenticate_object_domain(object_id, bytes)?;
@@ -1905,7 +2085,10 @@ impl PreparedPublication {
                 }
                 entries.retain(|object_id, entry| match entry.domain {
                     ObjectDomain::RepositoryRoot => *object_id == repository_root_id,
-                    ObjectDomain::OrderedTreeNode => tree_closure.contains(object_id),
+                    ObjectDomain::OrderedTreeNode => {
+                        existing_pack_object_ids.contains(object_id)
+                            || tree_closure.contains(object_id)
+                    }
                     ObjectDomain::SemanticChange => {
                         let Ok(change) = ChangeObjectV1::decode(*object_id, &entry.bytes) else {
                             return false;
@@ -1962,17 +2145,315 @@ impl PreparedPublication {
                     branch_snapshot_object_id: snapshot_id,
                     selector_generation: selector.selector_generation,
                 };
-                self.put_selector(
+                self.replace_staged_selector(
                     Bytes::from(entry.key.0),
                     next_selector.encode()?,
-                    SelectorExpectation::Equals(raw_selector),
+                    SelectorExpectation::Equals(stored_raw_selector),
                 )?;
             }
             if !page.has_more {
                 break;
             }
         }
+        let staged_branch_selectors: Vec<(Bytes, Bytes)> = self
+            .selector_puts
+            .iter()
+            .filter(|(key, _)| {
+                key.as_ref().starts_with(b"branch/") && !stored_selector_keys.contains(*key)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for (key, raw_selector) in staged_branch_selectors {
+            let selector = BranchSelectorV1::decode(&raw_selector)?;
+            if skip_branch == Some(selector.branch_id) {
+                continue;
+            }
+            self.rebind_staged_branch_pack(
+                view,
+                repository_root_id,
+                repository_root,
+                retired_commit_ids,
+                retired_change_ids,
+                key,
+                raw_selector,
+                SelectorExpectation::Absent,
+            )
+            .await?;
+        }
         Ok(())
+    }
+
+    async fn rebind_staged_branch_pack<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        repository_root_id: ObjectId,
+        repository_root: RepositoryRootV1,
+        retired_commit_ids: &BTreeSet<super::model::CommitId>,
+        retired_change_ids: &BTreeSet<super::model::ChangeId>,
+        selector_key: Bytes,
+        raw_selector: Bytes,
+        expected: SelectorExpectation,
+    ) -> Result<(), StorageError>
+    where
+        R: StorageAdapterRead,
+    {
+        let selector = BranchSelectorV1::decode(&raw_selector)?;
+        if selector_key != branch_selector_key(selector.branch_id) {
+            return Err(corruption("staged branch selector key and identity differ"));
+        }
+        let snapshot_bytes = self
+            .object_puts
+            .get(selector.branch_snapshot_object_id)
+            .cloned()
+            .ok_or_else(|| corruption("staged branch selector snapshot is not published"))?;
+        let snapshot =
+            BranchSnapshotV1::decode(selector.branch_snapshot_object_id, &snapshot_bytes)?;
+        if snapshot.branch_id != selector.branch_id {
+            return Err(corruption(
+                "staged branch snapshot identity is not authenticated",
+            ));
+        }
+        let pack_bytes = self
+            .object_puts
+            .get(snapshot.hot_pack_object_id)
+            .cloned()
+            .ok_or_else(|| corruption("staged branch hot pack is not published"))?;
+        let pack = HotObjectPackV1::decode(snapshot.hot_pack_object_id, &pack_bytes)?;
+        if pack.branch_id != selector.branch_id {
+            return Err(corruption(
+                "staged branch hot pack identity is not authenticated",
+            ));
+        }
+        let read = view.operation_read();
+        let mut entries = BTreeMap::new();
+        if let Some(base_id) = pack.base_pack_object_id {
+            let base_bytes = match self.object_puts.get(base_id) {
+                Some(bytes) => bytes.clone(),
+                None => super::view::load_object_bytes(read, base_id).await?,
+            };
+            let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
+            if base.branch_id != selector.branch_id || base.base_pack_object_id.is_some() {
+                return Err(corruption(
+                    "staged branch hot pack base is not one authenticated generation",
+                ));
+            }
+            for entry in base.entries {
+                let domain =
+                    super::object::authenticate_object_domain(entry.object_id, &entry.bytes)?;
+                if domain != entry.domain
+                    || !super::object::hot_packable_object(entry.object_id, &entry.bytes)?
+                {
+                    return Err(corruption(
+                        "staged branch base pack entry domain is not authenticated",
+                    ));
+                }
+                if entries.insert(entry.object_id, entry).is_some() {
+                    return Err(corruption("staged branch hot pack repeats an object"));
+                }
+            }
+        }
+        for entry in pack.entries {
+            let domain = super::object::authenticate_object_domain(entry.object_id, &entry.bytes)?;
+            if domain != entry.domain
+                || !super::object::hot_packable_object(entry.object_id, &entry.bytes)?
+            {
+                return Err(corruption(
+                    "staged branch hot pack entry domain is not authenticated",
+                ));
+            }
+            if entries.insert(entry.object_id, entry).is_some() {
+                return Err(corruption("staged branch hot pack repeats an object"));
+            }
+        }
+        let existing_pack_object_ids = entries.keys().copied().collect::<BTreeSet<_>>();
+        let mut tree_roots = vec![
+            repository_root.global_state_root,
+            repository_root.commit_catalog_root,
+            repository_root.change_catalog_root,
+            repository_root.retention_policy_root,
+            snapshot.local_state_root,
+            snapshot.historical_global_state_root,
+        ];
+        let range = Prefix {
+            bytes: Bytes::from_static(b"branch/"),
+        }
+        .to_range()?;
+        let mut cursor = read
+            .begin_scan(
+                SELECTOR_SPACE,
+                range,
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    order: ScanOrder::Ascending,
+                },
+            )
+            .await?;
+        loop {
+            let page = cursor.next_page(256).await?;
+            for entry in page.entries {
+                let stored = match entry.value {
+                    ProjectedValue::FullValue(bytes) => bytes,
+                    ProjectedValue::KeyOnly => {
+                        return Err(corruption(
+                            "branch selector root scan returned key-only data",
+                        ));
+                    }
+                };
+                let raw = self
+                    .selector_puts
+                    .get(&entry.key.0)
+                    .cloned()
+                    .unwrap_or(stored);
+                let selector = BranchSelectorV1::decode(&raw)?;
+                if entry.key.0 != branch_selector_key(selector.branch_id) {
+                    return Err(corruption(
+                        "branch selector root scan key and identity differ",
+                    ));
+                }
+                let snapshot_bytes = match self.object_puts.get(selector.branch_snapshot_object_id)
+                {
+                    Some(bytes) => bytes.clone(),
+                    None => {
+                        super::view::load_object_bytes(read, selector.branch_snapshot_object_id)
+                            .await?
+                    }
+                };
+                let branch_snapshot =
+                    BranchSnapshotV1::decode(selector.branch_snapshot_object_id, &snapshot_bytes)?;
+                if branch_snapshot.branch_id != selector.branch_id {
+                    return Err(corruption(
+                        "branch selector root scan snapshot identity differs",
+                    ));
+                }
+                tree_roots.push(branch_snapshot.local_state_root);
+                tree_roots.push(branch_snapshot.historical_global_state_root);
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+        let tree_closure = self
+            .authenticated_ordered_tree_closure(read, &tree_roots)
+            .await?;
+        self.add_authenticated_tree_closure_entries(read, &tree_closure, &mut entries)
+            .await?;
+        for (object_id, bytes) in self.object_puts.iter() {
+            let domain = super::object::authenticate_object_domain(object_id, bytes)?;
+            if !super::object::hot_packable_object(object_id, bytes)? {
+                continue;
+            }
+            let entry = HotObjectPackEntry {
+                object_id,
+                domain,
+                bytes: bytes.clone(),
+            };
+            if let Some(existing) = entries.get(&object_id) {
+                if existing.bytes != entry.bytes {
+                    return Err(corruption(
+                        "staged branch hot pack assigns new bytes to an object",
+                    ));
+                }
+            } else {
+                entries.insert(object_id, entry);
+            }
+        }
+        let mut roots = vec![
+            repository_root_id,
+            repository_root.global_state_root,
+            repository_root.commit_catalog_root,
+            repository_root.change_catalog_root,
+            repository_root.retention_policy_root,
+            snapshot.local_state_root,
+            snapshot.historical_global_state_root,
+            snapshot.semantic_head_commit_object_id,
+        ];
+        if let Some(ref_id) = snapshot.latest_ref_change_object_id {
+            roots.push(ref_id);
+        }
+        for object_id in roots {
+            let bytes = match self.object_puts.get(object_id) {
+                Some(bytes) => bytes.clone(),
+                None => super::view::load_object_bytes(read, object_id).await?,
+            };
+            let domain = super::object::authenticate_object_domain(object_id, &bytes)?;
+            if !super::object::hot_packable_object(object_id, &bytes)? {
+                continue;
+            }
+            let entry = HotObjectPackEntry {
+                object_id,
+                domain,
+                bytes,
+            };
+            if let Some(existing) = entries.get(&object_id) {
+                if existing.bytes != entry.bytes {
+                    return Err(corruption("staged branch hot pack root bytes changed"));
+                }
+            } else {
+                entries.insert(object_id, entry);
+            }
+        }
+        entries.retain(|object_id, entry| match entry.domain {
+            ObjectDomain::RepositoryRoot => *object_id == repository_root_id,
+            ObjectDomain::OrderedTreeNode => {
+                existing_pack_object_ids.contains(object_id) || tree_closure.contains(object_id)
+            }
+            ObjectDomain::SemanticChange => {
+                let Ok(change) = ChangeObjectV1::decode(*object_id, &entry.bytes) else {
+                    return false;
+                };
+                !retired_change_ids.contains(&change.change_id())
+            }
+            ObjectDomain::BranchRefChange => {
+                let Ok(ChangeObjectV1::BranchRef {
+                    change_id,
+                    branch_id,
+                    ..
+                }) = ChangeObjectV1::decode(*object_id, &entry.bytes)
+                else {
+                    return false;
+                };
+                !retired_change_ids.contains(&change_id) && branch_id == selector.branch_id
+            }
+            ObjectDomain::Commit => {
+                let Ok(commit) = CommitObjectV1::decode(*object_id, &entry.bytes) else {
+                    return false;
+                };
+                !retired_commit_ids.contains(&commit.commit_id)
+            }
+            ObjectDomain::CommitMemberPageV1 => {
+                let Ok(page) = CommitMemberPageV1::decode(*object_id, &entry.bytes) else {
+                    return false;
+                };
+                !retired_commit_ids.contains(&page.commit_id)
+            }
+            _ => true,
+        });
+        let rebound = HotObjectPackV1 {
+            branch_id: selector.branch_id,
+            repository_root_id,
+            epoch: self.next_global.epoch,
+            view_id: super::view::derive_pack_view_id(
+                repository_root_id,
+                selector.branch_id,
+                selector.selector_generation,
+            ),
+            base_pack_object_id: None,
+            entries: entries.into_values().collect(),
+        };
+        let (rebound_id, rebound_bytes) = rebound.encode()?;
+        self.stage_encoded_object(rebound_id, rebound_bytes)?;
+        let rebound_snapshot = BranchSnapshotV1 {
+            hot_pack_object_id: rebound_id,
+            ..snapshot
+        };
+        let (snapshot_id, snapshot_bytes) = rebound_snapshot.encode()?;
+        self.stage_encoded_object(snapshot_id, snapshot_bytes)?;
+        let next_selector = BranchSelectorV1 {
+            branch_id: selector.branch_id,
+            branch_snapshot_object_id: snapshot_id,
+            selector_generation: selector.selector_generation,
+        };
+        self.replace_staged_selector(selector_key, next_selector.encode()?, expected)
     }
 
     async fn rebind_retained_snapshot_packs<R>(
@@ -2017,7 +2498,7 @@ impl PreparedPublication {
                     {
                         continue;
                     }
-                    let raw_selector = match entry.value {
+                    let stored_raw_selector = match entry.value {
                         ProjectedValue::FullValue(bytes) => bytes,
                         ProjectedValue::KeyOnly => {
                             return Err(corruption(
@@ -2025,6 +2506,11 @@ impl PreparedPublication {
                             ));
                         }
                     };
+                    let raw_selector = self
+                        .selector_puts
+                        .get(&entry.key.0)
+                        .cloned()
+                        .unwrap_or_else(|| stored_raw_selector.clone());
                     let selector = SnapshotSelectorV1::decode(&raw_selector)?;
                     if selector.role != role
                         || entry.key.0 != snapshot_selector_key(role, selector.selector_id)
@@ -2033,8 +2519,12 @@ impl PreparedPublication {
                             "retained snapshot selector key and identity differ",
                         ));
                     }
-                    let target_bytes =
-                        super::view::load_object_bytes(read, selector.target_object_id).await?;
+                    let target_bytes = match self.object_puts.get(selector.target_object_id) {
+                        Some(bytes) => bytes.clone(),
+                        None => {
+                            super::view::load_object_bytes(read, selector.target_object_id).await?
+                        }
+                    };
                     let target =
                         SnapshotTargetV1::decode(selector.target_object_id, &target_bytes)?;
                     if target.role != selector.role || target.selector_id != selector.selector_id {
@@ -2042,9 +2532,16 @@ impl PreparedPublication {
                             "retained snapshot target and selector identity differ",
                         ));
                     }
-                    let snapshot_bytes =
-                        super::view::load_object_bytes(read, target.branch_snapshot_object_id)
-                            .await?;
+                    let snapshot_bytes = match self
+                        .object_puts
+                        .get(target.branch_snapshot_object_id)
+                    {
+                        Some(bytes) => bytes.clone(),
+                        None => {
+                            super::view::load_object_bytes(read, target.branch_snapshot_object_id)
+                                .await?
+                        }
+                    };
                     let snapshot = BranchSnapshotV1::decode(
                         target.branch_snapshot_object_id,
                         &snapshot_bytes,
@@ -2057,9 +2554,16 @@ impl PreparedPublication {
                             "retained snapshot target and branch snapshot disagree",
                         ));
                     }
-                    let semantic_commit_bytes =
-                        super::view::load_object_bytes(read, target.semantic_commit_object_id)
-                            .await?;
+                    let semantic_commit_bytes = match self
+                        .object_puts
+                        .get(target.semantic_commit_object_id)
+                    {
+                        Some(bytes) => bytes.clone(),
+                        None => {
+                            super::view::load_object_bytes(read, target.semantic_commit_object_id)
+                                .await?
+                        }
+                    };
                     let semantic_commit = CommitObjectV1::decode(
                         target.semantic_commit_object_id,
                         &semantic_commit_bytes,
@@ -2070,7 +2574,10 @@ impl PreparedPublication {
                         ));
                     }
                     if let Some(ref_id) = snapshot.latest_ref_change_object_id {
-                        let ref_bytes = super::view::load_object_bytes(read, ref_id).await?;
+                        let ref_bytes = match self.object_puts.get(ref_id) {
+                            Some(bytes) => bytes.clone(),
+                            None => super::view::load_object_bytes(read, ref_id).await?,
+                        };
                         let change = ChangeObjectV1::decode(ref_id, &ref_bytes)?;
                         if retired_change_ids.contains(&change.change_id()) {
                             return Err(corruption(
@@ -2078,8 +2585,13 @@ impl PreparedPublication {
                             ));
                         }
                     }
-                    let pack_bytes =
-                        super::view::load_object_bytes(read, snapshot.hot_pack_object_id).await?;
+                    let pack_bytes = match self.object_puts.get(snapshot.hot_pack_object_id) {
+                        Some(bytes) => bytes.clone(),
+                        None => {
+                            super::view::load_object_bytes(read, snapshot.hot_pack_object_id)
+                                .await?
+                        }
+                    };
                     let pack = HotObjectPackV1::decode(snapshot.hot_pack_object_id, &pack_bytes)?;
                     if pack.branch_id != snapshot.branch_id {
                         return Err(corruption(
@@ -2088,7 +2600,10 @@ impl PreparedPublication {
                     }
                     let mut entries = BTreeMap::new();
                     if let Some(base_id) = pack.base_pack_object_id {
-                        let base_bytes = super::view::load_object_bytes(read, base_id).await?;
+                        let base_bytes = match self.object_puts.get(base_id) {
+                            Some(bytes) => bytes.clone(),
+                            None => super::view::load_object_bytes(read, base_id).await?,
+                        };
                         let base = HotObjectPackV1::decode(base_id, &base_bytes)?;
                         if base.branch_id != snapshot.branch_id
                             || base.base_pack_object_id.is_some()
@@ -2110,6 +2625,7 @@ impl PreparedPublication {
                             return Err(corruption("retained snapshot hot pack repeats an object"));
                         }
                     }
+                    let existing_pack_object_ids = entries.keys().copied().collect::<BTreeSet<_>>();
                     let tree_closure = self
                         .authenticated_ordered_tree_closure(
                             read,
@@ -2122,6 +2638,8 @@ impl PreparedPublication {
                                 snapshot.historical_global_state_root,
                             ],
                         )
+                        .await?;
+                    self.add_authenticated_tree_closure_entries(read, &tree_closure, &mut entries)
                         .await?;
                     for (object_id, bytes) in self.object_puts.iter() {
                         let domain = super::object::authenticate_object_domain(object_id, bytes)?;
@@ -2182,7 +2700,10 @@ impl PreparedPublication {
                     }
                     entries.retain(|object_id, entry| match entry.domain {
                         ObjectDomain::RepositoryRoot => *object_id == repository_root_id,
-                        ObjectDomain::OrderedTreeNode => tree_closure.contains(object_id),
+                        ObjectDomain::OrderedTreeNode => {
+                            existing_pack_object_ids.contains(object_id)
+                                || tree_closure.contains(object_id)
+                        }
                         _ => true,
                     });
                     let rebound = HotObjectPackV1 {
@@ -2214,9 +2735,10 @@ impl PreparedPublication {
                         target_object_id: target_id,
                         ..selector
                     };
-                    self.put_snapshot_selector(
-                        rebound_selector,
-                        SelectorExpectation::Equals(raw_selector),
+                    self.replace_staged_selector(
+                        snapshot_selector_key(rebound_selector.role, rebound_selector.selector_id),
+                        rebound_selector.encode()?,
+                        SelectorExpectation::Equals(stored_raw_selector),
                     )?;
                 }
                 if !page.has_more {
