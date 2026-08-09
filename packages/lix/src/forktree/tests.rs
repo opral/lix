@@ -26,11 +26,10 @@ use super::model::{
 use super::object::OBJECT_SPACE;
 use super::serving::{retire_change_catalog_entries, retire_commit_catalog_entries};
 use super::tree::{
-    ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
-    build_state_tree, empty_receipt_tree, insert_receipt_part, lookup, scan_all,
-    validate_branch_snapshot_ref_edge, validate_change_catalog_back_edge,
-    validate_commit_catalog_back_edge, validate_receipt_tree, validate_upload_progress_tree,
-    validate_upload_selector_progress,
+    ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree,
+    empty_receipt_tree, insert_receipt_part, lookup, scan_all, validate_branch_snapshot_ref_edge,
+    validate_change_catalog_back_edge, validate_commit_catalog_back_edge, validate_receipt_tree,
+    validate_upload_progress_tree, validate_upload_selector_progress,
 };
 use super::view::SELECTOR_SPACE;
 use super::{
@@ -615,12 +614,6 @@ fn build_seed() -> SeedData {
     let local_state = build_state_tree(&local_rows).expect("local state");
     let local_state_root = local_state.root.object_id;
     objects.extend(local_state.objects).expect("local objects");
-    let retention = build_retention_tree(&[]).expect("retention");
-    let retention_root = retention.root.object_id;
-    objects
-        .extend(retention.objects)
-        .expect("retention objects");
-
     let commit = CommitObjectV1 {
         commit_id,
         generation: 1,
@@ -695,7 +688,6 @@ fn build_seed() -> SeedData {
         global_state_root,
         commit_catalog_root,
         change_catalog_root,
-        retention_policy_root: retention_root,
     };
     let (repository_root_id, repository_root_bytes) =
         repository_root.encode().expect("repository root");

@@ -88,14 +88,20 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError>;
 
-    /// Loads authenticated commit objects that remain physically retained
-    /// while checkpoint GC debt is pending. Callers gate this with the
-    /// authenticated checkpoint-GC control row.
+    /// Loads authenticated commit objects for an explicit topology projection.
+    /// This is not a GC progress or retention authority.
     async fn retained_nodes(&mut self) -> Result<Vec<CommitGraphNode>, LixError> {
         Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "retained commit scan is unavailable for this graph reader",
         ))
+    }
+
+    /// Returns commit identities pinned by authenticated ForkTree snapshot
+    /// selectors. Recovery, checkpoint, undo, redo, and tombstone selectors
+    /// are physical roots; no legacy checkpoint JSON row is consulted.
+    async fn snapshot_roots(&mut self) -> Result<Vec<(String, CommitId)>, LixError> {
+        Ok(Vec::new())
     }
 
     /// Loads semantic commit metadata through this reader's retained

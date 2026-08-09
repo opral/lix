@@ -49,10 +49,7 @@ use crate::forktree::{
     PreparedPublication, StateKey, UploadBindingRef, prepare_upload_part,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::gc::{
-    CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef,
-    load_checkpoint_publication_state,
-};
+use crate::gc::{CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_publication_state};
 use crate::live_state::{
     CertifiedCurrentStatePredecessor, LiveStateContext, LiveStateExactBatchRequest,
     LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
@@ -7195,7 +7192,6 @@ where
         previous_checkpoint_commit_id: CommitId,
         recovered_head_commit_id: CommitId,
         interval_has_commits: bool,
-        gc_state: CheckpointGcState,
         selected_changes: StagedCommitChangeBatch,
     ) -> Result<String, LixError> {
         let commit_id = self
@@ -7212,17 +7208,15 @@ where
                     checkpoint_commit_id,
                     interval_has_commits,
                 },
-                gc_state,
             })?;
         Ok(commit_id)
     }
 
-    /// Loads the branch-local recovery root and repository-global maintenance
-    /// state from one storage snapshot.
+    /// Loads the branch-local recovery root from one retained storage snapshot.
     pub(crate) async fn checkpoint_publication_state(
         &mut self,
         branch_id: &str,
-    ) -> Result<(Option<CheckpointRecoveryRef>, CheckpointGcState), LixError> {
+    ) -> Result<Option<CheckpointRecoveryRef>, LixError> {
         let read = self.opening_read();
         load_checkpoint_publication_state(&read, branch_id).await
     }
@@ -7598,8 +7592,7 @@ where
         diff_ids: Vec<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let branch_id = self.active_branch_id.clone();
-        let (previous_recovery, mut gc_state) =
-            self.checkpoint_publication_state(&branch_id).await?;
+        let _previous_recovery = self.checkpoint_publication_state(&branch_id).await?;
         let head_commit_id = self
             .load_branch_head(&branch_id)
             .await?
@@ -7697,17 +7690,6 @@ where
             return Err(stale_or_unknown_diff_id());
         }
         let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
-        gc_state.checkpoint_sequence =
-            gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "checkpoint sequence overflow",
-                )
-            })?;
-        if let Some(previous_recovery) = previous_recovery {
-            gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
-        }
-
         let checkpoint_commit_id = if unselected.is_empty() {
             let mut marker_rows = RawWriteBatch::with_capacity(1);
             marker_rows.push(checkpoint_marker_stage_row(&branch_id));
@@ -7721,7 +7703,6 @@ where
                 previous_checkpoint_commit_id,
                 head_commit_id,
                 interval_has_commits,
-                gc_state,
                 selected,
             )?
         } else {
@@ -7747,7 +7728,6 @@ where
                         checkpoint_commit_id,
                         interval_has_commits,
                     },
-                    gc_state,
                 })?;
             checkpoint_commit_id.to_string()
         };

@@ -964,7 +964,6 @@ where
                 typed(value.global_state_root, ObjectDomain::OrderedTreeNode),
                 typed(value.commit_catalog_root, ObjectDomain::OrderedTreeNode),
                 typed(value.change_catalog_root, ObjectDomain::OrderedTreeNode),
-                typed(value.retention_policy_root, ObjectDomain::OrderedTreeNode),
             ]);
         }
         ObjectDomain::BranchSnapshot => {

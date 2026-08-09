@@ -477,7 +477,6 @@ impl PreparedPublication {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
-            retention_policy_root: base_repository_root.retention_policy_root,
         })?;
         self.put_branch_selector(
             BranchSelectorV1 {
@@ -562,7 +561,6 @@ impl PreparedPublication {
             global_state_root: base_repository_root.global_state_root,
             commit_catalog_root: base_repository_root.commit_catalog_root,
             change_catalog_root: next_change_catalog_root,
-            retention_policy_root: base_repository_root.retention_policy_root,
         })?;
         self.put_branch_selector(
             BranchSelectorV1 {
@@ -1116,7 +1114,6 @@ impl PreparedPublication {
             || repository_root.commit_catalog_root != commit_catalog_edit.root
             || repository_root.change_catalog_root != change_catalog_edit.root
             || repository_root.global_state_root != view.repository_root().global_state_root
-            || repository_root.retention_policy_root != view.repository_root().retention_policy_root
         {
             return Err(corruption(
                 "snapshot release catalog retirement was derived from another coherent view",
@@ -1206,7 +1203,6 @@ impl PreparedPublication {
             || change_catalog_edit.base_root != view.repository_root().change_catalog_root
             || repository_root.commit_catalog_root != commit_catalog_edit.root
             || repository_root.change_catalog_root != change_catalog_edit.root
-            || repository_root.retention_policy_root != view.repository_root().retention_policy_root
             || commit_catalog_edit
                 .commit_entries
                 .get(&semantic_commit.commit_id)
@@ -1387,7 +1383,6 @@ impl PreparedPublication {
             || change_catalog_edit.base_root != view.repository_root().change_catalog_root
             || repository_root.commit_catalog_root != commit_catalog_edit.root
             || repository_root.change_catalog_root != change_catalog_edit.root
-            || repository_root.retention_policy_root != view.repository_root().retention_policy_root
         {
             return Err(corruption(
                 "ordered history roots/catalogs do not derive from the selected view",

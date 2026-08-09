@@ -33,7 +33,7 @@ pub(crate) use model::{
     CanonicalUploadId, ChangeCatalogEntry, ChangeCatalogOwner, ChangeId, ChangeObjectV1,
     CommitCatalogEntry, CommitChangePageV2, CommitId, CommitMemberV1, CommitObjectV1,
     GlobalSelectorV1, RepositoryRootV1, SnapshotRole, SnapshotSelectorId, SnapshotSelectorV1,
-    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1,
+    SnapshotTargetV1, UploadPartV1, UploadProgressV1, UploadSelectorV1, snapshot_selector_key,
 };
 pub(crate) use object::ObjectId;
 pub(crate) use publication::{
@@ -58,7 +58,8 @@ pub(crate) use tree::{
     RECEIPT_TREE_FANOUT, RECEIPT_TREE_LEAF_ENTRIES, ReceiptTreeEdit, ReceiptTreeRoot,
 };
 pub(crate) use view::{
-    CoherentView, ForkTreeReadFacade, open_coherent_view, open_coherent_view_on_read,
+    CoherentView, ForkTreeReadFacade, SELECTOR_SPACE, load_object_bytes, open_coherent_view,
+    open_coherent_view_on_read,
 };
 
 #[cfg(test)]

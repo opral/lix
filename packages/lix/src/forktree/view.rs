@@ -19,7 +19,7 @@ use super::model::{
 };
 use super::object::{OBJECT_SPACE, ObjectId};
 
-pub(super) const SELECTOR_SPACE: crate::storage::StorageSpace =
+pub(crate) const SELECTOR_SPACE: crate::storage::StorageSpace =
     crate::storage::StorageSpace::engine_declared(
         0x0009_0002,
         "forktree.selector.v1",
@@ -1349,7 +1349,7 @@ where
     })
 }
 
-pub(super) async fn load_object_bytes(
+pub(crate) async fn load_object_bytes(
     read: &(impl StorageAdapterRead + ?Sized),
     id: ObjectId,
 ) -> Result<Bytes, StorageError> {
@@ -1388,7 +1388,6 @@ where
         repository.global_state_root,
         repository.commit_catalog_root,
         repository.change_catalog_root,
-        repository.retention_policy_root,
         branch.local_state_root,
         branch.historical_global_state_root,
         branch.semantic_head_commit_object_id,
@@ -1405,7 +1404,6 @@ where
         (branch.historical_global_state_root, "state"),
         (repository.commit_catalog_root, "commit"),
         (repository.change_catalog_root, "change"),
-        (repository.retention_policy_root, "retention"),
     ] {
         super::tree::validate_root_bytes(id, kind, required_object(&objects, id)?)?;
     }

@@ -35,8 +35,7 @@ use super::state::{
     encode_state_key, encode_state_value, encode_untracked_key, encode_untracked_value,
 };
 use super::tree::{
-    ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_retention_tree,
-    build_state_tree,
+    ImmutableObjectSet, build_change_catalog, build_commit_catalog, build_state_tree,
 };
 use super::view::SELECTOR_SPACE;
 
@@ -240,7 +239,7 @@ where
     // branch-local copy gives ordinary branch-scoped catalog queries their
     // exact branch identity instead of forcing them through a global owner.
     let local_state = build_state_tree(&local_entries).map_err(LixError::from)?;
-    let retention = build_retention_tree(&[]).map_err(LixError::from)?;
+
 
     let mut objects = ImmutableObjectSet::default();
     objects
@@ -249,7 +248,6 @@ where
     objects
         .extend(local_state.objects)
         .map_err(LixError::from)?;
-    objects.extend(retention.objects).map_err(LixError::from)?;
     for (page_id, page_bytes) in &member_pages.objects {
         objects
             .insert(*page_id, page_bytes.clone())
@@ -348,7 +346,6 @@ where
         global_state_root: global_state.root.object_id,
         commit_catalog_root: commit_catalog.root.object_id,
         change_catalog_root: change_catalog.root.object_id,
-        retention_policy_root: retention.root.object_id,
     };
     let (repository_id, repository_bytes) = repository.encode().map_err(LixError::from)?;
     objects

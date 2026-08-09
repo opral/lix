@@ -54,6 +54,17 @@ where
         StorageWriteSet::new()
     }
 
+    /// Runs one bounded authenticated ForkTree maintenance step on the
+    /// adapter's sole physical storage owner. The collector owns its own
+    /// retained read and atomic write set; callers cannot supply another
+    /// progress or root authority.
+    pub(crate) async fn advance_forktree_gc(
+        &self,
+        budget: crate::forktree::GcBudget,
+    ) -> Result<crate::forktree::GcStepStatus, StorageError> {
+        crate::forktree::advance_gc(&self.storage, budget).await
+    }
+
     pub async fn begin_read_transaction(
         &self,
     ) -> Result<Box<StorageAdapterReadTransaction<StorageImpl::Read<'_>>>, crate::LixError> {

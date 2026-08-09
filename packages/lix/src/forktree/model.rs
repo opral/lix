@@ -83,7 +83,6 @@ pub(crate) struct RepositoryRootV1 {
     pub(crate) global_state_root: ObjectId,
     pub(crate) commit_catalog_root: ObjectId,
     pub(crate) change_catalog_root: ObjectId,
-    pub(crate) retention_policy_root: ObjectId,
 }
 
 impl RepositoryRootV1 {
@@ -94,14 +93,12 @@ impl RepositoryRootV1 {
                 self.global_state_root,
                 self.commit_catalog_root,
                 self.change_catalog_root,
-                self.retention_policy_root,
             ],
         )?;
         encode_object(ObjectDomain::RepositoryRoot, |encoder| {
             encode_id(encoder, self.global_state_root);
             encode_id(encoder, self.commit_catalog_root);
             encode_id(encoder, self.change_catalog_root);
-            encode_id(encoder, self.retention_policy_root);
             Ok(())
         })
     }
@@ -112,7 +109,6 @@ impl RepositoryRootV1 {
             global_state_root: decode_id(&mut decoder)?,
             commit_catalog_root: decode_id(&mut decoder)?,
             change_catalog_root: decode_id(&mut decoder)?,
-            retention_policy_root: decode_id(&mut decoder)?,
         };
         decoder.finish()?;
         validate_nonzero_ids(
@@ -121,7 +117,6 @@ impl RepositoryRootV1 {
                 value.global_state_root,
                 value.commit_catalog_root,
                 value.change_catalog_root,
-                value.retention_policy_root,
             ],
         )?;
         Ok(value)
@@ -2347,7 +2342,7 @@ pub(super) fn upload_selector_key(upload_id: &CanonicalUploadId) -> Result<Bytes
     Ok(Bytes::from(encoder.into_vec()))
 }
 
-pub(super) fn snapshot_selector_key(role: SnapshotRole, selector_id: SnapshotSelectorId) -> Bytes {
+pub(crate) fn snapshot_selector_key(role: SnapshotRole, selector_id: SnapshotSelectorId) -> Bytes {
     let mut key = Vec::with_capacity(role.key_prefix().len() + 16);
     key.extend_from_slice(role.key_prefix());
     key.extend_from_slice(selector_id.as_bytes());

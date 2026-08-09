@@ -26,7 +26,6 @@ enum TreeKind {
     ChangeCatalog = 2,
     Receipt = 3,
     State = 4,
-    Retention = 5,
 }
 
 impl TreeKind {
@@ -36,7 +35,6 @@ impl TreeKind {
             2 => Ok(Self::ChangeCatalog),
             3 => Ok(Self::Receipt),
             4 => Ok(Self::State),
-            5 => Ok(Self::Retention),
             _ => Err(corruption(format!("unknown ordered-tree kind {value}"))),
         }
     }
@@ -44,7 +42,7 @@ impl TreeKind {
     fn limits(self) -> (usize, usize) {
         match self {
             Self::Receipt => (RECEIPT_TREE_LEAF_ENTRIES, RECEIPT_TREE_FANOUT),
-            Self::CommitCatalog | Self::ChangeCatalog | Self::State | Self::Retention => {
+            Self::CommitCatalog | Self::ChangeCatalog | Self::State => {
                 (CATALOG_TREE_LEAF_ENTRIES, CATALOG_TREE_FANOUT)
             }
         }
@@ -194,7 +192,7 @@ pub(crate) struct OrderedTreeEdit {
 ///
 /// Internal nodes contribute child edges. Leaf edges are decoded according to
 /// the node's authenticated kind, so reachability never has a second decoder
-/// for state, catalog, receipt, or retention values.
+/// for state, catalog, or receipt values.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct OrderedTreeEdges {
     pub(super) object_ids: Vec<(ObjectId, ObjectDomain)>,
@@ -263,7 +261,7 @@ pub(super) fn ordered_tree_edges(
                         }
                         change_entries.push((key, value));
                     }
-                    TreeKind::Receipt | TreeKind::Retention => {
+                    TreeKind::Receipt => {
                         let id = ObjectId::from_bytes(
                             entry
                                 .value
@@ -271,14 +269,7 @@ pub(super) fn ordered_tree_edges(
                                 .try_into()
                                 .map_err(|_| corruption("tree object edge is not 32 bytes"))?,
                         );
-                        object_ids.push((
-                            id,
-                            if node.kind == TreeKind::Receipt {
-                                ObjectDomain::UploadPart
-                            } else {
-                                ObjectDomain::SnapshotTarget
-                            },
-                        ));
+                        object_ids.push((id, ObjectDomain::UploadPart));
                     }
                 }
             }
@@ -359,20 +350,6 @@ pub(super) fn build_state_tree(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<TreeBui
         })
         .collect::<Result<Vec<_>, StorageError>>()?;
     build_tree(TreeKind::State, &entries)
-}
-
-pub(super) fn build_retention_tree(
-    entries: &[(Vec<u8>, ObjectId)],
-) -> Result<TreeBuild, StorageError> {
-    let entries = entries
-        .iter()
-        .map(|(key, value)| LeafEntry {
-            key: key.clone(),
-            value: value.as_bytes().to_vec(),
-            receipt: None,
-        })
-        .collect::<Vec<_>>();
-    build_tree(TreeKind::Retention, &entries)
 }
 
 /// Applies distinct, sorted mutations by copying only each affected root-to-leaf
@@ -2059,7 +2036,6 @@ fn parse_kind(value: &str) -> Result<TreeKind, StorageError> {
         "change" => Ok(TreeKind::ChangeCatalog),
         "receipt" => Ok(TreeKind::Receipt),
         "state" => Ok(TreeKind::State),
-        "retention" => Ok(TreeKind::Retention),
         _ => Err(corruption(format!("unknown tree lookup kind {value}"))),
     }
 }

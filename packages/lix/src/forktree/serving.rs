@@ -428,7 +428,6 @@ where
         repository_root.global_state_root,
         repository_root.commit_catalog_root,
         repository_root.change_catalog_root,
-        repository_root.retention_policy_root,
     ];
     authenticated_root_ids.extend(snapshots.iter().flat_map(|snapshot| {
         [
@@ -443,7 +442,6 @@ where
         (repository_root.global_state_root, "state"),
         (repository_root.commit_catalog_root, "commit"),
         (repository_root.change_catalog_root, "change"),
-        (repository_root.retention_policy_root, "retention"),
     ] {
         super::tree::validate_root_bytes(
             id,

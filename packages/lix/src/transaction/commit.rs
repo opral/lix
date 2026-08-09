@@ -178,7 +178,7 @@ where
     let branch_ref_intents = prepared_writes.branch_ref_intents.clone();
 
     for checkpoint in &prepared_writes.checkpoint_publications {
-        crate::gc::stage_checkpoint_publication(&mut publication, checkpoint)?;
+        crate::gc::stage_checkpoint_publication(&mut publication, &view, checkpoint).await?;
     }
 
     let runtime_entity_pk =
@@ -592,7 +592,6 @@ where
         global_state_root,
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
-        retention_policy_root: view.repository_root().retention_policy_root,
     };
     let transition = BranchStateTransition {
         state_edit,
@@ -1269,7 +1268,6 @@ where
         global_state_root: final_global_state_root,
         commit_catalog_root: commit_catalog_edit.root,
         change_catalog_root: change_catalog_edit.root,
-        retention_policy_root: view.repository_root().retention_policy_root,
     };
     let transition = OrderedBranchHistoryTransition {
         state_edits,
