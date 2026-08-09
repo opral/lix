@@ -19,7 +19,7 @@ use super::object::{
 };
 use super::state::{StateKey, StateKeyRef, encode_state_key};
 use super::tree::ImmutableObjectSet;
-use super::view::load_object_bytes;
+use super::view::load_object_map;
 
 const MERKLE_STATE_BINDING_DOMAIN: &str = "lix forktree blob merkle state binding v1";
 const MAX_PROOF_DEPTH: usize = 128;
@@ -99,6 +99,15 @@ struct BlobMerkleProofStepV1 {
     parent_object_id: ObjectId,
     sibling_object_id: ObjectId,
     sibling_is_left: bool,
+}
+
+struct ProofPathState {
+    slot: usize,
+    ordinal: u64,
+    node_id: ObjectId,
+    expected_ref: BlobMerkleNodeRefV1,
+    steps: Vec<BlobMerkleProofStepV1>,
+    pending_sibling: Option<(ObjectId, ObjectId, BlobMerkleNodeRefV1, bool)>,
 }
 
 /// A bounded range proof containing only requested leaves, their chunk objects,
@@ -285,49 +294,93 @@ where
     validate_requested_range(&manifest, &requested_range)?;
     let mut objects = ImmutableObjectSet::default();
     // Operation-local read coalescing only: bytes never outlive this proof and
-    // are still authenticated at every typed edge below.
+    // are still authenticated at every typed edge below. The frontier is
+    // fetched in bounded multi-key batches; this changes adapter call shape,
+    // not the persisted format or any authority boundary.
     let mut loaded = BTreeMap::<ObjectId, Bytes>::new();
-    let mut paths = Vec::with_capacity((requested_range.end - requested_range.start) as usize);
-    for ordinal in requested_range.clone() {
-        let mut node_id = manifest.root_object_id;
-        let mut expected_ref = BlobMerkleNodeRefV1 {
-            object_id: manifest.root_object_id,
-            height: manifest.root_height,
-            first_ordinal: 0,
-            leaf_count: manifest.leaf_count,
-            logical_bytes: manifest.logical_bytes,
-        };
-        let mut steps = Vec::new();
-        loop {
-            let node_bytes = load_proof_object(read, &mut loaded, node_id).await?;
-            let node = decode_node(node_id, &node_bytes)?;
-            let summary = node.summary(node_id);
-            if summary.as_ref() != expected_ref {
+    let requested_count = (requested_range.end - requested_range.start) as usize;
+    let root_ref = BlobMerkleNodeRefV1 {
+        object_id: manifest.root_object_id,
+        height: manifest.root_height,
+        first_ordinal: 0,
+        leaf_count: manifest.leaf_count,
+        logical_bytes: manifest.logical_bytes,
+    };
+    let mut active = requested_range
+        .clone()
+        .enumerate()
+        .map(|(slot, ordinal)| ProofPathState {
+            slot,
+            ordinal,
+            node_id: manifest.root_object_id,
+            expected_ref: root_ref,
+            steps: Vec::new(),
+            pending_sibling: None,
+        })
+        .collect::<Vec<_>>();
+    let mut completed = (0..requested_count)
+        .map(|_| None)
+        .collect::<Vec<Option<(u64, ObjectId, ObjectId, Vec<BlobMerkleProofStepV1>)>>>();
+
+    while !active.is_empty() {
+        let ids = active
+            .iter()
+            .flat_map(|state| {
+                let sibling = state.pending_sibling.map(|(_, id, _, _)| id);
+                std::iter::once(state.node_id).chain(sibling)
+            })
+            .collect::<Vec<_>>();
+        load_missing_proof_objects(read, &mut loaded, ids).await?;
+        let mut next = Vec::with_capacity(active.len());
+        for mut state in active {
+            let pending_sibling = state.pending_sibling.take();
+            let node_bytes = loaded
+                .get(&state.node_id)
+                .cloned()
+                .ok_or_else(|| corruption("Merkle node object is absent"))?;
+            let node = decode_node(state.node_id, &node_bytes)?;
+            let summary = node.summary(state.node_id);
+            if summary.as_ref() != state.expected_ref {
                 return Err(corruption(
                     "Merkle node does not match its authenticated parent summary",
                 ));
             }
+            if let Some((parent_id, sibling_id, sibling_ref, sibling_is_left)) = pending_sibling {
+                let sibling_bytes = loaded
+                    .get(&sibling_id)
+                    .cloned()
+                    .ok_or_else(|| corruption("Merkle sibling object is absent"))?;
+                let sibling_node = decode_node(sibling_id, &sibling_bytes)?;
+                if sibling_node.summary(sibling_id).as_ref() != sibling_ref {
+                    return Err(corruption(
+                        "Merkle sibling does not match its authenticated parent summary",
+                    ));
+                }
+                objects.insert(sibling_id, sibling_bytes)?;
+                state.steps.push(BlobMerkleProofStepV1 {
+                    parent_object_id: parent_id,
+                    sibling_object_id: sibling_id,
+                    sibling_is_left,
+                });
+            }
             match node {
                 DecodedNode::Leaf(leaf) => {
-                    if leaf.ordinal != ordinal {
+                    if leaf.ordinal != state.ordinal {
                         return Err(corruption("Merkle leaf ordinal is not canonical"));
                     }
-                    objects.insert(node_id, node_bytes)?;
-                    let chunk_bytes =
-                        load_proof_object(read, &mut loaded, leaf.chunk_object_id).await?;
-                    objects.insert(leaf.chunk_object_id, chunk_bytes)?;
-                    paths.push(BlobMerkleProofPathV1 {
-                        leaf_object_id: node_id,
-                        leaf_ordinal: ordinal,
-                        steps,
-                    });
-                    break;
+                    objects.insert(state.node_id, node_bytes)?;
+                    completed[state.slot] = Some((
+                        state.ordinal,
+                        state.node_id,
+                        leaf.chunk_object_id,
+                        state.steps,
+                    ));
                 }
                 DecodedNode::Internal(internal) => {
-                    let in_left = ordinal >= internal.left.first_ordinal
-                        && ordinal < internal.left.first_ordinal + internal.left.leaf_count;
-                    let in_right = ordinal >= internal.right.first_ordinal
-                        && ordinal < internal.right.first_ordinal + internal.right.leaf_count;
+                    let in_left = state.ordinal >= internal.left.first_ordinal
+                        && state.ordinal < internal.left.first_ordinal + internal.left.leaf_count;
+                    let in_right = state.ordinal >= internal.right.first_ordinal
+                        && state.ordinal < internal.right.first_ordinal + internal.right.leaf_count;
                     if in_left == in_right {
                         return Err(corruption(
                             "Merkle ordinal is not covered by exactly one child",
@@ -338,25 +391,36 @@ where
                     } else {
                         (internal.right, internal.left, true)
                     };
-                    let sibling_bytes =
-                        load_proof_object(read, &mut loaded, sibling.object_id).await?;
-                    let sibling_node = decode_node(sibling.object_id, &sibling_bytes)?;
-                    if sibling_node.summary(sibling.object_id).as_ref() != sibling {
-                        return Err(corruption(
-                            "Merkle sibling does not match its authenticated parent summary",
-                        ));
-                    }
-                    objects.insert(sibling.object_id, sibling_bytes)?;
-                    steps.push(BlobMerkleProofStepV1 {
-                        parent_object_id: node_id,
-                        sibling_object_id: sibling.object_id,
-                        sibling_is_left,
-                    });
-                    node_id = child.object_id;
-                    expected_ref = child;
+                    state.pending_sibling =
+                        Some((state.node_id, sibling.object_id, sibling, sibling_is_left));
+                    state.node_id = child.object_id;
+                    state.expected_ref = child;
+                    next.push(state);
                 }
             }
         }
+        active = next;
+    }
+
+    let chunk_ids = completed
+        .iter()
+        .filter_map(|entry| entry.as_ref().map(|(_, _, chunk_id, _)| *chunk_id))
+        .collect::<Vec<_>>();
+    load_missing_proof_objects(read, &mut loaded, chunk_ids).await?;
+    let mut paths = Vec::with_capacity(requested_count);
+    for completed in completed {
+        let (ordinal, leaf_object_id, chunk_object_id, steps) =
+            completed.ok_or_else(|| corruption("Merkle proof omits a requested leaf"))?;
+        let chunk_bytes = loaded
+            .get(&chunk_object_id)
+            .cloned()
+            .ok_or_else(|| corruption("Merkle chunk object is absent"))?;
+        objects.insert(chunk_object_id, chunk_bytes)?;
+        paths.push(BlobMerkleProofPathV1 {
+            leaf_object_id,
+            leaf_ordinal: ordinal,
+            steps,
+        });
     }
     let proof = BlobMerkleProofV1 {
         manifest,
@@ -369,20 +433,27 @@ where
     Ok(proof)
 }
 
-async fn load_proof_object<R>(
+const PROOF_OBJECT_BATCH_ENTRIES: usize = 256;
+
+async fn load_missing_proof_objects<R>(
     read: &R,
     loaded: &mut BTreeMap<ObjectId, Bytes>,
-    id: ObjectId,
-) -> Result<Bytes, StorageError>
+    ids: impl IntoIterator<Item = ObjectId>,
+) -> Result<(), StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    if let Some(bytes) = loaded.get(&id) {
-        return Ok(bytes.clone());
+    let missing = ids
+        .into_iter()
+        .filter(|id| !loaded.contains_key(id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    for batch in missing.chunks(PROOF_OBJECT_BATCH_ENTRIES) {
+        let batch_objects = load_object_map(read, batch.iter().copied()).await?;
+        loaded.extend(batch_objects);
     }
-    let bytes = load_object_bytes(read, id).await?;
-    loaded.insert(id, bytes.clone());
-    Ok(bytes)
+    Ok(())
 }
 
 pub(crate) fn leaf_range_for_bytes(
