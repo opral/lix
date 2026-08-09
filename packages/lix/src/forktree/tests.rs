@@ -3717,8 +3717,10 @@ fn commit_member_pages_cover_boundaries_and_fail_closed_corruption() {
     );
 
     let mut corrupted = page_map.clone();
-    let first = corrupted.get_mut(&root).expect("root page");
-    first[0] ^= 0x01;
+    let first = corrupted.remove(&root).expect("root page");
+    let mut first_bytes = first.to_vec();
+    first_bytes[0] ^= 0x01;
+    corrupted.insert(root, Bytes::from(first_bytes));
     assert!(
         decoded
             .load_members_with(|id| {
