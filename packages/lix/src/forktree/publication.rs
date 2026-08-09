@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use crate::RequestBlobSpliceProvenance;
-use crate::binary_cas::{BlobPayload, BlobSameLengthSplice};
+use crate::binary_cas::{BlobEditSplice, BlobPayload, BlobSameLengthSplice};
 use crate::storage::{Key, Precondition, StorageError};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::{StoragePrecondition, StorageWriteSet};
@@ -658,6 +658,30 @@ impl PreparedPublication {
             .await
     }
 
+    /// Re-binds a transaction-verified variable-width edit to the exact
+    /// StateKey-selected BlobRef and path-copies its Merkle successor. The
+    /// edit hint is never an authority by itself: the selected base identity,
+    /// manifest root, geometry, and complete retained node closure are
+    /// authenticated on this coherent view before successor objects stage.
+    pub(crate) async fn stage_verified_inline_blob_edit<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        state_key: &StateKey,
+        payload: &BlobPayload,
+        splice: BlobEditSplice,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        let reference = view
+            .bind_blob_at_state_key(state_key)
+            .await
+            .map_err(|error| StorageError::Corruption(error.to_string()))?
+            .ok_or_else(|| corruption("verified blob edit base owner is absent"))?;
+        self.stage_verified_inline_blob_edit_bound(view, state_key, payload, splice, reference)
+            .await
+    }
+
     /// Promotes SQL's transport-side splice proof at the publication owner.
     /// The proof is re-bound to the exact BlobRef StateKey on this retained
     /// coherent view, and the authenticated base payload is checked against
@@ -687,24 +711,23 @@ impl PreparedPublication {
             .map_err(|_| corruption("request blob splice base length is invalid"))?;
         let prefix = provenance.prefix_bytes();
         let suffix = provenance.suffix_bytes();
-        if prefix > base_len
-            || suffix > base_len.saturating_sub(prefix)
-            || prefix
-                .checked_add(suffix)
-                .is_none_or(|bound| bound >= base_len)
-        {
+        if prefix > base_len || suffix > base_len.saturating_sub(prefix) {
             return Err(corruption("request blob splice bounds are invalid"));
         }
         let replacement_len = base_len - prefix - suffix;
         let insert = provenance.insert();
-        if insert.len() != replacement_len || payload.len() != base_len {
+        let expected_len = prefix
+            .checked_add(insert.len())
+            .and_then(|len| len.checked_add(suffix))
+            .ok_or_else(|| corruption("request blob splice result length overflows"))?;
+        if payload.len() != expected_len || (replacement_len == 0 && insert.is_empty()) {
             return Err(corruption(
-                "request blob splice is not a same-length fixed-width replacement",
+                "request blob splice result length or changed range is invalid",
             ));
         }
         let insert_end = prefix + insert.len();
         if payload.bytes().get(prefix..insert_end) != Some(insert)
-            || insert_end != base_len - suffix
+            || insert_end != payload.len() - suffix
         {
             return Err(corruption(
                 "request blob splice bytes do not match its authenticated base",
@@ -714,9 +737,103 @@ impl PreparedPublication {
         // derived from those verified bytes was matched to the exact
         // StateKey-selected BlobRef above; the proof below binds that owner to
         // its manifest root without a backend whole-file witness pass.
-        let splice = BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
-        self.stage_verified_inline_blob_splice_bound(view, state_key, payload, splice, reference)
+        if replacement_len == insert.len() {
+            let splice =
+                BlobSameLengthSplice::new(reference.semantic_id(), prefix, replacement_len);
+            self.stage_verified_inline_blob_splice_bound(
+                view, state_key, payload, splice, reference,
+            )
             .await
+        } else {
+            let splice = BlobEditSplice {
+                base_blob_hash: reference.semantic_id(),
+                offset: prefix,
+                delete_len: replacement_len,
+                insert_len: insert.len(),
+            };
+            self.stage_verified_inline_blob_edit_bound(view, state_key, payload, splice, reference)
+                .await
+        }
+    }
+
+    async fn stage_verified_inline_blob_edit_bound<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        _state_key: &StateKey,
+        payload: &BlobPayload,
+        splice: BlobEditSplice,
+        reference: AuthenticatedBlobRef,
+    ) -> Result<ObjectId, StorageError>
+    where
+        R: StorageAdapterRead + Sync,
+    {
+        if reference.semantic_id() != splice.base_blob_hash {
+            return Err(corruption(
+                "verified blob edit base identity does not match its StateKey owner",
+            ));
+        }
+        let base_len = usize::try_from(reference.expected_size())
+            .map_err(|_| corruption("verified blob edit base length is invalid"))?;
+        let delete_end = splice
+            .offset
+            .checked_add(splice.delete_len)
+            .filter(|end| *end <= base_len)
+            .ok_or_else(|| corruption("verified blob edit delete range is invalid"))?;
+        let expected_len = base_len
+            .checked_sub(splice.delete_len)
+            .and_then(|len| len.checked_add(splice.insert_len))
+            .ok_or_else(|| corruption("verified blob edit successor length overflows"))?;
+        if expected_len != payload.len()
+            || splice.offset.checked_add(splice.insert_len).is_none()
+            || (splice.delete_len == 0 && splice.insert_len == 0)
+        {
+            return Err(corruption(
+                "verified blob edit payload length or changed range is invalid",
+            ));
+        }
+        let base_manifest_object_id = reference.manifest_object_id();
+        let base_manifest_bytes = view.load_object_bytes(base_manifest_object_id).await?;
+        let base_manifest = BlobManifestV1::decode(base_manifest_object_id, &base_manifest_bytes)?;
+        if base_manifest.logical_bytes != reference.expected_size()
+            || base_manifest.canonical_blob_id != splice.base_blob_hash
+        {
+            return Err(corruption(
+                "verified blob edit base manifest is not bound to its BlobRef owner",
+            ));
+        }
+        let successor = view
+            .build_blob_merkle_edit_successor(
+                base_manifest,
+                payload.bytes(),
+                splice.offset,
+                delete_end - splice.offset,
+                splice.insert_len,
+            )
+            .await?;
+        let expected_successor_id = payload
+            .hash()
+            .unwrap_or_else(|| crate::binary_cas::BlobId::from_canonical_content(payload.bytes()));
+        if successor.manifest.canonical_blob_id != expected_successor_id
+            || successor.manifest.logical_bytes != payload.len() as u64
+        {
+            return Err(corruption(
+                "verified blob edit hint does not reproduce the requested payload",
+            ));
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_verified_inline_blob_splice(
+            successor
+                .objects
+                .iter()
+                .filter(|(id, bytes)| {
+                    super::object::authenticate_object_domain(*id, bytes)
+                        == Ok(super::object::ObjectDomain::BlobChunk)
+                })
+                .count(),
+            successor.manifest.leaf_count as usize,
+        );
+        self.stage_immutable_objects(&successor.objects)?;
+        self.stage_blob_manifest(&successor.manifest)
     }
 
     async fn stage_verified_inline_blob_splice_bound<R>(

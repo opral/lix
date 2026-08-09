@@ -1502,6 +1502,26 @@ where
                     .stage_verified_inline_blob_splice(view, &state_key, payload, splice)
                     .await
                     .map_err(LixError::from)?
+            } else if let Some(splice) = write.edit_blob_splice() {
+                if write.untracked {
+                    return Err(writer_error(
+                        "verified blob edit cannot target an untracked file owner",
+                    ));
+                }
+                let file_id = &write.file_id;
+                let state_key = StateKey {
+                    schema_key: "lix_binary_blob_ref".to_owned(),
+                    file_id: Some(file_id.clone()),
+                    entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                        writer_error(format!(
+                            "verified blob edit file identity is not a canonical UUID: {error}"
+                        ))
+                    })?,
+                };
+                publication
+                    .stage_verified_inline_blob_edit(view, &state_key, payload, splice)
+                    .await
+                    .map_err(LixError::from)?
             } else if let Some(provenance) = write.splice_provenance() {
                 if write.untracked {
                     return Err(writer_error(

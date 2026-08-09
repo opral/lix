@@ -140,6 +140,10 @@ impl ImmutableObjectSet {
         Ok(())
     }
 
+    pub(crate) fn remove(&mut self, id: ObjectId) {
+        self.objects.remove(&id);
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (ObjectId, &Bytes)> {
         self.objects.iter().map(|(id, bytes)| (*id, bytes))
     }

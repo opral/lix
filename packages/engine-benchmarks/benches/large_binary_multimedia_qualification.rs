@@ -270,6 +270,19 @@ where
     S: Storage,
     F: Future<Output = T>,
 {
+    timed_measured(label, storage, path, future).await.0
+}
+
+async fn timed_measured<S, F, T>(
+    label: &str,
+    storage: &CountStorage<S>,
+    path: &Path,
+    future: F,
+) -> (T, Timed)
+where
+    S: Storage,
+    F: Future<Output = T>,
+{
     storage.reset();
     let before_disk = disk_bytes(path);
     let cpu_before = cpu_ticks();
@@ -293,7 +306,7 @@ where
             "begin_reads":metric.io.begin_reads,"begin_writes":metric.io.begin_writes,"get_many_calls":metric.io.get_many_calls,"get_many_keys":metric.io.get_many_keys,"get_many_value_bytes":metric.io.get_many_bytes,"scans":metric.io.scans,"scan_rows":metric.io.scan_rows,"puts":metric.io.puts,"deletes":metric.io.deletes,"logical_write_bytes":metric.io.logical_write_bytes,"commits":metric.io.commits,"backend_puts":metric.io.backend_puts,"backend_deletes":metric.io.backend_deletes,"backend_written_bytes":metric.io.backend_bytes
         }})
     );
-    value
+    (value, metric)
 }
 
 async fn active_commit<S: Storage + Clone>(session: &SessionContext<S>) -> String {
@@ -319,7 +332,9 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         .expect("session");
     let base = payload(SIZE, 0x1234);
     let edited = edited_payload(&base);
-    let appended = payload(APPEND_SIZE, 0x5678);
+    let appended_suffix = payload(APPEND_SIZE - SIZE, 0x5678);
+    let mut appended = edited.clone();
+    appended.extend_from_slice(&appended_suffix);
 
     let chunks = base
         .chunks(FILE_UPLOAD_PART_BYTES)
@@ -501,14 +516,68 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     assert_eq!(digest(preserved.content()), digest(&edited));
     drop(preserved);
 
-    let _append = timed(
+    let appended_blob: lix::Blob = appended.clone().into();
+    let append_provenance = RequestBlobSpliceProvenance::new_validated(
+        &edited,
+        &appended_blob,
+        &sha256_hex(&edited),
+        &sha256_hex(&appended_blob),
+        edited.len(),
+        0,
+        appended_suffix,
+    )
+    .expect("authenticated append splice");
+    lix::storage_bench::begin_verified_inline_blob_splice_accounting();
+    let (append_result, append_metric) = timed_measured(
         &format!("{label}/append_1m"),
         &counted,
         &path,
-        session.upsert_file_content(PATH.to_owned(), appended.clone().into()),
+        session.execute_with_options_and_metadata(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[Value::Blob(appended_blob), Value::Text(file_id.clone())],
+            ExecuteOptions::default(),
+            ExecuteStatementMetadata {
+                parameter_blob_splices: vec![Some(append_provenance), None],
+                ..ExecuteStatementMetadata::default()
+            },
+        ),
     )
-    .await
-    .expect("append");
+    .await;
+    append_result.expect("append");
+    let append_accounting = lix::storage_bench::take_verified_inline_blob_splice_accounting();
+    assert_eq!(append_accounting.calls, 1);
+    assert_eq!(append_accounting.changed_chunks, 1);
+    assert_eq!(append_accounting.total_chunks, 65);
+    assert_eq!(
+        append_accounting.total_chunks - append_accounting.changed_chunks,
+        64,
+        "append must reuse all 64 authenticated base chunk ObjectIds"
+    );
+    assert!(
+        append_metric.io.puts <= 48,
+        "1 MiB append emitted {} puts instead of one chunk plus a bounded Merkle path",
+        append_metric.io.puts
+    );
+    assert!(
+        append_metric.io.logical_write_bytes <= 2 * 1024 * 1024,
+        "1 MiB append staged {} logical bytes",
+        append_metric.io.logical_write_bytes
+    );
+    assert!(
+        append_metric.io.backend_bytes <= 2 * 1024 * 1024,
+        "1 MiB append wrote {} backend bytes",
+        append_metric.io.backend_bytes
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "verified_variable_splice",
+            "label": format!("{label}/append_1m"),
+            "changed_chunks": append_accounting.changed_chunks,
+            "reused_chunk_object_ids": append_accounting.total_chunks - append_accounting.changed_chunks,
+            "total_chunks": append_accounting.total_chunks,
+        })
+    );
     session.create_checkpoint().await.expect("checkpoint");
     let branch = session
         .create_branch(CreateBranchOptions {
@@ -518,6 +587,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
         })
         .await
         .expect("branch");
+    let retained_branch_id = branch.id.clone();
     let branch_session = engine
         .open_session(branch.id.clone())
         .await
@@ -557,7 +627,7 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
     assert_eq!(digest(cold.content()), digest(&appended));
     drop(cold);
     timed(
-        &format!("{label}/final_reference_delete"),
+        &format!("{label}/shared_reference_delete"),
         &reopened,
         &path,
         reopened_session.execute(
@@ -574,10 +644,25 @@ async fn run<S: BenchBackend>(label: &str, storage: S, path: PathBuf) {
             .expect("deleted file read")
             .is_none()
     );
+    let retained_branch = reopened_engine
+        .open_session(retained_branch_id)
+        .await
+        .expect("open retained branch after main deletion");
+    let retained = retained_branch
+        .read_file_content(PATH.to_owned(), None)
+        .await
+        .expect("retained branch read after main deletion")
+        .expect("shared branch reference must retain blob");
+    assert_eq!(digest(retained.content()), digest(&appended));
+    drop(retained);
+    retained_branch
+        .close()
+        .await
+        .expect("close retained branch");
     reopened_session.close().await.expect("close reopened");
     println!(
         "{}",
-        serde_json::json!({"event":"result","backend":label,"final_reference_deletion":"public_sql_delete_from_lix_file","digest":digest(&appended),"bytes":appended.len()})
+        serde_json::json!({"event":"result","backend":label,"shared_reference_deletion":"main_deleted_branch_retained","digest":digest(&appended),"bytes":appended.len()})
     );
 }
 

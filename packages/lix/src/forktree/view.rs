@@ -363,6 +363,20 @@ where
             .await
     }
 
+    pub(super) async fn build_blob_merkle_edit_successor(
+        &self,
+        manifest: super::model::BlobManifestV1,
+        payload: &[u8],
+        offset: usize,
+        delete_len: usize,
+        insert_len: usize,
+    ) -> Result<super::merkle::BlobMerkleTreeBuild, StorageError> {
+        super::merkle::build_blob_merkle_edit_successor(
+            &self.read, manifest, payload, offset, delete_len, insert_len,
+        )
+        .await
+    }
+
     pub(super) async fn load_blob_ranges_many_on_view(
         &self,
         requests: &[(super::blob::AuthenticatedBlobRef, std::ops::Range<u64>)],
