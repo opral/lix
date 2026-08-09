@@ -8127,12 +8127,12 @@ where
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
+            forktree_reader: self.forktree.clone(),
         }
     }
 
     fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphContext::new().reader(self.forktree.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {

@@ -699,7 +699,7 @@ where
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphContext::new().reader(self.forktree.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
