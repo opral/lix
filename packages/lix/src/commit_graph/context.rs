@@ -517,9 +517,13 @@ impl CommitGraphLiveStateReader {
             let change_id = self.branch_ref.load_head_change_id(&head.branch_id).await?;
             let updated_at = change_id
                 .map(|id| {
-                    let bytes = *id.as_uuid().as_bytes();
-                    let millis =
-                        u64::from_be_bytes(bytes[8..16].try_into().unwrap()) & ((1_u64 << 52) - 1);
+                    // BranchRef has no wall-clock field. This stable display
+                    // discriminator keeps the public timestamp non-null and
+                    // change-sensitive; it is never used as chronology.
+                    let digest = blake3::hash(id.as_uuid().as_bytes());
+                    let millis = (u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
+                        % 1_000_000_000)
+                        + 1;
                     LixTimestamp::from_unix_millis_utc_lossy(millis as i64)
                 })
                 .unwrap_or_else(|| LixTimestamp::from_unix_millis_utc_lossy(0));
