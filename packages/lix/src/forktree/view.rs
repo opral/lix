@@ -1022,7 +1022,7 @@ where
         .collect())
 }
 
-fn historical_state_payloads_differ(
+pub(crate) fn historical_state_payloads_differ(
     before: Option<&super::state::HistoricalStateRow>,
     after: Option<&super::state::HistoricalStateRow>,
 ) -> bool {
@@ -1459,6 +1459,10 @@ mod tests {
         );
 
         assert!(historical_state_identity_changed(
+            Some(&before),
+            Some(&same_payload_new_change),
+        ));
+        assert!(!historical_state_payloads_differ(
             Some(&before),
             Some(&same_payload_new_change),
         ));

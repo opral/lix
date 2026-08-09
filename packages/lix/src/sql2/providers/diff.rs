@@ -11,7 +11,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::entity_pk::EntityPk;
-use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, historical_state_payloads_differ};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
@@ -186,6 +186,13 @@ where
                             .or(after.as_ref())
                             .is_some_and(|row| is_internal_marker_schema(&row.key.schema_key))
                         {
+                            continue;
+                        }
+                        // The authenticated ForkTree view owns semantic row
+                        // equality. A new authenticated write with identical
+                        // payload remains visible to chronology/touched-identity
+                        // consumers, but it is not a public content diff.
+                        if !historical_state_payloads_differ(before.as_ref(), after.as_ref()) {
                             continue;
                         }
                         let kind = match (before.as_ref(), after.as_ref()) {
