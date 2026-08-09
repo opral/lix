@@ -7438,16 +7438,25 @@ where
                 });
             }
         }
-        self.execute_typed_state_transitions(current_commit_id, desired_commit_id, transitions)
-            .await
+        self.execute_typed_state_transitions(
+            facade,
+            current_commit_id,
+            desired_commit_id,
+            transitions,
+        )
+        .await
     }
 
-    async fn execute_typed_state_transitions(
+    async fn execute_typed_state_transitions<R>(
         &mut self,
+        facade: &ForkTreeReadFacade<R>,
         current_commit_id: CommitId,
         desired_commit_id: CommitId,
         transitions: Vec<TypedStateTransition>,
-    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
+    where
+        R: StorageAdapterRead,
+    {
         if transitions.is_empty() {
             return Err(empty_state_transition(current_commit_id, desired_commit_id));
         }
@@ -7480,10 +7489,14 @@ where
             };
             if let Some(target) = transition.target.as_ref() {
                 if let Some(content) = Self::historical_blob_ref_file_content(
+                    facade,
+                    desired_commit_id,
                     &transition.identity,
                     target,
                     &branch_id,
-                )? {
+                )
+                .await?
+                {
                     file_content.push(content);
                 }
             }
@@ -7531,11 +7544,16 @@ where
         })
     }
 
-    fn historical_blob_ref_file_content(
+    async fn historical_blob_ref_file_content<R>(
+        facade: &ForkTreeReadFacade<R>,
+        desired_commit_id: CommitId,
         identity: &TrackedStateKey,
         target: &TypedStateTransitionTarget,
         branch_id: &str,
-    ) -> Result<Option<TransactionFileContent>, LixError> {
+    ) -> Result<Option<TransactionFileContent>, LixError>
+    where
+        R: StorageAdapterRead,
+    {
         if identity.schema_key != "lix_binary_blob_ref" {
             return Ok(None);
         }
@@ -7599,6 +7617,34 @@ where
             return Err(LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 "historical BlobRef transition has a zero manifest identity",
+            ));
+        }
+        let verified_payload = facade
+            .load_historical_blob_bytes_for_rows(&[(
+                desired_commit_id.to_string(),
+                StateKey {
+                    schema_key: identity.schema_key.clone(),
+                    file_id: identity.file_id.clone(),
+                    entity_pk: identity.entity_pk.clone(),
+                },
+            )])
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "historical BlobRef manifest payload is absent",
+                )
+            })?;
+        if verified_payload.len() as u64 != snapshot.size_bytes
+            || BlobId::from_content(&verified_payload) != blob_hash
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical BlobRef manifest payload does not match its snapshot",
             ));
         }
         let receipt = BlobWriteReceipt {
