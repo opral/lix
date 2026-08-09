@@ -18,6 +18,7 @@ rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb"]
 prepared-cas-observability = ["lix/prepared-cas-observability"]
+real-git-replay = ["lix/default_wasm_runtime", "rocksdb", "slatedb"]
 plugin-wasm-tests = ["lix/default_wasm_runtime"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Opt-in profiling build that routes Rust allocations through libc so tools
@@ -46,6 +47,7 @@ ahash = "0.8"
 async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
+clap = { version = "4.5.31", features = ["derive"] }
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -62,12 +64,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["std"] }
 zip = { version = "8", default-features = false }
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_text = { path = "../../plugins/text", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[example]]
 name = "forktree_sqlite_oltp"
 path = "examples/forktree_sqlite_oltp.rs"
 required-features = ["storage-benches", "slatedb"]
+[[example]]
+name = "git_replay_real_repo"
+path = "examples/git_replay_real_repo.rs"
+required-features = ["real-git-replay"]
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
