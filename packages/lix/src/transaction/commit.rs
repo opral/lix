@@ -21,11 +21,11 @@ use crate::transaction::types::{PreparedStateRowRef, StageJson};
 use crate::forktree::{
     BranchSnapshotV1, BranchStateTransition, CanonicalBranchId, ChangeCatalogEntry,
     ChangeCatalogOwner, ChangeId as ForkTreeChangeId, ChangeObjectV1, CommitCatalogEntry,
-    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, ObjectId,
+    CommitId as ForkTreeCommitId, CommitMemberV1, CommitObjectV1, CommitValidationMemo, ObjectId,
     OrderedBranchHistoryTransition, PreparedPublication, RepositoryRootV1, StateCellRef,
     StateKeyRef, StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef,
-    encode_state_key, encode_state_value, load_commit, open_coherent_view_on_read,
-    select_historical_commit_member, state_point,
+    encode_state_key, encode_state_value, load_commit_with_memo, new_commit_validation_memo,
+    open_coherent_view_on_read, select_historical_commit_member, state_point,
 };
 
 pub(crate) type RuntimeSequenceCheckpoint = (i64, LixTimestamp, crate::changelog::ChangeId);
@@ -202,6 +202,7 @@ where
     };
     let branch_id = sole_publication_branch(&prepared_writes, runtime_checkpoint.is_some())?;
     let view = open_coherent_view_on_read(read, publication_branch_id).await?;
+    let mut validation_memo = new_commit_validation_memo(&view);
     let mut publication = PreparedPublication::from_branch_view(&view)?;
     let prepared_blob_manifests = prepared_blob_manifest_ids(&mut publication, &prepared_writes)?;
     let branch_ref_intents = prepared_writes.branch_ref_intents.clone();
@@ -314,7 +315,8 @@ where
 
     if !semantic_commit {
         let plan = PreparedForkTreePlan::Publication(publication);
-        return append_branch_ref_intents(plan, &view, &branch_ref_intents).await;
+        return append_branch_ref_intents(plan, &view, &branch_ref_intents, &mut validation_memo)
+            .await;
     }
     let ordered_history = !prepared_writes.intermediate_commits.is_empty()
         || !prepared_writes
@@ -332,9 +334,11 @@ where
             publication,
             prepared_writes,
             prepared_blob_manifests,
+            &mut validation_memo,
         )
         .await;
-        return append_branch_ref_intents(plan?, &view, &branch_ref_intents).await;
+        return append_branch_ref_intents(plan?, &view, &branch_ref_intents, &mut validation_memo)
+            .await;
     }
     let tracked_rows = prepared_writes
         .state_rows
@@ -457,9 +461,13 @@ where
         .copied()
         .flatten()
         .ok_or_else(|| writer_error("branch commit has no selected parent"))?;
-    let selected_parent = load_commit(&view, forktree_commit_id(expected_parent))
-        .await?
-        .ok_or_else(|| writer_error("selected branch parent is absent from CommitCatalog"))?;
+    let selected_parent = load_commit_with_memo(
+        &view,
+        forktree_commit_id(expected_parent),
+        &mut validation_memo,
+    )
+    .await?
+    .ok_or_else(|| writer_error("selected branch parent is absent from CommitCatalog"))?;
     let (selected_parent_object_id, _) = selected_parent.encode()?;
     if selected_parent_object_id != view.branch_snapshot().semantic_head_commit_object_id {
         return Err(writer_error(
@@ -478,9 +486,10 @@ where
         if parent_commit_ids.contains(parent) {
             continue;
         }
-        let parent_object = load_commit(&view, forktree_commit_id(*parent))
-            .await?
-            .ok_or_else(|| writer_error("extra commit parent is absent from CommitCatalog"))?;
+        let parent_object =
+            load_commit_with_memo(&view, forktree_commit_id(*parent), &mut validation_memo)
+                .await?
+                .ok_or_else(|| writer_error("extra commit parent is absent from CommitCatalog"))?;
         let (parent_object_id, _) = parent_object.encode()?;
         parent_commit_ids.push(*parent);
         parent_object_ids.push(parent_object_id);
@@ -633,6 +642,7 @@ where
         PreparedForkTreePlan::Publication(publication),
         &view,
         &branch_ref_intents,
+        &mut validation_memo,
     )
     .await
 }
@@ -641,6 +651,7 @@ async fn append_branch_ref_intents<R>(
     plan: PreparedForkTreePlan,
     view: &crate::forktree::CoherentView<R>,
     intents: &[BranchRefPublicationIntent],
+    validation_memo: &mut CommitValidationMemo,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -660,17 +671,18 @@ where
             let source_head = intent
                 .commit_id
                 .ok_or_else(|| writer_error("branch creation has no source commit"))?;
-            let source_commit = load_commit(view, forktree_commit_id(source_head))
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_FOREIGN_KEY,
-                        format!(
-                            "branch ref commit_id '{}' does not reference an existing commit",
-                            source_head
-                        ),
-                    )
-                })?;
+            let source_commit =
+                load_commit_with_memo(view, forktree_commit_id(source_head), validation_memo)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_FOREIGN_KEY,
+                            format!(
+                                "branch ref commit_id '{}' does not reference an existing commit",
+                                source_head
+                            ),
+                        )
+                    })?;
             publication
                 .publish_new_branch_selector(
                     view,
@@ -689,7 +701,7 @@ where
                     // authenticated catalog. Resolve the requested commit
                     // from the operation view, then use the target view only
                     // for selector identity/CAS and branch-local state.
-                    load_commit(view, forktree_commit_id(commit_id))
+                    load_commit_with_memo(view, forktree_commit_id(commit_id), validation_memo)
                         .await?
                         .ok_or_else(|| writer_error("branch selector target commit is absent"))?,
                 ),
@@ -761,6 +773,7 @@ async fn prepare_ordered_single_branch_history<R>(
     mut publication: PreparedPublication,
     prepared: PreparedWriteSet,
     prepared_blob_manifests: BTreeMap<(String, String, bool, bool), ObjectId>,
+    validation_memo: &mut CommitValidationMemo,
 ) -> Result<PreparedForkTreePlan, LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -1130,16 +1143,18 @@ where
         let mut generation = None::<u64>;
         let mut parent_object_ids = Vec::with_capacity(content.draft.parent_commit_ids.len());
         for parent_id in &content.draft.parent_commit_ids {
-            let (parent_object_id, parent) =
-                if let Some((object_id, commit)) = staged_commits.get(parent_id) {
-                    (*object_id, commit.clone())
-                } else {
-                    let commit = load_commit(view, forktree_commit_id(*parent_id))
+            let (parent_object_id, parent) = if let Some((object_id, commit)) =
+                staged_commits.get(parent_id)
+            {
+                (*object_id, commit.clone())
+            } else {
+                let commit =
+                    load_commit_with_memo(view, forktree_commit_id(*parent_id), validation_memo)
                         .await?
                         .ok_or_else(|| writer_error("ordered history parent is absent"))?;
-                    let (object_id, _) = commit.encode()?;
-                    (object_id, commit)
-                };
+                let (object_id, _) = commit.encode()?;
+                (object_id, commit)
+            };
             parent_object_ids.push(parent_object_id);
             generation =
                 Some(generation.map_or(parent.generation, |value| value.max(parent.generation)));

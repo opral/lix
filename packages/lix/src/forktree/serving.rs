@@ -77,6 +77,114 @@ where
     Ok(members)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct CommitValidationMemoKey {
+    view_id: [u8; 32],
+    view_instance_id: u64,
+    repository_root: ObjectId,
+    global_epoch: u64,
+    global_selector_generation: u64,
+    branch_snapshot: ObjectId,
+    branch_selector_generation: u64,
+    commit_id: CommitId,
+    commit_object_id: ObjectId,
+    member_root: Option<ObjectId>,
+}
+
+#[derive(Clone, Debug)]
+struct CommitValidationMemoEntry {
+    commit: CommitObjectV1,
+    members: Vec<CommitMemberV1>,
+}
+
+/// Operation-local memo for successful immutable commit validation. The view
+/// identity is part of every key and the memo is created and dropped inside
+/// one publication; it is never a durable or cross-transaction authority.
+pub(crate) struct CommitValidationMemo {
+    view_id: [u8; 32],
+    view_instance_id: u64,
+    entries: BTreeMap<CommitValidationMemoKey, CommitValidationMemoEntry>,
+    object_index: BTreeMap<ObjectId, CommitValidationMemoKey>,
+}
+
+pub(crate) fn new_commit_validation_memo<R>(view: &CoherentView<R>) -> CommitValidationMemo
+where
+    R: StorageAdapterRead,
+{
+    CommitValidationMemo {
+        view_id: view.view_id(),
+        view_instance_id: view.view_instance_id(),
+        entries: BTreeMap::new(),
+        object_index: BTreeMap::new(),
+    }
+}
+
+impl CommitValidationMemo {
+    fn key<R>(
+        &self,
+        view: &CoherentView<R>,
+        commit: &CommitObjectV1,
+        commit_object_id: ObjectId,
+    ) -> CommitValidationMemoKey
+    where
+        R: StorageAdapterRead,
+    {
+        CommitValidationMemoKey {
+            view_id: view.view_id(),
+            view_instance_id: view.view_instance_id(),
+            repository_root: view.global_selector().repository_root,
+            global_epoch: view.global_selector().epoch,
+            global_selector_generation: view.global_selector().selector_generation,
+            branch_snapshot: view.branch_selector().branch_snapshot_object_id,
+            branch_selector_generation: view.branch_selector().selector_generation,
+            commit_id: commit.commit_id,
+            commit_object_id,
+            member_root: commit.member_page_root,
+        }
+    }
+
+    fn get<R>(
+        &self,
+        view: &CoherentView<R>,
+        commit_object_id: ObjectId,
+    ) -> Option<&CommitValidationMemoEntry>
+    where
+        R: StorageAdapterRead,
+    {
+        if self.view_id != view.view_id() || self.view_instance_id != view.view_instance_id() {
+            return None;
+        }
+        let key = self.object_index.get(&commit_object_id)?;
+        if key.view_id != view.view_id()
+            || key.view_instance_id != view.view_instance_id()
+            || key.repository_root != view.global_selector().repository_root
+            || key.global_epoch != view.global_selector().epoch
+            || key.global_selector_generation != view.global_selector().selector_generation
+            || key.branch_snapshot != view.branch_selector().branch_snapshot_object_id
+            || key.branch_selector_generation != view.branch_selector().selector_generation
+            || key.commit_object_id != commit_object_id
+        {
+            return None;
+        }
+        self.entries.get(key)
+    }
+
+    fn insert<R>(
+        &mut self,
+        view: &CoherentView<R>,
+        commit: CommitObjectV1,
+        commit_object_id: ObjectId,
+        members: Vec<CommitMemberV1>,
+    ) where
+        R: StorageAdapterRead,
+    {
+        let key = self.key(view, &commit, commit_object_id);
+        self.object_index.insert(commit_object_id, key.clone());
+        self.entries
+            .insert(key, CommitValidationMemoEntry { commit, members });
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateSource {
     Global,
@@ -1334,6 +1442,184 @@ where
     Ok(())
 }
 
+async fn load_validated_commit_for_memo<R>(
+    view: &CoherentView<R>,
+    commit_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    memo: &mut CommitValidationMemo,
+) -> Result<CommitValidationMemoEntry, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    if let Some(cached) = memo.get(view, commit_object_id) {
+        return Ok(cached.clone());
+    }
+    let bytes = view.load_object_bytes(commit_object_id).await?;
+    let commit = CommitObjectV1::decode(commit_object_id, &bytes)?;
+    let catalog_value = view
+        .lookup_tree_value(commit_catalog_root, "commit", commit.commit_id.as_bytes())
+        .await?
+        .ok_or_else(|| corruption("commit owner has no authoritative CommitCatalog entry"))?;
+    let catalog_entry = CommitCatalogEntry::decode(&catalog_value)?;
+    if catalog_entry.commit_object_id != commit_object_id {
+        return Err(corruption(
+            "commit owner disagrees with its authoritative CommitCatalog entry",
+        ));
+    }
+    let members = view.load_commit_members(&commit).await?;
+    Ok(CommitValidationMemoEntry { commit, members })
+}
+
+async fn validate_member_catalog_owner_with_memo<R>(
+    view: &CoherentView<R>,
+    commit_catalog_root: ObjectId,
+    target_commit_object_id: ObjectId,
+    target_generation: u64,
+    target_ordinal: usize,
+    target_members: &[CommitMemberV1],
+    member: CommitMemberV1,
+    entry: ChangeCatalogEntry,
+    memo: &mut CommitValidationMemo,
+) -> Result<(), StorageError>
+where
+    R: StorageAdapterRead,
+{
+    if entry.change_object_id != member.change_object_id() {
+        return Err(corruption(
+            "commit membership edge disagrees with ChangeCatalog object identity",
+        ));
+    }
+    let canonical_owner = match entry.owner {
+        ChangeCatalogOwner::CommitMember {
+            commit_object_id,
+            ordinal,
+        } => {
+            if commit_object_id == target_commit_object_id {
+                if target_members.get(ordinal as usize)
+                    != Some(&CommitMemberV1::introduced(member.change_object_id()))
+                {
+                    return Err(corruption(
+                        "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                    ));
+                }
+            } else {
+                let introduction = load_validated_commit_for_memo(
+                    view,
+                    commit_catalog_root,
+                    commit_object_id,
+                    memo,
+                )
+                .await?;
+                if introduction.members.get(ordinal as usize)
+                    != Some(&CommitMemberV1::introduced(member.change_object_id()))
+                {
+                    return Err(corruption(
+                        "ChangeCatalog canonical introduction owner/ordinal is invalid",
+                    ));
+                }
+            }
+            (commit_object_id, ordinal)
+        }
+        ChangeCatalogOwner::BranchRef { .. } => {
+            return Err(corruption(
+                "semantic commit member resolves to a branch-ref catalog owner",
+            ));
+        }
+    };
+    match member.source() {
+        None => {
+            let target_ordinal = u32::try_from(target_ordinal)
+                .map_err(|_| corruption("commit member ordinal exceeds u32"))?;
+            if canonical_owner != (target_commit_object_id, target_ordinal) {
+                return Err(corruption(
+                    "introduced membership is not the canonical ChangeCatalog owner",
+                ));
+            }
+        }
+        Some((source_commit_object_id, source_ordinal)) => {
+            let source = if source_commit_object_id == target_commit_object_id {
+                return Err(corruption(
+                    "selected membership source is the target commit itself",
+                ));
+            } else {
+                load_validated_commit_for_memo(
+                    view,
+                    commit_catalog_root,
+                    source_commit_object_id,
+                    memo,
+                )
+                .await?
+            };
+            if source.commit.generation >= target_generation {
+                return Err(corruption(
+                    "selected membership source generation is not earlier than its target",
+                ));
+            }
+            if source
+                .members
+                .get(source_ordinal as usize)
+                .map(|source| source.change_object_id())
+                != Some(member.change_object_id())
+            {
+                return Err(corruption(
+                    "selected membership source commit/ordinal back-edge is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_retained_commit_with_memo<R>(
+    view: &CoherentView<R>,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    commit_object_id: ObjectId,
+    commit: &CommitObjectV1,
+    memo: &mut CommitValidationMemo,
+) -> Result<Vec<CommitMemberV1>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    for parent_id in &commit.parent_commit_object_ids {
+        let bytes = view.load_object_bytes(*parent_id).await?;
+        let parent = CommitObjectV1::decode(*parent_id, &bytes)?;
+        if parent.generation >= commit.generation {
+            return Err(corruption(
+                "retained commit parent generation is not strictly earlier",
+            ));
+        }
+    }
+    let members = view.load_commit_members(commit).await?;
+    for (ordinal, member) in members.iter().copied().enumerate() {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_forktree_commit_validation_member_binding();
+        let bytes = view.load_object_bytes(member.change_object_id()).await?;
+        let change = ChangeObjectV1::decode(member.change_object_id(), &bytes)?;
+        if !matches!(change, ChangeObjectV1::Semantic { .. }) {
+            return Err(corruption("commit member edge names a RefChange object"));
+        }
+        let value = view
+            .lookup_tree_value(change_catalog_root, "change", change.change_id().as_bytes())
+            .await?
+            .ok_or_else(|| corruption("retained Change object has no ChangeCatalog owner"))?;
+        let entry = ChangeCatalogEntry::decode(&value)?;
+        validate_member_catalog_owner_with_memo(
+            view,
+            commit_catalog_root,
+            commit_object_id,
+            commit.generation,
+            ordinal,
+            &members,
+            member,
+            entry,
+            memo,
+        )
+        .await?;
+    }
+    Ok(members)
+}
+
 pub(crate) async fn select_historical_commit_member<R>(
     view: &CoherentView<R>,
     source_commit_id: CommitId,
@@ -1942,6 +2228,62 @@ where
         &commit,
     )
     .await?;
+    Ok(Some(commit))
+}
+
+/// Loads and fully authenticates one commit while reusing only successful
+/// validation results from this exact retained view/publication. The memo is
+/// intentionally caller-owned so a different view cannot observe or reuse it.
+pub(crate) async fn load_commit_with_memo<R>(
+    view: &CoherentView<R>,
+    id: CommitId,
+    memo: &mut CommitValidationMemo,
+) -> Result<Option<CommitObjectV1>, StorageError>
+where
+    R: StorageAdapterRead,
+{
+    let Some(value) = view
+        .lookup_tree_value(
+            view.repository_root().commit_catalog_root,
+            "commit",
+            id.as_bytes(),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let entry = CommitCatalogEntry::decode(&value)?;
+    let bytes = view.load_object_bytes(entry.commit_object_id).await?;
+    let commit = CommitObjectV1::decode(entry.commit_object_id, &bytes)?;
+    if commit.commit_id != id {
+        return Err(corruption(
+            "CommitCatalog key does not match embedded CommitId",
+        ));
+    }
+    if let Some(cached) = memo.get(view, entry.commit_object_id) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_forktree_commit_validation_memo_hit();
+        if cached.commit != commit {
+            return Err(corruption(
+                "validation memo object changed within one retained view",
+            ));
+        }
+        return Ok(Some(cached.commit.clone()));
+    }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_forktree_commit_validation_attempt();
+    let members = validate_retained_commit_with_memo(
+        view,
+        view.repository_root().commit_catalog_root,
+        view.repository_root().change_catalog_root,
+        entry.commit_object_id,
+        &commit,
+        memo,
+    )
+    .await?;
+    memo.insert(view, commit.clone(), entry.commit_object_id, members);
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_forktree_commit_validation_success();
     Ok(Some(commit))
 }
 

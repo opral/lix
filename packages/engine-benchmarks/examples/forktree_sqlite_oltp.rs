@@ -58,6 +58,15 @@ impl Operation {
 }
 
 fn main() {
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PHASES").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=trace")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(false)
+            .with_ansi(false)
+            .try_init()
+            .expect("install benchmark phase tracing subscriber");
+    }
     let mut args = std::env::args().skip(1);
     let backend = args.next().unwrap_or_else(|| usage("missing backend"));
     let rows = args
@@ -130,6 +139,12 @@ async fn run(
 
         let (lix_result, lix_elapsed) = if verify_only {
             (run_lix(&lix_fixture, operation).await, None)
+        } else if matches!(operation, Operation::UpdateOne)
+            && std::env::var_os("LIX_TRACKED_STATE_CRUD_PHASES").is_some()
+        {
+            let (result, profile) = run_lix_update_profiled(&lix_fixture).await;
+            print_lix_update_profile(sample, &profile);
+            (result, Some(profile.total_elapsed))
         } else {
             let start = Instant::now();
             let result = run_lix(&lix_fixture, operation).await;
@@ -155,6 +170,167 @@ async fn run(
             lix_elapsed.map_or(0, |value| value.as_micros()),
             sqlite_elapsed.map_or(0, |value| value.as_micros()),
         );
+    }
+}
+
+struct LixUpdateProfile {
+    total_elapsed: std::time::Duration,
+    sql_plan_execute: std::time::Duration,
+    readback: std::time::Duration,
+    ownership: lix::storage_bench::CrudOwnershipAccounting,
+    physical_writes: lix::storage_bench::CrudPhysicalWriteAccounting,
+    update_certificate: lix::storage_bench::CrudCertificateAccounting,
+    commit_validation: lix::storage_bench::CrudCommitValidationAccounting,
+}
+
+async fn run_lix_update_profiled(
+    fixture: &sql_session::SqlFixture,
+) -> (ExecuteResult, LixUpdateProfile) {
+    // These counters are feature-gated benchmark instrumentation. Resetting
+    // them immediately before the measured operation keeps fixture seeding and
+    // the baseline read outside the sample, matching the normal timer above.
+    lix::storage_bench::begin_crud_ownership_accounting();
+    let _ = lix::storage_bench::take_crud_physical_write_accounting();
+    let _ = lix::storage_bench::take_certified_entity_update_value_batch_accounting();
+    lix::storage_bench::begin_crud_commit_validation_accounting();
+
+    let total_start = Instant::now();
+    let sql_start = Instant::now();
+    let affected = fixture.update_one_by_pk().await;
+    let sql_plan_execute = sql_start.elapsed();
+    assert_eq!(affected, 1);
+
+    let read_start = Instant::now();
+    let result = fixture.read_all_result().await;
+    let readback = read_start.elapsed();
+    let total_elapsed = total_start.elapsed();
+
+    let ownership = lix::storage_bench::take_crud_ownership_accounting();
+    let physical_writes = lix::storage_bench::take_crud_physical_write_accounting();
+    let update_certificate =
+        lix::storage_bench::take_certified_entity_update_value_batch_accounting();
+    let commit_validation = lix::storage_bench::take_crud_commit_validation_accounting();
+    (
+        result,
+        LixUpdateProfile {
+            total_elapsed,
+            sql_plan_execute,
+            readback,
+            ownership,
+            physical_writes,
+            update_certificate,
+            commit_validation,
+        },
+    )
+}
+
+fn print_lix_update_profile(sample: usize, profile: &LixUpdateProfile) {
+    println!(
+        "phase_sample={sample} sql_plan_execute_us={} readback_us={} total_us={} \
+         physical_puts={} physical_deletes={} physical_written_bytes={} \
+         update_attempts={} update_hits={} certified_rows={} ownership_rows={} \
+         ownership_key_bytes={} ownership_value_bytes={} ownership_vec_entries={} \
+         ownership_string_entries={} ownership_map_entries={} \
+         commit_validation_attempts={} commit_validation_successes={} \
+         commit_validation_memo_hits={} commit_validation_member_bindings={}",
+        profile.sql_plan_execute.as_micros(),
+        profile.readback.as_micros(),
+        profile.total_elapsed.as_micros(),
+        profile.physical_writes.puts,
+        profile.physical_writes.deletes,
+        profile.physical_writes.written_bytes,
+        profile.update_certificate.attempts,
+        profile.update_certificate.hits,
+        profile.update_certificate.certified_rows,
+        profile
+            .ownership
+            .stages
+            .iter()
+            .map(|metric| metric.rows)
+            .sum::<u64>(),
+        profile
+            .ownership
+            .stages
+            .iter()
+            .map(|metric| metric.key_bytes)
+            .sum::<u64>(),
+        profile
+            .ownership
+            .stages
+            .iter()
+            .map(|metric| metric.value_bytes)
+            .sum::<u64>(),
+        profile
+            .ownership
+            .stages
+            .iter()
+            .map(|metric| metric.vec_entries)
+            .sum::<u64>(),
+        profile
+            .ownership
+            .stages
+            .iter()
+            .map(|metric| metric.string_entries)
+            .sum::<u64>(),
+        profile
+            .ownership
+            .stages
+            .iter()
+            .map(|metric| metric.map_entries)
+            .sum::<u64>(),
+        profile.commit_validation.attempts,
+        profile.commit_validation.successes,
+        profile.commit_validation.memo_hits,
+        profile.commit_validation.member_bindings,
+    );
+    for (stage, metric) in profile.ownership.stages.iter().enumerate() {
+        if *metric == lix::storage_bench::CrudOwnershipMetric::default() {
+            continue;
+        }
+        println!(
+            "phase_stage_sample={sample} stage={stage} name={} rows={} key_bytes={} value_bytes={} vec_entries={} string_entries={} map_entries={}",
+            ownership_stage_name(stage),
+            metric.rows,
+            metric.key_bytes,
+            metric.value_bytes,
+            metric.vec_entries,
+            metric.string_entries,
+            metric.map_entries,
+        );
+    }
+    for (stage, transfer) in profile.ownership.transfers.iter().enumerate() {
+        if *transfer == lix::storage_bench::CrudOwnershipTransferMetric::default() {
+            continue;
+        }
+        println!(
+            "phase_transfer_sample={sample} stage={stage} name={} created_bytes={} cloned_bytes={} retained_bytes={} dropped_bytes={}",
+            ownership_stage_name(stage),
+            transfer.created_bytes,
+            transfer.cloned_bytes,
+            transfer.retained_bytes,
+            transfer.dropped_bytes,
+        );
+    }
+}
+
+fn ownership_stage_name(stage: usize) -> &'static str {
+    match stage {
+        lix::storage_bench::CRUD_OWNERSHIP_SQL_BOUND => "sql_bound",
+        lix::storage_bench::CRUD_OWNERSHIP_RAW_BATCH => "raw_batch",
+        lix::storage_bench::CRUD_OWNERSHIP_RAW_TRANSFER => "raw_transfer",
+        lix::storage_bench::CRUD_OWNERSHIP_PREPARED_BATCH => "prepared_batch",
+        lix::storage_bench::CRUD_OWNERSHIP_PREPARED_CLONE => "prepared_clone",
+        lix::storage_bench::CRUD_OWNERSHIP_REPLACEMENT_INPUT => "replacement_input",
+        lix::storage_bench::CRUD_OWNERSHIP_REPLACEMENT_PART => "replacement_part",
+        lix::storage_bench::CRUD_OWNERSHIP_AUTHORITY => "authority",
+        lix::storage_bench::CRUD_OWNERSHIP_ROOT_PUBLICATION => "root_publication",
+        lix::storage_bench::CRUD_OWNERSHIP_WRITE_SET => "write_set",
+        lix::storage_bench::CRUD_OWNERSHIP_ADAPTER => "storage_adapter",
+        lix::storage_bench::CRUD_OWNERSHIP_MUTATION_JOURNAL => "mutation_journal",
+        lix::storage_bench::CRUD_OWNERSHIP_IDENTITY_ENCODING => "identity_encoding",
+        lix::storage_bench::CRUD_OWNERSHIP_NORMALIZATION => "normalization",
+        lix::storage_bench::CRUD_OWNERSHIP_JOURNAL_SEAL => "journal_seal",
+        _ => "unknown",
     }
 }
 

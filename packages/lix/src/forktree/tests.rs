@@ -41,9 +41,10 @@ use super::{
     StateSource, StateTreeMutation, StateValueRef, UntrackedValueRef, UploadBindingRef,
     UploadPartV1, UploadProgressV1, UploadSelectorV1, VisibleStateRow, abort_corrupt_gc,
     advance_gc, edit_state_tree, encode_state_key, encode_state_value, load_change, load_commit,
-    load_commit_member_records, load_commit_topologies, open_coherent_view, page_changes,
-    page_commits, prepare_upload_completion, put_change_catalog_entries,
-    put_commit_catalog_entries, state_point, state_range,
+    load_commit_member_records, load_commit_topologies, load_commit_with_memo,
+    new_commit_validation_memo, open_coherent_view, page_changes, page_commits,
+    prepare_upload_completion, put_change_catalog_entries, put_commit_catalog_entries, state_point,
+    state_range,
 };
 
 fn raw_id(byte: u8) -> [u8; 16] {
@@ -260,6 +261,45 @@ async fn selected_commit_member_authenticates_canonical_owner_source_and_generat
         .await
         .is_err(),
         "same-generation selected history must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn commit_validation_memo_is_view_local_and_never_caches_corruption() {
+    let seed = build_seed();
+    let storage = Memory::new();
+    seed_storage(&storage, &seed).await;
+
+    let view = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("open validation view");
+    let mut memo = new_commit_validation_memo(&view);
+    let first = load_commit_with_memo(&view, seed.commit_id, &mut memo)
+        .await
+        .expect("first authenticated commit load")
+        .expect("seed commit");
+    let second = load_commit_with_memo(&view, seed.commit_id, &mut memo)
+        .await
+        .expect("memoized authenticated commit load")
+        .expect("seed commit");
+    assert_eq!(first, second);
+    drop(view);
+
+    let mut writes = StorageWriteSet::new();
+    writes.delete(
+        OBJECT_SPACE,
+        seed.semantic_change_object_id.as_bytes().to_vec(),
+    );
+    commit_write_set_for_test(writes, &storage).await;
+
+    let reopened = open_coherent_view(&storage, seed.branch_id)
+        .await
+        .expect("reopen validation view");
+    assert!(
+        load_commit_with_memo(&reopened, seed.commit_id, &mut memo)
+            .await
+            .is_err(),
+        "a memo from another coherent view must not mask corruption"
     );
 }
 

@@ -18,6 +18,50 @@ static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_COMMIT_VALIDATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_COMMIT_VALIDATION_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_COMMIT_VALIDATION_MEMO_HITS: AtomicU64 = AtomicU64::new(0);
+static FORKTREE_COMMIT_VALIDATION_MEMBER_BINDINGS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudCommitValidationAccounting {
+    pub attempts: u64,
+    pub successes: u64,
+    pub memo_hits: u64,
+    pub member_bindings: u64,
+}
+
+pub fn begin_crud_commit_validation_accounting() {
+    FORKTREE_COMMIT_VALIDATION_ATTEMPTS.store(0, Ordering::Relaxed);
+    FORKTREE_COMMIT_VALIDATION_SUCCESSES.store(0, Ordering::Relaxed);
+    FORKTREE_COMMIT_VALIDATION_MEMO_HITS.store(0, Ordering::Relaxed);
+    FORKTREE_COMMIT_VALIDATION_MEMBER_BINDINGS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_commit_validation_attempt() {
+    FORKTREE_COMMIT_VALIDATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_commit_validation_success() {
+    FORKTREE_COMMIT_VALIDATION_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_commit_validation_memo_hit() {
+    FORKTREE_COMMIT_VALIDATION_MEMO_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_forktree_commit_validation_member_binding() {
+    FORKTREE_COMMIT_VALIDATION_MEMBER_BINDINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_crud_commit_validation_accounting() -> CrudCommitValidationAccounting {
+    CrudCommitValidationAccounting {
+        attempts: FORKTREE_COMMIT_VALIDATION_ATTEMPTS.swap(0, Ordering::Relaxed),
+        successes: FORKTREE_COMMIT_VALIDATION_SUCCESSES.swap(0, Ordering::Relaxed),
+        memo_hits: FORKTREE_COMMIT_VALIDATION_MEMO_HITS.swap(0, Ordering::Relaxed),
+        member_bindings: FORKTREE_COMMIT_VALIDATION_MEMBER_BINDINGS.swap(0, Ordering::Relaxed),
+    }
+}
 
 /// Matched transaction ownership counters used by the CRUD profile.  These
 /// counters are deliberately disabled unless the profile enables them, so the
